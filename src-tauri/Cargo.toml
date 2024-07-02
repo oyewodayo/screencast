@@ -1,0 +1,19 @@
+[package]
+name = "screencast"
+version = "0.0.0"
+description = "A screen recording and streaming application for easy use."
+authors = ["Temidayo Oyewo"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = [ "api-all", "dialog"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4.38"
+windows = {version="0.57.0", features = ["Win32_System_SystemInformation", "Win32_System_Power", "Win32_Storage_FileSystem", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Devices_Properties"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

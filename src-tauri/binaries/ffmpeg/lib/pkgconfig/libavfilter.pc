@@ -1,0 +1,14 @@
+prefix=/mingw64
+exec_prefix=${prefix}
+libdir=/mingw64/lib
+includedir=/mingw64/include
+
+Name: libavfilter
+Description: FFmpeg audio/video filtering library
+Version: 9.12.100
+Requires: 
+Requires.private: libswscale >= 7.5.100, libpostproc >= 57.3.100, libavformat >= 60.16.100, libavcodec >= 60.31.102, libswresample >= 4.12.100, libavutil >= 58.29.100
+Conflicts:
+Libs: -L${libdir}  -lavfilter 
+Libs.private: -lm -latomic -lplacebo -lass -lva -lvidstab -lzimg -lfontconfig -lfreetype -lfreetype -ldl -lvpl -lole32 -lgdi32 -luuid -lstdc++
+Cflags: -I${includedir}
