@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { invoke } from "@tauri-apps/api/tauri";
 
 
@@ -12,7 +12,7 @@ const OsInfo = () => {
       }, []);
 
   return (
-    <span className='os-info'> OS: <span className='text-blue bold-600'>{osInfo}</span></span>
+    <span className=''> OS: <span className='text-blue-500'>{osInfo}</span></span>
   )
 }
 

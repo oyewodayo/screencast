@@ -2,13 +2,12 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import BottomDocker from "./components/BottomDocker";
 
-
 type RAMInfo = [number, number];
 function App() {
+
   const [message, setMessage] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
-  const [elapsedTime, setElapsedTime] = useState<number>(0);
 
   const [ramInfo, setRamInfo] = useState<RAMInfo | null>(null);
   const [fileName, setFileName] = useState("Recording_"+new Date().toLocaleDateString().replace(/\//g, "_"));
@@ -26,22 +25,9 @@ function App() {
 
 
 
-  useEffect(() => {
-    let interval: number | undefined;
-    if (isRecording) {
-      interval = window.setInterval(() => {
-        setElapsedTime((prevTime) => prevTime + 1);
-      }, 1000);
-    } else {
-      setElapsedTime(0);
-    }
-    return () => clearInterval(interval);
-  }, [isRecording]);
-
   const handleStartRecording = async (formData: any) => {
     try {
       setError("");
-      console.log(formData)
       const response = await invoke<string>("start_recording", { formData });
       setMessage(response);
       setIsRecording(true);
@@ -80,29 +66,24 @@ function App() {
 
   return (
 
-    <div className="m-0 pt-2vh flex flex-col justify-center text-center">
-      <div className="section">
-        <div className="section-head">
+    <div className="w-full h-screen flex flex-col">
+      <div className="p-4">
+        <div className="flex justify-end text-center">
           <div className="">
             <div>
-            <img src="screencast.png" width={55}></img>
+              <img src="screencast.png" width={55}></img>
             </div>
-            <div className="font-size-12 align-left margin-top-n20 margin-right-5">
+            <div className="text-[12px] -mt-2.5">
               Briefcast
             </div>
           </div>
 
-          {isRecording && (
-            <div className="recording-indicator text-right">
-              <span className="record-icon"></span>
-              Recording: {formatTime(elapsedTime)}
-            </div>
-          )}
-          {message && <p className="message text-right">{message}</p>}
-          {error && <p className="error text-right">{error}</p>}
+
+          {/* {message && <p className="message text-right">{message}</p>}
+          {error && <p className="error text-right">{error}</p>} */}
         </div>
         <div>
-       
+          {/* Content page. */}
         </div>
       </div>
 
@@ -121,6 +102,9 @@ function App() {
         videoDevice={videoDevice}
         setVideoDevice={setVideoDevice}
         setAudioDevice={setAudioDevice}
+        res_message={message}
+        error={error}
+
       />
 
     </div>

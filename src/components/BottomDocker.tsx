@@ -1,15 +1,17 @@
 import React, { useEffect, useState } from "react";
 import OsInfo from "./OsInfo";
+
 import {
-  IoMicCircle,
+  IoArrowDown,
+  IoInformationCircle,
   IoRefresh,
-  IoScanSharp,
-  IoSettingsSharp,
-  IoVideocam,
-  IoVideocamSharp,
 } from "react-icons/io5";
 import { message } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
+import ActiveRecordingState from "./ActiveRecordingState";
+import SettingsModal from "./Modals/SettingsModal";
+import ScreenOptions from "./Modals/ScreenOptions";
+
 
 interface Props {
   handleStartRecording: (formData: {
@@ -32,6 +34,8 @@ interface Props {
   setAudioDevice: React.Dispatch<React.SetStateAction<string>>;
   videoDevice: string;
   setVideoDevice: React.Dispatch<React.SetStateAction<string>>;
+  res_message:string,
+  error:string
 }
 type ConnectedDevice = string[];
 const BottomDocker = ({
@@ -49,12 +53,22 @@ const BottomDocker = ({
   setAudioDevice,
   videoDevice,
   setVideoDevice,
+  res_message,
+  error
 }: Props) => {
+  const [modalOpenScreen, setModalOpenScreen] = useState(false);
+  const [modalOpenSettings, setModalOpenSettings] = useState(false);
   const [showExt, setShowExt] = useState("sva");
   const [connectedAudioDevices, setConnectedAudioDevices] =
     useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] =
     useState<ConnectedDevice | null>(null);
+
+  const [showDocker, setShowDocker] = useState(true)
+  const [overlayShape, setOverlayShape] = useState("rounded")
+    const [overlayPosition, setOverlayPosition] = useState("bottom_right")
+    const [overlaySize, setOverlaySize] = useState("small")
+
 
   useEffect(() => {
     invoke<ConnectedDevice>("get_connected_audios")
@@ -88,7 +102,7 @@ const BottomDocker = ({
         setFileExt("mp3");
         break;
       default:
-        setFileExt("mp4");
+        setFileExt("Avi");
         break;
     }
   }, [recordType]);
@@ -96,11 +110,12 @@ const BottomDocker = ({
   const handleRecordTypeChange = (
     event: React.ChangeEvent<HTMLSelectElement>
   ) => {
-    console.log(event.target.value);
-    console.log(fileExt);
+
     setShowExt(event.target.value);
     setRecordType(event.target.value);
+
   };
+
   const handleFileExtChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
     console.log(event.target.value);
 
@@ -124,102 +139,81 @@ const BottomDocker = ({
   };
 
   const onStartRecording = () => {
+
     const formData = {
       file_name: fileName,
       file_ext: fileExt,
       record_type: recordType,
       audio_device: audioDevice,
       video_device: videoDevice,
+      overlay_shape:overlayShape,
+      overlay_position:overlayPosition,
+      overlay_size:overlaySize
     };
-    console.log(formData);
+
+    console.log(formData)
     handleStartRecording(formData);
+    setModalOpenScreen(false)
+
   };
 
-  const handleSettingsPage = async () => {
-    return await message("Settings", "Message");
-  };
+  const openModalScreen = ()=>{
+    setModalOpenScreen(true)
+  }
+
+  const closeModalScreen = ()=>{
+    setModalOpenScreen(false)
+  }
+
+  const openModalSettings = ()=>{  
+    setModalOpenSettings(true)
+  }
+
+
+  const handleVideoOverlayAction = async() =>{
+    return await message("Video recording is going on as overlay to screen recoring", "Video recording");
+  }
+  const videoFormatInfo = async() =>{
+    return await message("Avi or Mkv format is highly rocommended to record video. However, you can remuxe or convert to other format when you are done recording.", { title: 'Video format', type: 'info' });
+  }
 
   return (
-    <div className="main-dock-container">
-      {recordType == "sva" && (
-        <div className="align-right">
-          <IoScanSharp
-            className={
-              isRecording ? `text-green padding-right-10` : `padding-right-10`
-            }
-          />
-          <IoVideocam
-            className={
-              isRecording ? `text-green padding-right-10` : `padding-right-10`
-            }
-          />
-          <IoMicCircle className={isRecording ? `text-green` : ``} />
-        </div>
-      )}
-      {recordType == "sa" && (
-        <div className="align-right">
-          <IoScanSharp
-            className={
-              isRecording ? `text-green padding-right-10` : `padding-right-10`
-            }
-          />
-          <IoMicCircle className={isRecording ? `text-green` : ``} />
-        </div>
-      )}
-      {recordType == "va" && (
-        <div className="align-right">
-          <IoVideocamSharp
-            className={
-              isRecording ? `text-green padding-right-10` : `padding-right-10`
-            }
-          />
-          <IoMicCircle className={isRecording ? `text-green` : ``} />
-        </div>
-      )}
-      {recordType == "s" && (
-        <div className="align-right">
-          <IoScanSharp
-            className={
-              isRecording ? `text-green padding-right-10` : `padding-right-10`
-            }
-          />
-        </div>
-      )}
-      {recordType == "v" && (
-        <div className="align-right">
-          <IoVideocamSharp
-            className={
-              isRecording ? `text-green padding-right-10` : `padding-right-10`
-            }
-          />
-        </div>
-      )}
-      {recordType == "a" && (
-        <div className="align-right">
-          <IoMicCircle
-            className={
-              isRecording ? `text-green padding-right-10` : `padding-right-10`
-            }
-          />
-        </div>
-      )}
-      {recordType == "c" && (
-        <div className="align-right">
-          <IoScanSharp
-            className={
-              isRecording ? `text-green padding-right-10` : `padding-right-10`
-            }
-          />
-        </div>
-      )}
-      <div className="main-dock">
-        <div className="docking-container">
-          <div className="recording h">
+    <>
+    <SettingsModal isOpenSettings={modalOpenSettings} onCloseSettings={closeModalScreen} setOpen={setModalOpenSettings}/>
+    <ScreenOptions  
+      overlayPosition={overlayPosition} 
+      overlayShape={overlayShape} 
+      overlaySize={overlaySize} 
+      setOverlayShape={setOverlayShape}
+      setOverlayPosition={setOverlayPosition}
+      setOverlaySize={setOverlaySize}
+      isOpenScreen={modalOpenScreen} 
+      onCloseScreen={closeModalScreen} 
+      onStartRecording={onStartRecording} 
+      setOpen={setModalOpenScreen}
+    />
+    <div className="w-full fixed bottom-0 flex flex-col">
+      <ActiveRecordingState 
+        isRecording={isRecording}
+        recordType={recordType}
+        res_message={res_message}
+        error={error}
+        openModalSettings={openModalSettings}
+        handleVideoOverlayAction={handleVideoOverlayAction}
+        handleStopRecording={handleStopRecording}
+        showDocker={showDocker}
+        setShowDocker={setShowDocker}
+         />
+      
+      {showDocker && (<div className="light w-full flex flex-col p-4">
+        <div className="w-full flex flex-row justify-between gap-5 overflow-auto">
+          
+          <div className="flex justify-end p-2">
             <div>
-              <div className="label item">Save file as</div>
+              <div className=" p-1 text-sm">Save file as</div>
               <input
                 type="text"
-                className="file_name"
+                className="file_name p-2.5 rounded-l text-sm"
                 name="file_name"
                 id="file_name"
                 value={fileName}
@@ -228,12 +222,12 @@ const BottomDocker = ({
               />
             </div>
             {["sva", "sa", "va", "s", "c", "v", "a"].includes(showExt) && (
-              <div>
-                <div className="label">Type</div>
+              <div className="mr-3">
+                <div className="p-1 text-sm flex items-center justify-between">Type <button><IoInformationCircle onClick={videoFormatInfo}/></button></div>
                 <select
                   name="file_ext"
                   id="file_ext"
-                  className="file_ext"
+                  className="p-2.5 rounded-r text-sm"
                   value={fileExt}
                   onChange={handleFileExtChange}
                 >
@@ -249,24 +243,27 @@ const BottomDocker = ({
                       <option value="wav">Wav</option>
                       <option value="aac">AAC</option>
                       <option value="wma">WMA</option>
+                      
                     </>
                   ) : (
                     <>
-                      <option value="mp4">Mp4</option>
                       <option value="avi">Avi</option>
+                      <option value="mkv">Mkv</option>
                       <option value="webm">webm</option>
-                      <option value="mov">Mov</option>
+                      <option value="mov">Mov</option>                      
+                      <option value="mp4">Mp4</option>
                     </>
                   )}
                 </select>
               </div>
             )}
 
-            <div className="margin-left-10">
-              <div className="label">Recording options</div>
+            <div className=" mr-3">
+              <div className="p-1 text-sm">Recording options</div>
               <select
                 name="record_type"
                 id="record_type"
+                className="p-2.5 rounded-md text-sm "
                 value={recordType}
                 onChange={handleRecordTypeChange}
               >
@@ -281,38 +278,37 @@ const BottomDocker = ({
                 <option value="a">Audio</option>
               </select>
             </div>
-            <div className="flex-end">
-              <IoSettingsSharp
-                onClick={handleSettingsPage}
-                className="padding-left-20 padding-bottom-7 font-size-22 cursor-pointer"
-              />
-            </div>
-          </div>
 
-          <div className="docking-right">
-            <div className="margin-bottom-10">
-              <button
-                onClick={onStartRecording}
+            
+          </div>
+         
+
+          <div className="p-2 items-end">
+            <div className="justify-end">
+              {!isRecording && <button
+                // onClick={onStartRecording}
+                onClick={()=>openModalScreen()}
                 disabled={isRecording}
-                className={isRecording ? "disabled" : "active"}
+                className="p-2.5 rounded-md text-sm border mr-2"
               >
                 {recordType == "c" ? "Capture" : "Start Recording"}
-              </button>
+              </button>}
               {isRecording && (
                 <button
                   onClick={handleStopRecording}
                   disabled={!isRecording}
-                  className={!isRecording ? "disabled" : "active"}
+                  className={"p-2.5 rounded-md text-sm bg-white"}
                 >
                   Stop Recording
                 </button>
               )}
             </div>
-            <div className="d-flex">
+            <div className="flex py-2">
               <div>
                 <select
                   name="audioDevice"
                   id="audioDevice"
+                  className="p-2.5 rounded-md text-sm mr-2"
                   value={audioDevice}
                   onChange={handleAudioDeviceChange}
                 >
@@ -332,6 +328,7 @@ const BottomDocker = ({
                 <select
                   name="videoDevice"
                   id="videoDevice"
+                   className="p-2.5 rounded-md text-sm"
                   value={videoDevice}
                   onChange={handleVideoDeviceChange}
                 >
@@ -346,14 +343,17 @@ const BottomDocker = ({
                   )}
                 </select>
               </div>
-              <div className="flex-end ">
-                <IoRefresh className="padding-bottom-7 padding-left-10 cursor-pointer" />
+              <div className="ml-2 align-middle">
+                <IoRefresh                
+                  className="padding-bottom-7 padding-left-10 cursor-pointer" 
+                  />
               </div>
             </div>
           </div>
         </div>
 
-        <div className="system-info font-size-12 bg-b">
+        <div className="w-full grid grid-cols-1 grid-flow-col text-xs">
+          <div>
           <span>{Date()}</span>
 
           <span className="cpu-info">
@@ -362,11 +362,11 @@ const BottomDocker = ({
             {ramInfo ? (
               <span>
                 {" "}
-                <span className="text-green">
+                <span className="text-green-800">
                   {(ramInfo[1] / 1024).toFixed(2)} GB
-                </span>{" "}
+                </span>
                 /
-                <span className="text-blue">
+                <span className="text-blue-500">
                   {(ramInfo[0] / 1024).toFixed(2)} GB
                 </span>
               </span>
@@ -374,11 +374,13 @@ const BottomDocker = ({
               <span>...</span>
             )}
           </span>
-
           <OsInfo />
+          </div>
+          <div className="right-0"><span> <a href="https://x.com/oyewodayo" target="blank">Request feature / Report a bug</a></span></div>
         </div>
-      </div>
+      </div>)}
     </div>
+    </>
   );
 };
 

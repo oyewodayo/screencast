@@ -20,7 +20,10 @@ struct FormData{
     file_ext:String,
     record_type:String,
     audio_device:String,
-    video_device:String
+    video_device:String,
+    overlay_shape:String,
+    overlay_position:String,
+    overlay_size:String,
 }
 
 
@@ -179,16 +182,22 @@ fn recording_with_output_sva(app_handle: AppHandle, output_path: &PathBuf,form_d
             "-f", "dshow",
             "-video_size", "320x240",
             "-i", &format!("video={}:audio={}", form_data.video_device, form_data.audio_device),
-            "-c:v", "mpeg4",
+            "-c:v", "mpeg4",           
             "-filter_complex", "[0:v][1:v]overlay=x=W-w-100:y=H-h-50",
             "-segment_time", "10",
             "-segment_format", "avi",
             output_path.to_str().unwrap(),
         ])
         .spawn();
-
+    println!("{:?}", result);
     match result {
-        Ok(_) => Ok(format!("Recording started. File will be saved to {}", output_path.display())),
+        
+        Ok(_) => {
+            let folder = output_path.parent();
+            let file_name = output_path.file_stem();
+            let file_extention = output_path.extension();
+            Ok(format!("File will be saved as \n {:?}.{:?}", file_name.unwrap(),file_extention.unwrap()))
+        },
         Err(e) => Err(format!("Failed to start recording: {}", e)),
     }
 }
@@ -272,7 +281,8 @@ fn recording_with_output_v(app_handle: AppHandle, output_path: &PathBuf,video_de
         .spawn();
 
     match result {
-        Ok(_) => Ok(format!("Recording started. File will be saved to {}", output_path.display())),
+        // Ok(_) => Ok(format!("Recording started. File will be saved to {}", output_path.display())),
+        Ok(_) => Ok(format!("Recording started. File will be saved to {:?}", output_path.file_name())),
         Err(e) => Err(format!("Failed to start recording: {}", e)),
     }
 }
@@ -371,7 +381,7 @@ fn recording_with_output_c(app_handle: AppHandle, output_path: &PathBuf) -> Resu
         Ok(_) => {
            
             match result {
-                Ok(_) => Ok("Recording stopped {OS}".to_string()),
+                Ok(_) => Ok("Recording stopped".to_string()),
                 Err(e) => Err(format!("Failed to stop recording: {}", e)),
             }
         },
@@ -419,7 +429,7 @@ fn stop_recording() -> Result<String, String> {
     };
 
     match result {
-        Ok(_) => Ok("Recording stopped {OS}".to_string()),
+        Ok(_) => Ok("Recording stopped".to_string()),
         Err(e) => Err(format!("Failed to stop recording: {}", e)),
     }
 }
