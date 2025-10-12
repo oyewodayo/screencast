@@ -1,6 +1,6 @@
 import React, { MouseEventHandler, useEffect, useState } from 'react'
-import { IoIosArrowDown, IoIosArrowUp } from 'react-icons/io';
-import { IoArrowDown, IoClose, IoMicCircle, IoOpenSharp, IoPause, IoPlay, IoScanSharp, IoSettingsSharp, IoStopSharp, IoVideocam, IoVideocamSharp } from 'react-icons/io5'
+import { IoIosArrowDown, IoIosArrowUp, IoIosPlayCircle } from 'react-icons/io';
+import { IoAirplane, IoArrowDown, IoClose, IoMicCircle, IoOpenSharp, IoPause, IoPlay, IoPlayForward, IoScanSharp, IoSettingsSharp, IoSparklesOutline, IoStopSharp, IoVideocam, IoVideocamSharp } from 'react-icons/io5'
 
 interface Props {
     recordType: string;
@@ -60,8 +60,10 @@ const ActiveRecordingState = (
                         className="cursor-pointer"
                     />
                 </div>
-                <div className='flex'>
-                   
+                <div className='flex items-center'>
+
+                    {/* { !showDocker && <button className='bg-black rounded p-0.5'><IoPlay title='Start recording' className='text-white' /></button>} */}
+
                     {isRecording? (
                     <div className="bg-black rounded text-[#F5F7FA] text-ms py-2 px-3 flex justify-between align-middle">              
                         <div className="flex ">
