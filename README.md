@@ -1,7 +1,7 @@
 # Briefcast - Professional Screen Recording Application
 
 <div align="center">
-  <img src="public/screencast.png" alt="Briefcast Logo" width="120"/>
+  <img src="public/Briefcast.png" alt="Briefcast Logo" width="120"/>
   
   [![Rust](https://img.shields.io/badge/Rust-1.70+-orange.svg)](https://www.rust-lang.org/)
   [![Tauri](https://img.shields.io/badge/Tauri-1.5+-blue.svg)](https://tauri.app/)
@@ -58,7 +58,7 @@ Briefcast is a modern, feature-rich screen recording application designed for pr
 | **SVA** | Screen + Video + Audio | Full presentation with webcam overlay |
 | **SA** | Screen + Audio | Tutorial videos, lectures |
 | **VA** | Video + Audio | Webcam-only recording |
-| **S** | Screen Only | Silent screencasts, demos |
+| **S** | Screen Only | Silent Briefcasts, demos |
 | **V** | Video Only | Video recording without screen |
 | **A** | Audio Only | Podcast, voice notes |
 | **C** | Screenshot | Quick screen capture |
@@ -145,7 +145,7 @@ Briefcast is a modern, feature-rich screen recording application designed for pr
 
 ### For Users (Pre-built Binaries)
 
-1. Download the latest release from the [Releases](https://github.com/yourusername/briefcast/releases) page
+1. Download the latest release from the [Releases](https://github.com/yourusername/Briefcast/releases) page
 2. Run the installer for your platform
 3. Launch Briefcast from your applications menu
 
@@ -153,8 +153,8 @@ Briefcast is a modern, feature-rich screen recording application designed for pr
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/briefcast.git
-cd briefcast
+git clone https://github.com/yourusername/Briefcast.git
+cd Briefcast
 
 # Install frontend dependencies
 pnpm install
@@ -181,7 +181,7 @@ cargo tauri dev
    - Configure overlay options (if using webcam)
 4. **Start Recording**: Click "Start Recording" button
 5. **Stop Recording**: Click "Stop Recording" when finished
-6. **Access Files**: Files are automatically saved to `%USERPROFILE%/Videos/screencast/`
+6. **Access Files**: Files are automatically saved to `%USERPROFILE%/Videos/Briefcast/`
 
 ### Recording Tips
 
@@ -260,7 +260,7 @@ cargo tauri build --target x86_64-pc-windows-msvc
 ### Directory Structure
 
 ```
-briefcast/
+Briefcast/
 ├── src/                      # React frontend
 │   ├── components/          # React components
 │   ├── pages/              # Page components
@@ -307,7 +307,7 @@ Edit `src-tauri/tauri.conf.json`:
   },
   "tauri": {
     "bundle": {
-      "identifier": "com.briefcast.app",
+      "identifier": "com.Briefcast.app",
       "resources": [
         "binaries/ffmpeg/*"
       ]
@@ -557,16 +557,16 @@ SOFTWARE.
 - **[React](https://reactjs.org/)** - For the powerful UI framework
 - **[Rust](https://www.rust-lang.org/)** - For enabling high-performance native code
 - **[TailwindCSS](https://tailwindcss.com/)** - For the beautiful styling system
-- All our [contributors](https://github.com/yourusername/briefcast/graphs/contributors)
+- All our [contributors](https://github.com/yourusername/Briefcast/graphs/contributors)
 
 ---
 
 ## 📞 Support & Contact
 
-- **Report Bugs**: [GitHub Issues](https://github.com/yourusername/briefcast/issues)
-- **Request Features**: [GitHub Discussions](https://github.com/yourusername/briefcast/discussions)
+- **Report Bugs**: [GitHub Issues](https://github.com/yourusername/Briefcast/issues)
+- **Request Features**: [GitHub Discussions](https://github.com/yourusername/Briefcast/discussions)
 - **Twitter**: [@oyewodayo](https://x.com/oyewodayo)
-- **Email**: support@briefcast.app
+- **Email**: support@Briefcast.app
 
 ---
 
@@ -594,17 +594,17 @@ SOFTWARE.
 
 ## 📊 Project Stats
 
-![GitHub stars](https://img.shields.io/github/stars/yourusername/briefcast?style=social)
-![GitHub forks](https://img.shields.io/github/forks/yourusername/briefcast?style=social)
-![GitHub issues](https://img.shields.io/github/issues/yourusername/briefcast)
-![GitHub pull requests](https://img.shields.io/github/issues-pr/yourusername/briefcast)
+![GitHub stars](https://img.shields.io/github/stars/yourusername/Briefcast?style=social)
+![GitHub forks](https://img.shields.io/github/forks/yourusername/Briefcast?style=social)
+![GitHub issues](https://img.shields.io/github/issues/yourusername/Briefcast)
+![GitHub pull requests](https://img.shields.io/github/issues-pr/yourusername/Briefcast)
 
 ---
 
 <div align="center">
   <p>Made by the Temidayo Oyewo</p>
   <p>
-    <a href="https://github.com/oyewodayo/screencast">GitHub</a> •
+    <a href="https://github.com/oyewodayo/Briefcast">GitHub</a> •
     <a href="https://twitter.com/oyewodayo">Twitter</a> •
     <a href="#support--contact">Support</a>
   </p>

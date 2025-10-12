@@ -1,6 +1,6 @@
 import React, { MouseEventHandler, useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp, IoIosPlayCircle } from 'react-icons/io';
-import { IoAirplane, IoArrowDown, IoClose, IoMicCircle, IoOpenSharp, IoPause, IoPlay, IoPlayForward, IoScanSharp, IoSettingsSharp, IoSparklesOutline, IoStopSharp, IoVideocam, IoVideocamSharp } from 'react-icons/io5'
+import { IoAirplane, IoArrowDown, IoClose, IoMicCircle, IoOpenSharp, IoPause, IoPlay, IoPlayForward, IoScanSharp, IoSettingsSharp, IoSparklesOutline, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen } from 'react-icons/io5'
 
 interface Props {
     recordType: string;
@@ -8,18 +8,22 @@ interface Props {
     res_message:string;
     error:string;
     openModalSettings:()=>void;
+    handleFolderSettings:()=>void;
     handleVideoOverlayAction: ()=>void;
     handleStopRecording: () => void;
     showDocker:boolean;
     setShowDocker:React.Dispatch<React.SetStateAction<boolean>>;
+    showFileList?: boolean;
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,res_message,error,openModalSettings, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker
+        recordType,isRecording,res_message,error,openModalSettings,handleFolderSettings, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
-    
+    const [showFolderOpen, setShowFolderOpen] = useState(false);
+const [isFolderOpen, setIsFolderOpen] = useState(false);
+
     const formatTime = (seconds: number): string => {
         const mins = Math.floor(seconds / 60);
         const secs = seconds % 60;
@@ -47,6 +51,7 @@ const ActiveRecordingState = (
         return () => clearInterval(interval);
     }, [isRecording]);
 
+
     return (
         <>
             <div className='mx-2'>
@@ -54,7 +59,20 @@ const ActiveRecordingState = (
                 {error && <p className="error text-right">{error}</p>}
             </div>
             <div className='flex justify-between pl-2 pb-2 items-center align-middle'>
-                <div className="">
+                <div className="flex">
+                   {showFileList ? (
+                        <IoFolderOpen
+                        className="cursor-pointer mr-4"
+                        onClick={() => handleFolderSettings()}
+                        />
+                    ) : (
+                        <IoFolder
+                        className="cursor-pointer mr-4"
+                        onClick={() => handleFolderSettings()}
+                        />
+                    )}
+
+
                     <IoSettingsSharp
                         onClick={()=>openModalSettings()}
                         className="cursor-pointer"

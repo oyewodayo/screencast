@@ -142,9 +142,9 @@ pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  fo
     println!("Here are the {:?}",form_data);
     println!("Here are the windows {:?}",windows_api::get_all_open_windows_titles());
     
-    // Append the screencast directory to the user's Videos directory
-    let mut screencast_dir = home_dir.clone();
-    screencast_dir.push("screencast");
+    // Append the Briefcast directory to the user's Videos directory
+    let mut Briefcast_dir = home_dir.clone();
+    Briefcast_dir.push("Briefcast");
 
     output_file = format!("Recording_{}.{}", current_date, form_data.file_ext);
 
@@ -152,19 +152,19 @@ pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  fo
         output_file = format!("{}.{}", form_data.file_name, form_data.file_ext);
     }
     
-    output_path = screencast_dir.join(&output_file);
+    output_path = Briefcast_dir.join(&output_file);
 
-    // Ensure the screencast directory exists, create it if it doesn't
-    if !screencast_dir.exists() {
-        if let Err(err) = fs::create_dir_all(&screencast_dir) {
-            return Err(format!("Failed to create screencast directory: {}", err));
+    // Ensure the Briefcast directory exists, create it if it doesn't
+    if !Briefcast_dir.exists() {
+        if let Err(err) = fs::create_dir_all(&Briefcast_dir) {
+            return Err(format!("Failed to create Briefcast directory: {}", err));
         }
     }
 
     // Check if the file exists
     let output_path = if output_path.exists() {
         output_file = format!("Recording_{}.{}", current_date, form_data.file_ext);
-        screencast_dir.join(&output_file)
+        Briefcast_dir.join(&output_file)
     } else {
         output_path
     };

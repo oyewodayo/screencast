@@ -25,6 +25,8 @@ const Dashboard = () => {  // REMOVED async - React components cannot be async
   const [titles, setTitles] = useState<WindowInfo[]>([]);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [filePath, setFilePath] = useState<string | null>(null);
+  const [showFileList, setShowFileList] = useState<boolean>(false);
+
 
   // Listen for global key events
   useEffect(() => {
@@ -150,24 +152,42 @@ const Dashboard = () => {  // REMOVED async - React components cannot be async
       setError(`Failed to stop recording: ${error}`);
     }
   };
+  const toggleFileList = () => setShowFileList(prev => !prev);
 
   return (
     <div className="w-full h-screen flex flex-col">
-      <div className="p-4">
-        <div className="flex justify-end text-center">
+      <div className="p-">
+        <div className="flex justify-between">
+          {/* File list sidebar */}
+          <div
+            className={`h-screen light border-b border-gray-300 rounded-tr-lg bg-gray-200 border-2 transition-all duration-300 overflow-hidden ${
+              showFileList ? "w-[250px] opacity-100" : "w-0 opacity-0"
+            }`}
+          >
+            {showFileList && (
+              <div className="p-3 text-sm">
+                files list here
+              </div>
+            )}
+          </div>
+
+          <div>
+              {/* Content page. */}
+              This is content page
+          </div>
           <div className="">
             <div>
-              <img src="screencast.png" width={55} alt="Screencast Logo" />
+              <img src="screencast.png" width={55} alt="Briefcast Logo" />
             </div>
-            <div className="text-[12px] -mt-2.5">
+            <div className="text-[12px] text-center  -mt-2.5">
               Briefcast
             </div>
           </div>
         </div>
         <div>
-          {/* Content page. */}
-        </div>
+       </div>
       </div>
+      
 
       <BottomDocker
         selectScreen={selectScreen}
@@ -194,6 +214,8 @@ const Dashboard = () => {  // REMOVED async - React components cannot be async
         setAudioDevice={setAudioDevice}
         res_message={message}
         error={error}
+        handleFolderSettings={toggleFileList}
+        showFileList={showFileList}
       />
       <div>
         {/* {filePath && <FileModal filePath={filePath} setFilePath={setFilePath} />} */}

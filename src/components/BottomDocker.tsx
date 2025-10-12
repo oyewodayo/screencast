@@ -19,6 +19,8 @@ type WindowInfo = {
   image_path: string;
 };
 interface Props {
+  handleFolderSettings:()=>void,
+  showFileList: boolean;
   selectScreen:boolean,
   setScreen:()=>void,
   unSetScreen:()=>void,
@@ -52,6 +54,8 @@ interface Props {
 }
 type ConnectedDevice = string[];
 const BottomDocker = ({
+  handleFolderSettings,
+  showFileList,
   selectScreen,
   setScreen,
   unSetScreen,
@@ -79,6 +83,7 @@ const BottomDocker = ({
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   const [modalOpenSettings, setModalOpenSettings] = useState(false);
+  const [folderOpenSettings, setFolderOpenSettings] = useState(false);
   const [showExt, setShowExt] = useState("sva");
   const [connectedAudioDevices, setConnectedAudioDevices] =
     useState<ConnectedDevice | null>(null);
@@ -262,11 +267,13 @@ const BottomDocker = ({
         recordType={recordType}
         res_message={res_message}
         error={error}
+        handleFolderSettings={handleFolderSettings}
         openModalSettings={openModalSettings}
         handleVideoOverlayAction={handleVideoOverlayAction}
         handleStopRecording={handleStopRecording}
         showDocker={showDocker}
         setShowDocker={setShowDocker}
+        showFileList={showFileList} 
          />
       
       {showDocker && (<div className="light w-full flex flex-col p-4">

@@ -1,5 +1,5 @@
 [package]
-name = "screencast"
+name = "Briefcast"
 version = "0.0.0"
 description = "A screen recording and streaming application for easy use."
 authors = ["Temidayo Oyewo"]
