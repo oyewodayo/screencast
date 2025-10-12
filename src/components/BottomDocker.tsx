@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from "react";
+import React, { Dispatch, SetStateAction, useEffect, useState } from "react";
 import OsInfo from "./OsInfo";
 
 import {
   IoArrowDown,
   IoInformationCircle,
+  IoPlay,
   IoRefresh,
 } from "react-icons/io5";
 import { message } from "@tauri-apps/api/dialog";
@@ -11,9 +12,21 @@ import { invoke } from "@tauri-apps/api/tauri";
 import ActiveRecordingState from "./ActiveRecordingState";
 import SettingsModal from "./Modals/SettingsModal";
 import ScreenOptions from "./Modals/ScreenOptions";
+// import { WindowInfo }from "../Types"
 
-
+type WindowInfo = {
+  title: string;
+  image_path: string;
+};
 interface Props {
+  selectScreen:boolean,
+  setScreen:()=>void,
+  unSetScreen:()=>void,
+  selectedScreen:string,
+  setSelectedScreen:React.Dispatch<React.SetStateAction<string>>,
+  isMonitoring:boolean,
+  setIsMonitoring: Dispatch<SetStateAction<boolean>>,
+  windowTitles : WindowInfo[],
   handleStartRecording: (formData: {
     file_name: string;
     file_ext: string;
@@ -25,22 +38,30 @@ interface Props {
   isRecording: boolean;
   ramInfo: [number, number] | null;
   fileName: string;
-  setFileName: React.Dispatch<React.SetStateAction<string>>;
+  setFileName: React.Dispatch<React.SetStateAction<string>>,
   fileExt: string;
-  setFileExt: React.Dispatch<React.SetStateAction<string>>;
+  setFileExt: React.Dispatch<React.SetStateAction<string>>,
   recordType: string;
-  setRecordType: React.Dispatch<React.SetStateAction<string>>;
+  setRecordType: React.Dispatch<React.SetStateAction<string>>,
   audioDevice: string;
-  setAudioDevice: React.Dispatch<React.SetStateAction<string>>;
-  videoDevice: string;
-  setVideoDevice: React.Dispatch<React.SetStateAction<string>>;
+  setAudioDevice: React.Dispatch<React.SetStateAction<string>>,
+  videoDevice: string,
+  setVideoDevice: React.Dispatch<React.SetStateAction<string>>,
   res_message:string,
   error:string
 }
 type ConnectedDevice = string[];
 const BottomDocker = ({
+  selectScreen,
+  setScreen,
+  unSetScreen,
+  selectedScreen,
+  setSelectedScreen,
   handleStartRecording,
   handleStopRecording,
+  isMonitoring,
+  setIsMonitoring,
+  windowTitles,
   isRecording,
   ramInfo,
   fileName,
@@ -65,10 +86,30 @@ const BottomDocker = ({
     useState<ConnectedDevice | null>(null);
 
   const [showDocker, setShowDocker] = useState(true)
+  const [screenSize, setScreenSize] = useState("fullscreen")
   const [overlayShape, setOverlayShape] = useState("rounded")
-    const [overlayPosition, setOverlayPosition] = useState("bottom_right")
-    const [overlaySize, setOverlaySize] = useState("small")
+  const [overlayPosition, setOverlayPosition] = useState("bottom_right")
+  const [overlaySize, setOverlaySize] = useState("small")
+  const [windowInfos, setWindowInfos] = useState<WindowInfo[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
 
+  const captureScreenshots = async () => {
+    setIsLoading(true);
+
+    try {
+      const result = await invoke<WindowInfo[]>('capture_window_screenshots_by_title');
+      console.log(result)
+      setWindowInfos(result);
+    } catch (err) {
+      // setError('Failed to capture screenshots: ' + (err as Error).message);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // useEffect(() => {
+  //   captureScreenshots();
+  // }, []);
 
   useEffect(() => {
     invoke<ConnectedDevice>("get_connected_audios")
@@ -145,6 +186,7 @@ const BottomDocker = ({
       file_ext: fileExt,
       record_type: recordType,
       audio_device: audioDevice,
+      screen_size:screenSize,
       video_device: videoDevice,
       overlay_shape:overlayShape,
       overlay_position:overlayPosition,
@@ -157,7 +199,20 @@ const BottomDocker = ({
 
   };
 
-  const openModalScreen = ()=>{
+  const openModalScreen = async ()=>{
+    try {
+      if (!isMonitoring) {
+        console.log("Is monitoring: ",isMonitoring)
+        await invoke("start_monitoring_windows")
+
+        setIsMonitoring(isMonitoring)
+        console.log("Monitoring started")
+      }
+
+    
+    } catch (error) {
+      console.error("Error monitoring screens: ",error)
+    }
     setModalOpenScreen(true)
   }
 
@@ -180,7 +235,15 @@ const BottomDocker = ({
   return (
     <>
     <SettingsModal isOpenSettings={modalOpenSettings} onCloseSettings={closeModalScreen} setOpen={setModalOpenSettings}/>
-    <ScreenOptions  
+    <ScreenOptions 
+     selectScreen={selectScreen}
+     setScreen={setScreen}
+     unSetScreen={unSetScreen}
+     selectedScreen={selectedScreen}
+     setSelectedScreen={setSelectedScreen} 
+      screenSize={screenSize}
+      setScreenSize={setScreenSize}
+      windowTitles={windowTitles}
       overlayPosition={overlayPosition} 
       overlayShape={overlayShape} 
       overlaySize={overlaySize} 
@@ -193,6 +256,7 @@ const BottomDocker = ({
       setOpen={setModalOpenScreen}
     />
     <div className="w-full fixed bottom-0 flex flex-col">
+     
       <ActiveRecordingState 
         isRecording={isRecording}
         recordType={recordType}
@@ -286,6 +350,7 @@ const BottomDocker = ({
           <div className="p-2 items-end">
             <div className="justify-end">
               {!isRecording && <button
+                // onClick={captureScreenshots}
                 // onClick={onStartRecording}
                 onClick={()=>openModalScreen()}
                 disabled={isRecording}
