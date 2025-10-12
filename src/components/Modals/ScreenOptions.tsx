@@ -1,7 +1,18 @@
+import { invoke } from "@tauri-apps/api";
 import { useState } from "react";
 import { IoClose, IoDesktop, IoScanOutline } from "react-icons/io5";
+import { WindowInfo } from "../../Types";
+
 
 interface AddModalProps{
+    selectScreen:boolean,
+    setScreen:()=>void,
+    unSetScreen:()=>void,
+    selectedScreen:string,
+    setSelectedScreen:React.Dispatch<React.SetStateAction<string>>,
+    screenSize:string,
+    setScreenSize:React.Dispatch<React.SetStateAction<string>>,
+    windowTitles:WindowInfo[]
     overlayPosition:string,
     overlayShape:string,
     overlaySize:string,
@@ -16,7 +27,20 @@ interface AddModalProps{
 
 
 
-const ScreenOptions = ({overlayPosition, overlayShape, overlaySize,setOverlayPosition, setOverlayShape, setOverlaySize, isOpenScreen, onCloseScreen,onStartRecording, setOpen}:AddModalProps) => {
+const ScreenOptions = ({
+        selectScreen,
+        setScreen,
+        unSetScreen,
+        selectedScreen,
+        setSelectedScreen,
+        screenSize,setScreenSize, 
+        windowTitles,
+        overlayPosition, overlayShape, 
+        overlaySize,setOverlayPosition, 
+        setOverlayShape, setOverlaySize, 
+        isOpenScreen, onCloseScreen,
+        onStartRecording, setOpen
+    }:AddModalProps) => {
   
     const closeModal =()=>{
         setOpen(false);
@@ -40,13 +64,20 @@ const ScreenOptions = ({overlayPosition, overlayShape, overlaySize,setOverlayPos
         setOverlaySize(value)
         console.log(value)
     }
+    const onChangeScreenSize = async ({target:{value}}:CustomChangeEvent)=>{
+        // const fetchTitles = await invoke<WindowTitles>('get_window_titles');
+        // console.log(fetchTitles)
+        setScreenSize(value)
+        console.log(value)
+    }
 
+    const isCheckedScreen = (value:string)=>value===screenSize;
     const isCheckedPosition = (value:string)=>value===overlayPosition;
     const isCheckedSize = (value:string)=>value===overlaySize;
     const isCheckedShape = (value:string)=>value===overlayShape;
     
     return (
-        <div key={"screen-options"} className={`w-screen h-screen mb-10 place-items-center fixed -top-20 left-0 z-50 ${isOpenScreen?'grid':'hidden'}`}>
+        <div key={"screen-options"} className={`w-screen h-screen mb-10 place-items-center items-start lg:mt-[5.5em]  fixed left-0 z-50 ${isOpenScreen?'grid':'hidden'}`}>
             <div className={`w-full h-full bg-white opacity-70 absolute left-0 z-20`}
             onClick={closeModal}
             > </div>
@@ -65,45 +96,28 @@ const ScreenOptions = ({overlayPosition, overlayShape, overlaySize,setOverlayPos
                         </div>
                         <button onClick={closeModal}><IoClose className="hover:bg-red-600 p-1 hover:text-white text-3xl"/></button>
                     </div>
+                    
                     <div className="w-full overflow-y-auto">
-                        <div className="font-semibold px-5">Screen</div> 
-                        <div className="grid lg:grid-cols-4 md:grid-cols-3 sm:grid-cols-2 grid-cols-2 items-center align-middle my-5 px-5 gap-10 ">
-                            <button className="text-center flex flex-col items-center text-green-400 hover:text-green-300">
-                                <IoScanOutline className="lg:text-9xl md:text-7xl sm:text-5xl text-5xl "/>
-                                Fullscreen
-                            </button>
-                            <button className="text-center flex flex-col items-center hover:text-green-300">
-                                <IoScanOutline className="lg:text-9xl md:text-7xl sm:text-5xl text-5xl "/>
-                                Custom
-                            </button>
-                            <button className="text-center flex flex-col items-center hover:text-green-300">
-                                <IoScanOutline className="lg:text-9xl md:text-7xl sm:text-5xl text-5xl "/>
-                                <div> Last screen</div>
-                            </button>
-                            <button className="text-center flex flex-col items-center hover:text-green-300">
-                                <IoScanOutline className="lg:text-9xl md:text-7xl sm:text-5xl text-5xl"/>
-                                <span className=""> Select screen</span>                           
-                            </button>                    
-                        
-                        </div>
-                        <hr />
                         <div className="px-10 py-5 mb-10">
                             <div className="font-semibold">Video overlay</div> 
                             <div className="">Overlay shape</div>
-                            <div className="grid grid-cols-3 items-center align-middle gap-3 py-5">
+                            <div className="grid grid-cols-3 items-center align-middle gap-3">
                                    
                                     <input type="radio" checked={isCheckedShape("rounded")} name="overlay_shape" value="rounded" onChange={onChangeOverlayShape}  hidden id="overlay_rounded" />
-                                    <label htmlFor="overlay_rounded" className={`${overlayShape==="rounded"?"bg-green-400 active:bg-green-400":"bg-slate-200"}  rounded h-[100px] w-[100px] cursor-pointer  hover:bg-green-300 checked:bg-green-400`}> </label>
+                                    <label htmlFor="overlay_rounded" className={`${overlayShape==="rounded"?"bg-green-400 active:bg-green-400":"bg-slate-200"}  rounded lg:h-[100px] lg:w-[100px] h-[80px] w-[80px] cursor-pointer  hover:bg-green-300 checked:bg-green-400`}> </label>
                                
                                
                                     <input type="radio" checked={isCheckedShape("circle")} name="overlay_shape" value="circle" onChange={onChangeOverlayShape} hidden id="overlay_circle" />
-                                    <label htmlFor="overlay_circle" className={`${overlayShape==="circle"?"bg-green-400 active:bg-green-400":"bg-slate-200"} rounded-full h-[100px] w-[100px] cursor-pointer  hover:bg-green-300 checked:bg-green-400`}> </label>
+                                    <label htmlFor="overlay_circle" className={`${overlayShape==="circle"?"bg-green-400 active:bg-green-400":"bg-slate-200"} rounded-full lg:h-[100px] lg:w-[100px] h-[80px] w-[80px] cursor-pointer  hover:bg-green-300 checked:bg-green-400`}> </label>
                               
                                
                                     <input type="radio" checked={isCheckedShape("square")} name="overlay_shape" value="square" onChange={onChangeOverlayShape} hidden id="overlay_square" />
-                                    <label htmlFor="overlay_square" className={`${overlayShape==="square"?"bg-green-400 active:bg-green-400":"bg-slate-200"} h-[100px] w-[100px] cursor-pointer  hover:bg-green-300 checked:bg-green-400`}> </label>
+                                    <label htmlFor="overlay_square" className={`${overlayShape==="square"?"bg-green-400 active:bg-green-400":"bg-slate-200"} lg:h-[100px] lg:w-[100px] h-[80px] w-[80px] cursor-pointer  hover:bg-green-300 checked:bg-green-400`}> </label>
                                 
                             </div>
+                        </div>
+                        <hr />
+                        <div className="px-10 py-5 mb-10">
                             <div className="pt-5">Overlay position</div>
                             <div className="gap-3 align-middle grid grid-cols-3 items-center py-5">
                                 <div >
@@ -119,6 +133,9 @@ const ScreenOptions = ({overlayPosition, overlayShape, overlaySize,setOverlayPos
                                     <input id="bottom_right" type="radio" checked={isCheckedPosition("bottom_right")} name="overlay_position" onChange={onChangeOverlayPosition} value="bottom_right" className="align-middle cursor-pointer"/> 
                                 </div>
                             </div>
+                        </div>
+                            <hr />
+                        <div className="px-10 py-5 mb-10">
                             <div className="pt-5">Overlay size</div>
                             <div className="gap-3 align-middle grid grid-cols-2 md:grid-cols-2 items-center py-5">
                                 <div className="" >
@@ -131,6 +148,59 @@ const ScreenOptions = ({overlayPosition, overlayShape, overlaySize,setOverlayPos
                                 </div>
                                
                             </div>
+                        </div>
+                        <hr />
+                        <div className="font-semibold px-5">Screen</div> 
+                        <div className="">
+
+                            {!selectScreen? (
+                                <div className="grid lg:grid-cols-4 md:grid-cols-2 sm:grid-cols-2 grid-cols-2 items-center align-middle my-5 px-5 gap-10">
+                                <button className={`${screenSize==="fullscreen"?"text-green-400":""} text-center flex flex-col items-center  hover:text-green-300`}>
+                                    <input type="radio" checked={isCheckedScreen("fullscreen")} name="screen_size" onChange={onChangeScreenSize} hidden value="fullscreen" id="screen_size" />
+                                    <label htmlFor="screen_size" className="">
+                                        <IoScanOutline className="lg:text-9xl md:text-7xl sm:text-5xl text-5xl cursor-pointer"/>
+                                    </label>
+                                    Fullscreen
+                                </button>
+
+                                <button className="text-center flex flex-col items-center hover:text-green-300">
+                                    <input type="radio" name="screen_size" value="custom_screen"  onChange={onChangeScreenSize} hidden id="custom_screen" />
+                                    <label htmlFor="custom_screen">
+                                        <IoScanOutline className="lg:text-9xl md:text-7xl sm:text-5xl text-5xl cursor-pointer"/>
+                                    </label>
+                                    Custom
+                                </button>
+
+                                <button className="text-center flex flex-col items-center hover:text-green-300">
+                                    <input type="radio" name="screen_size" value="lasts_screen"  onChange={onChangeScreenSize} hidden id="lasts_screen" />
+                                    <label htmlFor="lasts_screen">
+                                        <IoScanOutline className="lg:text-9xl md:text-7xl sm:text-5xl text-5xl cursor-pointer"/>
+                                    </label>
+                                    <div> Last screen</div>
+                                </button>
+
+                                <button className="text-center flex flex-col items-center hover:text-green-300" onClick={setScreen}>
+                                    <input type="radio" name="screen_size" value="select_screen"  onChange={onChangeScreenSize} hidden id="select_screen" />
+                                    <label htmlFor="select_screen">
+                                        <IoScanOutline className="lg:text-9xl md:text-7xl sm:text-5xl text-5xl cursor-pointer"/>
+                                    </label>
+                                    <span className=""> Select screen</span>                           
+                                </button>
+                                </div>
+                            ):(
+                                <div className="grid lg:grid-cols-4 md:grid-cols-2 sm:grid-cols-2 grid-cols-2 items-center align-middle my-5 px-5 gap-10 overflow-x-auto">
+                                Loading...
+                               
+                                {windowTitles.map((window:WindowInfo) => (
+                                    <div className="grid lg:grid-cols-2 md:grid-cols-2 " key={window.title}>
+                                        <h3>{window.title}</h3>
+                                        <img src={window.image_path} alt={window.title} />
+                                    </div>
+                                ))}
+                                    <button onClick={unSetScreen}>Unset</button>
+                                </div>
+                            ) }                   
+                        
                         </div>
                     </div>
 
