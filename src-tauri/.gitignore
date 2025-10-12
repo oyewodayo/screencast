@@ -7,18 +7,13 @@
 /gen/schemas
 
 # FFmpeg binaries (large files, platform-specific)
-src-tauri/binaries/
-src-tauri/binaries/ffmpeg/
-src-tauri/binaries/ffmpeg/*.exe
-src-tauri/binaries/ffmpeg/ffmpeg
-src-tauri/binaries/ffmpeg/ffprobe
-src-tauri/binaries/ffmpeg/ffplay
-src-tauri/binaries/bin/
-src-tauri/binaries/ffmpeg/
-src-tauri/binaries/bin/ffmpeg/*.exe
-src-tauri/binaries/bin/ffmpeg/ffmpeg
-src-tauri/binaries/bin/ffmpeg/ffprobe
-src-tauri/binaries/bin/ffmpeg/ffplay
+/src-tauri/binaries/
+/src-tauri/binaries/ffmpeg/
+/src-tauri/binaries/ffmpeg/*.exe
+/src-tauri/binaries/ffmpeg/ffmpeg
+/src-tauri/binaries/ffmpeg/ffprobe
+/src-tauri/binaries/ffmpeg/ffplay
+
 
 # Alternatively, ignore all binaries but keep the directory structure
 # src-tauri/binaries/**/*
