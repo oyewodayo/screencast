@@ -1,6 +1,6 @@
-import React, { MouseEventHandler, useEffect, useState } from 'react'
-import { IoIosArrowDown, IoIosArrowUp, IoIosPlayCircle } from 'react-icons/io';
-import { IoAirplane, IoArrowDown, IoClose, IoMicCircle, IoOpenSharp, IoPause, IoPlay, IoPlayForward, IoScanSharp, IoSettingsSharp, IoSparklesOutline, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen } from 'react-icons/io5'
+import React, { useEffect, useState } from 'react'
+import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
+import { IoClose, IoMicCircle, IoOpenSharp, IoPause, IoPlay, IoScanSharp, IoSettingsSharp, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen } from 'react-icons/io5'
 
 interface Props {
     recordType: string;
@@ -21,8 +21,7 @@ const ActiveRecordingState = (
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
-    const [showFolderOpen, setShowFolderOpen] = useState(false);
-const [isFolderOpen, setIsFolderOpen] = useState(false);
+
 
     const formatTime = (seconds: number): string => {
         const mins = Math.floor(seconds / 60);
@@ -54,7 +53,7 @@ const [isFolderOpen, setIsFolderOpen] = useState(false);
 
     return (
         <>
-            <div className='mx-2'>
+            <div className='mx-2' data-tauri-drag-region>
                 {res_message && <p className="message text-right">{res_message}</p>}
                 {error && <p className="error text-right">{error}</p>}
             </div>

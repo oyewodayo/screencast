@@ -9,7 +9,6 @@ use std::env::consts::OS;
 use commands::recording::AppState;
 
 use windows::{
-    core::*,
     Win32::{
         Foundation::*,
         System::LibraryLoader::*,
@@ -22,16 +21,19 @@ use tauri::{Manager, Window};
 mod commands {
     pub mod windows_api;
     pub mod recording;
+    pub mod conversion;
 }
 mod services {
     pub mod utility;
 }
+use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMode, ConfigBuilder};
 
-use log::LevelFilter;
-use simplelog::{Config, WriteLogger};
-use std::fs::File;
+use log::{LevelFilter, error};
 use std::sync::Once;
 use std::sync::Mutex;
+use std::fs::OpenOptions;
+use std::panic;
+
 
 static WINDOW: Once = Once::new();
 static mut GLOBAL_WINDOW: Option<Mutex<Window>> = None;
@@ -40,11 +42,11 @@ static mut HOOK_ID: Option<HHOOK> = None;
 // Define the KBDLLHOOKSTRUCT structure
 #[repr(C)]
 pub struct KBDLLHOOKSTRUCT {
-    pub vkCode: u32,
-    pub scanCode: u32,
+    pub vk_code: u32,
+    pub scan_code: u32,
     pub flags: u32,
     pub time: u32,
-    pub dwExtraInfo: usize,
+    pub dw_extra_info: usize,
 }
 
 // Keyboard hook procedure
@@ -58,7 +60,7 @@ extern "system" fn keyboard_proc(
             let w_param_u32 = w_param.0 as u32;
             if w_param_u32 == WM_KEYDOWN {
                 let kbd_struct = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
-                let key_code = kbd_struct.vkCode;
+                let key_code = kbd_struct.vk_code;
 
                 // Convert key_code to a readable key name
                 let key_name = get_key_name(key_code);
@@ -123,12 +125,68 @@ fn get_os_info() -> String {
 
 fn main() {
     // Initialize logger
-    WriteLogger::init(
-        LevelFilter::Info, 
-        Config::default(),  
-        File::create("app.log").unwrap(),
-    )
-    .unwrap();
+    let log_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open("app.log")
+        .expect("Failed to open log file");
+
+    // Configure logging with more verbose settings
+    let config = ConfigBuilder::new()
+        .set_time_format_rfc3339()
+        .set_time_offset_to_local()
+        .unwrap_or_else(|builder| builder)
+        .build();
+
+    // Initialize combined logger (writes to both terminal and file)
+    CombinedLogger::init(vec![
+        TermLogger::new(
+            LevelFilter::Debug,
+            config.clone(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ),
+        WriteLogger::new(LevelFilter::Trace, config, log_file), // TRACE captures everything
+    ])
+    .expect("Failed to initialize logger");
+
+    // Set panic hook to log panics to file
+    panic::set_hook(Box::new(|panic_info| {
+        let payload = panic_info.payload();
+        let message = if let Some(s) = payload.downcast_ref::<&str>() {
+            s
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "Unknown panic payload"
+        };
+
+        let location = if let Some(location) = panic_info.location() {
+            format!("{}:{}:{}", location.file(), location.line(), location.column())
+        } else {
+            "Unknown location".to_string()
+        };
+
+        error!("PANIC occurred at {}: {}", location, message);
+        
+        // Also write to a separate panic log
+        let panic_log = format!(
+            "\n=== PANIC at {} ===\n{}\n{}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            location,
+            message
+        );
+        
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("panic.log")
+        {
+            use std::io::Write;
+            let _ = file.write_all(panic_log.as_bytes());
+        }
+    }));
     
     std::env::set_var("RUST_BACKTRACE", "1");
 
@@ -142,6 +200,7 @@ fn main() {
                     GLOBAL_WINDOW = Some(Mutex::new(window.clone()));
                 }
             });
+
 
             unsafe {
                 let instance = GetModuleHandleW(None).unwrap();
@@ -171,6 +230,7 @@ fn main() {
             Ok(())
         })
         .manage(AppState::default())
+        .manage(commands::conversion::ConversionState::default())
         .invoke_handler(tauri::generate_handler![
             get_ram_info,
             get_os_info,
@@ -182,10 +242,23 @@ fn main() {
             commands::windows_api::start_monitoring_windows,
             commands::windows_api::stop_monitoring_windows,
             commands::windows_api::get_window_titles,
+            commands::windows_api::get_monitors,
             commands::windows_api::get_windows_titles,
-            commands::windows_api::capture_window_screenshots_by_title,
+            commands::windows_api::capture_window_screenshots_by_title_command,
+            commands::windows_api::cleanup_screenshot_files,
             commands::windows_api::activate_and_open_window,
+           
+            commands::conversion::convert_to_mp4,
+            commands::conversion::batch_convert_to_mp4,
+            commands::conversion::cancel_conversion,
+            commands::conversion::get_conversion_info,
+            commands::conversion::get_supported_conversion_formats,
+            commands::conversion::should_convert_file,
+            commands::conversion::convert_video,
+
             services::utility::open_file_from_directory,
+            services::utility::list_briefcast_files,
+            services::utility::convert_file_path_to_url,
             tauri_emit_global_key_event
         ])
         .run(tauri::generate_context!())

@@ -1,6 +1,5 @@
 
-import FileModal from "./components/Modals/FileModal";
-import SettingsModal from "./components/Modals/SettingsModal";
+import RecordingOverlayWindow from "./components/RecordingOverlayWindow";
 import Dashboard from "./pages/Dashboard";
 import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
 
@@ -9,6 +8,8 @@ function App() {
     <Router>
       <Routes>
         <Route path="/" element={<Dashboard />} />
+
+        <Route path="/recording-overlay" element={<RecordingOverlayWindow />} /> 
         {/* <Route path="/file-modal" element={<FileModal />} /> */}
         {/* <Route path="/settings" element={} /> */}
       </Routes>

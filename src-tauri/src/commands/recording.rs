@@ -1,6 +1,9 @@
+use std::ffi::OsStr;
 //recording.rs
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::Command;
+use std::process::Stdio;
 use chrono::Utc;
 use tauri::AppHandle;
 use tauri::regex::Regex;
@@ -12,12 +15,15 @@ use std::fs;
 use std::env;
 use chrono;
 use log::info;
+use std::io::Write;
 
 use crate::commands::windows_api;
+use std::os::windows::process::CommandExt;
 
-#[derive(Default, Clone)]
-pub struct AppState{
-    output_path:Arc<Mutex<Option<PathBuf>>>,
+#[derive(Default)]
+pub struct AppState {
+    output_path: Arc<Mutex<Option<PathBuf>>>,
+    ffmpeg_process: Arc<Mutex<Option<Child>>>, // NEW: Store the process
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -123,114 +129,18 @@ pub fn get_connected_cameras(app_handle: AppHandle)->Vec<String>{
     video_devices
 }
 
-#[tauri::command]
-pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  form_data: FormData) -> Result<String, String> {
-    let mut output_file: String;
-    let output_path:PathBuf;
-    let current_date = Utc::now().format("%Y_%m%d_%H_%M_%S");
+
+pub fn silent_command<P:AsRef<OsStr>>(program: P) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null());
     
-    // Get the user's home directory
-    let home_dir = match env::var("USERPROFILE") {
-        Ok(profile_dir) => {
-            let mut path_buf = PathBuf::from(profile_dir);
-            path_buf.push("Videos");
-            path_buf
-        },
-        Err(_) => return Err("Failed to get user's home directory".to_string()),
-    };
-
-    println!("Here are the {:?}",form_data);
-    println!("Here are the windows {:?}",windows_api::get_all_open_windows_titles());
-    
-    // Append the Briefcast directory to the user's Videos directory
-    let mut Briefcast_dir = home_dir.clone();
-    Briefcast_dir.push("Briefcast");
-
-    output_file = format!("Recording_{}.{}", current_date, form_data.file_ext);
-
-    if !form_data.file_name.is_empty() {
-        output_file = format!("{}.{}", form_data.file_name, form_data.file_ext);
-    }
-    
-    output_path = Briefcast_dir.join(&output_file);
-
-    // Ensure the Briefcast directory exists, create it if it doesn't
-    if !Briefcast_dir.exists() {
-        if let Err(err) = fs::create_dir_all(&Briefcast_dir) {
-            return Err(format!("Failed to create Briefcast directory: {}", err));
-        }
-    }
-
-    // Check if the file exists
-    let output_path = if output_path.exists() {
-        output_file = format!("Recording_{}.{}", current_date, form_data.file_ext);
-        Briefcast_dir.join(&output_file)
-    } else {
-        output_path
-    };
-
-    match form_data.record_type.as_str() {
-        "sva" => recording_with_output_sva(&app_handle,state, &output_path, &form_data).await,
-        "sv" => recording_with_output_sv(&app_handle, &output_path,&form_data.video_device),
-        "sa" => recording_with_output_sa(&app_handle, &output_path, &form_data.audio_device),
-        "va" => recording_with_output_va(&app_handle, &output_path,&form_data.audio_device, &form_data.video_device),
-        "s" => recording_with_output_s(&app_handle, &output_path),
-        "v" => recording_with_output_v(&app_handle, &output_path, &form_data.video_device),
-        "c" => recording_with_output_c(&app_handle, &output_path),
-        "a" => recording_with_output_a(&app_handle, &output_path,&form_data.audio_device),
-        _ => Err("Invalid recording type".to_string()),
-    }
-}
-
-//Screen video and audio
-pub async fn recording_with_output_sva(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
     {
-        let mut app_state = state.output_path.lock().await;
-        *app_state = Some(output_path.clone());
+        cmd.creation_flags(0x08000000); // hide console window
     }
     
-    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-
-    let mut args: Vec<String> = vec![
-        "-f".to_string(), "gdigrab".to_string(),
-        "-framerate".to_string(), "60".to_string(),    
-    ];
-
-    if form_data.screen_size != "fullscreen" {
-        args.extend(vec!["-video_size".to_string(), form_data.screen_size.to_string()]);
-    }
-
-    args.extend(vec!["-i".to_string(), "desktop".to_string()]);
-    
-    if !form_data.overlay_shape.is_empty() {
-        println!("overlay is present");
-        add_overlay_args(&mut args, form_data);
-    } else {
-        let mut audio_input = String::from("audio=");
-        audio_input.push_str(&form_data.audio_device);
-        args.push("-i".to_string());
-        args.push(audio_input);
-    }
-
-    // Output command
-    args.extend(vec![
-        "-segment_time".to_string(), "10".to_string(),
-        "-segment_format".to_string(), "avi".to_string(),
-        output_path.to_str().unwrap().to_string(),
-    ]);
-
-    let result = Command::new(&ffmpeg_path)
-        .args(&args)
-        .spawn();
-
-    println!("{:?}", result);
-
-    match result {
-        Ok(_) => {
-            Ok(format!("File will be saved as \n {}.{}", form_data.file_name, form_data.file_ext))
-        },
-        Err(e) => Err(format!("Failed to start recording: {}", e)),
-    }
+    cmd
 }
 
 pub fn add_overlay_args(args: &mut Vec<String>, form_data: &FormData) {
@@ -280,25 +190,239 @@ fn get_overlay_shape(shape: &str, overlay_filter: String) -> String {
     }
 }
 
-//Screen video
-pub fn recording_with_output_sv(app_handle: &AppHandle, output_path: &PathBuf, video_device: &str) -> Result<String, String> {
+#[tauri::command]
+pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  form_data: FormData) -> Result<String, String> {
+    let mut output_file: String;
+    let output_path:PathBuf;
+    let current_date = Utc::now().format("%Y_%m%d_%H_%M_%S");
+    
+    // Get the user's home directory
+    let home_dir = match env::var("USERPROFILE") {
+        Ok(profile_dir) => {
+            let mut path_buf = PathBuf::from(profile_dir);
+            path_buf.push("Videos");
+            path_buf
+        },
+        Err(_) => return Err("Failed to get user's home directory".to_string()),
+    };
+
+    println!("Form data {:?}",form_data);
+    println!("Here are the opened windows {:?}",windows_api::get_all_open_windows_titles());
+    
+    // Append the Briefcast directory to the user's Videos directory
+    let mut briefcast_dir = home_dir.clone();
+    briefcast_dir.push("Briefcast");
+
+    output_file = format!("{}_recording_{}.{}",form_data.record_type.to_uppercase(), current_date, form_data.file_ext);
+
+    if !form_data.file_name.is_empty() {
+        output_file = format!("{}.{}", form_data.file_name, form_data.file_ext);
+    }
+    
+    output_path = briefcast_dir.join(&output_file);
+
+    // Ensure the Briefcast directory exists, create it if it doesn't
+    if !briefcast_dir.exists() {
+        if let Err(err) = fs::create_dir_all(&briefcast_dir) {
+            return Err(format!("Failed to create Briefcast directory: {}", err));
+        }
+    }
+
+    // Check if the file exists
+    let output_path = if output_path.exists() {
+        output_file = format!("Recording_{}.{}", current_date, form_data.file_ext);
+        briefcast_dir.join(&output_file)
+    } else {
+        output_path
+    };
+
+    match form_data.record_type.as_str() {
+        "sva" => recording_with_output_sva(&app_handle, state, &output_path, &form_data).await,
+        "sv" => recording_with_output_sv(&app_handle, state, &output_path, &form_data).await,
+        "sa" => recording_with_output_sa(&app_handle, state, &output_path, &form_data).await,
+        "va" => recording_with_output_va(&app_handle, state, &output_path, &form_data).await,
+        "s" => recording_with_output_s(&app_handle, state, &output_path, &form_data).await,
+        "v" => recording_with_output_v(&app_handle, state, &output_path, &form_data).await,
+        "c" => recording_with_output_c(&app_handle, state, &output_path, &form_data).await,
+        "a" => recording_with_output_a(&app_handle, state, &output_path, &form_data).await,
+        _ => Err("Invalid recording type".to_string()),
+    }
+}
+
+//Screen video and audio
+pub async fn recording_with_output_sva(
+    app_handle: &AppHandle, 
+    state: State<'_, AppState>, 
+    output_path: &PathBuf, 
+    form_data: &FormData
+) -> Result<String, String> {
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = Some(output_path.clone());
+    }
+    
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let result = Command::new(&ffmpeg_path)
-        .args(&[
-            "-f", "gdigrab",
-            "-framerate", "200",
-            "-i", "desktop",
-            "-f", "dshow",
-            "-video_size", "320x240",
-            "-i", &format!("video={}", video_device),
-            "-c:v", "mpeg4",
-            "-filter_complex", "[0:v][1:v]overlay=x=W-w-100:y=H-h-50",
-            "-segment_time", "10",
-            "-segment_format", "avi",
-            output_path.to_str().unwrap(),
-        ])
+    let mut args: Vec<String> = vec![
+        "-f".to_string(), "gdigrab".to_string(),
+        "-framerate".to_string(), "60".to_string(),    
+    ];
+
+    if form_data.screen_size != "fullscreen" {
+        args.extend(vec!["-video_size".to_string(), form_data.screen_size.to_string()]);
+    }
+
+    args.extend(vec!["-i".to_string(), "desktop".to_string()]);
+    
+    if !form_data.overlay_shape.is_empty() {
+        println!("overlay is present");
+        add_overlay_args(&mut args, form_data);
+    } else {
+        let mut audio_input = String::from("audio=");
+        audio_input.push_str(&form_data.audio_device);
+        args.push("-f".to_string());
+        args.push("dshow".to_string());
+        args.push("-i".to_string());
+        args.push(audio_input);
+    }
+
+    // Add codec flags based on file extension
+    match form_data.file_ext.to_lowercase().as_str() {
+        "mp4" => {
+            args.extend(vec![
+                "-c:v".to_string(), "libx264".to_string(),
+                "-preset".to_string(), "ultrafast".to_string(),
+                "-crf".to_string(), "23".to_string(),
+                "-c:a".to_string(), "aac".to_string(),
+                "-b:a".to_string(), "192k".to_string(),
+                "-movflags".to_string(), "+faststart+frag_keyframe+empty_moov".to_string(),
+            ]);
+        },
+        "mkv" => {
+            args.extend(vec![
+                "-c:v".to_string(), "libx264".to_string(),
+                "-preset".to_string(), "ultrafast".to_string(),
+                "-crf".to_string(), "23".to_string(),
+                "-c:a".to_string(), "aac".to_string(),
+            ]);
+        },
+        "avi" => {
+            args.extend(vec![
+                "-c:v".to_string(), "libx264".to_string(),
+                "-preset".to_string(), "ultrafast".to_string(),
+                "-c:a".to_string(), "pcm_s16le".to_string(), // Better audio codec for AVI
+            ]);
+        },
+        "mov" => {
+            args.extend(vec![
+                "-c:v".to_string(), "libx264".to_string(),
+                "-preset".to_string(), "ultrafast".to_string(),
+                "-c:a".to_string(), "aac".to_string(),
+                "-movflags".to_string(), "+faststart+frag_keyframe+empty_moov".to_string(),
+            ]);
+        },
+        "webm" => {
+            args.extend(vec![
+                "-c:v".to_string(), "libvpx".to_string(), // Use libvpx instead of libvpx-vp9 for better compatibility
+                "-b:v".to_string(), "2M".to_string(),
+                "-c:a".to_string(), "libvorbis".to_string(), // Use libvorbis instead of libopus
+                "-quality".to_string(), "good".to_string(),
+                "-cpu-used".to_string(), "0".to_string(),
+            ]);
+        },
+        _ => {
+            // Default to mp4
+            args.extend(vec![
+                "-c:v".to_string(), "libx264".to_string(),
+                "-preset".to_string(), "ultrafast".to_string(),
+                "-c:a".to_string(), "aac".to_string(),
+                "-movflags".to_string(), "+faststart+frag_keyframe+empty_moov".to_string(),
+            ]);
+        }
+    }
+
+    let output_file = output_path.to_str().unwrap().to_string();
+
+    println!("Output file: {}", output_file);
+
+    // Add output file
+    args.push(output_file.clone());
+
+    println!("FFmpeg args: {:?}", args);
+
+    // IMPORTANT: Keep stdin open for graceful shutdown
+    let child = Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped()) // Changed to piped to capture output for debugging
+        .stderr(Stdio::piped()) // Changed to piped to capture errors
+        .spawn()
+        .map_err(|e| format!("Failed to start recording: {}", e))?;
+
+    // Store the process in state
+    {
+        let mut process_state = state.ffmpeg_process.lock().await;
+        *process_state = Some(child);
+    }
+
+    println!("FFmpeg process started successfully");
+
+    Ok(format!("Recording started. File will be saved as:\n{}", output_path.display()))
+}
+//Screen and video without audio
+pub async fn recording_with_output_sv(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+    
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = Some(output_path.clone());
+    }
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+
+    let mut args: Vec<String> = vec![
+        "-f".to_string(), "dshow".to_string(),
+        "-framerate".to_string(), "60".to_string(),    
+    ];
+    if form_data.screen_size != "fullscreen" {
+        args.extend(vec!["-video_size".to_string(), form_data.screen_size.to_string()]);
+    }
+
+    args.extend(vec![
+        "-i".to_string(), "desktop".to_string()
+        ]);
+    
+    if !form_data.overlay_shape.is_empty() {
+        println!("overlay is present");
+        add_overlay_args(&mut args, form_data);
+    } 
+
+    // Output command
+    args.extend(vec![
+        "-filter_complex".to_string(), "[0:v][1:v]overlay=x=W-w-100:y=H-h-50".to_string(),
+        "-c:v".to_string(), "mpeg4".to_string(),
+        "-segment_time".to_string(), "10".to_string(),
+        "-segment_format".to_string(), "avi".to_string(),
+        output_path.to_str().unwrap().to_string(),
+    ]);
+
+    let result = silent_command(&ffmpeg_path)
+        .args(&args)
         .spawn();
+
+    // let result = silent_command(&ffmpeg_path)
+    //     .args(&[
+    //         "-f", "gdigrab",
+    //         "-framerate", "200",
+    //         "-i", "desktop",
+    //         "-f", "dshow",
+    //         "-video_size", "320x240",
+    //         "-i", &format!("video={}", video_device),
+    //         "-c:v", "mpeg4",
+    //         "-filter_complex", "[0:v][1:v]overlay=x=W-w-100:y=H-h-50",
+    //         "-segment_time", "10",
+    //         "-segment_format", "avi",
+    //         output_path.to_str().unwrap(),
+    //     ])
+    //     .spawn();
 
     match result {
         Ok(_) => Ok(format!("Recording started. File will be saved to {}", output_path.display())),
@@ -307,18 +431,23 @@ pub fn recording_with_output_sv(app_handle: &AppHandle, output_path: &PathBuf, v
 }
 
 //Screen and audio
-pub fn recording_with_output_sa(app_handle: &AppHandle, output_path: &PathBuf, audio_device: &str) -> Result<String, String> {
+pub async fn recording_with_output_sa(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = Some(output_path.clone());
+    }
+
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     println!("Path {:?}", output_path);
-    let result = Command::new(&ffmpeg_path)
+    let result = silent_command(&ffmpeg_path)
         .args(&[
             "-f", "gdigrab",
             "-framerate", "200",
             "-i", "desktop",
             "-f", "dshow",
             "-video_size", "320x240",
-            "-i", &format!("audio={}", audio_device),
+            "-i", &format!("audio={}", form_data.audio_device.to_string()),
             output_path.to_str().unwrap(),
         ])
         .spawn();
@@ -330,14 +459,18 @@ pub fn recording_with_output_sa(app_handle: &AppHandle, output_path: &PathBuf, a
 }
 
 //Video only
-pub fn recording_with_output_v(app_handle: &AppHandle, output_path: &PathBuf, video_device: &str) -> Result<String, String> {
+pub async fn recording_with_output_v(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = Some(output_path.clone());
+    }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     println!("Path {:?}", output_path);
     let result = Command::new(&ffmpeg_path)
         .args(&[
             "-f", "dshow",
-            "-i", &format!("video={}", video_device),
+            "-i", &format!("video={}", form_data.video_device),
             "-c:v", "mpeg4",
             output_path.to_str().unwrap(),
         ])
@@ -350,14 +483,18 @@ pub fn recording_with_output_v(app_handle: &AppHandle, output_path: &PathBuf, vi
 }
 
 //Audio only
-pub fn recording_with_output_a(app_handle: &AppHandle, output_path: &PathBuf, audio_device: &str) -> Result<String, String> {
+pub async fn recording_with_output_a(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = Some(output_path.clone());
+    }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     println!("Path {:?}", output_path);
-    let result = Command::new(&ffmpeg_path)
+    let result = silent_command(&ffmpeg_path)
         .args(&[
             "-f", "dshow",
-            "-i", &format!("audio={}", audio_device),
+            "-i", &format!("audio={}", form_data.audio_device),
             output_path.to_str().unwrap(),
         ])
         .spawn();
@@ -369,14 +506,19 @@ pub fn recording_with_output_a(app_handle: &AppHandle, output_path: &PathBuf, au
 }
 
 //Video and audio
-pub fn recording_with_output_va(app_handle: &AppHandle, output_path: &PathBuf, audio_device: &str, video_device: &str) -> Result<String, String> {
+pub async fn recording_with_output_va(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = Some(output_path.clone());
+    }
+   
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     println!("Path {:?}", output_path);
-    let result = Command::new(&ffmpeg_path)
+    let result = silent_command(&ffmpeg_path)
         .args(&[
             "-f", "dshow",
-            "-i", &format!("video={}:audio={}", video_device, audio_device),
+            "-i", &format!("video={}:audio={}", form_data.video_device, form_data.audio_device),
             "-c:v", "mpeg4",
             output_path.to_str().unwrap(),
         ])
@@ -389,11 +531,15 @@ pub fn recording_with_output_va(app_handle: &AppHandle, output_path: &PathBuf, a
 }
 
 //Screen only
-pub fn recording_with_output_s(app_handle: &AppHandle, output_path: &PathBuf) -> Result<String, String> {
+pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = Some(output_path.clone());
+    }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     println!("Path {:?}", output_path);
-    let result = Command::new(&ffmpeg_path)
+    let result = silent_command(&ffmpeg_path)
         .args(&[
             "-f", "gdigrab",
             "-framerate", "200",
@@ -409,11 +555,15 @@ pub fn recording_with_output_s(app_handle: &AppHandle, output_path: &PathBuf) ->
 }
 
 //Capture
-pub fn recording_with_output_c(app_handle: &AppHandle, output_path: &PathBuf) -> Result<String, String> {
+pub async fn recording_with_output_c(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = Some(output_path.clone());
+    }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
    
     println!("Path {:?}", output_path);
-    let result = Command::new(&ffmpeg_path)
+    let result = silent_command(&ffmpeg_path)
         .args(&[
             "-f", "gdigrab",
             "-framerate", "30",
@@ -423,12 +573,12 @@ pub fn recording_with_output_c(app_handle: &AppHandle, output_path: &PathBuf) ->
         .spawn();
 
     match result {
-        Ok(_) => Ok("Recording stopped".to_string()),
+        Ok(_) => Ok("Capture stopped".to_string()),
         Err(e) => Err(format!("Failed to capture: {}", e)),
     }
 }
 
-pub fn _convert_video_type(app_handle: &AppHandle, input: &str, output: &str) -> Result<String, String> {
+pub fn _convert_video_type(app_handle: &AppHandle, input: &str, _output: &str) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     
     let metadata = fs::metadata(input).map_err(|e| format!("Failed to read file metadata: {}", e))?;
@@ -458,6 +608,7 @@ pub fn _convert_video_type(app_handle: &AppHandle, input: &str, output: &str) ->
 #[tauri::command]
 pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     info!("Stop recording processing");
+    
     let output_path = {
         let app_state = state.output_path.lock().await;
         match &*app_state {
@@ -465,39 +616,55 @@ pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -
             None => return Err("No recording in progress".to_string())
         } 
     };
-    
-    let result = if cfg!(target_os = "windows") {
-        Command::new("taskkill")
-            .args(&["/F", "/IM", "ffmpeg.exe"])
-            .output()
-    } else if cfg!(target_os = "macos") {
-        Command::new("pkill")
-            .arg("ffmpeg")
-            .output()
-    } else if cfg!(target_os = "linux") {
-        Command::new("pkill")
-            .arg("ffmpeg")
-            .output()
-    } else {
-        return Err("Unsupported operating system".to_string());
-    };
-    info!("Stopped recording");
 
-    match result {
-        Ok(_) => {
-            if let Some(output_str) = output_path.to_str() {
-                app_handle.emit_all("display-file-modal", output_str.to_string()).unwrap();
-    
-                if let Err(e) = create_or_replace_rec_completed_modal(app_handle).await {
-                    return Err(format!("Failed to stop recording: {}", e));
-                } else {
-                    return Ok(output_str.to_string());
-                }
-            } else {
-                return Err("Failed to convert output path to string".to_string());
+    // Try graceful shutdown first
+    let graceful_result: Result<(), String> = {
+        let mut process_state = state.ffmpeg_process.lock().await;
+        if let Some(mut process) = process_state.take() {
+            // Send 'q' command to FFmpeg for graceful shutdown
+            if let Some(stdin) = process.stdin.as_mut() {
+                let _ = stdin.write_all(b"q");
+                let _ = stdin.flush();
             }
-        },
-        Err(e) => Err(format!("Failed to stop recording: {}", e)),
+            
+            // Wait a bit for graceful shutdown
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            
+            match process.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => {
+                    // Still running, force kill
+                    let _ = process.kill();
+                    Err("Had to force kill".to_string())  // Changed to .to_string()
+                }
+                Err(e) => Err(format!("Error checking process: {}", e))
+            }
+        } else {
+            Err("No process found".to_string())
+        }
+    };
+
+    // Fallback to taskkill if graceful shutdown failed
+    if graceful_result.is_err() {
+        info!("Graceful shutdown failed, using taskkill");
+        let _ = Command::new("taskkill")
+            .args(&["/F", "/IM", "ffmpeg.exe"])
+            .output();
+    }
+
+    info!("Recording stopped");
+
+    if let Some(output_str) = output_path.to_str() {
+        app_handle.emit_all("display-file-modal", output_str.to_string()).unwrap();
+        app_handle.emit_all("refresh-file-list", ()).unwrap();
+
+        if let Err(e) = create_or_replace_rec_completed_modal(app_handle).await {
+            return Err(format!("Failed to show completion modal: {}", e));
+        }
+        
+        Ok(output_str.to_string())
+    } else {
+        Err("Failed to convert output path to string".to_string())
     }
 }
 

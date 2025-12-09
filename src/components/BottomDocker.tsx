@@ -2,56 +2,65 @@ import React, { Dispatch, SetStateAction, useEffect, useState } from "react";
 import OsInfo from "./OsInfo";
 
 import {
-  IoArrowDown,
   IoInformationCircle,
-  IoPlay,
-  IoRefresh,
+  IoRefresh
 } from "react-icons/io5";
 import { message } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
 import ActiveRecordingState from "./ActiveRecordingState";
 import SettingsModal from "./Modals/SettingsModal";
+import { WindowInfo } from "../Types";
 import ScreenOptions from "./Modals/ScreenOptions";
+import EnhancedScreenOptions from "./EnhancedScreenOptions";
 // import { WindowInfo }from "../Types"
 
-type WindowInfo = {
-  title: string;
-  image_path: string;
-};
 interface Props {
-  handleFolderSettings:()=>void,
+  handleFolderSettings: () => void;
   showFileList: boolean;
-  selectScreen:boolean,
-  setScreen:()=>void,
-  unSetScreen:()=>void,
-  selectedScreen:string,
-  setSelectedScreen:React.Dispatch<React.SetStateAction<string>>,
-  isMonitoring:boolean,
-  setIsMonitoring: Dispatch<SetStateAction<boolean>>,
-  windowTitles : WindowInfo[],
+  selectScreen: boolean;
+  setScreen: () => void;
+  unSetScreen: () => void;
+  selectedScreen: string;
+  setSelectedScreen: React.Dispatch<React.SetStateAction<string>>;
+  screenSize: string; // ADD THIS
+  setScreenSize: React.Dispatch<React.SetStateAction<string>>; // ADD THIS
+  overlayShape: string; // ADD THIS
+  setOverlayShape: React.Dispatch<React.SetStateAction<string>>; // ADD THIS
+  overlayPosition: string; // ADD THIS
+  setOverlayPosition: React.Dispatch<React.SetStateAction<string>>; // ADD THIS
+  overlaySize: string; // ADD THIS
+  setOverlaySize: React.Dispatch<React.SetStateAction<string>>; // ADD THIS
+  isMonitoring: boolean;
+  setIsMonitoring: Dispatch<SetStateAction<boolean>>;
+  windowTitles?: any[];
   handleStartRecording: (formData: {
     file_name: string;
     file_ext: string;
     record_type: string;
     audio_device: string;
     video_device: string;
+    screen_size: string; // Make sure this is here
+    overlay_shape: string;
+    overlay_position: string;
+    overlay_size: string;
   }) => void;
   handleStopRecording: () => void;
   isRecording: boolean;
   ramInfo: [number, number] | null;
   fileName: string;
-  setFileName: React.Dispatch<React.SetStateAction<string>>,
+  setFileName: React.Dispatch<React.SetStateAction<string>>;
   fileExt: string;
-  setFileExt: React.Dispatch<React.SetStateAction<string>>,
+  setFileExt: React.Dispatch<React.SetStateAction<string>>;
   recordType: string;
-  setRecordType: React.Dispatch<React.SetStateAction<string>>,
+  setRecordType: React.Dispatch<React.SetStateAction<string>>;
   audioDevice: string;
-  setAudioDevice: React.Dispatch<React.SetStateAction<string>>,
-  videoDevice: string,
-  setVideoDevice: React.Dispatch<React.SetStateAction<string>>,
-  res_message:string,
-  error:string
+  setAudioDevice: React.Dispatch<React.SetStateAction<string>>;
+  videoDevice: string;
+  setVideoDevice: React.Dispatch<React.SetStateAction<string>>;
+  res_message: string;
+  error: string;
 }
+
 type ConnectedDevice = string[];
 const BottomDocker = ({
   handleFolderSettings,
@@ -61,6 +70,14 @@ const BottomDocker = ({
   unSetScreen,
   selectedScreen,
   setSelectedScreen,
+  screenSize, // ADD THIS
+  setScreenSize, // ADD THIS
+  overlayShape, // ADD THIS
+  setOverlayShape, // ADD THIS
+  overlayPosition, // ADD THIS
+  setOverlayPosition, // ADD THIS
+  overlaySize, // ADD THIS
+  setOverlaySize, // ADD THIS
   handleStartRecording,
   handleStopRecording,
   isMonitoring,
@@ -83,34 +100,34 @@ const BottomDocker = ({
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   const [modalOpenSettings, setModalOpenSettings] = useState(false);
-  const [folderOpenSettings, setFolderOpenSettings] = useState(false);
   const [showExt, setShowExt] = useState("sva");
-  const [connectedAudioDevices, setConnectedAudioDevices] =
-    useState<ConnectedDevice | null>(null);
-  const [connectedCameraDevices, setConnectedCameraDevices] =
-    useState<ConnectedDevice | null>(null);
+  const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
+  const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
+  const [showDocker, setShowDocker] = useState(true);
+  
+  // REMOVE THESE - now coming from props:
+  // const [screenSize, setScreenSize] = useState("fullscreen")
+  // const [overlayShape, setOverlayShape] = useState("rounded")
+  // const [overlayPosition, setOverlayPosition] = useState("bottom_right")
+  // const [overlaySize, setOverlaySize] = useState("small")
 
-  const [showDocker, setShowDocker] = useState(true)
-  const [screenSize, setScreenSize] = useState("fullscreen")
-  const [overlayShape, setOverlayShape] = useState("rounded")
-  const [overlayPosition, setOverlayPosition] = useState("bottom_right")
-  const [overlaySize, setOverlaySize] = useState("small")
-  const [windowInfos, setWindowInfos] = useState<WindowInfo[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  // ... rest of your component stays the same
+  //   // const [windowInfos, setWindowInfos] = useState<WindowInfo[]>([]);
+  // const [isLoading, setIsLoading] = useState(false);
 
-  const captureScreenshots = async () => {
-    setIsLoading(true);
+  // const captureScreenshots = async () => {
+  //   setIsLoading(true);
 
-    try {
-      const result = await invoke<WindowInfo[]>('capture_window_screenshots_by_title');
-      console.log(result)
-      setWindowInfos(result);
-    } catch (err) {
-      // setError('Failed to capture screenshots: ' + (err as Error).message);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  //   try {
+  //     const result = await invoke<WindowInfo[]>('capture_window_screenshots_by_title_command');
+  //     console.log(result)
+  //     setWindowInfos(result);
+  //   } catch (err) {
+  //     // setError('Failed to capture screenshots: ' + (err as Error).message);
+  //   } finally {
+  //     setIsLoading(false);
+  //   }
+  // };
 
   // useEffect(() => {
   //   captureScreenshots();
@@ -240,7 +257,7 @@ const BottomDocker = ({
   return (
     <>
     <SettingsModal isOpenSettings={modalOpenSettings} onCloseSettings={closeModalScreen} setOpen={setModalOpenSettings}/>
-    <ScreenOptions 
+    <EnhancedScreenOptions 
      selectScreen={selectScreen}
      setScreen={setScreen}
      unSetScreen={unSetScreen}
@@ -248,7 +265,7 @@ const BottomDocker = ({
      setSelectedScreen={setSelectedScreen} 
       screenSize={screenSize}
       setScreenSize={setScreenSize}
-      windowTitles={windowTitles}
+      windowTitles={windowTitles || []}
       overlayPosition={overlayPosition} 
       overlayShape={overlayShape} 
       overlaySize={overlaySize} 
@@ -365,6 +382,7 @@ const BottomDocker = ({
               >
                 {recordType == "c" ? "Capture" : "Start Recording"}
               </button>}
+
               {isRecording && (
                 <button
                   onClick={handleStopRecording}

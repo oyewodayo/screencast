@@ -10,7 +10,7 @@ interface FileModalProps {
 
 const FileModal = ({ filePath, setFilePath }:FileModalProps) => {
   const [fileName, setFileName] = useState<string>('');
-  const [fileExtension, setFileExtension] = useState<string>('');
+  // const [fileExtension, setFileExtension] = useState<string>('');
 
   useEffect(() => {
     const unlistenPromise = listen<string>('display-file-modal', (event) => {
@@ -23,14 +23,6 @@ const FileModal = ({ filePath, setFilePath }:FileModalProps) => {
     };
   }, []);
 
-  const updateFileInfo = (path: string) => {
-    setFilePath(path);
-    const pathParts = path.split('\\');
-    const fullFileName = pathParts[pathParts.length - 1];
-    const [name, ext] = fullFileName.split('.');
-    setFileName(name);
-    setFileExtension(ext);
-  };
 
   const handleFileNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setFileName(e.target.value);
@@ -69,9 +61,9 @@ const FileModal = ({ filePath, setFilePath }:FileModalProps) => {
               onChange={handleFileNameChange}
               className="p-2 border rounded-l outline-none"
             />
-            <span className="p-2 border border-l-0 rounded-r bg-gray-100">
+            {/* <span className="p-2 border border-l-0 rounded-r bg-gray-100">
               .{fileExtension}
-            </span>
+            </span> */}
           </div>
 
           <div className="flex justify-center space-x-4">
