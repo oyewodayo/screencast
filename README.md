@@ -817,4 +817,13 @@ The following abbreviations are recognized:
 
 
 
-- [Briefstudio](https://studio.briefbrew.com/)
+## FFmpeg Setup
+
+This project requires FFmpeg. Download from:
+- Windows: https://www.gyan.dev/ffmpeg/builds/
+- macOS: `brew install ffmpeg`
+- Linux: `sudo apt install ffmpeg`
+
+Place the binaries in `src-tauri/binaries/ffmpeg/`
+
+- [Briefcast](https://studio.withbriefs.com/)

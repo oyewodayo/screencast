@@ -9,16 +9,8 @@
 # FFmpeg binaries (large files, platform-specific)
 /binaries/
 /binaries/ffmpeg/
-/binaries/ffmpeg/*.exe
-/binaries/ffmpeg/ffmpeg
-/binaries/ffmpeg/ffprobe
-/binaries/ffmpeg/ffplay
-/binaries/bin/
-/binaries/bin/ffmpeg/
-/binaries/bin/ffmpeg/*.exe
-/binaries/bin/ffmpeg/ffmpeg
-/binaries/bin/ffmpeg/ffprobe
-/binaries/bin/ffmpeg/ffplay
+binaries/ffmpeg/*.exe
+binaries/bin/
 
 
 # Alternatively, ignore all binaries but keep the directory structure
