@@ -41,7 +41,7 @@ monitor enumeration, and screenshot capture are all implemented directly against
 Win32 API, and only Windows FFmpeg binaries are bundled.
 
 ## Global key support
-Ctrl + shift + H : Minimize and maximize recording shortcut.
+- Ctrl + shift + H : Minimize and maximize recording shortcut.
 
 ## Prerequisites
 

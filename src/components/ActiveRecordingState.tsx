@@ -54,21 +54,26 @@ const ActiveRecordingState = (
 
 
     return (
-        <>
+        // This bar floats over whatever the video player is showing (a `fixed bottom-0`
+        // overlay), so it can't rely on the page's own background for contrast - a dark or
+        // black video behind it would make unstyled icons/text disappear entirely. The
+        // gradient scrim guarantees legibility regardless of what's playing, same technique
+        // the video player's own control bar uses (player.css .video-controls-container).
+        <div className="bg-gradient-to-t from-black/30 via-black/20 to-transparent pt-5">
             <div className='mx-2' data-tauri-drag-region>
-                {res_message && <p className="message text-right">{res_message}</p>}
-                {error && <p className="error text-right">{error}</p>}
+                {res_message && <p className="message text-right text-white">{res_message}</p>}
+                {error && <p className="error text-right text-red-400">{error}</p>}
             </div>
             <div className='flex justify-between pl-2 pb-2 items-center align-middle'>
                 <div className="flex">
                    {showFileList ? (
                         <IoFolderOpen
-                        className="cursor-pointer mr-4"
+                        className="cursor-pointer mr-4 text-white text-xl"
                         onClick={() => handleFolderSettings()}
                         />
                     ) : (
                         <IoFolder
-                        className="cursor-pointer mr-4"
+                        className="cursor-pointer mr-4 text-white text-xl"
                         onClick={() => handleFolderSettings()}
                         />
                     )}
@@ -166,74 +171,41 @@ const ActiveRecordingState = (
                         <div className="px-4 ">
                             {recordType == "sva" && (
                             <div className="w-full flex flex-row gap-3 text-right">
-                                <IoScanSharp 
-                                    
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer ` : ``
-                                }
-                                />
-                                <IoVideocam  
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                                <IoMicCircle className={isRecording ? `text-green-500 cursor-pointer` : ``} />
+                                <IoScanSharp className="text-white" />
+                                <IoVideocam className="text-white" />
+                                <IoMicCircle className="text-white" />
                             </div>
                             )}
                             {recordType == "sa" && (
                             <div className="w-full flex flex-row gap-3 text-right">
-                                <IoScanSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                                <IoMicCircle className={isRecording ? `text-green` : ``} />
+                                <IoScanSharp className="text-white" />
+                                <IoMicCircle className="text-white" />
                             </div>
                             )}
                             {recordType == "va" && (
                             <div className="w-full flex flex-row gap-3 text-right">
-                                <IoVideocamSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                                <IoMicCircle className={isRecording ? `text-green` : ``} />
+                                <IoVideocamSharp className="text-white" />
+                                <IoMicCircle className="text-white" />
                             </div>
                             )}
                             {recordType == "s" && (
                             <div className="w-full flex flex-row gap-3 text-right">
-                                <IoScanSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
+                                <IoScanSharp className="text-white" />
                             </div>
                             )}
                             {recordType == "v" && (
                             <div className="w-full flex flex-row gap-3 text-right">
-                                <IoVideocamSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
+                                <IoVideocamSharp className="text-white" />
                             </div>
                             )}
                             {recordType == "a" && (
                             <div className="w-full flex flex-row gap-3 text-right">
-                                <IoMicCircle
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
+                                <IoMicCircle className="text-white" />
                             </div>
                             )}
                             {recordType == "c" && (
                             <div className="w-full flex flex-row gap-3 text-right">
-                                <IoScanSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
+                                <IoScanSharp className="text-white" />
                             </div>
                             )}
                         </div>
@@ -241,13 +213,13 @@ const ActiveRecordingState = (
 
                     <div className='flex justify-end pl-2'>
                     { showDocker ?
-                    (<button onClick={closeDocker}><IoIosArrowDown/></button>):
-                    (<button onClick={openDocker}><IoIosArrowUp/></button>)
+                    (<button onClick={closeDocker}><IoIosArrowDown className="text-white text-xl" /></button>):
+                    (<button onClick={openDocker}><IoIosArrowUp className="text-white text-xl" /></button>)
                     }
                     </div>
                 </div>
             </div>
-        </>
+        </div>
     )
 }
 

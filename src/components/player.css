@@ -85,13 +85,17 @@ video {
 /* Video controls */
 .video-controls-container {
     position: absolute;
-    bottom: 0;
+    /* The app's own docker bar (ActiveRecordingState) is a `fixed bottom-0` overlay that
+       sits on top of the video player, at minimum ~64px tall even fully collapsed. Anchoring
+       these controls flush to bottom:0 put them directly underneath it, so toggling the
+       docker down was covering the player's own pause/volume/skip/etc buttons entirely. */
+    bottom: 64px;
     left: 0;
     right: 0;
     color: white;
     z-index: 100;
     opacity: 0;
-    transition: opacity 200ms ease-in-out;
+    transition: opacity 200ms ease-in-out, bottom 200ms ease-in-out;
     pointer-events: none;
 }
 
