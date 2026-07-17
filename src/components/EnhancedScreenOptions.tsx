@@ -3,22 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { useEffect, useState } from "react";
 import { FiMonitor } from "react-icons/fi";
 import { MdMonitor } from "react-icons/md";
-
-export type WindowInfo = {
-    title: string;
-    image_path?: string;
-    hwnd: number;
-};
-
-export type MonitorInfo = {
-    id: string;
-    name: string;
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    is_primary: boolean;
-};
+import { WindowInfo, MonitorInfo } from "../Types";
 
 interface ScreenOptionsProps {
     selectScreen: boolean;
@@ -60,7 +45,6 @@ const EnhancedScreenOptions = ({
     onCloseScreen,
     onStartRecording,
     setOpen,
-    selectedScreen,
     setSelectedScreen
 }: ScreenOptionsProps) => {
     const [mode, setMode] = useState<SelectionMode>('main');

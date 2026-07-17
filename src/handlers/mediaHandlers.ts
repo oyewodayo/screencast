@@ -1,5 +1,5 @@
   // handlers/mediaHandlers.ts
-  import { processFileList, createMediaFile, MediaFile, ProcessedFilesResult } from '../utils/videoUtils';
+  import { processFileList, MediaFile, ProcessedFilesResult } from '../utils/videoUtils';
 
 
 

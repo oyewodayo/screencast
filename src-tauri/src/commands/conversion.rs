@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use tauri::{AppHandle, Window, State};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::{Child, Stdio, Command};
+use std::process::{Stdio, Command};
 use std::sync::Arc;
 use tauri::async_runtime::Mutex;
 use std::io::{BufRead, BufReader};
+
+use crate::services::utility::{path_to_str, get_ffmpeg_path, get_ffprobe_path};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConversionProgress {
@@ -29,22 +31,6 @@ pub enum ConversionStatus {
 #[derive(Default, Clone)]
 pub struct ConversionState {
     active_process: Arc<Mutex<Option<u32>>>, // Store PID instead of Child
-}
-
-// Centralized FFmpeg path resolution with cross-platform support
-pub fn get_ffmpeg_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    let binary_name = "ffmpeg.exe";
-    
-    #[cfg(not(windows))]
-    let binary_name = "ffmpeg";
-    
-    let resource_path = format!("binaries/ffmpeg/{}", binary_name);
-    
-    app_handle
-        .path_resolver()
-        .resolve_resource(&resource_path)
-        .ok_or_else(|| format!("Failed to resolve ffmpeg at {}", resource_path))
 }
 
 // Helper function to parse duration from FFmpeg output (format: HH:MM:SS.ms)
@@ -71,27 +57,160 @@ fn parse_duration(output: &str) -> Option<f64> {
     None
 }
 
-// Helper function to parse current time from FFmpeg progress output
-fn parse_current_time(output: &str) -> Option<f64> {
-    for line in output.lines() {
-        if line.contains("time=") {
-            if let Some(time_str) = line.split("time=").nth(1) {
-                if let Some(time_part) = time_str.split_whitespace().next() {
-                    let parts: Vec<&str> = time_part.split(':').collect();
-                    if parts.len() == 3 {
-                        if let (Ok(hours), Ok(minutes), Ok(seconds)) = (
-                            parts[0].parse::<f64>(),
-                            parts[1].parse::<f64>(),
-                            parts[2].parse::<f64>(),
-                        ) {
-                            return Some(hours * 3600.0 + minutes * 60.0 + seconds);
-                        }
-                    }
-                }
+
+// Shared conversion runner used by both convert_to_mp4 and convert_video, so every target
+// format gets the same stderr progress-parsing thread (convert_video previously lacked one,
+// so its progress bar silently never moved).
+async fn run_conversion(
+    app_handle: &AppHandle,
+    window: &Window,
+    state: &State<'_, ConversionState>,
+    input_path: &str,
+    output: PathBuf,
+    codec_args: &[&str],
+) -> Result<String, String> {
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let input = PathBuf::from(input_path);
+
+    if !input.exists() {
+        return Err("Input file does not exist".to_string());
+    }
+
+    if output.exists() {
+        return Err("Output file already exists".to_string());
+    }
+
+    let _ = window.emit("conversion-progress", ConversionProgress {
+        input_path: input_path.to_string(),
+        output_path: output.to_string_lossy().to_string(),
+        progress: 0.0,
+        status: ConversionStatus::Starting,
+        message: "Starting conversion...".to_string(),
+    });
+
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.arg("-i").arg(path_to_str(&input)?);
+    cmd.args(codec_args);
+    // -progress pipe:1 makes ffmpeg write machine-readable key=value progress lines to
+    // stdout, newline-terminated. Without it, ffmpeg only prints a human-readable status
+    // line to stderr that it rewrites in place with '\r' (never '\n'), which BufReader's
+    // line-based reader never yields as a line - so progress silently never updated.
+    // -nostats suppresses that human status line so it doesn't clutter the stderr scan below.
+    cmd.args(["-y", "-progress", "pipe:1", "-nostats", path_to_str(&output)?]);
+    // No interactive input is ever needed (the -y above suppresses overwrite prompts), and
+    // leaving stdin inherited from the parent risks ffmpeg blocking on a read that never
+    // resolves when run from a console-attached dev build.
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("Failed to start conversion: {}", e))?;
+
+    let pid = child.id();
+    {
+        let mut active_process = state.active_process.lock().await;
+        *active_process = Some(pid);
+    }
+
+    let stderr = child.stderr.take()
+        .ok_or("Failed to capture stderr")?;
+    let stdout = child.stdout.take()
+        .ok_or("Failed to capture stdout")?;
+
+    // Total duration comes from ffmpeg's initial "Duration: HH:MM:SS.ms" line on stderr;
+    // current position comes from the structured -progress stream on stdout. Shared so the
+    // stdout reader thread can turn "out_time_us" into a percentage once duration is known.
+    let duration = Arc::new(std::sync::Mutex::new(None::<f64>));
+
+    let duration_for_stderr = duration.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        let mut full_output = String::new();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+
+            full_output.push_str(&line);
+            full_output.push('\n');
+
+            let mut guard = duration_for_stderr.lock().unwrap();
+            if guard.is_none() {
+                *guard = parse_duration(&full_output);
             }
         }
+    });
+
+    let window_clone = window.clone();
+    let input_path_clone = input_path.to_string();
+    let output_path_clone = output.to_string_lossy().to_string();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+
+            let Some(us_str) = line.strip_prefix("out_time_us=") else { continue };
+            let Ok(current_us) = us_str.trim().parse::<i64>() else { continue };
+            if current_us < 0 { continue }
+
+            let Some(total_duration) = *duration.lock().unwrap() else { continue };
+            if total_duration <= 0.0 { continue }
+
+            let current_time = current_us as f64 / 1_000_000.0;
+            let progress = (current_time / total_duration * 100.0).clamp(0.0, 99.0);
+
+            let _ = window_clone.emit("conversion-progress", ConversionProgress {
+                input_path: input_path_clone.clone(),
+                output_path: output_path_clone.clone(),
+                progress,
+                status: ConversionStatus::Processing,
+                message: format!("Converting... {:.1}%", progress),
+            });
+        }
+    });
+
+    // Wait for process to complete off the async runtime's worker threads - a transcode
+    // can take minutes, and child.wait() blocks synchronously.
+    let result = tauri::async_runtime::spawn_blocking(move || child.wait())
+        .await
+        .map_err(|e| format!("Conversion task panicked: {}", e))?
+        .map_err(|e| format!("Failed to wait for conversion: {}", e))?;
+
+    {
+        let mut active_process = state.active_process.lock().await;
+        *active_process = None;
     }
-    None
+
+    if result.success() {
+        let _ = window.emit("conversion-progress", ConversionProgress {
+            input_path: input_path.to_string(),
+            output_path: output.to_string_lossy().to_string(),
+            progress: 100.0,
+            status: ConversionStatus::Completed,
+            message: "Conversion completed successfully".to_string(),
+        });
+
+        Ok(output.to_string_lossy().to_string())
+    } else {
+        let error_msg = "Conversion failed - check FFmpeg output for details";
+
+        let _ = window.emit("conversion-progress", ConversionProgress {
+            input_path: input_path.to_string(),
+            output_path: output.to_string_lossy().to_string(),
+            progress: 0.0,
+            status: ConversionStatus::Failed,
+            message: error_msg.to_string(),
+        });
+
+        Err(error_msg.to_string())
+    }
 }
 
 #[tauri::command]
@@ -103,147 +222,28 @@ pub async fn convert_to_mp4(
     output_path: Option<String>,
     preserve_original: bool,
 ) -> Result<String, String> {
-    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
-    
     let input = PathBuf::from(&input_path);
-    
-    // Validate input file exists
-    if !input.exists() {
-        return Err("Input file does not exist".to_string());
-    }
-    println!("Input path is {:?}",input_path);
-    println!("Output path is {:?}",output_path);
-    println!("preserve_original path is {:?}",preserve_original);
-    // Determine output path
     let output = match output_path {
         Some(path) => PathBuf::from(path),
         None => input.with_extension("mp4"),
     };
-    
-    // Check if output already exists
-    if output.exists() {
-        return Err("Output file already exists".to_string());
-    }
 
-    // Emit starting progress
-    let _ = window.emit("conversion-progress", ConversionProgress {
-        input_path: input_path.clone(),
-        output_path: output.to_string_lossy().to_string(),
-        progress: 0.0,
-        status: ConversionStatus::Starting,
-        message: "Starting conversion...".to_string(),
-    });
-
-    // Build FFmpeg command
-    let mut cmd = Command::new(&ffmpeg_path);
-    
-    cmd.args(&[
-        "-i", input.to_str().unwrap(),
+    let codec_args = [
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "23",
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
-        "-y", // Overwrite output
-        output.to_str().unwrap(),
-    ])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    ];
 
-    // Spawn the process
-    let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to start conversion: {}", e))?;
+    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
 
-    // Store the process ID for potential cancellation
-    let pid = child.id();
-    {
-        let mut active_process = state.active_process.lock().await;
-        *active_process = Some(pid);
+    if !preserve_original {
+        let _ = std::fs::remove_file(&input);
     }
 
-    // Clone stderr before moving child
-    let stderr = child.stderr.take()
-        .ok_or("Failed to capture stderr")?;
-    
-    // Spawn a thread to monitor progress
-    let window_clone = window.clone();
-    let input_path_clone = input_path.clone();
-    let output_path_clone = output.to_string_lossy().to_string();
-    
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        let mut duration: Option<f64> = None;
-        let mut full_output = String::new();
-        
-        for line in reader.lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => continue,
-            };
-            
-            full_output.push_str(&line);
-            full_output.push('\n');
-            
-            // Parse duration if not already set
-            if duration.is_none() {
-                duration = parse_duration(&full_output);
-            }
-            
-            // Parse current time and calculate progress
-            if let (Some(current_time), Some(total_duration)) = (parse_current_time(&line), duration) {
-                let progress = (current_time / total_duration * 100.0).min(99.0);
-                
-                let _ = window_clone.emit("conversion-progress", ConversionProgress {
-                    input_path: input_path_clone.clone(),
-                    output_path: output_path_clone.clone(),
-                    progress,
-                    status: ConversionStatus::Processing,
-                    message: format!("Converting... {:.1}%", progress),
-                });
-            }
-        }
-    });
-
-    // Wait for process to complete
-    let result = child.wait()
-        .map_err(|e| format!("Failed to wait for conversion: {}", e))?;
-
-    // Clear the active process
-    {
-        let mut active_process = state.active_process.lock().await;
-        *active_process = None;
-    }
-
-    if result.success() {
-        // Emit completion event
-        let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: input_path.clone(),
-            output_path: output.to_string_lossy().to_string(),
-            progress: 100.0,
-            status: ConversionStatus::Completed,
-            message: "Conversion completed successfully".to_string(),
-        });
-
-        // Optionally delete original file
-        if !preserve_original {
-            let _ = std::fs::remove_file(&input);
-        }
-
-        Ok(output.to_string_lossy().to_string())
-    } else {
-        let error_msg = "Conversion failed - check FFmpeg output for details";
-        
-        let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: input_path.clone(),
-            output_path: output.to_string_lossy().to_string(),
-            progress: 0.0,
-            status: ConversionStatus::Failed,
-            message: error_msg.to_string(),
-        });
-
-        Err(error_msg.to_string())
-    }
+    Ok(result)
 }
 
 // Cancel ongoing conversion
@@ -257,7 +257,7 @@ pub async fn cancel_conversion(
         #[cfg(windows)]
         {
             Command::new("taskkill")
-                .args(&["/F", "/PID", &pid.to_string()])
+                .args(["/F", "/PID", &pid.to_string()])
                 .output()
                 .map_err(|e| format!("Failed to cancel conversion: {}", e))?;
         }
@@ -301,14 +301,25 @@ pub async fn batch_convert_to_mp4(
         }));
 
         // Determine output path for this file
-        let output_path = output_dir.as_ref().map(|dir| {
-            let input_path_buf = PathBuf::from(input_path);
-            let filename = input_path_buf.file_stem().unwrap().to_string_lossy();
-            PathBuf::from(dir)
-                .join(format!("{}.mp4", filename))
-                .to_string_lossy()
-                .to_string()
-        });
+        let output_path = match output_dir.as_ref() {
+            Some(dir) => {
+                let input_path_buf = PathBuf::from(input_path);
+                let filename = match input_path_buf.file_stem() {
+                    Some(stem) => stem.to_string_lossy().to_string(),
+                    None => {
+                        results.push(format!("FAILED: {} has no file name", input_path));
+                        continue;
+                    }
+                };
+                Some(
+                    PathBuf::from(dir)
+                        .join(format!("{}.mp4", filename))
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            }
+            None => None,
+        };
 
         match convert_to_mp4(
             app_handle.clone(),
@@ -320,7 +331,7 @@ pub async fn batch_convert_to_mp4(
         ).await {
             Ok(output_path) => results.push(output_path),
             Err(e) => {
-                println!("Failed to convert {}: {}", input_path, e);
+                log::warn!("Failed to convert {}: {}", input_path, e);
                 results.push(format!("FAILED: {}", e));
             }
         }
@@ -335,32 +346,58 @@ pub async fn get_conversion_info(
     app_handle: AppHandle,
     input_path: String,
 ) -> Result<HashMap<String, String>, String> {
-    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let ffprobe_path = get_ffprobe_path(&app_handle)?;
     let input = PathBuf::from(&input_path);
-    
+
     if !input.exists() {
         return Err("Input file does not exist".to_string());
     }
-    
-    let output = Command::new(&ffmpeg_path)
-        .args(&["-i", input.to_str().unwrap()])
-        .stderr(Stdio::piped())
+
+    let output = Command::new(&ffprobe_path)
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            path_to_str(&input)?,
+        ])
         .output()
-        .map_err(|e| format!("Failed to get file info: {}", e))?;
-    
+        .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
+
     let mut info = HashMap::new();
     info.insert("input_path".to_string(), input_path);
-    
-    // Get file size
+
     let file_size = input.metadata()
         .map(|m| m.len() / 1_000_000)
         .unwrap_or(0);
     info.insert("input_size".to_string(), format!("{} MB", file_size));
-    
-    info.insert("output_path".to_string(), 
+
+    info.insert("output_path".to_string(),
         input.with_extension("mp4").to_string_lossy().to_string()
     );
-    
+
+    if let Ok(probe) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        if let Some(duration) = probe["format"]["duration"].as_str().and_then(|d| d.parse::<f64>().ok()) {
+            info.insert("duration".to_string(), format!("{:.1}s", duration));
+        }
+
+        if let Some(streams) = probe["streams"].as_array() {
+            if let Some(video) = streams.iter().find(|s| s["codec_type"] == "video") {
+                if let Some(codec) = video["codec_name"].as_str() {
+                    info.insert("video_codec".to_string(), codec.to_string());
+                }
+                if let (Some(w), Some(h)) = (video["width"].as_i64(), video["height"].as_i64()) {
+                    info.insert("resolution".to_string(), format!("{}x{}", w, h));
+                }
+            }
+            if let Some(audio) = streams.iter().find(|s| s["codec_type"] == "audio") {
+                if let Some(codec) = audio["codec_name"].as_str() {
+                    info.insert("audio_codec".to_string(), codec.to_string());
+                }
+            }
+        }
+    }
+
     Ok(info)
 }
 
@@ -399,34 +436,12 @@ pub async fn convert_video(
     output_path: Option<String>,
     preserve_original: bool,
 ) -> Result<String, String> {
-    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
-    
     let input = PathBuf::from(&input_path);
-    
-    if !input.exists() {
-        return Err("Input file does not exist".to_string());
-    }
-    
-    // Determine output path
     let output = match output_path {
         Some(path) => PathBuf::from(path),
         None => input.with_extension(&output_format),
     };
-    
-    if output.exists() {
-        return Err("Output file already exists".to_string());
-    }
 
-    // Emit starting progress
-    let _ = window.emit("conversion-progress", ConversionProgress {
-        input_path: input_path.clone(),
-        output_path: output.to_string_lossy().to_string(),
-        progress: 0.0,
-        status: ConversionStatus::Starting,
-        message: "Starting conversion...".to_string(),
-    });
-
-    // Build codec args based on format
     let codec_args: Vec<&str> = match output_format.to_lowercase().as_str() {
         "mp4" => vec![
             "-c:v", "libx264",
@@ -458,45 +473,11 @@ pub async fn convert_video(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let mut cmd = Command::new(&ffmpeg_path);
-    cmd.arg("-i").arg(input.to_str().unwrap());
-    cmd.args(&codec_args);
-    cmd.arg("-y").arg(output.to_str().unwrap());
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
 
-    let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to start conversion: {}", e))?;
-
-    let pid = child.id();
-    {
-        let mut active_process = state.active_process.lock().await;
-        *active_process = Some(pid);
+    if !preserve_original {
+        let _ = std::fs::remove_file(&input);
     }
 
-    // Wait for completion
-    let result = child.wait()
-        .map_err(|e| format!("Failed to wait for conversion: {}", e))?;
-
-    {
-        let mut active_process = state.active_process.lock().await;
-        *active_process = None;
-    }
-
-    if result.success() {
-        let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: input_path.clone(),
-            output_path: output.to_string_lossy().to_string(),
-            progress: 100.0,
-            status: ConversionStatus::Completed,
-            message: "Conversion completed successfully".to_string(),
-        });
-
-        if !preserve_original {
-            let _ = std::fs::remove_file(&input);
-        }
-
-        Ok(output.to_string_lossy().to_string())
-    } else {
-        Err("Conversion failed".to_string())
-    }
+    Ok(result)
 }

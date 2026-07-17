@@ -11,50 +11,47 @@
   },
   "tauri": {
     "allowlist": {
-      "all": true, 
+      "all": false,
       "fs": {
-        "all": true,
-        "readFile": true,
-        "scope": ["$VIDEO/**", "**"]
+        "all": false,
+        "scope": ["$VIDEO/Briefcast/**", "$TEMP/**"]
       },
-       "protocol": {
-        "all": true,
+      "protocol": {
+        "all": false,
         "asset": true,
-        "assetScope": ["**"]
+        "assetScope": ["$VIDEO/Briefcast/**", "$TEMP/**"]
       },
       "path": {
-        "all": true      
+        "all": false
       },
       "dialog": {
-        "all": true, 
-        "ask": true, 
-        "confirm": true, 
-        "message": true, 
-        "open": true, 
-        "save": true 
+        "all": false,
+        "message": true
       },
       "notification": {
-        "all": true 
+        "all": false
       },
       "window": {
-        "all": true
-      }, 
+        "all": false,
+        "create": true,
+        "close": true,
+        "hide": true,
+        "show": true,
+        "setFocus": true,
+        "startDragging": true
+      },
       "os": {
-        "all": true
-      },   
+        "all": false
+      },
       "shell": {
         "all": false,
         "open": true
-      },
-      "fs": {
-        "all": true,
-        "scope":["**"]  
       }
     },
     "windows": [
       {
         "title": "Briefcast",
-        "width": 800,
+        "width": 900,
         "height": 600,
         "minWidth": 850,
         "minHeight": 600
@@ -77,7 +74,7 @@
   
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost data:; media-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'"
     },
     "bundle": {
       "active": true,

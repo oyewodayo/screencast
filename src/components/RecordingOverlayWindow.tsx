@@ -1,7 +1,7 @@
 // RecordingOverlayWindow.tsx - This should be a separate component/page
-import React, { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoClose, IoMicCircle, IoOpenSharp, IoPause, IoPlay, IoScanSharp, IoSettingsSharp, IoStopSharp, IoVideocam, IoVideocamSharp } from 'react-icons/io5'
+import { IoMicCircle, IoScanSharp, IoStopSharp, IoVideocam } from 'react-icons/io5'
 import { appWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/tauri';
@@ -11,6 +11,7 @@ const RecordingOverlayWindow = () => {
     const [isMinimized, setIsMinimized] = useState<boolean>(false);
     const [recordType, setRecordType] = useState<string>("sva");
     const [isRecording, setIsRecording] = useState<boolean>(false);
+    const [startTime, setStartTime] = useState<number | null>(null);
 
     const formatTime = (seconds: number): string => {
         const mins = Math.floor(seconds / 60);
@@ -44,11 +45,11 @@ const RecordingOverlayWindow = () => {
             const unlistenRecordingState = await listen<{
                 isRecording: boolean;
                 recordType: string;
-                elapsedTime: number;
+                startTime: number;
             }>('recording-state-update', (event) => {
                 setIsRecording(event.payload.isRecording);
                 setRecordType(event.payload.recordType);
-                setElapsedTime(event.payload.elapsedTime);
+                setStartTime(event.payload.startTime);
             });
 
             return () => {
@@ -66,18 +67,19 @@ const RecordingOverlayWindow = () => {
         };
     }, []);
 
-    // Timer
+    // Derive elapsed time from the shared start timestamp (see Dashboard.tsx /
+    // ActiveRecordingState.tsx) so this window's timer can't drift apart from the main window's.
     useEffect(() => {
         let interval: number | undefined;
-        if (isRecording) {
-            interval = window.setInterval(() => {
-                setElapsedTime((prevTime) => prevTime + 1);
-            }, 1000);
+        if (isRecording && startTime) {
+            const tick = () => setElapsedTime(Math.floor((Date.now() - startTime) / 1000));
+            tick();
+            interval = window.setInterval(tick, 1000);
         } else {
             setElapsedTime(0);
         }
         return () => clearInterval(interval);
-    }, [isRecording]);
+    }, [isRecording, startTime]);
 
     // Render minimized version
     if (isMinimized) {
@@ -149,13 +151,7 @@ const RecordingOverlayWindow = () => {
                 {isRecording && (
                     <div className="bg-black rounded-lg text-white text-xs py-2 px-3 flex items-center justify-between gap-2">              
                         <div className="flex gap-2">
-                            <button 
-                                className="flex items-center gap-1 hover:text-gray-300"
-                                title="Pause recording"
-                            >
-                                <IoPause className="text-lg" /> 
-                            </button>
-                            <button 
+                            <button
                                 className="flex items-center gap-1 hover:text-gray-300" 
                                 onClick={handleStopRecording}
                                 title="Stop recording"
@@ -198,107 +194,3 @@ const RecordingOverlayWindow = () => {
 }
 
 export default RecordingOverlayWindow;
-
-// ===== INTEGRATION CODE FOR DASHBOARD.TSX =====
-
-/* 
-Add this to your Dashboard.tsx handleStartRecording function:
-
-import { WebviewWindow } from '@tauri-apps/api/window';
-
-const handleStartRecording = async (formData: any) => {
-    try {
-        const playAudioNotification = () => {
-            return new Promise<void>((resolve) => {
-                const audio = new Audio("/sounds/icq-modern-notification-sound.mp3");
-                audio.onended = () => resolve();
-                audio.play().catch(err => {
-                    console.error("Error playing audio:", err);
-                    resolve();
-                });
-            });
-        };
-
-        await playAudioNotification();
-
-        const response = await invoke<string>("start_recording", { formData });
-        setMessage(response);
-        setIsRecording(true);
-        setError("");
-
-        // Create the recording overlay window
-        const overlayWindow = new WebviewWindow('recording-overlay', {
-            url: '/recording-overlay',  // You'll need to create this route
-            title: 'Recording',
-            width: 350,
-            height: 100,
-            x: 100,
-            y: 100,
-            resizable: false,
-            alwaysOnTop: true,
-            skipTaskbar: true,
-            decorations: false,
-            transparent: true,
-            focus: false,
-        });
-
-        overlayWindow.once('tauri://created', () => {
-            console.log('Recording overlay window created');
-        });
-
-        overlayWindow.once('tauri://error', (e) => {
-            console.error('Error creating overlay window:', e);
-        });
-
-        // Send updates to overlay window
-        const updateInterval = setInterval(() => {
-            overlayWindow.emit('recording-state-update', {
-                isRecording: true,
-                recordType: formData.record_type,
-                elapsedTime: Math.floor((Date.now() - startTime) / 1000)
-            });
-        }, 1000);
-
-        // Clean up on stop
-        const originalStop = handleStopRecording;
-        handleStopRecording = async () => {
-            clearInterval(updateInterval);
-            await overlayWindow.close();
-            await originalStop();
-        };
-
-    } catch (error) {
-        console.error("Error starting recording:", error);
-        setError(`Failed to start recording: ${error}`);
-    }
-};
-*/
-
-// ===== TAURI CONFIGURATION (tauri.conf.json) =====
-
-/*
-Add this to your tauri.conf.json windows array:
-
-{
-  "label": "recording-overlay",
-  "url": "/recording-overlay",
-  "width": 350,
-  "height": 100,
-  "resizable": false,
-  "alwaysOnTop": true,
-  "skipTaskbar": true,
-  "decorations": false,
-  "transparent": true,
-  "visible": false
-}
-*/
-
-// ===== ROUTING SETUP =====
-
-/*
-If using React Router, add this route:
-
-<Route path="/recording-overlay" element={<RecordingOverlayWindow />} />
-
-Or create a separate HTML file: recording-overlay.html
-*/

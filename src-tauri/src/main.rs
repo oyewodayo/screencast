@@ -8,16 +8,6 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 use std::env::consts::OS;
 use commands::recording::AppState;
 
-use windows::{
-    Win32::{
-        Foundation::*,
-        System::LibraryLoader::*,
-        UI::{WindowsAndMessaging::*, Input::KeyboardAndMouse::*},
-    },
-};
-use windows::core::{Result as WindowsResult, Error as WindowsError, HRESULT};
-use tauri::{Manager, Window};
-
 mod commands {
     pub mod windows_api;
     pub mod recording;
@@ -29,93 +19,21 @@ mod services {
 use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMode, ConfigBuilder};
 
 use log::{LevelFilter, error};
-use std::sync::Once;
-use std::sync::Mutex;
 use std::fs::OpenOptions;
 use std::panic;
 
-
-static WINDOW: Once = Once::new();
-static mut GLOBAL_WINDOW: Option<Mutex<Window>> = None;
-static mut HOOK_ID: Option<HHOOK> = None;
-
-// Define the KBDLLHOOKSTRUCT structure
-#[repr(C)]
-pub struct KBDLLHOOKSTRUCT {
-    pub vk_code: u32,
-    pub scan_code: u32,
-    pub flags: u32,
-    pub time: u32,
-    pub dw_extra_info: usize,
-}
-
-// Keyboard hook procedure
-extern "system" fn keyboard_proc(
-    n_code: i32,
-    w_param: WPARAM,
-    l_param: LPARAM,
-) -> LRESULT {
-    unsafe {
-        if n_code >= 0 {
-            let w_param_u32 = w_param.0 as u32;
-            if w_param_u32 == WM_KEYDOWN {
-                let kbd_struct = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
-                let key_code = kbd_struct.vk_code;
-
-                // Convert key_code to a readable key name
-                let key_name = get_key_name(key_code);
-
-                println!("Key Pressed: {}", key_name);
-
-                // Emit the global key event using the stored Window
-                if let Some(window) = &GLOBAL_WINDOW {
-                    if let Ok(window) = window.lock() {
-                        if let Err(e) = emit_global_key_event(window.clone(), key_name) {
-                            eprintln!("Failed to emit global key event: {:?}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Call the next hook in the chain
-        CallNextHookEx(HOOK_ID.unwrap_or(HHOOK(0)), n_code, w_param, l_param)
-    }
-}
-
-fn get_key_name(vk_code: u32) -> String {
-    let scan_code = unsafe { MapVirtualKeyW(vk_code, MAPVK_VK_TO_VSC) };
-    let mut key_name = [0u16; 128];
-    let length = unsafe { GetKeyNameTextW((scan_code << 16) as i32, &mut key_name) };
-    String::from_utf16_lossy(&key_name[..length as usize])
-}
-
-// Emit the global key event
-fn emit_global_key_event(window: tauri::Window, key_name: String) -> WindowsResult<()> {
-    window.emit("global-key-event", key_name)
-        .map_err(|e| WindowsError::new(HRESULT(0), e.to_string()))
-}
-
 #[tauri::command]
-fn tauri_emit_global_key_event(window: Window, key_name: String) {
-    let _ = window.emit("global-key-event", key_name);
-}
-
-#[tauri::command]
-fn get_ram_info() -> (u64, u64) {
+fn get_ram_info() -> Result<(u64, u64), String> {
     let mut mem_status = MEMORYSTATUSEX::default();
     mem_status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
 
-    let result = unsafe {
-        GlobalMemoryStatusEx(&mut mem_status)
-    };
+    unsafe { GlobalMemoryStatusEx(&mut mem_status) }
+        .map_err(|e| format!("Failed to get memory info: {}", e))?;
 
-    result.expect("Failed to get memory info");
-
-    (
+    Ok((
         mem_status.ullTotalPhys / (1024 * 1024),
         mem_status.ullAvailPhys / (1024 * 1024)
-    )
+    ))
 }
 
 #[tauri::command]
@@ -124,12 +42,23 @@ fn get_os_info() -> String {
 }
 
 fn main() {
+    let context = tauri::generate_context!();
+
+    // Resolve logs to the app's own data directory instead of the process's current working
+    // directory, which varies depending on how the app was launched (Start Menu shortcut,
+    // double-click from Explorer, `cargo run`, etc.) and previously scattered app.log/panic.log
+    // wherever that happened to be.
+    let log_dir = tauri::api::path::app_log_dir(context.config())
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+    let app_log_path = log_dir.join("app.log");
+    let panic_log_path = log_dir.join("panic.log");
+
     // Initialize logger
     let log_file = OpenOptions::new()
         .create(true)
-        .write(true)
         .append(true)
-        .open("app.log")
+        .open(&app_log_path)
         .expect("Failed to open log file");
 
     // Configure logging with more verbose settings
@@ -152,7 +81,7 @@ fn main() {
     .expect("Failed to initialize logger");
 
     // Set panic hook to log panics to file
-    panic::set_hook(Box::new(|panic_info| {
+    panic::set_hook(Box::new(move |panic_info| {
         let payload = panic_info.payload();
         let message = if let Some(s) = payload.downcast_ref::<&str>() {
             s
@@ -169,7 +98,7 @@ fn main() {
         };
 
         error!("PANIC occurred at {}: {}", location, message);
-        
+
         // Also write to a separate panic log
         let panic_log = format!(
             "\n=== PANIC at {} ===\n{}\n{}\n",
@@ -177,58 +106,20 @@ fn main() {
             location,
             message
         );
-        
+
         if let Ok(mut file) = OpenOptions::new()
             .create(true)
             .append(true)
-            .open("panic.log")
+            .open(&panic_log_path)
         {
             use std::io::Write;
             let _ = file.write_all(panic_log.as_bytes());
         }
     }));
-    
+
     std::env::set_var("RUST_BACKTRACE", "1");
 
     tauri::Builder::default()
-        .setup(|app| {
-            let window = app.get_window("main").expect("main window not found");
-            
-            // Store the window globally
-            WINDOW.call_once(|| {
-                unsafe {
-                    GLOBAL_WINDOW = Some(Mutex::new(window.clone()));
-                }
-            });
-
-
-            unsafe {
-                let instance = GetModuleHandleW(None).unwrap();
-                HOOK_ID = Some(SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(keyboard_proc),
-                    instance,
-                    0,
-                ).expect("Failed to set global keyboard hook"));
-
-                if let Some(hook) = HOOK_ID {
-                    if hook.0 == 0 {
-                        panic!("Failed to set global keyboard hook: HOOK_ID is 0");
-                    }
-                } else {
-                    panic!("Failed to set global keyboard hook: HOOK_ID is None");
-                }
-
-                std::thread::spawn(move || {
-                    let mut msg = MSG::default();
-                    while GetMessageW(&mut msg, HWND(0), 0, 0).as_bool() {
-                        TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-                });
-            }
-            Ok(())
-        })
         .manage(AppState::default())
         .manage(commands::conversion::ConversionState::default())
         .invoke_handler(tauri::generate_handler![
@@ -259,8 +150,13 @@ fn main() {
             services::utility::open_file_from_directory,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
-            tauri_emit_global_key_event
+            services::utility::rename_file
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                commands::windows_api::cleanup_stale_window_screenshots();
+            }
+        });
 }

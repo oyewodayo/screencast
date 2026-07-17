@@ -1,13 +1,13 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoClose, IoMicCircle, IoOpenSharp, IoPause, IoPlay, IoScanSharp, IoSettingsSharp, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen } from 'react-icons/io5'
+import { IoClose, IoMicCircle, IoOpenSharp, IoScanSharp, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen } from 'react-icons/io5'
 
 interface Props {
     recordType: string;
     isRecording:boolean;
+    recordingStartTime: number | null;
     res_message:string;
     error:string;
-    openModalSettings:()=>void;
     handleFolderSettings:()=>void;
     handleVideoOverlayAction: ()=>void;
     handleStopRecording: () => void;
@@ -17,7 +17,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,res_message,error,openModalSettings,handleFolderSettings, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
+        recordType,isRecording,recordingStartTime,res_message,error,handleFolderSettings, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -38,17 +38,19 @@ const ActiveRecordingState = (
     const openDocker =()=>{
         setShowDocker(true)
      }
+    // Derive elapsed time from the shared start timestamp (rather than accumulating +1 per
+    // tick) so this window's timer can't drift apart from the recording-overlay window's.
     useEffect(() => {
         let interval: number | undefined;
-        if (isRecording) {
-        interval = window.setInterval(() => {
-            setElapsedTime((prevTime) => prevTime + 1);
-        }, 1000);
+        if (isRecording && recordingStartTime) {
+        const tick = () => setElapsedTime(Math.floor((Date.now() - recordingStartTime) / 1000));
+        tick();
+        interval = window.setInterval(tick, 1000);
         } else {
         setElapsedTime(0);
         }
         return () => clearInterval(interval);
-    }, [isRecording]);
+    }, [isRecording, recordingStartTime]);
 
 
     return (
@@ -70,25 +72,14 @@ const ActiveRecordingState = (
                         onClick={() => handleFolderSettings()}
                         />
                     )}
-
-
-                    <IoSettingsSharp
-                        onClick={()=>openModalSettings()}
-                        className="cursor-pointer"
-                    />
                 </div>
                 <div className='flex items-center'>
 
                     {/* { !showDocker && <button className='bg-black rounded p-0.5'><IoPlay title='Start recording' className='text-white' /></button>} */}
 
                     {isRecording? (
-                    <div className="bg-black rounded text-[#F5F7FA] text-ms py-2 px-3 flex justify-between align-middle">              
+                    <div className="bg-black rounded text-[#F5F7FA] text-ms py-2 px-3 flex justify-between align-middle">
                         <div className="flex ">
-                            <div>
-                                {isRecording?
-                                    (<button className="flex"><IoPause className="rounded-md text-2xl cursor-pointer"/> Pause &nbsp;&nbsp;</button>):
-                                    (<button className="flex"><IoPlay className="rounded-md text-2xl cursor-pointer"/> Play &nbsp;&nbsp;</button>) }
-                            </div>
                             <button className="flex" onClick={handleStopRecording}><IoStopSharp className="rounded-md text-2xl cursor-pointer" /> Stop &nbsp;&nbsp; </button>
                             <div className='mr-3'> {formatTime(elapsedTime)}</div>
                         </div>

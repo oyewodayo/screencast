@@ -1,5 +1,3 @@
-import { useState } from 'react'
-import { FaClosedCaptioning } from 'react-icons/fa'
 import { MdOutlineOpacity } from 'react-icons/md'
 
 // Define the props interface
@@ -8,22 +6,20 @@ interface PlaytimeSettingsProps {
   isAutoplay: boolean;
   playbackSpeed: string;
   onPlaybackSpeedChange: (speed: string) => void;
+  opacity: number;
+  onOpacityChange: (opacity: number) => void;
 }
 
 const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   onAutoplayChange,
   isAutoplay,
   playbackSpeed,
-  onPlaybackSpeedChange
+  onPlaybackSpeedChange,
+  opacity,
+  onOpacityChange
 }) => {
-  const [isSubtitle, setIsSubtitle] = useState<boolean>(false);
-  const [opacity, setOpacity] = useState<number>(1.0);
-  
   const handleOpacity = (event: React.ChangeEvent<HTMLInputElement>): void => {
-    const newOpacity = parseFloat(event.target.value);
-    setOpacity(newOpacity);
-    console.log("Opacity slider value:", newOpacity);
-    // Apply opacity logic here if needed
+    onOpacityChange(parseFloat(event.target.value));
   };
 
   const handlePlaybackSpeedChange = (event: React.ChangeEvent<HTMLSelectElement>): void => {
@@ -93,26 +89,6 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
           />
         </div>
 
-        {/* Subtitles Setting */}
-        <button
-          className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 text-left"
-          onClick={() => setIsSubtitle(!isSubtitle)}
-        >
-          <div className='flex gap-2 place-items-center'> 
-            <FaClosedCaptioning className={`w-[100%] ${isSubtitle ? 'text-red-500' : ''} text-2xl`} />
-            Subtitles 
-          </div>
-          <label className="switch">
-            <input 
-              type="checkbox" 
-              checked={isSubtitle}
-              onChange={() => setIsSubtitle(!isSubtitle)} 
-              name="subtitle" 
-            />
-            <span className="slider round"></span>
-          </label>
-        </button>
-       
       </div>
     </div>
   )

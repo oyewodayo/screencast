@@ -2,6 +2,42 @@
 use std::{collections::HashMap, env, fs, path::{Path, PathBuf}, process::Command};
 use tauri::{command, AppHandle};
 
+pub fn path_to_str(path: &Path) -> Result<&str, String> {
+    path.to_str().ok_or_else(|| format!("Path is not valid UTF-8: {:?}", path))
+}
+
+// Centralized FFmpeg path resolution with cross-platform support
+pub fn get_ffmpeg_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let binary_name = "ffmpeg.exe";
+
+    #[cfg(not(windows))]
+    let binary_name = "ffmpeg";
+
+    let resource_path = format!("binaries/ffmpeg/{}", binary_name);
+
+    app_handle
+        .path_resolver()
+        .resolve_resource(&resource_path)
+        .ok_or_else(|| format!("Failed to resolve ffmpeg at {}", resource_path))
+}
+
+// Centralized ffprobe path resolution, mirroring get_ffmpeg_path
+pub fn get_ffprobe_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let binary_name = "ffprobe.exe";
+
+    #[cfg(not(windows))]
+    let binary_name = "ffprobe";
+
+    let resource_path = format!("binaries/ffmpeg/{}", binary_name);
+
+    app_handle
+        .path_resolver()
+        .resolve_resource(&resource_path)
+        .ok_or_else(|| format!("Failed to resolve ffprobe at {}", resource_path))
+}
+
 
 #[derive(Debug, serde::Serialize)]
 pub struct FileEntry {
@@ -107,6 +143,39 @@ pub async fn open_file_from_directory(filepath: String) -> Result<(), String> {
     Ok(())
 }
 
+
+#[command]
+pub fn rename_file(old_path: String, new_name: String) -> Result<String, String> {
+    if new_name.trim().is_empty() || new_name.contains('/') || new_name.contains('\\') || new_name.contains("..") {
+        return Err("Invalid file name".to_string());
+    }
+
+    let old = PathBuf::from(&old_path);
+
+    if !old.exists() {
+        return Err("File does not exist".to_string());
+    }
+
+    let parent = old.parent().ok_or("Could not determine parent directory")?;
+
+    // Preserve the original extension if the new name doesn't already specify one.
+    let new_file_name = match old.extension().and_then(|e| e.to_str()) {
+        Some(ext) if !new_name.to_lowercase().ends_with(&format!(".{}", ext.to_lowercase())) => {
+            format!("{}.{}", new_name, ext)
+        }
+        _ => new_name,
+    };
+
+    let new_path = parent.join(&new_file_name);
+
+    if new_path.exists() {
+        return Err("A file with that name already exists".to_string());
+    }
+
+    fs::rename(&old, &new_path).map_err(|e| format!("Failed to rename file: {}", e))?;
+
+    path_to_str(&new_path).map(|s| s.to_string())
+}
 
 #[tauri::command]
 pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {

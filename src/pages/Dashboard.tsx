@@ -23,6 +23,7 @@ interface FileMap {
 const Dashboard = () => {
   const [message, setMessage] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [error, setError] = useState<string>("");
   const [ramInfo, setRamInfo] = useState<RAMInfo | null>(null);
   const [fileName, setFileName] = useState("Recording_" + new Date().toLocaleDateString().replace(/\//g, "_"));
@@ -41,7 +42,9 @@ const Dashboard = () => {
   const [showFileList, setShowFileList] = useState<boolean>(false);
   const [files, setFiles] = useState<FileMap>({});
   const [openMenu, setOpenMenu] = useState<string | null>(null);
-  const [selectedFile, setSelectedFile] = useState<{ path: string; name: string } | null>(null);
+  const [renamingFile, setRenamingFile] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState<string>("");
+  const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
 
 
@@ -56,6 +59,7 @@ useEffect(() => {
       
       // Update main window state
       setIsRecording(false);
+      setRecordingStartTime(null);
       setMessage("Recording stopped");
       
       // Stop monitoring if active
@@ -91,28 +95,6 @@ useEffect(() => {
   };
 }, [isMonitoring]); 
 
-  // Listen for global key events
-  useEffect(() => {
-    const setupListener = async () => {
-      const unlisten = await listen('global-key-event', (event) => {
-        const keyName = event.payload as string;
-        console.log('Key pressed:', keyName);
-      });
-      return unlisten;
-    };
-
-    let unlistenFn: (() => void) | undefined;
-    setupListener().then(fn => {
-      unlistenFn = fn;
-    });
-
-    return () => {
-      if (unlistenFn) {
-        unlistenFn();
-      }
-    };
-  }, []);
-
   // Get RAM info
   useEffect(() => {
     invoke<RAMInfo>('get_ram_info')
@@ -120,17 +102,14 @@ useEffect(() => {
       .catch(console.error);
   }, []);
 
-  // Listen for file modal display event
+  // The "Convert format" button in the recording-completed popup (a separate Tauri window)
+  // can't render ConversionDialog itself, so it asks this window to open it instead.
   useEffect(() => {
     const setupListener = async () => {
-      const unlisten = await listen<string>('show-file-modal', (event) => {
-        console.log("File path from Dashboard::", event.payload);
+      const unlisten = await listen<string>('open-conversion-dialog', (event) => {
         const path = event.payload;
-
-        const fileModal = WebviewWindow.getByLabel('file-modal');
-        if (fileModal) {
-          fileModal.emit('display-file-modal', path);
-        }
+        const name = path.split(/[\\/]/).pop() || path;
+        setConversionFile({ path, name });
       });
       return unlisten;
     };
@@ -197,13 +176,15 @@ const setScreen = () => {
         await playAudioNotification();
 
         const response = await invoke<string>("start_recording", { formData });
+        const startTime = Date.now();
         setMessage(response);
         setIsRecording(true);
+        setRecordingStartTime(startTime);
         setError("");
 
         // Create/show the overlay window
         let overlayWindow = WebviewWindow.getByLabel('recording-overlay');
-        
+
         if (!overlayWindow) {
           overlayWindow = new WebviewWindow('recording-overlay', {
             url: '/recording-overlay',
@@ -221,12 +202,13 @@ const setScreen = () => {
         }
 
         await overlayWindow.show();
-        
-        // Send recording state to overlay
+
+        // Send recording state to overlay - both windows derive elapsed time from this
+        // same start timestamp so their displayed timers can't drift apart.
         overlayWindow.emit('recording-state-update', {
           isRecording: true,
           recordType: formData.record_type,
-          elapsedTime: 0
+          startTime
         });
         
     } catch (error) {
@@ -246,6 +228,7 @@ const setScreen = () => {
       
       setMessage(response);
       setIsRecording(false);
+      setRecordingStartTime(null);
 	  // ADD THIS: Hide the overlay window
 		const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
 		if (overlayWindow) {
@@ -320,7 +303,8 @@ const setScreen = () => {
 		// Update the selected file state
 		setSelectedFile({
 		path: fileUrl,
-		name: file.name
+		name: file.name,
+		sourcePath: file.path
 		});
 		
 		console.log('File selected for playback:', file.name);
@@ -328,6 +312,26 @@ const setScreen = () => {
 		console.error('Error loading file:', error);
 		setError(`Failed to load file: ${error}`);
 	}
+	};
+
+	const startRename = (file: FileEntry) => {
+		const dotIndex = file.name.lastIndexOf('.');
+		setRenameValue(dotIndex > 0 ? file.name.slice(0, dotIndex) : file.name);
+		setRenamingFile(file.path);
+		setOpenMenu(null);
+	};
+
+	const commitRename = async (file: FileEntry) => {
+		const newName = renameValue.trim();
+		setRenamingFile(null);
+		if (!newName || newName === file.name) return;
+		try {
+			await invoke<string>('rename_file', { oldPath: file.path, newName });
+			await handleDirectoryFiles();
+		} catch (error) {
+			console.error('Error renaming file:', error);
+			setError(`Failed to rename file: ${error}`);
+		}
 	};
 
 
@@ -353,17 +357,36 @@ const setScreen = () => {
                         {fileList.map((file) => (
                           <li
                             key={file.path}
-                            className="flex items-center justify-between group cursor-pointer hover:bg-gray-50"
+                            className={`flex items-center justify-between group cursor-pointer hover:bg-gray-50 ${
+                              selectedFile?.sourcePath === file.path ? 'bg-blue-50' : ''
+                            }`}
                           >
                             {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
-                            <div 
-                              className="flex-1 hover:text-blue-500"
-                              title={file.name}
-                              onClick={() => handleFileClick(file)}
-                            >
-                              {formatFileName(file.name)}
-                            </div>
-                            
+                            {renamingFile === file.path ? (
+                              <input
+                                className="flex-1 border border-blue-400 rounded px-1 text-sm"
+                                autoFocus
+                                value={renameValue}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={(e) => setRenameValue(e.target.value)}
+                                onBlur={() => commitRename(file)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') commitRename(file);
+                                  if (e.key === 'Escape') setRenamingFile(null);
+                                }}
+                              />
+                            ) : (
+                              <div
+                                className={`flex-1 hover:text-blue-500 ${
+                                  selectedFile?.sourcePath === file.path ? 'text-blue-600 font-medium' : ''
+                                }`}
+                                title={file.name}
+                                onClick={() => handleFileClick(file)}
+                              >
+                                {formatFileName(file.name)}
+                              </div>
+                            )}
+
                             {/* Three vertical dots menu */}
                             <div className="relative">
                               <button
@@ -385,8 +408,7 @@ const setScreen = () => {
                                     className="w-full text-left px-3 py-2 hover:bg-gray-100 text-sm"
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      console.log('Rename:', file.name);
-                                      setOpenMenu(null);
+                                      startRename(file);
                                     }}
                                   >
                                     Rename
@@ -436,7 +458,8 @@ const setScreen = () => {
                   
                   setSelectedFile({
                     path: fileUrl,
-                    name: newFileName
+                    name: newFileName,
+                    sourcePath: newPath
                   });
                 } catch (error) {
                   console.error('Error loading converted file:', error);
@@ -490,6 +513,7 @@ const setScreen = () => {
         isMonitoring={isMonitoring}
         setIsMonitoring={setIsMonitoring}
         isRecording={isRecording}
+        recordingStartTime={recordingStartTime}
         handleStartRecording={handleStartRecording}
         handleStopRecording={handleStopRecording}
         ramInfo={ramInfo}

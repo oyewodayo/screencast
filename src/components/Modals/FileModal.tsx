@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { useEffect } from 'react';
+import { listen, emit } from '@tauri-apps/api/event';
+import { appWindow } from '@tauri-apps/api/window';
 import { IoCheckmarkDoneCircle } from 'react-icons/io5';
 import { open } from '@tauri-apps/api/shell';
 
@@ -9,9 +10,6 @@ interface FileModalProps {
 }
 
 const FileModal = ({ filePath, setFilePath }:FileModalProps) => {
-  const [fileName, setFileName] = useState<string>('');
-  // const [fileExtension, setFileExtension] = useState<string>('');
-
   useEffect(() => {
     const unlistenPromise = listen<string>('display-file-modal', (event) => {
       console.log("Received file path in FileModal:", event.payload);
@@ -23,15 +21,18 @@ const FileModal = ({ filePath, setFilePath }:FileModalProps) => {
     };
   }, []);
 
-
-  const handleFileNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setFileName(e.target.value);
-  };
-
   const handleOpenFile = async () => {
     if (filePath) {
       await open(filePath);
     }
+  };
+
+  const handleConvertFormat = async () => {
+    if (!filePath) return;
+    // This modal runs in its own Tauri window (see src-tauri/src/views/completed_recording.*),
+    // so opening the conversion UI means asking the main window to do it, then closing this one.
+    await emit('open-conversion-dialog', filePath);
+    await appWindow.close();
   };
 
   if (!filePath) return null;
@@ -53,20 +54,7 @@ const FileModal = ({ filePath, setFilePath }:FileModalProps) => {
             </a>
           </p>
 
-          <div className="flex justify-center items-center mb-4">
-            <input
-              type="text"
-              name="file_name"
-              value={fileName}
-              onChange={handleFileNameChange}
-              className="p-2 border rounded-l outline-none"
-            />
-            {/* <span className="p-2 border border-l-0 rounded-r bg-gray-100">
-              .{fileExtension}
-            </span> */}
-          </div>
-
-          <div className="flex justify-center space-x-4">
+          <div className="flex justify-center space-x-4 mt-4">
             <button
               className="bg-black text-white px-5 py-2 rounded-l hover:bg-gray-800"
               onClick={handleOpenFile}
@@ -75,7 +63,7 @@ const FileModal = ({ filePath, setFilePath }:FileModalProps) => {
             </button>
             <button
               className="bg-black text-white px-5 py-2 rounded-r hover:bg-gray-800"
-              onClick={() => setFilePath(null)}
+              onClick={handleConvertFormat}
             >
               Convert format
             </button>

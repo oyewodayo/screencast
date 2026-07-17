@@ -1,4 +1,5 @@
-use tauri::async_runtime::Mutex;
+use tauri::async_runtime::Mutex as AsyncMutex;
+use std::sync::Mutex;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM, LRESULT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -19,13 +20,17 @@ use std::sync::OnceLock;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use log::info;
-use image::{ImageBuffer, Rgba, RgbaImage};
+use image::{Rgba, RgbaImage};
 
+// Written from a WH_SHELL callback, which runs synchronously on the OS message-pump thread
+// and cannot await - a plain std Mutex (held only for a trivial array swap) avoids needing
+// tauri::async_runtime::block_on inside that callback.
 static LAST_TWO_WINDOWS: OnceLock<Mutex<[String; 2]>> = OnceLock::new();
 static IS_MONITORING: AtomicBool = AtomicBool::new(false);
-static HOOK: OnceLock<Mutex<Option<HHOOK>>> = OnceLock::new();
+static HOOK: OnceLock<AsyncMutex<Option<HHOOK>>> = OnceLock::new();
+static CAPTURE_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize, Debug, Clone)]
 pub struct WindowTitles {
@@ -55,8 +60,8 @@ pub fn get_last_two_windows() -> &'static Mutex<[String; 2]> {
     LAST_TWO_WINDOWS.get_or_init(|| Mutex::new([String::new(), String::new()]))
 }
 
-fn get_hook() -> &'static Mutex<Option<HHOOK>> {
-    HOOK.get_or_init(|| Mutex::new(None))
+fn get_hook() -> &'static AsyncMutex<Option<HHOOK>> {
+    HOOK.get_or_init(|| AsyncMutex::new(None))
 }
 
 // Enhanced BitBlt capture with multiple attempts
@@ -90,7 +95,7 @@ fn capture_window_enhanced(hwnd: HWND, output_path: &str) -> Result<(), String> 
 
         let h_bitmap = CreateCompatibleBitmap(hdc_window, width, height);
         if h_bitmap.is_invalid() {
-            DeleteDC(hdc_mem);
+            let _ = DeleteDC(hdc_mem);
             ReleaseDC(hwnd, hdc_window);
             return Err("Failed to create bitmap".to_string());
         }
@@ -109,8 +114,8 @@ fn capture_window_enhanced(hwnd: HWND, output_path: &str) -> Result<(), String> 
 
         if result.is_err() {
             SelectObject(hdc_mem, old_bitmap);
-            DeleteObject(h_bitmap);
-            DeleteDC(hdc_mem);
+            let _ = DeleteObject(h_bitmap);
+            let _ = DeleteDC(hdc_mem);
             ReleaseDC(hwnd, hdc_window);
             return Err("BitBlt failed".to_string());
         }
@@ -125,7 +130,7 @@ fn capture_window_enhanced(hwnd: HWND, output_path: &str) -> Result<(), String> 
                 biHeight: -height, // Negative for top-down
                 biPlanes: 1,
                 biBitCount: 32,
-                biCompression: BI_RGB.0 as u32,
+                biCompression: BI_RGB.0,
                 biSizeImage: 0,
                 biXPelsPerMeter: 0,
                 biYPelsPerMeter: 0,
@@ -149,8 +154,8 @@ fn capture_window_enhanced(hwnd: HWND, output_path: &str) -> Result<(), String> 
         );
 
         SelectObject(hdc_mem, old_bitmap);
-        DeleteObject(h_bitmap);
-        DeleteDC(hdc_mem);
+        let _ = DeleteObject(h_bitmap);
+        let _ = DeleteDC(hdc_mem);
         ReleaseDC(hwnd, hdc_window);
 
         if scan_lines == 0 {
@@ -296,42 +301,55 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
     if cleaned_windows.is_empty() {
         return Err("No valid windows found".to_string());
     }
-    
-    let mut window_infos = Vec::new();
-    let temp_dir = std::env::temp_dir();
 
-    for (index, (hwnd, title)) in cleaned_windows.iter().enumerate() {
-        let output_filename = format!("briefcast_window_{}.png", index);
-        let output_path = temp_dir.join(&output_filename);
-        let output_path_str = output_path.to_string_lossy().to_string();
-        
-        println!("Attempting to capture: '{}'", title);
+    // capture_window_enhanced does blocking GDI work plus short rendering-delay sleeps;
+    // run the whole per-window loop off the async runtime's worker threads.
+    let run_id = format!(
+        "{}_{}",
+        std::process::id(),
+        CAPTURE_RUN_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut window_infos = Vec::new();
+        let temp_dir = std::env::temp_dir();
 
-        match capture_window_enhanced(*hwnd, &output_path_str) {
-            Ok(_) => {
-                if let Ok(metadata) = fs::metadata(&output_path) {
-                    if metadata.len() > 1000 {
-                        println!("✓ Captured '{}' ({} bytes)", title, metadata.len());
-                        window_infos.push(WindowInfo {
-                            title: title.to_string(),
-                            image_path: output_path_str,
-                            hwnd: hwnd.0,
-                        });
-                    } else {
-                        eprintln!("✗ Image too small for '{}'", title);
-                        let _ = fs::remove_file(&output_path);
+        for (index, (hwnd, title)) in cleaned_windows.iter().enumerate() {
+            // Namespaced by process id + call counter so repeated captures (or multiple app
+            // instances) don't overwrite each other's still-in-use screenshots.
+            let output_filename = format!("briefcast_window_{}_{}.png", run_id, index);
+            let output_path = temp_dir.join(&output_filename);
+            let output_path_str = output_path.to_string_lossy().to_string();
+
+            println!("Attempting to capture: '{}'", title);
+
+            match capture_window_enhanced(*hwnd, &output_path_str) {
+                Ok(_) => {
+                    if let Ok(metadata) = fs::metadata(&output_path) {
+                        if metadata.len() > 1000 {
+                            println!("✓ Captured '{}' ({} bytes)", title, metadata.len());
+                            window_infos.push(WindowInfo {
+                                title: title.to_string(),
+                                image_path: output_path_str,
+                                hwnd: hwnd.0,
+                            });
+                        } else {
+                            eprintln!("✗ Image too small for '{}'", title);
+                            let _ = fs::remove_file(&output_path);
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("✗ Failed to capture '{}': {}", title, e);
-                let _ = fs::remove_file(&output_path);
+                Err(e) => {
+                    eprintln!("✗ Failed to capture '{}': {}", title, e);
+                    let _ = fs::remove_file(&output_path);
+                }
             }
         }
-    }
 
-    println!("Successfully captured {}/{} windows", window_infos.len(), cleaned_windows.len());
-    Ok(window_infos)
+        println!("Successfully captured {}/{} windows", window_infos.len(), cleaned_windows.len());
+        window_infos
+    })
+    .await
+    .map_err(|e| format!("Screenshot capture task panicked: {}", e))
 }
 
 #[tauri::command]
@@ -347,6 +365,21 @@ pub fn get_all_open_windows_titles() -> Vec<(HWND, String)> {
         let _ = EnumWindows(Some(enum_window), LPARAM(&mut windows as *mut _ as isize));
     }
     windows
+}
+
+// Best-effort fallback for the frontend-driven cleanup_screenshot_files command above - if the
+// frontend never calls it (crash, force-quit), this sweeps any leftover capture files on exit.
+pub fn cleanup_stale_window_screenshots() {
+    let temp_dir = std::env::temp_dir();
+    if let Ok(entries) = fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("briefcast_window_") && name.ends_with(".png") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -375,22 +408,27 @@ unsafe extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
 #[tauri::command]
 pub async fn activate_and_open_window(title: &str) -> Result<(), String> {
-    let wide: Vec<u16> = OsStr::new(title).encode_wide().chain(Some(0)).collect();
-    let handle = unsafe {
-        FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr()))
-    };
+    let title = title.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let wide: Vec<u16> = OsStr::new(&title).encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr()))
+        };
 
-    if handle.0 == 0 {
-        return Err(format!("Window '{}' not found", title));
-    }
+        if handle.0 == 0 {
+            return Err(format!("Window '{}' not found", title));
+        }
 
-    unsafe {
-        let _ = ShowWindow(handle, SW_RESTORE);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let _ = SetForegroundWindow(handle);
-    }
+        unsafe {
+            let _ = ShowWindow(handle, SW_RESTORE);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = SetForegroundWindow(handle);
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Activate window task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -399,7 +437,7 @@ pub async fn start_monitoring_windows() -> Result<(), String> {
         return Err("Monitoring is already active".to_string());
     }
 
-    let hook = HOOK.get_or_init(|| Mutex::new(None));
+    let hook = HOOK.get_or_init(|| AsyncMutex::new(None));
     let mut hook_guard = hook.lock().await;
 
     if hook_guard.is_some() {
@@ -445,11 +483,10 @@ unsafe extern "system" fn shell_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let hwnd = HWND(wparam.0 as isize);
         let title = get_window_title(hwnd);
 
-        tauri::async_runtime::block_on(async {
-            let mut last_two = get_last_two_windows().lock().await;
+        if let Ok(mut last_two) = get_last_two_windows().lock() {
             last_two[0] = last_two[1].clone();
             last_two[1] = title;
-        });
+        }
     }
 
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
@@ -484,8 +521,8 @@ pub async fn get_window_titles() -> Result<WindowTitles, String> {
         return Err("Monitoring is not active".to_string());
     }
 
-    let titles = get_last_two_windows().lock().await;
-    Ok(WindowTitles { 
+    let titles = get_last_two_windows().lock().map_err(|e| e.to_string())?;
+    Ok(WindowTitles {
         active: titles[1].clone(), 
         last_active: titles[0].clone() 
     })

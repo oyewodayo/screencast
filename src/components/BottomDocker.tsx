@@ -8,11 +8,7 @@ import {
 import { message } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
 import ActiveRecordingState from "./ActiveRecordingState";
-import SettingsModal from "./Modals/SettingsModal";
-import { WindowInfo } from "../Types";
-import ScreenOptions from "./Modals/ScreenOptions";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
-// import { WindowInfo }from "../Types"
 
 interface Props {
   handleFolderSettings: () => void;
@@ -46,6 +42,7 @@ interface Props {
   }) => void;
   handleStopRecording: () => void;
   isRecording: boolean;
+  recordingStartTime: number | null;
   ramInfo: [number, number] | null;
   fileName: string;
   setFileName: React.Dispatch<React.SetStateAction<string>>;
@@ -84,6 +81,7 @@ const BottomDocker = ({
   setIsMonitoring,
   windowTitles,
   isRecording,
+  recordingStartTime,
   ramInfo,
   fileName,
   setFileName,
@@ -99,7 +97,6 @@ const BottomDocker = ({
   error
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
-  const [modalOpenSettings, setModalOpenSettings] = useState(false);
   const [showExt, setShowExt] = useState("sva");
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
@@ -133,7 +130,7 @@ const BottomDocker = ({
   //   captureScreenshots();
   // }, []);
 
-  useEffect(() => {
+  const loadDevices = () => {
     invoke<ConnectedDevice>("get_connected_audios")
       .then((devices) => {
         setConnectedAudioDevices(devices);
@@ -142,9 +139,7 @@ const BottomDocker = ({
         }
       })
       .catch(console.error);
-  }, []);
 
-  useEffect(() => {
     invoke<ConnectedDevice>("get_connected_cameras")
       .then((devices) => {
         setConnectedCameraDevices(devices);
@@ -153,6 +148,10 @@ const BottomDocker = ({
         }
       })
       .catch(console.error);
+  };
+
+  useEffect(() => {
+    loadDevices();
   }, []);
 
   useEffect(() => {
@@ -242,11 +241,6 @@ const BottomDocker = ({
     setModalOpenScreen(false)
   }
 
-  const openModalSettings = ()=>{  
-    setModalOpenSettings(true)
-  }
-
-
   const handleVideoOverlayAction = async() =>{
     return await message("Video recording is going on as overlay to screen recoring", "Video recording");
   }
@@ -256,8 +250,7 @@ const BottomDocker = ({
 
   return (
     <>
-    <SettingsModal isOpenSettings={modalOpenSettings} onCloseSettings={closeModalScreen} setOpen={setModalOpenSettings}/>
-    <EnhancedScreenOptions 
+    <EnhancedScreenOptions
      selectScreen={selectScreen}
      setScreen={setScreen}
      unSetScreen={unSetScreen}
@@ -279,13 +272,13 @@ const BottomDocker = ({
     />
     <div className="w-full fixed bottom-0 flex flex-col">
      
-      <ActiveRecordingState 
+      <ActiveRecordingState
         isRecording={isRecording}
+        recordingStartTime={recordingStartTime}
         recordType={recordType}
         res_message={res_message}
         error={error}
         handleFolderSettings={handleFolderSettings}
-        openModalSettings={openModalSettings}
         handleVideoOverlayAction={handleVideoOverlayAction}
         handleStopRecording={handleStopRecording}
         showDocker={showDocker}
@@ -434,8 +427,10 @@ const BottomDocker = ({
                 </select>
               </div>
               <div className="ml-2 align-middle">
-                <IoRefresh                
-                  className="padding-bottom-7 padding-left-10 cursor-pointer" 
+                <IoRefresh
+                  className="padding-bottom-7 padding-left-10 cursor-pointer"
+                  onClick={loadDevices}
+                  title="Refresh device list"
                   />
               </div>
             </div>

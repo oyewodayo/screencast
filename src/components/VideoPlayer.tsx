@@ -1,6 +1,6 @@
 import './player.css';
 import React, { useState, useRef, useEffect, ChangeEvent, MouseEvent } from 'react';
-import { IoFolder, IoPause, IoPlay } from 'react-icons/io5';
+import { IoPause, IoPlay } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -8,7 +8,7 @@ import { RxDoubleArrowLeft, RxDoubleArrowRight } from 'react-icons/rx';
 import Alert from './custom/Alert';
 import PlaytimeSettings from './custom/PlaytimeSettings';
 import useAutoHideControls from '../hooks/useAutoHideControls';
-import { MediaFile, ProcessedFilesResult } from '../utils/videoUtils';
+import { MediaFile } from '../utils/videoUtils';
 
 // Import utility functions
 import {
@@ -22,34 +22,13 @@ import {
   updateTimelineProgress
 } from '../utils/videoUtils';
 
-import {
-  handleFileSelection,
-  handleFolderSelection,
-  playMediaFile,
-  createPlaylist,
-  handleAutoPlay
-} from '../handlers/mediaHandlers';
+import { handleAutoPlay } from '../handlers/mediaHandlers';
 
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 
 
 
-
-interface PlayMediaResult {
-  success: boolean;
-  alert?: {
-    title: string;
-    message: string;
-  };
-}
-
-interface CreatePlaylistResult {
-  alert: {
-    title: string;
-    message: string;
-  };
-}
 
 interface PlayerState {
   isPlaying?: boolean;
@@ -94,9 +73,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   // Media type detection
   const [mediaType, setMediaType] = useState<MediaType>('video');
   // Core player state
-  const [isPaused, setIsPaused] = useState<boolean>(true);
+  const [, setIsPaused] = useState<boolean>(true);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
-  const [isMuted, setIsMuted] = useState<boolean>(true);
+  const [, setIsMuted] = useState<boolean>(true);
   const [volume, setVolumeState] = useState<number>(1.0);
   const [volumeLevel, setVolumeLevel] = useState<VolumeLevel>('high');
   const [currentPlaySpeed, setCurrentPlaySpeed] = useState<string>("1x");
@@ -109,12 +88,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   const [showSkipTime, setShowSkipTime] = useState<boolean>(false);
 
   // File and playlist state
-  const [files, setFiles] = useState<MediaFile[]>([]);
-  const [selectedFiles, setSelectedFiles] = useState<MediaFile[]>([]);
+  const [files] = useState<MediaFile[]>([]);
   const [currentlyPlayingFile, setCurrentlyPlayingFile] = useState<string | null>(null);
   const [currentFileTitle, setCurrentFileTitle] = useState<string>("");
-  const [folderName, setFolderName] = useState<string>("");
-  const [fileCount, setFileCount] = useState<number>(0);
 
   // Time and skip state
   const [currentTimeElement, setCurrentTimeElement] = useState<string>("0:00");
@@ -123,11 +99,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
 
   // Settings and preferences
   const [isAutoPlay, setAutoPlay] = useState<boolean>(true);
+  const [videoOpacity, setVideoOpacity] = useState<number>(1.0);
 
   // Alert state
   const [showAlert, setShowAlert] = useState<boolean>(false);
-  const [alertTitle, setAlertTitle] = useState<string>("Alert");
-  const [alertMessage, setAlertMessage] = useState<string>("This is an alert message");
+  const [alertTitle] = useState<string>("Alert");
+  const [alertMessage] = useState<string>("This is an alert message");
 
   const { visible, show, hide } = useAutoHideControls();
 
@@ -184,50 +161,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
       }
     });
   };
-
-  // File handling
-  const onFilesProcessed = (result: ProcessedFilesResult): void => {
-    setFiles(result.files);
-    setSelectedFiles(result.selectedFiles);
-    setFileCount(result.fileCount);
-    setFolderName(result.folderName);
-    setAlertTitle(result.alertData.title);
-    setAlertMessage(result.alertData.message);
-    setShowAlert(true);
-  };
-
-
-
-const playFile = async (file: MediaFile): Promise<void> => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    try {
-      // Set the video source to the selected file
-      video.src = file.url;
-      
-      // Update the current playing state
-      setCurrentlyPlayingFile(file.url);
-      setCurrentFileTitle(file.name);
-      
-      // Load and play the video
-      await video.load();
-      await video.play();
-      
-      // Update player state
-      setIsPlaying(true);
-      setIsPaused(false);
-      
-      // Start timeline update
-      requestAnimationFrame(updateTimeline);
-    } catch (error) {
-      console.error('Error playing file:', error);
-      setAlertTitle('Playback Error');
-      setAlertMessage(`Failed to play ${file.name}: ${error}`);
-      setShowAlert(true);
-    }
-  };
-
 
   // Player controls
   const togglePauseAndPlay = (): void => {
@@ -518,11 +451,12 @@ const playFile = async (file: MediaFile): Promise<void> => {
 			/>
 		)}
       
-    	<div 
-        	className={`w-full video-container paused captions bg-black rounded`} 
-			ref={videoContainerRef} 
+    	<div
+        	className={`w-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
+			ref={videoContainerRef}
+			style={{ opacity: videoOpacity }}
 			data-volume-level={volumeLevel}>
-			{mediaType === 'video' || mediaType === 'audio' && (
+			{(mediaType === 'video' || mediaType === 'audio') && (
 				<div>
 					<img className="thumbnail-img" id="thumbnailImg" alt="Video thumbnail" />
 					<div className="pointer-events-auto"></div>
@@ -618,8 +552,8 @@ const playFile = async (file: MediaFile): Promise<void> => {
 						</button>
 
 						{showSettings && (
-							<PlaytimeSettings 
-							onAutoplayChange={handleAutoplay} 
+							<PlaytimeSettings
+							onAutoplayChange={handleAutoplay}
 							isAutoplay={isAutoPlay}
 							playbackSpeed={currentPlaySpeed}
 							onPlaybackSpeedChange={(speed: string) => {
@@ -628,6 +562,8 @@ const playFile = async (file: MediaFile): Promise<void> => {
 								setCurrentPlaySpeed(`${speed}x`);
 								}
 							}}
+							opacity={videoOpacity}
+							onOpacityChange={setVideoOpacity}
 							/>
 						)}
 
@@ -680,20 +616,6 @@ const playFile = async (file: MediaFile): Promise<void> => {
 			}
     	</div>
 
-      
-        {/* <div className="w-[25%] h-full bg-gray-700 p-4 overflow-y-auto"> */}
-        {/* Transcript section - Only show for video/audio */}
-      {mediaType !== 'image' && currentFileTitle && (
-        <div className="transcript-section">
-          <div className="transcript-header">
-            <h3>{currentFileTitle}</h3>
-          </div>
-          <div className="transcript-content">
-            Currently playing video transcript will be displayed here.
-          </div>
-        </div>
-      )}
-      
     </div>
 
   );

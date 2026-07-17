@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 
 const useAutoHideControls = (delay = 3000) => {
   const [visible, setVisible] = useState(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const show = () => {
     setVisible(true);
