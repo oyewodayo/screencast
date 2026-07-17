@@ -5,11 +5,28 @@ import BottomDocker from "../components/BottomDocker";
 import { listen } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
 import { WebviewWindow } from '@tauri-apps/api/window';
+import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
 import { formatFileName } from "../utils/Formater";
 import VideoPlayer from "../components/VideoPlayer";
 import ConversionDialog from "../components/ConversionDialog";
 
 type RAMInfo = [number, number];
+
+// Toggles the recording-overlay window's visibility. Registered as an OS-level hotkey via
+// Tauri's globalShortcut API (backed by RegisterHotKey) while a recording is in progress -
+// this only ever fires for this exact key combo, unlike a low-level keyboard hook that would
+// see every keystroke system-wide.
+const OVERLAY_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+H';
+
+const toggleOverlayVisibility = async () => {
+  const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+  if (!overlayWindow) return;
+  if (await overlayWindow.isVisible()) {
+    await overlayWindow.hide();
+  } else {
+    await overlayWindow.show();
+  }
+};
 
 interface FileEntry {
     name: string;
@@ -73,10 +90,13 @@ useEffect(() => {
         }
       }
       
-      // Hide the overlay window
+      // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
       const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
       if (overlayWindow) {
         await overlayWindow.hide();
+      }
+      if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
+        await unregister(OVERLAY_TOGGLE_SHORTCUT);
       }
     });
     
@@ -177,12 +197,13 @@ const setScreen = () => {
 
         const response = await invoke<string>("start_recording", { formData });
         const startTime = Date.now();
-        setMessage(response);
         setIsRecording(true);
         setRecordingStartTime(startTime);
         setError("");
 
-        // Create/show the overlay window
+        // Create the overlay window, but don't show it - it stays hidden until the user
+        // asks for it via the toggle shortcut below, rather than popping up unasked-for
+        // every time a recording starts.
         let overlayWindow = WebviewWindow.getByLabel('recording-overlay');
 
         if (!overlayWindow) {
@@ -197,20 +218,26 @@ const setScreen = () => {
             skipTaskbar: true,
             decorations: false,
             transparent: true,
+            visible: false,
             focus: false,
           });
         }
 
-        await overlayWindow.show();
-
         // Send recording state to overlay - both windows derive elapsed time from this
-        // same start timestamp so their displayed timers can't drift apart.
+        // same start timestamp so their displayed timers can't drift apart. Sent even while
+        // hidden so the overlay is already in sync the moment the user reveals it.
         overlayWindow.emit('recording-state-update', {
           isRecording: true,
           recordType: formData.record_type,
           startTime
         });
-        
+
+        if (!(await isRegistered(OVERLAY_TOGGLE_SHORTCUT))) {
+          await register(OVERLAY_TOGGLE_SHORTCUT, toggleOverlayVisibility);
+        }
+
+        setMessage(`${response} (Ctrl+Shift+H to show/hide the recording overlay)`);
+
     } catch (error) {
         console.error("Error starting recording:", error);
         setError(`Failed to start recording: ${error}`);
@@ -229,12 +256,15 @@ const setScreen = () => {
       setMessage(response);
       setIsRecording(false);
       setRecordingStartTime(null);
-	  // ADD THIS: Hide the overlay window
+	  // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
 		const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
 		if (overlayWindow) {
 		await overlayWindow.hide();
 		}
-      
+		if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
+		await unregister(OVERLAY_TOGGLE_SHORTCUT);
+		}
+
       if (isMonitoring) {
         await invoke("stop_monitoring_windows");
         setIsMonitoring(false);

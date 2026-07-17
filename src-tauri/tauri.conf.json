@@ -31,6 +31,9 @@
       "notification": {
         "all": false
       },
+      "globalShortcut": {
+        "all": true
+      },
       "window": {
         "all": false,
         "create": true,

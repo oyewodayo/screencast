@@ -632,37 +632,43 @@ pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -
 
     let output_str = path_to_str(&output_path)?;
 
-    if let Err(e) = app_handle.emit_all("display-file-modal", output_str.to_string()) {
-        warn!("Failed to emit display-file-modal: {}", e);
-    }
     if let Err(e) = app_handle.emit_all("refresh-file-list", ()) {
         warn!("Failed to emit refresh-file-list: {}", e);
     }
 
-    if let Err(e) = create_or_replace_rec_completed_modal(app_handle).await {
+    if let Err(e) = create_or_replace_rec_completed_modal(app_handle, output_str).await {
         return Err(format!("Failed to show completion modal: {}", e));
     }
 
     Ok(output_str.to_string())
 }
 
-async fn create_or_replace_rec_completed_modal(app_handle: tauri::AppHandle) -> Result<String, String> {
+async fn create_or_replace_rec_completed_modal(app_handle: tauri::AppHandle, file_path: &str) -> Result<String, String> {
     if let Some(modal_window) = app_handle.get_window("completed_recording") {
         if let Err(e) = modal_window.close() {
             return Err(format!("Failed to close existing modal window: {}", e));
         }
     }
-    
-    let file_path = "src-tauri/src/views/completed_recording.html";
+
+    // The file path is baked into the window's own URL (rather than sent via a
+    // 'display-file-modal' event emitted from here) because emit_all only reaches windows that
+    // already exist at the moment it's called - this window doesn't exist yet until `build()`
+    // below returns, and even then its webview/JS hasn't loaded far enough to have registered
+    // a listener. An event fired here would always be missed. A URL query param has no such
+    // race: the page reads it on its very first render.
+    let url = format!(
+        "src-tauri/src/views/completed_recording.html?path={}",
+        urlencoding::encode(file_path)
+    );
     let result = tauri::WindowBuilder::new(
         &app_handle,
         "completed_recording",
-        tauri::WindowUrl::App(file_path.into()),
+        tauri::WindowUrl::App(url.into()),
     )
     .title("Recording completed")
     .center()
     .resizable(false)
-    .inner_size(400.0, 500.0)
+    .inner_size(420.0, 480.0)
     .always_on_top(true)
     .minimizable(false)
     .build();
