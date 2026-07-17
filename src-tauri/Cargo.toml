@@ -13,7 +13,7 @@ tauri = { version = "1.5", features = [ "window-hide", "window-set-focus", "wind
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4.38"
-windows = {version="0.57.0", features = ["Win32_System_SystemInformation", "Win32_System_Console", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Power", "Win32_Storage_FileSystem", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_Devices_Properties", "Win32_Graphics_Gdi", "Win32_System_Threading"] }
+windows = {version="0.57.0", features = ["Win32_System_SystemInformation", "Win32_System_Console", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Power", "Win32_Storage_FileSystem", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_Devices_Properties", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_Storage_Xps", "Win32_Graphics_Dwm"] }
 image = "0.25.1"
 log = "0.4.22"
 simplelog = "0.12.2"

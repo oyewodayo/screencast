@@ -265,10 +265,11 @@ const BottomDocker = ({
       setOverlayShape={setOverlayShape}
       setOverlayPosition={setOverlayPosition}
       setOverlaySize={setOverlaySize}
-      isOpenScreen={modalOpenScreen} 
-      onCloseScreen={closeModalScreen} 
-      onStartRecording={onStartRecording} 
+      isOpenScreen={modalOpenScreen}
+      onCloseScreen={closeModalScreen}
+      onStartRecording={onStartRecording}
       setOpen={setModalOpenScreen}
+      error={error}
     />
     <div className="w-full fixed bottom-0 flex flex-col">
      

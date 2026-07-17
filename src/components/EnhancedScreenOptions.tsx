@@ -1,6 +1,6 @@
 import { IoClose, IoDesktop, IoScanOutline, IoApps, IoReload } from "react-icons/io5";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FiMonitor } from "react-icons/fi";
 import { MdMonitor } from "react-icons/md";
 import { WindowInfo, MonitorInfo } from "../Types";
@@ -24,6 +24,7 @@ interface ScreenOptionsProps {
     onCloseScreen: () => void;
     onStartRecording: () => void;
     setOpen: React.Dispatch<React.SetStateAction<boolean>>;
+    error?: string;
 }
 
 type SelectionMode = 'main' | 'monitors' | 'windows';
@@ -45,7 +46,8 @@ const EnhancedScreenOptions = ({
     onCloseScreen,
     onStartRecording,
     setOpen,
-    setSelectedScreen
+    setSelectedScreen,
+    error
 }: ScreenOptionsProps) => {
     const [mode, setMode] = useState<SelectionMode>('main');
     const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
@@ -53,17 +55,24 @@ const EnhancedScreenOptions = ({
     const [selectedMonitor, setSelectedMonitor] = useState<string>('');
     const [selectedWindow, setSelectedWindow] = useState<number | null>(null);
     const [isLoading, setIsLoading] = useState(false);
+    // Snapshot of `error` taken when a window-load starts, so the fallback below only reacts
+    // to a *new* error firing during this load - not a stale, unrelated error already sitting
+    // in Dashboard's error state from something else entirely.
+    const loadErrorBaselineRef = useRef<string | undefined>(undefined);
 
-    // Load windows when entering windows mode
+    // Load windows when entering windows mode. isLoading must be cleared here regardless of
+    // whether any windows actually came back - previously it was only cleared when
+    // windowTitles was non-empty, so a successful-but-empty capture (or the loading state set
+    // by the "Window" button) left this stuck on "Loading windows..." forever.
     useEffect(() => {
-        if (selectScreen && windowTitles.length > 0) {
-            const windowsWithUrls = windowTitles.map(window => ({
-                ...window,
-                imageUrl: window.image_path ? convertFileSrc(window.image_path) : undefined
-            }));
-            setWindows(windowsWithUrls as any);
-            setMode('windows');
-        }
+        if (!selectScreen) return;
+        const windowsWithUrls = windowTitles.map(window => ({
+            ...window,
+            imageUrl: window.image_path ? convertFileSrc(window.image_path) : undefined
+        }));
+        setWindows(windowsWithUrls as any);
+        setMode('windows');
+        setIsLoading(false);
     }, [selectScreen, windowTitles]);
 
     // Load monitors when entering monitors mode
@@ -72,6 +81,17 @@ const EnhancedScreenOptions = ({
             loadMonitors();
         }
     }, [mode]);
+
+    // If the parent's window-capture invoke rejects outright, selectScreen never flips true
+    // and the effect above never runs - fall back to clearing isLoading here so the modal
+    // doesn't get stuck on "Loading windows..." forever. Only trips on an error that's new
+    // since this load started, so a stale unrelated error already in state can't falsely
+    // short-circuit a load that's still genuinely in progress.
+    useEffect(() => {
+        if (mode === 'windows' && isLoading && error && error !== loadErrorBaselineRef.current) {
+            setIsLoading(false);
+        }
+    }, [mode, isLoading, error]);
 
     // Cleanup on unmount
     useEffect(() => {
@@ -101,6 +121,7 @@ const EnhancedScreenOptions = ({
 
     const loadWindows = async () => {
         setIsLoading(true);
+        loadErrorBaselineRef.current = error;
         setScreen(); // Call the parent's setScreen function
     };
 

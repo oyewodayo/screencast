@@ -3,17 +3,21 @@ use std::sync::Mutex;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM, LRESULT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, FindWindowW, GetWindowTextLengthW, 
-    GetWindowTextW, IsWindowVisible, SetForegroundWindow, ShowWindow, 
+    CallNextHookEx, EnumWindows, FindWindowW, GetWindowTextLengthW,
+    GetWindowTextW, IsWindowVisible, SetForegroundWindow, ShowWindow,
     SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, SW_RESTORE, WH_SHELL,
     GetWindowRect
 };
 use windows::Win32::Graphics::Gdi::{
-    GetDC, ReleaseDC, CreateCompatibleDC, CreateCompatibleBitmap, 
-    SelectObject, DeleteObject, DeleteDC, GetDIBits, BitBlt,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY, HDC, HMONITOR,
+    GetDC, ReleaseDC, CreateCompatibleDC, CreateCompatibleBitmap,
+    SelectObject, DeleteObject, DeleteDC, GetDIBits,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HMONITOR,
     EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO
 };
+// PrintWindow/PRINT_WINDOW_FLAGS live under Storage::Xps in this crate version's metadata,
+// not UI::WindowsAndMessaging where the Win32 docs file them.
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::core::PCWSTR;
 use std::fs;
 use std::sync::OnceLock;
@@ -64,60 +68,56 @@ fn get_hook() -> &'static AsyncMutex<Option<HHOOK>> {
     HOOK.get_or_init(|| AsyncMutex::new(None))
 }
 
-// Enhanced BitBlt capture with multiple attempts
+// Capture a window's content via PrintWindow(PW_RENDERFULLCONTENT), which asks the window
+// to render itself into the provided DC directly. This is required for anything
+// GPU/DWM-composited - which is effectively every modern app (Chrome, VS Code, Explorer,
+// Windows Terminal, ...) - since the older GetDC(hwnd) + BitBlt approach only ever sees
+// whatever was last painted into the window's classic GDI surface, which for these apps is
+// nothing, producing a blank capture every time. PrintWindow also doesn't need the window
+// focused, so this no longer needs to steal foreground focus from window to window either.
 fn capture_window_enhanced(hwnd: HWND, output_path: &str) -> Result<(), String> {
     unsafe {
         let mut rect = RECT::default();
         GetWindowRect(hwnd, &mut rect).map_err(|e| format!("GetWindowRect failed: {}", e))?;
-        
+
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
-        
+
         if width <= 0 || height <= 0 || width > 10000 || height > 10000 {
             return Err(format!("Invalid window dimensions: {}x{}", width, height));
         }
 
-        // Try to bring window to foreground for better capture
-        let _ = SetForegroundWindow(hwnd);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Get window DC instead of screen DC for better results
-        let hdc_window = GetDC(hwnd);
-        if hdc_window.is_invalid() {
-            return Err("Failed to get window DC".to_string());
+        // A screen-compatible DC/bitmap is what PrintWindow expects to render into.
+        let hdc_screen = GetDC(HWND(0));
+        if hdc_screen.is_invalid() {
+            return Err("Failed to get screen DC".to_string());
         }
 
-        let hdc_mem = CreateCompatibleDC(hdc_window);
+        let hdc_mem = CreateCompatibleDC(hdc_screen);
         if hdc_mem.is_invalid() {
-            ReleaseDC(hwnd, hdc_window);
+            ReleaseDC(HWND(0), hdc_screen);
             return Err("Failed to create compatible DC".to_string());
         }
 
-        let h_bitmap = CreateCompatibleBitmap(hdc_window, width, height);
+        let h_bitmap = CreateCompatibleBitmap(hdc_screen, width, height);
         if h_bitmap.is_invalid() {
             let _ = DeleteDC(hdc_mem);
-            ReleaseDC(hwnd, hdc_window);
+            ReleaseDC(HWND(0), hdc_screen);
             return Err("Failed to create bitmap".to_string());
         }
 
         let old_bitmap = SelectObject(hdc_mem, h_bitmap);
-        
-        // Use BitBlt to capture window content
-        let result = BitBlt(
-            hdc_mem,
-            0, 0,
-            width, height,
-            hdc_window,
-            0, 0,
-            SRCCOPY
-        );
 
-        if result.is_err() {
+        // 2 = PW_RENDERFULLCONTENT (not re-exported with a proper PRINT_WINDOW_FLAGS type
+        // alongside PrintWindow itself in this crate version's Storage::Xps module).
+        let printed = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(2));
+
+        if !printed.as_bool() {
             SelectObject(hdc_mem, old_bitmap);
             let _ = DeleteObject(h_bitmap);
             let _ = DeleteDC(hdc_mem);
-            ReleaseDC(hwnd, hdc_window);
-            return Err("BitBlt failed".to_string());
+            ReleaseDC(HWND(0), hdc_screen);
+            return Err("PrintWindow failed".to_string());
         }
 
         // Small delay for rendering
@@ -156,7 +156,7 @@ fn capture_window_enhanced(hwnd: HWND, output_path: &str) -> Result<(), String> 
         SelectObject(hdc_mem, old_bitmap);
         let _ = DeleteObject(h_bitmap);
         let _ = DeleteDC(hdc_mem);
-        ReleaseDC(hwnd, hdc_window);
+        ReleaseDC(HWND(0), hdc_screen);
 
         if scan_lines == 0 {
             return Err("GetDIBits failed".to_string());
@@ -287,13 +287,28 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
             // Check if window has visible area
             unsafe {
                 let mut rect = RECT::default();
-                if GetWindowRect(*hwnd, &mut rect).is_ok() {
-                    let width = rect.right - rect.left;
-                    let height = rect.bottom - rect.top;
-                    width > 100 && height > 100
-                } else {
-                    false
+                if !GetWindowRect(*hwnd, &mut rect).is_ok() {
+                    return false;
                 }
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
+                if width <= 100 || height <= 100 {
+                    return false;
+                }
+
+                // IsWindowVisible can report true for windows DWM has cloaked - e.g. apps
+                // pre-loaded in the background on another virtual desktop, or cached instances
+                // (the Settings app is a common case of this) - which are not actually visible
+                // to the user despite passing every other check. Skip those.
+                let mut cloaked: u32 = 0;
+                let is_cloaked = DwmGetWindowAttribute(
+                    *hwnd,
+                    DWMWA_CLOAKED,
+                    &mut cloaked as *mut u32 as *mut std::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                ).is_ok() && cloaked != 0;
+
+                !is_cloaked
             }
         })
         .collect();
@@ -320,32 +335,40 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
             let output_path = temp_dir.join(&output_filename);
             let output_path_str = output_path.to_string_lossy().to_string();
 
-            println!("Attempting to capture: '{}'", title);
+            log::debug!("Attempting to capture: '{}'", title);
 
-            match capture_window_enhanced(*hwnd, &output_path_str) {
-                Ok(_) => {
-                    if let Ok(metadata) = fs::metadata(&output_path) {
-                        if metadata.len() > 1000 {
-                            println!("✓ Captured '{}' ({} bytes)", title, metadata.len());
-                            window_infos.push(WindowInfo {
-                                title: title.to_string(),
-                                image_path: output_path_str,
-                                hwnd: hwnd.0,
-                            });
-                        } else {
-                            eprintln!("✗ Image too small for '{}'", title);
-                            let _ = fs::remove_file(&output_path);
-                        }
+            // A thumbnail is purely cosmetic for this picker - the window is still perfectly
+            // valid to select and record even if PrintWindow can't produce a preview for it
+            // (some GPU-composited apps don't respond well to PrintWindow). Previously a
+            // failed/blank capture removed the window from the list entirely, which meant
+            // real, visible windows like Chrome or VS Code could vanish from the picker.
+            let image_path = match capture_window_enhanced(*hwnd, &output_path_str) {
+                Ok(_) => match fs::metadata(&output_path) {
+                    Ok(metadata) if metadata.len() > 1000 => {
+                        log::debug!("Captured '{}' ({} bytes)", title, metadata.len());
+                        output_path_str
                     }
-                }
+                    _ => {
+                        log::debug!("Thumbnail for '{}' too small, listing without one", title);
+                        let _ = fs::remove_file(&output_path);
+                        String::new()
+                    }
+                },
                 Err(e) => {
-                    eprintln!("✗ Failed to capture '{}': {}", title, e);
+                    log::debug!("Failed to capture '{}': {} - listing without a thumbnail", title, e);
                     let _ = fs::remove_file(&output_path);
+                    String::new()
                 }
-            }
+            };
+
+            window_infos.push(WindowInfo {
+                title: title.to_string(),
+                image_path,
+                hwnd: hwnd.0,
+            });
         }
 
-        println!("Successfully captured {}/{} windows", window_infos.len(), cleaned_windows.len());
+        log::debug!("Listed {} windows ({} with thumbnails)", window_infos.len(), window_infos.iter().filter(|w| !w.image_path.is_empty()).count());
         window_infos
     })
     .await
