@@ -40,6 +40,9 @@ Briefcast is Windows-only today. Screen/window capture (`gdigrab`/`dshow`), wind
 monitor enumeration, and screenshot capture are all implemented directly against the
 Win32 API, and only Windows FFmpeg binaries are bundled.
 
+## Global key support
+Ctrl + shift + H : Minimize and maximize recording shortcut.
+
 ## Prerequisites
 
 - Windows 10 or 11 (64-bit)
