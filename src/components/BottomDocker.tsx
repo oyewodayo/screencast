@@ -12,6 +12,9 @@ import EnhancedScreenOptions from "./EnhancedScreenOptions";
 
 interface Props {
   handleFolderSettings: () => void;
+  handleGoHome: () => void;
+  handleOpenSettings: () => void;
+  handleOpenExternalFile: () => void;
   showFileList: boolean;
   selectScreen: boolean;
   setScreen: () => void;
@@ -61,6 +64,9 @@ interface Props {
 type ConnectedDevice = string[];
 const BottomDocker = ({
   handleFolderSettings,
+  handleGoHome,
+  handleOpenSettings,
+  handleOpenExternalFile,
   showFileList,
   selectScreen,
   setScreen,
@@ -279,6 +285,9 @@ const BottomDocker = ({
         res_message={res_message}
         error={error}
         handleFolderSettings={handleFolderSettings}
+        handleGoHome={handleGoHome}
+        handleOpenSettings={handleOpenSettings}
+        handleOpenExternalFile={handleOpenExternalFile}
         handleVideoOverlayAction={handleVideoOverlayAction}
         handleStopRecording={handleStopRecording}
         showDocker={showDocker}

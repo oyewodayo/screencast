@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoClose, IoMicCircle, IoOpenSharp, IoScanSharp, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen } from 'react-icons/io5'
+import { IoClose, IoMicCircle, IoOpenSharp, IoScanSharp, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline } from 'react-icons/io5'
 
 interface Props {
     recordType: string;
@@ -9,6 +9,9 @@ interface Props {
     res_message:string;
     error:string;
     handleFolderSettings:()=>void;
+    handleGoHome:()=>void;
+    handleOpenSettings:()=>void;
+    handleOpenExternalFile:()=>void;
     handleVideoOverlayAction: ()=>void;
     handleStopRecording: () => void;
     showDocker:boolean;
@@ -17,7 +20,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,res_message,error,handleFolderSettings, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
+        recordType,isRecording,recordingStartTime,res_message,error,handleFolderSettings,handleGoHome,handleOpenSettings,handleOpenExternalFile, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -65,18 +68,35 @@ const ActiveRecordingState = (
                 {error && <p className="error text-right text-red-400">{error}</p>}
             </div>
             <div className='flex justify-between pl-2 pb-2 items-center align-middle'>
-                <div className="flex">
+                <div className="flex items-center">
                    {showFileList ? (
                         <IoFolderOpen
                         className="cursor-pointer mr-4 text-white text-xl"
                         onClick={() => handleFolderSettings()}
+                        title="Toggle file list"
                         />
                     ) : (
                         <IoFolder
                         className="cursor-pointer mr-4 text-white text-xl"
                         onClick={() => handleFolderSettings()}
+                        title="Toggle file list"
                         />
                     )}
+                    <IoDocumentAttachOutline
+                    className="cursor-pointer mr-4 text-white text-xl"
+                    onClick={() => handleOpenExternalFile()}
+                    title="Open file from anywhere"
+                    />
+                    <IoHomeOutline
+                    className="cursor-pointer mr-4 text-white text-xl"
+                    onClick={() => handleGoHome()}
+                    title="Home"
+                    />
+                    <IoSettingsOutline
+                    className="cursor-pointer mr-4 text-white text-xl"
+                    onClick={() => handleOpenSettings()}
+                    title="Settings"
+                    />
                 </div>
                 <div className='flex items-center'>
 

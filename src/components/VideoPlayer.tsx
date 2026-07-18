@@ -43,7 +43,9 @@ interface TimelineProgress {
 }
 
 type VolumeLevel = 'low' | 'high' | 'muted';
-type MediaType = 'video' | 'audio' | 'image' | 'pdf';
+// PDFs are handled by the dedicated PdfAnnotator component (see Dashboard.tsx routing) —
+// they never reach this component, so 'pdf' is intentionally not a MediaType here.
+type MediaType = 'video' | 'audio' | 'image';
 
 // Component interfaces for keyboard handler
 interface KeyboardHandlerActions {
@@ -112,7 +114,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   const detectMediaType = (fileSrc: string): MediaType => {
     const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.svg'];
     const audioExtensions = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'];
-    const pdfExtensions = ['.pdf'];
 
     // Query strings/fragments (e.g. Tauri asset URLs) can trail the real extension.
     const lowerSrc = fileSrc.toLowerCase().split(/[?#]/)[0];
@@ -121,8 +122,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
       return 'image';
     } else if (audioExtensions.some(ext => lowerSrc.endsWith(ext))) {
       return 'audio';
-    } else if (pdfExtensions.some(ext => lowerSrc.endsWith(ext))) {
-      return 'pdf';
     }
     return 'video';
   };
@@ -134,8 +133,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
     const type = detectMediaType(src);
     setMediaType(type);
 
-    if (type === 'image' || type === 'pdf') {
-      setCurrentFileTitle(title || (type === 'pdf' ? 'PDF' : 'Image'));
+    if (type === 'image') {
+      setCurrentFileTitle(title || 'Image');
       setIsPaused(true);
       setIsPlaying(false);
     }
@@ -606,17 +605,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
 						}}
 						/>
 					</div>
-				) : mediaType === 'pdf' ? (
-					<iframe
-						src={src}
-						title={currentFileTitle || 'PDF'}
-						style={{
-							width: '100%',
-							height: '100%',
-							border: 'none',
-							backgroundColor: '#fff'
-						}}
-					/>
 				) : (
 					<video
 						ref={videoRef}

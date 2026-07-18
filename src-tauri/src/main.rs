@@ -15,6 +15,7 @@ mod commands {
 }
 mod services {
     pub mod utility;
+    pub mod pdf_annotations;
 }
 use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMode, ConfigBuilder};
 
@@ -150,7 +151,9 @@ fn main() {
             services::utility::open_file_from_directory,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
-            services::utility::rename_file
+            services::utility::rename_file,
+            services::pdf_annotations::save_pdf_annotations,
+            services::pdf_annotations::load_pdf_annotations
         ])
         .build(context)
         .expect("error while building tauri application")

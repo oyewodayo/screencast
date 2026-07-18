@@ -19,14 +19,15 @@
       "protocol": {
         "all": false,
         "asset": true,
-        "assetScope": ["$VIDEO/Briefcast/**", "$TEMP/**"]
+        "assetScope": ["**"]
       },
       "path": {
         "all": false
       },
       "dialog": {
         "all": false,
-        "message": true
+        "message": true,
+        "open": true
       },
       "notification": {
         "all": false
@@ -77,7 +78,7 @@
   
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost data:; media-src 'self' asset: https://asset.localhost; frame-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost data:; media-src 'self' asset: https://asset.localhost; frame-src 'self' asset: https://asset.localhost; connect-src 'self' asset: https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
     },
     "bundle": {
       "active": true,

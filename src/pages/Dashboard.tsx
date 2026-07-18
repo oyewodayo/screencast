@@ -1,6 +1,7 @@
 // Dashboard.tsx
 import { useState, useEffect } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
+import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
 import BottomDocker from "../components/BottomDocker";
 import { listen } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
@@ -9,6 +10,9 @@ import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortc
 import { formatFileName } from "../utils/Formater";
 import VideoPlayer from "../components/VideoPlayer";
 import ConversionDialog from "../components/ConversionDialog";
+import PdfAnnotator from "../components/PdfAnnotator";
+import SettingsModal from "../components/Modals/SettingsModal";
+import { loadSettings } from "../utils/appSettings";
 import { IoVideocam, IoMusicalNotes, IoImage, IoDocumentText } from "react-icons/io5";
 
 type RAMInfo = [number, number];
@@ -34,6 +38,16 @@ const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.R
   { category: "audio", label: "Audio", icon: <IoMusicalNotes size={18} /> },
   { category: "image", label: "Image", icon: <IoImage size={18} /> },
   { category: "pdf", label: "Pdf", icon: <IoDocumentText size={18} /> },
+];
+
+// Filters shown in the native "open file" dialog — same extensions the sidebar already
+// understands, so anything pickable there is guaranteed playable/viewable here too.
+const OPEN_FILE_DIALOG_FILTERS = [
+  { name: "All supported files", extensions: Object.values(FILE_CATEGORY_EXTENSIONS).flat() },
+  { name: "Video", extensions: FILE_CATEGORY_EXTENSIONS.video },
+  { name: "Audio", extensions: FILE_CATEGORY_EXTENSIONS.audio },
+  { name: "Image", extensions: FILE_CATEGORY_EXTENSIONS.image },
+  { name: "PDF", extensions: FILE_CATEGORY_EXTENSIONS.pdf },
 ];
 
 // Toggles the recording-overlay window's visibility. Registered as an OS-level hotkey via
@@ -67,9 +81,12 @@ const Dashboard = () => {
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [error, setError] = useState<string>("");
   const [ramInfo, setRamInfo] = useState<RAMInfo | null>(null);
-  const [fileName, setFileName] = useState("Recording_" + new Date().toLocaleDateString().replace(/\//g, "_"));
-  const [fileExt, setFileExt] = useState("avi");
-  const [recordType, setRecordType] = useState("sva");
+  const [fileName, setFileName] = useState(
+    () => loadSettings().defaultFileNamePrefix + "_" + new Date().toLocaleDateString().replace(/\//g, "_")
+  );
+  const [fileExt, setFileExt] = useState(() => loadSettings().defaultFileExt);
+  const [recordType, setRecordType] = useState(() => loadSettings().defaultRecordType);
+  const [showSettings, setShowSettings] = useState<boolean>(false);
   const [audioDevice, setAudioDevice] = useState("");
   const [videoDevice, setVideoDevice] = useState("");
   const [selectScreen, setSelectScreen] = useState(false);
@@ -340,33 +357,73 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-  // NEW: Handler to pass file selection to VideoPlayer
-	const handleFileClick = async (file: FileEntry) => {
+	const handleGoHome = () => setSelectedFile(null);
+	const handleOpenSettings = () => setShowSettings(true);
+	const handleCloseSettings = () => setShowSettings(false);
+	// Settings apply immediately to the current session too, not just future ones — otherwise
+	// saving a new default file extension/type wouldn't visibly do anything until next launch.
+	const handleSettingsSaved = (settings: ReturnType<typeof loadSettings>) => {
+		setFileExt(settings.defaultFileExt);
+		setRecordType(settings.defaultRecordType);
+	};
+
+  // Shared by the sidebar (files already in the Briefcast library) and the "open file from
+  // anywhere" picker below — both just need a raw filesystem path turned into a playable URL.
+	const loadFileForPlayback = async (filePath: string, fileName: string) => {
 	try {
 		// Get the absolute file path from Rust
-		const absolutePath = await invoke<string>("convert_file_path_to_url", { 
-		filepath: file.path 
+		const absolutePath = await invoke<string>("convert_file_path_to_url", {
+		filepath: filePath
 		});
-		
+
 		console.log('Absolute file path:', absolutePath);
-		
+
 		// Convert to asset protocol URL using Tauri's helper
 		const fileUrl = convertFileSrc(absolutePath);
-		
+
 		console.log('Converted file URL:', fileUrl);
-		
+
 		// Update the selected file state
 		setSelectedFile({
 		path: fileUrl,
-		name: file.name,
-		sourcePath: file.path
+		name: fileName,
+		sourcePath: filePath
 		});
-		
-		console.log('File selected for playback:', file.name);
+
+		console.log('File selected for playback:', fileName);
 	} catch (error) {
 		console.error('Error loading file:', error);
 		setError(`Failed to load file: ${error}`);
 	}
+	};
+
+	const handleFileClick = async (file: FileEntry) => {
+		await loadFileForPlayback(file.path, file.name);
+	};
+
+	// Opens a native OS file picker scoped to nowhere in particular — unlike the sidebar (which
+	// only ever lists files under the app's own Briefcast folder), this lets the user view/play
+	// any video, audio, image, or PDF already sitting anywhere else on their system. Selecting
+	// one just opens it in the player/annotator; it does not get copied or added to the sidebar.
+	const handleOpenExternalFile = async () => {
+		try {
+			const selected = await openFileDialog({ multiple: false, filters: OPEN_FILE_DIALOG_FILTERS });
+			if (!selected || Array.isArray(selected)) return; // cancelled
+
+			const name = selected.split(/[\\/]/).pop() ?? selected;
+			if (!getFileCategory(name)) {
+				await showMessageDialog(`"${name}" isn't a supported file type (video, audio, image, or PDF).`, {
+					title: 'Unsupported file',
+					type: 'warning',
+				});
+				return;
+			}
+
+			await loadFileForPlayback(selected, name);
+		} catch (error) {
+			console.error('Error opening file:', error);
+			setError(`Failed to open file: ${error}`);
+		}
 	};
 
 	const startRename = (file: FileEntry) => {
@@ -556,12 +613,21 @@ const setScreen = () => {
          <div className="flex-1 flex items-center justify-center bg-gray-100">
       
           {selectedFile ? (
-            <VideoPlayer 
-				key={selectedFile.path}
-              	src={selectedFile.path}
-              	title={selectedFile.name}
-            	autoPlay={true}
-            />
+            getFileCategory(selectedFile.name) === "pdf" ? (
+              <PdfAnnotator
+                key={selectedFile.path}
+                src={selectedFile.path}
+                sourcePath={selectedFile.sourcePath}
+                title={selectedFile.name}
+              />
+            ) : (
+              <VideoPlayer
+                key={selectedFile.path}
+                src={selectedFile.path}
+                title={selectedFile.name}
+                autoPlay={true}
+              />
+            )
           ) : (
             <div className="flex items-center justify-center h-full w-full text-gray-500 italic">
               Select a file from the list to play
@@ -606,8 +672,13 @@ const setScreen = () => {
         res_message={message}
         error={error}
         handleFolderSettings={toggleFileList}
+        handleGoHome={handleGoHome}
+        handleOpenSettings={handleOpenSettings}
+        handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}
       />
+
+      {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} />}
     </div>
   );
 };
