@@ -346,7 +346,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
 
   if (pdfError) {
     return (
-      <div className="flex items-center justify-center h-full w-full text-red-600 italic">
+      <div className="flex items-center justify-center h-full w-full text-red-600 dark:text-red-400 italic">
         Failed to load PDF: {pdfError}
       </div>
     );
@@ -377,7 +377,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
   );
 
   return (
-    <div className="w-full h-screen flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200">
+    <div className="w-full h-screen flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950">
       {isFullscreen ? (
         // Presentation mode: no toolbar chrome at all — just the page(s) and a single,
         // always-visible way back out (the shortcuts — F, Escape — still work with nothing
@@ -428,7 +428,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
           sidebar/toolbar around instead of just scrolling within this box. */}
       <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex items-start justify-center p-8">
         {pdfLoading || !pdfDoc || store.loading ? (
-          <div className="text-gray-500 italic mt-20">Loading…</div>
+          <div className="text-gray-500 dark:text-neutral-400 italic mt-20">Loading…</div>
         ) : twoPageMode ? (
           <div className="flex items-start gap-4">
             {renderPage(clampedPageIndex, "left")}

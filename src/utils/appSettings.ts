@@ -14,6 +14,8 @@ export interface AppSettings {
   pdfDefaultPenColor: string;
   pdfDefaultHighlighterColor: string;
   pdfDefaultStrokeWidth: number;
+  // "system" follows the OS light/dark preference; "light"/"dark" pin it explicitly.
+  theme: "light" | "dark" | "system";
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -27,6 +29,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pdfDefaultPenColor: "#1a1a1a",
   pdfDefaultHighlighterColor: "#ffd43b",
   pdfDefaultStrokeWidth: 4,
+  theme: "system",
 };
 
 export function loadSettings(): AppSettings {

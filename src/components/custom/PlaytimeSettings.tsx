@@ -31,12 +31,12 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   const playbackSpeeds = ['0.25', '0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
 
   return (
-    <div className="origin-bottom-right absolute bottom-full right-0 w-[220px] rounded-md shadow-lg bg-white text-gray-700 ring-1 ring-black ring-opacity-5 z-50">
+    <div className="origin-bottom-right absolute bottom-full right-0 w-[220px] rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 z-50">
       <div className="py-1 w-[100%]">
-        
+
         {/* Autoplay Setting */}
         <button
-          className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 text-left"
+          className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 text-left"
           onClick={onAutoplayChange}
         >
           <div className='flex gap-2 place-items-center'>
@@ -54,14 +54,14 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
         </button>
 
         {/* Playback Speed Setting */}
-        <div className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 hover:bg-gray-100">
+        <div className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700">
           <div className='flex gap-2 place-items-center'>
             Playback Speed
           </div>
-          <select 
-            value={playbackSpeed.replace('x', '')} 
+          <select
+            value={playbackSpeed.replace('x', '')}
             onChange={handlePlaybackSpeedChange}
-            className="bg-gray-100 border border-gray-300 text-gray-700 text-sm rounded focus:ring-blue-500 focus:border-blue-500 p-1"
+            className="bg-gray-100 dark:bg-neutral-900 border border-gray-300 dark:border-neutral-600 text-gray-700 dark:text-neutral-200 text-sm rounded focus:ring-blue-500 focus:border-blue-500 p-1"
           >
             {playbackSpeeds.map((speed) => (
               <option key={speed} value={speed}>
@@ -72,7 +72,7 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
         </div>
 
         {/* Opacity Setting */}
-        <div className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 hover:bg-gray-100">
+        <div className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700">
           <div className='flex gap-2 place-items-center'>
             <MdOutlineOpacity className='-my-1 text-2xl'/> 
             Opacity 

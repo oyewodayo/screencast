@@ -157,14 +157,14 @@ const ConversionDialog: React.FC<{
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-white p-6 rounded-lg max-w-md w-full">
+      <div className="bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100 p-6 rounded-lg max-w-md w-full">
         <h3 className="text-lg font-semibold mb-4">Convert Video</h3>
-        
+
         <div className="mb-4">
-          <p className="text-sm text-gray-600 mb-2">
+          <p className="text-sm text-gray-600 dark:text-neutral-400 mb-2">
             File: <strong>{fileName}</strong>
           </p>
-          
+
           {/* Format Selection */}
           <div className="mb-3">
             <label className="block text-sm font-medium mb-1">Output Format</label>
@@ -172,7 +172,7 @@ const ConversionDialog: React.FC<{
               value={selectedFormat}
               onChange={(e) => setSelectedFormat(e.target.value)}
               disabled={isConverting}
-              className="w-full border border-gray-300 rounded px-3 py-2"
+              className="w-full border border-gray-300 dark:border-neutral-600 bg-white dark:bg-neutral-800 rounded px-3 py-2"
             >
               {formats.map(fmt => (
                 <option key={fmt.value} value={fmt.value}>
@@ -202,8 +202,8 @@ const ConversionDialog: React.FC<{
               <span className="capitalize">{conversionProgress.status}</span>
               <span>{Math.round(conversionProgress.progress)}%</span>
             </div>
-            <div className="w-full bg-gray-200 rounded-full h-2">
-              <div 
+            <div className="w-full bg-gray-200 dark:bg-neutral-700 rounded-full h-2">
+              <div
                 className={`h-2 rounded-full transition-all duration-300 ${
                   conversionProgress.status === 'failed' ? 'bg-red-600' :
                   conversionProgress.status === 'completed' ? 'bg-green-600' :
@@ -212,22 +212,22 @@ const ConversionDialog: React.FC<{
                 style={{ width: `${conversionProgress.progress}%` }}
               />
             </div>
-            <p className="text-sm text-gray-600 mt-1">{conversionProgress.message}</p>
+            <p className="text-sm text-gray-600 dark:text-neutral-400 mt-1">{conversionProgress.message}</p>
           </div>
         )}
 
         {/* Error Display */}
         {error && (
-          <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">
+          <div className="mb-4 p-3 bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 rounded text-sm text-red-700 dark:text-red-400">
             {error}
           </div>
         )}
 
         {/* Buttons */}
         <div className="flex gap-2 justify-end">
-          <button 
+          <button
             onClick={handleCancel}
-            className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded"
+            className="px-4 py-2 text-gray-600 dark:text-neutral-300 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded"
           >
             {isConverting ? 'Cancel' : 'Close'}
           </button>

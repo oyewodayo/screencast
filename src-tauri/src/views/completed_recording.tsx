@@ -7,6 +7,13 @@ import FileModal from "../../../src/components/Modals/FileModal";
 // too, every Tailwind class used by FileModal has no matching CSS in this window at all,
 // rendering as unstyled raw HTML.
 import "../../../src/index.css";
+// Same reasoning as the stylesheet import above: this window has no ThemeProvider of its own,
+// so it needs to independently apply the persisted light/dark preference (initTheme reads the
+// same localStorage settings the main window writes to, since both share the app's webview
+// storage) to avoid rendering permanently light regardless of the user's setting.
+import { initTheme } from "../../../src/contexts/ThemeContext";
+
+initTheme();
 
 // The path is baked into this window's own URL by create_or_replace_rec_completed_modal
 // (Rust side) rather than sent via an event - by the time any event listener registered here

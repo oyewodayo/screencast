@@ -126,11 +126,11 @@ const RecordingOverlayWindow = () => {
 
     // Render full overlay
     return (
-        <div className="w-full h-full flex flex-col bg-white/95 backdrop-blur-sm rounded-lg">
+        <div className="w-full h-full flex flex-col bg-white/95 dark:bg-neutral-900/95 backdrop-blur-sm rounded-lg">
             {/* Draggable header */}
-            <div 
+            <div
                 data-tauri-drag-region
-                className="bg-gray-800 rounded-t-lg px-3 py-2 cursor-move flex justify-between items-center"
+                className="bg-gray-800 dark:bg-neutral-950 rounded-t-lg px-3 py-2 cursor-move flex justify-between items-center"
             >
                 <div className="flex items-center gap-2">
                     <div className="w-2.5 h-2.5 rounded-full bg-red-500"></div>

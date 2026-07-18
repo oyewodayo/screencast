@@ -289,7 +289,7 @@ const BottomDocker = ({
         showFileList={showFileList} 
          />
       
-      {showDocker && (<div className="light w-full flex flex-col p-4">
+      {showDocker && (<div className="w-full flex flex-col p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
         <div className="w-full flex flex-row justify-between gap-5 overflow-auto">
           
           <div className="flex justify-end p-2">
@@ -297,7 +297,7 @@ const BottomDocker = ({
               <div className=" p-1 text-sm">Save file as</div>
               <input
                 type="text"
-                className="file_name p-2.5 rounded-l text-sm"
+                className="file_name p-2.5 rounded-l text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
                 name="file_name"
                 id="file_name"
                 value={fileName}
@@ -311,7 +311,7 @@ const BottomDocker = ({
                 <select
                   name="file_ext"
                   id="file_ext"
-                  className="p-2.5 rounded-r text-sm"
+                  className="p-2.5 rounded-r text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
                   value={fileExt}
                   onChange={handleFileExtChange}
                 >
@@ -347,7 +347,7 @@ const BottomDocker = ({
               <select
                 name="record_type"
                 id="record_type"
-                className="p-2.5 rounded-md text-sm "
+                className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
                 value={recordType}
                 onChange={handleRecordTypeChange}
               >
@@ -374,7 +374,7 @@ const BottomDocker = ({
                 // onClick={onStartRecording}
                 onClick={()=>openModalScreen()}
                 disabled={isRecording}
-                className="p-2.5 rounded-md text-sm border mr-2"
+                className="p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 mr-2"
               >
                 {recordType == "c" ? "Capture" : "Start Recording"}
               </button>}
@@ -383,7 +383,7 @@ const BottomDocker = ({
                 <button
                   onClick={handleStopRecording}
                   disabled={!isRecording}
-                  className={"p-2.5 rounded-md text-sm bg-white"}
+                  className={"p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"}
                 >
                   Stop Recording
                 </button>
@@ -394,7 +394,7 @@ const BottomDocker = ({
                 <select
                   name="audioDevice"
                   id="audioDevice"
-                  className="p-2.5 rounded-md text-sm mr-2"
+                  className="p-2.5 rounded-md text-sm mr-2 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
                   value={audioDevice}
                   onChange={handleAudioDeviceChange}
                 >
@@ -414,7 +414,7 @@ const BottomDocker = ({
                 <select
                   name="videoDevice"
                   id="videoDevice"
-                   className="p-2.5 rounded-md text-sm"
+                   className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
                   value={videoDevice}
                   onChange={handleVideoDeviceChange}
                 >
@@ -431,7 +431,7 @@ const BottomDocker = ({
               </div>
               <div className="ml-2 align-middle">
                 <IoRefresh
-                  className="padding-bottom-7 padding-left-10 cursor-pointer"
+                  className="padding-bottom-7 padding-left-10 cursor-pointer text-neutral-700 dark:text-neutral-300"
                   onClick={loadDevices}
                   title="Refresh device list"
                   />
@@ -450,11 +450,11 @@ const BottomDocker = ({
             {ramInfo ? (
               <span>
                 {" "}
-                <span className="text-green-800">
+                <span className="text-green-800 dark:text-green-400">
                   {(ramInfo[1] / 1024).toFixed(2)} GB
                 </span>
                 /
-                <span className="text-blue-500">
+                <span className="text-blue-500 dark:text-blue-400">
                   {(ramInfo[0] / 1024).toFixed(2)} GB
                 </span>
               </span>
@@ -464,7 +464,7 @@ const BottomDocker = ({
           </span>
           <OsInfo />
           </div>
-          <div className="right-0"><span> <a href="https://x.com/oyewodayo" target="blank">Request feature / Report a bug</a></span></div>
+          <div className="right-0"><span> <a href="https://x.com/oyewodayo" target="blank" className="text-blue-600 dark:text-blue-400">Request feature / Report a bug</a></span></div>
         </div>
       </div>)}
     </div>

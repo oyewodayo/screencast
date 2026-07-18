@@ -47,7 +47,7 @@ const TOOL_BUTTONS: { tool: AnnotationTool; label: string; shortcut: string; ico
 ];
 
 // Thin vertical hairline used to separate control groups, mirroring macOS/iPadOS toolbar chrome.
-const Divider: React.FC = () => <div className="w-px h-6 bg-black/[0.06] shrink-0" />;
+const Divider: React.FC = () => <div className="w-px h-6 bg-black/[0.06] dark:bg-white/[0.1] shrink-0" />;
 
 // Circular, icon-only button — the base unit every control in this toolbar is built from.
 const IconButton: React.FC<{
@@ -64,8 +64,8 @@ const IconButton: React.FC<{
     disabled={disabled}
     className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors duration-150 ${
       active
-        ? "bg-white text-blue-600 shadow-sm"
-        : "text-neutral-500 hover:bg-black/[0.05] hover:text-neutral-800"
+        ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
+        : "text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] hover:text-neutral-800 dark:hover:text-neutral-100"
     } disabled:opacity-30 disabled:hover:bg-transparent disabled:pointer-events-none`}
   >
     {children}
@@ -83,7 +83,7 @@ const SaveStatus: React.FC<{ isSaving: boolean; saveError: string | null }> = ({
   }
   if (isSaving) {
     return (
-      <div className="flex items-center gap-1.5 text-neutral-400 text-xs font-medium">
+      <div className="flex items-center gap-1.5 text-neutral-400 dark:text-neutral-500 text-xs font-medium">
         <IoCloudUploadOutline size={15} className="animate-pulse" />
         <span className="hidden sm:inline">Saving…</span>
       </div>
@@ -137,7 +137,7 @@ const PageJumpInput: React.FC<{ currentPageIndex: number; numPages: number; onPa
       }}
       onBlur={commit}
       onFocus={(e) => e.currentTarget.select()}
-      className="w-7 text-center text-xs font-medium text-neutral-700 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
+      className="w-7 text-center text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
     />
   );
 };
@@ -184,7 +184,7 @@ const ZoomInput: React.FC<{ zoom: number; minZoom: number; maxZoom: number; onZo
       }}
       onBlur={commit}
       onFocus={(e) => e.currentTarget.select()}
-      className="w-8 text-center text-xs font-medium text-neutral-600 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
+      className="w-8 text-center text-xs font-medium text-neutral-600 dark:text-neutral-300 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
     />
   );
 };
@@ -218,11 +218,11 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
 }) => {
   return (
     <div className="shrink-0 px-4 pt-3 pb-2">
-      <div className="flex items-center gap-3 mx-auto max-w-fit px-3 py-2 rounded-2xl bg-white/75 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.04]">
+      <div className="flex items-center gap-3 mx-auto max-w-fit px-3 py-2 rounded-2xl bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.04] dark:ring-white/[0.08]">
         {title && (
           <>
-            <div className="flex items-center gap-1.5 pl-1 pr-1 text-neutral-600 max-w-[160px]" title={title}>
-              <IoDocumentTextOutline size={15} className="shrink-0 text-neutral-400" />
+            <div className="flex items-center gap-1.5 pl-1 pr-1 text-neutral-600 dark:text-neutral-300 max-w-[160px]" title={title}>
+              <IoDocumentTextOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
               <span className="text-sm font-medium truncate">{title}</span>
             </div>
             <Divider />
@@ -233,7 +233,7 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             effect of re-clicking an active tool) so deselecting has an unmistakable, always-
             highlightable target — clicking an active pen/highlighter/eraser again also toggles
             it off, but this is the explicit, discoverable way to get back to "nothing selected". */}
-        <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045]">
+        <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045] dark:bg-white/[0.06]">
           <IconButton title="Select / no tool (V)" active={tool === null} onClick={onDeselectTool}>
             <BsCursor size={14} />
           </IconButton>
@@ -288,16 +288,16 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
         <Divider />
 
         {/* Page navigator pill */}
-        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] pl-1 pr-2 py-0.5">
+        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] dark:bg-white/[0.06] pl-1 pr-2 py-0.5">
           <IconButton title="Previous page (←)" disabled={currentPageIndex <= 0} onClick={() => onPageChange(currentPageIndex - pageStep)}>
             <IoIosArrowBack size={15} />
           </IconButton>
           {numPages === 0 ? (
-            <span className="text-xs font-medium text-neutral-600 w-14 text-center">…</span>
+            <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300 w-14 text-center">…</span>
           ) : (
-            <span className="flex items-center gap-1 text-xs font-medium text-neutral-600 tabular-nums">
+            <span className="flex items-center gap-1 text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums">
               <PageJumpInput currentPageIndex={currentPageIndex} numPages={numPages} onPageChange={onPageChange} />
-              <span className="text-neutral-400">
+              <span className="text-neutral-400 dark:text-neutral-500">
                 {twoPageMode && currentPageIndex + 1 < numPages ? `-${currentPageIndex + 2} ` : " "}
                 / {numPages}
               </span>
@@ -309,11 +309,11 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
         </div>
 
         {/* Zoom pill */}
-        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] pl-1 pr-2 py-0.5">
+        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] dark:bg-white/[0.06] pl-1 pr-2 py-0.5">
           <IconButton title="Zoom out (Ctrl+-)" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
             <IoRemove size={16} />
           </IconButton>
-          <span className="flex items-center text-xs font-medium text-neutral-600 tabular-nums">
+          <span className="flex items-center text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums">
             <ZoomInput zoom={zoom} minZoom={minZoom} maxZoom={maxZoom} onZoomChange={onZoomChange} />%
           </span>
           <IconButton title="Zoom in (Ctrl+=)" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>

@@ -464,20 +464,20 @@ const setScreen = () => {
 
 
   return (
-    <div className="w-full h-screen flex flex-col">
+    <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
       <div className="p-">
         <div className="flex justify-between">
           {/* File list sidebar — force-collapsed in PDF fullscreen/presentation mode,
               regardless of showFileList, so it never reappears over the presented page. */}
           <div
-            className={`h-screen light border-b border-gray-300 transition-all duration-300 overflow-hidden ${
+            className={`h-screen bg-neutral-50 dark:bg-neutral-900 border-b border-gray-300 dark:border-neutral-700 transition-all duration-300 overflow-hidden ${
               showFileList && !isPdfFullscreen ? "w-[250px] opacity-100" : "w-0 opacity-0"
             }`}
           >
             {showFileList && !isPdfFullscreen && (
               <div className="flex flex-col h-full">
                 {/* File type tabs */}
-                <div className="flex items-center justify-around border-b border-gray-300 py-2 shrink-0">
+                <div className="flex items-center justify-around border-b border-gray-300 dark:border-neutral-700 py-2 shrink-0">
                   {FILE_CATEGORY_TABS.map(({ category, label, icon }) => (
                     <button
                       key={category}
@@ -486,8 +486,8 @@ const setScreen = () => {
                       onClick={() => setActiveFileCategory(category)}
                       className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
                         activeFileCategory === category
-                          ? "text-blue-600 bg-blue-50"
-                          : "text-gray-500 hover:text-blue-500 hover:bg-gray-50"
+                          ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                          : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
                       }`}
                     >
                       {icon}
@@ -496,7 +496,7 @@ const setScreen = () => {
                   ))}
                 </div>
 
-                <div className="p-3 text-sm overflow-y-auto flex-1">
+                <div className="p-3 text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200">
                 {(() => {
                   const filteredEntries = Object.entries(files)
                     .map(([folder, fileList]) => [
@@ -511,19 +511,19 @@ const setScreen = () => {
 
                   return filteredEntries.map(([folder, fileList]) => (
                     <div key={folder} className="mb-4">
-                      <h3 className="font-semibold text-gray-700">{folder}:</h3>
+                      <h3 className="font-semibold text-gray-700 dark:text-neutral-300">{folder}:</h3>
                       <ul className="ml-2 mt-1">
                         {fileList.map((file) => (
                           <li
                             key={file.path}
-                            className={`flex items-center justify-between group cursor-pointer hover:bg-gray-50 ${
-                              selectedFile?.sourcePath === file.path ? 'bg-blue-50' : ''
+                            className={`flex items-center justify-between group cursor-pointer hover:bg-gray-50 dark:hover:bg-neutral-800 ${
+                              selectedFile?.sourcePath === file.path ? 'bg-blue-50 dark:bg-blue-500/10' : ''
                             }`}
                           >
                             {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
                             {renamingFile === file.path ? (
                               <input
-                                className="flex-1 border border-blue-400 rounded px-1 text-sm"
+                                className="flex-1 border border-blue-400 rounded px-1 text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
                                 autoFocus
                                 value={renameValue}
                                 onClick={(e) => e.stopPropagation()}
@@ -536,8 +536,8 @@ const setScreen = () => {
                               />
                             ) : (
                               <div
-                                className={`flex-1 hover:text-blue-500 ${
-                                  selectedFile?.sourcePath === file.path ? 'text-blue-600 font-medium' : ''
+                                className={`flex-1 hover:text-blue-500 dark:hover:text-blue-400 ${
+                                  selectedFile?.sourcePath === file.path ? 'text-blue-600 dark:text-blue-400 font-medium' : ''
                                 }`}
                                 title={file.name}
                                 onClick={() => handleFileClick(file)}
@@ -549,7 +549,7 @@ const setScreen = () => {
                             {/* Three vertical dots menu */}
                             <div className="relative">
                               <button
-                                className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-200 transition-opacity"
+                                className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-200 dark:hover:bg-neutral-700 transition-opacity"
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   setOpenMenu(openMenu === file.path ? null : file.path);
@@ -559,12 +559,12 @@ const setScreen = () => {
                                   <path d="M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/>
                                 </svg>
                               </button>
-                              
+
                               {/* Popup Menu */}
                               {openMenu === file.path && (
-                                <div className="absolute right-0 top-full mt-1 w-32 bg-white border border-gray-200 rounded-md shadow-lg z-10">
+                                <div className="absolute right-0 top-full mt-1 w-32 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg z-10">
                                   <button
-                                    className="w-full text-left px-3 py-2 hover:bg-gray-100 text-sm"
+                                    className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       startRename(file);
@@ -573,7 +573,7 @@ const setScreen = () => {
                                     Rename
                                   </button>
                                    <button
-                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 text-sm"
+                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
                                       onClick={(e) => {
                                         e.stopPropagation();
                                         setConversionFile(file);
@@ -627,8 +627,8 @@ const setScreen = () => {
               }}
             />
           )}
-         <div className="flex-1 min-w-0 flex items-center justify-center bg-gray-100">
-      
+         <div className="flex-1 min-w-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
+
           {selectedFile ? (
             getFileCategory(selectedFile.name) === "pdf" ? (
               <PdfAnnotator
@@ -648,7 +648,7 @@ const setScreen = () => {
               />
             )
           ) : (
-            <div className="flex items-center justify-center h-full w-full text-gray-500 italic">
+            <div className="flex items-center justify-center h-full w-full text-gray-500 dark:text-neutral-400 italic">
               Select a file from the list to play
             </div>
           )}

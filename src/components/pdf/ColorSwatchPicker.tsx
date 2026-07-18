@@ -54,7 +54,7 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange }
           <div
             ref={popoverRef}
             style={{ position: "fixed", top: coords.top, left: coords.left, transform: "translateX(-50%)" }}
-            className="flex items-center gap-2 px-2.5 py-2 rounded-2xl bg-white/90 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.18)] ring-1 ring-black/[0.06] z-[9999]"
+            className="flex items-center gap-2 px-2.5 py-2 rounded-2xl bg-white/90 dark:bg-neutral-800/95 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.18)] ring-1 ring-black/[0.06] dark:ring-white/[0.1] z-[9999]"
           >
             {PALETTE.map((swatch) => (
               <button
@@ -66,12 +66,12 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange }
                   setOpen(false);
                 }}
                 className={`w-6 h-6 rounded-full transition-transform duration-150 hover:scale-110 ${
-                  swatch.toLowerCase() === color.toLowerCase() ? "ring-2 ring-blue-500 ring-offset-2 ring-offset-white/90" : "ring-1 ring-black/[0.06]"
+                  swatch.toLowerCase() === color.toLowerCase() ? "ring-2 ring-blue-500 ring-offset-2 ring-offset-white/90 dark:ring-offset-neutral-800" : "ring-1 ring-black/[0.06] dark:ring-white/20"
                 }`}
                 style={{ backgroundColor: swatch }}
               />
             ))}
-            <div className="w-px h-5 bg-black/[0.08]" />
+            <div className="w-px h-5 bg-black/[0.08] dark:bg-white/[0.12]" />
             <input
               type="color"
               title="Custom color"
