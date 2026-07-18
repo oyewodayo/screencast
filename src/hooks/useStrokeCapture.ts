@@ -55,15 +55,27 @@ export default function useStrokeCapture(opts: UseStrokeCaptureOptions): void {
   const drawingRef = useRef(false);
   const rafRef = useRef<number | null>(null);
   const activeLineRef = useRef<ActiveTextLine | null>(null);
+  // The single pointer this stroke belongs to. Without this, a resting palm on a touchscreen
+  // (or any second simultaneous contact) fires its own independent pointerdown/move/up stream on
+  // this same canvas — its pointerdown resets `pointsRef` mid-stroke and its moves get appended
+  // alongside the real finger's, producing exactly the chaotic, jumping-between-two-locations
+  // scribble you get from bare-hand touch drawing without this. Every handler below ignores
+  // events from any pointerId other than this one for the duration of a stroke — first contact
+  // wins, everything else is rejected until release, which is the standard "poor man's palm
+  // rejection" approach for devices without hardware-level palm detection.
+  const activePointerIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     const canvas = opts.scratchCanvasRef.current;
     if (!canvas || !opts.enabled) return;
 
-    // Deliberately no `touch-action: none` here — that would disable trackpad/touch panning
-    // over the *entire* page (this canvas covers it all), breaking scroll everywhere except
-    // mid-stroke. pointerdown's preventDefault() below is enough to stop the browser's own
-    // gesture handling for the duration of an actual stroke.
+    // touch-action: none while a drawing tool is active (this effect only runs then — see
+    // `enabled` in PdfPage, which is false in plain view/select mode) so a touchscreen doesn't
+    // interpret an in-progress stroke as a pan/scroll gesture, which otherwise intermittently
+    // hijacks the drag (stutters, or cuts the stroke short with a pointercancel) partway through.
+    // Reset on cleanup so scrolling by touch still works normally once no tool is selected.
+    const previousTouchAction = canvas.style.touchAction;
+    canvas.style.touchAction = "none";
 
     const localPoint = (e: PointerEvent): Pt => {
       const rect = canvas.getBoundingClientRect();
@@ -142,8 +154,12 @@ export default function useStrokeCapture(opts: UseStrokeCaptureOptions): void {
 
     const handlePointerDown = (e: PointerEvent): void => {
       if (e.pointerType === "mouse" && e.button !== 0) return;
+      // A stroke is already in progress under a different pointer (a palm/second contact) —
+      // reject this one outright rather than letting it hijack or reset the active stroke.
+      if (drawingRef.current && e.pointerId !== activePointerIdRef.current) return;
       e.preventDefault();
       canvas.setPointerCapture(e.pointerId);
+      activePointerIdRef.current = e.pointerId;
       drawingRef.current = true;
       activeLineRef.current = null;
 
@@ -160,7 +176,7 @@ export default function useStrokeCapture(opts: UseStrokeCaptureOptions): void {
     };
 
     const handlePointerMove = (e: PointerEvent): void => {
-      if (!drawingRef.current) return;
+      if (!drawingRef.current || e.pointerId !== activePointerIdRef.current) return;
       const point = localPoint(e);
       if (optsRef.current.tool === "eraser") {
         pointsRef.current.push(point);
@@ -175,6 +191,7 @@ export default function useStrokeCapture(opts: UseStrokeCaptureOptions): void {
     const finishStroke = (): void => {
       if (!drawingRef.current) return;
       drawingRef.current = false;
+      activePointerIdRef.current = null;
 
       const points = pointsRef.current;
       const line = activeLineRef.current;
@@ -206,10 +223,14 @@ export default function useStrokeCapture(opts: UseStrokeCaptureOptions): void {
 
     const handlePointerUp = (e: PointerEvent): void => {
       if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+      // A rejected second pointer (see handlePointerDown) still fires its own up/cancel — must
+      // not be allowed to end the real stroke that's still in progress under a different id.
+      if (e.pointerId !== activePointerIdRef.current) return;
       finishStroke();
     };
 
-    const handlePointerCancel = (): void => {
+    const handlePointerCancel = (e: PointerEvent): void => {
+      if (e.pointerId !== activePointerIdRef.current) return;
       finishStroke();
     };
 
@@ -224,6 +245,7 @@ export default function useStrokeCapture(opts: UseStrokeCaptureOptions): void {
       canvas.removeEventListener("pointerup", handlePointerUp);
       canvas.removeEventListener("pointercancel", handlePointerCancel);
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      canvas.style.touchAction = previousTouchAction;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opts.scratchCanvasRef, opts.enabled]);
