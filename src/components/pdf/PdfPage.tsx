@@ -237,7 +237,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
     }
 
     const moved = session.x !== original.x || session.y !== original.y;
-    const resized = session.fontSize !== original.fontSize;
+    const resized = session.fontSize !== original.fontSize || session.width !== original.width;
     if (text !== original.text || moved || resized) {
       const { height } = measureTextBlock(text, session.fontSize, session.width);
       onObjectEdit(original, {
@@ -246,6 +246,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
         x: session.x,
         y: session.y,
         fontSize: session.fontSize,
+        width: session.width,
         height,
         updatedAt: Date.now(),
       });
@@ -275,6 +276,14 @@ const PdfPage: React.FC<PdfPageProps> = ({
     (newFontSizeDevicePx: number): void => {
       if (!viewport) return;
       setEditingText((prev) => (prev ? { ...prev, fontSize: newFontSizeDevicePx / viewport.scale } : prev));
+    },
+    [viewport]
+  );
+
+  const handleNoteWidthResizeEnd = useCallback(
+    (newWidthDevicePx: number): void => {
+      if (!viewport) return;
+      setEditingText((prev) => (prev ? { ...prev, width: newWidthDevicePx / viewport.scale } : prev));
     },
     [viewport]
   );
@@ -491,6 +500,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
           onCancel={cancelEditingText}
           onMoveEnd={handleNoteMoveEnd}
           onResizeEnd={handleNoteResizeEnd}
+          onResizeWidthEnd={handleNoteWidthResizeEnd}
         />
       )}
       {renderError && (

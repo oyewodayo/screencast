@@ -148,7 +148,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave }) => {
               <div className="flex items-center gap-2">
                 <input
                   type="range"
-                  min={50}
+                  min={15}
                   max={300}
                   step={5}
                   value={Math.round(settings.pdfDefaultZoom * 100)}

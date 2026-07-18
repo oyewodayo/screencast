@@ -42,7 +42,8 @@
         "hide": true,
         "show": true,
         "setFocus": true,
-        "startDragging": true
+        "startDragging": true,
+        "setFullscreen": true
       },
       "os": {
         "all": false

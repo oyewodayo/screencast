@@ -4,6 +4,8 @@ import { TEXT_FONT_FAMILY } from "../../handlers/pdfAnnotationHandlers";
 
 const MIN_FONT_SIZE_DEVICE_PX = 8;
 const MAX_FONT_SIZE_DEVICE_PX = 200;
+const MIN_WIDTH_DEVICE_PX = 60;
+const MAX_WIDTH_DEVICE_PX = 4000;
 
 interface TextNoteEditorProps {
   left: number; // device/CSS px, relative to the page's canvas stack
@@ -17,14 +19,16 @@ interface TextNoteEditorProps {
   onCancel: () => void;
   onMoveEnd: (newLeft: number, newTop: number) => void;
   onResizeEnd: (newFontSize: number) => void;
+  onResizeWidthEnd: (newWidth: number) => void;
 }
 
 // A real DOM <textarea> overlaid on the page at the note's position — canvas can't accept
 // keyboard text input directly, so editing happens here and only gets baked into the overlay
 // canvas (via renderObject in pdfAnnotationHandlers) once committed. A small header strip above
-// it drags the whole note; a corner handle at its top-right resizes the font. Both are purely
-// imperative (direct style mutation) while a drag is in progress — no React re-renders per
-// pixel — and only report the *final* value to the parent once, on release.
+// it drags the whole note; a corner handle at its top-right resizes the font; a strip along the
+// right edge resizes the wrap width. All three are purely imperative (direct style mutation)
+// while a drag is in progress — no React re-renders per pixel — and only report the *final*
+// value to the parent once, on release.
 const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
   left,
   top,
@@ -37,6 +41,7 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
   onCancel,
   onMoveEnd,
   onResizeEnd,
+  onResizeWidthEnd,
 }) => {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -126,6 +131,38 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
     window.addEventListener("pointerup", handleUp);
   };
 
+  const handleWidthResizePointerDown = (e: React.PointerEvent<HTMLDivElement>): void => {
+    e.stopPropagation();
+    e.preventDefault();
+    const wrapper = wrapperRef.current;
+    const textarea = textareaRef.current;
+    if (!wrapper || !textarea) return;
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+
+    const startClientX = e.clientX;
+    const startWidth = width;
+
+    const handleMove = (moveEvent: PointerEvent): void => {
+      const dx = moveEvent.clientX - startClientX;
+      const nextWidth = Math.min(MAX_WIDTH_DEVICE_PX, Math.max(MIN_WIDTH_DEVICE_PX, startWidth + dx));
+      wrapper.style.width = `${nextWidth}px`;
+      // Re-wrapping at the new width almost always changes how many lines are needed.
+      textarea.style.height = "auto";
+      textarea.style.height = `${textarea.scrollHeight}px`;
+    };
+    const handleUp = (upEvent: PointerEvent): void => {
+      handle.releasePointerCapture(upEvent.pointerId);
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      const finalWidth = parseFloat(wrapper.style.width) || startWidth;
+      onResizeWidthEnd(finalWidth);
+    };
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+  };
+
   return (
     <div ref={wrapperRef} className="absolute" style={{ left, top, width, zIndex: 20 }}>
       <div
@@ -141,6 +178,16 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
         style={{ cursor: "ns-resize" }}
       >
         <div className="w-1.5 h-1.5 border-r-2 border-b-2 border-black/50" />
+      </div>
+      {/* Width handle: a grab strip along the whole right edge, below the move bar / font-size
+          corner so it doesn't fight them for the same pixels. */}
+      <div
+        onPointerDown={handleWidthResizePointerDown}
+        title="Drag to resize width"
+        className="absolute top-3 bottom-0 -right-1 w-2 group"
+        style={{ cursor: "ew-resize" }}
+      >
+        <div className="absolute inset-y-0 right-0.5 w-0.5 rounded bg-black/10 group-hover:bg-blue-400 transition-colors" />
       </div>
       <textarea
         ref={textareaRef}

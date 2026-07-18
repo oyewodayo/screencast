@@ -1,6 +1,6 @@
 // components/pdf/AnnotationToolbar.tsx
 import React, { useEffect, useState } from "react";
-import { IoPencil, IoArrowUndo, IoArrowRedo, IoAdd, IoRemove, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoDocumentTextOutline, IoText } from "react-icons/io5";
+import { IoPencil, IoArrowUndo, IoArrowRedo, IoAdd, IoRemove, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoDocumentTextOutline, IoText, IoExpand } from "react-icons/io5";
 import { IoIosArrowBack, IoIosArrowForward } from "react-icons/io";
 import { BsHighlighter, BsCursor } from "react-icons/bs";
 import { FaEraser } from "react-icons/fa";
@@ -27,6 +27,10 @@ interface AnnotationToolbarProps {
   maxZoom: number;
   twoPageMode: boolean;
   onToggleTwoPageMode: () => void;
+  // No isFullscreen flag needed — this toolbar only ever renders while *not* fullscreen (see
+  // PdfAnnotator, which swaps it out for a minimal exit button instead), so this button only
+  // ever needs to say "enter".
+  onToggleFullscreen: () => void;
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
@@ -35,11 +39,11 @@ interface AnnotationToolbarProps {
   saveError: string | null;
 }
 
-const TOOL_BUTTONS: { tool: AnnotationTool; label: string; icon: React.ReactNode }[] = [
-  { tool: "pen", label: "Pen", icon: <IoPencil size={16} /> },
-  { tool: "highlighter", label: "Highlighter", icon: <BsHighlighter size={15} /> },
-  { tool: "text", label: "Text note", icon: <IoText size={17} /> },
-  { tool: "eraser", label: "Eraser", icon: <FaEraser size={14} /> },
+const TOOL_BUTTONS: { tool: AnnotationTool; label: string; shortcut: string; icon: React.ReactNode }[] = [
+  { tool: "pen", label: "Pen", shortcut: "P", icon: <IoPencil size={16} /> },
+  { tool: "highlighter", label: "Highlighter", shortcut: "H", icon: <BsHighlighter size={15} /> },
+  { tool: "text", label: "Text note", shortcut: "T", icon: <IoText size={17} /> },
+  { tool: "eraser", label: "Eraser", shortcut: "E", icon: <FaEraser size={14} /> },
 ];
 
 // Thin vertical hairline used to separate control groups, mirroring macOS/iPadOS toolbar chrome.
@@ -166,7 +170,7 @@ const ZoomInput: React.FC<{ zoom: number; minZoom: number; maxZoom: number; onZo
     <input
       type="text"
       inputMode="numeric"
-      title={`Zoom level (${Math.round(minZoom * 100)}-${Math.round(maxZoom * 100)}%)`}
+      title={`Zoom level (${Math.round(minZoom * 100)}-${Math.round(maxZoom * 100)}%) — Ctrl+0 to reset to 100%`}
       value={value}
       onChange={(e) => setValue(e.target.value.replace(/[^0-9]/g, ""))}
       onKeyDown={(e) => {
@@ -204,6 +208,7 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   maxZoom,
   twoPageMode,
   onToggleTwoPageMode,
+  onToggleFullscreen,
   canUndo,
   canRedo,
   onUndo,
@@ -229,11 +234,11 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             highlightable target — clicking an active pen/highlighter/eraser again also toggles
             it off, but this is the explicit, discoverable way to get back to "nothing selected". */}
         <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045]">
-          <IconButton title="Select (no tool)" active={tool === null} onClick={onDeselectTool}>
+          <IconButton title="Select / no tool (V)" active={tool === null} onClick={onDeselectTool}>
             <BsCursor size={14} />
           </IconButton>
-          {TOOL_BUTTONS.map(({ tool: t, label, icon }) => (
-            <IconButton key={t} title={label} active={tool === t} onClick={() => onToolChange(t)}>
+          {TOOL_BUTTONS.map(({ tool: t, label, shortcut, icon }) => (
+            <IconButton key={t} title={`${label} (${shortcut})`} active={tool === t} onClick={() => onToolChange(t)}>
               {icon}
             </IconButton>
           ))}
@@ -254,7 +259,7 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             step={1}
             value={strokeWidth}
             onChange={(e) => onStrokeWidthChange(Number(e.target.value))}
-            title="Stroke width"
+            title="Stroke width ([ / ])"
             className="w-16 accent-blue-500"
           />
         </div>
@@ -262,25 +267,29 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
         <Divider />
 
         <div className="flex items-center gap-0.5">
-          <IconButton title="Undo" disabled={!canUndo} onClick={onUndo}>
+          <IconButton title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={onUndo}>
             <IoArrowUndo size={16} />
           </IconButton>
-          <IconButton title="Redo" disabled={!canRedo} onClick={onRedo}>
+          <IconButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={onRedo}>
             <IoArrowRedo size={16} />
           </IconButton>
         </div>
 
         <Divider />
 
-        <IconButton title={twoPageMode ? "Single page view" : "Two-page view"} active={twoPageMode} onClick={onToggleTwoPageMode}>
+        <IconButton title={twoPageMode ? "Single page view (B)" : "Two-page view (B)"} active={twoPageMode} onClick={onToggleTwoPageMode}>
           <MdAutoStories size={17} />
+        </IconButton>
+
+        <IconButton title="Enter fullscreen / presentation mode (F)" onClick={onToggleFullscreen}>
+          <IoExpand size={16} />
         </IconButton>
 
         <Divider />
 
         {/* Page navigator pill */}
         <div className="flex items-center gap-1 rounded-full bg-black/[0.045] pl-1 pr-2 py-0.5">
-          <IconButton title="Previous page" disabled={currentPageIndex <= 0} onClick={() => onPageChange(currentPageIndex - pageStep)}>
+          <IconButton title="Previous page (←)" disabled={currentPageIndex <= 0} onClick={() => onPageChange(currentPageIndex - pageStep)}>
             <IoIosArrowBack size={15} />
           </IconButton>
           {numPages === 0 ? (
@@ -294,20 +303,20 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
               </span>
             </span>
           )}
-          <IconButton title="Next page" disabled={currentPageIndex >= numPages - 1} onClick={() => onPageChange(currentPageIndex + pageStep)}>
+          <IconButton title="Next page (→)" disabled={currentPageIndex >= numPages - 1} onClick={() => onPageChange(currentPageIndex + pageStep)}>
             <IoIosArrowForward size={15} />
           </IconButton>
         </div>
 
         {/* Zoom pill */}
         <div className="flex items-center gap-1 rounded-full bg-black/[0.045] pl-1 pr-2 py-0.5">
-          <IconButton title="Zoom out" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
+          <IconButton title="Zoom out (Ctrl+-)" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
             <IoRemove size={16} />
           </IconButton>
           <span className="flex items-center text-xs font-medium text-neutral-600 tabular-nums">
             <ZoomInput zoom={zoom} minZoom={minZoom} maxZoom={maxZoom} onZoomChange={onZoomChange} />%
           </span>
-          <IconButton title="Zoom in" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
+          <IconButton title="Zoom in (Ctrl+=)" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
             <IoAdd size={16} />
           </IconButton>
         </div>

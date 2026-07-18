@@ -1,5 +1,6 @@
 // components/PdfAnnotator.tsx
 import React, { useEffect, useRef, useState } from "react";
+import { IoContract } from "react-icons/io5";
 import usePdfDocument from "../hooks/usePdfDocument";
 import useAnnotationStore from "../hooks/useAnnotationStore";
 import usePageRenderCache from "../hooks/usePageRenderCache";
@@ -12,6 +13,8 @@ interface PdfAnnotatorProps {
   src: string; // asset:// URL, for loading PDF bytes via pdf.js
   sourcePath: string; // raw filesystem path, for the annotations sidecar
   title?: string;
+  isFullscreen: boolean;
+  onToggleFullscreen: () => void;
 }
 
 // Scroll/touch page-turn tuning.
@@ -20,14 +23,14 @@ const WHEEL_TURN_THRESHOLD = 25;
 const SWIPE_TURN_THRESHOLD_PX = 60;
 const BOUNDARY_SLOP_PX = 2; // treat "within 2px of the edge" as *at* the edge
 const PINCH_ZOOM_SENSITIVITY = 0.01;
-const MIN_ZOOM = 0.5;
+const MIN_ZOOM = 0.15;
 const MAX_ZOOM = 3;
 
 // Top-level PDF markup surface: pdf.js-rendered pages with a freehand ink overlay, replacing
 // the old plain <iframe> viewer (which couldn't support drawing at all). Owns the active tool
 // and viewport state; delegates PDF loading to usePdfDocument and annotation persistence/
 // undo-redo to useAnnotationStore.
-const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) => {
+const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isFullscreen, onToggleFullscreen }) => {
   const { pdfDoc, numPages, loading: pdfLoading, error: pdfError } = usePdfDocument(src);
   const store = useAnnotationStore(sourcePath);
   const pageCache = usePageRenderCache();
@@ -236,9 +239,13 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clampedPageIndex, numPages, pageStep]);
 
-  // Left/Up = previous page, Right/Down = next page. Ignored while focus is in a text field,
-  // number input, or the width slider — those already use arrow keys for their own purpose
-  // (e.g. nudging the width slider), and we don't want to steal that.
+  // Full keyboard shortcut set for the toolbar — see each IconButton's title in
+  // AnnotationToolbar.tsx for the matching hint shown on hover. Ignored while focus is in a
+  // text field, number input, or the width slider — those already use some of these keys for
+  // their own purpose (typing "p", nudging a slider with arrows, etc.), and we don't want to
+  // steal that. Escape exits fullscreen first if active, taking priority over every other
+  // Escape behavior (deselecting a tool), matching the universal "Escape = leave fullscreen"
+  // convention every other app follows.
   useEffect(() => {
     const isEditableTarget = (el: Element | null): boolean => {
       if (!el) return false;
@@ -248,26 +255,94 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
 
     const handleKeyDown = (e: KeyboardEvent): void => {
       if (isEditableTarget(document.activeElement)) return;
+
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (isFullscreen) onToggleFullscreen();
+        else handleDeselectTool();
+        return;
+      }
+
       if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
         e.preventDefault();
         handlePageChange(clampedPageIndex - pageStep, "bottom");
-      } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+        return;
+      }
+      if (e.key === "ArrowRight" || e.key === "ArrowDown") {
         e.preventDefault();
         handlePageChange(clampedPageIndex + pageStep, "top");
-      } else if (e.key === "Escape") {
-        handleDeselectTool();
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
-        e.preventDefault();
-        if (store.canUndo) store.undo();
-      } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
-        e.preventDefault();
-        if (store.canRedo) store.redo();
+        return;
+      }
+
+      // Ctrl/Cmd combos: undo/redo and zoom. Anything else held with Ctrl/Cmd (Ctrl+P, Ctrl+S,
+      // ...) is deliberately left alone rather than falling through to the plain-letter tool
+      // shortcuts below, which would otherwise hijack e.g. Ctrl+P (print) into selecting the pen.
+      if (e.ctrlKey || e.metaKey) {
+        const key = e.key.toLowerCase();
+        if (key === "z" && !e.shiftKey) {
+          e.preventDefault();
+          if (store.canUndo) store.undo();
+        } else if (key === "y" || (key === "z" && e.shiftKey)) {
+          e.preventDefault();
+          if (store.canRedo) store.redo();
+        } else if (key === "=" || key === "+") {
+          e.preventDefault();
+          setZoom((z) => Math.min(MAX_ZOOM, Math.round((z + 0.25) * 100) / 100));
+        } else if (key === "-") {
+          e.preventDefault();
+          setZoom((z) => Math.max(MIN_ZOOM, Math.round((z - 0.25) * 100) / 100));
+        } else if (key === "0") {
+          e.preventDefault();
+          setZoom(1);
+        }
+        return;
+      }
+
+      if (e.altKey) return; // don't claim plain letters under Alt either
+
+      switch (e.key.toLowerCase()) {
+        case "v":
+          e.preventDefault();
+          handleDeselectTool();
+          break;
+        case "p":
+          e.preventDefault();
+          handleToolChange("pen");
+          break;
+        case "h":
+          e.preventDefault();
+          handleToolChange("highlighter");
+          break;
+        case "t":
+          e.preventDefault();
+          handleToolChange("text");
+          break;
+        case "e":
+          e.preventDefault();
+          handleToolChange("eraser");
+          break;
+        case "b":
+          e.preventDefault();
+          handleToggleTwoPageMode();
+          break;
+        case "f":
+          e.preventDefault();
+          onToggleFullscreen();
+          break;
+        case "[":
+          e.preventDefault();
+          setStrokeWidth((w) => Math.max(1, w - 1));
+          break;
+        case "]":
+          e.preventDefault();
+          setStrokeWidth((w) => Math.min(20, w + 1));
+          break;
       }
     };
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [clampedPageIndex, numPages, pageStep, store.canUndo, store.canRedo, store.undo, store.redo]);
+  }, [clampedPageIndex, numPages, pageStep, store.canUndo, store.canRedo, store.undo, store.redo, isFullscreen, onToggleFullscreen]);
 
   if (pdfError) {
     return (
@@ -303,36 +378,55 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
 
   return (
     <div className="w-full h-screen flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200">
-      <AnnotationToolbar
-        title={title}
-        tool={tool}
-        onToolChange={handleToolChange}
-        onDeselectTool={handleDeselectTool}
-        color={activeColor}
-        onColorChange={setActiveColor}
-        strokeWidth={strokeWidth}
-        onStrokeWidthChange={setStrokeWidth}
-        currentPageIndex={clampedPageIndex}
-        numPages={numPages}
-        pageStep={pageStep}
-        onPageChange={handlePageChange}
-        zoom={zoom}
-        onZoomChange={setZoom}
-        minZoom={MIN_ZOOM}
-        maxZoom={MAX_ZOOM}
-        twoPageMode={twoPageMode}
-        onToggleTwoPageMode={handleToggleTwoPageMode}
-        canUndo={store.canUndo}
-        canRedo={store.canRedo}
-        onUndo={store.undo}
-        onRedo={store.redo}
-        isSaving={store.isSaving}
-        saveError={store.saveError}
-      />
+      {isFullscreen ? (
+        // Presentation mode: no toolbar chrome at all — just the page(s) and a single,
+        // always-visible way back out (the shortcuts — F, Escape — still work with nothing
+        // rendered to hint at them, since PdfAnnotator's keydown listener doesn't care whether
+        // the toolbar is on screen).
+        <button
+          type="button"
+          title="Exit fullscreen (F or Esc)"
+          onClick={onToggleFullscreen}
+          className="fixed top-4 right-4 z-50 flex items-center justify-center w-9 h-9 rounded-full bg-black/40 text-white hover:bg-black/60 backdrop-blur-sm transition-colors"
+        >
+          <IoContract size={16} />
+        </button>
+      ) : (
+        <AnnotationToolbar
+          title={title}
+          tool={tool}
+          onToolChange={handleToolChange}
+          onDeselectTool={handleDeselectTool}
+          color={activeColor}
+          onColorChange={setActiveColor}
+          strokeWidth={strokeWidth}
+          onStrokeWidthChange={setStrokeWidth}
+          currentPageIndex={clampedPageIndex}
+          numPages={numPages}
+          pageStep={pageStep}
+          onPageChange={handlePageChange}
+          zoom={zoom}
+          onZoomChange={setZoom}
+          minZoom={MIN_ZOOM}
+          maxZoom={MAX_ZOOM}
+          twoPageMode={twoPageMode}
+          onToggleTwoPageMode={handleToggleTwoPageMode}
+          onToggleFullscreen={onToggleFullscreen}
+          canUndo={store.canUndo}
+          canRedo={store.canRedo}
+          onUndo={store.undo}
+          onRedo={store.redo}
+          isSaving={store.isSaving}
+          saveError={store.saveError}
+        />
+      )}
 
-      {/* min-h-0 is load-bearing: without it a flex-1 child can't shrink below its content's
-          intrinsic height, so overflow-auto never actually gets a chance to scroll. */}
-      <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-auto flex items-start justify-center p-8">
+      {/* min-h-0/min-w-0 are load-bearing: without them a flex child can't shrink below its
+          content's intrinsic size in either axis, so overflow-auto never actually gets a chance
+          to scroll — instead the oversized content (e.g. a wide landscape page) blows out this
+          container's own flex-item width upstream in Dashboard.tsx, which is what pushes the
+          sidebar/toolbar around instead of just scrolling within this box. */}
+      <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex items-start justify-center p-8">
         {pdfLoading || !pdfDoc || store.loading ? (
           <div className="text-gray-500 italic mt-20">Loading…</div>
         ) : twoPageMode ? (

@@ -5,7 +5,7 @@ import { open as openFileDialog, message as showMessageDialog } from "@tauri-app
 import BottomDocker from "../components/BottomDocker";
 import { listen } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
-import { WebviewWindow } from '@tauri-apps/api/window';
+import { WebviewWindow, appWindow } from '@tauri-apps/api/window';
 import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
 import { formatFileName } from "../utils/Formater";
 import VideoPlayer from "../components/VideoPlayer";
@@ -88,6 +88,11 @@ const Dashboard = () => {
   const [fileExt, setFileExt] = useState(() => loadSettings().defaultFileExt);
   const [recordType, setRecordType] = useState(() => loadSettings().defaultRecordType);
   const [showSettings, setShowSettings] = useState<boolean>(false);
+  // Presentation mode for the PDF viewer: hides the sidebar and BottomDocker (not just the PDF's
+  // own toolbar, which PdfAnnotator hides itself) and puts the actual OS window into fullscreen,
+  // so it reads as a real presentation rather than just a bigger PDF pane with app chrome still
+  // visible around it.
+  const [isPdfFullscreen, setIsPdfFullscreen] = useState<boolean>(false);
   const [audioDevice, setAudioDevice] = useState("");
   const [videoDevice, setVideoDevice] = useState("");
   const [selectScreen, setSelectScreen] = useState(false);
@@ -368,6 +373,16 @@ const setScreen = () => {
 		setRecordType(settings.defaultRecordType);
 	};
 
+	const handleTogglePdfFullscreen = async () => {
+		const next = !isPdfFullscreen;
+		setIsPdfFullscreen(next);
+		try {
+			await appWindow.setFullscreen(next);
+		} catch (err) {
+			console.error('Failed to toggle window fullscreen:', err);
+		}
+	};
+
   // Shared by the sidebar (files already in the Briefcast library) and the "open file from
   // anywhere" picker below — both just need a raw filesystem path turned into a playable URL.
 	const loadFileForPlayback = async (filePath: string, fileName: string) => {
@@ -452,13 +467,14 @@ const setScreen = () => {
     <div className="w-full h-screen flex flex-col">
       <div className="p-">
         <div className="flex justify-between">
-          {/* File list sidebar */}
+          {/* File list sidebar — force-collapsed in PDF fullscreen/presentation mode,
+              regardless of showFileList, so it never reappears over the presented page. */}
           <div
             className={`h-screen light border-b border-gray-300 transition-all duration-300 overflow-hidden ${
-              showFileList ? "w-[250px] opacity-100" : "w-0 opacity-0"
+              showFileList && !isPdfFullscreen ? "w-[250px] opacity-100" : "w-0 opacity-0"
             }`}
           >
-            {showFileList && (
+            {showFileList && !isPdfFullscreen && (
               <div className="flex flex-col h-full">
                 {/* File type tabs */}
                 <div className="flex items-center justify-around border-b border-gray-300 py-2 shrink-0">
@@ -611,7 +627,7 @@ const setScreen = () => {
               }}
             />
           )}
-         <div className="flex-1 flex items-center justify-center bg-gray-100">
+         <div className="flex-1 min-w-0 flex items-center justify-center bg-gray-100">
       
           {selectedFile ? (
             getFileCategory(selectedFile.name) === "pdf" ? (
@@ -620,6 +636,8 @@ const setScreen = () => {
                 src={selectedFile.path}
                 sourcePath={selectedFile.sourcePath}
                 title={selectedFile.name}
+                isFullscreen={isPdfFullscreen}
+                onToggleFullscreen={handleTogglePdfFullscreen}
               />
             ) : (
               <VideoPlayer
@@ -638,6 +656,7 @@ const setScreen = () => {
         </div>
       </div>
 
+      {!isPdfFullscreen && (
       <BottomDocker
         selectScreen={selectScreen}
         setScreen={setScreen}
@@ -676,6 +695,7 @@ const setScreen = () => {
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}
       />
+      )}
 
       {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} />}
 
