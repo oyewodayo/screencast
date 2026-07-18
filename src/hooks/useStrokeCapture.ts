@@ -118,12 +118,12 @@ export default function useStrokeCapture(opts: UseStrokeCaptureOptions): void {
       clearCanvas(ctx, canvas);
 
       const current = optsRef.current;
-      if (!current.tool) return;
       if (current.tool === "eraser") {
         const last = pointsRef.current[pointsRef.current.length - 1];
         if (last) renderEraserCursor(ctx, last, current.eraserRadius);
         return;
       }
+      if (current.tool !== "pen" && current.tool !== "highlighter") return; // null or 'text' — nothing to preview here
       renderLiveStroke(ctx, current.tool, pointsRef.current, current.color, effectiveWidthDevice());
     };
 
@@ -188,11 +188,11 @@ export default function useStrokeCapture(opts: UseStrokeCaptureOptions): void {
       if (ctx) clearCanvas(ctx, canvas);
 
       const current = optsRef.current;
-      if (!current.tool) return;
       if (current.tool === "eraser") {
         current.onEraseEnd();
         return;
       }
+      if (current.tool !== "pen" && current.tool !== "highlighter") return; // null or 'text' — this hook never draws those
       if (points.length === 0 || !current.viewport) return;
 
       const pdfPoints = points.map((p) => devicePointToPdfPoint(current.viewport as PageViewport, p.x, p.y, p.pressure));

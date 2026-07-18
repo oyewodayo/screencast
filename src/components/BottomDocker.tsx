@@ -57,8 +57,6 @@ interface Props {
   setAudioDevice: React.Dispatch<React.SetStateAction<string>>;
   videoDevice: string;
   setVideoDevice: React.Dispatch<React.SetStateAction<string>>;
-  res_message: string;
-  error: string;
 }
 
 type ConnectedDevice = string[];
@@ -98,9 +96,7 @@ const BottomDocker = ({
   audioDevice,
   setAudioDevice,
   videoDevice,
-  setVideoDevice,
-  res_message,
-  error
+  setVideoDevice
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   const [showExt, setShowExt] = useState("sva");
@@ -282,8 +278,6 @@ const BottomDocker = ({
         isRecording={isRecording}
         recordingStartTime={recordingStartTime}
         recordType={recordType}
-        res_message={res_message}
-        error={error}
         handleFolderSettings={handleFolderSettings}
         handleGoHome={handleGoHome}
         handleOpenSettings={handleOpenSettings}

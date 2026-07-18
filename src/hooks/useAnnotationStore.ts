@@ -17,6 +17,8 @@ interface UseAnnotationStoreResult {
   loadError: string | null;
   getPageObjects: (pageIndex: number) => AnnotationObject[];
   addObject: (object: AnnotationObject) => void;
+  editObject: (before: AnnotationObject, after: AnnotationObject) => void;
+  deleteObject: (object: AnnotationObject) => void;
   beginErase: (pageIndex: number) => void;
   eraseAt: (pageIndex: number, point: Pt, radiusInPdfUnits: number) => void;
   endErase: () => void;
@@ -131,6 +133,33 @@ export default function useAnnotationStore(sourcePath: string | undefined): UseA
     [scheduleAutosave]
   );
 
+  // Retyping an existing text note. No-ops if nothing actually changed, so blurring an untouched
+  // editor doesn't push a pointless entry onto the undo stack.
+  const editObject = useCallback(
+    (before: AnnotationObject, after: AnnotationObject) => {
+      if (before.id !== after.id) return;
+      const command: AnnotationCommand = { type: "edit", pageIndex: after.pageIndex, before, after };
+      setDoc((prev) => (prev ? applyCommand(prev, command) : prev));
+      setUndoStack((prev) => [...prev, command]);
+      setRedoStack([]);
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
+  // Removes a single known object directly (e.g. a text note cleared back to empty) — same
+  // mechanism the eraser tool uses under the hood, just triggered without a drag gesture.
+  const deleteObject = useCallback(
+    (object: AnnotationObject) => {
+      const command: AnnotationCommand = { type: "erase", pageIndex: object.pageIndex, removed: [object] };
+      setDoc((prev) => (prev ? applyCommand(prev, command) : prev));
+      setUndoStack((prev) => [...prev, command]);
+      setRedoStack([]);
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
   const beginErase = useCallback((pageIndex: number) => {
     pendingEraseRef.current = { pageIndex, removed: [] };
   }, []);
@@ -169,10 +198,9 @@ export default function useAnnotationStore(sourcePath: string | undefined): UseA
       if (prevUndo.length === 0) return prevUndo;
       const command = prevUndo[prevUndo.length - 1];
 
-      if (command.type === "add") {
-        setDoc((prev) => (prev ? applyCommand(prev, invertCommand(command)) : prev));
-      } else {
-        // Re-add every object the erase removed.
+      if (command.type === "erase") {
+        // Re-add every object the erase removed — applyCommand's 'add' branch only takes one
+        // object at a time, so a multi-object erase (a whole eraser drag) needs the loop.
         setDoc((prev) => {
           if (!prev) return prev;
           let next = prev;
@@ -181,6 +209,10 @@ export default function useAnnotationStore(sourcePath: string | undefined): UseA
           }
           return next;
         });
+      } else {
+        // 'add' inverts to a single-object erase; 'edit' inverts to itself with before/after
+        // swapped — both are a single applyCommand call.
+        setDoc((prev) => (prev ? applyCommand(prev, invertCommand(command)) : prev));
       }
 
       setRedoStack((prevRedo) => [...prevRedo, command]);
@@ -206,6 +238,8 @@ export default function useAnnotationStore(sourcePath: string | undefined): UseA
     loadError,
     getPageObjects,
     addObject,
+    editObject,
+    deleteObject,
     beginErase,
     eraseAt,
     endErase,

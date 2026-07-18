@@ -19,6 +19,9 @@ const PAGE_TURN_COOLDOWN_MS = 500; // stops one trackpad flick or swipe from fli
 const WHEEL_TURN_THRESHOLD = 25;
 const SWIPE_TURN_THRESHOLD_PX = 60;
 const BOUNDARY_SLOP_PX = 2; // treat "within 2px of the edge" as *at* the edge
+const PINCH_ZOOM_SENSITIVITY = 0.01;
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 3;
 
 // Top-level PDF markup surface: pdf.js-rendered pages with a freehand ink overlay, replacing
 // the old plain <iframe> viewer (which couldn't support drawing at all). Owns the active tool
@@ -38,15 +41,19 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
     const defaultTool = loadSettings().pdfDefaultTool;
     return defaultTool === "none" ? null : defaultTool;
   });
-  // Pen and highlighter remember their own last-picked color (matches how real markup apps
-  // behave — switching tools shouldn't lose your highlighter color because you picked black
-  // for the pen a moment ago).
+  // Pen, highlighter, and text notes each remember their own last-picked color (matches how real
+  // markup apps behave — switching tools shouldn't lose your highlighter color because you
+  // picked black for the pen a moment ago).
   const [penColor, setPenColor] = useState<string>(() => loadSettings().pdfDefaultPenColor);
   const [highlighterColor, setHighlighterColor] = useState<string>(() => loadSettings().pdfDefaultHighlighterColor);
+  const [textColor, setTextColor] = useState<string>(() => loadSettings().pdfDefaultPenColor);
   const [strokeWidth, setStrokeWidth] = useState<number>(() => loadSettings().pdfDefaultStrokeWidth);
+  // The same 1-20 width slider doubles as the text tool's font size, mapped to a legible PDF-space
+  // point range (~10-48) rather than reusing the raw 1-20 value, which would be unreadably small.
+  const textFontSize = 8 + strokeWidth * 2;
 
-  const activeColor = tool === "highlighter" ? highlighterColor : penColor;
-  const setActiveColor = tool === "highlighter" ? setHighlighterColor : setPenColor;
+  const activeColor = tool === "highlighter" ? highlighterColor : tool === "text" ? textColor : penColor;
+  const setActiveColor = tool === "highlighter" ? setHighlighterColor : tool === "text" ? setTextColor : setPenColor;
 
   // Invariant: in two-page mode, currentPageIndex is always the *left* page of the spread (an
   // even index — spreads are fixed pairs 0-1, 2-3, 4-5..., not "whatever's currently on the
@@ -124,7 +131,51 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
       handlePageChange(clampedPageIndex + direction * pageStep, direction > 0 ? "top" : "bottom");
     };
 
+    // Trackpad pinch-to-zoom: Chromium reports a pinch gesture as a wheel event with
+    // ctrlKey=true (there's no separate "gesture" event outside Safari), which conveniently
+    // also covers a literal held-Ctrl + scroll-wheel zoom for free via the same code path.
+    // preventDefault stops the browser's own whole-page zoom from firing instead.
+    let pinchRestoreRaf1: number | null = null;
+    let pinchRestoreRaf2: number | null = null;
+    const handlePinchZoom = (e: WheelEvent): void => {
+      e.preventDefault();
+      if (pinchRestoreRaf1 !== null) cancelAnimationFrame(pinchRestoreRaf1);
+      if (pinchRestoreRaf2 !== null) cancelAnimationFrame(pinchRestoreRaf2);
+
+      // Preserve scroll position as a *fraction* of the scrollable content rather than trying to
+      // keep the exact point under the cursor fixed — the container has fixed, zoom-independent
+      // padding/gaps (p-8, the two-page gap-4) that a precise cursor-anchored formula would need
+      // to account for, and getting that math wrong would drift over repeated pinch steps. This
+      // is a deliberately simpler, robust approximation: no jarring jump back to the corner, at
+      // the cost of not being pixel-perfect under the cursor.
+      const scrollableWidth = el.scrollWidth - el.clientWidth;
+      const scrollableHeight = el.scrollHeight - el.clientHeight;
+      const fracX = scrollableWidth > 0 ? el.scrollLeft / scrollableWidth : 0.5;
+      const fracY = scrollableHeight > 0 ? el.scrollTop / scrollableHeight : 0.5;
+
+      const factor = Math.exp(-e.deltaY * PINCH_ZOOM_SENSITIVITY);
+      setZoom((z) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z * factor)));
+
+      // Double rAF: the page needs an actual layout pass at the new zoom before scrollWidth/
+      // Height reflect its new size — same technique as the page-change scroll-anchor effect.
+      pinchRestoreRaf1 = requestAnimationFrame(() => {
+        pinchRestoreRaf2 = requestAnimationFrame(() => {
+          pinchRestoreRaf1 = null;
+          pinchRestoreRaf2 = null;
+          const newScrollableWidth = el.scrollWidth - el.clientWidth;
+          const newScrollableHeight = el.scrollHeight - el.clientHeight;
+          el.scrollLeft = fracX * newScrollableWidth;
+          el.scrollTop = fracY * newScrollableHeight;
+        });
+      });
+    };
+
     const handleWheel = (e: WheelEvent): void => {
+      if (e.ctrlKey) {
+        handlePinchZoom(e);
+        return;
+      }
+
       if (withinCooldown()) return;
       if (e.deltaY > WHEEL_TURN_THRESHOLD && isAtBottom() && clampedPageIndex + pageStep <= numPages - 1) {
         e.preventDefault();
@@ -179,6 +230,8 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
       el.removeEventListener("touchstart", handleTouchStart);
       el.removeEventListener("touchmove", handleTouchMove);
       el.removeEventListener("touchend", handleTouchEnd);
+      if (pinchRestoreRaf1 !== null) cancelAnimationFrame(pinchRestoreRaf1);
+      if (pinchRestoreRaf2 !== null) cancelAnimationFrame(pinchRestoreRaf2);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clampedPageIndex, numPages, pageStep]);
@@ -203,12 +256,18 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
         handlePageChange(clampedPageIndex + pageStep, "top");
       } else if (e.key === "Escape") {
         handleDeselectTool();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+        e.preventDefault();
+        if (store.canUndo) store.undo();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
+        e.preventDefault();
+        if (store.canRedo) store.redo();
       }
     };
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [clampedPageIndex, numPages, pageStep]);
+  }, [clampedPageIndex, numPages, pageStep, store.canUndo, store.canRedo, store.undo, store.redo]);
 
   if (pdfError) {
     return (
@@ -230,9 +289,12 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
       tool={tool}
       color={activeColor}
       width={strokeWidth}
+      textFontSize={textFontSize}
       eraserRadius={Math.max(12, strokeWidth * 3)}
       interactive={!store.loading}
       onStrokeComplete={(object: AnnotationObject) => store.addObject(object)}
+      onObjectEdit={store.editObject}
+      onObjectDelete={store.deleteObject}
       onEraseBegin={store.beginErase}
       onEraseAt={store.eraseAt}
       onEraseEnd={store.endErase}
@@ -256,6 +318,8 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title }) =
         onPageChange={handlePageChange}
         zoom={zoom}
         onZoomChange={setZoom}
+        minZoom={MIN_ZOOM}
+        maxZoom={MAX_ZOOM}
         twoPageMode={twoPageMode}
         onToggleTwoPageMode={handleToggleTwoPageMode}
         canUndo={store.canUndo}

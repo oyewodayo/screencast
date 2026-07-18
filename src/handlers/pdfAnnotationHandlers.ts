@@ -12,6 +12,7 @@ import {
   PdfAnnotationDocument,
   Pt,
   StrokeObject,
+  TextObject,
 } from "../utils/pdfAnnotationTypes";
 
 // ---- Coordinate conversion (device px <-> PDF page-space) ----------------------------------
@@ -77,17 +78,23 @@ function drawHighlightPath(ctx: CanvasRenderingContext2D, points: { x: number; y
 }
 
 // Renders one committed object onto a canvas, converting its stored PDF-space points to
-// device space via the given viewport. `scale` further multiplies stroke width so line
-// thickness stays visually consistent as the viewport's zoom/DPR changes.
+// device space via the given viewport. `scale` further multiplies stroke width/font size so
+// dimensions stay visually consistent as the viewport's zoom/DPR changes.
 export function renderObject(
   ctx: CanvasRenderingContext2D,
   object: AnnotationObject,
   viewport: { convertToViewportPoint: (x: number, y: number) => number[] },
   scale: number
 ): void {
-  const devicePoints = object.points.map((p) => pdfPointToDevicePoint(viewport, p));
-
   ctx.save();
+
+  if (object.type === "text") {
+    renderTextObject(ctx, object, viewport, scale);
+    ctx.restore();
+    return;
+  }
+
+  const devicePoints = object.points.map((p) => pdfPointToDevicePoint(viewport, p));
   ctx.globalAlpha = object.opacity;
 
   if (object.type === "stroke") {
@@ -180,6 +187,17 @@ function distanceToSegment(p: Pt, a: Pt, b: Pt): number {
 }
 
 function objectIntersectsPoint(object: AnnotationObject, pdfPoint: Pt, radiusInPdfUnits: number): boolean {
+  if (object.type === "text") {
+    // Bounding-box test with the eraser radius as padding — text has no meaningful "line width"
+    // the way a stroke/highlight path does.
+    return (
+      pdfPoint.x >= object.x - radiusInPdfUnits &&
+      pdfPoint.x <= object.x + object.width + radiusInPdfUnits &&
+      pdfPoint.y <= object.y + radiusInPdfUnits &&
+      pdfPoint.y >= object.y - object.height - radiusInPdfUnits
+    );
+  }
+
   const hitRadius = radiusInPdfUnits + object.width / 2;
   for (let i = 0; i < object.points.length - 1; i++) {
     if (distanceToSegment(pdfPoint, object.points[i], object.points[i + 1]) <= hitRadius) {
@@ -214,9 +232,12 @@ export function applyCommand(doc: PdfAnnotationDocument, command: AnnotationComm
 
   if (command.type === "add") {
     objects.push(command.object);
-  } else {
+  } else if (command.type === "erase") {
     const removedIds = new Set(command.removed.map((o) => o.id));
     objects = objects.filter((o) => !removedIds.has(o.id));
+  } else {
+    // edit: replace the matching object in place (used for retyping an existing text note).
+    objects = objects.map((o) => (o.id === command.after.id ? command.after : o));
   }
 
   const newPage = { pageIndex, objects };
@@ -230,6 +251,9 @@ export function applyCommand(doc: PdfAnnotationDocument, command: AnnotationComm
 export function invertCommand(command: AnnotationCommand): AnnotationCommand {
   if (command.type === "add") {
     return { type: "erase", pageIndex: command.object.pageIndex, removed: [command.object] };
+  }
+  if (command.type === "edit") {
+    return { type: "edit", pageIndex: command.pageIndex, before: command.after, after: command.before };
   }
   // Inverting an erase re-adds every removed object; applyCommand only understands single-object
   // 'add' commands, so the caller (undo) applies each removed object as its own 'add'.
@@ -265,6 +289,119 @@ export function makeHighlightObject(
     createdAt: now,
     updatedAt: now,
   };
+}
+
+// ---- Text notes (jotting) ---------------------------------------------------------------------
+//
+// Fixed-width, word-wrapped text blocks. Wrapping is computed with plain canvas font metrics
+// (measureText), and — critically — the *same* wrap function is used both when a note is
+// committed (to measure its stored `height`) and when it's rendered, just fed PDF-space vs.
+// device-space font sizes respectively. Because canvas text metrics scale linearly with font
+// size, wrapping at "1 PDF unit == 1px" and later drawing at "fontSize * scale px" always
+// produces identical line breaks — so there's exactly one wrap implementation to keep correct,
+// not two that can silently drift apart (which would otherwise make the stored `height` used for
+// click-to-edit/eraser hit-testing wrong relative to what's actually painted).
+
+export const TEXT_FONT_FAMILY = "system-ui, -apple-system, sans-serif";
+const TEXT_LINE_HEIGHT_MULTIPLIER = 1.3;
+
+// A detached 1x1 canvas kept around purely so measureTextBlock has a 2D context to call
+// ctx.measureText on without needing a real page's context (which may not be zoomed the way we
+// want to measure in, and shouldn't have its transform/font state disturbed by an unrelated call).
+let measurementCanvas: HTMLCanvasElement | null = null;
+function getMeasurementContext(): CanvasRenderingContext2D {
+  if (!measurementCanvas) measurementCanvas = document.createElement("canvas");
+  const ctx = measurementCanvas.getContext("2d");
+  if (!ctx) throw new Error("Failed to acquire 2D context for text measurement");
+  return ctx;
+}
+
+// Splits `text` into wrapped lines that fit within `maxWidth` (in whatever unit `ctx.font`'s
+// size is currently set in), honoring explicit newlines as hard paragraph breaks first.
+function wrapTextBlock(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    if (paragraph === "") {
+      lines.push("");
+      continue;
+    }
+    const words = paragraph.split(" ");
+    let current = "";
+    for (const word of words) {
+      const attempt = current ? `${current} ${word}` : word;
+      if (current && ctx.measureText(attempt).width > maxWidth) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = attempt;
+      }
+    }
+    lines.push(current);
+  }
+  return lines;
+}
+
+export interface MeasuredTextBlock {
+  lines: string[];
+  lineHeight: number;
+  height: number;
+}
+
+// `fontSize`/`maxWidth` are read as PDF-space units here (see the section note above) — the
+// returned `height` is therefore directly usable as TextObject.height with no further scaling.
+export function measureTextBlock(text: string, fontSize: number, maxWidth: number): MeasuredTextBlock {
+  const ctx = getMeasurementContext();
+  ctx.font = `${fontSize}px ${TEXT_FONT_FAMILY}`;
+  const lines = wrapTextBlock(ctx, text, maxWidth);
+  const lineHeight = fontSize * TEXT_LINE_HEIGHT_MULTIPLIER;
+  return { lines, lineHeight, height: lines.length * lineHeight };
+}
+
+function renderTextObject(
+  ctx: CanvasRenderingContext2D,
+  object: TextObject,
+  viewport: { convertToViewportPoint: (x: number, y: number) => number[] },
+  scale: number
+): void {
+  const topLeft = pdfPointToDevicePoint(viewport, { x: object.x, y: object.y, pressure: 1 });
+  const deviceFontSize = object.fontSize * scale;
+  const deviceMaxWidth = object.width * scale;
+
+  ctx.font = `${deviceFontSize}px ${TEXT_FONT_FAMILY}`;
+  ctx.fillStyle = object.color;
+  ctx.textBaseline = "top";
+
+  const lines = wrapTextBlock(ctx, object.text, deviceMaxWidth);
+  const lineHeight = deviceFontSize * TEXT_LINE_HEIGHT_MULTIPLIER;
+  lines.forEach((line, i) => {
+    ctx.fillText(line, topLeft.x, topLeft.y + i * lineHeight);
+  });
+}
+
+export function makeTextObject(
+  pageIndex: number,
+  x: number,
+  y: number,
+  text: string,
+  color: string,
+  fontSize: number,
+  width: number,
+  height: number
+): TextObject {
+  const now = Date.now();
+  return { id: crypto.randomUUID(), type: "text", pageIndex, x, y, text, color, fontSize, width, height, createdAt: now, updatedAt: now };
+}
+
+// Click-to-edit hit test: is `point` inside this text block's bounding box? (Top-left anchored,
+// growing downward on screen == decreasing PDF y — see the TextObject doc comment.)
+export function findTextObjectAt(objects: AnnotationObject[], point: Pt): TextObject | null {
+  for (const object of objects) {
+    if (object.type !== "text") continue;
+    const withinX = point.x >= object.x && point.x <= object.x + object.width;
+    const withinY = point.y <= object.y && point.y >= object.y - object.height;
+    if (withinX && withinY) return object;
+  }
+  return null;
 }
 
 export function getPageViewportSize(page: PDFPageProxy, scale: number): { width: number; height: number } {

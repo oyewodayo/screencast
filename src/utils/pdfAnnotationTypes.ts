@@ -35,9 +35,28 @@ export interface HighlightObject extends BaseObject {
   blend?: "multiply";
 }
 
-// Discriminated union kept deliberately narrow for v1. Phase 2 adds 'shape' | 'text' | 'note'
-// variants here — purely additive, no migration needed as long as readers skip unknown types.
-export type AnnotationObject = StrokeObject | HighlightObject;
+// A jotted note: a fixed-width, word-wrapped text block anchored at its top-left corner.
+// `x`/`y` and `width` are PDF page-space units (zoom-independent), matching Pt's convention —
+// `y` is the TOP edge, and since PDF space is y-up while screen space is y-down, the block
+// occupies [y - height, y] in PDF-space (see pdfAnnotationHandlers.ts's rendering/hit-testing).
+// `height` is measured once at commit time (via measureTextBlock) from the actual wrapped line
+// count, rather than re-derived ad hoc wherever it's needed — keeps rendering and hit-testing
+// (click-to-edit, eraser) reading from a single source of truth instead of two slightly
+// different wrap calculations drifting apart.
+export interface TextObject extends BaseObject {
+  type: "text";
+  text: string;
+  color: string;
+  fontSize: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// Discriminated union. Phase 2 still has room for 'shape'/'note' (sticky-note) variants beyond
+// this — purely additive, no migration needed as long as readers skip unknown types.
+export type AnnotationObject = StrokeObject | HighlightObject | TextObject;
 
 export interface PdfAnnotationPage {
   pageIndex: number;
@@ -52,13 +71,15 @@ export interface PdfAnnotationDocument {
   updatedAt: string;
 }
 
-export type AnnotationTool = "pen" | "highlighter" | "eraser";
+export type AnnotationTool = "pen" | "highlighter" | "eraser" | "text";
 
-// Undo/redo command stack. Each entry is reversible without needing full-document snapshots,
-// since v1 only ever adds or bulk-removes whole objects (no move/resize until Phase 2).
+// Undo/redo command stack. Each entry is reversible without needing full-document snapshots.
+// 'edit' covers in-place text edits (retyping an existing note) — everything else only ever
+// adds or bulk-removes whole objects.
 export type AnnotationCommand =
   | { type: "add"; object: AnnotationObject }
-  | { type: "erase"; pageIndex: number; removed: AnnotationObject[] };
+  | { type: "erase"; pageIndex: number; removed: AnnotationObject[] }
+  | { type: "edit"; pageIndex: number; before: AnnotationObject; after: AnnotationObject };
 
 export function createEmptyDocument(sourceFileName: string): PdfAnnotationDocument {
   const now = new Date().toISOString();

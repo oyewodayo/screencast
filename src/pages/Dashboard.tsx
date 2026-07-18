@@ -12,6 +12,7 @@ import VideoPlayer from "../components/VideoPlayer";
 import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import SettingsModal from "../components/Modals/SettingsModal";
+import Toast from "../components/custom/Toast";
 import { loadSettings } from "../utils/appSettings";
 import { IoVideocam, IoMusicalNotes, IoImage, IoDocumentText } from "react-icons/io5";
 
@@ -669,8 +670,6 @@ const setScreen = () => {
         videoDevice={videoDevice}
         setVideoDevice={setVideoDevice}
         setAudioDevice={setAudioDevice}
-        res_message={message}
-        error={error}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
         handleOpenSettings={handleOpenSettings}
@@ -679,6 +678,11 @@ const setScreen = () => {
       />
 
       {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} />}
+
+      <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
+        {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}
+        {error && <Toast key={`err-${error}`} message={error} variant="error" onDismiss={() => setError("")} />}
+      </div>
     </div>
   );
 };

@@ -1,6 +1,6 @@
 // components/pdf/AnnotationToolbar.tsx
 import React, { useEffect, useState } from "react";
-import { IoPencil, IoArrowUndo, IoArrowRedo, IoAdd, IoRemove, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoDocumentTextOutline } from "react-icons/io5";
+import { IoPencil, IoArrowUndo, IoArrowRedo, IoAdd, IoRemove, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoDocumentTextOutline, IoText } from "react-icons/io5";
 import { IoIosArrowBack, IoIosArrowForward } from "react-icons/io";
 import { BsHighlighter, BsCursor } from "react-icons/bs";
 import { FaEraser } from "react-icons/fa";
@@ -23,6 +23,8 @@ interface AnnotationToolbarProps {
   onPageChange: (pageIndex: number) => void;
   zoom: number;
   onZoomChange: (zoom: number) => void;
+  minZoom: number;
+  maxZoom: number;
   twoPageMode: boolean;
   onToggleTwoPageMode: () => void;
   canUndo: boolean;
@@ -36,11 +38,9 @@ interface AnnotationToolbarProps {
 const TOOL_BUTTONS: { tool: AnnotationTool; label: string; icon: React.ReactNode }[] = [
   { tool: "pen", label: "Pen", icon: <IoPencil size={16} /> },
   { tool: "highlighter", label: "Highlighter", icon: <BsHighlighter size={15} /> },
+  { tool: "text", label: "Text note", icon: <IoText size={17} /> },
   { tool: "eraser", label: "Eraser", icon: <FaEraser size={14} /> },
 ];
-
-const MIN_ZOOM = 0.5;
-const MAX_ZOOM = 3;
 
 // Thin vertical hairline used to separate control groups, mirroring macOS/iPadOS toolbar chrome.
 const Divider: React.FC = () => <div className="w-px h-6 bg-black/[0.06] shrink-0" />;
@@ -138,6 +138,53 @@ const PageJumpInput: React.FC<{ currentPageIndex: number; numPages: number; onPa
   );
 };
 
+// Editable zoom level: free-typed while focused, committed on Enter/blur (clamped to
+// [minZoom, maxZoom]), and re-synced from `zoom` whenever it changes some other way (the +/-
+// buttons, trackpad pinch-zoom, etc).
+const ZoomInput: React.FC<{ zoom: number; minZoom: number; maxZoom: number; onZoomChange: (zoom: number) => void }> = ({
+  zoom,
+  minZoom,
+  maxZoom,
+  onZoomChange,
+}) => {
+  const [value, setValue] = useState(String(Math.round(zoom * 100)));
+
+  useEffect(() => {
+    setValue(String(Math.round(zoom * 100)));
+  }, [zoom]);
+
+  const commit = (): void => {
+    const parsed = parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      onZoomChange(Math.min(maxZoom, Math.max(minZoom, parsed / 100)));
+    } else {
+      setValue(String(Math.round(zoom * 100)));
+    }
+  };
+
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      title={`Zoom level (${Math.round(minZoom * 100)}-${Math.round(maxZoom * 100)}%)`}
+      value={value}
+      onChange={(e) => setValue(e.target.value.replace(/[^0-9]/g, ""))}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          commit();
+          e.currentTarget.blur();
+        } else if (e.key === "Escape") {
+          setValue(String(Math.round(zoom * 100)));
+          e.currentTarget.blur();
+        }
+      }}
+      onBlur={commit}
+      onFocus={(e) => e.currentTarget.select()}
+      className="w-8 text-center text-xs font-medium text-neutral-600 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
+    />
+  );
+};
+
 const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   title,
   tool,
@@ -153,6 +200,8 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   onPageChange,
   zoom,
   onZoomChange,
+  minZoom,
+  maxZoom,
   twoPageMode,
   onToggleTwoPageMode,
   canUndo,
@@ -252,11 +301,13 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
 
         {/* Zoom pill */}
         <div className="flex items-center gap-1 rounded-full bg-black/[0.045] pl-1 pr-2 py-0.5">
-          <IconButton title="Zoom out" disabled={zoom <= MIN_ZOOM} onClick={() => onZoomChange(Math.max(MIN_ZOOM, Math.round((zoom - 0.25) * 100) / 100))}>
+          <IconButton title="Zoom out" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
             <IoRemove size={16} />
           </IconButton>
-          <span className="text-xs font-medium text-neutral-600 w-10 text-center tabular-nums">{Math.round(zoom * 100)}%</span>
-          <IconButton title="Zoom in" disabled={zoom >= MAX_ZOOM} onClick={() => onZoomChange(Math.min(MAX_ZOOM, Math.round((zoom + 0.25) * 100) / 100))}>
+          <span className="flex items-center text-xs font-medium text-neutral-600 tabular-nums">
+            <ZoomInput zoom={zoom} minZoom={minZoom} maxZoom={maxZoom} onZoomChange={onZoomChange} />%
+          </span>
+          <IconButton title="Zoom in" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
             <IoAdd size={16} />
           </IconButton>
         </div>

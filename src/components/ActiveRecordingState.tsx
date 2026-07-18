@@ -6,8 +6,6 @@ interface Props {
     recordType: string;
     isRecording:boolean;
     recordingStartTime: number | null;
-    res_message:string;
-    error:string;
     handleFolderSettings:()=>void;
     handleGoHome:()=>void;
     handleOpenSettings:()=>void;
@@ -20,7 +18,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,res_message,error,handleFolderSettings,handleGoHome,handleOpenSettings,handleOpenExternalFile, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,handleOpenSettings,handleOpenExternalFile, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -63,10 +61,7 @@ const ActiveRecordingState = (
         // gradient scrim guarantees legibility regardless of what's playing, same technique
         // the video player's own control bar uses (player.css .video-controls-container).
         <div className="bg-gradient-to-t from-black/30 via-black/20 to-transparent pt-5">
-            <div className='mx-2' data-tauri-drag-region>
-                {res_message && <p className="message text-right text-white">{res_message}</p>}
-                {error && <p className="error text-right text-red-400">{error}</p>}
-            </div>
+            <div className='mx-2 h-4' data-tauri-drag-region />
             <div className='flex justify-between pl-2 pb-2 items-center align-middle'>
                 <div className="flex items-center">
                    {showFileList ? (
