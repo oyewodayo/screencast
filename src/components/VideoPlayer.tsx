@@ -43,7 +43,7 @@ interface TimelineProgress {
 }
 
 type VolumeLevel = 'low' | 'high' | 'muted';
-type MediaType = 'video' | 'audio' | 'image';
+type MediaType = 'video' | 'audio' | 'image' | 'pdf';
 
 // Component interfaces for keyboard handler
 interface KeyboardHandlerActions {
@@ -110,35 +110,47 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
 
     // Helper function to detect media type
   const detectMediaType = (fileSrc: string): MediaType => {
-    const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'];
-    const audioExtensions = ['.mp3', '.wav', '.ogg', '.m4a', '.aac'];
-    
-    const lowerSrc = fileSrc.toLowerCase();
-    
+    const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.svg'];
+    const audioExtensions = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'];
+    const pdfExtensions = ['.pdf'];
+
+    // Query strings/fragments (e.g. Tauri asset URLs) can trail the real extension.
+    const lowerSrc = fileSrc.toLowerCase().split(/[?#]/)[0];
+
     if (imageExtensions.some(ext => lowerSrc.endsWith(ext))) {
       return 'image';
     } else if (audioExtensions.some(ext => lowerSrc.endsWith(ext))) {
       return 'audio';
+    } else if (pdfExtensions.some(ext => lowerSrc.endsWith(ext))) {
+      return 'pdf';
     }
     return 'video';
   };
 
+  // Detect the media type and reset playback state whenever a new file is selected.
   useEffect(() => {
-    if (src && videoRef.current) {
-      const type = detectMediaType(src);
-      setMediaType(type);
-      
-      if (type === 'image') {
-        // For images, just display them
-        setCurrentFileTitle(title || 'Image');
-        setIsPaused(true);
-        setIsPlaying(false);
-      } else {
-        videoRef.current.src = src;
-        if (autoPlay) videoRef.current.play();
-      }
+    if (!src) return;
+
+    const type = detectMediaType(src);
+    setMediaType(type);
+
+    if (type === 'image' || type === 'pdf') {
+      setCurrentFileTitle(title || (type === 'pdf' ? 'PDF' : 'Image'));
+      setIsPaused(true);
+      setIsPlaying(false);
     }
-  }, [src, autoPlay, title]);
+  }, [src, title]);
+
+  // Load and play the file once the <video> element for it is actually mounted.
+  // (It only mounts for the 'video'/'audio' types, so this can't run in the same
+  // effect as media-type detection above without racing the render that swaps
+  // the element in.)
+  useEffect(() => {
+    if ((mediaType === 'video' || mediaType === 'audio') && src && videoRef.current) {
+      videoRef.current.src = src;
+      if (autoPlay) videoRef.current.play().catch(() => {});
+    }
+  }, [mediaType, src, autoPlay]);
 
   // State update helper
   const updatePlayerState = (newState: PlayerState): void => {
@@ -164,7 +176,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
 
   // Player controls
   const togglePauseAndPlay = (): void => {
-    if (mediaType === 'image') return;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -184,7 +196,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   };
 
   const toggleMute = (): void => {
-     if (mediaType === 'image') return;
+     if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -207,12 +219,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   };
 
   const toggleMiniPlayerMode = async (): Promise<void> => {
-     if (mediaType === 'image') return;
+     if (mediaType !== 'video' && mediaType !== 'audio') return;
     await togglePictureInPicture(videoRef.current);
   };
 
   const playbackSpeedIncrease = (): void => {
-    if (mediaType === 'image') return;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -222,7 +234,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   };
 
   const playbackSpeedReduce = (): void => {
-    if (mediaType === 'image') return;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -232,7 +244,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   };
 
   const playbackSpeedNormal = (): void => {
-    if (mediaType === 'image') return;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -241,7 +253,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   };
 
   const handleVolumeChange = (e: ChangeEvent<HTMLInputElement>): void => {
-    if (mediaType === 'image') return;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const newVolume = parseFloat(e.target.value);
     setVolumeState(newVolume);
     setVolume(videoRef.current, newVolume);
@@ -253,7 +265,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   };
 
   const handleForwardSkipTime = (e: MouseEvent<HTMLButtonElement>): void => {
-    if (mediaType === 'image') return;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const seconds = parseInt(e.currentTarget.innerText);
     skipTime(videoRef.current, seconds);
     setCurrentSkipTime(seconds);
@@ -261,7 +273,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
   };
 
   const handleBackwardSkipTime = (e: MouseEvent<HTMLButtonElement>): void => {
-    if (mediaType === 'image') return;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const seconds = parseInt(e.currentTarget.innerText);
     skipTime(videoRef.current, -seconds);
     setCurrentSkipTime(seconds);
@@ -304,7 +316,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
 
   // Effects
   useEffect(() => {
-     if (mediaType === 'image') return; // Skip video event listeners for images
+     if (mediaType !== 'video' && mediaType !== 'audio') return; // Skip video event listeners for images
     
     const video = videoRef.current;
     if (!video) return;
@@ -594,6 +606,17 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
 						}}
 						/>
 					</div>
+				) : mediaType === 'pdf' ? (
+					<iframe
+						src={src}
+						title={currentFileTitle || 'PDF'}
+						style={{
+							width: '100%',
+							height: '100%',
+							border: 'none',
+							backgroundColor: '#fff'
+						}}
+					/>
 				) : (
 					<video
 						ref={videoRef}

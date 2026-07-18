@@ -9,8 +9,32 @@ import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortc
 import { formatFileName } from "../utils/Formater";
 import VideoPlayer from "../components/VideoPlayer";
 import ConversionDialog from "../components/ConversionDialog";
+import { IoVideocam, IoMusicalNotes, IoImage, IoDocumentText } from "react-icons/io5";
 
 type RAMInfo = [number, number];
+
+type FileCategory = "video" | "audio" | "image" | "pdf";
+
+const FILE_CATEGORY_EXTENSIONS: Record<FileCategory, string[]> = {
+  video: ["mp4", "mov", "avi", "mkv", "webm", "wmv"],
+  audio: ["mp3", "wav", "aac", "flac", "ogg", "m4a"],
+  image: ["jpg", "jpeg", "png", "gif", "bmp", "tiff"],
+  pdf: ["pdf"],
+};
+
+const getFileCategory = (fileName: string): FileCategory | null => {
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+  const match = (Object.entries(FILE_CATEGORY_EXTENSIONS) as [FileCategory, string[]][])
+    .find(([, exts]) => exts.includes(ext));
+  return match ? match[0] : null;
+};
+
+const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.ReactNode }[] = [
+  { category: "video", label: "Video", icon: <IoVideocam size={18} /> },
+  { category: "audio", label: "Audio", icon: <IoMusicalNotes size={18} /> },
+  { category: "image", label: "Image", icon: <IoImage size={18} /> },
+  { category: "pdf", label: "Pdf", icon: <IoDocumentText size={18} /> },
+];
 
 // Toggles the recording-overlay window's visibility. Registered as an OS-level hotkey via
 // Tauri's globalShortcut API (backed by RegisterHotKey) while a recording is in progress -
@@ -58,6 +82,7 @@ const Dashboard = () => {
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
   const [files, setFiles] = useState<FileMap>({});
+  const [activeFileCategory, setActiveFileCategory] = useState<FileCategory>("video");
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>("");
@@ -376,11 +401,41 @@ const setScreen = () => {
             }`}
           >
             {showFileList && (
-              <div className="p-3 text-sm overflow-y-auto max-h-[76%]">
-                {Object.keys(files).length === 0 ? (
-                  <p>No media files found</p>
-                ) : (
-                  Object.entries(files).map(([folder, fileList]) => (
+              <div className="flex flex-col h-full">
+                {/* File type tabs */}
+                <div className="flex items-center justify-around border-b border-gray-300 py-2 shrink-0">
+                  {FILE_CATEGORY_TABS.map(({ category, label, icon }) => (
+                    <button
+                      key={category}
+                      type="button"
+                      title={label}
+                      onClick={() => setActiveFileCategory(category)}
+                      className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
+                        activeFileCategory === category
+                          ? "text-blue-600 bg-blue-50"
+                          : "text-gray-500 hover:text-blue-500 hover:bg-gray-50"
+                      }`}
+                    >
+                      {icon}
+                      <span>{label}</span>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="p-3 text-sm overflow-y-auto flex-1">
+                {(() => {
+                  const filteredEntries = Object.entries(files)
+                    .map(([folder, fileList]) => [
+                      folder,
+                      fileList.filter((file) => getFileCategory(file.name) === activeFileCategory),
+                    ] as [string, FileEntry[]])
+                    .filter(([, fileList]) => fileList.length > 0);
+
+                  if (filteredEntries.length === 0) {
+                    return <p>No {activeFileCategory} files found</p>;
+                  }
+
+                  return filteredEntries.map(([folder, fileList]) => (
                     <div key={folder} className="mb-4">
                       <h3 className="font-semibold text-gray-700">{folder}:</h3>
                       <ul className="ml-2 mt-1">
@@ -460,8 +515,9 @@ const setScreen = () => {
                         ))}
                       </ul>
                     </div>
-                  ))
-                )}
+                  ));
+                })()}
+                </div>
               </div>
             )}
           </div>
@@ -512,16 +568,6 @@ const setScreen = () => {
             </div>
           )}
         </div>
-
-          
-          {/* <div className="">
-            <div>
-              <img src="screencast.png" width={55} alt="Briefcast Logo" />
-            </div>
-            <div className="text-[12px] text-center -mt-2.5">
-              Briefcast
-            </div>
-          </div> */}
         </div>
       </div>
 

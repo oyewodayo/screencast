@@ -103,7 +103,8 @@ fn is_media_file(ext: &str)->bool{
         ext,
         "jpg" | "jpeg" | "png" | "gif"  | "bmp" | "tiff" |
         "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" |
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv"
+        "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv" |
+        "pdf"
     )
 }
 
