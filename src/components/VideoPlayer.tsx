@@ -62,9 +62,17 @@ interface VideoPlayerProps {
   src?: string;
   title?: string;
   autoPlay?: boolean;
+  // Seeks here once metadata is loaded — lets a caller resume audio/video where a previous
+  // session left off instead of always restarting at 0.
+  initialTime?: number;
+  // Native <video loop> — used for single-track repeat, since the browser handles it without
+  // ever firing 'ended' (and therefore without our own auto-advance logic getting involved).
+  loop?: boolean;
+  onTimeUpdate?: (time: number) => void;
+  onEnded?: () => void;
 }
 
-const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }) => {
+const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, initialTime, loop = false, onTimeUpdate, onEnded }) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoContainerRef = useRef<HTMLDivElement>(null);
@@ -339,6 +347,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
     };
 
     const handleEnded = (): void => {
+      onEnded?.();
       if (currentlyPlayingFile) { // This checks for both null and empty string
         handleAutoPlay(files, currentlyPlayingFile, video, updatePlayerState, isAutoPlay);
       }
@@ -349,7 +358,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
     video.addEventListener('volumechange', handleVolumeChange);
     video.addEventListener('ended', handleEnded);
 
-    // Set up keyboard shortcuts
+    // Set up keyboard shortcuts. Arrow-key seeking is disabled for audio — Dashboard's own
+    // keydown listener owns ArrowLeft/Right/Up/Down there instead, to switch tracks.
     const keyboardHandler = createKeyboardHandler({
       togglePauseAndPlay,
       toggleFullScreenMode,
@@ -359,7 +369,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
       toggleCaptions,
       playbackSpeedIncrease,
       playbackSpeedReduce
-    } as KeyboardHandlerActions);
+    } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
 
@@ -369,12 +379,29 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
       video.removeEventListener('volumechange', handleVolumeChange);
       video.removeEventListener('ended', handleEnded);
       document.removeEventListener('keydown', keyboardHandler);
-      
+
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [files, currentlyPlayingFile, isAutoPlay, mediaType]);
+  }, [files, currentlyPlayingFile, isAutoPlay, mediaType, onEnded]);
+
+  // Reports playback position as it advances, and once more on unmount/file-change — the latter
+  // is what lets a caller (Dashboard, for audio) capture "wherever this track was" the moment the
+  // user navigates away, even if they navigated mid-scrub between two timeupdate ticks.
+  useEffect(() => {
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
+    const video = videoRef.current;
+    if (!video || !onTimeUpdate) return;
+
+    const handleTimeUpdate = (): void => onTimeUpdate(video.currentTime);
+    video.addEventListener('timeupdate', handleTimeUpdate);
+
+    return () => {
+      video.removeEventListener('timeupdate', handleTimeUpdate);
+      onTimeUpdate(video.currentTime);
+    };
+  }, [mediaType, onTimeUpdate]);
 
   // Icons components (could be moved to separate file)
   const MiniPlayerIcon: React.FC = () => (
@@ -608,10 +635,14 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true }
 				) : (
 					<video
 						ref={videoRef}
+						loop={loop}
 						onClick={togglePauseAndPlay}
 						onLoadedMetadata={() => {
 							if (videoRef.current) {
 							setTotalTimeElement(formatDuration(videoRef.current.duration));
+							if (initialTime && Number.isFinite(initialTime) && initialTime > 0 && initialTime < videoRef.current.duration) {
+								videoRef.current.currentTime = initialTime;
+							}
 							}
 						}}
 					>

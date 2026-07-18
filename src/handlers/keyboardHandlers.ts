@@ -14,14 +14,24 @@ interface KeyboardHandlers {
   onVolumeChange?: (volume: number) => void;
 }
 
+interface KeyboardHandlerOptions {
+  // Off for audio, where Dashboard's own keydown listener owns ArrowLeft/Right/Up/Down to
+  // switch tracks instead — "j"/"l" remain available for speed either way.
+  enableArrowSeek?: boolean;
+}
+
 /**
  * Create keyboard event handler for video player
  * @param handlers - Object containing handler functions
+ * @param options - Behavior toggles; see KeyboardHandlerOptions
  * @returns Keyboard event handler function
  */
 export const createKeyboardHandler = (
-  handlers: KeyboardHandlers
+  handlers: KeyboardHandlers,
+  options?: KeyboardHandlerOptions
 ): (e: KeyboardEvent) => void => {
+  const enableArrowSeek = options?.enableArrowSeek ?? true;
+
   return (e: KeyboardEvent) => {
     // Don't trigger if user is typing in an input field
     const target = e.target as HTMLElement;
@@ -52,11 +62,19 @@ export const createKeyboardHandler = (
         handlers.toggleMute?.();
         break;
       case "ArrowLeft":
+        if (!enableArrowSeek) break;
+        e.preventDefault();
+        handlers.playbackSpeedReduce?.();
+        break;
       case "j":
         e.preventDefault();
         handlers.playbackSpeedReduce?.();
         break;
       case "ArrowRight":
+        if (!enableArrowSeek) break;
+        e.preventDefault();
+        handlers.playbackSpeedIncrease?.();
+        break;
       case "l":
         e.preventDefault();
         handlers.playbackSpeedIncrease?.();

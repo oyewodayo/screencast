@@ -1,5 +1,5 @@
 // Dashboard.tsx
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
 import BottomDocker from "../components/BottomDocker";
@@ -14,7 +14,17 @@ import PdfAnnotator from "../components/PdfAnnotator";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { loadSettings } from "../utils/appSettings";
-import { IoVideocam, IoMusicalNotes, IoImage, IoDocumentText } from "react-icons/io5";
+import {
+  IoVideocam,
+  IoMusicalNotes,
+  IoImage,
+  IoDocumentText,
+  IoChevronBack,
+  IoChevronForward,
+  IoRepeatOutline,
+  IoShuffleOutline,
+  IoPlayForwardOutline,
+} from "react-icons/io5";
 
 type RAMInfo = [number, number];
 
@@ -111,6 +121,24 @@ const Dashboard = () => {
   const [renameValue, setRenameValue] = useState<string>("");
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
+  // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
+  const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
+  const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
+  const [audioAutoplayNext, setAudioAutoplayNext] = useState<boolean>(true);
+
+  // Last known playback position per audio file (keyed by sourcePath), so switching away and
+  // back — including by accident via prev/next — resumes instead of restarting at 0. A ref, not
+  // state: it's written on every timeupdate tick and shouldn't trigger re-renders.
+  const audioPositionsRef = useRef<Record<string, number>>({});
+  // Sourcepaths visited while shuffle is on, so "previous" can undo a shuffled "next" instead of
+  // computing a sequential-order previous that wouldn't match what was actually just played.
+  const shuffleHistoryRef = useRef<string[]>([]);
+  // Lets stable (useCallback, empty-deps) callbacks passed down to VideoPlayer read whichever
+  // file is *currently* selected without needing to be recreated every time it changes.
+  const selectedFileRef = useRef(selectedFile);
+  useEffect(() => {
+    selectedFileRef.current = selectedFile;
+  }, [selectedFile]);
 
 
 useEffect(() => {
@@ -417,6 +445,120 @@ const setScreen = () => {
 		await loadFileForPlayback(file.path, file.name);
 	};
 
+	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
+	// the currently selected file happens to live in, so prev/next still works when a category
+	// is split across multiple folders.
+	const getFlatFilesForCategory = (category: FileCategory): FileEntry[] =>
+		Object.values(files)
+			.flat()
+			.filter((file) => getFileCategory(file.name) === category);
+
+	// Cycles to the previous/next image relative to whatever's currently selected, wrapping
+	// around at either end (matches how most image viewers handle prev/next at the boundaries).
+	const navigateImage = (direction: 1 | -1) => {
+		if (!selectedFile) return;
+		const images = getFlatFilesForCategory("image");
+		if (images.length === 0) return;
+		const currentIndex = images.findIndex((file) => file.path === selectedFile.sourcePath);
+		if (currentIndex === -1) return;
+		const nextIndex = (currentIndex + direction + images.length) % images.length;
+		const next = images[nextIndex];
+		loadFileForPlayback(next.path, next.name);
+	};
+
+	// Persists the currently-playing audio file's position on every tick, keyed by its
+	// filesystem path — read back in the `initialTime` passed to VideoPlayer below so navigating
+	// away and back (including by an accidental prev/next tap) resumes instead of restarting.
+	// Stable identity (empty deps) so VideoPlayer's own timeupdate listener doesn't get torn
+	// down and re-attached on every unrelated Dashboard re-render.
+	const handleAudioTimeUpdate = useCallback((time: number) => {
+		const current = selectedFileRef.current;
+		if (current && getFileCategory(current.name) === "audio") {
+			audioPositionsRef.current[current.sourcePath] = time;
+		}
+	}, []);
+
+	// Prev/next for audio — shuffle-aware. Manual navigation (arrow keys, the sidebar buttons)
+	// always wraps at the ends; auto-advance-on-end (handleAudioEnded below) opts out of that via
+	// `wrap: false` unless repeat-all is on, so a non-repeating playlist actually stops instead of
+	// looping forever.
+	const navigateAudio = (direction: 1 | -1, options?: { wrap?: boolean }) => {
+		const wrap = options?.wrap ?? true;
+		const current = selectedFileRef.current;
+		if (!current) return;
+		const tracks = getFlatFilesForCategory("audio");
+		if (tracks.length === 0) return;
+		const currentIndex = tracks.findIndex((file) => file.path === current.sourcePath);
+		if (currentIndex === -1) return;
+
+		let nextIndex: number;
+		if (direction === -1 && audioShuffle && shuffleHistoryRef.current.length > 0) {
+			// Undo the last shuffled "next" rather than computing a sequential-order previous,
+			// which wouldn't match whatever was actually played before this.
+			const previousPath = shuffleHistoryRef.current.pop() as string;
+			const foundIndex = tracks.findIndex((file) => file.path === previousPath);
+			nextIndex = foundIndex === -1 ? currentIndex : foundIndex;
+		} else if (audioShuffle && tracks.length > 1) {
+			if (direction === 1) shuffleHistoryRef.current.push(current.sourcePath);
+			do {
+				nextIndex = Math.floor(Math.random() * tracks.length);
+			} while (nextIndex === currentIndex);
+		} else {
+			nextIndex = currentIndex + direction;
+			if (nextIndex < 0) {
+				if (!wrap) return;
+				nextIndex = tracks.length - 1;
+			} else if (nextIndex >= tracks.length) {
+				if (!wrap) return;
+				nextIndex = 0;
+			}
+		}
+
+		const next = tracks[nextIndex];
+		loadFileForPlayback(next.path, next.name);
+	};
+
+	// Repeat-one is handled natively via <video loop> on VideoPlayer (see its `loop` prop below)
+	// — 'ended' never even fires in that case, so it doesn't need to be special-cased here.
+	const handleAudioEnded = useCallback(() => {
+		const current = selectedFileRef.current;
+		if (!current || getFileCategory(current.name) !== "audio") return;
+		if (audioRepeatMode === "one") return;
+		if (audioRepeatMode !== "all" && !audioAutoplayNext) return; // just stop, like today
+		navigateAudio(1, { wrap: audioRepeatMode === "all" });
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [audioRepeatMode, audioAutoplayNext, audioShuffle, files]);
+
+	const cycleAudioRepeatMode = (): void => {
+		setAudioRepeatMode((prev) => (prev === "off" ? "all" : prev === "all" ? "one" : "off"));
+	};
+
+	// Arrow-key navigation — only active while an image or audio file is the currently displayed
+	// one, so it doesn't hijack arrow keys elsewhere (video seeking, PDF page turns, form inputs).
+	useEffect(() => {
+		if (!selectedFile) return;
+		const category = getFileCategory(selectedFile.name);
+		if (category !== "image" && category !== "audio") return;
+
+		const handleKeyDown = (e: KeyboardEvent) => {
+			const target = e.target as HTMLElement | null;
+			if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+
+			if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+				e.preventDefault();
+				if (category === "audio") navigateAudio(-1);
+				else navigateImage(-1);
+			} else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+				e.preventDefault();
+				if (category === "audio") navigateAudio(1);
+				else navigateImage(1);
+			}
+		};
+
+		document.addEventListener("keydown", handleKeyDown);
+		return () => document.removeEventListener("keydown", handleKeyDown);
+	}, [selectedFile, files, audioShuffle]);
+
 	// Opens a native OS file picker scoped to nowhere in particular — unlike the sidebar (which
 	// only ever lists files under the app's own Briefcast folder), this lets the user view/play
 	// any video, audio, image, or PDF already sitting anywhere else on their system. Selecting
@@ -462,6 +604,18 @@ const setScreen = () => {
 		}
 	};
 
+	// Computed once per render so both the fixed sidebar header and the scrollable list below
+	// it can share the same grouping — previously this was recomputed inside an IIFE local to
+	// just the list, which the header (now pulled out so it can stay fixed) couldn't reach.
+	const filteredEntries = Object.entries(files)
+		.map(([folder, fileList]) => [
+			folder,
+			fileList.filter((file) => getFileCategory(file.name) === activeFileCategory),
+		] as [string, FileEntry[]])
+		.filter(([, fileList]) => fileList.length > 0);
+	const sidebarHeaderLabel =
+		filteredEntries.length === 1 ? `${filteredEntries[0][0]}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
+	const isAudioSelected = selectedFile !== null && getFileCategory(selectedFile.name) === "audio";
 
   return (
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
@@ -496,22 +650,87 @@ const setScreen = () => {
                   ))}
                 </div>
 
+                {/* Folder label + prev/next/repeat/shuffle/autoplay controls — fixed below the
+                    tabs, does not scroll with the file list beneath it. */}
+                <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
+                  <h3 className="font-semibold text-gray-700 dark:text-neutral-300 text-sm truncate">{sidebarHeaderLabel}</h3>
+                  {(activeFileCategory === "image" || activeFileCategory === "audio") && (
+                    <div className="flex items-center gap-0.5 shrink-0">
+                      {activeFileCategory === "audio" && (
+                        <>
+                          <button
+                            type="button"
+                            title={`Repeat: ${audioRepeatMode === "off" ? "off" : audioRepeatMode === "all" ? "all" : "one"}`}
+                            onClick={cycleAudioRepeatMode}
+                            className={`relative p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                              audioRepeatMode !== "off"
+                                ? "text-blue-600 dark:text-blue-400"
+                                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                            }`}
+                          >
+                            <IoRepeatOutline size={14} />
+                            {audioRepeatMode === "one" && (
+                              <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-blue-600 dark:bg-blue-500 text-white text-[8px] font-bold leading-none flex items-center justify-center">
+                                1
+                              </span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            title={`Shuffle: ${audioShuffle ? "on" : "off"}`}
+                            onClick={() => setAudioShuffle((prev) => !prev)}
+                            className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                              audioShuffle
+                                ? "text-blue-600 dark:text-blue-400"
+                                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                            }`}
+                          >
+                            <IoShuffleOutline size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            title={`Autoplay next track: ${audioAutoplayNext ? "on" : "off"}`}
+                            onClick={() => setAudioAutoplayNext((prev) => !prev)}
+                            className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                              audioAutoplayNext
+                                ? "text-blue-600 dark:text-blue-400"
+                                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                            }`}
+                          >
+                            <IoPlayForwardOutline size={14} />
+                          </button>
+                          <div className="w-px h-4 bg-gray-300 dark:bg-neutral-600 mx-0.5" />
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        title="Previous (←)"
+                        onClick={() => (activeFileCategory === "audio" ? navigateAudio(-1) : navigateImage(-1))}
+                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                      >
+                        <IoChevronBack size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        title="Next (→)"
+                        onClick={() => (activeFileCategory === "audio" ? navigateAudio(1) : navigateImage(1))}
+                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                      >
+                        <IoChevronForward size={14} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+
                 <div className="p-3 text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200">
-                {(() => {
-                  const filteredEntries = Object.entries(files)
-                    .map(([folder, fileList]) => [
-                      folder,
-                      fileList.filter((file) => getFileCategory(file.name) === activeFileCategory),
-                    ] as [string, FileEntry[]])
-                    .filter(([, fileList]) => fileList.length > 0);
-
-                  if (filteredEntries.length === 0) {
-                    return <p>No {activeFileCategory} files found</p>;
-                  }
-
-                  return filteredEntries.map(([folder, fileList]) => (
+                {filteredEntries.length === 0 ? (
+                  <p>No {activeFileCategory} files found</p>
+                ) : (
+                  filteredEntries.map(([folder, fileList]) => (
                     <div key={folder} className="mb-4">
-                      <h3 className="font-semibold text-gray-700 dark:text-neutral-300">{folder}:</h3>
+                      {filteredEntries.length > 1 && (
+                        <h4 className="text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1">{folder}</h4>
+                      )}
                       <ul className="ml-2 mt-1">
                         {fileList.map((file) => (
                           <li
@@ -589,8 +808,8 @@ const setScreen = () => {
                         ))}
                       </ul>
                     </div>
-                  ));
-                })()}
+                  ))
+                )}
                 </div>
               </div>
             )}
@@ -645,6 +864,10 @@ const setScreen = () => {
                 src={selectedFile.path}
                 title={selectedFile.name}
                 autoPlay={true}
+                initialTime={isAudioSelected ? audioPositionsRef.current[selectedFile.sourcePath] : undefined}
+                loop={isAudioSelected && audioRepeatMode === "one"}
+                onTimeUpdate={handleAudioTimeUpdate}
+                onEnded={handleAudioEnded}
               />
             )
           ) : (
