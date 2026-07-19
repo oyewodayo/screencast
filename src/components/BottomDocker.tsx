@@ -37,7 +37,7 @@ interface Props {
     file_ext: string;
     record_type: string;
     audio_device: string;
-    video_device: string;
+    video_devices: string[];
     screen_size: string; // Make sure this is here
     overlay_shape: string;
     overlay_position: string;
@@ -55,8 +55,8 @@ interface Props {
   setRecordType: React.Dispatch<React.SetStateAction<string>>;
   audioDevice: string;
   setAudioDevice: React.Dispatch<React.SetStateAction<string>>;
-  videoDevice: string;
-  setVideoDevice: React.Dispatch<React.SetStateAction<string>>;
+  videoDevices: string[];
+  setVideoDevices: React.Dispatch<React.SetStateAction<string[]>>;
 }
 
 type ConnectedDevice = string[];
@@ -95,8 +95,8 @@ const BottomDocker = ({
   setRecordType,
   audioDevice,
   setAudioDevice,
-  videoDevice,
-  setVideoDevice
+  videoDevices,
+  setVideoDevices
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -149,7 +149,7 @@ const BottomDocker = ({
       .then((devices) => {
         setConnectedCameraDevices(devices);
         if (devices.length > 0) {
-          setVideoDevice(devices[0]);
+          setVideoDevices([devices[0]]); // Default to the first detected camera
         }
       })
       .catch(console.error);
@@ -196,10 +196,10 @@ const BottomDocker = ({
     setAudioDevice(event.target.value);
   };
 
-  const handleVideoDeviceChange = (
-    event: React.ChangeEvent<HTMLSelectElement>
-  ) => {
-    setVideoDevice(event.target.value);
+  const toggleVideoDevice = (device: string) => {
+    setVideoDevices((prev) =>
+      prev.includes(device) ? prev.filter((d) => d !== device) : [...prev, device]
+    );
   };
 
   // EnhancedScreenOptions passes the resolved target directly when it has one (e.g. clicking a
@@ -216,7 +216,7 @@ const BottomDocker = ({
       record_type: recordType,
       audio_device: audioDevice,
       screen_size: effectiveScreenSize,
-      video_device: videoDevice,
+      video_devices: videoDevices,
       overlay_shape:overlayShape,
       overlay_position:overlayPosition,
       overlay_size:overlaySize,
@@ -278,6 +278,7 @@ const BottomDocker = ({
     <>
     <EnhancedScreenOptions
      recordType={recordType}
+     videoDevices={videoDevices}
      selectScreen={selectScreen}
      setScreen={setScreen}
      unSetScreen={unSetScreen}
@@ -408,24 +409,23 @@ const BottomDocker = ({
 
             <div className="flex items-end gap-1">
               <div>
-                <div className="p-1 text-sm">Video device</div>
-                <select
-                  name="videoDevice"
-                  id="videoDevice"
-                  className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-                  value={videoDevice}
-                  onChange={handleVideoDeviceChange}
-                >
-                  {connectedCameraDevices ? (
-                    connectedCameraDevices.map((videoDevice, index) => (
-                      <option key={index} value={videoDevice}>
-                        {videoDevice}
-                      </option>
+                <div className="p-1 text-sm">Video device(s)</div>
+                <div className="p-2 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 max-h-28 overflow-y-auto min-w-[180px]">
+                  {connectedCameraDevices && connectedCameraDevices.length > 0 ? (
+                    connectedCameraDevices.map((device, index) => (
+                      <label key={index} className="flex items-center gap-2 py-0.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={videoDevices.includes(device)}
+                          onChange={() => toggleVideoDevice(device)}
+                        />
+                        <span className="truncate">{device}</span>
+                      </label>
                     ))
                   ) : (
-                    <option value="">No video cameras detected</option>
+                    <span className="text-neutral-500">No video cameras detected</span>
                   )}
-                </select>
+                </div>
               </div>
               <button
                 type="button"

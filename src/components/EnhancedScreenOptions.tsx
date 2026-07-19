@@ -4,9 +4,11 @@ import { useEffect, useRef, useState } from "react";
 import { FiMonitor } from "react-icons/fi";
 import { MdMonitor } from "react-icons/md";
 import { WindowInfo, MonitorInfo } from "../Types";
+import CameraOverlayPreview from "./CameraOverlayPreview";
 
 interface ScreenOptionsProps {
     recordType: string;
+    videoDevices: string[];
     selectScreen: boolean;
     setScreen: () => void;
     unSetScreen: () => void;
@@ -41,6 +43,7 @@ interface SelectionTarget {
 
 const EnhancedScreenOptions = ({
     recordType,
+    videoDevices,
     selectScreen,
     setScreen,
     unSetScreen,
@@ -389,6 +392,13 @@ const EnhancedScreenOptions = ({
 
     const renderOverlaySettings = () => (
         <div className="border-t dark:border-neutral-700 p-6 bg-gray-50 dark:bg-neutral-800/60 space-y-4">
+            <CameraOverlayPreview
+                videoDevices={videoDevices}
+                overlayShape={overlayShape}
+                overlayPosition={overlayPosition}
+                overlaySize={overlaySize}
+            />
+
             <div>
                 <label className="block text-sm font-medium mb-2">Camera Shape</label>
                 <div className="flex gap-3">
@@ -415,6 +425,9 @@ const EnhancedScreenOptions = ({
 
             <div>
                 <label className="block text-sm font-medium mb-2">Camera Position</label>
+                <p className="text-xs text-gray-500 dark:text-neutral-400 mb-2">
+                    If multiple cameras are selected, they're arranged in a row starting from this corner.
+                </p>
                 <div className="grid grid-cols-3 gap-2">
                     {[
                         'top_left', 'top_center', 'top_right',
@@ -483,10 +496,13 @@ const EnhancedScreenOptions = ({
                     {mode === 'main' && renderMainOptions()}
                     {mode === 'monitors' && renderMonitors()}
                     {mode === 'windows' && renderWindows()}
-                    {/* A camera overlay bubble doesn't apply to a single still frame — hiding
-                        this for Screenshot avoids a settings section whose choices would
-                        otherwise be silently ignored. */}
-                    {recordType !== "c" && renderOverlaySettings()}
+                    {/* A camera overlay bubble only exists for the two record types that
+                        actually composite a camera onto a screen capture (see win.rs's
+                        recording_with_output_sva/_sv) - showing these settings for "sa"/"s"/
+                        "a"/"va"/"v" used to silently do nothing, and now that this section
+                        includes a live getUserMedia preview, it would also needlessly grab the
+                        webcam for a recording that will never use one. */}
+                    {(recordType === "sva" || recordType === "sv") && renderOverlaySettings()}
                 </div>
 
                 {/* Footer */}

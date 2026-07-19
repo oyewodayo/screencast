@@ -125,7 +125,7 @@ const Dashboard = () => {
   // visible around it.
   const [isPdfFullscreen, setIsPdfFullscreen] = useState<boolean>(false);
   const [audioDevice, setAudioDevice] = useState("");
-  const [videoDevice, setVideoDevice] = useState("");
+  const [videoDevices, setVideoDevices] = useState<string[]>([]);
   const [selectScreen, setSelectScreen] = useState(false);
   const [selectedScreen, setSelectedScreen] = useState("");
    const [screenSize, setScreenSize] = useState("fullscreen");
@@ -1125,6 +1125,7 @@ const setScreen = () => {
               <VideoPlayer
                 key={selectedFile.path}
                 src={selectedFile.path}
+                filePath={selectedFile.sourcePath}
                 title={selectedFile.name}
                 autoPlay={true}
                 initialTime={isAudioSelected ? audioPositionsRef.current[selectedFile.sourcePath] : undefined}
@@ -1172,8 +1173,8 @@ const setScreen = () => {
         recordType={recordType}
         setRecordType={setRecordType}
         audioDevice={audioDevice}
-        videoDevice={videoDevice}
-        setVideoDevice={setVideoDevice}
+        videoDevices={videoDevices}
+        setVideoDevices={setVideoDevices}
         setAudioDevice={setAudioDevice}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}

@@ -129,6 +129,7 @@ fn main() {
             commands::window_capture::activate_and_open_window,
 
             commands::conversion::convert_to_mp4,
+            commands::conversion::get_playable_preview,
             commands::conversion::batch_convert_to_mp4,
             commands::conversion::cancel_conversion,
             commands::conversion::get_conversion_info,

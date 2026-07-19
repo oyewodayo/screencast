@@ -1,5 +1,6 @@
 import './player.css';
 import React, { useState, useRef, useEffect, ChangeEvent, MouseEvent } from 'react';
+import { invoke, convertFileSrc } from '@tauri-apps/api/tauri';
 import { IoPause, IoPlay } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
@@ -62,6 +63,10 @@ interface VideoPlayerProps {
   src?: string;
   title?: string;
   autoPlay?: boolean;
+  // Real filesystem path behind `src` (which is already a browser-loadable asset:// URL) -
+  // needed only to invoke get_playable_preview if native playback fails. Without it, a decode
+  // failure has no recovery path and just shows black, same as before this existed.
+  filePath?: string;
   // Seeks here once metadata is loaded — lets a caller resume audio/video where a previous
   // session left off instead of always restarting at 0.
   initialTime?: number;
@@ -72,16 +77,24 @@ interface VideoPlayerProps {
   onEnded?: () => void;
 }
 
-const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, initialTime, loop = false, onTimeUpdate, onEnded }) => {
+const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded }) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoContainerRef = useRef<HTMLDivElement>(null);
   const timelineContainerRef = useRef<HTMLDivElement>(null);
   const animationFrameRef = useRef<number | null>(null);
+  // Tracks which `src` a silent conversion fallback has already been attempted for, so a
+  // decode failure on the *converted* file (rare, but possible) doesn't retry forever - and so
+  // switching to a genuinely different file always gets a fresh attempt.
+  const recoveryAttemptedForRef = useRef<string | null>(null);
 
-  
+
   // Media type detection
   const [mediaType, setMediaType] = useState<MediaType>('video');
+  // True only while silently re-encoding an unplayable file in the background - see
+  // handleVideoError. Distinct from the browser's own native "loading metadata" moment, which
+  // needs no UI of its own since it's normally near-instant for files that already play fine.
+  const [isRecovering, setIsRecovering] = useState<boolean>(false);
   // Core player state
   const [, setIsPaused] = useState<boolean>(true);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -158,6 +171,43 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
       if (autoPlay) videoRef.current.play().catch(() => {});
     }
   }, [mediaType, src, autoPlay]);
+
+  // Some containers/codecs this app can record (most notably .avi - WebView2's <video> element
+  // has no container support for it at all, regardless of what's encoded inside) can never play
+  // natively no matter what settings produced them. Rather than show a silent black screen,
+  // silently re-encode to a browser-playable mp4 in the background and swap it in - no error
+  // message, no button, the user just sees a loading spinner and then their video plays.
+  //
+  // This used to try to return before the conversion finished and stream the still-growing file
+  // in via MediaSource + ranged fetch, to avoid blocking on a large recording's full re-encode.
+  // That depended on WebView2's specific MediaSource implementation, exact codec-string
+  // matching, and fetch-over-a-custom-protocol all behaving as expected - none of which is
+  // inspectable from here (no devtools/console access to this app's running window), and it
+  // broke in practice. Simpler and actually verifiable: wait for the real, complete conversion
+  // (ultrafast preset keeps this to normally a small fraction of the recording's own runtime)
+  // and then load an ordinary, fully-written file the exact way every other video here plays.
+  //
+  // Only for actual video (not audio - get_playable_preview always outputs h264 video + aac,
+  // which isn't the right fix for an audio-only source that fails for a different reason).
+  const handleVideoError = async (): Promise<void> => {
+    if (mediaType !== 'video' || !filePath || !src) return;
+    if (recoveryAttemptedForRef.current === src) return; // already tried once for this file
+
+    recoveryAttemptedForRef.current = src;
+    setIsRecovering(true);
+    try {
+      const playablePath = await invoke<string>('get_playable_preview', { inputPath: filePath });
+      const playableUrl = convertFileSrc(playablePath);
+      if (videoRef.current) {
+        videoRef.current.src = playableUrl;
+        if (autoPlay) await videoRef.current.play().catch(() => {});
+      }
+    } catch (err) {
+      console.error('Silent playback recovery failed:', err);
+    } finally {
+      setIsRecovering(false);
+    }
+  };
 
   // State update helper
   const updatePlayerState = (newState: PlayerState): void => {
@@ -631,10 +681,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 					}}
 					/>
 				) : (
+					<>
 					<video
 						ref={videoRef}
 						loop={loop}
 						onClick={togglePauseAndPlay}
+						onError={handleVideoError}
 						onLoadedMetadata={() => {
 							if (videoRef.current) {
 							setTotalTimeElement(formatDuration(videoRef.current.duration));
@@ -652,6 +704,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 							default={captionsVisible}
 						/>
 					</video>
+					{isRecovering && (
+						<div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+							<div className="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />
+						</div>
+					)}
+					</>
 				)
 			}
     	</div>

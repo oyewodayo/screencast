@@ -283,6 +283,81 @@ pub async fn convert_to_mp4(
     Ok(result)
 }
 
+// Deterministic, content-addressed cache location for the "just play, no prompts" preview
+// fallback (see get_playable_preview below) - keyed by the source path plus its modification
+// time, so a file replaced at the same path invalidates and regenerates automatically instead
+// of ever silently reusing a stale preview.
+fn preview_cache_path(input: &PathBuf) -> Result<PathBuf, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let metadata = std::fs::metadata(input).map_err(|e| format!("Failed to read input file: {}", e))?;
+    let modified_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut hasher = DefaultHasher::new();
+    input.to_string_lossy().hash(&mut hasher);
+    modified_secs.hash(&mut hasher);
+    let key = hasher.finish();
+
+    Ok(std::env::temp_dir().join("briefcast_preview_cache").join(format!("{:x}.mp4", key)))
+}
+
+// Silent, no-prompt fallback for a file the in-app player can't decode natively - most notably
+// .avi, which WebView2's <video> element has no container support for at all regardless of the
+// codec inside it; no ffmpeg encoding setting can change that. VideoPlayer.tsx calls this only
+// from its <video> element's onError handler (never up front), so a file that already plays
+// fine never pays this cost.
+//
+// This used to try to stream the conversion progressively (return the output path immediately
+// and let the player read the still-growing file via MediaSource + ranged fetch) so a large
+// recording wouldn't block on the full re-encode. That depended on WebView2's specific
+// MediaSource implementation, exact codec-string matching, and fetch-over-a-custom-protocol all
+// behaving as expected - none of which is inspectable from here (no devtools/console access to
+// this app's running window), and it broke in practice twice. VLC-style universal playback works
+// because VLC owns its entire decode pipeline (libavformat/libavcodec directly, no browser
+// engine in between); trying to reproduce that inside a webview's <video>/MediaSource stack means
+// depending on a browser vendor's partial implementation of it instead. Simpler and actually
+// verifiable: wait for the real, complete conversion (ultrafast preset, so normally a small
+// fraction of the recording's own runtime - measured ~3x faster than real-time against this
+// app's own bundled ffmpeg) and then load an ordinary, fully-written file the exact way every
+// other video in this app already plays.
+#[tauri::command]
+pub async fn get_playable_preview(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    input_path: String,
+) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input)?;
+
+    // Already converted (fully, from a previous open) - just hand back the finished file, no
+    // need to ever re-run ffmpeg for the same source.
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
+    }
+
+    let codec_args = [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+    ];
+
+    run_conversion(&app_handle, &window, &state, &input_path, cache_path, &codec_args).await
+}
+
 // Convert a still image (screenshot) between png/jpeg/webp/bmp. No audio/video codec args
 // apply here - ffmpeg's image2 muxer picks a sane default encoder from the output extension,
 // and run_conversion's duration-based progress just never populates (there's no "Duration:"

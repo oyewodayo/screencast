@@ -52,7 +52,8 @@ pub struct FormData{
     file_ext:String,
     record_type:String,
     audio_device:String,
-    video_device:String,
+    #[serde(default)]
+    video_devices:Vec<String>,
     screen_size:String,
     overlay_shape:String,
     overlay_position:String,
@@ -122,48 +123,157 @@ pub fn map_overlay_size(size: &str) -> String {
     }
 }
 
+// The real on-screen footprint of one camera bubble, needed to space multiple bubbles apart
+// without overlapping. circle/rounded collapse to a square the way get_overlay_shape's own
+// scale=w='min(iw,ih)':h='min(iw,ih)' already does per-camera - this just mirrors that math so
+// the position math agrees with what the filter graph actually produces.
+fn overlay_pixel_dimensions(shape: &str, size: &str) -> (i32, i32) {
+    let mapped = map_overlay_size(size);
+    let (w, h) = mapped
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?)))
+        .unwrap_or((320, 240));
+
+    match shape {
+        "circle" | "rounded" => {
+            let s = w.min(h);
+            (s, s)
+        }
+        _ => (w, h),
+    }
+}
+
 // Shared by every platform's overlay compositing (a webcam bubble drawn over the screen
 // capture) — only the *inputs* feeding this filter graph differ per OS (dshow/avfoundation/v4l2
 // device syntax), the graph itself is plain ffmpeg filter syntax and has no OS dependency.
-pub fn get_overlay_position(position: String) -> String {
-    match position.as_str() {
-        "bottom_left" => "overlay=x=100:y=H-h-50".to_string(),
-        "bottom_middle" => "overlay=x=(W-w)/2:y=H-h-50".to_string(),
-        "bottom_right" => "overlay=x=W-w-100:y=H-h-50".to_string(),
-        _ => "overlay=x=W-w-100:y=H-h-50".to_string(),
+//
+// With N cameras selected, each one is stacked outward from the chosen anchor corner (gap of
+// 20px, same margin the single-camera positions already used) rather than all landing on top of
+// each other at the same x/y. Covers all 6 positions the Camera Position buttons in
+// EnhancedScreenOptions.tsx can send - top_left/top_center/top_right previously fell through to
+// the bottom_right default below (silently, since nothing ever rendered a preview to notice),
+// same bug class as the "bottom_center" vs "bottom_middle" mismatch fixed above.
+fn overlay_position_expr(anchor: &str, index: usize, count: usize, cam_w: i32, cam_h: i32) -> String {
+    let _ = cam_h; // width alone (via cam_w) is enough since margins are fixed constants.
+    let gap = 20;
+    let step = index as i32 * (cam_w + gap);
+
+    let (x_base, y_top) = match anchor {
+        "top_left" => ("left", true),
+        "top_center" => ("center", true),
+        "top_right" => ("right", true),
+        "bottom_left" => ("left", false),
+        "bottom_center" => ("center", false),
+        // "bottom_right" and any unrecognized anchor fall back to this, matching the old
+        // single-camera default.
+        _ => ("right", false),
+    };
+
+    let x_expr = match x_base {
+        "left" => format!("{}+{}", 100, step),
+        "center" => {
+            let total = count as i32 * cam_w + (count.saturating_sub(1)) as i32 * gap;
+            format!("(W-{})/2+{}", total, step)
+        }
+        _ => format!("W-w-{}-{}", 100, step),
+    };
+
+    let y_expr = if y_top { "50".to_string() } else { "H-h-50".to_string() };
+
+    format!("overlay=x={}:y={}", x_expr, y_expr)
+}
+
+// One stage of the overlay chain: reads `prev_label` (the running composite so far, "[0:v]" for
+// the first camera or "[tmpN]" for subsequent ones) and `input_label` (this camera's raw input,
+// "[1:v]", "[2:v]", ...), and writes either an intermediate "[tmpN]" label (out_label = Some) for
+// the next stage to read, or nothing (out_label = None) on the final stage so ffmpeg auto-selects
+// it as the sole unlabeled filter output, same as the old single-camera graph did.
+fn overlay_stage_filter(
+    shape: &str,
+    stage_index: usize,
+    input_label: &str,
+    prev_label: &str,
+    out_label: Option<&str>,
+    position_expr: &str,
+) -> String {
+    // Just the trailing "[label]" to append when this stage feeds another one, or nothing when
+    // it's the final stage (left for ffmpeg to auto-select, as today's single-camera graph did).
+    let out_suffix = match out_label {
+        Some(label) => format!("[{}]", label),
+        None => String::new(),
+    };
+
+    match shape {
+        "circle" => format!(
+            "{input}scale=w='min(iw,ih)':h='min(iw,ih)', \
+            geq=lum_expr='if(gt((X-W/2)^2+(Y-H/2)^2,(W/2)^2),0,255)', \
+            format=yuva420p[alpha{n}]; \
+            {input}scale=w='min(iw,ih)':h='min(iw,ih)'[video{n}]; \
+            [video{n}][alpha{n}]alphamerge[overlay{n}]; \
+            {prev}[overlay{n}]{position_expr}{out_suffix}",
+            input = input_label,
+            n = stage_index,
+            prev = prev_label,
+            position_expr = position_expr,
+            out_suffix = out_suffix,
+        ),
+        "rounded" => format!(
+            "{input}scale=w='min(iw,ih)':h='min(iw,ih)', \
+            geq=lum_expr='if(gte(X,{r})*gte(Y,{r})*gte(W-{r}-X,0)*gte(H-{r}-Y,0),255,0)', \
+            format=yuva420p[alpha{n}]; \
+            {input}scale=w='min(iw,ih)':h='min(iw,ih)'[video{n}]; \
+            [video{n}][alpha{n}]alphamerge[overlay{n}]; \
+            {prev}[overlay{n}]{position_expr}{out_suffix}",
+            input = input_label,
+            n = stage_index,
+            r = 20,
+            prev = prev_label,
+            position_expr = position_expr,
+            out_suffix = out_suffix,
+        ),
+        _ => format!("{}{}{}{}", prev_label, input_label, position_expr, out_suffix),
     }
 }
 
-pub fn get_overlay_shape(shape: &str, overlay_filter: String) -> String {
-    match shape {
-        "circle" => format!(
-            "[1:v]scale=w='min(iw,ih)':h='min(iw,ih)', \
-            geq=lum_expr='if(gt((X-W/2)^2+(Y-H/2)^2,(W/2)^2),0,255)', \
-            format=yuva420p[alpha]; \
-            [1:v]scale=w='min(iw,ih)':h='min(iw,ih)'[video]; \
-            [video][alpha]alphamerge[overlay]; \
-            [0:v][overlay]{}",
-            overlay_filter
-        ),
-        "rounded" => format!(
-            "[1:v]scale=w='min(iw,ih)':h='min(iw,ih)', \
-            geq=lum_expr='if(gte(X,{r})*gte(Y,{r})*gte(W-{r}-X,0)*gte(H-{r}-Y,0),255,0)', \
-            format=yuva420p[alpha]; \
-            [1:v]scale=w='min(iw,ih)':h='min(iw,ih)'[video]; \
-            [video][alpha]alphamerge[overlay]; \
-            [0:v][overlay]{}",
-            overlay_filter,
-            r = 20
-        ),
-        _ => format!("[0:v][1:v]{}", overlay_filter),
+// Builds the full filter_complex chaining one overlay stage per camera - two or more cameras
+// each get masked/shaped independently and composited onto the running result in sequence
+// ([0:v] + cam0 -> tmp1, tmp1 + cam1 -> tmp2, ...), with the last stage left unlabeled so ffmpeg
+// picks it automatically the same way the old single-camera graph did (no -map anywhere here).
+pub fn build_camera_overlay_filter_complex(shape: &str, position: &str, size: &str, camera_count: usize) -> String {
+    let (cam_w, cam_h) = overlay_pixel_dimensions(shape, size);
+    let mut stages: Vec<String> = Vec::with_capacity(camera_count);
+    let mut prev_label = "[0:v]".to_string();
+
+    for index in 0..camera_count {
+        let input_label = format!("[{}:v]", index + 1);
+        let position_expr = overlay_position_expr(position, index, camera_count, cam_w, cam_h);
+        let is_last = index + 1 == camera_count;
+        let out_label = if is_last { None } else { Some(format!("tmp{}", index + 1)) };
+
+        stages.push(overlay_stage_filter(
+            shape,
+            index,
+            &input_label,
+            &prev_label,
+            out_label.as_deref(),
+            &position_expr,
+        ));
+
+        if let Some(label) = out_label {
+            prev_label = format!("[{}]", label);
+        }
     }
+
+    stages.join("; ")
 }
 
 // Output codec flags per container extension. win.rs's sva mode predates this and keeps its own
-// inline copy (see the "leave Windows as-is" note on that module) — this exists so macOS/Linux,
-// which are new code with no existing behavior to preserve, share one copy of it between them
-// instead of duplicating the same match a second and third time.
-#[allow(dead_code)]
+// inline copy (see the "leave Windows as-is" note on that module), but recording_with_output_v
+// uses this - it used to hardcode "-c:v mpeg4" for every extension, which is flatly invalid for
+// "webm" (can't hold an mpeg4 stream) and, worse, produced mp4/mov files with no moov atom (and
+// so completely unopenable - the reported "blank black screen") whenever stop_recording's
+// graceful shutdown didn't finish in time and had to force-kill ffmpeg, since plain mp4/mov only
+// ever write the moov atom once at the very end.
 pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
     match ext.to_lowercase().as_str() {
         "mp4" => vec![
@@ -179,6 +289,10 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             "-preset".into(), "ultrafast".into(),
             "-crf".into(), "23".into(),
             "-c:a".into(), "aac".into(),
+            // Without this, ffmpeg's native aac encoder defaults to 128k - noticeably more
+            // compressed than the 192k every other lossy-audio branch here already uses. Same
+            // fix as the "mp4"/"mov"/"webm"/fallback branches, just closing this one gap.
+            "-b:a".into(), "192k".into(),
         ],
         "avi" => vec![
             "-c:v".into(), "libx264".into(),
@@ -189,12 +303,28 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             "-c:v".into(), "libx264".into(),
             "-preset".into(), "ultrafast".into(),
             "-c:a".into(), "aac".into(),
+            "-b:a".into(), "192k".into(),
             "-movflags".into(), "+faststart+frag_keyframe+empty_moov".into(),
         ],
         "webm" => vec![
+            // gdigrab/avfoundation/x11grab all capture the screen with an alpha channel
+            // (BGRA/ARGB) even though a desktop capture never has meaningful transparency.
+            // libvpx's VP8 encoder happens to support alpha (as yuva420p), and ffmpeg's default
+            // format auto-negotiation prefers that alpha-preserving path when the source has
+            // one - but that path fails to even initialize in this build ("Error while opening
+            // encoder... Nothing was written into output file", reproduced 100% of the time
+            // against this app's own bundled ffmpeg on a real 4K capture). Forcing plain
+            // yuv420p (dropping the pointless alpha channel) avoids that path entirely and the
+            // encoder opens fine - this was the actual root cause of ".webm recordings don't
+            // play", not a browser/WebView2 codec-support issue: the files were never valid to
+            // begin with.
+            "-pix_fmt".into(), "yuv420p".into(),
             "-c:v".into(), "libvpx".into(), // libvpx (not libvpx-vp9) for wider compatibility
             "-b:v".into(), "2M".into(),
             "-c:a".into(), "libvorbis".into(), // libvorbis (not libopus), same reasoning
+            // Without this, libvorbis defaults to its ~112k quality-3 preset - same gap as the
+            // unset aac bitrate above, just for the vorbis encoder.
+            "-b:a".into(), "192k".into(),
             // realtime+cpu-used 5, not good+cpu-used 0 (libvpx's slowest, offline-quality
             // preset) - this is live screen capture, not a file conversion, and needs an encoder
             // that can actually keep up with the incoming framerate. See win.rs's identical fix
@@ -208,10 +338,37 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             "-c:v".into(), "libx264".into(),
             "-preset".into(), "ultrafast".into(),
             "-c:a".into(), "aac".into(),
+            "-b:a".into(), "192k".into(),
             "-movflags".into(), "+faststart+frag_keyframe+empty_moov".into(),
         ],
     }
 }
+
+// Codec/bitrate flags for the audio-only record type's file extensions (mp3/wav/aac/wma - see
+// BottomDocker.tsx's file-extension options when record_type is "a"). Same reasoning as
+// codec_args_for_ext: recording_with_output_a used to set none of this at all, leaving it to
+// ffmpeg's per-container default - which for mp3 measured out to the same 128k default this file
+// keeps hitting elsewhere.
+pub(crate) fn audio_codec_args_for_ext(ext: &str) -> Vec<String> {
+    match ext.to_lowercase().as_str() {
+        "mp3" => vec!["-c:a".into(), "libmp3lame".into(), "-b:a".into(), "192k".into()],
+        "wav" => vec!["-c:a".into(), "pcm_s16le".into()], // uncompressed - no bitrate to set
+        "wma" => vec!["-c:a".into(), "wmav2".into(), "-b:a".into(), "192k".into()],
+        // "aac" and any unrecognized extension
+        _ => vec!["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()],
+    }
+}
+
+// Boosts captured mic audio that's otherwise noticeably quiet, and compresses its dynamic range
+// first so that boost doesn't clip whatever passages are already loud (voice trailing off vs.
+// leaning into the mic, etc). Deliberately NOT dynaudnorm/loudnorm - both are meant for
+// normalizing a finished file, and empirically (measured against this app's own bundled ffmpeg
+// and real mic) dynaudnorm runs at ~0.1x real-time speed here, which would make it fall further
+// and further behind during any real recording and risk the same "force-killed with a large
+// unflushed backlog, corrupt output" failure mode already documented for other slow encoders in
+// this codebase (see win.rs's webm comments). acompressor+volume are cheap per-sample filters
+// with no lookahead buffering, confirmed to run at real-time speed in the same test.
+pub(crate) const AUDIO_ENHANCE_FILTER: &str = "acompressor=threshold=-25dB:ratio=3:attack=5:release=200,volume=6dB";
 
 // Hides the console window a spawned child would otherwise flash open on Windows (a no-op
 // everywhere else, since spawning a child process never pops up a console on macOS/Linux in the
