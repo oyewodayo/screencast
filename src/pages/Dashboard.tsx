@@ -24,6 +24,8 @@ import {
   IoRepeatOutline,
   IoShuffleOutline,
   IoPlayForwardOutline,
+  IoTrashOutline,
+  IoArrowUndoOutline,
 } from "react-icons/io5";
 
 type RAMInfo = [number, number];
@@ -50,6 +52,25 @@ const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.R
   { category: "image", label: "Image", icon: <IoImage size={18} /> },
   { category: "pdf", label: "Pdf", icon: <IoDocumentText size={18} /> },
 ];
+
+// The sidebar's active tab is either a real file category or the Trash view — the latter isn't
+// a FileCategory (getFileCategory never returns it; it's a distinct data source, not an
+// extension-based filter over `files`), so it gets its own type rather than being folded in.
+type SidebarTab = FileCategory | "trash";
+
+interface TrashEntry {
+  trashed_name: string;
+  name: string;
+  original_path: string;
+  deleted_at: number; // unix seconds
+}
+
+const formatDeletedAt = (unixSeconds: number): string => {
+  const diffDays = Math.floor((Date.now() - unixSeconds * 1000) / (1000 * 60 * 60 * 24));
+  if (diffDays <= 0) return "today";
+  if (diffDays === 1) return "1 day ago";
+  return `${diffDays} days ago`;
+};
 
 // Filters shown in the native "open file" dialog — same extensions the sidebar already
 // understands, so anything pickable there is guaranteed playable/viewable here too.
@@ -115,7 +136,8 @@ const Dashboard = () => {
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
   const [files, setFiles] = useState<FileMap>({});
-  const [activeFileCategory, setActiveFileCategory] = useState<FileCategory>("video");
+  const [activeFileCategory, setActiveFileCategory] = useState<SidebarTab>("video");
+  const [trashItems, setTrashItems] = useState<TrashEntry[]>([]);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>("");
@@ -222,6 +244,35 @@ useEffect(() => {
     };
   }, []);
 
+  // ScreenshotOverlayWindow does the actual capture itself (it's the one holding the formData
+  // by then) and reports the outcome back here purely for the toast — the sidebar refresh
+  // already happens on its own via the existing refresh-file-list listener below, since
+  // take_screenshot emits that on the backend regardless of which window called it.
+  useEffect(() => {
+    const setupListener = async () => {
+      const unlisten = await listen<{ message: string; isError?: boolean }>('screenshot-captured', (event) => {
+        if (event.payload.isError) {
+          setError(event.payload.message);
+        } else {
+          setMessage(event.payload.message);
+          setError("");
+        }
+      });
+      return unlisten;
+    };
+
+    let unlistenFn: (() => void) | undefined;
+    setupListener().then(fn => {
+      unlistenFn = fn;
+    });
+
+    return () => {
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
+  }, []);
+
 const setScreen = () => {
     invoke<WindowInfo[]>('capture_window_screenshots_by_title_command')
       .then((windowTitles) => {
@@ -239,23 +290,90 @@ const setScreen = () => {
     setSelectScreen(false);
   };
 
-  const handleStartRecording = async (formData: any) => {
+  // Window-targeted *recording* still auto-raises its target: Windows' SetForegroundWindow
+  // restriction (see openScreenshotOverlay below for the full explanation) applies here too and
+  // can just as easily no-op, but a multi-second recording has room to be manually corrected
+  // (switch to the window yourself once it starts) in a way a single-shot screenshot doesn't —
+  // so recording keeps this best-effort auto-focus rather than also gaining an overlay step.
+  const activateTargetWindowIfNeeded = async (): Promise<void> => {
+    if (!screenSize.startsWith('window:')) return;
+    await invoke('activate_and_open_window', { title: selectedScreen });
+    await new Promise(resolve => setTimeout(resolve, 500));
+  };
+
+  // Anything other than Full Screen always goes through the overlay - Window capture can't rely
+  // on auto-focus at all (there's no "fix it after the fact" for a single frame, see
+  // openScreenshotOverlay below), and Monitor capture gets the same confirm-before-capture beat
+  // so nothing gets grabbed the instant a target is picked. Full Screen has no specific target to
+  // confirm against, so it stays instant.
+  //
+  // Reads screen_size off `formData` (built moments ago from whatever target was just resolved)
+  // rather than the ambient `screenSize` state - that state update and this call can land in the
+  // same synchronous tick (e.g. clicking a window thumbnail), in which case reading the state
+  // directly here would still see the *previous* selection.
+  const handleTakeScreenshot = async (formData: any) => {
+    if (formData.screen_size !== 'fullscreen') {
+      await openScreenshotOverlay(formData);
+      return;
+    }
     try {
-        // NOW screenSize is accessible here
-        if (screenSize.startsWith('monitor:')) {
-            const monitorId = screenSize.replace('monitor:', '');
-            console.log('Recording monitor:', monitorId);
-            // Add monitor-specific logic
-        } else if (screenSize.startsWith('window:')) {
-            const windowHwnd = screenSize.replace('window:', '');
-            console.log('Recording window:', windowHwnd, selectedScreen);
-            
-            // Activate the window before recording
-            await invoke('activate_and_open_window', { 
-                title: selectedScreen 
-            });
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
+      const playShutterSound = () => {
+        return new Promise<void>((resolve) => {
+          const audio = new Audio("/sounds/option-3.mp3");
+          audio.onended = () => resolve();
+          audio.play().catch(() => resolve());
+        });
+      };
+      // Fired off without awaiting — the capture itself shouldn't wait on playback finishing,
+      // this is just audible feedback that something happened.
+      playShutterSound();
+
+      const savedPath = await invoke<string>("take_screenshot", { formData });
+      const fileName = savedPath.split(/[\\/]/).pop() ?? savedPath;
+      setMessage(`Screenshot saved: ${fileName}`);
+      setError("");
+    } catch (error) {
+      console.error("Error taking screenshot:", error);
+      setError(`Failed to take screenshot: ${error}`);
+    }
+  };
+
+  // Replaces auto-focusing the target window (which routinely failed — see the module-level
+  // comment on ScreenshotOverlayWindow.tsx for the Windows-level reason why) with a small
+  // always-on-top overlay: the user brings the real target window forward themselves — genuine
+  // user input always wins the focus fight a program can't — then confirms capture on the
+  // overlay, which hides itself immediately before the actual frame grab so it's never part of
+  // the captured pixels.
+  //
+  // screenshot-overlay is pre-declared in tauri.conf.json (visible: false) and only ever
+  // shown/hidden from here on, exactly like recording-overlay — not created fresh via
+  // `new WebviewWindow(...)` each time, which is an unproven path in this app (every other
+  // overlay window already existed by the time anything tried to show it) and turned out to be
+  // unreliable in practice. Data reaches it via an event rather than the URL, since the window
+  // (and its listener) already exists long before any particular capture request does.
+  const openScreenshotOverlay = async (formData: any) => {
+    try {
+      const overlayWindow = WebviewWindow.getByLabel('screenshot-overlay');
+      if (!overlayWindow) {
+        setError('Screenshot overlay window is not available');
+        return;
+      }
+      await overlayWindow.emit('screenshot-overlay-armed', { title: formData.window_title, formData });
+      await overlayWindow.show();
+      await overlayWindow.setFocus();
+    } catch (error) {
+      console.error('Error opening screenshot overlay:', error);
+      setError(`Failed to open screenshot overlay: ${error}`);
+    }
+  };
+
+  const handleStartRecording = async (formData: any) => {
+    if (formData.record_type === "c") {
+      await handleTakeScreenshot(formData);
+      return;
+    }
+    try {
+        await activateTargetWindowIfNeeded();
 
         // Play audio notification
         const playAudioNotification = () => {
@@ -367,8 +485,79 @@ const setScreen = () => {
 		handleDirectoryFiles();
 	}, []);
 
+	// Runs once per launch, not a background timer — same "check whenever it's opened" policy
+	// the backend's purge_expired_trash itself is built around (see its own comment for why).
 	useEffect(() => {
-		const setupListener = async () => {	
+		const retentionDays = loadSettings().trashRetentionDays;
+		invoke<number>("purge_expired_trash", { retentionDays })
+			.then((purgedCount) => {
+				if (purgedCount > 0) console.log(`Purged ${purgedCount} expired trash item(s)`);
+			})
+			.catch((error) => console.error("Error purging expired trash:", error));
+	}, []);
+
+	const loadTrash = async () => {
+		try {
+			const items = await invoke<TrashEntry[]>("list_trash");
+			setTrashItems(items);
+		} catch (error) {
+			console.error("Error loading trash:", error);
+			setError(`Failed to load trash: ${error}`);
+		}
+	};
+
+	const handleDeleteFile = async (file: FileEntry) => {
+		try {
+			await invoke("move_to_trash", { path: file.path });
+			if (selectedFile?.sourcePath === file.path) setSelectedFile(null);
+			setOpenMenu(null);
+			await handleDirectoryFiles();
+			setMessage(`Moved to trash: ${formatFileName(file.name)}`);
+		} catch (error) {
+			console.error("Error deleting file:", error);
+			setError(`Failed to delete file: ${error}`);
+		}
+	};
+
+	const handleRestoreFromTrash = async (item: TrashEntry) => {
+		try {
+			await invoke("restore_from_trash", { trashedName: item.trashed_name });
+			await Promise.all([loadTrash(), handleDirectoryFiles()]);
+			setMessage(`Restored: ${formatFileName(item.name)}`);
+		} catch (error) {
+			console.error("Error restoring file:", error);
+			setError(`Failed to restore file: ${error}`);
+		}
+	};
+
+	const handleDeleteForever = async (item: TrashEntry) => {
+		try {
+			await invoke("delete_trash_item", { trashedName: item.trashed_name });
+			await loadTrash();
+		} catch (error) {
+			console.error("Error permanently deleting file:", error);
+			setError(`Failed to permanently delete file: ${error}`);
+		}
+	};
+
+	const handleEmptyTrash = async () => {
+		try {
+			await invoke("empty_trash");
+			await loadTrash();
+			setMessage("Trash emptied");
+		} catch (error) {
+			console.error("Error emptying trash:", error);
+			setError(`Failed to empty trash: ${error}`);
+		}
+	};
+
+	const handleOpenTrash = () => {
+		setActiveFileCategory("trash");
+		loadTrash();
+	};
+
+	useEffect(() => {
+		const setupListener = async () => {
 			const unlistenRefresh = await listen('refresh-file-list', () => {
 			console.log('🔄 Refresh file list event received...');
 			handleDirectoryFiles();
@@ -614,7 +803,9 @@ const setScreen = () => {
 		] as [string, FileEntry[]])
 		.filter(([, fileList]) => fileList.length > 0);
 	const sidebarHeaderLabel =
-		filteredEntries.length === 1 ? `${filteredEntries[0][0]}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
+		activeFileCategory === "trash"
+			? "Trash:"
+			: filteredEntries.length === 1 ? `${filteredEntries[0][0]}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
 	const isAudioSelected = selectedFile !== null && getFileCategory(selectedFile.name) === "audio";
 
   return (
@@ -648,6 +839,19 @@ const setScreen = () => {
                       <span>{label}</span>
                     </button>
                   ))}
+                  <button
+                    type="button"
+                    title="Trash"
+                    onClick={handleOpenTrash}
+                    className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
+                      activeFileCategory === "trash"
+                        ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                        : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
+                    }`}
+                  >
+                    <IoTrashOutline size={18} />
+                    <span>Trash</span>
+                  </button>
                 </div>
 
                 {/* Folder label + prev/next/repeat/shuffle/autoplay controls — fixed below the
@@ -723,7 +927,57 @@ const setScreen = () => {
                 </div>
 
                 <div className="p-3 text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200">
-                {filteredEntries.length === 0 ? (
+                {activeFileCategory === "trash" ? (
+                  trashItems.length === 0 ? (
+                    <p>Trash is empty</p>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-xs text-neutral-500 dark:text-neutral-400">
+                          {trashItems.length} item{trashItems.length === 1 ? "" : "s"}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={handleEmptyTrash}
+                          className="text-xs text-red-600 dark:text-red-400 hover:underline"
+                        >
+                          Empty Trash
+                        </button>
+                      </div>
+                      <ul className="space-y-0.5">
+                        {trashItems.map((item) => (
+                          <li
+                            key={item.trashed_name}
+                            className="flex items-center justify-between gap-2 group px-1 py-1.5 rounded hover:bg-gray-50 dark:hover:bg-neutral-800"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate" title={item.name}>{formatFileName(item.name)}</div>
+                              <div className="text-[10px] text-neutral-400 dark:text-neutral-500">Deleted {formatDeletedAt(item.deleted_at)}</div>
+                            </div>
+                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                              <button
+                                type="button"
+                                title="Restore"
+                                onClick={() => handleRestoreFromTrash(item)}
+                                className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                              >
+                                <IoArrowUndoOutline size={14} />
+                              </button>
+                              <button
+                                type="button"
+                                title="Delete forever"
+                                onClick={() => handleDeleteForever(item)}
+                                className="p-1 rounded text-red-500 hover:bg-red-100 dark:hover:bg-red-500/20"
+                              >
+                                <IoTrashOutline size={14} />
+                              </button>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )
+                ) : filteredEntries.length === 0 ? (
                   <p>No {activeFileCategory} files found</p>
                 ) : (
                   filteredEntries.map(([folder, fileList]) => (
@@ -800,6 +1054,15 @@ const setScreen = () => {
                                       }}
                                     >
                                     Convert
+                                  </button>
+                                  <button
+                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm text-red-600 dark:text-red-400"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDeleteFile(file);
+                                      }}
+                                    >
+                                    Delete
                                   </button>
                                 </div>
                               )}

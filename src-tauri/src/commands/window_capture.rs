@@ -33,16 +33,25 @@ pub struct WindowInfo {
     title: String,
     image_path: String,
     hwnd: isize,
+    // The owning process's executable path - window titles alone can be ambiguous (several
+    // browser windows, several editor windows with similarly-named files) and thumbnails aren't
+    // always available (see capture_window_enhanced's comment on why PrintWindow can fail for
+    // some GPU-composited windows), so this gives the picker a second, always-available way to
+    // tell windows apart. Empty string where a platform doesn't (yet) resolve it.
+    exe_path: String,
 }
 
 #[derive(Serialize, Debug, Clone)]
 pub struct MonitorInfo {
-    id: String,
+    // pub(crate): recording.rs (a sibling module, not a descendant of this one — plain private
+    // fields aren't visible there) reads these directly to resolve "monitor:<id>" screen_size
+    // values into real geometry for gdigrab/x11grab/avfoundation targeting.
+    pub(crate) id: String,
     name: String,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
     is_primary: bool,
 }
 

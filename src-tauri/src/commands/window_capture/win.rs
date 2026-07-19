@@ -6,11 +6,14 @@
 // now owns the one canonical command per operation and dispatches into these.
 use tauri::async_runtime::Mutex as AsyncMutex;
 use std::sync::Mutex;
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM, LRESULT, RECT};
+use windows::Win32::System::Threading::{
+    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION
+};
+use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, WPARAM, LRESULT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, EnumWindows, FindWindowW, GetWindowTextLengthW,
-    GetWindowTextW, IsWindowVisible, SetForegroundWindow, ShowWindow,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow,
     SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, SW_RESTORE, WH_SHELL,
     GetWindowRect
 };
@@ -23,8 +26,8 @@ use windows::Win32::Graphics::Gdi::{
 // PrintWindow/PRINT_WINDOW_FLAGS live under Storage::Xps in this crate version's metadata,
 // not UI::WindowsAndMessaging where the Win32 docs file them.
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-use windows::core::PCWSTR;
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::core::{PCWSTR, PWSTR};
 use std::fs;
 use std::sync::OnceLock;
 use std::ffi::OsStr;
@@ -243,6 +246,41 @@ pub fn get_monitors() -> Result<Vec<MonitorInfo>, String> {
     Ok(monitors)
 }
 
+// Best-effort: the owning process's absolute executable path, used as a second, always-available
+// identifier in the window picker (thumbnails can be missing - see capture_window_enhanced's
+// comment - and titles alone can be ambiguous between similarly-named windows). Any failure along
+// the way (no process for the hwnd, access denied opening a protected/elevated process, ...) just
+// yields an empty string rather than erroring the whole listing out over one window's metadata.
+fn get_process_exe_path(hwnd: HWND) -> String {
+    unsafe {
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return String::new();
+        }
+
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return String::new();
+        };
+
+        let mut buffer = [0u16; 1024];
+        let mut size = buffer.len() as u32;
+        let path = if QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        ).is_ok() {
+            String::from_utf16_lossy(&buffer[..size as usize])
+        } else {
+            String::new()
+        };
+
+        let _ = CloseHandle(process);
+        path
+    }
+}
+
 pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) -> Result<Vec<WindowInfo>, String> {
     let windows = get_all_open_windows_titles();
 
@@ -347,6 +385,7 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
                 title: title.to_string(),
                 image_path,
                 hwnd: hwnd.0,
+                exe_path: get_process_exe_path(*hwnd),
             });
         }
 
@@ -401,6 +440,67 @@ pub async fn activate_and_open_window(title: &str) -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("Activate window task panicked: {}", e))?
+}
+
+// Clamps a window rect to the union of every monitor's bounds, so a rect that pokes even
+// slightly outside the real desktop - whether from GetWindowRect's border padding (see below)
+// or a window genuinely dragged half off-screen - never reaches ffmpeg. gdigrab hard-rejects an
+// out-of-bounds -offset_x/-offset_y/-video_size crop instead of clipping it, which is exactly
+// the "Screenshot capture failed" ffmpeg threw for a maximized window.
+fn clamp_rect_to_desktop(x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    let bounds = get_monitors().ok().filter(|m| !m.is_empty()).map(|monitors| {
+        let min_x = monitors.iter().map(|m| m.x).min().unwrap();
+        let min_y = monitors.iter().map(|m| m.y).min().unwrap();
+        let max_x = monitors.iter().map(|m| m.x + m.width).max().unwrap();
+        let max_y = monitors.iter().map(|m| m.y + m.height).max().unwrap();
+        (min_x, min_y, max_x, max_y)
+    });
+
+    let Some((min_x, min_y, max_x, max_y)) = bounds else {
+        return (x, y, width.max(1), height.max(1));
+    };
+
+    let left = x.clamp(min_x, max_x);
+    let top = y.clamp(min_y, max_y);
+    let right = (x + width).clamp(min_x, max_x);
+    let bottom = (y + height).clamp(min_y, max_y);
+
+    (left, top, (right - left).max(1), (bottom - top).max(1))
+}
+
+// Used by recording::win to capture "this window" as a screen-region crop rather than through
+// gdigrab's own `-i title=...` mode — see the comment on gdigrab_input_args in recording/win.rs
+// for why that mode isn't used despite being the more obvious approach.
+pub fn get_window_rect_by_title(title: &str) -> Result<(i32, i32, i32, i32), String> {
+    let wide: Vec<u16> = OsStr::new(title).encode_wide().chain(Some(0)).collect();
+    let handle = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())) };
+
+    if handle.0 == 0 {
+        return Err(format!("Window '{}' not found", title));
+    }
+
+    // GetWindowRect includes the invisible resize-border padding Windows 10/11 adds around
+    // every window for its drop shadow - a handful of pixels normally, but for a *maximized*
+    // window that padding pushes the reported rect several pixels past every screen edge.
+    // DWMWA_EXTENDED_FRAME_BOUNDS is the actual visible bounds the user sees (no padding), so
+    // it's used whenever available; GetWindowRect is only the fallback if the DWM call fails
+    // (e.g. DWM composition disabled).
+    let mut rect = RECT::default();
+    let dwm_ok = unsafe {
+        DwmGetWindowAttribute(
+            handle,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut std::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        ).is_ok()
+    };
+    if !dwm_ok {
+        unsafe {
+            GetWindowRect(handle, &mut rect).map_err(|e| format!("GetWindowRect failed: {}", e))?;
+        }
+    }
+
+    Ok(clamp_rect_to_desktop(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
 }
 
 pub async fn start_monitoring_windows() -> Result<(), String> {

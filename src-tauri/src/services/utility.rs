@@ -45,16 +45,34 @@ pub struct FileEntry {
     path: String,
 }
 
+// Windows/Linux both conventionally keep recordings under ~/Videos; macOS uses ~/Movies instead.
+// The one place this app's "where do Briefcast's files live" convention is decided — shared by
+// list_briefcast_files below, trash.rs, and commands/recording.rs. Previously each of the first
+// two had their own copy of this, and utility.rs's specifically only ever checked USERPROFILE
+// (Windows' home-dir env var), meaning file listing silently returned nothing at all on
+// macOS/Linux regardless of anything else already being cross-platform there.
+pub fn briefcast_dir() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    let home = env::var("USERPROFILE");
+    #[cfg(not(target_os = "windows"))]
+    let home = env::var("HOME");
+
+    let mut path = PathBuf::from(home.map_err(|_| "Failed to get user's home directory".to_string())?);
+
+    #[cfg(target_os = "macos")]
+    path.push("Movies");
+    #[cfg(not(target_os = "macos"))]
+    path.push("Videos");
+
+    path.push("Briefcast");
+    Ok(path)
+}
 
 #[command]
 pub fn list_briefcast_files()->HashMap<String, Vec<FileEntry>>{
     let mut result = HashMap::new();
 
-    if let Some(home_dir) = env::var_os("USERPROFILE"){
-        let mut folder_path = PathBuf::from(home_dir);
-        folder_path.push("Videos");
-        folder_path.push("Briefcast");
-
+    if let Ok(folder_path) = briefcast_dir() {
         if folder_path.exists() && folder_path.is_dir(){
             scan_directory(&folder_path, &mut result);
         }
@@ -87,6 +105,12 @@ fn scan_directory(path: &Path, result: &mut HashMap<String, Vec<FileEntry>>){
                 }
             }
              else if entry_path.is_dir() {
+                // Trashed files live here (see services/trash.rs) and must never surface in the
+                // normal file list — that's the whole point of trash being "hidden" rather than
+                // just another folder.
+                if entry_path.file_name().and_then(|n| n.to_str()) == Some(".trash") {
+                    continue;
+                }
                 scan_directory(&entry_path, result);
              }
         }

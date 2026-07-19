@@ -6,6 +6,7 @@ import { MdMonitor } from "react-icons/md";
 import { WindowInfo, MonitorInfo } from "../Types";
 
 interface ScreenOptionsProps {
+    recordType: string;
     selectScreen: boolean;
     setScreen: () => void;
     unSetScreen: () => void;
@@ -22,14 +23,24 @@ interface ScreenOptionsProps {
     setOverlaySize: React.Dispatch<React.SetStateAction<string>>;
     isOpenScreen: boolean;
     onCloseScreen: () => void;
-    onStartRecording: () => void;
+    // Accepts the resolved capture target directly rather than relying on the caller to have
+    // already re-rendered with the setScreenSize/setSelectedScreen calls made just before it -
+    // those are async state updates, so reading them back synchronously in the same tick (as
+    // clicking a window thumbnail below needs to) would still see the *previous* selection.
+    onStartRecording: (target?: SelectionTarget) => void;
     setOpen: React.Dispatch<React.SetStateAction<boolean>>;
     error?: string;
 }
 
 type SelectionMode = 'main' | 'monitors' | 'windows';
 
+interface SelectionTarget {
+    screenSize: string;
+    selectedScreen: string;
+}
+
 const EnhancedScreenOptions = ({
+    recordType,
     selectScreen,
     setScreen,
     unSetScreen,
@@ -138,21 +149,50 @@ const EnhancedScreenOptions = ({
         setMode('main');
     };
 
-    const handleStartRecording = () => {
-        // Store selection info in screenSize for parent component compatibility
+    const resolveCurrentTarget = (): SelectionTarget => {
         if (selectedMonitor) {
-            setScreenSize(`monitor:${selectedMonitor}`);
-            setSelectedScreen(selectedMonitor);
-        } else if (selectedWindow !== null) {
-            const window = windows.find(w => w.hwnd === selectedWindow);
-            setScreenSize(`window:${selectedWindow}`);
-            setSelectedScreen(window?.title || '');
-        } else {
-            setScreenSize('fullscreen');
+            const monitor = monitors.find(m => m.id === selectedMonitor);
+            return { screenSize: `monitor:${selectedMonitor}`, selectedScreen: monitor?.name || selectedMonitor };
         }
+        if (selectedWindow !== null) {
+            const window = windows.find(w => w.hwnd === selectedWindow);
+            return { screenSize: `window:${selectedWindow}`, selectedScreen: window?.title || '' };
+        }
+        return { screenSize: 'fullscreen', selectedScreen: '' };
+    };
 
-        onStartRecording();
+    // Also updates screenSize/selectedScreen for parent-component compatibility (other code
+    // still reads them ambiently) - but the actual capture is driven by `target`, passed
+    // directly, so it's correct immediately rather than depending on those updates landing first.
+    const confirmAndStart = (target: SelectionTarget) => {
+        setScreenSize(target.screenSize);
+        setSelectedScreen(target.selectedScreen);
+        onStartRecording(target);
         closeModal();
+    };
+
+    const handleStartRecording = () => {
+        confirmAndStart(resolveCurrentTarget());
+    };
+
+    // Screenshotting a window is a single click: picking the window *is* confirming the capture
+    // target, so this brings it to the front itself (best-effort - Windows can silently block a
+    // programmatic focus steal, see ScreenshotOverlayWindow's module comment, which is why the
+    // overlay that opens right after still lets the user bring it forward manually if this
+    // didn't take) and goes straight to onStartRecording, which arms the overlay - instead of
+    // also waiting on a separate footer button press. Video/audio recording of a window keeps
+    // the two-step select-then-confirm flow, since a multi-second recording has room to be
+    // corrected after starting in a way a single-shot screenshot doesn't.
+    const handleWindowClick = async (window: WindowInfo & { hwnd: number }) => {
+        setSelectedWindow(window.hwnd);
+        if (recordType === 'c') {
+            try {
+                await invoke('activate_and_open_window', { title: window.title });
+            } catch (err) {
+                console.error('Failed to activate window:', err);
+            }
+            confirmAndStart({ screenSize: `window:${window.hwnd}`, selectedScreen: window.title || '' });
+        }
     };
 
     const renderMainOptions = () => (
@@ -280,7 +320,7 @@ const EnhancedScreenOptions = ({
                     {windows.map((window: any) => (
                         <button
                             key={window.hwnd}
-                            onClick={() => setSelectedWindow(window.hwnd)}
+                            onClick={() => handleWindowClick(window)}
                             className={`rounded-lg border-2 overflow-hidden transition-all text-left ${
                                 selectedWindow === window.hwnd
                                     ? 'border-green-500 ring-2 ring-green-200 dark:ring-green-500/30'
@@ -305,6 +345,17 @@ const EnhancedScreenOptions = ({
                                 <p className="text-xs truncate" title={window.title}>
                                     {window.title}
                                 </p>
+                                {/* A second, always-available way to tell windows apart -
+                                    titles alone can be ambiguous, and the thumbnail above isn't
+                                    always available (see win.rs's capture_window_enhanced). */}
+                                {window.exe_path && (
+                                    <p
+                                        className="text-[10px] text-gray-500 dark:text-neutral-500 truncate"
+                                        title={window.exe_path}
+                                    >
+                                        {window.exe_path}
+                                    </p>
+                                )}
                             </div>
                         </button>
                     ))}
@@ -409,7 +460,10 @@ const EnhancedScreenOptions = ({
                     {mode === 'main' && renderMainOptions()}
                     {mode === 'monitors' && renderMonitors()}
                     {mode === 'windows' && renderWindows()}
-                    {renderOverlaySettings()}
+                    {/* A camera overlay bubble doesn't apply to a single still frame — hiding
+                        this for Screenshot avoids a settings section whose choices would
+                        otherwise be silently ignored. */}
+                    {recordType !== "c" && renderOverlaySettings()}
                 </div>
 
                 {/* Footer */}
@@ -433,7 +487,7 @@ const EnhancedScreenOptions = ({
                         onClick={handleStartRecording}
                         className="bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 px-6 py-2 rounded hover:bg-gray-800 dark:hover:bg-white text-sm font-medium"
                     >
-                        Start Recording
+                        {recordType === "c" ? "Take Screenshot" : "Start Recording"}
                     </button>
                 </div>
             </div>

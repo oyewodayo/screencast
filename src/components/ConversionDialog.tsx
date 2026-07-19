@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
+import { isImageFile } from "../utils/videoUtils";
 
 // Conversion types
 interface ConversionProgress {
@@ -72,9 +73,33 @@ export const useVideoConversion = () => {
   ) => {
     setIsConverting(true);
     setConversionProgress(null);
-    
+
     try {
       const result = await invoke<string>('convert_video', {
+        inputPath,
+        outputFormat,
+        outputPath: outputPath || null,
+        preserveOriginal
+      });
+      return result;
+    } catch (error) {
+      console.error('Conversion failed:', error);
+      setIsConverting(false);
+      throw error;
+    }
+  };
+
+  const convertImage = async (
+    inputPath: string,
+    outputFormat: string,
+    outputPath?: string,
+    preserveOriginal: boolean = true
+  ) => {
+    setIsConverting(true);
+    setConversionProgress(null);
+
+    try {
+      const result = await invoke<string>('convert_image', {
         inputPath,
         outputFormat,
         outputPath: outputPath || null,
@@ -101,11 +126,27 @@ export const useVideoConversion = () => {
   return {
     convertToMp4,
     convertVideo,
+    convertImage,
     cancelConversion,
     conversionProgress,
     isConverting,
   };
 };
+
+const VIDEO_FORMATS = [
+  { value: 'mp4', label: 'MP4 (Recommended)' },
+  { value: 'mov', label: 'MOV' },
+  { value: 'mkv', label: 'MKV' },
+  { value: 'avi', label: 'AVI' },
+  { value: 'webm', label: 'WebM' },
+];
+
+const IMAGE_FORMATS = [
+  { value: 'png', label: 'PNG' },
+  { value: 'jpeg', label: 'JPEG' },
+  { value: 'webp', label: 'WebP' },
+  { value: 'bmp', label: 'BMP' },
+];
 
 // Conversion UI Component
 const ConversionDialog: React.FC<{
@@ -114,34 +155,30 @@ const ConversionDialog: React.FC<{
   onClose: () => void;
   onConverted: (newPath: string, fileName: string) => void;
 }> = ({ filePath, fileName, onClose, onConverted }) => {
-  const { convertToMp4, convertVideo, cancelConversion, conversionProgress, isConverting } = useVideoConversion();
-  const [selectedFormat, setSelectedFormat] = useState<string>('mp4');
+  const { convertToMp4, convertVideo, convertImage, cancelConversion, conversionProgress, isConverting } = useVideoConversion();
+  const isImage = isImageFile(fileName);
+  const formats = isImage ? IMAGE_FORMATS : VIDEO_FORMATS;
+  const [selectedFormat, setSelectedFormat] = useState<string>(isImage ? 'png' : 'mp4');
   const [preserveOriginal, setPreserveOriginal] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
-
-  const formats = [
-    { value: 'mp4', label: 'MP4 (Recommended)' },
-    { value: 'mov', label: 'MOV' },
-    { value: 'mkv', label: 'MKV' },
-    { value: 'avi', label: 'AVI' },
-    { value: 'webm', label: 'WebM' },
-  ];
 
   const handleConvert = async () => {
     setError('');
     try {
       let newPath: string;
-      
-      if (selectedFormat === 'mp4') {
+
+      if (isImage) {
+        newPath = await convertImage(filePath, selectedFormat, undefined, preserveOriginal);
+      } else if (selectedFormat === 'mp4') {
         newPath = await convertToMp4(filePath, undefined, preserveOriginal);
       } else {
         newPath = await convertVideo(filePath, selectedFormat, undefined, preserveOriginal);
       }
-      
+
       // Extract filename with new extension
       const newFileName = fileName.replace(/\.[^/.]+$/, `.${selectedFormat}`);
       onConverted(newPath, newFileName);
-      
+
     } catch (error: any) {
       console.error('Conversion failed:', error);
       setError(error.toString());
@@ -158,7 +195,7 @@ const ConversionDialog: React.FC<{
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div className="bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100 p-6 rounded-lg max-w-md w-full">
-        <h3 className="text-lg font-semibold mb-4">Convert Video</h3>
+        <h3 className="text-lg font-semibold mb-4">{isImage ? 'Convert Image' : 'Convert Video'}</h3>
 
         <div className="mb-4">
           <p className="text-sm text-gray-600 dark:text-neutral-400 mb-2">

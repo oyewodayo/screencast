@@ -24,7 +24,7 @@ use std::process::Command;
 
 use tauri::{AppHandle, State};
 
-use super::{codec_args_for_ext, get_overlay_position, get_overlay_shape, map_overlay_size, spawn_recording, AppState, FormData};
+use super::{codec_args_for_ext, extract_ffmpeg_error, get_overlay_position, get_overlay_shape, map_overlay_size, spawn_recording, AppState, FormData};
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
 fn x11_display() -> String {
@@ -300,25 +300,36 @@ pub async fn recording_with_output_s(
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }
 
-//Capture — a continuous screen recording (not a single still frame) started/stopped exactly
-// like every other mode, matching win.rs's recording_with_output_c despite the "Screenshot"
-// label the frontend shows for this record type; that mismatch is pre-existing, not introduced
-// here.
-pub async fn recording_with_output_c(
-    app_handle: &AppHandle,
-    state: State<'_, AppState>,
-    output_path: &PathBuf,
-    _form_data: &FormData,
-) -> Result<String, String> {
+// A real instant screenshot: `-frames:v 1` tells ffmpeg to grab exactly one frame and exit on
+// its own, so this is a single .output() call — no AppState involvement, no ffmpeg_process to
+// track, nothing for stop_recording to stop. Replaces what used to be recording_with_output_c, a
+// continuous screen recording started/stopped exactly like every other mode despite the
+// "Screenshot" label the frontend showed for this record type — the same bug win.rs had.
+pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, _form_data: &FormData) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let output_path = output_path.clone();
 
-    let args: Vec<String> = vec![
-        "-f".to_string(), "x11grab".to_string(),
-        "-framerate".to_string(), "30".to_string(),
-        "-i".to_string(), x11_display(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
-    ];
+    tauri::async_runtime::spawn_blocking(move || {
+        let args: Vec<String> = vec![
+            "-f".to_string(), "x11grab".to_string(),
+            "-i".to_string(), x11_display(),
+            "-frames:v".to_string(), "1".to_string(),
+            "-y".to_string(),
+            path_to_str(&output_path)?.to_string(),
+        ];
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+        let output = Command::new(&ffmpeg_path)
+            .args(&args)
+            .output()
+            .map_err(|e| format!("Failed to capture screenshot: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Screenshot capture failed: {}", extract_ffmpeg_error(&stderr)));
+        }
+
+        Ok(format!("Screenshot saved to {}", output_path.display()))
+    })
+    .await
+    .map_err(|e| format!("Screenshot task panicked: {}", e))?
 }

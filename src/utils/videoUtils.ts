@@ -98,6 +98,17 @@ export const isAudioFile = (filename: string): boolean => {
 };
 
 /**
+ * Check if file is an image file
+ * @param filename - Name of the file
+ * @returns True if file is an image
+ */
+export const isImageFile = (filename: string): boolean => {
+  const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'];
+  const ext = `.${getFileExtension(filename)}`;
+  return imageExtensions.includes(ext);
+};
+
+/**
  * Check if file is a supported media file
  * @param filename - Name of the file
  * @returns True if file is supported media

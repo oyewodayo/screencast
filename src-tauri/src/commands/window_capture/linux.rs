@@ -232,6 +232,10 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
                 title: title.clone(),
                 image_path,
                 hwnd: *window as isize,
+                // TODO: resolve via the window's _NET_WM_PID property + /proc/<pid>/exe, same
+                // idea as win.rs's get_process_exe_path. Left empty for now rather than blocking
+                // this on X11 process-id plumbing that nothing else here needs yet.
+                exe_path: String::new(),
             });
         }
 

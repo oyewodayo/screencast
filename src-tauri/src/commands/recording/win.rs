@@ -10,8 +10,43 @@ use std::process::{Command, Stdio};
 use tauri::regex::Regex;
 use tauri::{AppHandle, State};
 
-use super::{get_overlay_position, get_overlay_shape, map_overlay_size, silent_command, AppState, FormData};
+use super::{extract_ffmpeg_error, get_overlay_position, get_overlay_shape, map_overlay_size, resolve_capture_target, silent_command, AppState, CaptureTarget, FormData};
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
+
+fn desktop_crop_args(x: i32, y: i32, width: i32, height: i32) -> Vec<String> {
+    vec![
+        "-offset_x".to_string(), x.to_string(),
+        "-offset_y".to_string(), y.to_string(),
+        "-video_size".to_string(), format!("{}x{}", width, height),
+        "-i".to_string(), "desktop".to_string(),
+    ]
+}
+
+// gdigrab does have its own dedicated window-capture mode (`-i title=<exact title>` instead of
+// `-i desktop`), which is the more obvious way to implement this — deliberately not used here.
+// That mode grabs a window's contents the same way the classic GetDC(hwnd)+BitBlt technique
+// does, which is exactly what this app's own window-thumbnail feature (see
+// window_capture/win.rs's capture_window_enhanced) already had to move *away* from in favor of
+// PrintWindow(PW_RENDERFULLCONTENT), because BitBlt-style capture comes back solid black for any
+// GPU-composited window — which in practice is nearly every modern app (Chrome, VS Code,
+// Electron, ...). ffmpeg has no PrintWindow-equivalent flag for gdigrab.
+//
+// Instead, this captures the screen *region* the window currently occupies — a real,
+// already-composited pixel source, since it's just cropping the same desktop grab the Monitor
+// case above already uses successfully. This only produces the right pixels if the window is
+// actually the frontmost thing at that location, which is why callers are expected to have
+// already awaited activate_and_open_window before starting capture (Dashboard.tsx does this for
+// recording; take_screenshot needs the same treatment on the frontend).
+fn gdigrab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
+    match target {
+        CaptureTarget::FullScreen => Ok(vec!["-i".to_string(), "desktop".to_string()]),
+        CaptureTarget::Monitor { x, y, width, height } => Ok(desktop_crop_args(*x, *y, *width, *height)),
+        CaptureTarget::Window { title } => {
+            let (x, y, width, height) = crate::commands::window_capture::win::get_window_rect_by_title(title)?;
+            Ok(desktop_crop_args(x, y, width, height))
+        }
+    }
+}
 
 pub fn get_connected_devices(app_handle: &AppHandle) -> (Vec<String>, Vec<String>) {
     let ffmpeg_path = match get_ffmpeg_path(app_handle) {
@@ -98,11 +133,7 @@ pub async fn recording_with_output_sva(
         "-framerate".to_string(), "60".to_string(),
     ];
 
-    if form_data.screen_size != "fullscreen" {
-        args.extend(vec!["-video_size".to_string(), form_data.screen_size.to_string()]);
-    }
-
-    args.extend(vec!["-i".to_string(), "desktop".to_string()]);
+    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
 
     if !form_data.overlay_shape.is_empty() {
         log::debug!("overlay is present");
@@ -257,18 +288,18 @@ pub async fn recording_with_output_sa(app_handle: &AppHandle, state: State<'_, A
 
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
+    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "200".to_string()];
+    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
+    args.extend(vec![
+        "-f".to_string(), "dshow".to_string(),
+        "-i".to_string(), format!("audio={}", form_data.audio_device),
+        "-y".to_string(),
+        path_to_str(output_path)?.to_string(),
+    ]);
+
     log::debug!("Path {:?}", output_path);
     let child = silent_command(&ffmpeg_path)
-        .args([
-            "-f", "gdigrab",
-            "-framerate", "200",
-            "-i", "desktop",
-            "-f", "dshow",
-            "-video_size", "320x240",
-            "-i", &format!("audio={}", form_data.audio_device),
-            "-y",
-            path_to_str(output_path)?,
-        ])
+        .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -366,22 +397,20 @@ pub async fn recording_with_output_va(app_handle: &AppHandle, state: State<'_, A
 }
 
 //Screen only
-pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, _form_data: &FormData) -> Result<String, String> {
+pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
     {
         let mut app_state = state.output_path.lock().await;
         *app_state = Some(output_path.clone());
     }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
+    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "200".to_string()];
+    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
+    args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
+
     log::debug!("Path {:?}", output_path);
     let child = silent_command(&ffmpeg_path)
-        .args([
-            "-f", "gdigrab",
-            "-framerate", "200",
-            "-i", "desktop",
-            "-y",
-            path_to_str(output_path)?,
-        ])
+        .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -393,30 +422,39 @@ pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, Ap
     Ok(format!("Recording started. File will be saved to {}", output_path.display()))
 }
 
-//Capture
-pub async fn recording_with_output_c(app_handle: &AppHandle, state: State<'_, AppState>, output_path: &PathBuf, _form_data: &FormData) -> Result<String, String> {
-    {
-        let mut app_state = state.output_path.lock().await;
-        *app_state = Some(output_path.clone());
-    }
+// A real instant screenshot: `-frames:v 1` tells gdigrab/ffmpeg to grab exactly one frame and
+// exit on its own, so this is a single .output() call (wait for the process to finish, done) —
+// no AppState involvement, no ffmpeg_process to track, nothing for stop_recording to stop.
+pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let output_path = output_path.clone();
+    let input_args = gdigrab_input_args(&resolve_capture_target(form_data))?;
 
-    log::debug!("Path {:?}", output_path);
-    let child = silent_command(&ffmpeg_path)
-        .args([
-            "-f", "gdigrab",
-            "-framerate", "30",
-            "-i", "desktop",
-            "-y",
-            path_to_str(output_path)?,
-        ])
-        .spawn()
-        .map_err(|e| format!("Failed to capture: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string()];
+        args.extend(input_args);
+        args.extend(vec![
+            "-frames:v".to_string(), "1".to_string(),
+            "-y".to_string(),
+            path_to_str(&output_path)?.to_string(),
+        ]);
 
-    {
-        let mut process_state = state.ffmpeg_process.lock().await;
-        *process_state = Some(child);
-    }
+        // Not silent_command: that nulls stderr, which would throw away ffmpeg's actual error
+        // text right when it's most useful (a failed capture) — hide_console_window alone gets
+        // the "don't flash a console window" behavior without that tradeoff.
+        let mut cmd = Command::new(&ffmpeg_path);
+        cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        super::hide_console_window(&mut cmd);
 
-    Ok("Capture started".to_string())
+        let output = cmd.output().map_err(|e| format!("Failed to capture screenshot: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Screenshot capture failed: {}", extract_ffmpeg_error(&stderr)));
+        }
+
+        Ok(format!("Screenshot saved to {}", output_path.display()))
+    })
+    .await
+    .map_err(|e| format!("Screenshot task panicked: {}", e))?
 }

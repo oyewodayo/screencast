@@ -16,6 +16,7 @@ mod commands {
 mod services {
     pub mod utility;
     pub mod pdf_annotations;
+    pub mod trash;
 }
 use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMode, ConfigBuilder};
 
@@ -117,6 +118,7 @@ fn main() {
             commands::recording::get_connected_devices,
             commands::recording::start_recording,
             commands::recording::stop_recording,
+            commands::recording::take_screenshot,
             commands::window_capture::start_monitoring_windows,
             commands::window_capture::stop_monitoring_windows,
             commands::window_capture::get_window_titles,
@@ -133,13 +135,21 @@ fn main() {
             commands::conversion::get_supported_conversion_formats,
             commands::conversion::should_convert_file,
             commands::conversion::convert_video,
+            commands::conversion::convert_image,
 
             services::utility::open_file_from_directory,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
             services::utility::rename_file,
             services::pdf_annotations::save_pdf_annotations,
-            services::pdf_annotations::load_pdf_annotations
+            services::pdf_annotations::load_pdf_annotations,
+
+            services::trash::move_to_trash,
+            services::trash::list_trash,
+            services::trash::restore_from_trash,
+            services::trash::delete_trash_item,
+            services::trash::empty_trash,
+            services::trash::purge_expired_trash
         ])
         .build(context)
         .expect("error while building tauri application")

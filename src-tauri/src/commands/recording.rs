@@ -17,7 +17,6 @@ use tauri::State;
 use tauri::async_runtime::Mutex;
 use tauri::Manager;
 use std::fs;
-use std::env;
 use log::{info, warn};
 use std::io::Write;
 use std::ffi::OsStr;
@@ -55,6 +54,61 @@ pub struct FormData{
     overlay_shape:String,
     overlay_position:String,
     overlay_size:String,
+    // The title of the window screen_size names (as "window:<hwnd>") — the hwnd alone isn't
+    // enough to actually *capture* that window on Windows (gdigrab targets windows by title, not
+    // handle), so the frontend sends this alongside it. #[serde(default)] so a caller that
+    // doesn't set it (screen_size isn't "window:...") doesn't need to send an empty string.
+    #[serde(default)]
+    window_title: String,
+}
+
+// What a "screen" capture should actually point ffmpeg at, resolved once from FormData.screen_size
+// (and, for windows, window_title) so every capture mode — take_screenshot and every
+// screen-capturing recording_with_output_* — interprets it the same way instead of each
+// reimplementing (or, as before this existed, half-implementing) its own parsing of it.
+pub(crate) enum CaptureTarget {
+    FullScreen,
+    Monitor { x: i32, y: i32, width: i32, height: i32 },
+    Window { title: String },
+}
+
+// screen_size arrives as "fullscreen", "monitor:<id>", or "window:<hwnd>" (see
+// EnhancedScreenOptions.tsx). The monitor case resolves `<id>` against get_monitors() for real
+// geometry — previously this whole value was passed straight through as literal ffmpeg
+// `-video_size` text, which is only ever a valid WxH string for the "fullscreen" case; for
+// "monitor:monitor_0" or "window:66" it handed ffmpeg outright invalid syntax it could only
+// reject. Falls back to FullScreen (rather than erroring the whole capture out) if a monitor id
+// can't be resolved — a screen recording that captures more than intended beats one that
+// silently doesn't start at all.
+pub(crate) fn resolve_capture_target(form_data: &FormData) -> CaptureTarget {
+    if let Some(monitor_id) = form_data.screen_size.strip_prefix("monitor:") {
+        if let Ok(monitors) = crate::commands::window_capture::get_monitors() {
+            if let Some(m) = monitors.iter().find(|m| m.id == monitor_id) {
+                return CaptureTarget::Monitor { x: m.x, y: m.y, width: m.width, height: m.height };
+            }
+        }
+        return CaptureTarget::FullScreen;
+    }
+
+    if form_data.screen_size.starts_with("window:") && !form_data.window_title.is_empty() {
+        return CaptureTarget::Window { title: form_data.window_title.clone() };
+    }
+
+    CaptureTarget::FullScreen
+}
+
+// ffmpeg's stderr always leads with its multi-hundred-character build banner (version, compile
+// flags, bundled library list) before it ever gets to the actual failure, so dumping the whole
+// thing as the error - as every take_screenshot used to - buries the one line anyone can act on
+// under noise the UI can't even fully display. The real reason is reliably among the last few
+// non-empty lines.
+pub(crate) fn extract_ffmpeg_error(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return "ffmpeg exited with an error and produced no output".to_string();
+    }
+    let tail_len = lines.len().min(5);
+    lines[lines.len() - tail_len..].join(" | ")
 }
 
 pub fn map_overlay_size(size: &str) -> String {
@@ -150,8 +204,20 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
     }
 }
 
-// Runs ffmpeg with a hidden console window on Windows (a no-op everywhere else, since spawning
-// a child process never pops up a console on macOS/Linux in the first place).
+// Hides the console window a spawned child would otherwise flash open on Windows (a no-op
+// everywhere else, since spawning a child process never pops up a console on macOS/Linux in the
+// first place). Split out from silent_command below so callers that actually want to read
+// stdout/stderr (take_screenshot's error reporting needs ffmpeg's real stderr, not /dev/null)
+// aren't forced to accept silent_command's opinion of nulling both.
+#[cfg(target_os = "windows")]
+pub(crate) fn hide_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000);
+}
+
+// Runs ffmpeg with a hidden console window on Windows, stdin piped (every recording mode needs
+// this open for the graceful 'q'-to-stop in stop_recording), stdout/stderr discarded — the right
+// default for the long-running recording modes below, none of which read their own output.
 pub fn silent_command<P: AsRef<OsStr>>(program: P) -> Command {
     let mut cmd = Command::new(program);
     cmd.stdin(Stdio::piped())
@@ -159,10 +225,7 @@ pub fn silent_command<P: AsRef<OsStr>>(program: P) -> Command {
         .stderr(Stdio::null());
 
     #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // hide console window
-    }
+    hide_console_window(&mut cmd);
 
     cmd
 }
@@ -216,46 +279,22 @@ pub fn get_connected_cameras(app_handle: AppHandle)->Vec<String>{
     get_connected_devices(app_handle).0
 }
 
-// Windows/Linux both conventionally keep recordings under ~/Videos; macOS uses ~/Movies instead.
-fn videos_dir() -> Result<PathBuf, String> {
-    #[cfg(target_os = "windows")]
-    let home = env::var("USERPROFILE");
-    #[cfg(not(target_os = "windows"))]
-    let home = env::var("HOME");
-
-    let mut path = PathBuf::from(home.map_err(|_| "Failed to get user's home directory".to_string())?);
-
-    #[cfg(target_os = "macos")]
-    path.push("Movies");
-    #[cfg(not(target_os = "macos"))]
-    path.push("Videos");
-
-    Ok(path)
-}
-
-#[tauri::command]
-pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  form_data: FormData) -> Result<String, String> {
+// Shared by start_recording and take_screenshot — both need "figure out where this file goes,
+// creating the Briefcast folder and dodging an existing same-named file along the way", neither
+// cares how the bytes that eventually land there get produced.
+fn resolve_output_path(form_data: &FormData) -> Result<PathBuf, String> {
     let mut output_file: String;
-
     let current_date = Utc::now().format("%Y_%m%d_%H_%M_%S");
 
-    let home_dir = videos_dir()?;
+    let briefcast_dir = crate::services::utility::briefcast_dir()?;
 
-    log::debug!("Form data {:?}",form_data);
-    #[cfg(target_os = "windows")]
-    log::debug!("Here are the opened windows {:?}", crate::commands::window_capture::win::get_all_open_windows_titles());
-
-    // Append the Briefcast directory to the user's Videos (or Movies, on macOS) directory
-    let mut briefcast_dir = home_dir.clone();
-    briefcast_dir.push("Briefcast");
-
-    output_file = format!("{}_recording_{}.{}",form_data.record_type.to_uppercase(), current_date, form_data.file_ext);
+    output_file = format!("{}_recording_{}.{}", form_data.record_type.to_uppercase(), current_date, form_data.file_ext);
 
     if !form_data.file_name.is_empty() {
         output_file = format!("{}.{}", form_data.file_name, form_data.file_ext);
     }
 
-    let output_path:PathBuf = briefcast_dir.join(&output_file);
+    let output_path: PathBuf = briefcast_dir.join(&output_file);
 
     // Ensure the Briefcast directory exists, create it if it doesn't
     if !briefcast_dir.exists() {
@@ -265,12 +304,21 @@ pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  fo
     }
 
     // Check if the file exists
-    let output_path = if output_path.exists() {
+    if output_path.exists() {
         output_file = format!("Recording_{}.{}", current_date, form_data.file_ext);
-        briefcast_dir.join(&output_file)
+        Ok(briefcast_dir.join(&output_file))
     } else {
-        output_path
-    };
+        Ok(output_path)
+    }
+}
+
+#[tauri::command]
+pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  form_data: FormData) -> Result<String, String> {
+    log::debug!("Form data {:?}",form_data);
+    #[cfg(target_os = "windows")]
+    log::debug!("Here are the opened windows {:?}", crate::commands::window_capture::win::get_all_open_windows_titles());
+
+    let output_path = resolve_output_path(&form_data)?;
 
     match form_data.record_type.as_str() {
         "sva" => platform::recording_with_output_sva(&app_handle, state, &output_path, &form_data).await,
@@ -279,10 +327,33 @@ pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  fo
         "va" => platform::recording_with_output_va(&app_handle, state, &output_path, &form_data).await,
         "s" => platform::recording_with_output_s(&app_handle, state, &output_path, &form_data).await,
         "v" => platform::recording_with_output_v(&app_handle, state, &output_path, &form_data).await,
-        "c" => platform::recording_with_output_c(&app_handle, state, &output_path, &form_data).await,
         "a" => platform::recording_with_output_a(&app_handle, state, &output_path, &form_data).await,
+        "c" => Err("Screenshot capture doesn't go through start_recording — use take_screenshot instead".to_string()),
         _ => Err("Invalid recording type".to_string()),
     }
+}
+
+// A real instant screenshot: one ffmpeg invocation that grabs a single frame and exits on its
+// own — unlike every recording mode above, there's no ongoing process to track in AppState and
+// nothing for stop_recording to ever stop. This used to be record_type "c", spawned through the
+// exact same start/stop recording lifecycle as a video (a running timer, a Stop button, a
+// completion modal reporting "Duration: Unknown" for what was supposed to be a still image) —
+// which also wrote a multi-frame gdigrab capture straight into a static .png path, producing a
+// broken, ~0-byte file. This replaces that path entirely.
+#[tauri::command]
+pub async fn take_screenshot(app_handle: AppHandle, form_data: FormData) -> Result<String, String> {
+    log::debug!("Screenshot form data {:?}", form_data);
+
+    let output_path = resolve_output_path(&form_data)?;
+    let result = platform::take_screenshot(&app_handle, &output_path, &form_data).await;
+
+    if result.is_ok() {
+        if let Err(e) = app_handle.emit_all("refresh-file-list", ()) {
+            warn!("Failed to emit refresh-file-list: {}", e);
+        }
+    }
+
+    result
 }
 
 #[tauri::command]

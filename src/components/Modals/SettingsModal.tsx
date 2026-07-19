@@ -167,6 +167,24 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave }) => {
             </Field>
           </Section>
 
+          <Section title="Files">
+            <Field label="Auto-delete trash after">
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  max={365}
+                  className={`${fieldInputClass} w-16 text-right`}
+                  value={settings.trashRetentionDays}
+                  onChange={(e) => update("trashRetentionDays", Math.max(0, Number(e.target.value) || 0))}
+                />
+                <span className="text-sm text-neutral-500 dark:text-neutral-400">
+                  {settings.trashRetentionDays <= 0 ? "never" : "days"}
+                </span>
+              </div>
+            </Field>
+          </Section>
+
           <Section title="PDF annotator defaults">
             <Field label="Starting tool">
               <select
