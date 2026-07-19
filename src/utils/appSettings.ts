@@ -16,6 +16,9 @@ export interface AppSettings {
   pdfDefaultStrokeWidth: number;
   // "system" follows the OS light/dark preference; "light"/"dark" pin it explicitly.
   theme: "light" | "dark" | "system";
+  // Days a deleted file sits in the trash before purge_expired_trash removes it for good, run
+  // once on app launch. 0 (or negative) means "never auto-purge — keep until Empty Trash".
+  trashRetentionDays: number;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -30,6 +33,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pdfDefaultHighlighterColor: "#ffd43b",
   pdfDefaultStrokeWidth: 4,
   theme: "system",
+  trashRetentionDays: 30,
 };
 
 export function loadSettings(): AppSettings {

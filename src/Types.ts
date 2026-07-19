@@ -2,6 +2,7 @@ export type WindowInfo = {
     title: string;
     image_path?: string;
     hwnd: number;
+    exe_path?: string;
 };
 
 export type MonitorInfo = {

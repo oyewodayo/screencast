@@ -246,6 +246,40 @@ pub async fn convert_to_mp4(
     Ok(result)
 }
 
+// Convert a still image (screenshot) between png/jpeg/webp/bmp. No audio/video codec args
+// apply here - ffmpeg's image2 muxer picks a sane default encoder from the output extension,
+// and run_conversion's duration-based progress just never populates (there's no "Duration:"
+// line for a single frame), which is fine since these finish effectively instantly anyway.
+#[tauri::command]
+pub async fn convert_image(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    input_path: String,
+    output_format: String,
+    output_path: Option<String>,
+    preserve_original: bool,
+) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let output = match output_path {
+        Some(path) => PathBuf::from(path),
+        None => input.with_extension(&output_format),
+    };
+
+    let codec_args: Vec<&str> = match output_format.to_lowercase().as_str() {
+        "png" | "jpeg" | "jpg" | "webp" | "bmp" => vec![],
+        _ => return Err(format!("Unsupported output format: {}", output_format)),
+    };
+
+    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+
+    if !preserve_original {
+        let _ = std::fs::remove_file(&input);
+    }
+
+    Ok(result)
+}
+
 // Cancel ongoing conversion
 #[tauri::command]
 pub async fn cancel_conversion(

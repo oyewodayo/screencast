@@ -620,18 +620,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 
 			{
 				mediaType === 'image' ? (
-					<div>
-						<img
-						src={src}
-						alt={currentFileTitle}
-						style={{
-							width: '100%',
-							height: '100%',
-							objectFit: 'contain',
-							backgroundColor: '#000'
-						}}
-						/>
-					</div>
+					<img
+					src={src}
+					alt={currentFileTitle}
+					style={{
+						width: '100%',
+						height: '100%',
+						objectFit: 'contain',
+						backgroundColor: '#000'
+					}}
+					/>
 				) : (
 					<video
 						ref={videoRef}

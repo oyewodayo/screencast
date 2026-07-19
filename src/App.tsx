@@ -1,5 +1,6 @@
 
 import RecordingOverlayWindow from "./components/RecordingOverlayWindow";
+import ScreenshotOverlayWindow from "./components/ScreenshotOverlayWindow";
 import Dashboard from "./pages/Dashboard";
 import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
 
@@ -9,7 +10,8 @@ function App() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
 
-        <Route path="/recording-overlay" element={<RecordingOverlayWindow />} /> 
+        <Route path="/recording-overlay" element={<RecordingOverlayWindow />} />
+        <Route path="/screenshot-overlay" element={<ScreenshotOverlayWindow />} />
         {/* <Route path="/file-modal" element={<FileModal />} /> */}
         {/* <Route path="/settings" element={} /> */}
       </Routes>
