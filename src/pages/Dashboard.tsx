@@ -147,6 +147,10 @@ const [conversionFile, setConversionFile] = useState<{path: string; name: string
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
   const [audioAutoplayNext, setAudioAutoplayNext] = useState<boolean>(true);
+  // Video autoplay-next-file — mirrors audioAutoplayNext, but there's no video repeat/shuffle UI,
+  // so it's just the one flag. Driven by VideoPlayer's own Autoplay button/settings row (it can't
+  // hold this itself since it fully remounts on every file change via `key={selectedFile.path}`).
+  const [videoAutoplayNext, setVideoAutoplayNext] = useState<boolean>(true);
 
   // Last known playback position per audio file (keyed by sourcePath), so switching away and
   // back — including by accident via prev/next — resumes instead of restarting at 0. A ref, not
@@ -722,6 +726,47 @@ const setScreen = () => {
 		setAudioRepeatMode((prev) => (prev === "off" ? "all" : prev === "all" ? "one" : "off"));
 	};
 
+	// Video equivalent of navigateAudio — no shuffle/repeat-all for video, so this is the simple
+	// sequential-with-wrap form (matches navigateImage's shape).
+	const navigateVideo = (direction: 1 | -1, options?: { wrap?: boolean }) => {
+		const wrap = options?.wrap ?? true;
+		const current = selectedFileRef.current;
+		if (!current) return;
+		const videos = getFlatFilesForCategory("video");
+		if (videos.length === 0) return;
+		const currentIndex = videos.findIndex((file) => file.path === current.sourcePath);
+		if (currentIndex === -1) return;
+		let nextIndex = currentIndex + direction;
+		if (nextIndex < 0) {
+			if (!wrap) return;
+			nextIndex = videos.length - 1;
+		} else if (nextIndex >= videos.length) {
+			if (!wrap) return;
+			nextIndex = 0;
+		}
+		const next = videos[nextIndex];
+		loadFileForPlayback(next.path, next.name);
+	};
+
+	// Video equivalent of handleAudioEnded — advances to the next video in the list when the
+	// player's own Autoplay toggle is on. No repeat mode for video, so a non-wrapping advance
+	// (stops at the last file rather than looping) is the only behavior.
+	const handleVideoEnded = useCallback(() => {
+		const current = selectedFileRef.current;
+		if (!current || getFileCategory(current.name) !== "video") return;
+		if (!videoAutoplayNext) return;
+		navigateVideo(1, { wrap: false });
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [videoAutoplayNext, files]);
+
+	// Single onEnded handed to VideoPlayer for both audio and video playback — each of the two
+	// handlers above bails immediately if the file that just ended isn't its category, so exactly
+	// one of them actually does anything on any given call.
+	const handleMediaEnded = useCallback(() => {
+		handleAudioEnded();
+		handleVideoEnded();
+	}, [handleAudioEnded, handleVideoEnded]);
+
 	// Arrow-key navigation — only active while an image or audio file is the currently displayed
 	// one, so it doesn't hijack arrow keys elsewhere (video seeking, PDF page turns, form inputs).
 	useEffect(() => {
@@ -1131,7 +1176,11 @@ const setScreen = () => {
                 initialTime={isAudioSelected ? audioPositionsRef.current[selectedFile.sourcePath] : undefined}
                 loop={isAudioSelected && audioRepeatMode === "one"}
                 onTimeUpdate={handleAudioTimeUpdate}
-                onEnded={handleAudioEnded}
+                onEnded={handleMediaEnded}
+                autoplayNext={isAudioSelected ? audioAutoplayNext : videoAutoplayNext}
+                onAutoplayNextChange={() =>
+                  isAudioSelected ? setAudioAutoplayNext((prev) => !prev) : setVideoAutoplayNext((prev) => !prev)
+                }
               />
             )
           ) : (

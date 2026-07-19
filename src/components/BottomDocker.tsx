@@ -1,4 +1,4 @@
-import React, { Dispatch, SetStateAction, useEffect, useState } from "react";
+import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
 import OsInfo from "./OsInfo";
 
 import {
@@ -106,6 +106,27 @@ const BottomDocker = ({
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
   const [showDocker, setShowDocker] = useState(true);
+  // This whole docker is `fixed bottom-0`, sitting on top of the video player rather than
+  // participating in its flex layout - so the player's own control bar (see .video-controls-
+  // container in player.css) has no natural way to know how tall it is and previously assumed a
+  // fixed 64px (the collapsed-only height), which put the controls out of view any time the full
+  // panel below (file name/type/recording options/etc.) was expanded. Measuring the real height
+  // and publishing it as a CSS var lets the player's controls track it exactly, collapsed or not.
+  const dockerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = dockerRef.current;
+    if (!el) return;
+
+    const publishHeight = (): void => {
+      document.documentElement.style.setProperty('--docker-height', `${el.offsetHeight}px`);
+    };
+
+    publishHeight();
+    const observer = new ResizeObserver(publishHeight);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [showDocker]);
   
   // REMOVE THESE - now coming from props:
   // const [screenSize, setScreenSize] = useState("fullscreen")
@@ -298,7 +319,7 @@ const BottomDocker = ({
       onStartRecording={onStartRecording} 
       setOpen={setModalOpenScreen}
     />
-    <div className="w-full fixed bottom-0 flex flex-col">
+    <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col">
      
       <ActiveRecordingState
         isRecording={isRecording}

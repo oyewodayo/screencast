@@ -6,12 +6,14 @@
 
 use std::env::consts::OS;
 use commands::recording::AppState;
+use tauri::Manager;
 
 mod commands {
     pub mod window_capture;
     pub mod system_info;
     pub mod recording;
     pub mod conversion;
+    pub mod native_playback;
 }
 mod services {
     pub mod utility;
@@ -110,6 +112,7 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
         .manage(commands::conversion::ConversionState::default())
+        .manage(commands::native_playback::NativePlaybackState::default())
         .invoke_handler(tauri::generate_handler![
             commands::system_info::get_ram_info,
             get_os_info,
@@ -138,6 +141,12 @@ fn main() {
             commands::conversion::convert_video,
             commands::conversion::convert_image,
 
+            commands::native_playback::start_native_playback,
+            commands::native_playback::get_next_video_frame,
+            commands::native_playback::get_next_audio_chunk,
+            commands::native_playback::seek_native_playback,
+            commands::native_playback::stop_native_playback,
+
             services::utility::open_file_from_directory,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
@@ -155,9 +164,12 @@ fn main() {
         ])
         .build(context)
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 commands::window_capture::cleanup_stale_window_screenshots();
+                commands::native_playback::cleanup_all_sessions(
+                    &app_handle.state::<commands::native_playback::NativePlaybackState>(),
+                );
             }
         });
 }

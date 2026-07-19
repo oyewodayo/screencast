@@ -35,10 +35,16 @@ interface TimeInfo {
  * @returns Formatted time string
  */
 export const formatDuration = (time: number): string => {
-  const leadingZeroFormatter = new Intl.NumberFormat(undefined, { 
-    minimumIntegerDigits: 2 
+  // Not yet known (metadata still loading) or unknown (some webm/mkv files report Infinity until
+  // the browser has scanned enough of the stream) - show a placeholder instead of "NaN:NaN:NaN".
+  if (!Number.isFinite(time)) {
+    return '0:00';
+  }
+
+  const leadingZeroFormatter = new Intl.NumberFormat(undefined, {
+    minimumIntegerDigits: 2
   });
-  
+
   const seconds = Math.floor(time % 60);
   const minutes = Math.floor(time / 60) % 60;
   const hours = Math.floor(time / 3600);

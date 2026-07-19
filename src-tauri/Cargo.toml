@@ -17,6 +17,7 @@ image = "0.25.1"
 log = "0.4.22"
 simplelog = "0.12.2"
 urlencoding = "2.1"
+base64 = "0.22"
 
 # Win32 bindings — only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the
