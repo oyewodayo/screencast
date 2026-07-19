@@ -6,6 +6,16 @@ pub fn path_to_str(path: &Path) -> Result<&str, String> {
     path.to_str().ok_or_else(|| format!("Path is not valid UTF-8: {:?}", path))
 }
 
+// Lets the frontend adapt the UI to real backend capability gaps - e.g. hiding the Window
+// capture option on macOS, where window enumeration/capture genuinely isn't implemented yet (see
+// window_capture::macos's module comment), rather than offering it and erroring when clicked.
+// std::env::consts::OS is a compile-time constant ("windows" | "macos" | "linux"), so this is
+// exactly as reliable as the #[cfg(target_os = ...)] switches the rest of the backend uses.
+#[command]
+pub fn get_platform() -> &'static str {
+    std::env::consts::OS
+}
+
 // Centralized FFmpeg path resolution with cross-platform support
 pub fn get_ffmpeg_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
     #[cfg(windows)]

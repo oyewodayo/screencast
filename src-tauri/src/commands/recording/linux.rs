@@ -24,11 +24,42 @@ use std::process::Command;
 
 use tauri::{AppHandle, State};
 
-use super::{codec_args_for_ext, extract_ffmpeg_error, get_overlay_position, get_overlay_shape, map_overlay_size, spawn_recording, AppState, FormData};
+use super::{
+    codec_args_for_ext, extract_ffmpeg_error, get_overlay_position, get_overlay_shape,
+    map_overlay_size, resolve_capture_target, spawn_recording, AppState, CaptureTarget, FormData,
+};
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
 fn x11_display() -> String {
     env::var("DISPLAY").unwrap_or_else(|_| ":0.0".to_string())
+}
+
+// Resolves a CaptureTarget into x11grab's -video_size/-i arguments, mirroring win.rs's
+// gdigrab_input_args. Unlike gdigrab's separate -offset_x/-offset_y flags, x11grab's offset
+// lives right in the -i string itself (":D.S+X,Y") — same crop-the-desktop-grab shape of
+// solution as Windows, since x11grab reading a specific window's own pixels isn't reliable
+// either (a compositor's final on-screen output is what needs capturing, not necessarily
+// whatever the window's own backing buffer holds).
+//
+// This also fixes a real, pre-existing bug: the code this replaces passed `form_data.screen_size`
+// itself straight through as literal ffmpeg -video_size text, which is only ever a valid "WxH"
+// string for the fullscreen case — for "monitor:monitor_0" or "window:12345" it handed ffmpeg
+// outright invalid syntax. win.rs had - and fixed - the exact same bug; this was never fixed here.
+fn x11grab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
+    match target {
+        CaptureTarget::FullScreen => Ok(vec!["-i".to_string(), x11_display()]),
+        CaptureTarget::Monitor { x, y, width, height } => Ok(vec![
+            "-video_size".to_string(), format!("{}x{}", width, height),
+            "-i".to_string(), format!("{}+{},{}", x11_display(), x, y),
+        ]),
+        CaptureTarget::Window { title } => {
+            let (x, y, width, height) = crate::commands::window_capture::linux::get_window_rect_by_title(title)?;
+            Ok(vec![
+                "-video_size".to_string(), format!("{}x{}", width, height),
+                "-i".to_string(), format!("{}+{},{}", x11_display(), x, y),
+            ])
+        }
+    }
 }
 
 // PulseAudio (and PipeWire's pulse-compatibility shim) source names — this list includes both
@@ -123,10 +154,7 @@ pub async fn recording_with_output_sva(
         "-f".to_string(), "x11grab".to_string(),
         "-framerate".to_string(), "30".to_string(),
     ];
-    if form_data.screen_size != "fullscreen" {
-        args.extend(vec!["-video_size".to_string(), form_data.screen_size.to_string()]);
-    }
-    args.extend(vec!["-i".to_string(), x11_display()]);
+    args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
 
     let has_overlay = !form_data.overlay_shape.is_empty();
     if has_overlay {
@@ -176,10 +204,7 @@ pub async fn recording_with_output_sv(
         "-f".to_string(), "x11grab".to_string(),
         "-framerate".to_string(), "30".to_string(),
     ];
-    if form_data.screen_size != "fullscreen" {
-        args.extend(vec!["-video_size".to_string(), form_data.screen_size.to_string()]);
-    }
-    args.extend(vec!["-i".to_string(), x11_display()]);
+    args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
 
     if !form_data.overlay_shape.is_empty() {
         let camera_path = require_v4l2_path(&form_data.video_device)?;
@@ -201,15 +226,17 @@ pub async fn recording_with_output_sa(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(), "x11grab".to_string(),
         "-framerate".to_string(), "30".to_string(),
-        "-i".to_string(), x11_display(),
+    ];
+    args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
+    args.extend(vec![
         "-f".to_string(), "pulse".to_string(),
         "-i".to_string(), form_data.audio_device.clone(),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
-    ];
+    ]);
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }
@@ -285,17 +312,17 @@ pub async fn recording_with_output_s(
     app_handle: &AppHandle,
     state: State<'_, AppState>,
     output_path: &PathBuf,
-    _form_data: &FormData,
+    form_data: &FormData,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(), "x11grab".to_string(),
         "-framerate".to_string(), "30".to_string(),
-        "-i".to_string(), x11_display(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }
@@ -305,18 +332,19 @@ pub async fn recording_with_output_s(
 // track, nothing for stop_recording to stop. Replaces what used to be recording_with_output_c, a
 // continuous screen recording started/stopped exactly like every other mode despite the
 // "Screenshot" label the frontend showed for this record type — the same bug win.rs had.
-pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, _form_data: &FormData) -> Result<String, String> {
+pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let output_path = output_path.clone();
+    let input_args = x11grab_input_args(&resolve_capture_target(app_handle, form_data))?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let args: Vec<String> = vec![
-            "-f".to_string(), "x11grab".to_string(),
-            "-i".to_string(), x11_display(),
+        let mut args: Vec<String> = vec!["-f".to_string(), "x11grab".to_string()];
+        args.extend(input_args);
+        args.extend(vec![
             "-frames:v".to_string(), "1".to_string(),
             "-y".to_string(),
             path_to_str(&output_path)?.to_string(),
-        ];
+        ]);
 
         let output = Command::new(&ffmpeg_path)
             .args(&args)

@@ -141,6 +141,7 @@ fn main() {
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
             services::utility::rename_file,
+            services::utility::get_platform,
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
 

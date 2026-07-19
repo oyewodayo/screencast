@@ -57,6 +57,35 @@ fn parse_duration(output: &str) -> Option<f64> {
     None
 }
 
+// If `path` is already taken, finds the next free "name (1).ext", "name (2).ext", ... instead -
+// converting the same source to the same target format twice (a very ordinary thing to do:
+// convert, tweak something, convert again) used to hard-fail with "Output file already exists"
+// for no reason a user could act on other than renaming or deleting the previous output
+// themselves first. Recording's own resolve_output_path (commands/recording.rs) already takes
+// this same approach for a name collision - conversion output just never got the same treatment.
+fn unique_output_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+
+    let parent = path.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = path.extension().map(|s| s.to_string_lossy().to_string());
+
+    for n in 1.. {
+        let candidate_name = match &ext {
+            Some(ext) => format!("{} ({}).{}", stem, n, ext),
+            None => format!("{} ({})", stem, n),
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    unreachable!()
+}
+
 
 // Shared conversion runner used by both convert_to_mp4 and convert_video, so every target
 // format gets the same stderr progress-parsing thread (convert_video previously lacked one,
@@ -76,9 +105,7 @@ async fn run_conversion(
         return Err("Input file does not exist".to_string());
     }
 
-    if output.exists() {
-        return Err("Output file already exists".to_string());
-    }
+    let output = unique_output_path(output);
 
     let _ = window.emit("conversion-progress", ConversionProgress {
         input_path: input_path.to_string(),
@@ -123,7 +150,11 @@ async fn run_conversion(
     let duration = Arc::new(std::sync::Mutex::new(None::<f64>));
 
     let duration_for_stderr = duration.clone();
-    std::thread::spawn(move || {
+    // Returns the accumulated stderr (rather than stashing it in a Mutex read right after
+    // child.wait()) so the failure branch below can .join() this thread and be sure every line
+    // - including whatever ffmpeg printed right as it exited - was actually captured, instead of
+    // racing a reader thread that's still draining the pipe.
+    let stderr_thread = std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         let mut full_output = String::new();
 
@@ -141,6 +172,8 @@ async fn run_conversion(
                 *guard = parse_duration(&full_output);
             }
         }
+
+        full_output
     });
 
     let window_clone = window.clone();
@@ -199,17 +232,21 @@ async fn run_conversion(
 
         Ok(output.to_string_lossy().to_string())
     } else {
-        let error_msg = "Conversion failed - check FFmpeg output for details";
+        let stderr_output = stderr_thread.join().unwrap_or_default();
+        let error_msg = format!(
+            "Conversion failed: {}",
+            crate::commands::recording::extract_ffmpeg_error(&stderr_output)
+        );
 
         let _ = window.emit("conversion-progress", ConversionProgress {
             input_path: input_path.to_string(),
             output_path: output.to_string_lossy().to_string(),
             progress: 0.0,
             status: ConversionStatus::Failed,
-            message: error_msg.to_string(),
+            message: error_msg.clone(),
         });
 
-        Err(error_msg.to_string())
+        Err(error_msg)
     }
 }
 

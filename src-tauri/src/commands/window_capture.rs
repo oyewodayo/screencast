@@ -55,9 +55,47 @@ pub struct MonitorInfo {
     is_primary: bool,
 }
 
+// Only macOS's implementation actually needs the AppHandle (to resolve ffmpeg's bundled path
+// for listing avfoundation "Capture screen N" devices) — Win32/X11 monitor enumeration is a
+// direct syscall needing no app resources. Threaded through uniformly anyway so this command's
+// signature doesn't need its own per-platform #[cfg], matching get_connected_devices elsewhere
+// in this codebase (also uniformly takes an AppHandle even where most platforms ignore it).
 #[tauri::command]
-pub fn get_monitors() -> Result<Vec<MonitorInfo>, String> {
-    platform::get_monitors()
+pub fn get_monitors(app_handle: tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::get_monitors(&app_handle)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_handle;
+        platform::get_monitors()
+    }
+}
+
+// Clamps a rect to the union of every monitor's bounds, so a rect that pokes even slightly
+// outside the real desktop never reaches ffmpeg's screen-grab crop - gdigrab/x11grab both
+// hard-reject an out-of-bounds -offset/-video_size region instead of clipping it (the original,
+// motivating case: GetWindowRect's border padding on a maximized window on Windows - see
+// win.rs's get_window_rect_by_title - but the same risk applies to any window that's simply
+// been dragged partway off-screen, on any platform). Shared rather than duplicated per platform
+// since the geometry math itself has nothing OS-specific about it.
+pub(crate) fn clamp_rect_to_desktop(monitors: &[MonitorInfo], x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    if monitors.is_empty() {
+        return (x, y, width.max(1), height.max(1));
+    }
+
+    let min_x = monitors.iter().map(|m| m.x).min().unwrap();
+    let min_y = monitors.iter().map(|m| m.y).min().unwrap();
+    let max_x = monitors.iter().map(|m| m.x + m.width).max().unwrap();
+    let max_y = monitors.iter().map(|m| m.y + m.height).max().unwrap();
+
+    let left = x.clamp(min_x, max_x);
+    let top = y.clamp(min_y, max_y);
+    let right = (x + width).clamp(min_x, max_x);
+    let bottom = (y + height).clamp(min_y, max_y);
+
+    (left, top, (right - left).max(1), (bottom - top).max(1))
 }
 
 #[tauri::command]

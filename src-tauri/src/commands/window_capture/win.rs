@@ -442,32 +442,6 @@ pub async fn activate_and_open_window(title: &str) -> Result<(), String> {
     .map_err(|e| format!("Activate window task panicked: {}", e))?
 }
 
-// Clamps a window rect to the union of every monitor's bounds, so a rect that pokes even
-// slightly outside the real desktop - whether from GetWindowRect's border padding (see below)
-// or a window genuinely dragged half off-screen - never reaches ffmpeg. gdigrab hard-rejects an
-// out-of-bounds -offset_x/-offset_y/-video_size crop instead of clipping it, which is exactly
-// the "Screenshot capture failed" ffmpeg threw for a maximized window.
-fn clamp_rect_to_desktop(x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
-    let bounds = get_monitors().ok().filter(|m| !m.is_empty()).map(|monitors| {
-        let min_x = monitors.iter().map(|m| m.x).min().unwrap();
-        let min_y = monitors.iter().map(|m| m.y).min().unwrap();
-        let max_x = monitors.iter().map(|m| m.x + m.width).max().unwrap();
-        let max_y = monitors.iter().map(|m| m.y + m.height).max().unwrap();
-        (min_x, min_y, max_x, max_y)
-    });
-
-    let Some((min_x, min_y, max_x, max_y)) = bounds else {
-        return (x, y, width.max(1), height.max(1));
-    };
-
-    let left = x.clamp(min_x, max_x);
-    let top = y.clamp(min_y, max_y);
-    let right = (x + width).clamp(min_x, max_x);
-    let bottom = (y + height).clamp(min_y, max_y);
-
-    (left, top, (right - left).max(1), (bottom - top).max(1))
-}
-
 // Used by recording::win to capture "this window" as a screen-region crop rather than through
 // gdigrab's own `-i title=...` mode — see the comment on gdigrab_input_args in recording/win.rs
 // for why that mode isn't used despite being the more obvious approach.
@@ -500,7 +474,8 @@ pub fn get_window_rect_by_title(title: &str) -> Result<(i32, i32, i32, i32), Str
         }
     }
 
-    Ok(clamp_rect_to_desktop(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
+    let monitors = get_monitors().unwrap_or_default();
+    Ok(super::clamp_rect_to_desktop(&monitors, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
 }
 
 pub async fn start_monitoring_windows() -> Result<(), String> {

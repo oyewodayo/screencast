@@ -25,8 +25,11 @@ use crate::services::utility::path_to_str;
 
 #[cfg(target_os = "windows")]
 mod win;
+// pub(crate): window_capture::macos (a sibling module, not a descendant of this one) needs
+// list_avfoundation_devices to enumerate "Capture screen N" devices for its own get_monitors -
+// shared rather than duplicated so the ffmpeg-stderr-parsing logic only exists in one place.
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -80,9 +83,9 @@ pub(crate) enum CaptureTarget {
 // reject. Falls back to FullScreen (rather than erroring the whole capture out) if a monitor id
 // can't be resolved — a screen recording that captures more than intended beats one that
 // silently doesn't start at all.
-pub(crate) fn resolve_capture_target(form_data: &FormData) -> CaptureTarget {
+pub(crate) fn resolve_capture_target(app_handle: &AppHandle, form_data: &FormData) -> CaptureTarget {
     if let Some(monitor_id) = form_data.screen_size.strip_prefix("monitor:") {
-        if let Ok(monitors) = crate::commands::window_capture::get_monitors() {
+        if let Ok(monitors) = crate::commands::window_capture::get_monitors(app_handle.clone()) {
             if let Some(m) = monitors.iter().find(|m| m.id == monitor_id) {
                 return CaptureTarget::Monitor { x: m.x, y: m.y, width: m.width, height: m.height };
             }
@@ -192,8 +195,14 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             "-c:v".into(), "libvpx".into(), // libvpx (not libvpx-vp9) for wider compatibility
             "-b:v".into(), "2M".into(),
             "-c:a".into(), "libvorbis".into(), // libvorbis (not libopus), same reasoning
-            "-quality".into(), "good".into(),
-            "-cpu-used".into(), "0".into(),
+            // realtime+cpu-used 5, not good+cpu-used 0 (libvpx's slowest, offline-quality
+            // preset) - this is live screen capture, not a file conversion, and needs an encoder
+            // that can actually keep up with the incoming framerate. See win.rs's identical fix
+            // for the full reasoning (an encoder that can't keep up backs up, and gets force-
+            // killed with a large unflushed backlog when the recording stops, corrupting the
+            // WebM/Matroska container).
+            "-quality".into(), "realtime".into(),
+            "-cpu-used".into(), "5".into(),
         ],
         _ => vec![
             "-c:v".into(), "libx264".into(),

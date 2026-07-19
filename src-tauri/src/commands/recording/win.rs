@@ -133,7 +133,7 @@ pub async fn recording_with_output_sva(
         "-framerate".to_string(), "60".to_string(),
     ];
 
-    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
+    args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
 
     if !form_data.overlay_shape.is_empty() {
         log::debug!("overlay is present");
@@ -187,8 +187,16 @@ pub async fn recording_with_output_sva(
                 "-c:v".to_string(), "libvpx".to_string(), // Use libvpx instead of libvpx-vp9 for better compatibility
                 "-b:v".to_string(), "2M".to_string(),
                 "-c:a".to_string(), "libvorbis".to_string(), // Use libvorbis instead of libopus
-                "-quality".to_string(), "good".to_string(),
-                "-cpu-used".to_string(), "0".to_string(),
+                // "good"+cpu-used 0 is libvpx's slowest, highest-quality *offline* preset - fine
+                // for converting an already-recorded file, but this is live 60fps screen capture:
+                // the encoder can't remotely keep up, falls further and further behind real time,
+                // and when stop_recording tries to gracefully finish up, there's a large backlog
+                // still left to encode/flush that the shutdown timeout doesn't wait around for -
+                // resulting in a force-kill mid-write and the exact kind of corrupt,
+                // unparseable-EBML-header .webm file this produced. realtime+cpu-used 5 is
+                // libvpx's standard low-latency live-encoding preset.
+                "-quality".to_string(), "realtime".to_string(),
+                "-cpu-used".to_string(), "5".to_string(),
             ]);
         },
         _ => {
@@ -211,12 +219,20 @@ pub async fn recording_with_output_sva(
 
     log::debug!("FFmpeg args: {:?}", args);
 
-    // IMPORTANT: Keep stdin open for graceful shutdown
+    // IMPORTANT: Keep stdin open for graceful shutdown. stdout/stderr are nulled, not piped:
+    // ffmpeg writes continuous stats/progress lines to stderr throughout the whole recording,
+    // and nothing here ever reads a piped stdout/stderr to drain it - once the OS pipe buffer
+    // fills (a matter of minutes, not seconds, for any real recording), ffmpeg's next write()
+    // blocks forever. At that point it's stuck *before* it ever gets back around to checking
+    // stdin, so stop_recording's graceful "q" write goes nowhere, its 2-second wait times out,
+    // and the process gets force-killed - which for a container format that needs a proper
+    // finalize on exit (WebM/Matroska in particular) produces exactly the kind of corrupt,
+    // unparseable file ("EBML header parsing failed") this was silently causing.
     let child = Command::new(&ffmpeg_path)
         .args(&args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped()) // Changed to piped to capture output for debugging
-        .stderr(Stdio::piped()) // Changed to piped to capture errors
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -289,7 +305,7 @@ pub async fn recording_with_output_sa(app_handle: &AppHandle, state: State<'_, A
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "200".to_string()];
-    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
+    args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
     args.extend(vec![
         "-f".to_string(), "dshow".to_string(),
         "-i".to_string(), format!("audio={}", form_data.audio_device),
@@ -405,7 +421,7 @@ pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, Ap
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "200".to_string()];
-    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
+    args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
     args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
 
     log::debug!("Path {:?}", output_path);
@@ -428,7 +444,7 @@ pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, Ap
 pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let output_path = output_path.clone();
-    let input_args = gdigrab_input_args(&resolve_capture_target(form_data))?;
+    let input_args = gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string()];

@@ -175,8 +175,11 @@ const ConversionDialog: React.FC<{
         newPath = await convertVideo(filePath, selectedFormat, undefined, preserveOriginal);
       }
 
-      // Extract filename with new extension
-      const newFileName = fileName.replace(/\.[^/.]+$/, `.${selectedFormat}`);
+      // Read the actual saved filename back off newPath rather than guessing one from the
+      // original - the backend silently disambiguates onto "name (1).ext" etc. when a file of
+      // the guessed name already exists (e.g. converting the same source twice), so the two can
+      // legitimately differ.
+      const newFileName = newPath.split(/[\\/]/).pop() ?? fileName.replace(/\.[^/.]+$/, `.${selectedFormat}`);
       onConverted(newPath, newFileName);
 
     } catch (error: any) {
