@@ -4,12 +4,12 @@
     windows_subsystem = "windows"
 )]
 
-use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use std::env::consts::OS;
 use commands::recording::AppState;
 
 mod commands {
-    pub mod windows_api;
+    pub mod window_capture;
+    pub mod system_info;
     pub mod recording;
     pub mod conversion;
 }
@@ -22,20 +22,6 @@ use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMo
 use log::{LevelFilter, error};
 use std::fs::OpenOptions;
 use std::panic;
-
-#[tauri::command]
-fn get_ram_info() -> Result<(u64, u64), String> {
-    let mut mem_status = MEMORYSTATUSEX::default();
-    mem_status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-
-    unsafe { GlobalMemoryStatusEx(&mut mem_status) }
-        .map_err(|e| format!("Failed to get memory info: {}", e))?;
-
-    Ok((
-        mem_status.ullTotalPhys / (1024 * 1024),
-        mem_status.ullAvailPhys / (1024 * 1024)
-    ))
-}
 
 #[tauri::command]
 fn get_os_info() -> String {
@@ -124,22 +110,22 @@ fn main() {
         .manage(AppState::default())
         .manage(commands::conversion::ConversionState::default())
         .invoke_handler(tauri::generate_handler![
-            get_ram_info,
+            commands::system_info::get_ram_info,
             get_os_info,
             commands::recording::get_connected_audios,
             commands::recording::get_connected_cameras,
-            commands::recording::get_connected_devices,           
+            commands::recording::get_connected_devices,
             commands::recording::start_recording,
             commands::recording::stop_recording,
-            commands::windows_api::start_monitoring_windows,
-            commands::windows_api::stop_monitoring_windows,
-            commands::windows_api::get_window_titles,
-            commands::windows_api::get_monitors,
-            commands::windows_api::get_windows_titles,
-            commands::windows_api::capture_window_screenshots_by_title_command,
-            commands::windows_api::cleanup_screenshot_files,
-            commands::windows_api::activate_and_open_window,
-           
+            commands::window_capture::start_monitoring_windows,
+            commands::window_capture::stop_monitoring_windows,
+            commands::window_capture::get_window_titles,
+            commands::window_capture::get_monitors,
+            commands::window_capture::get_windows_titles,
+            commands::window_capture::capture_window_screenshots_by_title_command,
+            commands::window_capture::cleanup_screenshot_files,
+            commands::window_capture::activate_and_open_window,
+
             commands::conversion::convert_to_mp4,
             commands::conversion::batch_convert_to_mp4,
             commands::conversion::cancel_conversion,
@@ -159,7 +145,7 @@ fn main() {
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                commands::windows_api::cleanup_stale_window_screenshots();
+                commands::window_capture::cleanup_stale_window_screenshots();
             }
         });
 }
