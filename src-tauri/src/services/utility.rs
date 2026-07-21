@@ -84,52 +84,171 @@ pub fn list_briefcast_files()->HashMap<String, Vec<FileEntry>>{
 
     if let Ok(folder_path) = briefcast_dir() {
         if folder_path.exists() && folder_path.is_dir(){
-            scan_directory(&folder_path, &mut result);
+            scan_directory(&folder_path, &folder_path, &mut result);
         }
     }
     println!("Folder: {:?}", &result);
     result
 }
 
-fn scan_directory(path: &Path, result: &mut HashMap<String, Vec<FileEntry>>){
-    if let Ok(entries) = fs::read_dir(path){
-        let folder_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Briefcast".to_string());
+// Relative path from the Briefcast root, always "/"-joined regardless of OS — "" denotes the
+// root itself. This is also exactly the shape create_folder/move_file expect for their folder
+// arguments, so the frontend can pass a key from this map straight back to those commands
+// without reconstructing an OS path first.
+fn relative_key(root: &Path, dir: &Path) -> String {
+    dir.strip_prefix(root)
+        .map(|rel| rel.iter().map(|c| c.to_string_lossy().to_string()).collect::<Vec<_>>().join("/"))
+        .unwrap_or_default()
+}
 
-        let mut files = Vec::new();
+fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<FileEntry>>){
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let key = relative_key(root, dir);
 
-        for entry in entries.flatten(){
-            let entry_path = entry.path();
+    let mut files = Vec::new();
+    let mut subdirs = Vec::new();
 
-            if entry_path.is_file(){
-                if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()){
-                    let ext = ext.to_lowercase();
+    for entry in entries.flatten(){
+        let entry_path = entry.path();
 
-                    if is_media_file(&ext){
-                        if let Some(file_name) = entry_path.file_name(){
-                            files.push(FileEntry{
-                                name: file_name.to_string_lossy().to_string(),
-                                path: entry_path.display().to_string(),
-                            });
-                        }
+        if entry_path.is_file(){
+            if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()){
+                let ext = ext.to_lowercase();
+
+                if is_media_file(&ext){
+                    if let Some(file_name) = entry_path.file_name(){
+                        files.push(FileEntry{
+                            name: file_name.to_string_lossy().to_string(),
+                            path: entry_path.display().to_string(),
+                        });
                     }
                 }
             }
-             else if entry_path.is_dir() {
-                // Trashed files live here (see services/trash.rs) and must never surface in the
-                // normal file list — that's the whole point of trash being "hidden" rather than
-                // just another folder.
-                if entry_path.file_name().and_then(|n| n.to_str()) == Some(".trash") {
-                    continue;
-                }
-                scan_directory(&entry_path, result);
-             }
         }
-
-        files.sort_by(|a, b| b.name.cmp(&a.name));
-        if !files.is_empty(){
-            result.insert(folder_name, files);
-        }
+         else if entry_path.is_dir() {
+            // Trashed files live here (see services/trash.rs) and must never surface in the
+            // normal file list — that's the whole point of trash being "hidden" rather than
+            // just another folder.
+            if entry_path.file_name().and_then(|n| n.to_str()) == Some(".trash") {
+                continue;
+            }
+            subdirs.push(entry_path);
+         }
     }
+
+    files.sort_by(|a, b| b.name.cmp(&a.name));
+    // Every real directory gets an entry, even an empty one — unlike the old basename-keyed
+    // version (which only recorded a folder if it had media files, and collapsed distinct
+    // folders sharing a basename into one), a freshly created or currently-empty folder still
+    // needs to show up so it's visible and usable as a move/drop target right away.
+    result.insert(key, files);
+
+    for subdir in subdirs {
+        scan_directory(root, &subdir, result);
+    }
+}
+
+// Shared by create_folder/move_file: resolves a "/"-joined path relative to the Briefcast root
+// (as produced by relative_key above) back into a real filesystem path, rejecting anything that
+// isn't a plain, single-level-at-a-time descendant of root (no "..", no absolute components) —
+// these relative paths are normally backend-generated, but both commands are reachable directly
+// from the frontend, so this is the one place that boundary gets enforced regardless of caller.
+fn resolve_relative(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    if relative.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let mut path = root.to_path_buf();
+    for component in relative.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err("Invalid folder path".to_string());
+        }
+        path.push(component);
+    }
+    Ok(path)
+}
+
+fn validate_folder_name(name: &str) -> Result<&str, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') || trimmed == "." || trimmed == ".." {
+        return Err("Invalid folder name".to_string());
+    }
+    Ok(trimmed)
+}
+
+// `parent_path` is "" for the Briefcast root or a relative_key-shaped path (e.g. "Workshops") for
+// a subfolder — same convention list_briefcast_files' map is keyed by. Returns the new folder's
+// own relative_key, ready to hand straight back for a subsequent create_folder/move_file call.
+#[command]
+pub fn create_folder(parent_path: String, name: String) -> Result<String, String> {
+    let name = validate_folder_name(&name)?;
+    let root = briefcast_dir()?;
+    let parent = resolve_relative(&root, &parent_path)?;
+
+    if !parent.is_dir() {
+        return Err("Parent folder does not exist".to_string());
+    }
+
+    let new_dir = parent.join(name);
+    if new_dir.exists() {
+        return Err("A folder with that name already exists".to_string());
+    }
+    fs::create_dir_all(&new_dir).map_err(|e| format!("Failed to create folder: {}", e))?;
+
+    Ok(if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) })
+}
+
+// Deletes a folder, but only if it's genuinely empty (no files, no subfolders — checked via a
+// real fs::read_dir, not just "no media files of some category", so a folder holding an
+// unsupported file type or a nested empty subfolder still refuses to delete rather than
+// silently discarding something). The Briefcast root itself can never be deleted this way.
+#[command]
+pub fn delete_folder(folder_path: String) -> Result<(), String> {
+    if folder_path.is_empty() {
+        return Err("Cannot delete the Briefcast root folder".to_string());
+    }
+    let root = briefcast_dir()?;
+    let dir = resolve_relative(&root, &folder_path)?;
+    if !dir.is_dir() {
+        return Err("Folder does not exist".to_string());
+    }
+
+    let mut entries = fs::read_dir(&dir).map_err(|e| format!("Failed to read folder: {}", e))?;
+    if entries.next().is_some() {
+        return Err("Folder is not empty".to_string());
+    }
+
+    fs::remove_dir(&dir).map_err(|e| format!("Failed to delete folder: {}", e))
+}
+
+// Moves a file (given its current absolute path, as stored on FileEntry) into another folder
+// identified by relative_key-shaped path ("" = Briefcast root). Same-folder moves are a no-op
+// success rather than an error, so the frontend doesn't need to special-case "dropped it back
+// where it came from".
+#[command]
+pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String, String> {
+    let root = briefcast_dir()?;
+    let dest_dir = resolve_relative(&root, &dest_folder_path)?;
+    if !dest_dir.is_dir() {
+        return Err("Destination folder does not exist".to_string());
+    }
+
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err("File does not exist".to_string());
+    }
+
+    let file_name = source.file_name().ok_or("Invalid source file name")?;
+    let dest_path = dest_dir.join(file_name);
+
+    if dest_path == source {
+        return path_to_str(&source).map(|s| s.to_string());
+    }
+    if dest_path.exists() {
+        return Err("A file with that name already exists in that folder".to_string());
+    }
+
+    fs::rename(&source, &dest_path).map_err(|e| format!("Failed to move file: {}", e))?;
+    path_to_str(&dest_path).map(|s| s.to_string())
 }
 
 fn is_media_file(ext: &str)->bool{

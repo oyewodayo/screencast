@@ -26,7 +26,10 @@ import {
   IoPlayForwardOutline,
   IoTrashOutline,
   IoArrowUndoOutline,
+  IoFolderOutline,
+  IoAddCircleOutline,
 } from "react-icons/io5";
+import { MdCreateNewFolder } from "react-icons/md";
 
 type RAMInfo = [number, number];
 
@@ -98,6 +101,29 @@ const toggleOverlayVisibility = async () => {
   }
 };
 
+// Toggles the system-wide stylus annotation overlay's "draw mode" - unlike the recording overlay
+// above, this one is available any time (not gated on an active recording), so its hotkey is
+// registered/unregistered purely based on the enableAnnotationTool setting (see the effect that
+// watches annotationEnabled below), not recording state.
+const ANNOTATION_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+D';
+// Hard kill switch, independent of the Settings checkbox/localStorage. Confirmed on 2026-07-21:
+// flipping this to false reliably hangs the whole app (Briefcast.exe stops responding, verified via
+// Get-Process -> Responding: False) on first launch, right as ensure_annotation_overlay
+// (annotation.rs) creates the overlay window - it appears in the window list but the app never
+// gets past window.set_position()/set_size() afterward. This is a real deadlock, not just the
+// click-through issue the surrounding comments describe, and reproduced twice in a row on a 4K/2.5x
+// scaled display. Root cause not yet found - likely something in tauri::WindowBuilder::build() or
+// the physical set_position/set_size calls blocking the main event loop thread from an async
+// command context. Do not flip this without first fixing that deadlock and confirming
+// ensure_annotation_overlay can return successfully (add temporary eprintln checkpoints around the
+// build()/set_position()/set_size() calls in annotation.rs and watch `npm run tauri dev`'s output -
+// the run stops dead between the bounds log line and a final success log line).
+const ANNOTATION_FEATURE_DISABLED = true;
+// How long to keep the overlay window shown (but click-through) after draw mode turns off, so a
+// stroke that's still fading gets to finish instead of vanishing instantly. Covers
+// AnnotationOverlayWindow.tsx's FADE_HOLD_MS (1200) + FADE_OUT_MS (1400) with margin.
+const ANNOTATION_FADE_GRACE_MS = 3000;
+
 interface FileEntry {
     name: string;
     path: string;
@@ -141,6 +167,23 @@ const Dashboard = () => {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>("");
+  // "Move to ▸" flyout inside a file's 3-dot menu — keyed by file.path, separate from openMenu
+  // so it can be nested inside that same popup instead of needing its own positioning.
+  const [moveMenuOpenFor, setMoveMenuOpenFor] = useState<string | null>(null);
+  // Folder relative-path (see FileMap's keys) whose inline "new folder" input is active, or null
+  // if none is. "" means creating a top-level folder directly under Briefcast.
+  const [creatingFolderIn, setCreatingFolderIn] = useState<string | null>(null);
+  const [newFolderValue, setNewFolderValue] = useState<string>("");
+  // Drag-and-drop move: the file(s) currently being dragged (more than one if the dragged file
+  // was part of the active multi-selection below), and whichever folder header the pointer is
+  // presently over (for the drop-target highlight). Both null outside a drag gesture.
+  const [draggingFiles, setDraggingFiles] = useState<FileEntry[] | null>(null);
+  const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
+  // Multi-select for bulk move — a set of file.path values, spanning whichever folders are
+  // currently visible under the active category. Cleared whenever the category tab changes so
+  // a stale selection from "Video" doesn't silently carry over into "Audio".
+  const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(new Set());
+  const [bulkMoveMenuOpen, setBulkMoveMenuOpen] = useState<boolean>(false);
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
@@ -151,6 +194,19 @@ const [conversionFile, setConversionFile] = useState<{path: string; name: string
   // so it's just the one flag. Driven by VideoPlayer's own Autoplay button/settings row (it can't
   // hold this itself since it fully remounts on every file change via `key={selectedFile.path}`).
   const [videoAutoplayNext, setVideoAutoplayNext] = useState<boolean>(true);
+  // Whether the system-wide annotation overlay is allowed to exist at all this session — see
+  // handleSettingsSaved and the effect below that creates/hides the overlay window and
+  // registers/unregisters ANNOTATION_TOGGLE_SHORTCUT whenever this changes.
+  const [annotationEnabled, setAnnotationEnabled] = useState<boolean>(() => loadSettings().enableAnnotationTool);
+  // Mirrors whether the overlay is currently in "draw mode" (capturing input) vs click-through.
+  // A ref, not state — read inside the global-shortcut callback and the turn-off-request
+  // listener, both registered once and needing the *current* value, not whatever was in scope
+  // when they were set up.
+  const annotationDrawModeRef = useRef<boolean>(false);
+  // Pending "hide the overlay" timeout scheduled when draw mode turns off (see
+  // toggleAnnotationDrawMode) — tracked so a quick off-then-on re-toggle can cancel it instead of
+  // hiding a window the user just turned drawing back on for.
+  const annotationHideTimeoutRef = useRef<number | null>(null);
 
   // Last known playback position per audio file (keyed by sourcePath), so switching away and
   // back — including by accident via prev/next — resumes instead of restarting at 0. A ref, not
@@ -557,6 +613,7 @@ const setScreen = () => {
 
 	const handleOpenTrash = () => {
 		setActiveFileCategory("trash");
+		setSelectedFilePaths(new Set());
 		loadTrash();
 	};
 
@@ -592,7 +649,124 @@ const setScreen = () => {
 	const handleSettingsSaved = (settings: ReturnType<typeof loadSettings>) => {
 		setFileExt(settings.defaultFileExt);
 		setRecordType(settings.defaultRecordType);
+		setAnnotationEnabled(settings.enableAnnotationTool);
 	};
+
+	// Shows/hides the annotation overlay and flips its click-through state, and tells its own page
+	// to show/hide the floating toolbar. Called both by the global hotkey (toggles) and by the
+	// turn-off-request listener below (forces off, e.g. from the overlay's Esc/close button).
+	//
+	// The overlay stays hidden except for this deliberately brief, user-initiated window - see the
+	// long comment in ensure_annotation_overlay (annotation.rs) for why: a click-through style that
+	// silently fails to apply is nearly harmless on a window that's about to be hidden anyway, but
+	// catastrophic on one left permanently visible in the background. show()/setIgnoreCursorEvents
+	// are also always sequenced show-before-ignore when turning draw mode on, since setting that
+	// style before a window has ever been shown is what didn't reliably stick on Windows.
+	const toggleAnnotationDrawMode = useCallback(async (forceOff = false) => {
+		const overlay = WebviewWindow.getByLabel('annotation-overlay');
+		if (!overlay) return;
+		const next = forceOff ? false : !annotationDrawModeRef.current;
+		annotationDrawModeRef.current = next;
+
+		if (annotationHideTimeoutRef.current !== null) {
+			window.clearTimeout(annotationHideTimeoutRef.current);
+			annotationHideTimeoutRef.current = null;
+		}
+
+		try {
+			if (next) {
+				await overlay.show();
+				await overlay.setIgnoreCursorEvents(false);
+				await overlay.emit('annotation-mode-changed', { active: true });
+			} else {
+				await overlay.emit('annotation-mode-changed', { active: false });
+				await overlay.setIgnoreCursorEvents(true);
+				// Not hidden immediately - a still-fading stroke should keep fading, not vanish the
+				// instant draw mode turns off. ANNOTATION_FADE_GRACE_MS covers the overlay's own
+				// FADE_HOLD_MS + FADE_OUT_MS (AnnotationOverlayWindow.tsx) with margin. Click-through
+				// is already applied above, so even if this timer never fires (e.g. the app closes
+				// first), the overlay can't block input in the meantime.
+				annotationHideTimeoutRef.current = window.setTimeout(() => {
+					annotationHideTimeoutRef.current = null;
+					if (!annotationDrawModeRef.current) void overlay.hide();
+				}, ANNOTATION_FADE_GRACE_MS);
+			}
+		} catch (err) {
+			console.error('Failed to toggle annotation draw mode:', err);
+		}
+	}, []);
+
+	// Creates (idempotent) and shows the annotation overlay + registers its hotkey whenever the
+	// feature is enabled; tears both down whenever it's disabled. Independent of recording state —
+	// this feature is meant to be available any time, not just mid-recording (unlike
+	// OVERLAY_TOGGLE_SHORTCUT above).
+	useEffect(() => {
+		if (ANNOTATION_FEATURE_DISABLED) return;
+		let cancelled = false;
+
+		(async () => {
+			if (!annotationEnabled) {
+				if (annotationDrawModeRef.current) {
+					await toggleAnnotationDrawMode(true);
+				}
+				if (await isRegistered(ANNOTATION_TOGGLE_SHORTCUT)) {
+					await unregister(ANNOTATION_TOGGLE_SHORTCUT);
+				}
+				const overlay = WebviewWindow.getByLabel('annotation-overlay');
+				if (overlay) await overlay.hide();
+				return;
+			}
+
+			try {
+				await invoke('ensure_annotation_overlay');
+			} catch (err) {
+				console.error('Failed to create annotation overlay:', err);
+				return;
+			}
+			if (cancelled) return;
+			try {
+				if (!(await isRegistered(ANNOTATION_TOGGLE_SHORTCUT))) {
+					await register(ANNOTATION_TOGGLE_SHORTCUT, () => {
+						void toggleAnnotationDrawMode();
+					});
+				}
+			} catch (err) {
+				// Most likely cause: another already-running app has this exact combo registered
+				// as its own OS-level global hotkey, so ours is rejected - surfaced here (rather
+				// than only console.error, which nobody sees without devtools) since otherwise the
+				// symptom is just "the shortcut silently does nothing," indistinguishable from the
+				// feature being broken.
+				console.error('Failed to register annotation hotkey:', err);
+				setError(`Couldn't register the annotation shortcut (${ANNOTATION_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+		};
+	}, [annotationEnabled, toggleAnnotationDrawMode]);
+
+	// The overlay's own Esc key / toolbar close button can't reach annotationDrawModeRef directly
+	// (different window, different JS context) - it asks via this event instead.
+	useEffect(() => {
+		const unlistenPromise = listen('annotation-turn-off-request', () => {
+			if (annotationDrawModeRef.current) {
+				void toggleAnnotationDrawMode(true);
+			}
+		});
+		return () => {
+			unlistenPromise.then((fn) => fn());
+		};
+	}, [toggleAnnotationDrawMode]);
+
+	// Unregister on unmount so the hotkey doesn't linger after Dashboard itself goes away.
+	useEffect(() => {
+		return () => {
+			isRegistered(ANNOTATION_TOGGLE_SHORTCUT).then((registered) => {
+				if (registered) void unregister(ANNOTATION_TOGGLE_SHORTCUT);
+			});
+		};
+	}, []);
 
 	const handleTogglePdfFullscreen = async () => {
 		const next = !isPdfFullscreen;
@@ -818,6 +992,121 @@ const setScreen = () => {
 		}
 	};
 
+	// FileMap's keys are relative_key-shaped paths from the Rust side ("" = Briefcast root,
+	// "Workshops/Papers" = a nested folder) — these two just adapt that raw key for display.
+	const folderDisplayName = (folder: string): string => (folder === "" ? "Briefcast" : folder.split("/").pop()!);
+	const folderDepth = (folder: string): number => (folder === "" ? 0 : folder.split("/").length);
+
+	const findFileFolder = (path: string): string | null => {
+		for (const [folder, list] of Object.entries(files)) {
+			if (list.some((f) => f.path === path)) return folder;
+		}
+		return null;
+	};
+
+	// True only if the filesystem folder is completely empty — no files of any type, no
+	// subfolders — not merely "no files in the currently active category". Root can never be
+	// deleted, so it's always reported non-empty here regardless of its real contents.
+	const isFolderEmpty = (folder: string): boolean => {
+		if (folder === "") return false;
+		if ((files[folder]?.length ?? 0) > 0) return false;
+		return !Object.keys(files).some((key) => key.startsWith(`${folder}/`));
+	};
+
+	const toggleFileSelected = (path: string) => {
+		setSelectedFilePaths((prev) => {
+			const next = new Set(prev);
+			if (next.has(path)) next.delete(path);
+			else next.add(path);
+			return next;
+		});
+	};
+
+	const getSelectedFileEntries = (): FileEntry[] => Object.values(files).flat().filter((f) => selectedFilePaths.has(f.path));
+
+	// Whichever of "just this one file" or "the whole active selection" a drag/move action on
+	// `file` should apply to — the shared rule behind both drag-and-drop and the per-file
+	// "Move to" menu: dragging/moving a file that's part of a multi-selection moves the whole
+	// selection, dragging/moving anything else only moves that one file.
+	const filesToActOn = (file: FileEntry): FileEntry[] => {
+		if (!selectedFilePaths.has(file.path)) return [file];
+		const selection = getSelectedFileEntries();
+		return selection.length > 1 ? selection : [file];
+	};
+
+	const startCreateFolder = (parentFolder: string) => {
+		setCreatingFolderIn(parentFolder);
+		setNewFolderValue("");
+		setOpenMenu(null);
+	};
+
+	const commitCreateFolder = async () => {
+		const parent = creatingFolderIn;
+		const name = newFolderValue.trim();
+		setCreatingFolderIn(null);
+		if (parent === null || !name) return;
+		try {
+			await invoke<string>("create_folder", { parentPath: parent, name });
+			await handleDirectoryFiles();
+			setMessage(`Created folder: ${name}`);
+		} catch (error) {
+			console.error("Error creating folder:", error);
+			setError(`Failed to create folder: ${error}`);
+		}
+	};
+
+	// Handles both a single-file move and a bulk move — `fileList` is whatever filesToActOn()
+	// decided applies (see its comment). Files already in destFolder are silently skipped rather
+	// than erroring, since a multi-selection spanning folders will often already include some
+	// that are exactly where they're being dropped.
+	const handleMoveFiles = async (fileList: FileEntry[], destFolder: string) => {
+		setOpenMenu(null);
+		setMoveMenuOpenFor(null);
+		setDragOverFolder(null);
+		setBulkMoveMenuOpen(false);
+		const toMove = fileList.filter((file) => findFileFolder(file.path) !== destFolder);
+		if (toMove.length === 0) return;
+		try {
+			const results = await Promise.allSettled(
+				toMove.map((file) => invoke<string>("move_file", { sourcePath: file.path, destFolderPath: destFolder }))
+			);
+			await handleDirectoryFiles();
+
+			// The file's playback URL is derived from its old absolute path, so a currently-open
+			// file needs reloading from its new location rather than just refreshing the list.
+			const openIndex = toMove.findIndex((file) => selectedFile?.sourcePath === file.path);
+			if (openIndex !== -1) {
+				const openResult = results[openIndex];
+				if (openResult.status === "fulfilled") await loadFileForPlayback(openResult.value, toMove[openIndex].name);
+			}
+
+			setSelectedFilePaths(new Set());
+			const failedCount = results.filter((r) => r.status === "rejected").length;
+			if (failedCount > 0) {
+				const firstError = results.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason;
+				setError(`Moved ${toMove.length - failedCount} of ${toMove.length} file(s) — ${failedCount} failed: ${firstError}`);
+			} else if (toMove.length === 1) {
+				setMessage(`Moved ${formatFileName(toMove[0].name)} to ${folderDisplayName(destFolder)}`);
+			} else {
+				setMessage(`Moved ${toMove.length} files to ${folderDisplayName(destFolder)}`);
+			}
+		} catch (error) {
+			console.error("Error moving files:", error);
+			setError(`Failed to move files: ${error}`);
+		}
+	};
+
+	const handleDeleteFolder = async (folder: string) => {
+		try {
+			await invoke("delete_folder", { folderPath: folder });
+			await handleDirectoryFiles();
+			setMessage(`Deleted folder: ${folderDisplayName(folder)}`);
+		} catch (error) {
+			console.error("Error deleting folder:", error);
+			setError(`Failed to delete folder: ${error}`);
+		}
+	};
+
 	const startRename = (file: FileEntry) => {
 		const dotIndex = file.name.lastIndexOf('.');
 		setRenameValue(dotIndex > 0 ? file.name.slice(0, dotIndex) : file.name);
@@ -841,16 +1130,21 @@ const setScreen = () => {
 	// Computed once per render so both the fixed sidebar header and the scrollable list below
 	// it can share the same grouping — previously this was recomputed inside an IIFE local to
 	// just the list, which the header (now pulled out so it can stay fixed) couldn't reach.
+	// Every real folder is kept (even ones with zero files in the active category) so it stays
+	// visible — and usable as a create-subfolder/move/drop target — regardless of which file-type
+	// tab happens to be open. Sorted lexicographically on the relative-path key, which conveniently
+	// also sorts every folder after its own parent ("Workshops" before "Workshops/Papers") and
+	// puts the root ("") first, so this doubles as the hierarchical display order.
 	const filteredEntries = Object.entries(files)
 		.map(([folder, fileList]) => [
 			folder,
 			fileList.filter((file) => getFileCategory(file.name) === activeFileCategory),
 		] as [string, FileEntry[]])
-		.filter(([, fileList]) => fileList.length > 0);
+		.sort(([a], [b]) => a.localeCompare(b));
 	const sidebarHeaderLabel =
 		activeFileCategory === "trash"
 			? "Trash:"
-			: filteredEntries.length === 1 ? `${filteredEntries[0][0]}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
+			: filteredEntries.length === 1 ? `${folderDisplayName(filteredEntries[0][0])}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
 	const isAudioSelected = selectedFile !== null && getFileCategory(selectedFile.name) === "audio";
 
   return (
@@ -861,7 +1155,7 @@ const setScreen = () => {
               regardless of showFileList, so it never reappears over the presented page. */}
           <div
             className={`h-screen bg-neutral-50 dark:bg-neutral-900 border-b border-gray-300 dark:border-neutral-700 transition-all duration-300 overflow-hidden ${
-              showFileList && !isPdfFullscreen ? "w-[250px] opacity-100" : "w-0 opacity-0"
+              showFileList && !isPdfFullscreen ? "w-[300px] opacity-100" : "w-0 opacity-0"
             }`}
           >
             {showFileList && !isPdfFullscreen && (
@@ -873,7 +1167,10 @@ const setScreen = () => {
                       key={category}
                       type="button"
                       title={label}
-                      onClick={() => setActiveFileCategory(category)}
+                      onClick={() => {
+                        setActiveFileCategory(category);
+                        setSelectedFilePaths(new Set());
+                      }}
                       className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
                         activeFileCategory === category
                           ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
@@ -903,73 +1200,129 @@ const setScreen = () => {
                     tabs, does not scroll with the file list beneath it. */}
                 <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
                   <h3 className="font-semibold text-gray-700 dark:text-neutral-300 text-sm truncate">{sidebarHeaderLabel}</h3>
-                  {(activeFileCategory === "image" || activeFileCategory === "audio") && (
-                    <div className="flex items-center gap-0.5 shrink-0">
-                      {activeFileCategory === "audio" && (
-                        <>
-                          <button
-                            type="button"
-                            title={`Repeat: ${audioRepeatMode === "off" ? "off" : audioRepeatMode === "all" ? "all" : "one"}`}
-                            onClick={cycleAudioRepeatMode}
-                            className={`relative p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                              audioRepeatMode !== "off"
-                                ? "text-blue-600 dark:text-blue-400"
-                                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                            }`}
-                          >
-                            <IoRepeatOutline size={14} />
-                            {audioRepeatMode === "one" && (
-                              <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-blue-600 dark:bg-blue-500 text-white text-[8px] font-bold leading-none flex items-center justify-center">
-                                1
-                              </span>
-                            )}
-                          </button>
-                          <button
-                            type="button"
-                            title={`Shuffle: ${audioShuffle ? "on" : "off"}`}
-                            onClick={() => setAudioShuffle((prev) => !prev)}
-                            className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                              audioShuffle
-                                ? "text-blue-600 dark:text-blue-400"
-                                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                            }`}
-                          >
-                            <IoShuffleOutline size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            title={`Autoplay next track: ${audioAutoplayNext ? "on" : "off"}`}
-                            onClick={() => setAudioAutoplayNext((prev) => !prev)}
-                            className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                              audioAutoplayNext
-                                ? "text-blue-600 dark:text-blue-400"
-                                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                            }`}
-                          >
-                            <IoPlayForwardOutline size={14} />
-                          </button>
-                          <div className="w-px h-4 bg-gray-300 dark:bg-neutral-600 mx-0.5" />
-                        </>
-                      )}
+                  <div className="flex items-center gap-0.5 shrink-0">
+                    {activeFileCategory !== "trash" && (
                       <button
                         type="button"
-                        title="Previous (←)"
-                        onClick={() => (activeFileCategory === "audio" ? navigateAudio(-1) : navigateImage(-1))}
+                        title="New folder"
+                        onClick={() => startCreateFolder("")}
                         className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
                       >
-                        <IoChevronBack size={14} />
+                        <MdCreateNewFolder size={16} />
                       </button>
+                    )}
+                    {(activeFileCategory === "image" || activeFileCategory === "audio") && (
+                      <>
+                        {activeFileCategory === "audio" && (
+                          <>
+                            <button
+                              type="button"
+                              title={`Repeat: ${audioRepeatMode === "off" ? "off" : audioRepeatMode === "all" ? "all" : "one"}`}
+                              onClick={cycleAudioRepeatMode}
+                              className={`relative p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                                audioRepeatMode !== "off"
+                                  ? "text-blue-600 dark:text-blue-400"
+                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                              }`}
+                            >
+                              <IoRepeatOutline size={14} />
+                              {audioRepeatMode === "one" && (
+                                <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-blue-600 dark:bg-blue-500 text-white text-[8px] font-bold leading-none flex items-center justify-center">
+                                  1
+                                </span>
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              title={`Shuffle: ${audioShuffle ? "on" : "off"}`}
+                              onClick={() => setAudioShuffle((prev) => !prev)}
+                              className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                                audioShuffle
+                                  ? "text-blue-600 dark:text-blue-400"
+                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                              }`}
+                            >
+                              <IoShuffleOutline size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              title={`Autoplay next track: ${audioAutoplayNext ? "on" : "off"}`}
+                              onClick={() => setAudioAutoplayNext((prev) => !prev)}
+                              className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                                audioAutoplayNext
+                                  ? "text-blue-600 dark:text-blue-400"
+                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                              }`}
+                            >
+                              <IoPlayForwardOutline size={14} />
+                            </button>
+                            <div className="w-px h-4 bg-gray-300 dark:bg-neutral-600 mx-0.5" />
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          title="Previous (←)"
+                          onClick={() => (activeFileCategory === "audio" ? navigateAudio(-1) : navigateImage(-1))}
+                          className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        >
+                          <IoChevronBack size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          title="Next (→)"
+                          onClick={() => (activeFileCategory === "audio" ? navigateAudio(1) : navigateImage(1))}
+                          className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        >
+                          <IoChevronForward size={14} />
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Bulk action bar — only for a real multi-selection (not trash, which has its
+                    own per-item restore/delete-forever actions already). */}
+                {activeFileCategory !== "trash" && selectedFilePaths.size > 0 && (
+                  <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-200 dark:border-neutral-700 shrink-0 bg-blue-50 dark:bg-blue-500/10">
+                    <span className="text-xs font-medium text-blue-700 dark:text-blue-300">
+                      {selectedFilePaths.size} selected
+                    </span>
+                    <div className="flex items-center gap-3">
+                      <div className="relative">
+                        <button
+                          type="button"
+                          onClick={() => setBulkMoveMenuOpen((prev) => !prev)}
+                          className="flex items-center gap-0.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                        >
+                          Move to
+                          <IoChevronForward size={11} className={`transition-transform ${bulkMoveMenuOpen ? 'rotate-90' : ''}`} />
+                        </button>
+                        {bulkMoveMenuOpen && (
+                          <div className="absolute right-0 top-full mt-1 w-40 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg z-20 max-h-48 overflow-y-auto py-0.5">
+                            {Object.keys(files)
+                              .sort((a, b) => a.localeCompare(b))
+                              .map((destFolder) => (
+                                <button
+                                  key={destFolder || "__root__"}
+                                  className="w-full text-left px-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                  onClick={() => handleMoveFiles(getSelectedFileEntries(), destFolder)}
+                                >
+                                  {folderDisplayName(destFolder)}
+                                </button>
+                              ))}
+                          </div>
+                        )}
+                      </div>
                       <button
                         type="button"
-                        title="Next (→)"
-                        onClick={() => (activeFileCategory === "audio" ? navigateAudio(1) : navigateImage(1))}
-                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        onClick={() => setSelectedFilePaths(new Set())}
+                        className="text-xs text-neutral-500 dark:text-neutral-400 hover:underline"
                       >
-                        <IoChevronForward size={14} />
+                        Clear
                       </button>
                     </div>
-                  )}
-                </div>
+                  </div>
+                )}
 
                 <div className="p-3 text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200">
                 {activeFileCategory === "trash" ? (
@@ -1026,95 +1379,230 @@ const setScreen = () => {
                   <p>No {activeFileCategory} files found</p>
                 ) : (
                   filteredEntries.map(([folder, fileList]) => (
-                    <div key={folder} className="mb-4">
-                      {filteredEntries.length > 1 && (
-                        <h4 className="text-xs font-semibold text-gray-500 dark:text-neutral-400 mb-1">{folder}</h4>
-                      )}
-                      <ul className="ml-2 mt-1">
-                        {fileList.map((file) => (
-                          <li
-                            key={file.path}
-                            className={`flex items-center justify-between group cursor-pointer hover:bg-gray-50 dark:hover:bg-neutral-800 ${
-                              selectedFile?.sourcePath === file.path ? 'bg-blue-50 dark:bg-blue-500/10' : ''
-                            }`}
+                    <div
+                      key={folder}
+                      className="mb-3"
+                      // Folder-as-drop-target: only reacts while a file is actually being
+                      // dragged, so plain mouse hovering never lights it up.
+                      onDragOver={(e) => {
+                        if (!draggingFiles) return;
+                        e.preventDefault();
+                        if (dragOverFolder !== folder) setDragOverFolder(folder);
+                      }}
+                      onDragLeave={() => setDragOverFolder((prev) => (prev === folder ? null : prev))}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (draggingFiles) handleMoveFiles(draggingFiles, folder);
+                      }}
+                    >
+                      <div
+                        className={`group/folder flex items-center justify-between gap-1 -mx-1 px-1 py-0.5 rounded transition-colors ${
+                          dragOverFolder === folder ? "bg-blue-100 dark:bg-blue-500/20 ring-1 ring-blue-400" : ""
+                        }`}
+                        style={{ paddingLeft: 4 + folderDepth(folder) * 10 }}
+                      >
+                        <h4
+                          className="text-xs font-semibold text-gray-500 dark:text-neutral-400 flex items-center gap-1 min-w-0 truncate"
+                          title={folderDisplayName(folder)}
+                        >
+                          <IoFolderOutline size={12} className="shrink-0" />
+                          <span className="truncate">{folderDisplayName(folder)}</span>
+                        </h4>
+                        <div className="flex items-center gap-0.5 opacity-0 group-hover/folder:opacity-100 transition-opacity shrink-0">
+                          {isFolderEmpty(folder) && (
+                            <button
+                              type="button"
+                              title="Delete empty folder"
+                              onClick={() => handleDeleteFolder(folder)}
+                              className="p-0.5 rounded text-gray-400 hover:text-red-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                            >
+                              <IoTrashOutline size={13} />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            title="New subfolder"
+                            onClick={() => startCreateFolder(folder)}
+                            className="p-0.5 rounded text-gray-400 hover:text-blue-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
                           >
-                            {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
-                            {renamingFile === file.path ? (
+                            <IoAddCircleOutline size={14} />
+                          </button>
+                        </div>
+                      </div>
+
+                      {creatingFolderIn === folder && (
+                        <div className="flex items-center gap-1 mt-1" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
+                          <IoFolderOutline size={12} className="text-gray-400 shrink-0" />
+                          <input
+                            autoFocus
+                            value={newFolderValue}
+                            onChange={(e) => setNewFolderValue(e.target.value)}
+                            onBlur={commitCreateFolder}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") commitCreateFolder();
+                              if (e.key === "Escape") setCreatingFolderIn(null);
+                            }}
+                            placeholder="Folder name"
+                            className="flex-1 min-w-0 border border-blue-400 rounded px-1 text-xs bg-white dark:bg-neutral-800"
+                          />
+                        </div>
+                      )}
+
+                      {fileList.length === 0 ? (
+                        <p
+                          className="text-[11px] text-neutral-400 dark:text-neutral-500 italic mt-1"
+                          style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}
+                        >
+                          No {activeFileCategory} files
+                        </p>
+                      ) : (
+                        <ul className="mt-1" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
+                          {fileList.map((file) => (
+                            <li
+                              key={file.path}
+                              draggable
+                              onDragStart={(e) => {
+                                setDraggingFiles(filesToActOn(file));
+                                e.dataTransfer.effectAllowed = "move";
+                              }}
+                              onDragEnd={() => {
+                                setDraggingFiles(null);
+                                setDragOverFolder(null);
+                              }}
+                              className={`flex items-center justify-between gap-1 min-w-0 group cursor-pointer hover:bg-gray-50 dark:hover:bg-neutral-800 ${
+                                selectedFile?.sourcePath === file.path ? 'bg-blue-50 dark:bg-blue-500/10' : ''
+                              } ${draggingFiles?.some((f) => f.path === file.path) ? 'opacity-40' : ''}`}
+                            >
                               <input
-                                className="flex-1 border border-blue-400 rounded px-1 text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
-                                autoFocus
-                                value={renameValue}
+                                type="checkbox"
+                                checked={selectedFilePaths.has(file.path)}
                                 onClick={(e) => e.stopPropagation()}
-                                onChange={(e) => setRenameValue(e.target.value)}
-                                onBlur={() => commitRename(file)}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') commitRename(file);
-                                  if (e.key === 'Escape') setRenamingFile(null);
-                                }}
-                              />
-                            ) : (
-                              <div
-                                className={`flex-1 hover:text-blue-500 dark:hover:text-blue-400 ${
-                                  selectedFile?.sourcePath === file.path ? 'text-blue-600 dark:text-blue-400 font-medium' : ''
+                                onChange={() => toggleFileSelected(file.path)}
+                                title="Select for bulk move"
+                                className={`shrink-0 mr-1.5 accent-blue-500 transition-opacity ${
+                                  selectedFilePaths.size > 0 || selectedFilePaths.has(file.path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
                                 }`}
-                                title={file.name}
-                                onClick={() => handleFileClick(file)}
-                              >
-                                {formatFileName(file.name)}
-                              </div>
-                            )}
+                              />
+                              {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
+                              {renamingFile === file.path ? (
+                                <input
+                                  className="flex-1 min-w-0 border border-blue-400 rounded px-1 text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
+                                  autoFocus
+                                  value={renameValue}
+                                  onClick={(e) => e.stopPropagation()}
+                                  onChange={(e) => setRenameValue(e.target.value)}
+                                  onBlur={() => commitRename(file)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') commitRename(file);
+                                    if (e.key === 'Escape') setRenamingFile(null);
+                                  }}
+                                />
+                              ) : (
+                                <div
+                                  className={`flex-1 min-w-0 truncate hover:text-blue-500 dark:hover:text-blue-400 ${
+                                    selectedFile?.sourcePath === file.path ? 'text-blue-600 dark:text-blue-400 font-medium' : ''
+                                  }`}
+                                  title={file.name}
+                                  onClick={() => handleFileClick(file)}
+                                >
+                                  {formatFileName(file.name)}
+                                </div>
+                              )}
 
-                            {/* Three vertical dots menu */}
-                            <div className="relative">
-                              <button
-                                className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-200 dark:hover:bg-neutral-700 transition-opacity"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setOpenMenu(openMenu === file.path ? null : file.path);
-                                }}
-                              >
-                                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
-                                  <path d="M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/>
-                                </svg>
-                              </button>
+                              {/* Three vertical dots menu */}
+                              <div className="relative">
+                                <button
+                                  className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-200 dark:hover:bg-neutral-700 transition-opacity"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setOpenMenu(openMenu === file.path ? null : file.path);
+                                    setMoveMenuOpenFor(null);
+                                  }}
+                                >
+                                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
+                                    <path d="M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/>
+                                  </svg>
+                                </button>
 
-                              {/* Popup Menu */}
-                              {openMenu === file.path && (
-                                <div className="absolute right-0 top-full mt-1 w-32 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg z-10">
-                                  <button
-                                    className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      startRename(file);
-                                    }}
-                                  >
-                                    Rename
-                                  </button>
-                                   <button
+                                {/* Popup Menu */}
+                                {openMenu === file.path && (
+                                  <div className="absolute right-0 top-full mt-1 w-36 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg z-20">
+                                    <button
                                       className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        setConversionFile(file);
-                                        setOpenMenu(null);
+                                        startRename(file);
                                       }}
                                     >
-                                    Convert
-                                  </button>
-                                  <button
-                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm text-red-600 dark:text-red-400"
+                                      Rename
+                                    </button>
+                                     <button
+                                        className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setConversionFile(file);
+                                          setOpenMenu(null);
+                                        }}
+                                      >
+                                      Convert
+                                    </button>
+
+                                    {/* "Move to ▸" — expands in place into the folder list rather
+                                        than as a hover flyout, so it works the same on touch/
+                                        trackpad as a click, with no hover-timing to get wrong. */}
+                                    <button
+                                      className="w-full flex items-center justify-between px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        handleDeleteFile(file);
+                                        setMoveMenuOpenFor((prev) => (prev === file.path ? null : file.path));
                                       }}
                                     >
-                                    Delete
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
+                                      {filesToActOn(file).length > 1 ? `Move ${filesToActOn(file).length} items to` : "Move to"}
+                                      <IoChevronForward
+                                        size={12}
+                                        className={`transition-transform ${moveMenuOpenFor === file.path ? 'rotate-90' : ''}`}
+                                      />
+                                    </button>
+                                    {moveMenuOpenFor === file.path && (
+                                      <div className="border-t border-gray-200 dark:border-neutral-700 max-h-40 overflow-y-auto py-0.5">
+                                        {Object.keys(files)
+                                          .sort((a, b) => a.localeCompare(b))
+                                          .map((destFolder) => (
+                                            <button
+                                              key={destFolder || "__root__"}
+                                              disabled={destFolder === folder}
+                                              className={`w-full text-left pl-6 pr-3 py-1.5 text-xs truncate ${
+                                                destFolder === folder
+                                                  ? "text-neutral-300 dark:text-neutral-600 cursor-default"
+                                                  : "hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                              }`}
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                if (destFolder !== folder) handleMoveFiles(filesToActOn(file), destFolder);
+                                              }}
+                                            >
+                                              {folderDisplayName(destFolder)}
+                                            </button>
+                                          ))}
+                                      </div>
+                                    )}
+
+                                    <button
+                                        className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm text-red-600 dark:text-red-400"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleDeleteFile(file);
+                                        }}
+                                      >
+                                      Delete
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
                   ))
                 )}

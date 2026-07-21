@@ -26,7 +26,7 @@ pub fn save_pdf_annotations(pdf_path: String, json: String) -> Result<(), String
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write annotations: {}", e))?;
     fs::rename(&tmp, &sidecar).map_err(|e| format!("Failed to save annotations: {}", e))?;
 
-    Ok(())
+    Ok(()) 
 }
 
 #[command]

@@ -19,6 +19,10 @@ export interface AppSettings {
   // Days a deleted file sits in the trash before purge_expired_trash removes it for good, run
   // once on app launch. 0 (or negative) means "never auto-purge — keep until Empty Trash".
   trashRetentionDays: number;
+  // Global on/off switch for the system-wide stylus annotation overlay (see
+  // AnnotationOverlayWindow.tsx) — when false, Dashboard never creates the overlay window or
+  // registers its hotkey at all.
+  enableAnnotationTool: boolean;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -34,6 +38,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pdfDefaultStrokeWidth: 4,
   theme: "system",
   trashRetentionDays: 30,
+  // The overlay this drives now stays hidden except for the brief, user-initiated span while
+  // draw mode is actually on (see ensure_annotation_overlay/toggleAnnotationDrawMode) - a hidden
+  // window can't block input no matter what, which is what makes it safe to default to on rather
+  // than requiring an opt-in visit to Settings.
+  enableAnnotationTool: true,
 };
 
 export function loadSettings(): AppSettings {

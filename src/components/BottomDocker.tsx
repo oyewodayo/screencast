@@ -259,7 +259,7 @@ const BottomDocker = ({
         console.log("Is monitoring: ",isMonitoring)
         await invoke("start_monitoring_windows")
 
-        setIsMonitoring(isMonitoring)
+        setIsMonitoring(true)
         console.log("Monitoring started")
       }
 

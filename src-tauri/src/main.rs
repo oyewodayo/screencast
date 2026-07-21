@@ -14,6 +14,7 @@ mod commands {
     pub mod recording;
     pub mod conversion;
     pub mod native_playback;
+    pub mod annotation;
 }
 mod services {
     pub mod utility;
@@ -147,10 +148,15 @@ fn main() {
             commands::native_playback::seek_native_playback,
             commands::native_playback::stop_native_playback,
 
+            commands::annotation::ensure_annotation_overlay,
+
             services::utility::open_file_from_directory,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
             services::utility::rename_file,
+            services::utility::create_folder,
+            services::utility::delete_folder,
+            services::utility::move_file,
             services::utility::get_platform,
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
