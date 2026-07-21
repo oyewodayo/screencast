@@ -392,6 +392,45 @@ pub async fn convert_image(
     Ok(result)
 }
 
+// Convert an audio file between mp3/wav/aac/flac/ogg/m4a. -vn drops any video stream before
+// encoding - many mp3/m4a files carry embedded cover art as an attached-picture "video" stream,
+// which would otherwise get passed through (or rejected outright by formats like wav/flac that
+// don't support attachments at all) instead of producing a clean audio-only output.
+#[tauri::command]
+pub async fn convert_audio(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    input_path: String,
+    output_format: String,
+    output_path: Option<String>,
+    preserve_original: bool,
+) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let output = match output_path {
+        Some(path) => PathBuf::from(path),
+        None => input.with_extension(&output_format),
+    };
+
+    let codec_args: Vec<&str> = match output_format.to_lowercase().as_str() {
+        "mp3" => vec!["-vn", "-c:a", "libmp3lame", "-b:a", "192k"],
+        "wav" => vec!["-vn", "-c:a", "pcm_s16le"],
+        "aac" => vec!["-vn", "-c:a", "aac", "-b:a", "192k"],
+        "flac" => vec!["-vn", "-c:a", "flac"],
+        "ogg" => vec!["-vn", "-c:a", "libvorbis", "-q:a", "5"],
+        "m4a" => vec!["-vn", "-c:a", "aac", "-b:a", "192k"],
+        _ => return Err(format!("Unsupported output format: {}", output_format)),
+    };
+
+    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+
+    if !preserve_original {
+        let _ = std::fs::remove_file(&input);
+    }
+
+    Ok(result)
+}
+
 // Cancel ongoing conversion
 #[tauri::command]
 pub async fn cancel_conversion(

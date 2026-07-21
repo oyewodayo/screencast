@@ -14,6 +14,7 @@ import PdfAnnotator from "../components/PdfAnnotator";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { loadSettings } from "../utils/appSettings";
+import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, isConvertibleCategory } from "../utils/fileCategory";
 import {
   IoVideocam,
   IoMusicalNotes,
@@ -32,22 +33,6 @@ import {
 import { MdCreateNewFolder } from "react-icons/md";
 
 type RAMInfo = [number, number];
-
-type FileCategory = "video" | "audio" | "image" | "pdf";
-
-const FILE_CATEGORY_EXTENSIONS: Record<FileCategory, string[]> = {
-  video: ["mp4", "mov", "avi", "mkv", "webm", "wmv"],
-  audio: ["mp3", "wav", "aac", "flac", "ogg", "m4a"],
-  image: ["jpg", "jpeg", "png", "gif", "bmp", "tiff"],
-  pdf: ["pdf"],
-};
-
-const getFileCategory = (fileName: string): FileCategory | null => {
-  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
-  const match = (Object.entries(FILE_CATEGORY_EXTENSIONS) as [FileCategory, string[]][])
-    .find(([, exts]) => exts.includes(ext));
-  return match ? match[0] : null;
-};
 
 const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.ReactNode }[] = [
   { category: "video", label: "Video", icon: <IoVideocam size={18} /> },
@@ -1536,16 +1521,18 @@ const setScreen = () => {
                                     >
                                       Rename
                                     </button>
-                                     <button
-                                        className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setConversionFile(file);
-                                          setOpenMenu(null);
-                                        }}
-                                      >
-                                      Convert
-                                    </button>
+                                     {isConvertibleCategory(getFileCategory(file.name)) && (
+                                       <button
+                                          className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setConversionFile(file);
+                                            setOpenMenu(null);
+                                          }}
+                                        >
+                                        Convert
+                                      </button>
+                                     )}
 
                                     {/* "Move to ▸" — expands in place into the folder list rather
                                         than as a hover flyout, so it works the same on touch/
