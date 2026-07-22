@@ -251,6 +251,43 @@ pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String
     path_to_str(&dest_path).map(|s| s.to_string())
 }
 
+// Copies an external file (e.g. dragged in from the OS file explorer) into a Briefcast folder,
+// identified by relative_key-shaped path ("" = root) — same validation as move_file, but copies
+// rather than renames since the source lives outside briefcast_dir() and must be left in place.
+// Rejects extensions list_briefcast_files wouldn't display anyway (is_media_file), so a dropped
+// file never silently vanishes from the sidebar after a successful copy.
+#[command]
+pub fn import_file(source_path: String, dest_folder_path: String) -> Result<String, String> {
+    let root = briefcast_dir()?;
+    let dest_dir = resolve_relative(&root, &dest_folder_path)?;
+    if !dest_dir.is_dir() {
+        return Err("Destination folder does not exist".to_string());
+    }
+
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err("File does not exist".to_string());
+    }
+
+    let ext_ok = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| is_media_file(&e.to_lowercase()))
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err("Unsupported file type".to_string());
+    }
+
+    let file_name = source.file_name().ok_or("Invalid source file name")?;
+    let dest_path = dest_dir.join(file_name);
+    if dest_path.exists() {
+        return Err("A file with that name already exists in that folder".to_string());
+    }
+
+    fs::copy(&source, &dest_path).map_err(|e| format!("Failed to import file: {}", e))?;
+    path_to_str(&dest_path).map(|s| s.to_string())
+}
+
 fn is_media_file(ext: &str)->bool{
     matches!(
         ext,

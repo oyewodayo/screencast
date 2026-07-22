@@ -1106,6 +1106,65 @@ const setScreen = () => {
 		}
 	};
 
+	// Copies files dragged in from outside the app (e.g. Windows Explorer) into destFolder — the
+	// external-source counterpart to handleMoveFiles above, same Promise.allSettled/refresh/
+	// combined-message shape, but via the import_file command (fs::copy, source left in place)
+	// rather than move_file. `paths` are real absolute filesystem paths, which (unlike a plain
+	// HTML5 drop's dataTransfer.files) only Tauri's own native file-drop event actually provides —
+	// see the onFileDropEvent listener below for why.
+	const handleImportFiles = async (paths: string[], destFolder: string) => {
+		if (paths.length === 0) return;
+		const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p;
+		try {
+			const results = await Promise.allSettled(
+				paths.map((path) => invoke<string>("import_file", { sourcePath: path, destFolderPath: destFolder }))
+			);
+			await handleDirectoryFiles();
+
+			const failedCount = results.filter((r) => r.status === "rejected").length;
+			if (failedCount > 0) {
+				const firstError = results.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason;
+				setError(`Imported ${paths.length - failedCount} of ${paths.length} file(s) — ${failedCount} failed: ${firstError}`);
+			} else if (paths.length === 1) {
+				setMessage(`Imported ${formatFileName(baseName(paths[0]))} to ${folderDisplayName(destFolder)}`);
+			} else {
+				setMessage(`Imported ${paths.length} files to ${folderDisplayName(destFolder)}`);
+			}
+		} catch (error) {
+			console.error("Error importing files:", error);
+			setError(`Failed to import files: ${error}`);
+		}
+	};
+
+	// Real OS file drops never reach the browser's own `drop` event with usable data on Tauri v1 —
+	// browsers/webviews never expose an absolute filesystem path on a dropped File object (that's
+	// what Tauri's native file-drop event exists to provide instead). So targeting still comes from
+	// plain DOM dragover on each folder <div> (dragOverFolder, updated below) for the *visual*
+	// highlight and "which folder" tracking, while the *paths* come from here — read via a ref
+	// since this listener is registered once and would otherwise close over a stale dragOverFolder.
+	// Tauri v1's FileDropEvent payload carries no cursor position, which is the reason this can't be
+	// done with the native event alone.
+	const dragOverFolderRef = useRef<string | null>(null);
+	useEffect(() => {
+		dragOverFolderRef.current = dragOverFolder;
+	}, [dragOverFolder]);
+
+	useEffect(() => {
+		const unlistenPromise = appWindow.onFileDropEvent((event) => {
+			if (event.payload.type === "drop") {
+				const destFolder = dragOverFolderRef.current ?? "";
+				setDragOverFolder(null);
+				handleImportFiles(event.payload.paths, destFolder);
+			} else if (event.payload.type === "cancel") {
+				setDragOverFolder(null);
+			}
+		});
+		return () => {
+			unlistenPromise.then((unlisten) => unlisten());
+		};
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, []);
+
 	const handleDeleteFolder = async (folder: string) => {
 		try {
 			await invoke("delete_folder", { folderPath: folder });
@@ -1425,10 +1484,18 @@ const setScreen = () => {
                     <div
                       key={folder}
                       className="mb-3"
-                      // Folder-as-drop-target: only reacts while a file is actually being
-                      // dragged, so plain mouse hovering never lights it up.
+                      // Folder-as-drop-target: reacts to an in-app file drag (draggingFiles) or an
+                      // OS file being dragged in from outside (e.dataTransfer.types includes
+                      // "Files", e.g. from Windows Explorer — this "types" check works during
+                      // dragover regardless of Tauri's native file-drop interception, which only
+                      // affects the final `drop` event's data, not the drag session itself) —
+                      // plain mouse hovering does neither, so it never lights up on its own.
+                      // This is purely visual/targeting state: for an external OS drag, the actual
+                      // import happens in the top-level onFileDropEvent listener above (which is
+                      // where the real file paths are available), not in onDrop below — a plain
+                      // HTML5 drop of an OS file never carries a usable path here.
                       onDragOver={(e) => {
-                        if (!draggingFiles) return;
+                        if (!draggingFiles && !e.dataTransfer.types.includes("Files")) return;
                         e.preventDefault();
                         if (dragOverFolder !== folder) setDragOverFolder(folder);
                       }}

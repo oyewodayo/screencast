@@ -163,6 +163,7 @@ fn main() {
             services::utility::create_folder,
             services::utility::delete_folder,
             services::utility::move_file,
+            services::utility::import_file,
             services::utility::get_platform,
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
