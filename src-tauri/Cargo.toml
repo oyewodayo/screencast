@@ -24,6 +24,12 @@ base64 = "0.22"
 # actual source was already portable.
 [target.'cfg(windows)'.dependencies]
 windows = {version="0.57.0", features = ["Win32_System_SystemInformation", "Win32_System_Console", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Power", "Win32_Storage_FileSystem", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_Devices_Properties", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_Storage_Xps", "Win32_Graphics_Dwm"] }
+# WASAPI loopback capture (system/"what you hear" audio) for recording - see
+# services/loopback_audio.rs. Neither device enumeration (get_connected_audios, dshow-based) nor
+# ffmpeg itself can capture this on a machine with no Stereo Mix-equivalent device; WASAPI
+# loopback is the one universal, driver-independent way to grab it on any Windows install.
+wasapi = "0.23"
+hound = "3.5"
 
 # Pure-Rust X11 protocol client (talks directly to the X server over its own socket transport —
 # no libX11/libxcb .so needed at build or run time) — the closest Linux analog to using the

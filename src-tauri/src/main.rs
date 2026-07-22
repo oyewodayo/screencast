@@ -20,6 +20,11 @@ mod services {
     pub mod utility;
     pub mod pdf_annotations;
     pub mod trash;
+    // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
+    // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
+    // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
+    #[cfg(target_os = "windows")]
+    pub mod loopback_audio;
 }
 use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMode, ConfigBuilder};
 

@@ -29,7 +29,12 @@ const STORAGE_KEY = "briefcast.settings.v1";
 
 export const DEFAULT_SETTINGS: AppSettings = {
   defaultRecordType: "sva",
-  defaultFileExt: "avi",
+  // mp4/h264 is the one container+codec combo every WebView2/Chromium <video> element decodes
+  // natively with hardware acceleration - .avi (the old default) has no WebView2 container
+  // support at all regardless of the codec inside it (see get_playable_preview's doc comment in
+  // src-tauri/src/commands/conversion.rs), so every fresh install used to force a full blocking
+  // re-encode on the very first playback of the very first recording it ever made.
+  defaultFileExt: "mp4",
   defaultFileNamePrefix: "Recording",
   pdfDefaultZoom: 1.25,
   pdfDefaultTool: "pen",

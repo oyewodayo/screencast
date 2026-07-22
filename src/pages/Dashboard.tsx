@@ -8,7 +8,7 @@ import { WindowInfo } from "../Types";
 import { WebviewWindow, appWindow } from '@tauri-apps/api/window';
 import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
 import { formatFileName } from "../utils/Formater";
-import VideoPlayer from "../components/VideoPlayer";
+import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -29,6 +29,7 @@ import {
   IoArrowUndoOutline,
   IoFolderOutline,
   IoAddCircleOutline,
+  IoBuildOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder } from "react-icons/md";
 
@@ -143,6 +144,12 @@ const Dashboard = () => {
      const [overlayShape, setOverlayShape] = useState("rounded"); // ADD THIS
   const [overlayPosition, setOverlayPosition] = useState("bottom_right"); // ADD THIS
   const [overlaySize, setOverlaySize] = useState("small"); // ADD THIS
+  // WASAPI loopback ("what you hear") capture, Windows-only - see start_recording's handling of
+  // FormData.include_system_audio and services/loopback_audio.rs for why this exists (dshow alone
+  // can't capture system audio on a machine with no Stereo Mix-equivalent device). Only
+  // meaningful for the screen-capture record types (sva/sa/s); RecordingDocker only shows the
+  // toggle for those.
+  const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(false);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
@@ -171,6 +178,24 @@ const Dashboard = () => {
   const [bulkMoveMenuOpen, setBulkMoveMenuOpen] = useState<boolean>(false);
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
+  // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
+  // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
+  // Toggled from the sidebar header's tools icon (next to "new folder"); falls back to "record"
+  // whenever there's no open file to show tools for, so it never gets stuck on an empty panel.
+  const [dockerMode, setDockerMode] = useState<"record" | "file-tools">("record");
+  useEffect(() => {
+    if (!selectedFile) setDockerMode("record");
+  }, [selectedFile]);
+  // Lets the video-tools timeline (FileToolsDocker -> VideoTimelineDocker) seek the actual player
+  // imperatively — there's no controlled "currentTime" prop on VideoPlayer, since native
+  // <video>/timeupdate already reports position out via onTimeUpdate below; this ref is just the
+  // one missing direction back in. Playhead position itself is tracked in state (not read
+  // straight off the ref) so the timeline re-renders as playback advances.
+  const videoPlayerRef = useRef<VideoPlayerHandle>(null);
+  const [playerCurrentTime, setPlayerCurrentTime] = useState<number>(0);
+  useEffect(() => {
+    setPlayerCurrentTime(0);
+  }, [selectedFile?.path]);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -1099,17 +1124,29 @@ const setScreen = () => {
 		setOpenMenu(null);
 	};
 
-	const commitRename = async (file: FileEntry) => {
-		const newName = renameValue.trim();
-		setRenamingFile(null);
+	// Shared by the sidebar's inline rename (commitRename below) and the "file tools" docker's
+	// rename field — also fixes a latent staleness bug the inline rename used to have on its own:
+	// renaming the file currently open in the player left `selectedFile` pointing at a path that
+	// no longer existed on disk until the next unrelated refresh happened to fix it.
+	const renameFile = async (file: FileEntry, newName: string): Promise<void> => {
 		if (!newName || newName === file.name) return;
 		try {
-			await invoke<string>('rename_file', { oldPath: file.path, newName });
+			const newPath = await invoke<string>('rename_file', { oldPath: file.path, newName });
 			await handleDirectoryFiles();
+			if (selectedFile?.sourcePath === file.path) {
+				const newFileName = newPath.split(/[\\/]/).pop() ?? newName;
+				await loadFileForPlayback(newPath, newFileName);
+			}
 		} catch (error) {
 			console.error('Error renaming file:', error);
 			setError(`Failed to rename file: ${error}`);
 		}
+	};
+
+	const commitRename = async (file: FileEntry) => {
+		const newName = renameValue.trim();
+		setRenamingFile(null);
+		await renameFile(file, newName);
 	};
 
 	// Computed once per render so both the fixed sidebar header and the scrollable list below
@@ -1194,6 +1231,27 @@ const setScreen = () => {
                         className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
                       >
                         <MdCreateNewFolder size={16} />
+                      </button>
+                    )}
+                    {activeFileCategory !== "trash" && (
+                      <button
+                        type="button"
+                        disabled={!selectedFile}
+                        title={
+                          !selectedFile
+                            ? "Select a file to see its tools"
+                            : dockerMode === "file-tools"
+                            ? "Show recording controls"
+                            : "Show tools for this file"
+                        }
+                        onClick={() => setDockerMode((prev) => (prev === "record" ? "file-tools" : "record"))}
+                        className={`p-1 rounded transition-colors disabled:opacity-30 disabled:pointer-events-none ${
+                          dockerMode === "file-tools"
+                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        }`}
+                      >
+                        <IoBuildOutline size={15} />
                       </button>
                     )}
                     {(activeFileCategory === "image" || activeFileCategory === "audio") && (
@@ -1643,6 +1701,7 @@ const setScreen = () => {
               />
             ) : (
               <VideoPlayer
+                ref={videoPlayerRef}
                 key={selectedFile.path}
                 src={selectedFile.path}
                 filePath={selectedFile.sourcePath}
@@ -1650,7 +1709,10 @@ const setScreen = () => {
                 autoPlay={true}
                 initialTime={isAudioSelected ? audioPositionsRef.current[selectedFile.sourcePath] : undefined}
                 loop={isAudioSelected && audioRepeatMode === "one"}
-                onTimeUpdate={handleAudioTimeUpdate}
+                onTimeUpdate={(time) => {
+                  handleAudioTimeUpdate(time);
+                  setPlayerCurrentTime(time);
+                }}
                 onEnded={handleMediaEnded}
                 autoplayNext={isAudioSelected ? audioAutoplayNext : videoAutoplayNext}
                 onAutoplayNextChange={() =>
@@ -1669,6 +1731,14 @@ const setScreen = () => {
 
       {!isPdfFullscreen && (
       <BottomDocker
+        dockerMode={dockerMode}
+        activeFile={selectedFile ? { name: selectedFile.name, path: selectedFile.sourcePath } : null}
+        activeFilePlayableSrc={selectedFile?.path ?? null}
+        activeFileCurrentTime={playerCurrentTime}
+        onSeekActiveFile={(time) => videoPlayerRef.current?.seek(time)}
+        onConvertFile={(file) => setConversionFile(file)}
+        onRenameFile={renameFile}
+        onDeleteFile={handleDeleteFile}
         selectScreen={selectScreen}
         setScreen={setScreen}
         unSetScreen={unSetScreen}
@@ -1678,8 +1748,10 @@ const setScreen = () => {
         setOverlayShape={setOverlayShape} 
         overlayPosition={overlayPosition} 
         setOverlayPosition={setOverlayPosition} 
-        overlaySize={overlaySize} 
+        overlaySize={overlaySize}
         setOverlaySize={setOverlaySize}
+        includeSystemAudio={includeSystemAudio}
+        setIncludeSystemAudio={setIncludeSystemAudio}
         selectedScreen={selectedScreen}
         setSelectedScreen={setSelectedScreen}
         windowTitles={windowTitles}

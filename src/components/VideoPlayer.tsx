@@ -1,5 +1,5 @@
 import './player.css';
-import React, { useState, useRef, useEffect, ChangeEvent, MouseEvent } from 'react';
+import React, { useState, useRef, useEffect, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import { IoPause, IoPlay, IoPlayCircleOutline, IoPlayCircle } from 'react-icons/io5';
@@ -85,9 +85,27 @@ interface VideoPlayerProps {
   onAutoplayNextChange?: () => void;
 }
 
-const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, autoplayNext, onAutoplayNextChange }) => {
+// Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
+// this player from the outside — there's no controlled "currentTime" prop, since native
+// <video>/timeupdate already round-trips position out via onTimeUpdate; this is just the one
+// missing direction back in.
+export interface VideoPlayerHandle {
+  seek: (time: number) => void;
+}
+
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, autoplayNext, onAutoplayNextChange }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    seek: (time: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      const duration = video.duration;
+      video.currentTime = Number.isFinite(duration) ? Math.max(0, Math.min(time, duration)) : Math.max(0, time);
+    },
+  }), []);
+
   const videoContainerRef = useRef<HTMLDivElement>(null);
   const timelineContainerRef = useRef<HTMLDivElement>(null);
   const animationFrameRef = useRef<number | null>(null);
@@ -848,6 +866,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
     </div>
 
   );
-};
+});
 
 export default VideoPlayer;

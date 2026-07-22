@@ -10,8 +10,16 @@ use std::process::{Command, Stdio};
 use tauri::regex::Regex;
 use tauri::{AppHandle, State};
 
-use super::{audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error, map_overlay_size, resolve_capture_target, silent_command, AppState, CaptureTarget, FormData, AUDIO_ENHANCE_FILTER};
+use super::{audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error, map_overlay_size, resolve_capture_target, silent_command, AppState, CaptureTarget, FormData, AUDIO_ENHANCE_FILTER, MAX_RECORDING_WIDTH};
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
+
+// Downscale flag for the plain (no camera overlay) desktop-capture path - when a camera overlay
+// IS in play, the equivalent downscale is instead the final stage of
+// build_camera_overlay_filter_complex's own filter_complex, since ffmpeg rejects a separate -vf
+// on the same output stream a -filter_complex already produces video for.
+fn desktop_scale_args() -> Vec<String> {
+    vec!["-vf".to_string(), format!("scale='min({},iw)':-2", MAX_RECORDING_WIDTH)]
+}
 
 fn desktop_crop_args(x: i32, y: i32, width: i32, height: i32) -> Vec<String> {
     vec![
@@ -150,7 +158,8 @@ pub async fn recording_with_output_sva(
     // Camera inputs (if any) must be added before the audio input below - add_overlay_args's
     // filter_complex references them as [1:v]..[N:v], immediately following the screen capture
     // at index 0, so nothing else can be inserted between the screen input and the camera inputs.
-    if !form_data.video_devices.is_empty() {
+    let has_camera_overlay = !form_data.video_devices.is_empty();
+    if has_camera_overlay {
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
         add_overlay_args(&mut args, form_data);
     }
@@ -161,6 +170,13 @@ pub async fn recording_with_output_sva(
         "-f".to_string(), "dshow".to_string(),
         "-i".to_string(), format!("audio={}", form_data.audio_device),
     ]);
+
+    // Downscale the raw desktop capture - only when there's no camera overlay, whose own
+    // filter_complex (add_overlay_args, above) already ends with this same downscale as its
+    // final stage. ffmpeg rejects a -vf here alongside a -filter_complex already producing video.
+    if !has_camera_overlay {
+        args.extend(desktop_scale_args());
+    }
 
     // Add codec flags based on file extension. Used to be its own inline copy of this match
     // (kept separate from codec_args_for_ext per this module's original "leave Windows as-is"
@@ -268,12 +284,18 @@ pub async fn recording_with_output_sa(app_handle: &AppHandle, state: State<'_, A
 
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "200".to_string()];
+    // 200 was never a real target — gdigrab can't actually deliver anywhere near that from a
+    // desktop source, it just means ffmpeg burns extra CPU polling far faster than any monitor
+    // refreshes, which eats into the budget the encoder needs to keep up in real time. 30fps is
+    // what screen-recording/tutorial content actually needs.
+    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "30".to_string()];
     args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
     args.extend(vec![
         "-f".to_string(), "dshow".to_string(),
         "-i".to_string(), format!("audio={}", form_data.audio_device),
     ]);
+    // Downscale the raw desktop capture - see desktop_scale_args' doc comment.
+    args.extend(desktop_scale_args());
     // Previously had no codec flags at all here, leaving both streams to ffmpeg's per-container
     // defaults - which measured out to a 200kbps video bitrate for a 4K capture (badly
     // blocky) and default-quality MP3 audio, inconsistent with every other recording mode.
@@ -402,8 +424,16 @@ pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, Ap
     }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "200".to_string()];
+    // Same framerate fix as recording_with_output_sa - 200 was never reachable, just wasted CPU.
+    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "30".to_string()];
     args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
+    // Downscale the raw desktop capture - see desktop_scale_args' doc comment.
+    args.extend(desktop_scale_args());
+    // This used to have no codec flags at all, leaving the video stream to ffmpeg's implicit
+    // per-container default encoder (e.g. plain mpeg4 for .mp4) instead of libx264 - a real,
+    // separate cause of poor quality/efficiency for screen-only recordings specifically, not
+    // just the missing downscale/framerate fix above.
+    args.extend(codec_args_for_ext(&form_data.file_ext));
     args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
 
     log::debug!("Path {:?}", output_path);
