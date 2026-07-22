@@ -35,6 +35,20 @@ export interface HighlightObject extends BaseObject {
   blend?: "multiply";
 }
 
+// A character range into a TextObject's `text` — [start, end), start inclusive/end exclusive.
+// The base unit every per-character formatting overlay (color, bold, italic) is built from.
+export interface TextRange {
+  start: number;
+  end: number;
+}
+
+// A colored sub-range — [start, end) plus the color. Optional/additive on top of TextObject.color
+// (the base color for anything not covered by a run), so notes saved before this existed keep
+// rendering exactly as they did before.
+export interface TextColorRun extends TextRange {
+  color: string;
+}
+
 // A jotted note: a fixed-width, word-wrapped text block anchored at its top-left corner.
 // `x`/`y` and `width` are PDF page-space units (zoom-independent), matching Pt's convention —
 // `y` is the TOP edge, and since PDF space is y-up while screen space is y-down, the block
@@ -47,6 +61,9 @@ export interface TextObject extends BaseObject {
   type: "text";
   text: string;
   color: string;
+  colorRuns?: TextColorRun[];
+  boldRuns?: TextRange[];
+  italicRuns?: TextRange[];
   fontSize: number;
   x: number;
   y: number;

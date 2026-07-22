@@ -13,7 +13,9 @@ import {
   PdfAnnotationDocument,
   Pt,
   StrokeObject,
+  TextColorRun,
   TextObject,
+  TextRange,
 } from "../utils/pdfAnnotationTypes";
 import { getCachedImage } from "../utils/imageObjectCache";
 
@@ -405,33 +407,54 @@ function getMeasurementContext(): CanvasRenderingContext2D {
   return ctx;
 }
 
+// A wrapped line plus where it begins in the original (unwrapped) text — the offset is what lets
+// renderTextObject map TextObject.colorRuns (character ranges into the original string) onto the
+// right sub-span of the right visual line.
+interface WrappedTextLine {
+  text: string;
+  startOffset: number;
+}
+
 // Splits `text` into wrapped lines that fit within `maxWidth` (in whatever unit `ctx.font`'s
-// size is currently set in), honoring explicit newlines as hard paragraph breaks first.
-function wrapTextBlock(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
-  const lines: string[] = [];
-  for (const paragraph of text.split("\n")) {
+// size is currently set in), honoring explicit newlines as hard paragraph breaks first. Tracks
+// each line's starting offset in `text` alongside it as it goes — `wordOffset`/`paragraphOffset`
+// can overrun by one (counting a trailing space/newline that isn't actually there) at the very
+// end of a paragraph/the whole text, but that's harmless since neither is read again afterward.
+function wrapTextBlock(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): WrappedTextLine[] {
+  const lines: WrappedTextLine[] = [];
+  let paragraphOffset = 0;
+
+  const paragraphs = text.split("\n");
+  for (const paragraph of paragraphs) {
     if (paragraph === "") {
-      lines.push("");
-      continue;
-    }
-    const words = paragraph.split(" ");
-    let current = "";
-    for (const word of words) {
-      const attempt = current ? `${current} ${word}` : word;
-      if (current && ctx.measureText(attempt).width > maxWidth) {
-        lines.push(current);
-        current = word;
-      } else {
-        current = attempt;
+      lines.push({ text: "", startOffset: paragraphOffset });
+    } else {
+      const words = paragraph.split(" ");
+      let current = "";
+      let lineStart = paragraphOffset;
+      let wordOffset = paragraphOffset;
+
+      for (const word of words) {
+        const attempt = current ? `${current} ${word}` : word;
+        if (current && ctx.measureText(attempt).width > maxWidth) {
+          lines.push({ text: current, startOffset: lineStart });
+          current = word;
+          lineStart = wordOffset;
+        } else {
+          current = attempt;
+        }
+        wordOffset += word.length + 1;
       }
+      lines.push({ text: current, startOffset: lineStart });
     }
-    lines.push(current);
+    paragraphOffset += paragraph.length + 1;
   }
+
   return lines;
 }
 
 export interface MeasuredTextBlock {
-  lines: string[];
+  lines: WrappedTextLine[];
   lineHeight: number;
   height: number;
 }
@@ -455,16 +478,192 @@ function renderTextObject(
   const topLeft = pdfPointToDevicePoint(viewport, { x: object.x, y: object.y, pressure: 1 });
   const deviceFontSize = object.fontSize * scale;
   const deviceMaxWidth = object.width * scale;
+  const baseFont = `${deviceFontSize}px ${TEXT_FONT_FAMILY}`;
 
-  ctx.font = `${deviceFontSize}px ${TEXT_FONT_FAMILY}`;
-  ctx.fillStyle = object.color;
+  ctx.font = baseFont;
   ctx.textBaseline = "top";
 
+  // Wrapping itself always uses the base (regular-weight, upright) font metrics, even for lines
+  // containing bold text — bold glyphs run slightly wider, so a line with a lot of bold near the
+  // wrap width could in principle overflow it by a few px. Accepted as a minor known limitation
+  // rather than making wrapping itself format-aware, which these short annotation notes rarely
+  // approach in practice.
   const lines = wrapTextBlock(ctx, object.text, deviceMaxWidth);
   const lineHeight = deviceFontSize * TEXT_LINE_HEIGHT_MULTIPLIER;
+  const colorRuns = object.colorRuns ?? [];
+  const boldRuns = object.boldRuns ?? [];
+  const italicRuns = object.italicRuns ?? [];
+  const hasFormatting = colorRuns.length > 0 || boldRuns.length > 0 || italicRuns.length > 0;
+
   lines.forEach((line, i) => {
-    ctx.fillText(line, topLeft.x, topLeft.y + i * lineHeight);
+    const y = topLeft.y + i * lineHeight;
+
+    if (!hasFormatting) {
+      ctx.font = baseFont;
+      ctx.fillStyle = object.color;
+      ctx.fillText(line.text, topLeft.x, y);
+      return;
+    }
+
+    // Split this line into sub-segments at every color/bold/italic boundary that falls inside it
+    // (clipped to the line's own bounds), so each segment is guaranteed to be either fully
+    // covered by a given run or fully uncovered by it — never straddling a boundary — for all
+    // three independently.
+    const lineStart = line.startOffset;
+    const lineEnd = line.startOffset + line.text.length;
+    const cutSet = new Set<number>([0, line.text.length]);
+    const addBoundaries = (ranges: TextRange[]): void => {
+      for (const range of ranges) {
+        if (range.end <= lineStart || range.start >= lineEnd) continue;
+        cutSet.add(Math.max(0, range.start - lineStart));
+        cutSet.add(Math.min(line.text.length, range.end - lineStart));
+      }
+    };
+    addBoundaries(colorRuns);
+    addBoundaries(boldRuns);
+    addBoundaries(italicRuns);
+    const cuts = Array.from(cutSet).sort((a, b) => a - b);
+
+    let x = topLeft.x;
+    for (let s = 0; s < cuts.length - 1; s++) {
+      const segStart = cuts[s];
+      const segEnd = cuts[s + 1];
+      if (segEnd <= segStart) continue;
+      const segment = line.text.slice(segStart, segEnd);
+      const absoluteStart = lineStart + segStart;
+      const absoluteEnd = lineStart + segEnd;
+      const coveringColor = colorRuns.find((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
+      const isBold = boldRuns.some((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
+      const isItalic = italicRuns.some((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
+
+      ctx.font = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}${baseFont}`;
+      ctx.fillStyle = coveringColor?.color ?? object.color;
+      ctx.fillText(segment, x, y);
+      x += ctx.measureText(segment).width;
+    }
   });
+}
+
+// Inserts a new colored run over [start, end), trimming/splitting any existing runs that overlap
+// it — the stored colorRuns array is always a flat, non-overlapping interval list (never a stack
+// to composite at render time), which is what keeps renderTextObject's per-segment lookup above
+// a simple single `.find`.
+export function applyColorRun(existing: TextColorRun[], start: number, end: number, color: string): TextColorRun[] {
+  if (start >= end) return existing;
+  const result: TextColorRun[] = [];
+  for (const run of existing) {
+    if (run.end <= start || run.start >= end) {
+      result.push(run);
+      continue;
+    }
+    if (run.start < start) result.push({ start: run.start, end: start, color: run.color });
+    if (run.end > end) result.push({ start: end, end: run.end, color: run.color });
+  }
+  result.push({ start, end, color });
+  return result.sort((a, b) => a.start - b.start);
+}
+
+// Keeps a list of ranges' offsets correct as the user keeps typing — generic over anything
+// shaped like a TextRange (TextColorRun's extra `color` field rides along for free via the
+// spread), so color/bold/italic ranges can all share this one diffing implementation. Called on
+// every keystroke with the text before/after that keystroke. Finds the common prefix/suffix
+// between old and new text (the same trick a simple diff uses) to isolate what actually changed,
+// then shifts ranges entirely after the edit, leaves ranges entirely before it alone, and trims
+// ranges that overlap it down to whichever side(s) survive. The freshly-typed text inside an
+// edited span never inherits formatting — simplest predictable behavior, not a full rich-text
+// diff/merge.
+function shiftRanges<T extends TextRange>(ranges: T[], oldText: string, newText: string): T[] {
+  if (ranges.length === 0 || oldText === newText) return ranges;
+
+  let prefix = 0;
+  const maxPrefix = Math.min(oldText.length, newText.length);
+  while (prefix < maxPrefix && oldText[prefix] === newText[prefix]) prefix++;
+
+  let suffix = 0;
+  const maxSuffix = maxPrefix - prefix;
+  while (suffix < maxSuffix && oldText[oldText.length - 1 - suffix] === newText[newText.length - 1 - suffix]) suffix++;
+
+  const oldEditEnd = oldText.length - suffix;
+  const newEditEnd = newText.length - suffix;
+  const delta = newEditEnd - oldEditEnd;
+
+  const shifted: T[] = [];
+  for (const range of ranges) {
+    if (range.end <= prefix) {
+      shifted.push(range);
+      continue;
+    }
+    if (range.start >= oldEditEnd) {
+      shifted.push({ ...range, start: range.start + delta, end: range.end + delta });
+      continue;
+    }
+    if (range.start < prefix) shifted.push({ ...range, start: range.start, end: prefix });
+    if (range.end > oldEditEnd) shifted.push({ ...range, start: newEditEnd, end: range.end + delta });
+  }
+  return shifted.filter((r) => r.end > r.start);
+}
+
+export function shiftColorRunsForEdit(runs: TextColorRun[], oldText: string, newText: string): TextColorRun[] {
+  return shiftRanges(runs, oldText, newText);
+}
+
+export function shiftTextRangesForEdit(ranges: TextRange[], oldText: string, newText: string): TextRange[] {
+  return shiftRanges(ranges, oldText, newText);
+}
+
+// Adds [start, end) to a list of plain (valueless) ranges — used for bold/italic, where "in the
+// list" simply means "on". Unlike applyColorRun (which replaces on overlap, since a run's color
+// is a single value), this is a straightforward interval union: overlapping/adjacent ranges merge
+// into one rather than splitting.
+export function addTextRange(existing: TextRange[], start: number, end: number): TextRange[] {
+  if (start >= end) return existing;
+  const merged = [...existing, { start, end }].sort((a, b) => a.start - b.start);
+  const result: TextRange[] = [];
+  for (const range of merged) {
+    const last = result[result.length - 1];
+    if (last && range.start <= last.end) {
+      last.end = Math.max(last.end, range.end);
+    } else {
+      result.push({ ...range });
+    }
+  }
+  return result;
+}
+
+// Removes [start, end) from a list of ranges, trimming/splitting whatever overlapped it — the
+// inverse of addTextRange, used to turn bold/italic back off over a selection.
+export function removeTextRange(existing: TextRange[], start: number, end: number): TextRange[] {
+  if (start >= end) return existing;
+  const result: TextRange[] = [];
+  for (const range of existing) {
+    if (range.end <= start || range.start >= end) {
+      result.push(range);
+      continue;
+    }
+    if (range.start < start) result.push({ start: range.start, end: start });
+    if (range.end > end) result.push({ start: end, end: range.end });
+  }
+  return result;
+}
+
+// Is [start, end) *entirely* within the union of `existing`? Used to decide which way a
+// bold/italic toggle button should go for the current selection.
+export function isTextRangeCovered(existing: TextRange[], start: number, end: number): boolean {
+  if (start >= end) return false;
+  let cursor = start;
+  for (const range of [...existing].sort((a, b) => a.start - b.start)) {
+    if (range.start > cursor) return false; // gap before this range — not fully covered
+    if (range.end > cursor) cursor = range.end;
+    if (cursor >= end) return true;
+  }
+  return cursor >= end;
+}
+
+// Standard toggle semantics (as in any word processor): if the selection is already fully
+// bold/italic, turn it off; otherwise turn it fully on. Shared by both the bold and italic
+// buttons in TextNoteEditor — they only differ in which ranges array they pass in.
+export function toggleTextRange(existing: TextRange[], start: number, end: number): TextRange[] {
+  return isTextRangeCovered(existing, start, end) ? removeTextRange(existing, start, end) : addTextRange(existing, start, end);
 }
 
 export function makeTextObject(

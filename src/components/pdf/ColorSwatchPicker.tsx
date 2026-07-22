@@ -5,9 +5,17 @@ import { createPortal } from "react-dom";
 interface ColorSwatchPickerProps {
   color: string;
   onChange: (color: string) => void;
+  // "md" (default) is sized for the main annotation toolbar, among other 32px IconButtons; "sm"
+  // is for tighter contexts like the text-note header strip, where "md" reads as oversized.
+  size?: "sm" | "md";
 }
 
 const PALETTE = ["#1a1a1a", "#e03131", "#f08c00", "#ffd43b", "#2f9e44", "#1971c2", "#9c36b5"];
+
+const TRIGGER_SIZE_CLASSES: Record<"sm" | "md", string> = {
+  sm: "w-4 h-4 ring-1",
+  md: "w-6 h-6 ring-2",
+};
 
 // Positioned via a portal + `position: fixed` computed from the trigger button's own
 // bounding rect, rather than `absolute` inside the toolbar. The toolbar is a translucent,
@@ -15,7 +23,7 @@ const PALETTE = ["#1a1a1a", "#e03131", "#f08c00", "#ffd43b", "#2f9e44", "#1971c2
 // pill groups) — anchoring a popover to one of them risks it fighting for stacking order
 // against the PDF canvas underneath. Rendering at the document root with a very high
 // z-index sidesteps that entirely.
-const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange }) => {
+const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, size = "md" }) => {
   const [open, setOpen] = useState(false);
   const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -44,8 +52,13 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange }
         ref={buttonRef}
         type="button"
         title="Color"
+        // Callers can embed this next to a focused input (e.g. a text note's textarea) that
+        // commits/closes itself on blur — suppressing the default mousedown focus-shift here
+        // keeps that input focused instead of stealing it, so opening the picker doesn't trigger
+        // whatever the caller does on blur. click still fires normally afterward.
+        onMouseDown={(e) => e.preventDefault()}
         onClick={() => (open ? setOpen(false) : openPicker())}
-        className="w-6 h-6 rounded-full ring-2 ring-white shadow-sm transition-transform duration-150 hover:scale-110"
+        className={`rounded-full ring-white shadow-sm transition-transform duration-150 hover:scale-110 ${TRIGGER_SIZE_CLASSES[size]}`}
         style={{ backgroundColor: color }}
       />
       {open &&
@@ -61,6 +74,7 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange }
                 key={swatch}
                 type="button"
                 title={swatch}
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => {
                   onChange(swatch);
                   setOpen(false);
@@ -76,6 +90,7 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange }
               type="color"
               title="Custom color"
               value={color}
+              onMouseDown={(e) => e.preventDefault()}
               onChange={(e) => onChange(e.target.value)}
               className="w-6 h-6 p-0 border-0 rounded-full cursor-pointer bg-transparent"
             />

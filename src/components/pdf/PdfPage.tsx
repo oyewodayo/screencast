@@ -1,7 +1,7 @@
 // components/pdf/PdfPage.tsx
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy, PageViewport } from "pdfjs-dist";
-import { AnnotationObject, AnnotationTool, ImageObject, Pt, TextObject } from "../../utils/pdfAnnotationTypes";
+import { AnnotationObject, AnnotationTool, ImageObject, Pt, TextColorRun, TextObject, TextRange } from "../../utils/pdfAnnotationTypes";
 import {
   clearCanvas,
   devicePointToPdfPoint,
@@ -56,8 +56,6 @@ interface EditingTextState {
   y: number;
   width: number;
   fontSize: number;
-  color: string;
-  text: string;
 }
 
 // One page = three stacked, identically-sized canvases: the pdf.js render target (bottom),
@@ -121,12 +119,18 @@ const PdfPage: React.FC<PdfPageProps> = ({
     editingTextRef.current = editingText;
   }, [editingText]);
 
-  // The *live* typed content of whatever note is being edited. TextNoteEditor keeps keystrokes
-  // out of React state entirely for performance (see its onChange), so this ref — updated via
-  // onTextChange on every keystroke — is the only place that content exists until commit. Commit
-  // must read from here, never from `editingText.text`/session.text, which is only ever the
-  // value the session *started* with and is never updated as the user types.
+  // The *live* content of whatever note is being edited — text, base color, and per-range
+  // color/bold/italic. TextNoteEditor owns its own reactive copy of all of this locally (it needs
+  // that to drive its live colored/styled backdrop preview), and reports the full bundle up here
+  // via onContentChange after every change (keystroke, color pick, bold/italic toggle). These
+  // stay refs rather than PdfPage's own state — PdfPage itself never needs to react to them, only
+  // read the latest values once, at commit time — so staging them here costs nothing per
+  // keystroke, unlike editingText (which does need to be reactive, for position/size).
   const liveTextRef = useRef<string>("");
+  const liveColorRef = useRef<string>("");
+  const liveColorRunsRef = useRef<TextColorRun[]>([]);
+  const liveBoldRunsRef = useRef<TextRange[]>([]);
+  const liveItalicRunsRef = useRef<TextRange[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -252,13 +256,22 @@ const PdfPage: React.FC<PdfPageProps> = ({
     setEditingText(null);
 
     const text = liveTextRef.current;
+    const color = liveColorRef.current;
+    const colorRuns = liveColorRunsRef.current;
+    const boldRuns = liveBoldRunsRef.current;
+    const italicRuns = liveItalicRunsRef.current;
     const isEmpty = text.trim().length === 0;
 
     if (session.isNew) {
       if (isEmpty) return; // never existed — nothing to do
       const { height } = measureTextBlock(text, session.fontSize, session.width);
-      const object = makeTextObject(pageIndex, session.x, session.y, text, session.color, session.fontSize, session.width, height);
-      onStrokeComplete(object);
+      const object = makeTextObject(pageIndex, session.x, session.y, text, color, session.fontSize, session.width, height);
+      onStrokeComplete({
+        ...object,
+        colorRuns: colorRuns.length > 0 ? colorRuns : undefined,
+        boldRuns: boldRuns.length > 0 ? boldRuns : undefined,
+        italicRuns: italicRuns.length > 0 ? italicRuns : undefined,
+      });
       return;
     }
 
@@ -272,7 +285,12 @@ const PdfPage: React.FC<PdfPageProps> = ({
 
     const moved = session.x !== original.x || session.y !== original.y;
     const resized = session.fontSize !== original.fontSize || session.width !== original.width;
-    if (text !== original.text || moved || resized) {
+    const recolored = color !== original.color;
+    const runsChanged =
+      JSON.stringify(colorRuns) !== JSON.stringify(original.colorRuns ?? []) ||
+      JSON.stringify(boldRuns) !== JSON.stringify(original.boldRuns ?? []) ||
+      JSON.stringify(italicRuns) !== JSON.stringify(original.italicRuns ?? []);
+    if (text !== original.text || moved || resized || recolored || runsChanged) {
       const { height } = measureTextBlock(text, session.fontSize, session.width);
       onObjectEdit(original, {
         ...original,
@@ -282,6 +300,10 @@ const PdfPage: React.FC<PdfPageProps> = ({
         fontSize: session.fontSize,
         width: session.width,
         height,
+        color,
+        colorRuns: colorRuns.length > 0 ? colorRuns : undefined,
+        boldRuns: boldRuns.length > 0 ? boldRuns : undefined,
+        italicRuns: italicRuns.length > 0 ? italicRuns : undefined,
         updatedAt: Date.now(),
       });
     }
@@ -291,9 +313,20 @@ const PdfPage: React.FC<PdfPageProps> = ({
     setEditingText(null); // nothing was ever written to the store, so cancelling is just this
   }, []);
 
-  const handleNoteTextChange = useCallback((text: string): void => {
-    liveTextRef.current = text;
-  }, []);
+  // TextNoteEditor computes/owns all the live editing state itself (needed for its own colored
+  // backdrop preview — see its component comment) and reports the full bundle here after every
+  // change; this just stages it in refs for commitEditingText to read later. Stable (empty deps)
+  // so TextNoteEditor's reporting effect doesn't re-fire on every PdfPage render.
+  const handleNoteContentChange = useCallback(
+    (text: string, color: string, colorRuns: TextColorRun[], boldRuns: TextRange[], italicRuns: TextRange[]): void => {
+      liveTextRef.current = text;
+      liveColorRef.current = color;
+      liveColorRunsRef.current = colorRuns;
+      liveBoldRunsRef.current = boldRuns;
+      liveItalicRunsRef.current = italicRuns;
+    },
+    []
+  );
 
   // Live position/size updates from the editor's drag/resize handles land in `editingText` state
   // (not the store) — see the commitEditingText doc comment above for why.
@@ -364,6 +397,10 @@ const PdfPage: React.FC<PdfPageProps> = ({
     const openEditorAt = (pdfPoint: Pt, existing: TextObject | null): void => {
       if (existing) {
         liveTextRef.current = existing.text;
+        liveColorRef.current = existing.color;
+        liveColorRunsRef.current = existing.colorRuns ?? [];
+        liveBoldRunsRef.current = existing.boldRuns ?? [];
+        liveItalicRunsRef.current = existing.italicRuns ?? [];
         setEditingText({
           id: existing.id,
           isNew: false,
@@ -371,11 +408,13 @@ const PdfPage: React.FC<PdfPageProps> = ({
           y: existing.y,
           width: existing.width,
           fontSize: existing.fontSize,
-          color: existing.color,
-          text: existing.text,
         });
       } else {
         liveTextRef.current = "";
+        liveColorRef.current = color;
+        liveColorRunsRef.current = [];
+        liveBoldRunsRef.current = [];
+        liveItalicRunsRef.current = [];
         setEditingText({
           id: crypto.randomUUID(),
           isNew: true,
@@ -383,8 +422,6 @@ const PdfPage: React.FC<PdfPageProps> = ({
           y: pdfPoint.y,
           width: TEXT_NOTE_DEFAULT_WIDTH_PDF,
           fontSize: textFontSize,
-          color,
-          text: "",
         });
       }
     };
@@ -604,9 +641,12 @@ const PdfPage: React.FC<PdfPageProps> = ({
           top={editorPosition.y}
           width={editingText.width * viewport.scale}
           fontSize={editingText.fontSize * viewport.scale}
-          color={editingText.color}
-          initialText={editingText.text}
-          onTextChange={handleNoteTextChange}
+          initialText={liveTextRef.current}
+          initialColor={liveColorRef.current}
+          initialColorRuns={liveColorRunsRef.current}
+          initialBoldRuns={liveBoldRunsRef.current}
+          initialItalicRuns={liveItalicRunsRef.current}
+          onContentChange={handleNoteContentChange}
           onCommit={commitEditingText}
           onCancel={cancelEditingText}
           onMoveEnd={handleNoteMoveEnd}
