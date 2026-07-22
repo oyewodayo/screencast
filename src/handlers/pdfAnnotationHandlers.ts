@@ -9,11 +9,13 @@ import {
   AnnotationCommand,
   AnnotationObject,
   HighlightObject,
+  ImageObject,
   PdfAnnotationDocument,
   Pt,
   StrokeObject,
   TextObject,
 } from "../utils/pdfAnnotationTypes";
+import { getCachedImage } from "../utils/imageObjectCache";
 
 // ---- Coordinate conversion (device px <-> PDF page-space) ----------------------------------
 
@@ -90,6 +92,12 @@ export function renderObject(
 
   if (object.type === "text") {
     renderTextObject(ctx, object, viewport, scale);
+    ctx.restore();
+    return;
+  }
+
+  if (object.type === "image") {
+    renderImageObject(ctx, object, viewport, scale);
     ctx.restore();
     return;
   }
@@ -172,6 +180,83 @@ export function renderPageObjects(
   }
 }
 
+// ---- Images -------------------------------------------------------------------------------------
+//
+// Stored top-left anchored (pre-rotation), same convention as TextObject. Rotation is applied
+// around the box's *center* at render/hit-test time, so x/y/width/height never change just because
+// the object is rotated — only ImageAnnotationEditor's live resize (which is itself center-
+// anchored) ever touches them directly.
+
+function renderImageObject(
+  ctx: CanvasRenderingContext2D,
+  object: ImageObject,
+  viewport: { convertToViewportPoint: (x: number, y: number) => number[] },
+  scale: number
+): void {
+  const img = getCachedImage(object.src);
+  if (!img) return; // not decoded yet — the caller's preload effect redraws once it resolves
+
+  const topLeft = pdfPointToDevicePoint(viewport, { x: object.x, y: object.y, pressure: 1 });
+  const w = object.width * scale;
+  const h = object.height * scale;
+
+  ctx.translate(topLeft.x + w / 2, topLeft.y + h / 2);
+  ctx.rotate(object.rotation);
+  ctx.drawImage(img, -w / 2, -h / 2, w, h);
+}
+
+export function makeImageObject(
+  pageIndex: number,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  src: string
+): ImageObject {
+  const now = Date.now();
+  return { id: crypto.randomUUID(), type: "image", pageIndex, x, y, width, height, rotation: 0, src, createdAt: now, updatedAt: now };
+}
+
+// Rotates `point` by `radians` around `center`, using the standard CCW-positive matrix — used to
+// bring a query point into an image's local (unrotated) frame instead of needing a rotated-
+// rectangle intersection test.
+//
+// Note the sign here is *not* just "-object.rotation": `object.rotation` is authored as a
+// device-space (y-down) clockwise angle (it's fed straight into ctx.rotate()/CSS `rotate()`), but
+// this function operates on PDF-space (y-up) points. Flipping the y-axis between those two spaces
+// also flips the apparent handedness of the rotation, so undoing a device-space +θ rotation on a
+// PDF-space point requires rotating by +θ here, not -θ (verified by tracing a concrete vector
+// through both spaces — see the ImageObject hit-testing discussion).
+function rotatePointAroundCenter(point: Pt, center: { x: number; y: number }, radians: number): Pt {
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  return { x: center.x + dx * cos - dy * sin, y: center.y + dx * sin + dy * cos, pressure: point.pressure };
+}
+
+function imageIntersectsPoint(object: ImageObject, pdfPoint: Pt, paddingInPdfUnits: number): boolean {
+  const center = { x: object.x + object.width / 2, y: object.y - object.height / 2 };
+  const local = rotatePointAroundCenter(pdfPoint, center, object.rotation);
+  return (
+    local.x >= object.x - paddingInPdfUnits &&
+    local.x <= object.x + object.width + paddingInPdfUnits &&
+    local.y <= object.y + paddingInPdfUnits &&
+    local.y >= object.y - object.height - paddingInPdfUnits
+  );
+}
+
+// Click-to-select hit test, mirroring findTextObjectAt's signature/bounding-box style but
+// iterating topmost (last-drawn) first — images are far more likely than text notes to overlap,
+// so which one a click lands on should follow visual stacking order.
+export function findImageObjectAt(objects: AnnotationObject[], point: Pt): ImageObject | null {
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const object = objects[i];
+    if (object.type === "image" && imageIntersectsPoint(object, point, 0)) return object;
+  }
+  return null;
+}
+
 // ---- Eraser hit-testing ------------------------------------------------------------------------
 
 function distanceToSegment(p: Pt, a: Pt, b: Pt): number {
@@ -196,6 +281,10 @@ function objectIntersectsPoint(object: AnnotationObject, pdfPoint: Pt, radiusInP
       pdfPoint.y <= object.y + radiusInPdfUnits &&
       pdfPoint.y >= object.y - object.height - radiusInPdfUnits
     );
+  }
+
+  if (object.type === "image") {
+    return imageIntersectsPoint(object, pdfPoint, radiusInPdfUnits);
   }
 
   const hitRadius = radiusInPdfUnits + object.width / 2;

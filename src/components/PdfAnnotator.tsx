@@ -1,14 +1,19 @@
 // components/PdfAnnotator.tsx
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { IoContract } from "react-icons/io5";
 import usePdfDocument from "../hooks/usePdfDocument";
 import useAnnotationStore from "../hooks/useAnnotationStore";
 import usePageRenderCache from "../hooks/usePageRenderCache";
 import { AnnotationObject, AnnotationTool } from "../utils/pdfAnnotationTypes";
+import { makeImageObject } from "../handlers/pdfAnnotationHandlers";
+import { fileToDataUrl } from "../utils/imageObjectCache";
 import AnnotationToolbar from "./pdf/AnnotationToolbar";
 import PdfPage from "./pdf/PdfPage";
 import PdfSidebar, { PdfSidebarView } from "./pdf/PdfSidebar";
 import { loadSettings } from "../utils/appSettings";
+
+const IMAGE_MAX_DIMENSION_PX = 2048; // downscale threshold before embedding into the sidecar JSON
+const IMAGE_MAX_INITIAL_WIDTH_FRACTION = 0.5; // fraction of the page's width, at 100% zoom, an inserted image is capped to
 
 interface PdfAnnotatorProps {
   src: string; // asset:// URL, for loading PDF bytes via pdf.js
@@ -59,6 +64,13 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
   // point range (~10-48) rather than reusing the raw 1-20 value, which would be unreadably small.
   const textFontSize = 8 + strokeWidth * 2;
 
+  // Which image annotation (if any) currently shows move/resize/rotate handles. Lifted up here
+  // (rather than living inside PdfPage) because an image can be inserted/pasted while any page is
+  // showing, and selection needs to follow it regardless of which <PdfPage> instance ends up
+  // holding the matching object — see PdfPage's selectedImageId/onSelectImage props.
+  const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const activeColor = tool === "highlighter" ? highlighterColor : tool === "text" ? textColor : penColor;
   const setActiveColor = tool === "highlighter" ? setHighlighterColor : tool === "text" ? setTextColor : setPenColor;
 
@@ -90,12 +102,83 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
   };
 
   const handleToolChange = (nextTool: AnnotationTool): void => {
+    setSelectedImageId(null); // switching to a drawing tool exits image-selection mode
     setTool((prev) => (prev === nextTool ? null : nextTool));
   };
 
   const handleDeselectTool = (): void => {
     setTool(null);
   };
+
+  // Selecting an image only ever makes sense on the page it's actually on — clear it on every
+  // navigation rather than leaving a stale id around that happens to self-clean once the relevant
+  // <PdfPage> re-renders with different `objects`.
+  useEffect(() => {
+    setSelectedImageId(null);
+  }, [clampedPageIndex]);
+
+  // Reads a File (from the hidden file input or a paste event) into an ImageObject sized to fit
+  // the current page and centered on the current viewport, adds it, and selects it so its
+  // move/resize/rotate handles show immediately.
+  const insertImageFile = useCallback(
+    async (file: File): Promise<void> => {
+      if (!pdfDoc) return;
+      try {
+        const loaded = await fileToDataUrl(file, IMAGE_MAX_DIMENSION_PX);
+        const page = await pdfDoc.getPage(clampedPageIndex + 1);
+        const pageViewportAtScale1 = page.getViewport({ scale: 1 });
+        const zoomViewport = page.getViewport({ scale: zoom });
+        const [pdfCenterX, pdfCenterY] = zoomViewport.convertToPdfPoint(zoomViewport.width / 2, zoomViewport.height / 2);
+
+        const width = Math.min(loaded.width, pageViewportAtScale1.width * IMAGE_MAX_INITIAL_WIDTH_FRACTION);
+        const height = width * (loaded.height / loaded.width);
+        const x = pdfCenterX - width / 2;
+        const y = pdfCenterY + height / 2;
+
+        const object = makeImageObject(clampedPageIndex, x, y, width, height, loaded.dataUrl);
+        store.addObject(object);
+        setSelectedImageId(object.id);
+      } catch (err) {
+        console.error("Failed to insert image:", err);
+      }
+    },
+    // store.addObject specifically (not the whole `store`) — useAnnotationStore returns a fresh
+    // object every render, so depending on `store` itself would tear down and resubscribe the
+    // paste listener effect below on every render instead of just when addObject actually changes.
+    [pdfDoc, clampedPageIndex, zoom, store.addObject]
+  );
+
+  const handleInsertImageClick = (): void => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>): void => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file consecutively
+    if (file) void insertImageFile(file);
+  };
+
+  // Global paste-image support: works regardless of which tool is active, as long as focus isn't
+  // in an editable element that should receive the paste itself (e.g. a text-note textarea).
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent): void => {
+      const target = e.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
+        return;
+      }
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const imageItem = Array.from(items).find((item) => item.type.startsWith("image/"));
+      if (!imageItem) return;
+      const file = imageItem.getAsFile();
+      if (!file) return;
+      e.preventDefault();
+      void insertImageFile(file);
+    };
+
+    document.addEventListener("paste", handlePaste);
+    return () => document.removeEventListener("paste", handlePaste);
+  }, [insertImageFile]);
 
   const handleSidebarViewChange = (view: PdfSidebarView): void => {
     setSidebarView((prev) => (prev === view ? null : view));
@@ -267,7 +350,10 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
       if (e.key === "Escape") {
         e.preventDefault();
         if (isFullscreen) onToggleFullscreen();
-        else handleDeselectTool();
+        else {
+          handleDeselectTool();
+          setSelectedImageId(null);
+        }
         return;
       }
 
@@ -375,6 +461,8 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
       textFontSize={textFontSize}
       eraserRadius={Math.max(12, strokeWidth * 3)}
       interactive={!store.loading}
+      selectedImageId={selectedImageId}
+      onSelectImage={setSelectedImageId}
       onStrokeComplete={(object: AnnotationObject) => store.addObject(object)}
       onObjectEdit={store.editObject}
       onObjectDelete={store.deleteObject}
@@ -386,6 +474,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
 
   return (
     <div className="w-full h-screen flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950">
+      <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileInputChange} className="hidden" />
       {isFullscreen ? (
         // Presentation mode: no toolbar chrome at all — just the page(s) and a single,
         // always-visible way back out (the shortcuts — F, Escape — still work with nothing
@@ -407,6 +496,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
           tool={tool}
           onToolChange={handleToolChange}
           onDeselectTool={handleDeselectTool}
+          onInsertImageClick={handleInsertImageClick}
           color={activeColor}
           onColorChange={setActiveColor}
           strokeWidth={strokeWidth}

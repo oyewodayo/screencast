@@ -54,9 +54,23 @@ export interface TextObject extends BaseObject {
   height: number;
 }
 
+// A raster image placed on the page: draggable, resizable (aspect-locked, center-anchored), and
+// rotatable. `x`/`y` are the top-left corner *before* rotation is applied (same top-left-anchored
+// PDF-space convention as TextObject); rotation is applied around the box's center at render time,
+// so `x`/`y`/`width`/`height` never change just because the object is rotated.
+export interface ImageObject extends BaseObject {
+  type: "image";
+  src: string; // base64 data URL, embedded directly in the sidecar JSON
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotation: number; // radians
+}
+
 // Discriminated union. Phase 2 still has room for 'shape'/'note' (sticky-note) variants beyond
 // this — purely additive, no migration needed as long as readers skip unknown types.
-export type AnnotationObject = StrokeObject | HighlightObject | TextObject;
+export type AnnotationObject = StrokeObject | HighlightObject | TextObject | ImageObject;
 
 export interface PdfAnnotationPage {
   pageIndex: number;

@@ -1,10 +1,11 @@
 // components/pdf/PdfPage.tsx
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy, PageViewport } from "pdfjs-dist";
-import { AnnotationObject, AnnotationTool, Pt, TextObject } from "../../utils/pdfAnnotationTypes";
+import { AnnotationObject, AnnotationTool, ImageObject, Pt, TextObject } from "../../utils/pdfAnnotationTypes";
 import {
   clearCanvas,
   devicePointToPdfPoint,
+  findImageObjectAt,
   findTextObjectAt,
   makeTextObject,
   measureTextBlock,
@@ -15,7 +16,9 @@ import {
 } from "../../handlers/pdfAnnotationHandlers";
 import useStrokeCapture from "../../hooks/useStrokeCapture";
 import { PageRenderCache } from "../../hooks/usePageRenderCache";
+import { preloadImage } from "../../utils/imageObjectCache";
 import TextNoteEditor from "./TextNoteEditor";
+import ImageAnnotationEditor from "./ImageAnnotationEditor";
 
 const TEXT_NOTE_DEFAULT_WIDTH_PDF = 160;
 const DRAG_THRESHOLD_DEVICE_PX = 5; // below this, a pointerdown+up on a note is a tap (edit), not a drag (move)
@@ -33,6 +36,8 @@ interface PdfPageProps {
   textFontSize: number;
   eraserRadius: number;
   interactive: boolean;
+  selectedImageId: string | null;
+  onSelectImage: (id: string | null) => void;
   onStrokeComplete: (object: AnnotationObject) => void;
   onObjectEdit: (before: AnnotationObject, after: AnnotationObject) => void;
   onObjectDelete: (object: AnnotationObject) => void;
@@ -78,6 +83,8 @@ const PdfPage: React.FC<PdfPageProps> = ({
   textFontSize,
   eraserRadius,
   interactive,
+  selectedImageId,
+  onSelectImage,
   onStrokeComplete,
   onObjectEdit,
   onObjectDelete,
@@ -97,6 +104,11 @@ const PdfPage: React.FC<PdfPageProps> = ({
   // cursor-following position is drawn on the scratch canvas instead, same "only redraw what's
   // actually moving" approach useStrokeCapture uses for in-progress strokes.
   const [draggingTextId, setDraggingTextId] = useState<string | null>(null);
+  // Bumped whenever an image object referenced by `objects` finishes decoding, purely to give the
+  // overlay-redraw effect below a reason to re-run — renderImageObject silently no-ops until the
+  // image is in the decoded-image cache (see imageObjectCache.ts), so the first render after an
+  // image is added/loaded is otherwise a blank canvas until *something* else changes.
+  const [imageVersion, setImageVersion] = useState<number>(0);
 
   // Read by the click handler / commit logic below without needing to be effect dependencies —
   // both change far more often than "is the text-tool click listener even attached" should.
@@ -186,20 +198,42 @@ const PdfPage: React.FC<PdfPageProps> = ({
     };
   }, [pdfDoc, pageIndex, cache]);
 
+  // Decodes any image object's data URL into a cached HTMLImageElement (renderObject/
+  // renderImageObject can only draw synchronously from that cache — see imageObjectCache.ts).
+  // Bumping imageVersion on resolve is what makes the overlay-redraw effect below pick the newly-
+  // decoded image up, since `objects` itself doesn't change just because a decode finished.
+  useEffect(() => {
+    let cancelled = false;
+    for (const object of objects) {
+      if (object.type !== "image") continue;
+      preloadImage(object.src)
+        .then(() => {
+          if (!cancelled) setImageVersion((v) => v + 1);
+        })
+        .catch((err) => console.error("Failed to decode image annotation:", err));
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [objects]);
+
   // Redraw the committed ink overlay whenever the page's stored objects or viewport change
   // (e.g. after a stroke, an undo/redo, an erase, or a text note being added/edited/moved).
-  // The object currently being dragged is excluded — its live position is drawn on the scratch
-  // canvas instead, so it doesn't appear twice (once frozen at its old spot, once following
-  // the cursor) while a drag is in progress.
+  // The object currently being dragged, and the currently-selected image (manipulated live via
+  // ImageAnnotationEditor's DOM overlay below), are excluded — their live position/size/rotation
+  // is shown elsewhere, so they don't appear twice while a drag/resize/rotate is in progress.
   useEffect(() => {
     if (!viewport) return;
     const canvas = overlayCanvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!ctx || !canvas) return;
     clearCanvas(ctx, canvas);
-    const visibleObjects = draggingTextId ? objects.filter((o) => o.id !== draggingTextId) : objects;
+    const visibleObjects = objects.filter((o) => o.id !== draggingTextId && o.id !== selectedImageId);
     renderPageObjects(ctx, visibleObjects, viewport, viewport.scale);
-  }, [viewport, objects, draggingTextId]);
+    // imageVersion isn't read directly but is exactly what should trigger a redraw once a
+    // previously-undecoded image finishes loading.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewport, objects, draggingTextId, selectedImageId, imageVersion]);
 
   // Resolves whatever text session is currently open: commits it to the store (add / edit /
   // delete-if-cleared-to-empty) or discards it if nothing meaningful changed. Nothing is written
@@ -459,6 +493,83 @@ const PdfPage: React.FC<PdfPageProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pageIndex]);
 
+  // Image click-to-select: only active in "Select / no tool" mode (tool === null). Every other
+  // tool already owns the scratch canvas's pointer events in that state (useStrokeCapture for
+  // pen/highlighter/eraser, the effect above for text), so this only ever attaches when nothing
+  // else is listening — no gesture conflict to arbitrate.
+  useEffect(() => {
+    const canvas = scratchCanvasRef.current;
+    if (!canvas || tool !== null || !interactive || !viewport) return;
+
+    const handlePointerDown = (e: PointerEvent): void => {
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      const rect = canvas.getBoundingClientRect();
+      const pdfPoint = devicePointToPdfPoint(viewport, e.clientX - rect.left, e.clientY - rect.top, 1);
+      const hit = findImageObjectAt(objectsRef.current, pdfPoint);
+      onSelectImage(hit?.id ?? null);
+    };
+
+    canvas.addEventListener("pointerdown", handlePointerDown);
+    return () => canvas.removeEventListener("pointerdown", handlePointerDown);
+  }, [tool, interactive, viewport, onSelectImage]);
+
+  // Delete/Backspace removes the selected image, as long as this page is the one that actually
+  // holds it (selection is a single id shared across the whole document, per PdfAnnotator) and
+  // focus isn't in a text field that should get the keystroke instead.
+  const selectedImageObject = selectedImageId ? objects.find((o): o is ImageObject => o.type === "image" && o.id === selectedImageId) ?? null : null;
+  useEffect(() => {
+    if (!selectedImageObject) return;
+    const handleKeyDown = (e: KeyboardEvent): void => {
+      if (e.key !== "Delete" && e.key !== "Backspace") return;
+      const target = document.activeElement;
+      if (target instanceof HTMLElement && (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+      e.preventDefault();
+      onObjectDelete(selectedImageObject);
+      onSelectImage(null);
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [selectedImageObject, onObjectDelete, onSelectImage]);
+
+  const handleImageMoveEnd = useCallback(
+    (newLeftDevicePx: number, newTopDevicePx: number): void => {
+      if (!viewport || !selectedImageObject) return;
+      const pdfPoint = devicePointToPdfPoint(viewport, newLeftDevicePx, newTopDevicePx, 1);
+      onObjectEdit(selectedImageObject, { ...selectedImageObject, x: pdfPoint.x, y: pdfPoint.y, updatedAt: Date.now() });
+    },
+    [viewport, selectedImageObject, onObjectEdit]
+  );
+
+  const handleImageResizeEnd = useCallback(
+    (newWidthDevicePx: number, newHeightDevicePx: number, newLeftDevicePx: number, newTopDevicePx: number): void => {
+      if (!viewport || !selectedImageObject) return;
+      const pdfPoint = devicePointToPdfPoint(viewport, newLeftDevicePx, newTopDevicePx, 1);
+      onObjectEdit(selectedImageObject, {
+        ...selectedImageObject,
+        x: pdfPoint.x,
+        y: pdfPoint.y,
+        width: newWidthDevicePx / viewport.scale,
+        height: newHeightDevicePx / viewport.scale,
+        updatedAt: Date.now(),
+      });
+    },
+    [viewport, selectedImageObject, onObjectEdit]
+  );
+
+  const handleImageRotateEnd = useCallback(
+    (newRotation: number): void => {
+      if (!selectedImageObject) return;
+      onObjectEdit(selectedImageObject, { ...selectedImageObject, rotation: newRotation, updatedAt: Date.now() });
+    },
+    [selectedImageObject, onObjectEdit]
+  );
+
+  const handleImageDelete = useCallback((): void => {
+    if (!selectedImageObject) return;
+    onObjectDelete(selectedImageObject);
+    onSelectImage(null);
+  }, [selectedImageObject, onObjectDelete, onSelectImage]);
+
   useStrokeCapture({
     scratchCanvasRef,
     enabled: interactive && viewport !== null && tool !== null && tool !== "text",
@@ -503,6 +614,24 @@ const PdfPage: React.FC<PdfPageProps> = ({
           onResizeWidthEnd={handleNoteWidthResizeEnd}
         />
       )}
+      {selectedImageObject && viewport && (() => {
+        const topLeft = pdfPointToDevicePoint(viewport, { x: selectedImageObject.x, y: selectedImageObject.y, pressure: 1 });
+        return (
+          <ImageAnnotationEditor
+            key={selectedImageObject.id}
+            left={topLeft.x}
+            top={topLeft.y}
+            width={selectedImageObject.width * viewport.scale}
+            height={selectedImageObject.height * viewport.scale}
+            rotation={selectedImageObject.rotation}
+            src={selectedImageObject.src}
+            onMoveEnd={handleImageMoveEnd}
+            onResizeEnd={handleImageResizeEnd}
+            onRotateEnd={handleImageRotateEnd}
+            onDelete={handleImageDelete}
+          />
+        );
+      })()}
       {renderError && (
         <div className="absolute inset-0 flex items-center justify-center bg-white text-red-600 text-sm p-4">
           Failed to render page: {renderError}

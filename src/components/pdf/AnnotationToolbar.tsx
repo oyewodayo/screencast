@@ -14,6 +14,7 @@ import {
   IoExpand,
   IoGridOutline,
   IoListOutline,
+  IoImageOutline,
 } from "react-icons/io5";
 import { IoIosArrowBack, IoIosArrowForward } from "react-icons/io";
 import { BsHighlighter, BsCursor } from "react-icons/bs";
@@ -30,6 +31,7 @@ interface AnnotationToolbarProps {
   tool: AnnotationTool | null;
   onToolChange: (tool: AnnotationTool) => void;
   onDeselectTool: () => void;
+  onInsertImageClick: () => void;
   color: string;
   onColorChange: (color: string) => void;
   strokeWidth: number;
@@ -213,6 +215,7 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   tool,
   onToolChange,
   onDeselectTool,
+  onInsertImageClick,
   color,
   onColorChange,
   strokeWidth,
@@ -276,6 +279,13 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             </IconButton>
           ))}
         </div>
+
+        {/* Inserting an image isn't a persistent "tool" the way pen/highlighter/text are — it's a
+            one-shot action (pick a file, it appears selected and ready to drag/resize/rotate) —
+            so it lives here as a standalone button rather than in the tool segmented control. */}
+        <IconButton title="Insert image" onClick={onInsertImageClick}>
+          <IoImageOutline size={16} />
+        </IconButton>
 
         {tool && tool !== "eraser" && (
           <>
