@@ -10,8 +10,16 @@ use std::process::{Command, Stdio};
 use tauri::regex::Regex;
 use tauri::{AppHandle, State};
 
-use super::{extract_ffmpeg_error, get_overlay_position, get_overlay_shape, map_overlay_size, resolve_capture_target, silent_command, AppState, CaptureTarget, FormData};
+use super::{audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error, map_overlay_size, resolve_capture_target, silent_command, AppState, CaptureTarget, FormData, AUDIO_ENHANCE_FILTER, MAX_RECORDING_WIDTH};
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
+
+// Downscale flag for the plain (no camera overlay) desktop-capture path - when a camera overlay
+// IS in play, the equivalent downscale is instead the final stage of
+// build_camera_overlay_filter_complex's own filter_complex, since ffmpeg rejects a separate -vf
+// on the same output stream a -filter_complex already produces video for.
+fn desktop_scale_args() -> Vec<String> {
+    vec!["-vf".to_string(), format!("scale='min({},iw)':-2", MAX_RECORDING_WIDTH)]
+}
 
 fn desktop_crop_args(x: i32, y: i32, width: i32, height: i32) -> Vec<String> {
     vec![
@@ -101,15 +109,27 @@ pub fn get_connected_devices(app_handle: &AppHandle) -> (Vec<String>, Vec<String
     (video_devices, audio_devices)
 }
 
+// Adds one video-only dshow input per selected camera (mic audio travels as its own separate
+// input now - see recording_with_output_sva - rather than being bundled into a single camera's
+// input line, which only ever made sense when there was exactly one camera), then a
+// -filter_complex chaining an overlay stage per camera onto the screen capture.
 pub fn add_overlay_args(args: &mut Vec<String>, form_data: &FormData) {
     let overlay_size = map_overlay_size(&form_data.overlay_size);
-    let video_audio_input = format!("video={}:audio={}", form_data.video_device, form_data.audio_device);
 
-    args.extend(vec![
-        "-f".to_string(), "dshow".to_string(),
-        "-video_size".to_string(), overlay_size, "-i".to_string(), video_audio_input]);
-    let overlay_filter = get_overlay_position(form_data.overlay_position.to_string());
-    let filter_complex = get_overlay_shape(&form_data.overlay_shape, overlay_filter);
+    for device in &form_data.video_devices {
+        args.extend(vec![
+            "-f".to_string(), "dshow".to_string(),
+            "-video_size".to_string(), overlay_size.clone(),
+            "-i".to_string(), format!("video={}", device),
+        ]);
+    }
+
+    let filter_complex = build_camera_overlay_filter_complex(
+        &form_data.overlay_shape,
+        &form_data.overlay_position,
+        &form_data.overlay_size,
+        form_data.video_devices.len(),
+    );
 
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
 }
@@ -133,74 +153,39 @@ pub async fn recording_with_output_sva(
         "-framerate".to_string(), "60".to_string(),
     ];
 
-    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
+    args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
 
-    if !form_data.overlay_shape.is_empty() {
-        log::debug!("overlay is present");
+    // Camera inputs (if any) must be added before the audio input below - add_overlay_args's
+    // filter_complex references them as [1:v]..[N:v], immediately following the screen capture
+    // at index 0, so nothing else can be inserted between the screen input and the camera inputs.
+    let has_camera_overlay = !form_data.video_devices.is_empty();
+    if has_camera_overlay {
+        log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
         add_overlay_args(&mut args, form_data);
-    } else {
-        let mut audio_input = String::from("audio=");
-        audio_input.push_str(&form_data.audio_device);
-        args.push("-f".to_string());
-        args.push("dshow".to_string());
-        args.push("-i".to_string());
-        args.push(audio_input);
     }
 
-    // Add codec flags based on file extension
-    match form_data.file_ext.to_lowercase().as_str() {
-        "mp4" => {
-            args.extend(vec![
-                "-c:v".to_string(), "libx264".to_string(),
-                "-preset".to_string(), "ultrafast".to_string(),
-                "-crf".to_string(), "23".to_string(),
-                "-c:a".to_string(), "aac".to_string(),
-                "-b:a".to_string(), "192k".to_string(),
-                "-movflags".to_string(), "+faststart+frag_keyframe+empty_moov".to_string(),
-            ]);
-        },
-        "mkv" => {
-            args.extend(vec![
-                "-c:v".to_string(), "libx264".to_string(),
-                "-preset".to_string(), "ultrafast".to_string(),
-                "-crf".to_string(), "23".to_string(),
-                "-c:a".to_string(), "aac".to_string(),
-            ]);
-        },
-        "avi" => {
-            args.extend(vec![
-                "-c:v".to_string(), "libx264".to_string(),
-                "-preset".to_string(), "ultrafast".to_string(),
-                "-c:a".to_string(), "pcm_s16le".to_string(), // Better audio codec for AVI
-            ]);
-        },
-        "mov" => {
-            args.extend(vec![
-                "-c:v".to_string(), "libx264".to_string(),
-                "-preset".to_string(), "ultrafast".to_string(),
-                "-c:a".to_string(), "aac".to_string(),
-                "-movflags".to_string(), "+faststart+frag_keyframe+empty_moov".to_string(),
-            ]);
-        },
-        "webm" => {
-            args.extend(vec![
-                "-c:v".to_string(), "libvpx".to_string(), // Use libvpx instead of libvpx-vp9 for better compatibility
-                "-b:v".to_string(), "2M".to_string(),
-                "-c:a".to_string(), "libvorbis".to_string(), // Use libvorbis instead of libopus
-                "-quality".to_string(), "good".to_string(),
-                "-cpu-used".to_string(), "0".to_string(),
-            ]);
-        },
-        _ => {
-            // Default to mp4
-            args.extend(vec![
-                "-c:v".to_string(), "libx264".to_string(),
-                "-preset".to_string(), "ultrafast".to_string(),
-                "-c:a".to_string(), "aac".to_string(),
-                "-movflags".to_string(), "+faststart+frag_keyframe+empty_moov".to_string(),
-            ]);
-        }
+    // Audio is now always its own standalone input - previously it was bundled into the single
+    // camera's dshow input line (video=X:audio=Y), which only worked for exactly one camera.
+    args.extend(vec![
+        "-f".to_string(), "dshow".to_string(),
+        "-i".to_string(), format!("audio={}", form_data.audio_device),
+    ]);
+
+    // Downscale the raw desktop capture - only when there's no camera overlay, whose own
+    // filter_complex (add_overlay_args, above) already ends with this same downscale as its
+    // final stage. ffmpeg rejects a -vf here alongside a -filter_complex already producing video.
+    if !has_camera_overlay {
+        args.extend(desktop_scale_args());
     }
+
+    // Add codec flags based on file extension. Used to be its own inline copy of this match
+    // (kept separate from codec_args_for_ext per this module's original "leave Windows as-is"
+    // policy) - now unified with it since both needed the same fix (missing -b:a on mkv/webm
+    // meant those fell back to noticeably-more-compressed default bitrates), so keeping two
+    // copies in sync stopped being worth it.
+    args.extend(codec_args_for_ext(&form_data.file_ext));
+    // Evens out quiet/inconsistent mic levels - see AUDIO_ENHANCE_FILTER's doc comment.
+    args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
 
     let output_file = path_to_str(output_path)?.to_string();
 
@@ -211,12 +196,20 @@ pub async fn recording_with_output_sva(
 
     log::debug!("FFmpeg args: {:?}", args);
 
-    // IMPORTANT: Keep stdin open for graceful shutdown
+    // IMPORTANT: Keep stdin open for graceful shutdown. stdout/stderr are nulled, not piped:
+    // ffmpeg writes continuous stats/progress lines to stderr throughout the whole recording,
+    // and nothing here ever reads a piped stdout/stderr to drain it - once the OS pipe buffer
+    // fills (a matter of minutes, not seconds, for any real recording), ffmpeg's next write()
+    // blocks forever. At that point it's stuck *before* it ever gets back around to checking
+    // stdin, so stop_recording's graceful "q" write goes nowhere, its 2-second wait times out,
+    // and the process gets force-killed - which for a container format that needs a proper
+    // finalize on exit (WebM/Matroska in particular) produces exactly the kind of corrupt,
+    // unparseable file ("EBML header parsing failed") this was silently causing.
     let child = Command::new(&ffmpeg_path)
         .args(&args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped()) // Changed to piped to capture output for debugging
-        .stderr(Stdio::piped()) // Changed to piped to capture errors
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -251,14 +244,17 @@ pub async fn recording_with_output_sv(app_handle: &AppHandle, state: State<'_, A
         "-i".to_string(), "desktop".to_string()
         ]);
 
-    if !form_data.overlay_shape.is_empty() {
-        log::debug!("overlay is present");
+    // add_overlay_args already appends its own -filter_complex chaining every selected camera
+    // (see recording_with_output_sva) - a second hardcoded "-filter_complex" here used to follow
+    // it and silently win, ignoring the user's shape/position choice and hardcoding exactly one
+    // camera. Removed so add_overlay_args's chain is authoritative, same as sva.
+    if !form_data.video_devices.is_empty() {
+        log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
         add_overlay_args(&mut args, form_data);
     }
 
     // Output command
     args.extend(vec![
-        "-filter_complex".to_string(), "[0:v][1:v]overlay=x=W-w-100:y=H-h-50".to_string(),
         "-c:v".to_string(), "mpeg4".to_string(),
         "-segment_time".to_string(), "10".to_string(),
         "-segment_format".to_string(), "avi".to_string(),
@@ -288,14 +284,24 @@ pub async fn recording_with_output_sa(app_handle: &AppHandle, state: State<'_, A
 
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "200".to_string()];
-    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
+    // 200 was never a real target — gdigrab can't actually deliver anywhere near that from a
+    // desktop source, it just means ffmpeg burns extra CPU polling far faster than any monitor
+    // refreshes, which eats into the budget the encoder needs to keep up in real time. 30fps is
+    // what screen-recording/tutorial content actually needs.
+    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "30".to_string()];
+    args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
     args.extend(vec![
         "-f".to_string(), "dshow".to_string(),
         "-i".to_string(), format!("audio={}", form_data.audio_device),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ]);
+    // Downscale the raw desktop capture - see desktop_scale_args' doc comment.
+    args.extend(desktop_scale_args());
+    // Previously had no codec flags at all here, leaving both streams to ffmpeg's per-container
+    // defaults - which measured out to a 200kbps video bitrate for a 4K capture (badly
+    // blocky) and default-quality MP3 audio, inconsistent with every other recording mode.
+    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
+    args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
 
     log::debug!("Path {:?}", output_path);
     let child = silent_command(&ffmpeg_path)
@@ -320,14 +326,18 @@ pub async fn recording_with_output_v(app_handle: &AppHandle, state: State<'_, Ap
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     log::debug!("Path {:?}", output_path);
+    let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
+
+    let mut args: Vec<String> = vec![
+        "-f".to_string(), "dshow".to_string(),
+        "-i".to_string(), format!("video={}", video_device),
+    ];
+    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
+
     let child = Command::new(&ffmpeg_path)
-        .args([
-            "-f", "dshow",
-            "-i", &format!("video={}", form_data.video_device),
-            "-c:v", "mpeg4",
-            "-y",
-            path_to_str(output_path)?,
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
@@ -349,13 +359,18 @@ pub async fn recording_with_output_a(app_handle: &AppHandle, state: State<'_, Ap
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     log::debug!("Path {:?}", output_path);
+    let mut args: Vec<String> = vec![
+        "-f".to_string(), "dshow".to_string(),
+        "-i".to_string(), format!("audio={}", form_data.audio_device),
+    ];
+    // Previously had no codec flags at all - left to ffmpeg's per-container default, which for
+    // .mp3 measured out to 128k, same gap as every other mode fixed above.
+    args.extend(audio_codec_args_for_ext(&form_data.file_ext));
+    args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
+    args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
+
     let child = silent_command(&ffmpeg_path)
-        .args([
-            "-f", "dshow",
-            "-i", &format!("audio={}", form_data.audio_device),
-            "-y",
-            path_to_str(output_path)?,
-        ])
+        .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -377,14 +392,19 @@ pub async fn recording_with_output_va(app_handle: &AppHandle, state: State<'_, A
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     log::debug!("Path {:?}", output_path);
+    let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
+
+    let mut args: Vec<String> = vec![
+        "-f".to_string(), "dshow".to_string(),
+        "-i".to_string(), format!("video={}:audio={}", video_device, form_data.audio_device),
+    ];
+    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
+
     let child = silent_command(&ffmpeg_path)
-        .args([
-            "-f", "dshow",
-            "-i", &format!("video={}:audio={}", form_data.video_device, form_data.audio_device),
-            "-c:v", "mpeg4",
-            "-y",
-            path_to_str(output_path)?,
-        ])
+        .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -404,8 +424,16 @@ pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, Ap
     }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "200".to_string()];
-    args.extend(gdigrab_input_args(&resolve_capture_target(form_data))?);
+    // Same framerate fix as recording_with_output_sa - 200 was never reachable, just wasted CPU.
+    let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string(), "-framerate".to_string(), "30".to_string()];
+    args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
+    // Downscale the raw desktop capture - see desktop_scale_args' doc comment.
+    args.extend(desktop_scale_args());
+    // This used to have no codec flags at all, leaving the video stream to ffmpeg's implicit
+    // per-container default encoder (e.g. plain mpeg4 for .mp4) instead of libx264 - a real,
+    // separate cause of poor quality/efficiency for screen-only recordings specifically, not
+    // just the missing downscale/framerate fix above.
+    args.extend(codec_args_for_ext(&form_data.file_ext));
     args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
 
     log::debug!("Path {:?}", output_path);
@@ -428,7 +456,7 @@ pub async fn recording_with_output_s(app_handle: &AppHandle, state: State<'_, Ap
 pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let output_path = output_path.clone();
-    let input_args = gdigrab_input_args(&resolve_capture_target(form_data))?;
+    let input_args = gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string()];

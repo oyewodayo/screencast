@@ -6,17 +6,25 @@
 
 use std::env::consts::OS;
 use commands::recording::AppState;
+use tauri::Manager;
 
 mod commands {
     pub mod window_capture;
     pub mod system_info;
     pub mod recording;
     pub mod conversion;
+    pub mod native_playback;
+    pub mod annotation;
 }
 mod services {
     pub mod utility;
     pub mod pdf_annotations;
     pub mod trash;
+    // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
+    // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
+    // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
+    #[cfg(target_os = "windows")]
+    pub mod loopback_audio;
 }
 use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMode, ConfigBuilder};
 
@@ -110,6 +118,7 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
         .manage(commands::conversion::ConversionState::default())
+        .manage(commands::native_playback::NativePlaybackState::default())
         .invoke_handler(tauri::generate_handler![
             commands::system_info::get_ram_info,
             get_os_info,
@@ -129,6 +138,7 @@ fn main() {
             commands::window_capture::activate_and_open_window,
 
             commands::conversion::convert_to_mp4,
+            commands::conversion::get_playable_preview,
             commands::conversion::batch_convert_to_mp4,
             commands::conversion::cancel_conversion,
             commands::conversion::get_conversion_info,
@@ -136,11 +146,24 @@ fn main() {
             commands::conversion::should_convert_file,
             commands::conversion::convert_video,
             commands::conversion::convert_image,
+            commands::conversion::convert_audio,
+
+            commands::native_playback::start_native_playback,
+            commands::native_playback::get_next_video_frame,
+            commands::native_playback::get_next_audio_chunk,
+            commands::native_playback::seek_native_playback,
+            commands::native_playback::stop_native_playback,
+
+            commands::annotation::ensure_annotation_overlay,
 
             services::utility::open_file_from_directory,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
             services::utility::rename_file,
+            services::utility::create_folder,
+            services::utility::delete_folder,
+            services::utility::move_file,
+            services::utility::get_platform,
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
 
@@ -153,9 +176,12 @@ fn main() {
         ])
         .build(context)
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 commands::window_capture::cleanup_stale_window_screenshots();
+                commands::native_playback::cleanup_all_sessions(
+                    &app_handle.state::<commands::native_playback::NativePlaybackState>(),
+                );
             }
         });
 }

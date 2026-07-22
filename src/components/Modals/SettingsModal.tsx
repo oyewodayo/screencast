@@ -167,6 +167,21 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave }) => {
             </Field>
           </Section>
 
+          <Section title="Presentation annotation">
+            <Field label="Enable annotation tool">
+              <input
+                type="checkbox"
+                checked={settings.enableAnnotationTool}
+                onChange={(e) => update("enableAnnotationTool", e.target.checked)}
+                className="w-4 h-4 accent-blue-500 cursor-pointer"
+              />
+            </Field>
+            <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+              While enabled, press Ctrl+Shift+D (Cmd+Shift+D on Mac) anywhere to draw on screen — circle or underline
+              anything to emphasize it. Strokes fade out on their own after a few seconds.
+            </p>
+          </Section>
+
           <Section title="Files">
             <Field label="Auto-delete trash after">
               <div className="flex items-center gap-2">

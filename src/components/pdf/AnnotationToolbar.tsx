@@ -1,15 +1,32 @@
 // components/pdf/AnnotationToolbar.tsx
 import React, { useEffect, useState } from "react";
-import { IoPencil, IoArrowUndo, IoArrowRedo, IoAdd, IoRemove, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoDocumentTextOutline, IoText, IoExpand } from "react-icons/io5";
+import {
+  IoPencil,
+  IoArrowUndo,
+  IoArrowRedo,
+  IoAdd,
+  IoRemove,
+  IoCheckmarkCircle,
+  IoCloudUploadOutline,
+  IoAlertCircleOutline,
+  IoDocumentTextOutline,
+  IoText,
+  IoExpand,
+  IoGridOutline,
+  IoListOutline,
+} from "react-icons/io5";
 import { IoIosArrowBack, IoIosArrowForward } from "react-icons/io";
 import { BsHighlighter, BsCursor } from "react-icons/bs";
 import { FaEraser } from "react-icons/fa";
 import { MdAutoStories } from "react-icons/md";
 import { AnnotationTool } from "../../utils/pdfAnnotationTypes";
+import { PdfSidebarView } from "./PdfSidebar";
 import ColorSwatchPicker from "./ColorSwatchPicker";
 
 interface AnnotationToolbarProps {
   title?: string;
+  sidebarView: PdfSidebarView | null;
+  onSidebarViewChange: (view: PdfSidebarView) => void;
   tool: AnnotationTool | null;
   onToolChange: (tool: AnnotationTool) => void;
   onDeselectTool: () => void;
@@ -191,6 +208,8 @@ const ZoomInput: React.FC<{ zoom: number; minZoom: number; maxZoom: number; onZo
 
 const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   title,
+  sidebarView,
+  onSidebarViewChange,
   tool,
   onToolChange,
   onDeselectTool,
@@ -219,6 +238,20 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   return (
     <div className="shrink-0 px-4 pt-3 pb-2">
       <div className="flex items-center gap-3 mx-auto max-w-fit px-3 py-2 rounded-2xl bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.04] dark:ring-white/[0.08]">
+        {/* Sidebar panel toggles: page thumbnails and the PDF's table of contents. Each re-clicks
+            itself off (handled by the parent, same toggle pattern as the tool buttons below) so
+            there's always an unambiguous way back to "no panel open". */}
+        <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045] dark:bg-white/[0.06]">
+          <IconButton title="Page thumbnails" active={sidebarView === "thumbnails"} onClick={() => onSidebarViewChange("thumbnails")}>
+            <IoGridOutline size={15} />
+          </IconButton>
+          <IconButton title="Table of contents" active={sidebarView === "outline"} onClick={() => onSidebarViewChange("outline")}>
+            <IoListOutline size={16} />
+          </IconButton>
+        </div>
+
+        <Divider />
+
         {title && (
           <>
             <div className="flex items-center gap-1.5 pl-1 pr-1 text-neutral-600 dark:text-neutral-300 max-w-[160px]" title={title}>

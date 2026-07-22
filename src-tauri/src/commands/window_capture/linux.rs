@@ -62,6 +62,7 @@ struct Atoms {
     net_wm_name: u32,
     utf8_string: u32,
     net_active_window: u32,
+    net_wm_pid: u32,
 }
 
 fn connect() -> Result<(RustConnection, usize), String> {
@@ -82,7 +83,28 @@ fn atoms(conn: &RustConnection) -> Result<Atoms, String> {
         net_wm_name: intern(conn, "_NET_WM_NAME")?,
         utf8_string: intern(conn, "UTF8_STRING")?,
         net_active_window: intern(conn, "_NET_ACTIVE_WINDOW")?,
+        net_wm_pid: intern(conn, "_NET_WM_PID")?,
     })
+}
+
+// The absolute path to the window's owning process's executable, via the EWMH _NET_WM_PID
+// property (a CARDINAL holding the process id) and /proc/<pid>/exe - the same "second,
+// always-available identifier" win.rs's get_process_exe_path gives the Windows picker. Best
+// effort: empty string if the window doesn't set _NET_WM_PID, or /proc isn't readable (a
+// sandboxed app, a permissions-restricted process, ...).
+fn window_exe_path(conn: &RustConnection, atoms: &Atoms, window: Window) -> String {
+    let Ok(Ok(reply)) = conn
+        .get_property(false, window, atoms.net_wm_pid, AtomEnum::CARDINAL, 0, 1)
+        .map(|c| c.reply())
+    else {
+        return String::new();
+    };
+    let Some(pid) = reply.value32().and_then(|mut it| it.next()) else {
+        return String::new();
+    };
+    std::fs::read_link(format!("/proc/{}/exe", pid))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 // A window's title: _NET_WM_NAME (UTF8_STRING, the modern EWMH way) falling back to the legacy
@@ -149,8 +171,13 @@ pub fn get_monitors() -> Result<Vec<MonitorInfo>, String> {
     let (conn, screen_num) = connect()?;
     let root = conn.setup().roots[screen_num].root;
 
+    // x11rb's ConnectionExt prefixes every extension (non-core-protocol) request with the
+    // extension's name to avoid clashing with core X11 requests or other extensions' requests
+    // of the same name - randr_get_monitors here, composite_redirect_window/etc. below, unlike
+    // the *_atom/get_property/get_geometry/... core-protocol calls elsewhere in this file, which
+    // stay unprefixed since core requests never need that disambiguation.
     let reply = conn
-        .get_monitors(root, true)
+        .randr_get_monitors(root, true)
         .map_err(|e| format!("Failed to request monitors: {}", e))?
         .reply()
         .map_err(|e| format!("Failed to get monitors (is RandR 1.5+ available?): {}", e))?;
@@ -232,10 +259,7 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
                 title: title.clone(),
                 image_path,
                 hwnd: *window as isize,
-                // TODO: resolve via the window's _NET_WM_PID property + /proc/<pid>/exe, same
-                // idea as win.rs's get_process_exe_path. Left empty for now rather than blocking
-                // this on X11 process-id plumbing that nothing else here needs yet.
-                exe_path: String::new(),
+                exe_path: window_exe_path(&conn, &atoms, *window),
             });
         }
 
@@ -255,7 +279,7 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
 // same reason win.rs uses PrintWindow instead of a plain screen-region grab) and reads that
 // pixmap's pixels back with GetImage.
 fn capture_window(conn: &RustConnection, window: Window, output_path: &std::path::Path) -> Result<(), String> {
-    conn.redirect_window(window, Redirect::AUTOMATIC)
+    conn.composite_redirect_window(window, Redirect::AUTOMATIC)
         .map_err(|e| format!("redirect_window request failed: {}", e))?;
 
     let pixmap = conn
@@ -263,12 +287,12 @@ fn capture_window(conn: &RustConnection, window: Window, output_path: &std::path
         .map_err(|e| format!("Failed to allocate a pixmap id: {}", e))?;
 
     let name_result = conn
-        .name_window_pixmap(window, pixmap)
+        .composite_name_window_pixmap(window, pixmap)
         .map_err(|e| format!("name_window_pixmap request failed: {}", e))
         .and_then(|cookie| cookie.check().map_err(|e| format!("name_window_pixmap failed (no compositor running?): {}", e)));
 
     if let Err(e) = name_result {
-        let _ = conn.unredirect_window(window, Redirect::AUTOMATIC);
+        let _ = conn.composite_unredirect_window(window, Redirect::AUTOMATIC);
         return Err(e);
     }
 
@@ -293,7 +317,7 @@ fn capture_window(conn: &RustConnection, window: Window, output_path: &std::path
     })();
 
     let _ = conn.free_pixmap(pixmap);
-    let _ = conn.unredirect_window(window, Redirect::AUTOMATIC);
+    let _ = conn.composite_unredirect_window(window, Redirect::AUTOMATIC);
 
     capture_result
 }
@@ -365,6 +389,49 @@ pub async fn activate_and_open_window(title: &str) -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("Activate window task panicked: {}", e))?
+}
+
+// Used by recording::linux to capture "this window" as a screen-region crop, mirroring win.rs's
+// function of the same name (and its rationale): x11grab has no reliable direct per-window
+// capture mode either, since a compositor renders a window's true on-screen pixels, not
+// whatever the window's own backing buffer holds - the same reason win.rs crops the desktop
+// grab to the window's rect instead of trying to read the window's pixels directly.
+pub fn get_window_rect_by_title(title: &str) -> Result<(i32, i32, i32, i32), String> {
+    let (conn, screen_num) = connect()?;
+    let root = conn.setup().roots[screen_num].root;
+    let atoms = atoms(&conn)?;
+    let windows = client_list(&conn, &atoms, root)?;
+
+    let window = windows
+        .into_iter()
+        .find(|&w| window_title(&conn, &atoms, w) == title)
+        .ok_or_else(|| format!("Window '{}' not found", title))?;
+
+    let geometry = conn
+        .get_geometry(window)
+        .map_err(|e| format!("get_geometry request failed: {}", e))?
+        .reply()
+        .map_err(|e| format!("get_geometry failed: {}", e))?;
+
+    // get_geometry's x/y are relative to the window's immediate parent - after window-manager
+    // reparenting that's the WM's decoration frame, not the root, so they're not directly usable
+    // as a screen-absolute crop origin. translate_coordinates resolves the window's own (0,0)
+    // corner to root-relative (i.e. real screen) coordinates, the X11 equivalent of what
+    // DWMWA_EXTENDED_FRAME_BOUNDS gives win.rs.
+    let translated = conn
+        .translate_coordinates(window, root, 0, 0)
+        .map_err(|e| format!("translate_coordinates request failed: {}", e))?
+        .reply()
+        .map_err(|e| format!("translate_coordinates failed: {}", e))?;
+
+    let monitors = get_monitors().unwrap_or_default();
+    Ok(super::clamp_rect_to_desktop(
+        &monitors,
+        translated.dst_x as i32,
+        translated.dst_y as i32,
+        geometry.width as i32,
+        geometry.height as i32,
+    ))
 }
 
 pub async fn start_monitoring_windows() -> Result<(), String> {

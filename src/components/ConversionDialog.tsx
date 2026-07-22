@@ -2,7 +2,7 @@
 import { invoke } from "@tauri-apps/api";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
-import { isImageFile } from "../utils/videoUtils";
+import { getFileCategory, isConvertibleCategory } from "../utils/fileCategory";
 
 // Conversion types
 interface ConversionProgress {
@@ -13,8 +13,10 @@ interface ConversionProgress {
   message: string;
 }
 
-// React hook for conversion
-export const useVideoConversion = () => {
+// React hook for conversion — one thin invoke wrapper per convertible category, sharing progress/
+// cancel state. Which one a given file actually needs is decided by CONVERSION_PROFILES below,
+// not by anything in here.
+export const useMediaConversion = () => {
   const [conversionProgress, setConversionProgress] = useState<ConversionProgress | null>(null);
   const [isConverting, setIsConverting] = useState(false);
 
@@ -23,7 +25,7 @@ export const useVideoConversion = () => {
       const unlisten = await listen<ConversionProgress>('conversion-progress', (event) => {
         console.log('Conversion progress:', event.payload);
         setConversionProgress(event.payload);
-        
+
         if (event.payload.status === 'completed' || event.payload.status === 'failed') {
           setIsConverting(false);
         }
@@ -44,13 +46,13 @@ export const useVideoConversion = () => {
   }, []);
 
   const convertToMp4 = async (
-    inputPath: string, 
+    inputPath: string,
     outputPath?: string,
     preserveOriginal: boolean = true
   ) => {
     setIsConverting(true);
     setConversionProgress(null);
-    
+
     try {
       const result = await invoke<string>('convert_to_mp4', {
         inputPath,
@@ -113,6 +115,30 @@ export const useVideoConversion = () => {
     }
   };
 
+  const convertAudio = async (
+    inputPath: string,
+    outputFormat: string,
+    outputPath?: string,
+    preserveOriginal: boolean = true
+  ) => {
+    setIsConverting(true);
+    setConversionProgress(null);
+
+    try {
+      const result = await invoke<string>('convert_audio', {
+        inputPath,
+        outputFormat,
+        outputPath: outputPath || null,
+        preserveOriginal
+      });
+      return result;
+    } catch (error) {
+      console.error('Conversion failed:', error);
+      setIsConverting(false);
+      throw error;
+    }
+  };
+
   const cancelConversion = async () => {
     try {
       await invoke('cancel_conversion');
@@ -127,13 +153,19 @@ export const useVideoConversion = () => {
     convertToMp4,
     convertVideo,
     convertImage,
+    convertAudio,
     cancelConversion,
     conversionProgress,
     isConverting,
   };
 };
 
-const VIDEO_FORMATS = [
+interface FormatOption {
+  value: string;
+  label: string;
+}
+
+const VIDEO_FORMATS: FormatOption[] = [
   { value: 'mp4', label: 'MP4 (Recommended)' },
   { value: 'mov', label: 'MOV' },
   { value: 'mkv', label: 'MKV' },
@@ -141,12 +173,36 @@ const VIDEO_FORMATS = [
   { value: 'webm', label: 'WebM' },
 ];
 
-const IMAGE_FORMATS = [
+const AUDIO_FORMATS: FormatOption[] = [
+  { value: 'mp3', label: 'MP3 (Recommended)' },
+  { value: 'wav', label: 'WAV' },
+  { value: 'aac', label: 'AAC' },
+  { value: 'flac', label: 'FLAC' },
+  { value: 'ogg', label: 'OGG' },
+  { value: 'm4a', label: 'M4A' },
+];
+
+const IMAGE_FORMATS: FormatOption[] = [
   { value: 'png', label: 'PNG' },
   { value: 'jpeg', label: 'JPEG' },
   { value: 'webp', label: 'WebP' },
   { value: 'bmp', label: 'BMP' },
 ];
+
+interface ConversionProfile {
+  dialogTitle: string;
+  formats: FormatOption[];
+  defaultFormat: string;
+}
+
+// The one place that decides what "Convert" offers for a given file category. Adding support for
+// converting a new category (or changing a format list) only ever means editing this object —
+// nothing else in the component branches on category directly.
+const CONVERSION_PROFILES: Record<'video' | 'audio' | 'image', ConversionProfile> = {
+  video: { dialogTitle: 'Convert Video', formats: VIDEO_FORMATS, defaultFormat: 'mp4' },
+  audio: { dialogTitle: 'Convert Audio', formats: AUDIO_FORMATS, defaultFormat: 'mp3' },
+  image: { dialogTitle: 'Convert Image', formats: IMAGE_FORMATS, defaultFormat: 'png' },
+};
 
 // Conversion UI Component
 const ConversionDialog: React.FC<{
@@ -155,28 +211,34 @@ const ConversionDialog: React.FC<{
   onClose: () => void;
   onConverted: (newPath: string, fileName: string) => void;
 }> = ({ filePath, fileName, onClose, onConverted }) => {
-  const { convertToMp4, convertVideo, convertImage, cancelConversion, conversionProgress, isConverting } = useVideoConversion();
-  const isImage = isImageFile(fileName);
-  const formats = isImage ? IMAGE_FORMATS : VIDEO_FORMATS;
-  const [selectedFormat, setSelectedFormat] = useState<string>(isImage ? 'png' : 'mp4');
+  const { convertToMp4, convertVideo, convertImage, convertAudio, cancelConversion, conversionProgress, isConverting } = useMediaConversion();
+  const category = getFileCategory(fileName);
+  const profile = isConvertibleCategory(category) ? CONVERSION_PROFILES[category] : null;
+  const [selectedFormat, setSelectedFormat] = useState<string>(profile?.defaultFormat ?? '');
   const [preserveOriginal, setPreserveOriginal] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
 
   const handleConvert = async () => {
+    if (!profile) return;
     setError('');
     try {
       let newPath: string;
 
-      if (isImage) {
+      if (category === 'image') {
         newPath = await convertImage(filePath, selectedFormat, undefined, preserveOriginal);
+      } else if (category === 'audio') {
+        newPath = await convertAudio(filePath, selectedFormat, undefined, preserveOriginal);
       } else if (selectedFormat === 'mp4') {
         newPath = await convertToMp4(filePath, undefined, preserveOriginal);
       } else {
         newPath = await convertVideo(filePath, selectedFormat, undefined, preserveOriginal);
       }
 
-      // Extract filename with new extension
-      const newFileName = fileName.replace(/\.[^/.]+$/, `.${selectedFormat}`);
+      // Read the actual saved filename back off newPath rather than guessing one from the
+      // original - the backend silently disambiguates onto "name (1).ext" etc. when a file of
+      // the guessed name already exists (e.g. converting the same source twice), so the two can
+      // legitimately differ.
+      const newFileName = newPath.split(/[\\/]/).pop() ?? fileName.replace(/\.[^/.]+$/, `.${selectedFormat}`);
       onConverted(newPath, newFileName);
 
     } catch (error: any) {
@@ -192,10 +254,34 @@ const ConversionDialog: React.FC<{
     onClose();
   };
 
+  // Defensive fallback: Dashboard.tsx only ever offers "Convert" for convertible categories, so
+  // this shouldn't normally be reachable — but a file this dialog doesn't know how to convert
+  // (PDF, or an unrecognized extension) gets a clear message instead of a wrong/blank format list.
+  if (!profile) {
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div className="bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100 p-6 rounded-lg max-w-md w-full">
+          <h3 className="text-lg font-semibold mb-4">Can't Convert This File</h3>
+          <p className="text-sm text-gray-600 dark:text-neutral-400 mb-4">
+            <strong>{fileName}</strong> isn't a file type Briefcast can convert.
+          </p>
+          <div className="flex justify-end">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 text-gray-600 dark:text-neutral-300 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div className="bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100 p-6 rounded-lg max-w-md w-full">
-        <h3 className="text-lg font-semibold mb-4">{isImage ? 'Convert Image' : 'Convert Video'}</h3>
+        <h3 className="text-lg font-semibold mb-4">{profile.dialogTitle}</h3>
 
         <div className="mb-4">
           <p className="text-sm text-gray-600 dark:text-neutral-400 mb-2">
@@ -211,7 +297,7 @@ const ConversionDialog: React.FC<{
               disabled={isConverting}
               className="w-full border border-gray-300 dark:border-neutral-600 bg-white dark:bg-neutral-800 rounded px-3 py-2"
             >
-              {formats.map(fmt => (
+              {profile.formats.map(fmt => (
                 <option key={fmt.value} value={fmt.value}>
                   {fmt.label}
                 </option>
@@ -268,7 +354,7 @@ const ConversionDialog: React.FC<{
           >
             {isConverting ? 'Cancel' : 'Close'}
           </button>
-          <button 
+          <button
             onClick={handleConvert}
             disabled={isConverting}
             className="px-4 py-2 bg-blue-600 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-blue-700"

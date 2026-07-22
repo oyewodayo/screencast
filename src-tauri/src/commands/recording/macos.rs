@@ -22,9 +22,9 @@ use super::{codec_args_for_ext, extract_ffmpeg_error, get_overlay_position, get_
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
 #[derive(Debug, Clone)]
-struct AvDevice {
-    index: u32,
-    name: String,
+pub(crate) struct AvDevice {
+    pub(crate) index: u32,
+    pub(crate) name: String,
 }
 
 // Parses `ffmpeg -f avfoundation -list_devices true -i ""`'s stderr, which looks like:
@@ -33,7 +33,7 @@ struct AvDevice {
 //   [AVFoundation indev @ 0x...] [1] Capture screen 0
 //   [AVFoundation indev @ 0x...] AVFoundation audio devices:
 //   [AVFoundation indev @ 0x...] [0] MacBook Pro Microphone
-fn list_avfoundation_devices(app_handle: &AppHandle) -> Result<(Vec<AvDevice>, Vec<AvDevice>), String> {
+pub(crate) fn list_avfoundation_devices(app_handle: &AppHandle) -> Result<(Vec<AvDevice>, Vec<AvDevice>), String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     // ffmpeg exits non-zero here (there's no real input, only a device listing was asked for) —
@@ -134,6 +134,37 @@ fn require_screen_index(video_devices: &[AvDevice]) -> Result<u32, String> {
         .ok_or_else(|| "No screen capture device found (expected a 'Capture screen N' entry from avfoundation)".to_string())
 }
 
+// Re-derives the avfoundation screen index a "monitor:monitor_<i>" screen_size value refers to,
+// by position within the same filtered "Capture screen" list window_capture::macos::get_monitors
+// builds its ids from (see that function's comment) - avfoundation captures a whole display
+// directly, so all a Monitor selection actually needs to become is that device's own index.
+fn resolve_screen_index(video_devices: &[AvDevice], monitor_id: &str) -> Option<u32> {
+    let i: usize = monitor_id.strip_prefix("monitor_")?.parse().ok()?;
+    video_devices
+        .iter()
+        .filter(|d| d.name.starts_with("Capture screen"))
+        .nth(i)
+        .map(|d| d.index)
+}
+
+// Resolves form_data.screen_size into the avfoundation screen index to actually pass to -i.
+// Previously every screen-capturing function here ignored screen_size entirely (form_data was
+// unused) and always grabbed require_screen_index's first screen - meaning picking a specific
+// Monitor silently recorded/screenshotted the *wrong* one instead of the one actually selected.
+// "window:..." isn't supported (see window_capture::macos's module comment for why) and errors
+// clearly instead of falling back to some screen, which would be the same silent-wrong-capture
+// bug in a different shape.
+fn resolve_screen_target(video_devices: &[AvDevice], form_data: &FormData) -> Result<u32, String> {
+    if form_data.screen_size.starts_with("window:") {
+        return Err("Window-specific capture isn't implemented on macOS yet — pick Full Screen or a Monitor instead.".to_string());
+    }
+    if let Some(monitor_id) = form_data.screen_size.strip_prefix("monitor:") {
+        return resolve_screen_index(video_devices, monitor_id)
+            .ok_or_else(|| format!("Monitor '{}' not found", monitor_id));
+    }
+    require_screen_index(video_devices)
+}
+
 //Screen, optional camera overlay, and audio
 pub async fn recording_with_output_sva(
     app_handle: &AppHandle,
@@ -143,7 +174,7 @@ pub async fn recording_with_output_sva(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = require_screen_index(&video_devices)?;
+    let screen_index = resolve_screen_target(&video_devices, form_data)?;
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
 
     let has_overlay = !form_data.overlay_shape.is_empty();
@@ -178,7 +209,7 @@ pub async fn recording_with_output_sv(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = require_screen_index(&video_devices)?;
+    let screen_index = resolve_screen_target(&video_devices, form_data)?;
 
     let mut args: Vec<String> = vec![
         "-f".to_string(), "avfoundation".to_string(),
@@ -207,7 +238,7 @@ pub async fn recording_with_output_sa(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = require_screen_index(&video_devices)?;
+    let screen_index = resolve_screen_target(&video_devices, form_data)?;
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
 
     let args: Vec<String> = vec![
@@ -296,11 +327,11 @@ pub async fn recording_with_output_s(
     app_handle: &AppHandle,
     state: State<'_, AppState>,
     output_path: &PathBuf,
-    _form_data: &FormData,
+    form_data: &FormData,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = require_screen_index(&video_devices)?;
+    let screen_index = resolve_screen_target(&video_devices, form_data)?;
 
     let args: Vec<String> = vec![
         "-f".to_string(), "avfoundation".to_string(),
@@ -319,10 +350,10 @@ pub async fn recording_with_output_s(
 // track, nothing for stop_recording to stop. Replaces what used to be recording_with_output_c, a
 // continuous screen recording started/stopped exactly like every other mode despite the
 // "Screenshot" label the frontend showed for this record type — the same bug win.rs had.
-pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, _form_data: &FormData) -> Result<String, String> {
+pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = require_screen_index(&video_devices)?;
+    let screen_index = resolve_screen_target(&video_devices, form_data)?;
     let output_path = output_path.clone();
 
     tauri::async_runtime::spawn_blocking(move || {

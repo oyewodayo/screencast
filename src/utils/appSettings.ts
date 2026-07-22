@@ -19,13 +19,22 @@ export interface AppSettings {
   // Days a deleted file sits in the trash before purge_expired_trash removes it for good, run
   // once on app launch. 0 (or negative) means "never auto-purge — keep until Empty Trash".
   trashRetentionDays: number;
+  // Global on/off switch for the system-wide stylus annotation overlay (see
+  // AnnotationOverlayWindow.tsx) — when false, Dashboard never creates the overlay window or
+  // registers its hotkey at all.
+  enableAnnotationTool: boolean;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
 
 export const DEFAULT_SETTINGS: AppSettings = {
   defaultRecordType: "sva",
-  defaultFileExt: "avi",
+  // mp4/h264 is the one container+codec combo every WebView2/Chromium <video> element decodes
+  // natively with hardware acceleration - .avi (the old default) has no WebView2 container
+  // support at all regardless of the codec inside it (see get_playable_preview's doc comment in
+  // src-tauri/src/commands/conversion.rs), so every fresh install used to force a full blocking
+  // re-encode on the very first playback of the very first recording it ever made.
+  defaultFileExt: "mp4",
   defaultFileNamePrefix: "Recording",
   pdfDefaultZoom: 1.25,
   pdfDefaultTool: "pen",
@@ -34,6 +43,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pdfDefaultStrokeWidth: 4,
   theme: "system",
   trashRetentionDays: 30,
+  // The overlay this drives now stays hidden except for the brief, user-initiated span while
+  // draw mode is actually on (see ensure_annotation_overlay/toggleAnnotationDrawMode) - a hidden
+  // window can't block input no matter what, which is what makes it safe to default to on rather
+  // than requiring an opt-in visit to Settings.
+  enableAnnotationTool: true,
 };
 
 export function loadSettings(): AppSettings {

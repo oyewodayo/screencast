@@ -43,7 +43,8 @@
         "show": true,
         "setFocus": true,
         "startDragging": true,
-        "setFullscreen": true
+        "setFullscreen": true,
+        "setIgnoreCursorEvents": true
       },
       "os": {
         "all": false

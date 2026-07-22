@@ -1,4 +1,6 @@
-import { MdOutlineOpacity } from 'react-icons/md'
+import { useState } from 'react';
+import { MdOutlineOpacity, MdSpeed } from 'react-icons/md';
+import { IoPlayCircleOutline, IoChevronForward, IoCheckmark } from 'react-icons/io5';
 
 // Define the props interface
 interface PlaytimeSettingsProps {
@@ -18,77 +20,91 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   opacity,
   onOpacityChange
 }) => {
+  // A native <select>'s open dropdown list is rendered by the OS, not the page, so it can't pick
+  // up this app's styling (that's what was showing as a plain, unstyled white popup) - this
+  // in-menu accordion replaces it with rows built from the same .settings-row styling as the rest
+  // of this flyout.
+  const [showSpeedOptions, setShowSpeedOptions] = useState<boolean>(false);
+
   const handleOpacity = (event: React.ChangeEvent<HTMLInputElement>): void => {
     onOpacityChange(parseFloat(event.target.value));
   };
 
-  const handlePlaybackSpeedChange = (event: React.ChangeEvent<HTMLSelectElement>): void => {
-    const newSpeed = event.target.value;
-    onPlaybackSpeedChange(newSpeed);
+  const handlePlaybackSpeedSelect = (speed: string): void => {
+    onPlaybackSpeedChange(speed);
+    setShowSpeedOptions(false);
   };
 
   // Predefined playback speed options
   const playbackSpeeds = ['0.25', '0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
+  const normalizedSpeed = playbackSpeed.replace('x', '');
 
   return (
-    <div className="origin-bottom-right absolute bottom-full right-0 w-[220px] rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 z-50">
-      <div className="py-1 w-[100%]">
-
-        {/* Autoplay Setting */}
-        <button
-          className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 text-left"
-          onClick={onAutoplayChange}
-        >
-          <div className='flex gap-2 place-items-center'>
-            Autoplay
-          </div>
-          <label className="switch">
-            <input 
-              type="checkbox" 
-              checked={isAutoplay}
-              onChange={onAutoplayChange}
-              name="autoplay" 
-            />
-            <span className="slider round"></span>
-          </label>
-        </button>
-
-        {/* Playback Speed Setting */}
-        <div className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700">
-          <div className='flex gap-2 place-items-center'>
-            Playback Speed
-          </div>
-          <select
-            value={playbackSpeed.replace('x', '')}
-            onChange={handlePlaybackSpeedChange}
-            className="bg-gray-100 dark:bg-neutral-900 border border-gray-300 dark:border-neutral-600 text-gray-700 dark:text-neutral-200 text-sm rounded focus:ring-blue-500 focus:border-blue-500 p-1"
-          >
-            {playbackSpeeds.map((speed) => (
-              <option key={speed} value={speed}>
-                {speed}x
-              </option>
-            ))}
-          </select>
-        </div>
-
-        {/* Opacity Setting */}
-        <div className="flex justify-between place-items-center w-[100%] px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700">
-          <div className='flex gap-2 place-items-center'>
-            <MdOutlineOpacity className='-my-1 text-2xl'/> 
-            Opacity 
-          </div>
-          <input 
-            type="range" 
-            min={0} 
-            max={1} 
-            step={0.1}
-            value={opacity}
-            onChange={handleOpacity}
-            name="video-opacity" 
-            className='w-20' 
+    <div className="origin-bottom-right absolute bottom-full right-0 settings-menu rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-800 dark:text-neutral-100 ring-1 ring-black dark:ring-white/10 ring-opacity-5 z-50">
+      {/* Autoplay */}
+      <button className="settings-row" onClick={onAutoplayChange}>
+        <span className="settings-row-label">
+          <IoPlayCircleOutline />
+          Autoplay
+        </span>
+        <label className="switch" onClick={(e) => e.stopPropagation()}>
+          <input
+            type="checkbox"
+            checked={isAutoplay}
+            onChange={onAutoplayChange}
+            name="autoplay"
           />
-        </div>
+          <span className="slider round"></span>
+        </label>
+      </button>
 
+      <div className="settings-divider" />
+
+      {/* Playback Speed */}
+      <button className="settings-row" onClick={() => setShowSpeedOptions((prev) => !prev)}>
+        <span className="settings-row-label">
+          <MdSpeed />
+          Playback speed
+        </span>
+        <span className="settings-row-value">
+          {normalizedSpeed === '1' ? 'Normal' : `${normalizedSpeed}x`}
+          <IoChevronForward className={`settings-chevron ${showSpeedOptions ? 'settings-chevron-open' : ''}`} />
+        </span>
+      </button>
+
+      {showSpeedOptions && (
+        <div className="settings-submenu">
+          {playbackSpeeds.map((speed) => (
+            <button
+              key={speed}
+              className="settings-row settings-submenu-item"
+              onClick={() => handlePlaybackSpeedSelect(speed)}
+            >
+              <span>{speed === '1' ? 'Normal' : `${speed}x`}</span>
+              {normalizedSpeed === speed && <IoCheckmark className="settings-check" />}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="settings-divider" />
+
+      {/* Opacity */}
+      <div className="settings-row">
+        <span className="settings-row-label">
+          <MdOutlineOpacity />
+          Opacity
+        </span>
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.1}
+          value={opacity}
+          onChange={handleOpacity}
+          name="video-opacity"
+          className="settings-slider"
+        />
       </div>
     </div>
   )

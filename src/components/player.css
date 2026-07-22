@@ -85,11 +85,14 @@ video {
 /* Video controls */
 .video-controls-container {
     position: absolute;
-    /* The app's own docker bar (ActiveRecordingState) is a `fixed bottom-0` overlay that
-       sits on top of the video player, at minimum ~64px tall even fully collapsed. Anchoring
-       these controls flush to bottom:0 put them directly underneath it, so toggling the
-       docker down was covering the player's own pause/volume/skip/etc buttons entirely. */
-    bottom: 64px;
+    /* The app's own docker bar (BottomDocker/ActiveRecordingState) is a `fixed bottom-0` overlay
+       that sits on top of the video player, and its height changes a lot depending on whether the
+       full file-name/type/recording-options panel is expanded or collapsed. BottomDocker measures
+       its own real height with a ResizeObserver and publishes it as --docker-height, so these
+       controls always clear it instead of assuming one fixed height (which put them out of view
+       under the docker any time it was taller than that guess). 64px is only the fallback for
+       before that var is set on first paint. */
+    bottom: var(--docker-height, 64px);
     left: 0;
     right: 0;
     color: white;
@@ -484,4 +487,189 @@ input:focus-visible {
     display: flex;
     align-items: center;
     gap: 0.5rem;
+}
+
+/* Toggle switch (Autoplay, and any future on/off setting) - used by PlaytimeSettings and the
+   control bar's own autoplay button. Previously referenced (.switch/.slider/.round) but never
+   actually defined anywhere, so it rendered as a bare, unstyled native checkbox. */
+.switch {
+    position: relative;
+    display: inline-block;
+    width: 34px;
+    height: 20px;
+    flex-shrink: 0;
+}
+
+.switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.switch .slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background-color: rgba(120, 120, 120, 0.4);
+    transition: background-color 150ms ease-in-out;
+}
+
+.switch .slider::before {
+    content: "";
+    position: absolute;
+    height: 14px;
+    width: 14px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    transition: transform 150ms ease-in-out;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
+.switch input:checked + .slider {
+    background-color: #ef4444;
+}
+
+.switch input:checked + .slider::before {
+    transform: translateX(14px);
+}
+
+.switch input:focus-visible + .slider {
+    outline: 2px solid #3b82f6;
+    outline-offset: 2px;
+}
+
+.switch .slider.round {
+    border-radius: 20px;
+}
+
+.switch .slider.round::before {
+    border-radius: 50%;
+}
+
+/* Settings menu (PlaytimeSettings) - a YouTube-style flyout: icon + label on the left, a
+   toggle/value/control on the right, consistent row height and hover state. */
+.settings-menu {
+    min-width: 240px;
+    max-width: 280px;
+    padding: 0.4rem 0;
+    font-size: 0.8125rem;
+}
+
+/* .settings-menu button.settings-row (not just .settings-row) - every row here is rendered
+   inside the player's own .video-controls-container .controls, whose generic button rule
+   (font-size: 1.1rem, padding: 0, centered flex, scale(1.1) on hover - all meant for the round
+   icon buttons) has the same specificity as a bare class selector and wins on source order. This
+   matches it class-for-class plus the button type so it reliably wins instead. */
+.settings-menu .settings-row,
+.settings-menu button.settings-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    width: 100%;
+    padding: 0.55rem 0.9rem;
+    text-align: left;
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 0.8125rem;
+    opacity: 1;
+    cursor: default;
+}
+
+.settings-menu button.settings-row {
+    cursor: pointer;
+}
+
+.settings-menu button.settings-row:hover {
+    background-color: rgba(120, 120, 120, 0.12);
+    transform: none;
+    opacity: 1;
+}
+
+.settings-row-label {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    min-width: 0;
+}
+
+.settings-row-label svg {
+    flex-shrink: 0;
+    font-size: 1.15rem;
+    opacity: 0.85;
+}
+
+/* Plain "value" text on the right side of a row that opens a submenu (playback speed) - a real
+   <select>'s own open-list popup is drawn by the OS and can't be themed, so that submenu is built
+   from .settings-submenu/.settings-submenu-item below instead of a <select>. */
+.settings-row-value {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    color: rgba(255, 255, 255, 0.7);
+    flex-shrink: 0;
+}
+
+.settings-chevron {
+    font-size: 0.75rem;
+    transition: transform 150ms ease-in-out;
+}
+
+.settings-chevron-open {
+    transform: rotate(90deg);
+}
+
+.settings-submenu {
+    max-height: 180px;
+    overflow-y: auto;
+    background-color: rgba(0, 0, 0, 0.2);
+}
+
+.settings-menu button.settings-submenu-item {
+    padding-left: 2.3rem;
+    justify-content: flex-start;
+}
+
+.settings-check {
+    color: #ef4444;
+    font-size: 1rem;
+}
+
+.settings-slider {
+    width: 90px;
+    height: 4px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgba(120, 120, 120, 0.4);
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+.settings-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    background: #ef4444;
+    cursor: pointer;
+    border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
+.settings-slider::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    background: #ef4444;
+    cursor: pointer;
+    border-radius: 50%;
+    border: none;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
+.settings-divider {
+    height: 1px;
+    margin: 0.3rem 0;
+    background-color: rgba(120, 120, 120, 0.2);
 }

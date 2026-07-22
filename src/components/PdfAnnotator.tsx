@@ -7,6 +7,7 @@ import usePageRenderCache from "../hooks/usePageRenderCache";
 import { AnnotationObject, AnnotationTool } from "../utils/pdfAnnotationTypes";
 import AnnotationToolbar from "./pdf/AnnotationToolbar";
 import PdfPage from "./pdf/PdfPage";
+import PdfSidebar, { PdfSidebarView } from "./pdf/PdfSidebar";
 import { loadSettings } from "../utils/appSettings";
 
 interface PdfAnnotatorProps {
@@ -38,6 +39,9 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
   const [currentPageIndex, setCurrentPageIndex] = useState<number>(0);
   const [zoom, setZoom] = useState<number>(() => loadSettings().pdfDefaultZoom);
   const [twoPageMode, setTwoPageMode] = useState<boolean>(false);
+  // null = neither panel open. Mutually exclusive with itself only (not with the annotation
+  // tool) — you can keep drawing while browsing thumbnails/contents.
+  const [sidebarView, setSidebarView] = useState<PdfSidebarView | null>(null);
   // null = no tool selected ("deselected" / plain viewing mode) — clicking the already-active
   // tool in the toolbar toggles it back to null instead of leaving it stuck selected.
   const [tool, setTool] = useState<AnnotationTool | null>(() => {
@@ -91,6 +95,10 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
 
   const handleDeselectTool = (): void => {
     setTool(null);
+  };
+
+  const handleSidebarViewChange = (view: PdfSidebarView): void => {
+    setSidebarView((prev) => (prev === view ? null : view));
   };
 
   const handleToggleTwoPageMode = (): void => {
@@ -394,6 +402,8 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
       ) : (
         <AnnotationToolbar
           title={title}
+          sidebarView={sidebarView}
+          onSidebarViewChange={handleSidebarViewChange}
           tool={tool}
           onToolChange={handleToolChange}
           onDeselectTool={handleDeselectTool}
@@ -421,22 +431,27 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
         />
       )}
 
-      {/* min-h-0/min-w-0 are load-bearing: without them a flex child can't shrink below its
-          content's intrinsic size in either axis, so overflow-auto never actually gets a chance
-          to scroll — instead the oversized content (e.g. a wide landscape page) blows out this
-          container's own flex-item width upstream in Dashboard.tsx, which is what pushes the
-          sidebar/toolbar around instead of just scrolling within this box. */}
-      <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex items-start justify-center p-8">
-        {pdfLoading || !pdfDoc || store.loading ? (
-          <div className="text-gray-500 dark:text-neutral-400 italic mt-20">Loading…</div>
-        ) : twoPageMode ? (
-          <div className="flex items-start gap-4">
-            {renderPage(clampedPageIndex, "left")}
-            {hasRightPage && renderPage(rightPageIndex, "right")}
-          </div>
-        ) : (
-          renderPage(clampedPageIndex, "single")
+      {/* min-h-0 here (and min-w-0 one level down) is load-bearing: without it a flex child can't
+          shrink below its content's intrinsic size in either axis, so overflow-auto never
+          actually gets a chance to scroll — instead the oversized content (e.g. a wide landscape
+          page) blows out this container's own flex-item width upstream in Dashboard.tsx, which
+          is what pushes the sidebar/toolbar around instead of just scrolling within this box. */}
+      <div className="flex-1 min-h-0 flex items-stretch overflow-hidden">
+        {!isFullscreen && sidebarView && pdfDoc && (
+          <PdfSidebar pdfDoc={pdfDoc} numPages={numPages} currentPageIndex={clampedPageIndex} onPageChange={handlePageChange} view={sidebarView} />
         )}
+        <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex items-start justify-center p-8">
+          {pdfLoading || !pdfDoc || store.loading ? (
+            <div className="text-gray-500 dark:text-neutral-400 italic mt-20">Loading…</div>
+          ) : twoPageMode ? (
+            <div className="flex items-start gap-4">
+              {renderPage(clampedPageIndex, "left")}
+              {hasRightPage && renderPage(rightPageIndex, "right")}
+            </div>
+          ) : (
+            renderPage(clampedPageIndex, "single")
+          )}
+        </div>
       </div>
     </div>
   );

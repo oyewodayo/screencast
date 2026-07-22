@@ -1,6 +1,8 @@
 import './player.css';
-import React, { useState, useRef, useEffect, ChangeEvent, MouseEvent } from 'react';
-import { IoPause, IoPlay } from 'react-icons/io5';
+import React, { useState, useRef, useEffect, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
+import { invoke, convertFileSrc } from '@tauri-apps/api/tauri';
+import { listen } from '@tauri-apps/api/event';
+import { IoPause, IoPlay, IoPlayCircleOutline, IoPlayCircle } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -8,7 +10,6 @@ import { RxDoubleArrowLeft, RxDoubleArrowRight } from 'react-icons/rx';
 import Alert from './custom/Alert';
 import PlaytimeSettings from './custom/PlaytimeSettings';
 import useAutoHideControls from '../hooks/useAutoHideControls';
-import { MediaFile } from '../utils/videoUtils';
 
 // Import utility functions
 import {
@@ -22,24 +23,25 @@ import {
   updateTimelineProgress
 } from '../utils/videoUtils';
 
-import { handleAutoPlay } from '../handlers/mediaHandlers';
-
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 
 
 
 
-interface PlayerState {
-  isPlaying?: boolean;
-  isPaused?: boolean;
-  currentlyPlayingFile?: string | null;
-  currentFileTitle?: string;
-}
-
 interface TimelineProgress {
   currentTime: string;
   totalTime: string;
+}
+
+// Mirrors the Rust side's ConversionProgress (src-tauri/src/commands/conversion.rs), emitted by
+// run_conversion (shared by get_playable_preview and the manual "Convert" dialog).
+interface ConversionProgress {
+  input_path: string;
+  output_path: string;
+  progress: number;
+  status: 'starting' | 'processing' | 'completed' | 'failed';
+  message: string;
 }
 
 type VolumeLevel = 'low' | 'high' | 'muted';
@@ -62,6 +64,10 @@ interface VideoPlayerProps {
   src?: string;
   title?: string;
   autoPlay?: boolean;
+  // Real filesystem path behind `src` (which is already a browser-loadable asset:// URL) -
+  // needed only to invoke get_playable_preview if native playback fails. Without it, a decode
+  // failure has no recovery path and just shows black, same as before this existed.
+  filePath?: string;
   // Seeks here once metadata is loaded — lets a caller resume audio/video where a previous
   // session left off instead of always restarting at 0.
   initialTime?: number;
@@ -70,18 +76,59 @@ interface VideoPlayerProps {
   loop?: boolean;
   onTimeUpdate?: (time: number) => void;
   onEnded?: () => void;
+  // Controls the Autoplay toggle (button + settings row). When the caller passes both of these,
+  // the toggle becomes fully controlled - its displayed state and every click are driven by the
+  // caller instead of local state. This matters because this component is fully remounted (`key`)
+  // whenever the played file changes, so any local toggle state can't survive across files - the
+  // caller (Dashboard) is the only place autoplay-next state can actually persist.
+  autoplayNext?: boolean;
+  onAutoplayNextChange?: () => void;
 }
 
-const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, initialTime, loop = false, onTimeUpdate, onEnded }) => {
+// Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
+// this player from the outside — there's no controlled "currentTime" prop, since native
+// <video>/timeupdate already round-trips position out via onTimeUpdate; this is just the one
+// missing direction back in.
+export interface VideoPlayerHandle {
+  seek: (time: number) => void;
+}
+
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, autoplayNext, onAutoplayNextChange }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    seek: (time: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      const duration = video.duration;
+      video.currentTime = Number.isFinite(duration) ? Math.max(0, Math.min(time, duration)) : Math.max(0, time);
+    },
+  }), []);
+
   const videoContainerRef = useRef<HTMLDivElement>(null);
   const timelineContainerRef = useRef<HTMLDivElement>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const settingsBtnRef = useRef<HTMLButtonElement>(null);
+  const settingsMenuRef = useRef<HTMLDivElement>(null);
+  // Tracks which `src` a silent conversion fallback has already been attempted for, so a
+  // decode failure on the *converted* file (rare, but possible) doesn't retry forever - and so
+  // switching to a genuinely different file always gets a fresh attempt.
+  const recoveryAttemptedForRef = useRef<string | null>(null);
+  // True while the user is actively dragging the timeline scrub handle - suppresses the normal
+  // playback-driven progress updates (see updateTimeline) so they can't fight the drag.
+  const isDraggingTimelineRef = useRef<boolean>(false);
+  const pendingSeekFractionRef = useRef<number | null>(null);
+  const dragRafRef = useRef<number | null>(null);
 
-  
   // Media type detection
   const [mediaType, setMediaType] = useState<MediaType>('video');
+  // True only while re-encoding an unplayable file in the background - see handleVideoError.
+  // Distinct from the browser's own native "loading metadata" moment, which needs no UI of its
+  // own since it's normally near-instant for files that already play fine.
+  const [isRecovering, setIsRecovering] = useState<boolean>(false);
+  // 0-100, updated live from the backend's conversion-progress events while isRecovering.
+  const [recoveryProgress, setRecoveryProgress] = useState<number>(0);
   // Core player state
   const [, setIsPaused] = useState<boolean>(true);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -98,8 +145,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
   const [showSkipTime, setShowSkipTime] = useState<boolean>(false);
 
   // File and playlist state
-  const [files] = useState<MediaFile[]>([]);
-  const [currentlyPlayingFile, setCurrentlyPlayingFile] = useState<string | null>(null);
   const [currentFileTitle, setCurrentFileTitle] = useState<string>("");
 
   // Time and skip state
@@ -108,7 +153,10 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
   const [currentSkipTime, setCurrentSkipTime] = useState<number>(30);
 
   // Settings and preferences
-  const [isAutoPlay, setAutoPlay] = useState<boolean>(true);
+  // Falls back to local state when the caller doesn't pass autoplayNext/onAutoplayNextChange
+  // (e.g. used standalone outside Dashboard) - see the effective isAutoPlay/handleAutoplay below.
+  const [localAutoPlay, setLocalAutoPlay] = useState<boolean>(true);
+  const isAutoPlay = onAutoplayNextChange ? !!autoplayNext : localAutoPlay;
   const [videoOpacity, setVideoOpacity] = useState<number>(1.0);
 
   // Alert state
@@ -159,26 +207,55 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
     }
   }, [mediaType, src, autoPlay]);
 
-  // State update helper
-  const updatePlayerState = (newState: PlayerState): void => {
-    Object.entries(newState).forEach(([key, value]) => {
-      switch (key) {
-        case 'isPlaying':
-          setIsPlaying(value as boolean);
-          break;
-        case 'isPaused':
-          setIsPaused(value as boolean);
-          break;
-        case 'currentlyPlayingFile':
-          setCurrentlyPlayingFile(value as string | null);
-          break;
-        case 'currentFileTitle':
-          setCurrentFileTitle(value as string);
-          break;
-        default:
-          break;
-      }
+  // Some containers/codecs this app can record (most notably .avi - WebView2's <video> element
+  // has no container support for it at all, regardless of what's encoded inside) can never play
+  // natively no matter what settings produced them. get_playable_preview re-encodes it to a
+  // normal, complete, full-quality mp4 (same codec/crf this app already uses elsewhere, no
+  // resolution or quality shortcuts) and this waits for that to fully finish before loading it -
+  // guaranteed-correct output at the cost of a real wait (roughly 1/3-1/4 of the video's own
+  // length on typical hardware, per ultrafast-preset timing measured elsewhere in this codebase).
+  //
+  // A prior attempt tried to avoid that wait entirely by decoding frame-by-frame into a <canvas>
+  // (ffmpeg's own pipeline, bypassing WebView2's <video> stack) - working and glitch-free, but
+  // capped in quality by two things no amount of tuning fixes: per-frame JPEG re-compression has
+  // no inter-frame compression the way real video codecs do, and every frame has to survive a
+  // round-trip through Tauri's JSON/base64 IPC. For this app's actual content (screen recordings
+  // full of small UI text), that produced clearly unacceptable blur - so this fallback goes back
+  // to the simple, quality-guaranteed path and makes the wait itself transparent instead, via the
+  // conversion-progress event run_conversion already emits (shared with the manual "Convert"
+  // dialog) rather than an opaque spinner.
+  //
+  // Only for actual video (not audio - get_playable_preview always outputs h264 video + aac,
+  // which isn't the right fix for an audio-only source that fails for a different reason).
+  const handleVideoError = async (): Promise<void> => {
+    if (mediaType !== 'video' || !filePath || !src) return;
+    if (recoveryAttemptedForRef.current === src) return; // already tried once for this file
+
+    recoveryAttemptedForRef.current = src;
+    setIsRecovering(true);
+    setRecoveryProgress(0);
+
+    // Scoped to this file's own input_path so a concurrent, unrelated conversion (e.g. the user
+    // manually converting a different file via the "Convert" dialog at the same time) can't
+    // make this progress bar jump around with someone else's numbers.
+    const unlisten = await listen<ConversionProgress>('conversion-progress', (event) => {
+      if (event.payload.input_path !== filePath) return;
+      setRecoveryProgress(Math.round(event.payload.progress));
     });
+
+    try {
+      const playablePath = await invoke<string>('get_playable_preview', { inputPath: filePath });
+      const playableUrl = convertFileSrc(playablePath);
+      if (videoRef.current) {
+        videoRef.current.src = playableUrl;
+        if (autoPlay) await videoRef.current.play().catch(() => {});
+      }
+    } catch (err) {
+      console.error('Playback recovery failed:', err);
+    } finally {
+      unlisten();
+      setIsRecovering(false);
+    }
   };
 
   // Player controls
@@ -287,6 +364,72 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
     setShowSkipTime(false);
   };
 
+  // Updates the visual thumb/progress position immediately (a plain CSS var write, effectively
+  // free), independent of whether we actually seek the video this same call - dragging feels
+  // laggy if the thumb only moves once the (comparatively expensive) seek finishes.
+  const updateTimelineVisual = (fraction: number): void => {
+    const timeline = timelineContainerRef.current;
+    const video = videoRef.current;
+    if (timeline) timeline.style.setProperty('--progress-position', fraction.toString());
+    if (video && Number.isFinite(video.duration)) {
+      setCurrentTimeElement(formatDuration(fraction * video.duration));
+    }
+  };
+
+  const seekToClientX = (clientX: number, throttle: boolean): void => {
+    const timeline = timelineContainerRef.current;
+    const video = videoRef.current;
+    if (!timeline || !video || !Number.isFinite(video.duration)) return;
+    const rect = timeline.getBoundingClientRect();
+    const fraction = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+
+    updateTimelineVisual(fraction);
+
+    // While actively dragging, coalesce to one actual seek per animation frame instead of one
+    // per mousemove (which can fire far faster than the decoder can usefully keep up with) -
+    // the thumb still tracks the cursor at full rate via updateTimelineVisual above, only the
+    // (more expensive) real seek is throttled.
+    if (throttle) {
+      pendingSeekFractionRef.current = fraction;
+      if (dragRafRef.current === null) {
+        dragRafRef.current = requestAnimationFrame(() => {
+          dragRafRef.current = null;
+          if (pendingSeekFractionRef.current === null) return;
+          if (videoRef.current && Number.isFinite(videoRef.current.duration)) {
+            videoRef.current.currentTime = pendingSeekFractionRef.current * videoRef.current.duration;
+          }
+          pendingSeekFractionRef.current = null;
+        });
+      }
+    } else {
+      video.currentTime = fraction * video.duration;
+    }
+  };
+
+  // Real-time drag-to-scrub: mousedown both seeks immediately (subsuming plain click-to-seek)
+  // and starts tracking window-level mousemove/mouseup, so dragging keeps working even if the
+  // cursor slips off the (narrow) timeline bar mid-drag - a per-element listener alone would
+  // drop the drag the instant that happens.
+  const handleTimelineMouseDown = (e: MouseEvent<HTMLDivElement>): void => {
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
+    isDraggingTimelineRef.current = true;
+    seekToClientX(e.clientX, false);
+
+    const handleWindowMouseMove = (moveEvent: globalThis.MouseEvent): void => {
+      seekToClientX(moveEvent.clientX, true);
+    };
+
+    const handleWindowMouseUp = (upEvent: globalThis.MouseEvent): void => {
+      isDraggingTimelineRef.current = false;
+      seekToClientX(upEvent.clientX, false); // final precise seek, not the throttled one
+      window.removeEventListener('mousemove', handleWindowMouseMove);
+      window.removeEventListener('mouseup', handleWindowMouseUp);
+    };
+
+    window.addEventListener('mousemove', handleWindowMouseMove);
+    window.addEventListener('mouseup', handleWindowMouseUp);
+  };
+
   const selectSkipTiming = (value: number): void => {
     setCurrentSkipTime(value);
     setShowSkipTime(false);
@@ -296,8 +439,29 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
     setShowSettings(!showSettings);
   };
 
+  // Close the settings flyout on any click outside it (its own gear button included, so that
+  // click doesn't immediately re-close what toggleSettings just opened) - previously it only ever
+  // closed by clicking the gear again.
+  useEffect(() => {
+    if (!showSettings) return;
+
+    const handleClickOutside = (event: globalThis.MouseEvent): void => {
+      const target = event.target as Node;
+      if (settingsMenuRef.current?.contains(target)) return;
+      if (settingsBtnRef.current?.contains(target)) return;
+      setShowSettings(false);
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showSettings]);
+
   const handleAutoplay = (): void => {
-    setAutoPlay(!isAutoPlay);
+    if (onAutoplayNextChange) {
+      onAutoplayNextChange();
+    } else {
+      setLocalAutoPlay(!localAutoPlay);
+    }
   };
 
   const handleScreenControls = (): void => {
@@ -306,6 +470,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 
   // Timeline and progress updates
   const updateTimeline = (): void => {
+    if (isDraggingTimelineRef.current) {
+      // Drag already owns the visual position (see updateTimelineVisual) - just keep the loop
+      // alive so it resumes tracking playback the instant the drag ends, without needing to be
+      // separately restarted from handleTimelineMouseDown.
+      animationFrameRef.current = requestAnimationFrame(updateTimeline);
+      return;
+    }
     if (videoRef.current && !videoRef.current.paused) {
       const progress: TimelineProgress | null = updateTimelineProgress(
         videoRef.current, 
@@ -348,9 +519,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 
     const handleEnded = (): void => {
       onEnded?.();
-      if (currentlyPlayingFile) { // This checks for both null and empty string
-        handleAutoPlay(files, currentlyPlayingFile, video, updatePlayerState, isAutoPlay);
-      }
     };
 
     video.addEventListener('play', handlePlay);
@@ -384,7 +552,18 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [files, currentlyPlayingFile, isAutoPlay, mediaType, onEnded]);
+  }, [mediaType, onEnded]);
+
+  // Unmount-only: cancels a throttled drag-seek that's still pending if the player goes away
+  // mid-drag (window mousemove/mouseup listeners from handleTimelineMouseDown clean themselves
+  // up on the next mouseup regardless, since they're plain closures, not refs).
+  useEffect(() => {
+    return () => {
+      if (dragRafRef.current) {
+        cancelAnimationFrame(dragRafRef.current);
+      }
+    };
+  }, []);
 
   // Reports playback position as it advances, and once more on unmount/file-change — the latter
   // is what lets a caller (Dashboard, for audio) capture "wherever this track was" the moment the
@@ -500,7 +679,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 					<div className="pointer-events-auto"></div>
 					
 					<div className="video-controls-container py-2 place-items-center">
-					<div className="timeline-container" id="timelineContainer" ref={timelineContainerRef}>
+					<div className="timeline-container" id="timelineContainer" ref={timelineContainerRef} onMouseDown={handleTimelineMouseDown}>
 						<div className="timeline">
 						<img className="preview-img" id="previewImgSrc" alt="Video preview" />
 						<div className="thumb-indicator"></div>
@@ -509,13 +688,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 					
 					<div className="controls flex flex-row justify-between mt-2">
 						<div className='flex gap-5'>
-						<button className="play-pause-btn" onClick={togglePauseAndPlay}>
+						<button className="play-pause-btn" onClick={togglePauseAndPlay} title={isPlaying ? 'Pause (k)' : 'Play (k)'}>
 							{isPlaying ? <IoPause className='text-3xl' /> : <IoPlay className='text-3xl' />}
 						</button>
-						
+
 						<div className="volume-container">
-							<button className="mute-btn z-20 w-7" onClick={toggleMute}>
-							{renderVolumeIcon()}  
+							<button className="mute-btn z-20 w-7" onClick={toggleMute} title="Mute (m)">
+							{renderVolumeIcon()}
 							</button>
 							<input 
 							className="volume-slider" 
@@ -530,7 +709,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 						</div>
 
 						<div className="duration-container">
-							{currentFileTitle && (
+							{/* Was gated on currentFileTitle, internal state that's only ever populated for
+							    the 'image' media type (see the media-type-detection effect) - never set for
+							    ordinary video/audio playback, so this never actually rendered a time display
+							    for the app's main use case. Gating on `src` (a real playing-file signal) instead. */}
+							{src && (
 							<>
 								<div className="current-time">{currentTimeElement}</div>
 								/
@@ -542,19 +725,21 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 						
 						<div className="flex flex-col place-items-center items-center">
 						<div className='flex gap-4'>
-							<button 
+							<button
 							className='flex justify-center place-items-center'
-							onClick={handleBackwardSkipTime} 
+							onClick={handleBackwardSkipTime}
 							onDoubleClick={handleForwardSkip}
+							title={`Back ${currentSkipTime}s (double-click to change)`}
 							>
 							<RxDoubleArrowLeft className={`text-[20px]`} />
 							<span className='text-[10px]'>{currentSkipTime}</span>
 							</button>
-							
-							<button 
+
+							<button
 							className='flex justify-center place-items-center'
-							onClick={handleForwardSkipTime} 
+							onClick={handleForwardSkipTime}
 							onDoubleClick={handleForwardSkip}
+							title={`Forward ${currentSkipTime}s (double-click to change)`}
 							>
 							<span className='text-[10px]'>{currentSkipTime}</span>
 							<RxDoubleArrowRight className={`text-[20px]`} />
@@ -568,28 +753,40 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 
 						<div className='flex gap-5'>
 						<div className='place-items-center flex'>
-							<button className="playback-reduce" onClick={playbackSpeedReduce}>
+							<button className="playback-reduce" onClick={playbackSpeedReduce} title="Slow down (j)">
 							<IoIosArrowBack className='text-2xl' />
 							</button>
 
-							<button className="speed-btn wide-btn" onClick={playbackSpeedNormal}>
+							<button className="speed-btn wide-btn" onClick={playbackSpeedNormal} title="Reset speed to 1x">
 							{currentPlaySpeed}
 							</button>
 
-							<button className="playback-increase" onClick={playbackSpeedIncrease}>
+							<button className="playback-increase" onClick={playbackSpeedIncrease} title="Speed up (l)">
 							<IoIosArrowForward className='text-2xl' />
 							</button>
 						</div>
 
-						<button className="captions-btn w-7" onClick={toggleCaptions}>
+						<button
+						className="autoplay-btn w-7"
+						onClick={handleAutoplay}
+						title={isAutoPlay ? 'Autoplay is on' : 'Autoplay is off'}
+						aria-pressed={isAutoPlay}
+						>
+							{isAutoPlay
+							? <IoPlayCircle className='w-[100%] text-2xl text-red-500' />
+							: <IoPlayCircleOutline className='w-[100%] text-2xl text-white' />}
+						</button>
+
+						<button className="captions-btn w-7" onClick={toggleCaptions} title={captionsVisible ? 'Captions on' : 'Captions off'}>
 							<FaClosedCaptioning className={`w-[100%] text-2xl ${captionsVisible ? 'text-red-500' : 'text-white'}`} />
 						</button>
 
-						<button className="settings-btn w-7" onClick={toggleSettings}>
+						<button ref={settingsBtnRef} className="settings-btn w-7" onClick={toggleSettings} title="Settings">
 							<FaCog className='w-[100%] text-2xl' />
 						</button>
 
 						{showSettings && (
+							<div ref={settingsMenuRef} className="contents">
 							<PlaytimeSettings
 							onAutoplayChange={handleAutoplay}
 							isAutoplay={isAutoPlay}
@@ -603,13 +800,14 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 							opacity={videoOpacity}
 							onOpacityChange={setVideoOpacity}
 							/>
+							</div>
 						)}
 
-						<button className="mini-player-btn w-7" onClick={toggleMiniPlayerMode}>
+						<button className="mini-player-btn w-7" onClick={toggleMiniPlayerMode} title="Picture in picture (i)">
 							<MiniPlayerIcon />
 						</button>
 
-						<button className="full-screen-btn w-7" onClick={toggleFullScreenMode}>
+						<button className="full-screen-btn w-7" onClick={toggleFullScreenMode} title={isFullscreen ? 'Exit fullscreen (f)' : 'Fullscreen (f)'}>
 							{isFullscreen ? <BsFullscreenExit className='text-2xl' /> : <BsFullscreen className='text-2xl' />}
 						</button>
 						</div>
@@ -631,10 +829,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 					}}
 					/>
 				) : (
+					<>
 					<video
 						ref={videoRef}
 						loop={loop}
 						onClick={togglePauseAndPlay}
+						onError={handleVideoError}
 						onLoadedMetadata={() => {
 							if (videoRef.current) {
 							setTotalTimeElement(formatDuration(videoRef.current.duration));
@@ -652,6 +852,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
 							default={captionsVisible}
 						/>
 					</video>
+					{isRecovering && (
+						<div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none bg-black/40">
+							<div className="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />
+							<div className="text-white text-sm">Preparing video{recoveryProgress > 0 ? ` — ${recoveryProgress}%` : '...'}</div>
+						</div>
+					)}
+					</>
 				)
 			}
     	</div>
@@ -659,6 +866,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, title, autoPlay = true, 
     </div>
 
   );
-};
+});
 
 export default VideoPlayer;

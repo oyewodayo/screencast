@@ -1,16 +1,30 @@
-import React, { Dispatch, SetStateAction, useEffect, useState } from "react";
+import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
 import OsInfo from "./OsInfo";
 
-import {
-  IoInformationCircle,
-  IoRefresh
-} from "react-icons/io5";
 import { message } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
 import ActiveRecordingState from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
+import RecordingDocker from "./docker/RecordingDocker";
+import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 
 interface Props {
+  // Which content the collapsible panel below ActiveRecordingState shows - the default
+  // recording-setup controls, or quick tools for whichever file is currently open. Toggled from
+  // Dashboard's sidebar (see the button next to "new folder"); falls back to "record" whenever
+  // activeFile is null; either way, the presence check happens in BottomDocker's render, not here.
+  dockerMode: "record" | "file-tools";
+  activeFile: DockerFile | null;
+  // Asset:// URL for activeFile (already converted for the main player) — needed only by the
+  // video-tools timeline, which loads its own hidden <video> to capture thumbnail frames.
+  activeFilePlayableSrc: string | null;
+  // Live playback position of the main player, and a way to seek it - what lets the video-tools
+  // timeline's playhead track and drive real playback instead of being purely decorative.
+  activeFileCurrentTime: number;
+  onSeekActiveFile: (time: number) => void;
+  onConvertFile: (file: DockerFile) => void;
+  onRenameFile: (file: DockerFile, newName: string) => Promise<void>;
+  onDeleteFile: (file: DockerFile) => Promise<void>;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
   handleOpenSettings: () => void;
@@ -29,6 +43,8 @@ interface Props {
   setOverlayPosition: React.Dispatch<React.SetStateAction<string>>; // ADD THIS
   overlaySize: string; // ADD THIS
   setOverlaySize: React.Dispatch<React.SetStateAction<string>>; // ADD THIS
+  includeSystemAudio: boolean;
+  setIncludeSystemAudio: React.Dispatch<React.SetStateAction<boolean>>;
   isMonitoring: boolean;
   setIsMonitoring: Dispatch<SetStateAction<boolean>>;
   windowTitles?: any[];
@@ -37,11 +53,12 @@ interface Props {
     file_ext: string;
     record_type: string;
     audio_device: string;
-    video_device: string;
+    video_devices: string[];
     screen_size: string; // Make sure this is here
     overlay_shape: string;
     overlay_position: string;
     overlay_size: string;
+    include_system_audio: boolean;
   }) => void;
   handleStopRecording: () => void;
   isRecording: boolean;
@@ -55,12 +72,20 @@ interface Props {
   setRecordType: React.Dispatch<React.SetStateAction<string>>;
   audioDevice: string;
   setAudioDevice: React.Dispatch<React.SetStateAction<string>>;
-  videoDevice: string;
-  setVideoDevice: React.Dispatch<React.SetStateAction<string>>;
+  videoDevices: string[];
+  setVideoDevices: React.Dispatch<React.SetStateAction<string[]>>;
 }
 
 type ConnectedDevice = string[];
 const BottomDocker = ({
+  dockerMode,
+  activeFile,
+  activeFilePlayableSrc,
+  activeFileCurrentTime,
+  onSeekActiveFile,
+  onConvertFile,
+  onRenameFile,
+  onDeleteFile,
   handleFolderSettings,
   handleGoHome,
   handleOpenSettings,
@@ -79,6 +104,8 @@ const BottomDocker = ({
   setOverlayPosition, // ADD THIS
   overlaySize, // ADD THIS
   setOverlaySize, // ADD THIS
+  includeSystemAudio,
+  setIncludeSystemAudio,
   handleStartRecording,
   handleStopRecording,
   isMonitoring,
@@ -95,8 +122,8 @@ const BottomDocker = ({
   setRecordType,
   audioDevice,
   setAudioDevice,
-  videoDevice,
-  setVideoDevice
+  videoDevices,
+  setVideoDevices
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -106,6 +133,27 @@ const BottomDocker = ({
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
   const [showDocker, setShowDocker] = useState(true);
+  // This whole docker is `fixed bottom-0`, sitting on top of the video player rather than
+  // participating in its flex layout - so the player's own control bar (see .video-controls-
+  // container in player.css) has no natural way to know how tall it is and previously assumed a
+  // fixed 64px (the collapsed-only height), which put the controls out of view any time the full
+  // panel below (file name/type/recording options/etc.) was expanded. Measuring the real height
+  // and publishing it as a CSS var lets the player's controls track it exactly, collapsed or not.
+  const dockerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = dockerRef.current;
+    if (!el) return;
+
+    const publishHeight = (): void => {
+      document.documentElement.style.setProperty('--docker-height', `${el.offsetHeight}px`);
+    };
+
+    publishHeight();
+    const observer = new ResizeObserver(publishHeight);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [showDocker]);
   
   // REMOVE THESE - now coming from props:
   // const [screenSize, setScreenSize] = useState("fullscreen")
@@ -149,7 +197,7 @@ const BottomDocker = ({
       .then((devices) => {
         setConnectedCameraDevices(devices);
         if (devices.length > 0) {
-          setVideoDevice(devices[0]);
+          setVideoDevices([devices[0]]); // Default to the first detected camera
         }
       })
       .catch(console.error);
@@ -196,10 +244,10 @@ const BottomDocker = ({
     setAudioDevice(event.target.value);
   };
 
-  const handleVideoDeviceChange = (
-    event: React.ChangeEvent<HTMLSelectElement>
-  ) => {
-    setVideoDevice(event.target.value);
+  const toggleVideoDevice = (device: string) => {
+    setVideoDevices((prev) =>
+      prev.includes(device) ? prev.filter((d) => d !== device) : [...prev, device]
+    );
   };
 
   // EnhancedScreenOptions passes the resolved target directly when it has one (e.g. clicking a
@@ -216,7 +264,7 @@ const BottomDocker = ({
       record_type: recordType,
       audio_device: audioDevice,
       screen_size: effectiveScreenSize,
-      video_device: videoDevice,
+      video_devices: videoDevices,
       overlay_shape:overlayShape,
       overlay_position:overlayPosition,
       overlay_size:overlaySize,
@@ -224,6 +272,7 @@ const BottomDocker = ({
       // by title, not handle, so the actual title has to travel separately. Monitor capture
       // reuses the same field for its overlay's on-screen label.
       window_title: effectiveScreenSize !== 'fullscreen' ? effectiveSelectedScreen : '',
+      include_system_audio: includeSystemAudio,
     };
 
     console.log(formData)
@@ -238,7 +287,7 @@ const BottomDocker = ({
         console.log("Is monitoring: ",isMonitoring)
         await invoke("start_monitoring_windows")
 
-        setIsMonitoring(isMonitoring)
+        setIsMonitoring(true)
         console.log("Monitoring started")
       }
 
@@ -278,6 +327,7 @@ const BottomDocker = ({
     <>
     <EnhancedScreenOptions
      recordType={recordType}
+     videoDevices={videoDevices}
      selectScreen={selectScreen}
      setScreen={setScreen}
      unSetScreen={unSetScreen}
@@ -297,173 +347,58 @@ const BottomDocker = ({
       onStartRecording={onStartRecording} 
       setOpen={setModalOpenScreen}
     />
-    <div className="w-full fixed bottom-0 flex flex-col">
+    <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col">
      
-      <ActiveRecordingState
-        isRecording={isRecording}
-        recordingStartTime={recordingStartTime}
-        recordType={recordType}
-        handleFolderSettings={handleFolderSettings}
-        handleGoHome={handleGoHome}
-        handleOpenSettings={handleOpenSettings}
-        handleOpenExternalFile={handleOpenExternalFile}
-        handleVideoOverlayAction={handleVideoOverlayAction}
-        handleStopRecording={handleStopRecording}
-        showDocker={showDocker}
-        setShowDocker={setShowDocker}
-        showFileList={showFileList} 
-         />
+        <ActiveRecordingState
+            isRecording={isRecording}
+            recordingStartTime={recordingStartTime}
+            recordType={recordType}
+            handleFolderSettings={handleFolderSettings}
+            handleGoHome={handleGoHome}
+            handleOpenSettings={handleOpenSettings}
+            handleOpenExternalFile={handleOpenExternalFile}
+            handleVideoOverlayAction={handleVideoOverlayAction}
+            handleStopRecording={handleStopRecording}
+            showDocker={showDocker}
+            setShowDocker={setShowDocker}
+            showFileList={showFileList} 
+        />
       
       {showDocker && (<div className="w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
-        <div className="w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
-
-          <div className="flex flex-wrap items-end gap-3">
-            <div>
-              <div className="p-1 text-sm">Save file as</div>
-              <input
-                type="text"
-                className="file_name p-2.5 rounded-l text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-                name="file_name"
-                id="file_name"
-                value={fileName}
-                onChange={handleFileNameChange}
-                placeholder={"Recording-" + Date()}
-              />
-            </div>
-
-            <div>
-              <div className="p-1 text-sm flex items-center justify-between">Type <button type="button"><IoInformationCircle onClick={videoFormatInfo}/></button></div>
-              <select
-                name="file_ext"
-                id="file_ext"
-                className="p-2.5 rounded-r text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-                value={fileExt}
-                onChange={handleFileExtChange}
-              >
-                {recordType === "c" ? (
-                  <>
-                    <option value="png">Png</option>
-                    <option value="jpeg">Jpeg</option>
-                    <option value="webp">webp</option>
-                  </>
-                ) : recordType === "a" ? (
-                  <>
-                    <option value="mp3">Mp3</option>
-                    <option value="wav">Wav</option>
-                    <option value="aac">AAC</option>
-                    <option value="wma">WMA</option>
-                  </>
-                ) : (
-                  <>
-                    <option value="avi">Avi</option>
-                    <option value="mkv">Mkv</option>
-                    <option value="webm">webm</option>
-                    <option value="mov">Mov</option>
-                    <option value="mp4">Mp4</option>
-                  </>
-                )}
-              </select>
-            </div>
-
-            <div>
-              <div className="p-1 text-sm">Recording options</div>
-              <select
-                name="record_type"
-                id="record_type"
-                className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-                value={recordType}
-                onChange={handleRecordTypeChange}
-              >
-                <option value="sva">
-                  Screen record(Screen + Video + Audio)
-                </option>
-                <option value="sa">Screen record(Screen + Audio)</option>
-                <option value="va">Screen record(Video and Audio)</option>
-                <option value="s">Screen record(Screen only)</option>
-                <option value="v">Video</option>
-                <option value="a">Audio</option>
-              </select>
-            </div>
-
-            <div>
-              <div className="p-1 text-sm">Audio device</div>
-              <select
-                name="audioDevice"
-                id="audioDevice"
-                className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-                value={audioDevice}
-                onChange={handleAudioDeviceChange}
-              >
-                {connectedAudioDevices ? (
-                  connectedAudioDevices.map((audioDevice, index) => (
-                    <option key={index} value={audioDevice}>
-                      {audioDevice}
-                    </option>
-                  ))
-                ) : (
-                  <option value="">No audio device detected</option>
-                )}
-              </select>
-            </div>
-
-            <div className="flex items-end gap-1">
-              <div>
-                <div className="p-1 text-sm">Video device</div>
-                <select
-                  name="videoDevice"
-                  id="videoDevice"
-                  className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-                  value={videoDevice}
-                  onChange={handleVideoDeviceChange}
-                >
-                  {connectedCameraDevices ? (
-                    connectedCameraDevices.map((videoDevice, index) => (
-                      <option key={index} value={videoDevice}>
-                        {videoDevice}
-                      </option>
-                    ))
-                  ) : (
-                    <option value="">No video cameras detected</option>
-                  )}
-                </select>
-              </div>
-              <button
-                type="button"
-                onClick={loadDevices}
-                title="Refresh device list"
-                className="p-2.5 rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700"
-              >
-                <IoRefresh />
-              </button>
-            </div>
-          </div>
-
-          <div className="flex items-end gap-2">
-            <button
-              onClick={handleScreenshotClick}
-              disabled={isRecording}
-              className="p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              Screenshot
-            </button>
-
-            {!isRecording ? (
-              <button
-                onClick={()=>openModalScreen()}
-                className="p-2.5 rounded-md text-sm bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white"
-              >
-                Start Recording
-              </button>
-            ) : (
-              <button
-                onClick={handleStopRecording}
-                className="p-2.5 rounded-md text-sm bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white"
-              >
-                Stop Recording
-              </button>
-            )}
-          </div>
-        </div>
+        {dockerMode === "file-tools" && activeFile ? (
+          <FileToolsDocker
+            file={activeFile}
+            playableSrc={activeFilePlayableSrc}
+            currentTime={activeFileCurrentTime}
+            onSeek={onSeekActiveFile}
+            onConvert={onConvertFile}
+            onRename={onRenameFile}
+            onDelete={onDeleteFile}
+          />
+        ) : (
+          <RecordingDocker
+            fileName={fileName}
+            onFileNameChange={handleFileNameChange}
+            fileExt={fileExt}
+            onFileExtChange={handleFileExtChange}
+            onShowVideoFormatInfo={videoFormatInfo}
+            recordType={recordType}
+            onRecordTypeChange={handleRecordTypeChange}
+            audioDevice={audioDevice}
+            onAudioDeviceChange={handleAudioDeviceChange}
+            connectedAudioDevices={connectedAudioDevices}
+            connectedCameraDevices={connectedCameraDevices}
+            videoDevices={videoDevices}
+            onToggleVideoDevice={toggleVideoDevice}
+            onRefreshDevices={loadDevices}
+            includeSystemAudio={includeSystemAudio}
+            onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
+            isRecording={isRecording}
+            onScreenshotClick={handleScreenshotClick}
+            onStartRecordingClick={() => openModalScreen()}
+            onStopRecordingClick={handleStopRecording}
+          />
+        )}
 
         <div className="w-full grid grid-cols-1 grid-flow-col text-xs">
           <div>
