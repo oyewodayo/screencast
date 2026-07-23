@@ -193,8 +193,13 @@ const [conversionFile, setConversionFile] = useState<{path: string; name: string
   // straight off the ref) so the timeline re-renders as playback advances.
   const videoPlayerRef = useRef<VideoPlayerHandle>(null);
   const [playerCurrentTime, setPlayerCurrentTime] = useState<number>(0);
+  // Mirrors playerCurrentTime's round-trip, but for play/pause state - lets the video-tools
+  // timeline show an accurate Play/Pause icon and toggle real playback from its own transport
+  // button, the same way its playhead already tracks and drives the real player.
+  const [playerIsPlaying, setPlayerIsPlaying] = useState<boolean>(false);
   useEffect(() => {
     setPlayerCurrentTime(0);
+    setPlayerIsPlaying(false);
   }, [selectedFile?.path]);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
@@ -822,6 +827,17 @@ const setScreen = () => {
 		await loadFileForPlayback(file.path, file.name);
 	};
 
+	// Fired by VideoTimelineDocker's Save button once export_trimmed_video finishes - same
+	// refresh-list-then-select-the-result shape as ConversionDialog's onConverted below, since
+	// this is exactly the same kind of event (a new file appeared in the library, backed by a
+	// real render already sitting on disk). The video that was being edited is left exactly as it
+	// was; this just adds its trimmed/cut sibling alongside it.
+	const handleVideoExported = async (newPath: string, newFileName: string) => {
+		await handleDirectoryFiles();
+		setMessage(`Saved edited video: ${formatFileName(newFileName)}`);
+		await loadFileForPlayback(newPath, newFileName);
+	};
+
 	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
 	// the currently selected file happens to live in, so prev/next still works when a category
 	// is split across multiple folders.
@@ -935,13 +951,19 @@ const setScreen = () => {
 	// Video equivalent of handleAudioEnded — advances to the next video in the list when the
 	// player's own Autoplay toggle is on. No repeat mode for video, so a non-wrapping advance
 	// (stops at the last file rather than looping) is the only behavior.
+	//
+	// Suppressed entirely while the video-tools timeline panel is open: autoplaying away from the
+	// video someone is mid-edit on is disorienting (the player silently switches out from under
+	// them) and is also what was quietly discarding in-session undo/redo history - see
+	// useVideoEditStore's per-path history cache for the other half of that fix.
 	const handleVideoEnded = useCallback(() => {
 		const current = selectedFileRef.current;
 		if (!current || getFileCategory(current.name) !== "video") return;
 		if (!videoAutoplayNext) return;
+		if (dockerMode === "file-tools") return;
 		navigateVideo(1, { wrap: false });
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [videoAutoplayNext, files]);
+	}, [videoAutoplayNext, files, dockerMode]);
 
 	// Single onEnded handed to VideoPlayer for both audio and video playback — each of the two
 	// handlers above bails immediately if the file that just ended isn't its category, so exactly
@@ -1780,6 +1802,7 @@ const setScreen = () => {
                   handleAudioTimeUpdate(time);
                   setPlayerCurrentTime(time);
                 }}
+                onPlayStateChange={setPlayerIsPlaying}
                 onEnded={handleMediaEnded}
                 autoplayNext={isAudioSelected ? audioAutoplayNext : videoAutoplayNext}
                 onAutoplayNextChange={() =>
@@ -1803,9 +1826,12 @@ const setScreen = () => {
         activeFilePlayableSrc={selectedFile?.path ?? null}
         activeFileCurrentTime={playerCurrentTime}
         onSeekActiveFile={(time) => videoPlayerRef.current?.seek(time)}
+        activeFileIsPlaying={playerIsPlaying}
+        onTogglePlayActiveFile={() => videoPlayerRef.current?.togglePlay()}
         onConvertFile={(file) => setConversionFile(file)}
         onRenameFile={renameFile}
         onDeleteFile={handleDeleteFile}
+        onExportedFile={handleVideoExported}
         selectScreen={selectScreen}
         setScreen={setScreen}
         unSetScreen={unSetScreen}

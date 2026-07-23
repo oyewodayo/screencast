@@ -19,6 +19,7 @@ mod commands {
 mod services {
     pub mod utility;
     pub mod pdf_annotations;
+    pub mod video_edits;
     pub mod trash;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
@@ -147,6 +148,7 @@ fn main() {
             commands::conversion::convert_video,
             commands::conversion::convert_image,
             commands::conversion::convert_audio,
+            commands::conversion::export_trimmed_video,
 
             commands::native_playback::start_native_playback,
             commands::native_playback::get_next_video_frame,
@@ -167,6 +169,8 @@ fn main() {
             services::utility::get_platform,
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
+            services::video_edits::save_video_edit_state,
+            services::video_edits::load_video_edit_state,
 
             services::trash::move_to_trash,
             services::trash::list_trash,

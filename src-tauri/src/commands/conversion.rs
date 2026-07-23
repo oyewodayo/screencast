@@ -431,6 +431,86 @@ pub async fn convert_audio(
     Ok(result)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct KeepSegment {
+    pub start: f64,
+    pub end: f64,
+}
+
+// Renders the edited (trimmed/split) video described by `segments` - an ordered list of the
+// *kept* time ranges from the source, produced by VideoTimelineDocker's trim handles and
+// split+delete tool - to a brand-new file next to the source. The source is never opened for
+// writing and never deleted: unlike convert_to_mp4/convert_video/convert_audio above, there is no
+// `preserve_original` parameter here at all, because there is no "false" branch to have - the
+// input is categorically read-only to this command.
+//
+// A single kept segment (plain trim, no cuts) uses fast, low-artifact `-ss`/`-to` range
+// extraction. More than one (after Split+Delete) needs an actual filter graph: trim+concat can't
+// be expressed as simple `-ss`/`-to` since ffmpeg only accepts one input range per input stream.
+#[tauri::command]
+pub async fn export_trimmed_video(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    input_path: String,
+    segments: Vec<KeepSegment>,
+) -> Result<String, String> {
+    if segments.is_empty() {
+        return Err("No segments to export".to_string());
+    }
+
+    let input = PathBuf::from(&input_path);
+    let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = input.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
+    let parent = input.parent().map(PathBuf::from).unwrap_or_default();
+    let output = parent.join(format!("{} (edited).{}", stem, ext));
+
+    let owned_args: Vec<String> = if segments.len() == 1 {
+        let seg = &segments[0];
+        vec![
+            "-ss".into(), format!("{:.3}", seg.start),
+            "-to".into(), format!("{:.3}", seg.end),
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), "medium".into(),
+            "-crf".into(), "23".into(),
+            "-c:a".into(), "aac".into(),
+            "-b:a".into(), "128k".into(),
+            "-movflags".into(), "+faststart".into(),
+        ]
+    } else {
+        // One [trim+setpts] pair per kept segment, feeding a single concat node - the standard
+        // ffmpeg pattern for "cut several ranges out of one input and stitch the rest together".
+        // concat's inputs must be *segment-major* - [v0][a0][v1][a1]... - not all video labels
+        // followed by all audio labels; the latter silently mislabels pad indices as the wrong
+        // media type and ffmpeg rejects the whole filtergraph ("Media type mismatch").
+        let mut filter = String::new();
+        let mut concat_inputs = String::new();
+        for (i, seg) in segments.iter().enumerate() {
+            filter.push_str(&format!(
+                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS[v{2}];[0:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
+                seg.start, seg.end, i
+            ));
+            concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
+        }
+        filter.push_str(&format!("{}concat=n={}:v=1:a=1[outv][outa]", concat_inputs, segments.len()));
+
+        vec![
+            "-filter_complex".into(), filter,
+            "-map".into(), "[outv]".into(),
+            "-map".into(), "[outa]".into(),
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), "medium".into(),
+            "-crf".into(), "23".into(),
+            "-c:a".into(), "aac".into(),
+            "-b:a".into(), "128k".into(),
+            "-movflags".into(), "+faststart".into(),
+        ]
+    };
+    let codec_args: Vec<&str> = owned_args.iter().map(|s| s.as_str()).collect();
+
+    run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await
+}
+
 // Cancel ongoing conversion
 #[tauri::command]
 pub async fn cancel_conversion(

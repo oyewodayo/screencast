@@ -76,6 +76,10 @@ interface VideoPlayerProps {
   loop?: boolean;
   onTimeUpdate?: (time: number) => void;
   onEnded?: () => void;
+  // Round-trips play/pause state out, mirroring onTimeUpdate - fires from the native <video>
+  // 'play'/'pause' events, so it stays correct regardless of what triggered the change (this
+  // player's own button, togglePlay() from outside, keyboard shortcuts, autoplay, etc).
+  onPlayStateChange?: (isPlaying: boolean) => void;
   // Controls the Autoplay toggle (button + settings row). When the caller passes both of these,
   // the toggle becomes fully controlled - its displayed state and every click are driven by the
   // caller instead of local state. This matters because this component is fully remounted (`key`)
@@ -88,12 +92,14 @@ interface VideoPlayerProps {
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
 // this player from the outside — there's no controlled "currentTime" prop, since native
 // <video>/timeupdate already round-trips position out via onTimeUpdate; this is just the one
-// missing direction back in.
+// missing direction back in. togglePlay is the same idea for play/pause - onPlayStateChange
+// below is its own round-trip out, mirroring onTimeUpdate.
 export interface VideoPlayerHandle {
   seek: (time: number) => void;
+  togglePlay: () => void;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, autoplayNext, onAutoplayNextChange }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -104,6 +110,10 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       const duration = video.duration;
       video.currentTime = Number.isFinite(duration) ? Math.max(0, Math.min(time, duration)) : Math.max(0, time);
     },
+    // togglePauseAndPlay is declared further down in this component, but this factory only
+    // actually runs (via useImperativeHandle's internal effect) after the whole render body -
+    // including that declaration - has executed, so the forward reference is safe.
+    togglePlay: () => togglePauseAndPlay(),
   }), []);
 
   const videoContainerRef = useRef<HTMLDivElement>(null);
@@ -502,12 +512,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const handlePlay = (): void => {
       setIsPlaying(true);
       setIsPaused(false);
+      onPlayStateChange?.(true);
       updateTimeline();
     };
 
     const handlePause = (): void => {
       setIsPlaying(false);
       setIsPaused(true);
+      onPlayStateChange?.(false);
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
@@ -552,7 +564,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [mediaType, onEnded]);
+  }, [mediaType, onEnded, onPlayStateChange]);
 
   // Unmount-only: cancels a throttled drag-seek that's still pending if the player goes away
   // mid-drag (window mousemove/mouseup listeners from handleTimelineMouseDown clean themselves

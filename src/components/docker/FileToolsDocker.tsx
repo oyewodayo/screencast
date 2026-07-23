@@ -43,9 +43,16 @@ interface FileToolsDockerProps {
   playableSrc: string | null;
   currentTime: number;
   onSeek: (time: number) => void;
+  // Video-only: lets the timeline's own transport button show accurate state and drive real
+  // playback, same round-trip idea as currentTime/onSeek.
+  isPlaying: boolean;
+  onTogglePlay: () => void;
   onConvert: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
+  // Video-only: fired once a timeline Save export finishes. See VideoTimelineDocker's own prop
+  // doc comment - the source file is never modified, this is always a newly rendered file.
+  onExported: (newPath: string, newFileName: string) => void;
 }
 
 // The file-type-specific alternative to RecordingDocker (see BottomDocker's dockerMode switch):
@@ -54,7 +61,18 @@ interface FileToolsDockerProps {
 // component rather than four near-identical ones — the info/actions block is identical across
 // categories today, and a category's own editing controls (once built) can be added as an
 // additional branch here without duplicating the shared parts.
-const FileToolsDocker: React.FC<FileToolsDockerProps> = ({ file, playableSrc, currentTime, onSeek, onConvert, onRename, onDelete }) => {
+const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
+  file,
+  playableSrc,
+  currentTime,
+  onSeek,
+  isPlaying,
+  onTogglePlay,
+  onConvert,
+  onRename,
+  onDelete,
+  onExported,
+}) => {
   const category = getFileCategory(file.name);
   const copy = category ? FILE_TOOLS_COPY[category] : null;
 
@@ -66,9 +84,12 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({ file, playableSrc, cu
         playableSrc={playableSrc}
         currentTime={currentTime}
         onSeek={onSeek}
+        isPlaying={isPlaying}
+        onTogglePlay={onTogglePlay}
         onConvert={onConvert}
         onRename={onRename}
         onDelete={onDelete}
+        onExported={onExported}
       />
     );
   }

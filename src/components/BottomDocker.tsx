@@ -22,9 +22,14 @@ interface Props {
   // timeline's playhead track and drive real playback instead of being purely decorative.
   activeFileCurrentTime: number;
   onSeekActiveFile: (time: number) => void;
+  // Same round-trip as activeFileCurrentTime/onSeekActiveFile, for play/pause - lets the video-
+  // tools timeline show an accurate transport button and drive real playback from it.
+  activeFileIsPlaying: boolean;
+  onTogglePlayActiveFile: () => void;
   onConvertFile: (file: DockerFile) => void;
   onRenameFile: (file: DockerFile, newName: string) => Promise<void>;
   onDeleteFile: (file: DockerFile) => Promise<void>;
+  onExportedFile: (newPath: string, newFileName: string) => void;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
   handleOpenSettings: () => void;
@@ -83,9 +88,12 @@ const BottomDocker = ({
   activeFilePlayableSrc,
   activeFileCurrentTime,
   onSeekActiveFile,
+  activeFileIsPlaying,
+  onTogglePlayActiveFile,
   onConvertFile,
   onRenameFile,
   onDeleteFile,
+  onExportedFile,
   handleFolderSettings,
   handleGoHome,
   handleOpenSettings,
@@ -371,9 +379,12 @@ const BottomDocker = ({
             playableSrc={activeFilePlayableSrc}
             currentTime={activeFileCurrentTime}
             onSeek={onSeekActiveFile}
+            isPlaying={activeFileIsPlaying}
+            onTogglePlay={onTogglePlayActiveFile}
             onConvert={onConvertFile}
             onRename={onRenameFile}
             onDelete={onDeleteFile}
+            onExported={onExportedFile}
           />
         ) : (
           <RecordingDocker
