@@ -19,6 +19,7 @@ import { PageRenderCache } from "../../hooks/usePageRenderCache";
 import { preloadImage } from "../../utils/imageObjectCache";
 import TextNoteEditor from "./TextNoteEditor";
 import ImageAnnotationEditor from "./ImageAnnotationEditor";
+import PdfTextLayer from "./PdfTextLayer";
 
 const TEXT_NOTE_DEFAULT_WIDTH_PDF = 160;
 const DRAG_THRESHOLD_DEVICE_PX = 5; // below this, a pointerdown+up on a note is a tap (edit), not a drag (move)
@@ -90,6 +91,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
   onEraseAt,
   onEraseEnd,
 }) => {
+  const pageWrapperRef = useRef<HTMLDivElement>(null);
   const pageCanvasRef = useRef<HTMLCanvasElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const scratchCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -548,20 +550,28 @@ const PdfPage: React.FC<PdfPageProps> = ({
   // tool already owns the scratch canvas's pointer events in that state (useStrokeCapture for
   // pen/highlighter/eraser, the effect above for text), so this only ever attaches when nothing
   // else is listening — no gesture conflict to arbitrate.
+  //
+  // Attached to the page wrapper (not scratchCanvasRef) because scratchCanvas itself goes
+  // pointer-events:none in select mode below — the PdfTextLayer needs to be the topmost thing
+  // actually receiving the mousedown for native text selection to engage. Geometry-based hit
+  // testing here doesn't care which descendant the event bubbled up through, so listening on the
+  // wrapper works identically to listening on the canvas used to. preventDefault on an image hit
+  // stops that same mousedown from also starting a text selection underneath it.
   useEffect(() => {
-    const canvas = scratchCanvasRef.current;
-    if (!canvas || tool !== null || !interactive || !viewport) return;
+    const wrapper = pageWrapperRef.current;
+    if (!wrapper || tool !== null || !interactive || !viewport) return;
 
     const handlePointerDown = (e: PointerEvent): void => {
       if (e.pointerType === "mouse" && e.button !== 0) return;
-      const rect = canvas.getBoundingClientRect();
+      const rect = wrapper.getBoundingClientRect();
       const pdfPoint = devicePointToPdfPoint(viewport, e.clientX - rect.left, e.clientY - rect.top, 1);
       const hit = findImageObjectAt(objectsRef.current, pdfPoint);
       onSelectImage(hit?.id ?? null);
+      if (hit) e.preventDefault();
     };
 
-    canvas.addEventListener("pointerdown", handlePointerDown);
-    return () => canvas.removeEventListener("pointerdown", handlePointerDown);
+    wrapper.addEventListener("pointerdown", handlePointerDown);
+    return () => wrapper.removeEventListener("pointerdown", handlePointerDown);
   }, [tool, interactive, viewport, onSelectImage]);
 
   // Delete/Backspace removes the selected image, as long as this page is the one that actually
@@ -640,13 +650,21 @@ const PdfPage: React.FC<PdfPageProps> = ({
   const editorPosition = editingText && viewport ? pdfPointToDevicePoint(viewport, { x: editingText.x, y: editingText.y, pressure: 1 }) : null;
 
   return (
-    <div className="relative inline-block bg-white shadow-[0_12px_40px_rgba(0,0,0,0.14)] ring-1 ring-black/[0.06]">
+    <div ref={pageWrapperRef} className="relative inline-block bg-white shadow-[0_12px_40px_rgba(0,0,0,0.14)] ring-1 ring-black/[0.06]">
       <canvas ref={pageCanvasRef} className="block" style={{ position: "relative" }} />
+      {/* Selectable text, positioned pixel-for-pixel over the glyphs the page canvas above just
+          painted. Only actually interactive in "Select / no tool" mode — see scratchCanvas below,
+          which owns the pointer for every other tool and steps out of the way (pointer-events:
+          none) only when this does the opposite, so exactly one of the two is ever clickable. */}
+      {viewport && <PdfTextLayer pdfDoc={pdfDoc} pageIndex={pageIndex} viewport={viewport} selectable={tool === null} />}
       <canvas ref={overlayCanvasRef} className="absolute top-0 left-0 pointer-events-none" />
       <canvas
         ref={scratchCanvasRef}
         className="absolute top-0 left-0"
-        style={{ cursor: tool === "eraser" ? "cell" : tool === "text" ? "text" : tool ? "crosshair" : "default" }}
+        style={{
+          cursor: tool === "eraser" ? "cell" : tool === "text" ? "text" : tool ? "crosshair" : "default",
+          pointerEvents: tool === null ? "none" : "auto",
+        }}
       />
       {editingText && editorPosition && viewport && (
         <TextNoteEditor
