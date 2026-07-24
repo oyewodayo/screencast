@@ -171,6 +171,46 @@ const Dashboard = () => {
   // presently over (for the drop-target highlight). Both null outside a drag gesture.
   const [draggingFiles, setDraggingFiles] = useState<FileEntry[] | null>(null);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
+  // Sidebar-file-to-timeline dragging runs on plain pointer events, not the native HTML5 drag-and-
+  // drop API (draggable/onDragStart/onDrop) that the folder-move feature above uses - the same
+  // root cause as the external Explorer-drag investigation turned out to be broader than just
+  // "cross-window drags": this app's window has a native OS-level drop-target hook registered
+  // (needed for onFileDropEvent, the only way to get real filesystem paths out of an external
+  // drop at all), and that hook appears to take over drag handling for the whole webview, not just
+  // drags that cross a window boundary - confirmed by this exact pattern (native DnD -> plain
+  // pointer events) being what got clip-reordering inside the timeline itself working earlier.
+  // The click-vs-drag threshold mirrors VideoTimelineDocker's own clip-drag handling: a plain tap
+  // still opens/plays the file, it only becomes a drag once the pointer moves a few px.
+  const SIDEBAR_DRAG_THRESHOLD_PX = 4;
+  const sidebarDragRef = useRef<{ file: FileEntry; startX: number; startY: number; isDragging: boolean } | null>(null);
+
+  const handleSidebarFilePointerDown = (file: FileEntry) => (e: React.PointerEvent) => {
+    if (getFileCategory(file.name) !== "video") return; // only meaningful for the video timeline
+    e.currentTarget.setPointerCapture(e.pointerId);
+    sidebarDragRef.current = { file, startX: e.clientX, startY: e.clientY, isDragging: false };
+  };
+  const handleSidebarFilePointerMove = (e: React.PointerEvent) => {
+    const drag = sidebarDragRef.current;
+    if (!drag) return;
+    if (!drag.isDragging && Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) >= SIDEBAR_DRAG_THRESHOLD_PX) {
+      drag.isDragging = true;
+      setDraggingFiles([drag.file]);
+    }
+  };
+  const handleSidebarFilePointerUp = (file: FileEntry) => (e: React.PointerEvent) => {
+    const drag = sidebarDragRef.current;
+    sidebarDragRef.current = null;
+    if (!drag?.isDragging) {
+      // No real drag happened - a plain tap, handled the same as clicking the filename always has.
+      handleFileClick(file);
+      return;
+    }
+    setDraggingFiles(null);
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (el?.closest("[data-timeline-track]")) {
+      setPendingTimelineInsert({ paths: [file.path], clientX: e.clientX });
+    }
+  };
   // Multi-select for bulk move — a set of file.path values, spanning whichever folders are
   // currently visible under the active category. Cleared whenever the category tab changes so
   // a stale selection from "Video" doesn't silently carry over into "Audio".
@@ -200,7 +240,52 @@ const [conversionFile, setConversionFile] = useState<{path: string; name: string
   useEffect(() => {
     setPlayerCurrentTime(0);
     setPlayerIsPlaying(false);
+    // A cross-clip preview switch (see resolvePreviewAssetUrl/handleSeekActiveFile below) may have
+    // left the player pointed at some *other* file's asset URL - opening a genuinely different
+    // file here always starts fresh, so the "what's actually loaded" tracker needs to reset too.
+    previewSourcePathRef.current = selectedFile?.sourcePath ?? null;
   }, [selectedFile?.path]);
+
+  // Asset URLs for files referenced by a timeline clip other than the one currently open -
+  // resolved on demand (same convert_file_path_to_url + convertFileSrc round-trip
+  // loadFileForPlayback already does for the primary file) and cached forever per path, since a
+  // given file's asset URL never changes for the life of the app.
+  const previewAssetUrlCacheRef = useRef<Map<string, string>>(new Map());
+  // Which source file's content is actually loaded into the player right now - starts matching
+  // selectedFile.sourcePath, but a cross-clip preview seek (see handleSeekActiveFile below) can
+  // point it at a different file entirely without touching selectedFile itself.
+  const previewSourcePathRef = useRef<string | null>(null);
+
+  const resolvePreviewAssetUrl = async (sourcePath: string): Promise<string> => {
+    const cached = previewAssetUrlCacheRef.current.get(sourcePath);
+    if (cached) return cached;
+    const absolutePath = await invoke<string>("convert_file_path_to_url", { filepath: sourcePath });
+    const url = convertFileSrc(absolutePath);
+    previewAssetUrlCacheRef.current.set(sourcePath, url);
+    return url;
+  };
+
+  // The video-tools timeline's own seek, extended to know *which file* it's seeking within -
+  // once a clip can be dragged in from a different file than the one currently open, "seek to
+  // this time" is ambiguous without also saying which file's timeline that time belongs to. Swaps
+  // the player's actual source (via the imperative loadSource, not the `src` prop/selectedFile -
+  // see VideoPlayerHandle's own comment for why) only when the target differs from what's already
+  // loaded, so scrubbing within the same clip stays a plain, cheap seek.
+  const handleSeekActiveFile = (sourcePath: string, time: number) => {
+    if (previewSourcePathRef.current === sourcePath) {
+      videoPlayerRef.current?.seek(time);
+      return;
+    }
+    previewSourcePathRef.current = sourcePath;
+    if (sourcePath === selectedFile?.sourcePath) {
+      // Back to the primary file - its asset URL is already resolved (selectedFile.path).
+      videoPlayerRef.current?.loadSource(selectedFile.path, time);
+      return;
+    }
+    resolvePreviewAssetUrl(sourcePath)
+      .then((url) => videoPlayerRef.current?.loadSource(url, time))
+      .catch((error) => console.error("Failed to load preview source for", sourcePath, error));
+  };
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -1171,14 +1256,72 @@ const setScreen = () => {
 		dragOverFolderRef.current = dragOverFolder;
 	}, [dragOverFolder]);
 
+	// The video-tools timeline's own drop target has the *same* "no cursor position in the native
+	// event" problem as dragOverFolderRef above, but plain DOM dragover can't solve it the same way
+	// here: that only works because an in-page drag (e.g. dragging a Briefcast sidebar row) never
+	// leaves the webview, so Chromium's own drag-tracking dispatches it normally. A drag whose
+	// *origin* is a different native window (Explorer) is a real OS-level drag session - Tauri's
+	// file-drop event fires reliably for it, but WebView2's DOM dragover does not (confirmed: it
+	// silently never fired, so the timeline's drop target was never detected and every external
+	// drop fell through to a library import instead). The fix is to poll the cursor position
+	// (get_cursor_position_in_window) each time Tauri's own 'hover' event fires and hit-test it
+	// against the DOM directly - which works regardless of whether Chromium ever saw a dragover.
+	//
+	// get_cursor_position_in_window does the whole cursor-position-to-client-coordinates
+	// conversion natively in one Win32-only call rather than combining a native GetCursorPos with
+	// this window's own innerPosition()/scaleFactor() - an earlier version mixed those two sources
+	// and produced consistently wrong coordinates on a 250%-scaled display (confirmed: a drop over
+	// the visible timeline resolved to a DOM element in the sidebar instead), most likely because
+	// Tauri 1.8.3 itself depends on an older `windows` crate than this app's own Rust code and the
+	// two disagree on DPI virtualization for a plain cross-process GetCursorPos call.
+	//
+	// The actual insert can't happen here - it needs editStore, which lives inside
+	// VideoTimelineDocker - so a confirmed timeline-targeted drop is just handed down as
+	// pendingTimelineInsert for that component to act on and then clear.
+	const dragOverTimelineXRef = useRef<number | null>(null);
+	const [pendingTimelineInsert, setPendingTimelineInsert] = useState<{ paths: string[]; clientX: number } | null>(null);
+	const hoverTokenRef = useRef(0);
+
+	const resolveExternalDropClientX = async (): Promise<number | null> => {
+		try {
+			const [clientX, clientY] = await invoke<[number, number]>("get_cursor_position_in_window");
+			const el = document.elementFromPoint(clientX, clientY);
+			const overTimeline = !!el?.closest("[data-timeline-track]");
+			// Temporary diagnostic - if clientX/clientY now land on the timeline while it's visibly
+			// under the cursor, the DPI fix worked; if they're still off, something else is wrong.
+			console.log("[Dashboard] resolveExternalDropClientX", { clientX, clientY, elementTag: el?.tagName, overTimeline });
+			return overTimeline ? clientX : null;
+		} catch (error) {
+			console.error("Failed to resolve external drag position:", error);
+			return null;
+		}
+	};
+
 	useEffect(() => {
-		const unlistenPromise = appWindow.onFileDropEvent((event) => {
+		const unlistenPromise = appWindow.onFileDropEvent(async (event) => {
+			console.log("[Dashboard] onFileDropEvent", event.payload.type, event.payload.type !== "cancel" ? event.payload.paths : undefined);
+			if (event.payload.type === "hover") {
+				// Only the most recently *requested* hover's resolution is ever applied - hover events
+				// can arrive faster than the position round-trip resolves, and an out-of-order stale
+				// result landing last would leave dragOverTimelineXRef pointing at an old position.
+				const token = ++hoverTokenRef.current;
+				const clientX = await resolveExternalDropClientX();
+				if (hoverTokenRef.current === token) dragOverTimelineXRef.current = clientX;
+				return;
+			}
 			if (event.payload.type === "drop") {
+				console.log("[Dashboard] drop - dragOverTimelineXRef was", dragOverTimelineXRef.current);
+				if (dragOverTimelineXRef.current !== null) {
+					setPendingTimelineInsert({ paths: event.payload.paths, clientX: dragOverTimelineXRef.current });
+					dragOverTimelineXRef.current = null;
+					return;
+				}
 				const destFolder = dragOverFolderRef.current ?? "";
 				setDragOverFolder(null);
 				handleImportFiles(event.payload.paths, destFolder);
 			} else if (event.payload.type === "cancel") {
 				setDragOverFolder(null);
+				dragOverTimelineXRef.current = null;
 			}
 		});
 		return () => {
@@ -1635,7 +1778,9 @@ const setScreen = () => {
                                     selectedFile?.sourcePath === file.path ? 'text-blue-600 dark:text-blue-400 font-medium' : ''
                                   }`}
                                   title={file.name}
-                                  onClick={() => handleFileClick(file)}
+                                  onPointerDown={handleSidebarFilePointerDown(file)}
+                                  onPointerMove={handleSidebarFilePointerMove}
+                                  onPointerUp={handleSidebarFilePointerUp(file)}
                                 >
                                   {formatFileName(file.name)}
                                 </div>
@@ -1825,13 +1970,20 @@ const setScreen = () => {
         activeFile={selectedFile ? { name: selectedFile.name, path: selectedFile.sourcePath } : null}
         activeFilePlayableSrc={selectedFile?.path ?? null}
         activeFileCurrentTime={playerCurrentTime}
-        onSeekActiveFile={(time) => videoPlayerRef.current?.seek(time)}
+        onSeekActiveFile={handleSeekActiveFile}
         activeFileIsPlaying={playerIsPlaying}
         onTogglePlayActiveFile={() => videoPlayerRef.current?.togglePlay()}
         onConvertFile={(file) => setConversionFile(file)}
         onRenameFile={renameFile}
         onDeleteFile={handleDeleteFile}
         onExportedFile={handleVideoExported}
+        draggingLibraryFile={
+          draggingFiles && draggingFiles.length === 1 && getFileCategory(draggingFiles[0].name) === "video"
+            ? { path: draggingFiles[0].path, name: draggingFiles[0].name }
+            : null
+        }
+        pendingTimelineInsert={pendingTimelineInsert}
+        onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         selectScreen={selectScreen}
         setScreen={setScreen}
         unSetScreen={unSetScreen}

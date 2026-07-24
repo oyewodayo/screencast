@@ -42,7 +42,7 @@ interface FileToolsDockerProps {
   // hidden <video> to capture thumbnail frames - ffprobe/canvas can't do that on the real fs path).
   playableSrc: string | null;
   currentTime: number;
-  onSeek: (time: number) => void;
+  onSeek: (sourcePath: string, time: number) => void;
   // Video-only: lets the timeline's own transport button show accurate state and drive real
   // playback, same round-trip idea as currentTime/onSeek.
   isPlaying: boolean;
@@ -53,6 +53,12 @@ interface FileToolsDockerProps {
   // Video-only: fired once a timeline Save export finishes. See VideoTimelineDocker's own prop
   // doc comment - the source file is never modified, this is always a newly rendered file.
   onExported: (newPath: string, newFileName: string) => void;
+
+  // Video-only: drag-in-a-clip support, threaded straight through to VideoTimelineDocker - see
+  // its own prop doc comments for what each of these actually does.
+  draggingLibraryFile: { path: string; name: string } | null;
+  pendingTimelineInsert: { paths: string[]; clientX: number } | null;
+  onTimelineInsertHandled: () => void;
 }
 
 // The file-type-specific alternative to RecordingDocker (see BottomDocker's dockerMode switch):
@@ -72,6 +78,9 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onRename,
   onDelete,
   onExported,
+  draggingLibraryFile,
+  pendingTimelineInsert,
+  onTimelineInsertHandled,
 }) => {
   const category = getFileCategory(file.name);
   const copy = category ? FILE_TOOLS_COPY[category] : null;
@@ -90,6 +99,9 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onRename={onRename}
         onDelete={onDelete}
         onExported={onExported}
+        draggingLibraryFile={draggingLibraryFile}
+        pendingTimelineInsert={pendingTimelineInsert}
+        onTimelineInsertHandled={onTimelineInsertHandled}
       />
     );
   }

@@ -39,3 +39,27 @@ pub fn load_pdf_annotations(pdf_path: String) -> Result<Option<String>, String> 
         .map(Some)
         .map_err(|e| format!("Failed to read annotations: {}", e))
 }
+
+// Writes a fully flattened PDF (annotations baked into the page bitmaps by the frontend, via
+// pdf-lib) to "<name> (annotated).pdf" next to the source PDF - same naming convention
+// export_trimmed_video uses for its own sibling output file. Unlike the sidecar JSON, this is a
+// real, standalone PDF: readable in any viewer, not just this app.
+#[command]
+pub fn save_exported_pdf(pdf_path: String, bytes: Vec<u8>) -> Result<String, String> {
+    let pdf = PathBuf::from(&pdf_path);
+    if !pdf.exists() {
+        return Err(format!("PDF does not exist: {}", pdf_path));
+    }
+
+    let stem = pdf.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let parent = pdf.parent().map(PathBuf::from).unwrap_or_default();
+    let output = parent.join(format!("{} (annotated).pdf", stem));
+
+    let tmp_file_name = format!("{}.tmp", output.file_name().unwrap().to_string_lossy());
+    let tmp = output.with_file_name(tmp_file_name);
+
+    fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write exported PDF: {}", e))?;
+    fs::rename(&tmp, &output).map_err(|e| format!("Failed to save exported PDF: {}", e))?;
+
+    Ok(output.to_string_lossy().to_string())
+}

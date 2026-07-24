@@ -128,6 +128,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
   // keystroke, unlike editingText (which does need to be reactive, for position/size).
   const liveTextRef = useRef<string>("");
   const liveColorRef = useRef<string>("");
+  const liveBackgroundColorRef = useRef<string | undefined>(undefined);
   const liveColorRunsRef = useRef<TextColorRun[]>([]);
   const liveBoldRunsRef = useRef<TextRange[]>([]);
   const liveItalicRunsRef = useRef<TextRange[]>([]);
@@ -257,6 +258,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
 
     const text = liveTextRef.current;
     const color = liveColorRef.current;
+    const backgroundColor = liveBackgroundColorRef.current;
     const colorRuns = liveColorRunsRef.current;
     const boldRuns = liveBoldRunsRef.current;
     const italicRuns = liveItalicRunsRef.current;
@@ -268,6 +270,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
       const object = makeTextObject(pageIndex, session.x, session.y, text, color, session.fontSize, session.width, height);
       onStrokeComplete({
         ...object,
+        backgroundColor,
         colorRuns: colorRuns.length > 0 ? colorRuns : undefined,
         boldRuns: boldRuns.length > 0 ? boldRuns : undefined,
         italicRuns: italicRuns.length > 0 ? italicRuns : undefined,
@@ -285,7 +288,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
 
     const moved = session.x !== original.x || session.y !== original.y;
     const resized = session.fontSize !== original.fontSize || session.width !== original.width;
-    const recolored = color !== original.color;
+    const recolored = color !== original.color || backgroundColor !== original.backgroundColor;
     const runsChanged =
       JSON.stringify(colorRuns) !== JSON.stringify(original.colorRuns ?? []) ||
       JSON.stringify(boldRuns) !== JSON.stringify(original.boldRuns ?? []) ||
@@ -301,6 +304,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
         width: session.width,
         height,
         color,
+        backgroundColor,
         colorRuns: colorRuns.length > 0 ? colorRuns : undefined,
         boldRuns: boldRuns.length > 0 ? boldRuns : undefined,
         italicRuns: italicRuns.length > 0 ? italicRuns : undefined,
@@ -318,9 +322,17 @@ const PdfPage: React.FC<PdfPageProps> = ({
   // change; this just stages it in refs for commitEditingText to read later. Stable (empty deps)
   // so TextNoteEditor's reporting effect doesn't re-fire on every PdfPage render.
   const handleNoteContentChange = useCallback(
-    (text: string, color: string, colorRuns: TextColorRun[], boldRuns: TextRange[], italicRuns: TextRange[]): void => {
+    (
+      text: string,
+      color: string,
+      backgroundColor: string | undefined,
+      colorRuns: TextColorRun[],
+      boldRuns: TextRange[],
+      italicRuns: TextRange[]
+    ): void => {
       liveTextRef.current = text;
       liveColorRef.current = color;
+      liveBackgroundColorRef.current = backgroundColor;
       liveColorRunsRef.current = colorRuns;
       liveBoldRunsRef.current = boldRuns;
       liveItalicRunsRef.current = italicRuns;
@@ -398,6 +410,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
       if (existing) {
         liveTextRef.current = existing.text;
         liveColorRef.current = existing.color;
+        liveBackgroundColorRef.current = existing.backgroundColor;
         liveColorRunsRef.current = existing.colorRuns ?? [];
         liveBoldRunsRef.current = existing.boldRuns ?? [];
         liveItalicRunsRef.current = existing.italicRuns ?? [];
@@ -412,6 +425,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
       } else {
         liveTextRef.current = "";
         liveColorRef.current = color;
+        liveBackgroundColorRef.current = undefined;
         liveColorRunsRef.current = [];
         liveBoldRunsRef.current = [];
         liveItalicRunsRef.current = [];
@@ -643,6 +657,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
           fontSize={editingText.fontSize * viewport.scale}
           initialText={liveTextRef.current}
           initialColor={liveColorRef.current}
+          initialBackgroundColor={liveBackgroundColorRef.current}
           initialColorRuns={liveColorRunsRef.current}
           initialBoldRuns={liveBoldRunsRef.current}
           initialItalicRuns={liveItalicRunsRef.current}

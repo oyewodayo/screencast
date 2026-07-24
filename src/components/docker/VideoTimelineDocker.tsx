@@ -1,6 +1,8 @@
 // components/docker/VideoTimelineDocker.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/tauri";
+import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { BsCursor } from "react-icons/bs";
 import { MdFlip } from "react-icons/md";
 import {
@@ -28,11 +30,12 @@ import {
   IoSaveOutline,
   IoPlay,
   IoPause,
+  IoAddCircleOutline,
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import useVideoEditStore from "../../hooks/useVideoEditStore";
 import { Clip } from "../../utils/videoEditTypes";
-import { clipIndexAt } from "../../handlers/videoEditHandlers";
+import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 
 const MIN_PX_PER_SEC = 8;
 const MAX_PX_PER_SEC = 200;
@@ -41,6 +44,15 @@ const THUMB_TARGET_WIDTH = 100; // px - roughly how wide each filmstrip frame sh
 const NICE_TICK_INTERVALS = [1, 2, 3, 5, 10, 15, 30, 60, 120, 300, 600]; // seconds
 const MIN_TICK_SPACING_PX = 70;
 const MIN_CLIP_LENGTH = 0.05;
+// Generous tolerance on the "still inside the tracked clip" check in the live-preview tracking
+// effect below - seeking to an arbitrary time doesn't always land exactly there (keyframe-
+// interval snapping, decoder rounding), so a strict [start,end) check evaluated on the very first
+// tick after a seek could look like we'd already left the clip we just jumped to, and cascade
+// straight past it to the *next* one - which is exactly what "played the first clip then skipped
+// straight to the third" was: the seek to clip 2 landed a hair outside its stored [start,end), so
+// that effect immediately advanced again before clip 2 ever got a chance to play. Also used by
+// handleTransportPlayClick to decide "are we sitting at the very end of the sequence".
+const SEEK_TOLERANCE_SEC = 0.25;
 
 const formatTimestamp = (totalSeconds: number): string => {
   const minutes = Math.floor(totalSeconds / 60);
@@ -94,7 +106,11 @@ interface VideoTimelineDockerProps {
   file: DockerFile;
   playableSrc: string;
   currentTime: number;
-  onSeek: (time: number) => void;
+  // sourcePath names which file's timeline `time` belongs to - required now that a clip dragged
+  // in from elsewhere means "seek to this time" is ambiguous without saying which file. Dashboard
+  // swaps the player's actual source when it differs from what's currently loaded; see its
+  // handleSeekActiveFile for the details.
+  onSeek: (sourcePath: string, time: number) => void;
   // Real play/pause state of the main player, and a way to toggle it - the transport button in
   // the track control rail below, same round-trip idea as currentTime/onSeek.
   isPlaying: boolean;
@@ -105,6 +121,26 @@ interface VideoTimelineDockerProps {
   // Fired once a Save export finishes - the new (edited) render, added to the library as a
   // separate file. `file` itself is never touched by editing or exporting.
   onExported: (newPath: string, newFileName: string) => void;
+
+  // Drag-in support - inserting a whole other file as a new clip anywhere on the timeline.
+  //
+  // A file being dragged from the Briefcast sidebar right now (in-page pointer drag, tracked in
+  // Dashboard.tsx) - null otherwise. Used only to know a drop here should insert a clip; the
+  // actual drop is still a plain HTML5 dragover/drop pair (see the track's onDragOver/onDrop
+  // below), since - unlike reordering clips already on this timeline - this drag both starts and
+  // ends outside this component, and HTML5 DnD's own target-under-cursor dispatch is the simplest
+  // way to know when it lands here. This in-page case is reliable via plain dragover/drop because
+  // it never leaves the webview.
+  draggingLibraryFile: { path: string; name: string } | null;
+  // Files Dashboard has confirmed were dropped on *this* track from an external source (Explorer),
+  // with the client-X position they landed at - resolved once (fetch each duration, insert each
+  // clip), then cleared via onTimelineInsertHandled. Unlike the in-page case above, an external
+  // drag's hover position can't be tracked via this component's own dragover handler - Dashboard
+  // resolves it by polling the OS cursor position instead (see its onFileDropEvent handler for
+  // why: WebView2's DOM dragover isn't reliably delivered for a drag whose *origin* is a
+  // different native window, only Tauri's own file-drop event is, and that carries no position).
+  pendingTimelineInsert: { paths: string[]; clientX: number } | null;
+  onTimelineInsertHandled: () => void;
 }
 
 // The video-specific "file tools" docker: a scrubbable timeline (ruler + playhead + reorderable
@@ -125,6 +161,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onRename,
   onDelete,
   onExported,
+  draggingLibraryFile,
+  pendingTimelineInsert,
+  onTimelineInsertHandled,
 }) => {
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -143,6 +182,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [trackLocked, setTrackLocked] = useState(false);
   const [trackMuted, setTrackMuted] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // The "..." menu is rendered through a portal (see moreMenuButtonRef/moreMenuPosition below)
+  // rather than as a normal absolutely-positioned child - the Timeline panel has overflow-hidden
+  // (for the track's rounded corners/border), and this menu anchors near the bottom of a short
+  // rail, so once it grew past 3 items its top rows were silently clipped by that ancestor. A
+  // portal escapes that clipping entirely; its position is just computed from the button's own
+  // viewport rect instead of relying on CSS positioning relative to an ancestor.
+  const moreMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const [moreMenuPosition, setMoreMenuPosition] = useState<{ top: number; left: number } | null>(null);
 
   const baseName = (name: string): string => {
     const dotIndex = name.lastIndexOf(".");
@@ -240,6 +287,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     startClientX: number;
     startValue: number;
     oppositeBound: number;
+    maxEnd: number;
     liveValue: number;
   }>(null);
 
@@ -265,7 +313,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // this is a fresh, never-edited video) - the track/preview always has *something* to render
   // against rather than going blank until the sidecar round-trip resolves. Never draggable/
   // resizable itself (see the `__pending__` checks below) since it isn't real state yet.
-  const baseClips: Clip[] = editStore.clips.length > 0 ? editStore.clips : duration > 0 ? [{ id: "__pending__", start: 0, end: duration }] : [];
+  const baseClips: Clip[] =
+    editStore.clips.length > 0 ? editStore.clips : duration > 0 ? [{ id: "__pending__", sourcePath: file.path, start: 0, end: duration }] : [];
 
   // Applies the in-progress resize (if any) so every position derived below - block widths, tick
   // marks, the playhead, other handles - stays visually consistent with the live drag instead of
@@ -333,7 +382,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const { index, sourceTime } = clipAtOutputTime(outputTime);
     activeClipIndexRef.current = index;
     lastAppliedTimeRef.current = sourceTime;
-    onSeek(sourceTime);
+    onSeek(renderClips[index].sourcePath, sourceTime);
   };
 
   const handleScrubPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -358,7 +407,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     setSelectedClipId(clip.id);
     const startValue = edge === "start" ? clip.start : clip.end;
     const oppositeBound = edge === "start" ? clip.end : clip.start;
-    setResizeDrag({ id: clip.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
+    // This clip's *own* source file's duration - every clip can come from a different file, so
+    // there's no single shared duration to clamp the end edge against anymore. Falls back to no
+    // upper clamp if it isn't known yet (e.g. a just-dropped file whose ffprobe lookup is still
+    // in flight) rather than blocking the drag.
+    const maxEnd = editStore.getSourceDuration(clip.sourcePath) ?? Number.POSITIVE_INFINITY;
+    setResizeDrag({ id: clip.id, edge, startClientX: e.clientX, startValue, oppositeBound, maxEnd, liveValue: startValue });
   };
   const handleResizeDragMove = (e: React.PointerEvent) => {
     if (!resizeDrag) return;
@@ -368,7 +422,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const clamped =
       resizeDrag.edge === "start"
         ? Math.max(0, Math.min(raw, resizeDrag.oppositeBound - MIN_CLIP_LENGTH))
-        : Math.min(duration, Math.max(raw, resizeDrag.oppositeBound + MIN_CLIP_LENGTH));
+        : Math.min(resizeDrag.maxEnd, Math.max(raw, resizeDrag.oppositeBound + MIN_CLIP_LENGTH));
     setResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
   };
   const endResizeDrag = () => {
@@ -414,20 +468,82 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       setSelectedClipId(clip.id);
       activeClipIndexRef.current = index;
       lastAppliedTimeRef.current = clip.start;
-      onSeek(clip.start);
+      onSeek(clip.sourcePath, clip.start);
     }
   };
 
-  const handleSplit = () => editStore.splitAt(currentTime);
-  const handleDeleteSegment = () => {
-    const selected = selectedClipId ? baseClips.find((c) => c.id === selectedClipId) : undefined;
-    editStore.deleteClipAt(selected ? selected.start : currentTime);
-    if (selected) setSelectedClipId(null);
+  // Split/Delete always act on the clip currently under the *playhead* (activeClipIndexRef),
+  // never on a bare time value searched across all clips - once clips can come from different
+  // files, a raw source time alone is ambiguous (two clips from different files can easily share
+  // overlapping ranges), so the caller has to say which clip it means.
+  const handleSplit = () => {
+    const idx = activeClipIndexRef.current;
+    if (idx >= 0 && idx < baseClips.length) editStore.splitAt(idx, currentTime);
   };
+  const handleDeleteSegment = () => {
+    const selectedIndex = selectedClipId ? baseClips.findIndex((c) => c.id === selectedClipId) : -1;
+    const index = selectedIndex !== -1 ? selectedIndex : activeClipIndexRef.current;
+    if (index < 0 || index >= baseClips.length) return;
+    editStore.deleteClipAt(index);
+    if (selectedIndex !== -1) setSelectedClipId(null);
+  };
+  // Pressing Play after the sequence has already played through to the end needs to restart from
+  // clip 0 - native <video> never auto-rewinds on .play() once it's reached "ended", it just sits
+  // at the last frame, so without this a stalled-at-the-end timeline looked like Play did nothing
+  // at all (because, from the player's point of view, it didn't - there was nowhere further to
+  // play to). Only triggers right at the end of the *last* clip, so pausing partway through and
+  // pressing Play again still resumes from wherever you paused instead of jumping back to 0.
+  const handleTransportPlayClick = () => {
+    const lastIndex = baseClips.length - 1;
+    const last = baseClips[lastIndex];
+    const atEnd = !!last && !isPlaying && activeClipIndexRef.current >= lastIndex && currentTime >= last.end - SEEK_TOLERANCE_SEC;
+    if (atEnd) {
+      const first = baseClips[0];
+      activeClipIndexRef.current = 0;
+      lastAppliedTimeRef.current = first.start;
+      onSeek(first.sourcePath, first.start);
+    }
+    onTogglePlay();
+  };
+
   const handleSave = async () => {
     const result = await editStore.exportEdited();
     if (result) onExported(result.path, result.name);
   };
+
+  // Drag-in: a file dropped on the track, from either the Briefcast sidebar (draggingLibraryFile,
+  // native HTML5 onDrop right below - reliable here since this drag never leaves the webview) or
+  // Explorer (pendingTimelineInsert, routed here by Dashboard once its cursor-position polling
+  // confirms the drop landed on this track - see pendingTimelineInsert's own doc comment).
+  const handleTrackDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault(); // required for onDrop to fire at all
+  };
+  const handleTrackDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    // Temporary diagnostic - if "track onDrop fired" never appears in the console during a
+    // sidebar-to-timeline drag, the browser never dispatched onDrop at all (points at something
+    // intercepting the drag before it reaches this element); if it appears but draggingLibraryFile
+    // is null, the drop landed here without Dashboard's drag-start state having been set.
+    console.log("[VideoTimelineDocker] track onDrop fired", { draggingLibraryFile, clientX: e.clientX });
+    if (draggingLibraryFile) {
+      void editStore.insertClipAt(draggingLibraryFile.path, computeOverIndex(e.clientX));
+    }
+  };
+
+  useEffect(() => {
+    if (!pendingTimelineInsert) return;
+    console.log("[VideoTimelineDocker] pendingTimelineInsert received", pendingTimelineInsert);
+    const { paths, clientX } = pendingTimelineInsert;
+    const index = computeOverIndex(clientX);
+    (async () => {
+      for (const path of paths) {
+        // eslint-disable-next-line no-await-in-loop
+        await editStore.insertClipAt(path, index);
+      }
+      onTimelineInsertHandled();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingTimelineInsert]);
 
   // Bootstrap: whenever a different clip becomes first in playback order - initial load, or a
   // reorder that puts something else at index 0 - force playback to actually start there, rather
@@ -441,7 +557,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     bootstrappedFirstClipIdRef.current = first.id;
     activeClipIndexRef.current = 0;
     lastAppliedTimeRef.current = first.start;
-    onSeek(first.start);
+    onSeek(first.sourcePath, first.start);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [baseClips[0]?.id]);
 
@@ -461,13 +577,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const activeIdx = activeClipIndexRef.current;
     if (activeIdx < 0 || activeIdx >= baseClips.length) return; // not bootstrapped yet
     const active = baseClips[activeIdx];
-    if (currentTime >= active.start && currentTime < active.end) return; // still inside it
+    if (currentTime >= active.start - SEEK_TOLERANCE_SEC && currentTime < active.end + SEEK_TOLERANCE_SEC) return; // still inside it
 
     const nextIndex = activeIdx + 1;
     if (nextIndex < baseClips.length) {
       activeClipIndexRef.current = nextIndex;
       lastAppliedTimeRef.current = baseClips[nextIndex].start;
-      onSeek(baseClips[nextIndex].start);
+      onSeek(baseClips[nextIndex].sourcePath, baseClips[nextIndex].start);
     }
     // else: finished the last clip in playback order - let native playback end there naturally.
   }, [currentTime, editStore.clips]);
@@ -486,15 +602,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     );
   };
 
+  // Reliable fallback to dragging a clip in - a native file picker, unaffected by any of the
+  // drag-and-drop fragility (in-page vs. cross-window, WebView2/Tauri interception, etc.) that
+  // draggingLibraryFile/pendingTimelineInsert above have to work around. Inserts right after
+  // whichever clip is currently under the playhead, same insertion point a drop at the playhead
+  // would produce.
+  const handleInsertClipViaPicker = async () => {
+    setMenuOpen(false);
+    const selected = await openFileDialog({ multiple: false, filters: [{ name: "Video", extensions: FILE_CATEGORY_EXTENSIONS.video }] });
+    if (!selected || Array.isArray(selected)) return; // cancelled
+    const insertIndex = Math.max(0, activeClipIndexRef.current + 1);
+    await editStore.insertClipAt(selected, insertIndex);
+  };
+
   // Playhead position on the (output/assembled) ruler - maps currentTime (a raw source
-  // timestamp) via whichever clip is currently considered active, falling back to the nearest
-  // valid index if currentTime doesn't cleanly fall inside any clip right this instant (e.g. mid-
-  // transition, the one tick before the effect above seeks onward).
-  const activeIndexForDisplay = (() => {
-    const idx = clipIndexAt(renderClips, currentTime);
-    if (idx !== -1) return idx;
-    return Math.min(Math.max(activeClipIndexRef.current, 0), renderClips.length - 1);
-  })();
+  // timestamp) via whichever clip is currently tracked as active (activeClipIndexRef, clamped
+  // into range in case clips changed shape since it was last set).
+  const activeIndexForDisplay = Math.min(Math.max(activeClipIndexRef.current, 0), renderClips.length - 1);
   const playheadLeft =
     renderClips.length > 0
       ? (outputStarts[activeIndexForDisplay] +
@@ -594,6 +718,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         </div>
       </div>
 
+      {/* Save failures previously only showed up as the Save button's hover tooltip, easy to miss
+          entirely without devtools open - surfaced here so the actual ffmpeg/IO error is visible
+          at a glance. */}
+      {editStore.exportError && (
+        <div className="px-2 py-1.5 rounded-md bg-red-950/60 border border-red-800 text-red-300 text-xs break-words">
+          Save failed: {editStore.exportError}
+        </div>
+      )}
+
       {/* Timeline */}
       <div className="w-full flex border border-neutral-800 rounded-md overflow-hidden bg-neutral-950 text-neutral-200">
         {/* Track control rail */}
@@ -625,61 +758,94 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             type="button"
             title={isPlaying ? "Pause" : "Play"}
-            onClick={onTogglePlay}
+            onClick={handleTransportPlayClick}
             className="text-neutral-400 hover:text-neutral-200"
           >
             {isPlaying ? <IoPause size={15} /> : <IoPlay size={15} />}
           </button>
           <div className="relative">
             <button
+              ref={moreMenuButtonRef}
               type="button"
               title="More"
-              onClick={() => setMenuOpen((v) => !v)}
+              onClick={() => {
+                if (menuOpen) {
+                  setMenuOpen(false);
+                  return;
+                }
+                const rect = moreMenuButtonRef.current?.getBoundingClientRect();
+                if (rect) setMoreMenuPosition({ top: rect.top, left: rect.right + 4 });
+                setMenuOpen(true);
+              }}
               className="text-neutral-400 hover:text-neutral-200"
             >
               <IoEllipsisHorizontal size={15} />
             </button>
-            {menuOpen && (
-              <div className="absolute left-6 bottom-0 w-40 bg-neutral-800 border border-neutral-700 rounded-md shadow-lg z-20 text-sm">
-                <button
-                  type="button"
-                  className="w-full text-left px-3 py-2 hover:bg-neutral-700"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    setRenamingInline(true);
-                  }}
-                >
-                  Rename
-                </button>
-                <button
-                  type="button"
-                  className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onConvert(file);
-                  }}
-                >
-                  <IoSwapHorizontalOutline size={13} /> Convert
-                </button>
-                <button
-                  type="button"
-                  className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
-                  onClick={handleShowInFolder}
-                >
-                  <IoFolderOpenOutline size={13} /> Show in folder
-                </button>
-                <button
-                  type="button"
-                  className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700 text-red-400"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onDelete(file);
-                  }}
-                >
-                  <IoTrashOutline size={13} /> Delete
-                </button>
-              </div>
-            )}
+            {menuOpen &&
+              moreMenuPosition &&
+              createPortal(
+                <>
+                  {/* Full-viewport backdrop, behind the menu, just to catch outside clicks. */}
+                  <div className="fixed inset-0 z-40" onClick={() => setMenuOpen(false)} />
+                  {/* text-neutral-200 set explicitly (not just inherited, unlike before this was
+                      a portal) - document.body, where this now renders, is outside the Timeline
+                      panel's own text-neutral-200 ancestor, so without this the menu items fell
+                      back to the page's default (invisible-on-dark) text color. */}
+                  <div
+                    className="fixed w-44 bg-neutral-800 border border-neutral-700 rounded-md shadow-lg z-50 text-sm text-neutral-200"
+                    style={{ top: moreMenuPosition.top, left: moreMenuPosition.left }}
+                  >
+                    <button
+                      type="button"
+                      className="w-full text-left px-3 py-2 hover:bg-neutral-700"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setRenamingInline(true);
+                      }}
+                    >
+                      Rename
+                    </button>
+                    <button
+                      type="button"
+                      className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        void handleInsertClipViaPicker();
+                      }}
+                    >
+                      <IoAddCircleOutline size={13} /> Insert clip…
+                    </button>
+                    <button
+                      type="button"
+                      className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onConvert(file);
+                      }}
+                    >
+                      <IoSwapHorizontalOutline size={13} /> Convert
+                    </button>
+                    <button
+                      type="button"
+                      className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                      onClick={handleShowInFolder}
+                    >
+                      <IoFolderOpenOutline size={13} /> Show in folder
+                    </button>
+                    <button
+                      type="button"
+                      className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700 text-red-400"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onDelete(file);
+                      }}
+                    >
+                      <IoTrashOutline size={13} /> Delete
+                    </button>
+                  </div>
+                </>,
+                document.body
+              )}
           </div>
 
           <div className="mt-1 w-10 h-7 rounded border border-neutral-700 bg-neutral-800 flex items-center justify-center overflow-hidden">
@@ -729,11 +895,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               <span className="tabular-nums shrink-0">{formatTimestamp(totalOutputDuration)}</span>
             </div>
 
-            {/* Track */}
+            {/* Track - data-timeline-track marks this as the drop target Dashboard looks for via
+                document.elementFromPoint when routing an external (Explorer) file drop; see
+                pendingTimelineInsert's doc comment above. */}
             <div
-              className="h-16 relative py-1 cursor-pointer"
+              data-timeline-track="true"
+              className={`h-16 relative py-1 cursor-pointer ${draggingLibraryFile ? "bg-blue-500/10 outline-dashed outline-2 outline-blue-400 -outline-offset-2" : ""}`}
               onPointerDown={handleScrubPointerDown}
               onPointerMove={handleScrubPointerMove}
+              onDragOver={handleTrackDragOver}
+              onDrop={handleTrackDrop}
             >
               {/* Clip blocks, laid out sequentially in playback order - click to select (dashed
                   outline), drag past a few px to reorder (see beginClipDrag's comment for why

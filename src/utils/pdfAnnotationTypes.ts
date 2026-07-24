@@ -61,6 +61,10 @@ export interface TextObject extends BaseObject {
   type: "text";
   text: string;
   color: string;
+  // Fill behind the note's text, in the same PDF page-space box its text occupies (see below).
+  // Omitted/undefined means no fill — fully transparent, i.e. the pre-existing behavior for notes
+  // saved before this existed.
+  backgroundColor?: string;
   colorRuns?: TextColorRun[];
   boldRuns?: TextRange[];
   italicRuns?: TextRange[];

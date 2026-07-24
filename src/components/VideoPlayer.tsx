@@ -94,9 +94,18 @@ interface VideoPlayerProps {
 // <video>/timeupdate already round-trips position out via onTimeUpdate; this is just the one
 // missing direction back in. togglePlay is the same idea for play/pause - onPlayStateChange
 // below is its own round-trip out, mirroring onTimeUpdate.
+//
+// loadSource swaps the underlying <video>'s source *without* going through the `src` prop or
+// Dashboard's `selectedFile` state - needed for previewing a timeline clip that references a
+// different file than the one actually open (a clip dragged in from elsewhere): swapping
+// `selectedFile` itself would change what the *whole app* considers open (title, sidebar
+// selection, which edit session's timeline is showing), which is wrong for what's meant to be a
+// transient preview-only switch. Since the `src` prop is unchanged across this, VideoPlayer's own
+// prop-driven load effect never fights this override - it only re-runs when `src` itself changes.
 export interface VideoPlayerHandle {
   seek: (time: number) => void;
   togglePlay: () => void;
+  loadSource: (src: string, seekTime: number) => void;
 }
 
 const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange }, ref) => {
@@ -114,6 +123,18 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     // actually runs (via useImperativeHandle's internal effect) after the whole render body -
     // including that declaration - has executed, so the forward reference is safe.
     togglePlay: () => togglePauseAndPlay(),
+    loadSource: (src: string, seekTime: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      const onLoaded = () => {
+        video.removeEventListener("loadedmetadata", onLoaded);
+        video.currentTime = seekTime;
+        video.play().catch(() => {});
+      };
+      video.addEventListener("loadedmetadata", onLoaded);
+      video.src = src;
+      video.load();
+    },
   }), []);
 
   const videoContainerRef = useRef<HTMLDivElement>(null);

@@ -21,7 +21,9 @@ interface Props {
   // Live playback position of the main player, and a way to seek it - what lets the video-tools
   // timeline's playhead track and drive real playback instead of being purely decorative.
   activeFileCurrentTime: number;
-  onSeekActiveFile: (time: number) => void;
+  // sourcePath names which file's timeline `time` belongs to - a timeline clip dragged in from
+  // elsewhere means "seek to this time" is ambiguous without also saying which file.
+  onSeekActiveFile: (sourcePath: string, time: number) => void;
   // Same round-trip as activeFileCurrentTime/onSeekActiveFile, for play/pause - lets the video-
   // tools timeline show an accurate transport button and drive real playback from it.
   activeFileIsPlaying: boolean;
@@ -30,6 +32,11 @@ interface Props {
   onRenameFile: (file: DockerFile, newName: string) => Promise<void>;
   onDeleteFile: (file: DockerFile) => Promise<void>;
   onExportedFile: (newPath: string, newFileName: string) => void;
+  // Video-only: drag-in-a-clip support for the timeline, threaded straight through to
+  // VideoTimelineDocker - see its own prop doc comments for what each of these actually does.
+  draggingLibraryFile: { path: string; name: string } | null;
+  pendingTimelineInsert: { paths: string[]; clientX: number } | null;
+  onTimelineInsertHandled: () => void;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
   handleOpenSettings: () => void;
@@ -94,6 +101,9 @@ const BottomDocker = ({
   onRenameFile,
   onDeleteFile,
   onExportedFile,
+  draggingLibraryFile,
+  pendingTimelineInsert,
+  onTimelineInsertHandled,
   handleFolderSettings,
   handleGoHome,
   handleOpenSettings,
@@ -385,6 +395,9 @@ const BottomDocker = ({
             onRename={onRenameFile}
             onDelete={onDeleteFile}
             onExported={onExportedFile}
+            draggingLibraryFile={draggingLibraryFile}
+            pendingTimelineInsert={pendingTimelineInsert}
+            onTimelineInsertHandled={onTimelineInsertHandled}
           />
         ) : (
           <RecordingDocker

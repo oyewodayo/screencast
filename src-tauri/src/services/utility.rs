@@ -400,3 +400,60 @@ pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
     // Return the clean absolute path - we'll convert it on the frontend
     Ok(clean_path)
 }
+
+// Cursor position in this window's own client (CSS/logical pixel) coordinate space, for
+// drag-and-drop position tracking that can't rely on DOM dragover events - Tauri v1's
+// FileDropEvent (window.onFileDropEvent) fires reliably for an external OS-level drag
+// (Explorer -> this window) but carries no cursor position at all, and WebView2's own DOM
+// dragover/dragleave events are unreliable for that same cross-window drag (they're solid for
+// an in-page drag that never leaves the webview, which is why the existing sidebar-to-folder
+// move feature and this app's own clip-reordering both use plain dragover successfully - but a
+// drag whose *origin* is a different native window doesn't reliably reach the DOM the same way).
+//
+// Everything here is computed with plain Win32 calls in this one function, deliberately never
+// mixed with Tauri's own JS-side window.innerPosition()/scaleFactor() - a first version did mix
+// them (native GetCursorPos + JS-side window geometry) and produced consistently wrong
+// coordinates (confirmed: a drop over the visible timeline resolved to a DOM element in the
+// sidebar instead) on a display with 250% scaling. Root cause: tauri 1.8.3 itself depends on an
+// older `windows` crate (0.39) than this file's own direct dependency (0.57) - both HWND types
+// are structurally identical (a bare `isize`) so window.hwnd().0 can be reused directly to build
+// this crate's own HWND, but the two dependency graphs clearly disagree somewhere on the DPI
+// virtualization applied to a plain cross-process GetCursorPos call vs. what WebView2 itself
+// sees. Asking Win32 for the window's own client-area origin (ClientToScreen) and DPI
+// (GetDpiForWindow) *in the same call*, instead of trusting a second source to agree, sidesteps
+// having to figure out exactly which of the two disagreed.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn get_cursor_position_in_window(window: tauri::Window) -> Result<(f64, f64), String> {
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let hwnd = HWND(window.hwnd().map_err(|e| format!("Failed to get window handle: {}", e))?.0);
+
+    // (0, 0) in client coordinates -> the client area's top-left corner in screen coordinates.
+    let mut origin = POINT::default();
+    unsafe {
+        if !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return Err("ClientToScreen failed".to_string());
+        }
+    }
+
+    let mut cursor = POINT::default();
+    unsafe {
+        GetCursorPos(&mut cursor).map_err(|e| format!("Failed to get cursor position: {}", e))?;
+    }
+
+    let scale = unsafe { GetDpiForWindow(hwnd) } as f64 / 96.0;
+    let client_x = (cursor.x - origin.x) as f64 / scale;
+    let client_y = (cursor.y - origin.y) as f64 / scale;
+
+    Ok((client_x, client_y))
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub fn get_cursor_position_in_window(_window: tauri::Window) -> Result<(f64, f64), String> {
+    Err("Cursor position lookup is only implemented on Windows".to_string())
+}

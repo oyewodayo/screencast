@@ -87,28 +87,36 @@ fn unique_output_path(path: PathBuf) -> PathBuf {
 }
 
 
-// Shared conversion runner used by both convert_to_mp4 and convert_video, so every target
-// format gets the same stderr progress-parsing thread (convert_video previously lacked one,
-// so its progress bar silently never moved).
+// Shared conversion runner used by every command in this file, so every target format gets the
+// same stderr progress-parsing thread (convert_video previously lacked one, so its progress bar
+// silently never moved). Takes a *list* of inputs (each becomes its own `-i`) rather than a
+// single path - export_trimmed_video needs that to pull clips from more than one source file;
+// every other caller here just passes a single-element list. `progress_key` is what's reported
+// as `input_path` on emitted events - for single-input callers that's just the input path
+// itself, for a multi-input export it's the output file's own base path, since there's no one
+// "the input" to name it after and the frontend already keys its progress listener off whatever
+// it originally requested the export under.
 async fn run_conversion(
     app_handle: &AppHandle,
     window: &Window,
     state: &State<'_, ConversionState>,
-    input_path: &str,
+    inputs: &[String],
+    progress_key: &str,
     output: PathBuf,
     codec_args: &[&str],
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-    let input = PathBuf::from(input_path);
 
-    if !input.exists() {
-        return Err("Input file does not exist".to_string());
+    for input_path in inputs {
+        if !PathBuf::from(input_path).exists() {
+            return Err(format!("Input file does not exist: {}", input_path));
+        }
     }
 
     let output = unique_output_path(output);
 
     let _ = window.emit("conversion-progress", ConversionProgress {
-        input_path: input_path.to_string(),
+        input_path: progress_key.to_string(),
         output_path: output.to_string_lossy().to_string(),
         progress: 0.0,
         status: ConversionStatus::Starting,
@@ -116,14 +124,17 @@ async fn run_conversion(
     });
 
     let mut cmd = Command::new(&ffmpeg_path);
-    cmd.arg("-i").arg(path_to_str(&input)?);
+    for input_path in inputs {
+        cmd.arg("-i").arg(path_to_str(&PathBuf::from(input_path))?);
+    }
     cmd.args(codec_args);
     // -progress pipe:1 makes ffmpeg write machine-readable key=value progress lines to
     // stdout, newline-terminated. Without it, ffmpeg only prints a human-readable status
     // line to stderr that it rewrites in place with '\r' (never '\n'), which BufReader's
     // line-based reader never yields as a line - so progress silently never updated.
     // -nostats suppresses that human status line so it doesn't clutter the stderr scan below.
-    cmd.args(["-y", "-progress", "pipe:1", "-nostats", path_to_str(&output)?]);
+    cmd.args(["-y", "-progress", "pipe:1", "-nostats"]);
+    cmd.arg(path_to_str(&output)?);
     // No interactive input is ever needed (the -y above suppresses overwrite prompts), and
     // leaving stdin inherited from the parent risks ffmpeg blocking on a read that never
     // resolves when run from a console-attached dev build.
@@ -177,7 +188,7 @@ async fn run_conversion(
     });
 
     let window_clone = window.clone();
-    let input_path_clone = input_path.to_string();
+    let progress_key_clone = progress_key.to_string();
     let output_path_clone = output.to_string_lossy().to_string();
 
     std::thread::spawn(move || {
@@ -200,7 +211,7 @@ async fn run_conversion(
             let progress = (current_time / total_duration * 100.0).clamp(0.0, 99.0);
 
             let _ = window_clone.emit("conversion-progress", ConversionProgress {
-                input_path: input_path_clone.clone(),
+                input_path: progress_key_clone.clone(),
                 output_path: output_path_clone.clone(),
                 progress,
                 status: ConversionStatus::Processing,
@@ -223,7 +234,7 @@ async fn run_conversion(
 
     if result.success() {
         let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: input_path.to_string(),
+            input_path: progress_key.to_string(),
             output_path: output.to_string_lossy().to_string(),
             progress: 100.0,
             status: ConversionStatus::Completed,
@@ -239,7 +250,7 @@ async fn run_conversion(
         );
 
         let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: input_path.to_string(),
+            input_path: progress_key.to_string(),
             output_path: output.to_string_lossy().to_string(),
             progress: 0.0,
             status: ConversionStatus::Failed,
@@ -274,7 +285,7 @@ pub async fn convert_to_mp4(
         "-movflags", "+faststart",
     ];
 
-    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+    let result = run_conversion(&app_handle, &window, &state, &[input_path.clone()], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -355,7 +366,7 @@ pub async fn get_playable_preview(
         "-movflags", "+faststart",
     ];
 
-    run_conversion(&app_handle, &window, &state, &input_path, cache_path, &codec_args).await
+    run_conversion(&app_handle, &window, &state, &[input_path.clone()], &input_path, cache_path, &codec_args).await
 }
 
 // Convert a still image (screenshot) between png/jpeg/webp/bmp. No audio/video codec args
@@ -383,7 +394,7 @@ pub async fn convert_image(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+    let result = run_conversion(&app_handle, &window, &state, &[input_path.clone()], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -422,7 +433,7 @@ pub async fn convert_audio(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+    let result = run_conversion(&app_handle, &window, &state, &[input_path.clone()], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -431,39 +442,53 @@ pub async fn convert_audio(
     Ok(result)
 }
 
+// rename_all is needed here (unlike this command's own top-level camelCase args, which Tauri's
+// invoke_handler macro converts automatically) because this struct is deserialized as the
+// *value* of the `segments` array by serde directly, not through that per-command conversion -
+// without it, the frontend's `sourcePath` would fail to match `source_path`.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KeepSegment {
+    pub source_path: String,
     pub start: f64,
     pub end: f64,
 }
 
-// Renders the edited (trimmed/split) video described by `segments` - an ordered list of the
-// *kept* time ranges from the source, produced by VideoTimelineDocker's trim handles and
-// split+delete tool - to a brand-new file next to the source. The source is never opened for
-// writing and never deleted: unlike convert_to_mp4/convert_video/convert_audio above, there is no
-// `preserve_original` parameter here at all, because there is no "false" branch to have - the
-// input is categorically read-only to this command.
+// Renders the edited (trimmed/split/reordered) video described by `segments` - an ordered list
+// of the *kept* time ranges, each independently naming which source file it comes from, produced
+// by VideoTimelineDocker's trim handles, split+delete tool, and drag-to-reorder/drag-in - to a
+// brand-new file next to `output_base_path`. Every source segments reference is opened read-only
+// and never touched: unlike convert_to_mp4/convert_video/convert_audio above, there is no
+// `preserve_original` parameter here at all, because there is no "false" branch to have.
 //
-// A single kept segment (plain trim, no cuts) uses fast, low-artifact `-ss`/`-to` range
-// extraction. More than one (after Split+Delete) needs an actual filter graph: trim+concat can't
-// be expressed as simple `-ss`/`-to` since ffmpeg only accepts one input range per input stream.
+// `output_base_path` only names/locates the output - it's the file the timeline was opened on,
+// which is not necessarily the source of any particular segment once clips have been dragged in
+// from elsewhere (see DockerFile/DockerFile.path in VideoTimelineDocker.tsx).
+//
+// A single kept segment from a single source (plain trim, no cuts, no drag-ins) uses fast, low-
+// artifact `-ss`/`-to` range extraction on that one input. Anything else - multiple segments
+// and/or multiple distinct source files - needs an actual filter graph: trim+concat can't be
+// expressed as simple `-ss`/`-to` since ffmpeg only accepts one input range per input stream, and
+// each segment gets its own `-i` so segments can come from entirely different files.
 #[tauri::command]
 pub async fn export_trimmed_video(
     app_handle: AppHandle,
     window: Window,
     state: State<'_, ConversionState>,
-    input_path: String,
+    output_base_path: String,
     segments: Vec<KeepSegment>,
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
     }
 
-    let input = PathBuf::from(&input_path);
-    let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext = input.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
-    let parent = input.parent().map(PathBuf::from).unwrap_or_default();
+    let base = PathBuf::from(&output_base_path);
+    let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = base.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
+    let parent = base.parent().map(PathBuf::from).unwrap_or_default();
     let output = parent.join(format!("{} (edited).{}", stem, ext));
+
+    let inputs: Vec<String> = segments.iter().map(|s| s.source_path.clone()).collect();
 
     let owned_args: Vec<String> = if segments.len() == 1 {
         let seg = &segments[0];
@@ -478,16 +503,18 @@ pub async fn export_trimmed_video(
             "-movflags".into(), "+faststart".into(),
         ]
     } else {
-        // One [trim+setpts] pair per kept segment, feeding a single concat node - the standard
-        // ffmpeg pattern for "cut several ranges out of one input and stitch the rest together".
-        // concat's inputs must be *segment-major* - [v0][a0][v1][a1]... - not all video labels
-        // followed by all audio labels; the latter silently mislabels pad indices as the wrong
-        // media type and ffmpeg rejects the whole filtergraph ("Media type mismatch").
+        // One [trim+setpts] pair per kept segment, each reading from *its own* input index
+        // (segment i's -i is inputs[i]) so segments can be a mix of several source files, feeding
+        // a single concat node - the standard ffmpeg pattern for "cut several ranges out of one
+        // or more inputs and stitch the rest together". concat's inputs must be *segment-major* -
+        // [v0][a0][v1][a1]... - not all video labels followed by all audio labels; the latter
+        // silently mislabels pad indices as the wrong media type and ffmpeg rejects the whole
+        // filtergraph ("Media type mismatch").
         let mut filter = String::new();
         let mut concat_inputs = String::new();
         for (i, seg) in segments.iter().enumerate() {
             filter.push_str(&format!(
-                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS[v{2}];[0:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
+                "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS[v{2}];[{2}:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
                 seg.start, seg.end, i
             ));
             concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
@@ -508,7 +535,7 @@ pub async fn export_trimmed_video(
     };
     let codec_args: Vec<&str> = owned_args.iter().map(|s| s.as_str()).collect();
 
-    run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await
+    run_conversion(&app_handle, &window, &state, &inputs, &output_base_path, output, &codec_args).await
 }
 
 // Cancel ongoing conversion
@@ -738,7 +765,7 @@ pub async fn convert_video(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+    let result = run_conversion(&app_handle, &window, &state, &[input_path.clone()], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);

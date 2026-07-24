@@ -3,6 +3,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { MdFormatBold, MdFormatItalic } from "react-icons/md";
 import { TEXT_FONT_FAMILY, applyColorRun, shiftColorRunsForEdit, shiftTextRangesForEdit, toggleTextRange } from "../../handlers/pdfAnnotationHandlers";
 import { TextColorRun, TextRange } from "../../utils/pdfAnnotationTypes";
+import BackgroundSwatchPicker from "./BackgroundSwatchPicker";
 import ColorSwatchPicker from "./ColorSwatchPicker";
 
 const MIN_FONT_SIZE_DEVICE_PX = 8;
@@ -18,6 +19,7 @@ interface TextNoteEditorProps {
   fontSize: number;
   initialText: string;
   initialColor: string;
+  initialBackgroundColor: string | undefined;
   initialColorRuns: TextColorRun[];
   initialBoldRuns: TextRange[];
   initialItalicRuns: TextRange[];
@@ -25,7 +27,14 @@ interface TextNoteEditorProps {
   // content — the parent stages it in refs (not state) and only actually persists it at commit,
   // same "not React state up there" reasoning liveTextRef used before this component started
   // managing its own live formatting state locally for the backdrop preview below.
-  onContentChange: (text: string, color: string, colorRuns: TextColorRun[], boldRuns: TextRange[], italicRuns: TextRange[]) => void;
+  onContentChange: (
+    text: string,
+    color: string,
+    backgroundColor: string | undefined,
+    colorRuns: TextColorRun[],
+    boldRuns: TextRange[],
+    italicRuns: TextRange[]
+  ) => void;
   onCommit: () => void;
   onCancel: () => void;
   onMoveEnd: (newLeft: number, newTop: number) => void;
@@ -95,6 +104,7 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
   fontSize,
   initialText,
   initialColor,
+  initialBackgroundColor,
   initialColorRuns,
   initialBoldRuns,
   initialItalicRuns,
@@ -115,6 +125,7 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
 
   const [text, setText] = useState(initialText);
   const [color, setColor] = useState(initialColor);
+  const [backgroundColor, setBackgroundColor] = useState<string | undefined>(initialBackgroundColor);
   const [colorRuns, setColorRuns] = useState<TextColorRun[]>(initialColorRuns);
   const [boldRuns, setBoldRuns] = useState<TextRange[]>(initialBoldRuns);
   const [italicRuns, setItalicRuns] = useState<TextRange[]>(initialItalicRuns);
@@ -143,8 +154,8 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
   // content itself changes — the initial fire on mount is a harmless no-op re-write of what the
   // parent already staged.
   useEffect(() => {
-    onContentChange(text, color, colorRuns, boldRuns, italicRuns);
-  }, [text, color, colorRuns, boldRuns, italicRuns, onContentChange]);
+    onContentChange(text, color, backgroundColor, colorRuns, boldRuns, italicRuns);
+  }, [text, color, backgroundColor, colorRuns, boldRuns, italicRuns, onContentChange]);
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>): void => {
     const newText = e.target.value;
@@ -293,17 +304,21 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
       <div
         onPointerDown={handleMovePointerDown}
         title="Drag to move"
-        className="h-7 px-1.5 flex items-center gap-1 justify-start rounded-t bg-black/10 hover:bg-black/20 transition-colors"
+        // A translucent, backdrop-blurred pill (not the page-relative bg-black/10 this used to be)
+        // so the controls stay legible sitting directly on top of arbitrary page content — a dark
+        // photo, a busy diagram — not just plain white/light backgrounds.
+        className="h-7 px-1.5 flex items-center gap-1 justify-start rounded-t bg-white/80 dark:bg-neutral-800/85 backdrop-blur-md shadow-sm ring-1 ring-black/[0.06] dark:ring-white/[0.1] hover:bg-white/90 dark:hover:bg-neutral-800/95 transition-colors"
         style={{ cursor: "move" }}
       >
         <div onPointerDown={(e) => e.stopPropagation()} className="flex items-center gap-1">
           <ColorSwatchPicker color={color} onChange={handleColorPick} size="sm" />
+          <BackgroundSwatchPicker color={backgroundColor} onChange={setBackgroundColor} size="sm" />
           <button
             type="button"
             title="Bold selection"
             onMouseDown={(e) => e.preventDefault()}
             onClick={handleToggleBold}
-            className="w-5 h-5 flex items-center justify-center rounded text-black/60 hover:text-black hover:bg-black/10 transition-colors"
+            className="w-5 h-5 flex items-center justify-center rounded text-black/60 dark:text-white/70 hover:text-black dark:hover:text-white hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
           >
             <MdFormatBold size={14} />
           </button>
@@ -312,7 +327,7 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
             title="Italicize selection"
             onMouseDown={(e) => e.preventDefault()}
             onClick={handleToggleItalic}
-            className="w-5 h-5 flex items-center justify-center rounded text-black/60 hover:text-black hover:bg-black/10 transition-colors"
+            className="w-5 h-5 flex items-center justify-center rounded text-black/60 dark:text-white/70 hover:text-black dark:hover:text-white hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
           >
             <MdFormatItalic size={14} />
           </button>
@@ -351,7 +366,10 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
             padding: 2,
             border: "1px dashed rgba(0,0,0,0.3)",
             borderTop: "none",
-            background: "rgba(255,255,255,0.92)",
+            // Matches what actually gets baked into the page at commit (renderTextObject draws the
+            // same fill, or none) — no fill picked reads as fully transparent here too, rather than
+            // defaulting to an opaque white box that wouldn't actually be there once committed.
+            background: backgroundColor ?? "transparent",
           }}
         >
           {renderFormattedSegments(text, colorRuns, boldRuns, italicRuns, color)}

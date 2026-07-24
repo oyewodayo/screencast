@@ -161,6 +161,7 @@ fn main() {
             services::utility::open_file_from_directory,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
+            services::utility::get_cursor_position_in_window,
             services::utility::rename_file,
             services::utility::create_folder,
             services::utility::delete_folder,
@@ -169,6 +170,7 @@ fn main() {
             services::utility::get_platform,
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
+            services::pdf_annotations::save_exported_pdf,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

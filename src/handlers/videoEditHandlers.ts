@@ -15,41 +15,43 @@ export function invertCommand(command: VideoEditCommand): VideoEditCommand {
   return { before: command.after, after: command.before, label: command.label };
 }
 
-// The plain [start,end) ranges export_trimmed_video needs, in the same order as `clips` - that
-// order is exactly the desired playback/output order, so this is a type-only projection, not a
-// sort or a merge.
+// The plain [start,end) ranges export_trimmed_video needs, each naming its own source file, in
+// the same order as `clips` - that order is exactly the desired playback/output order, so this is
+// a type-only projection, not a sort or a merge.
 export function toKeepSegments(clips: Clip[]): KeepSegment[] {
-  return clips.map(({ start, end }) => ({ start, end }));
+  return clips.map(({ sourcePath, start, end }) => ({ sourcePath, start, end }));
 }
 
-// Which clip (by array position) `sourceTime` falls into, if any. Normal editing never produces
-// overlapping clips, so this is expected to be unambiguous; if it ever isn't, the first match
-// (lowest array index) wins.
-export function clipIndexAt(clips: Clip[], sourceTime: number): number {
-  return clips.findIndex((c) => sourceTime >= c.start && sourceTime < c.end);
+// Which clip (by array position) `sourceTime` falls into, restricted to `sourcePath` - without
+// that restriction this would be ambiguous once clips can come from different files (two clips
+// from different sources can easily share overlapping time ranges, e.g. both starting at 0).
+// Only meaningful for "is the clip I already know about still the one under the playhead" checks
+// (the live-preview tracking effect, mainly) - operations that need to find *which* clip a click
+// or the playhead landed on (Split, Delete) are given that clip's array index directly by the
+// caller instead of re-deriving it from a bare time value, for the same reason.
+export function clipIndexAt(clips: Clip[], sourcePath: string, sourceTime: number): number {
+  return clips.findIndex((c) => c.sourcePath === sourcePath && sourceTime >= c.start && sourceTime < c.end);
 }
 
-// Splits the clip at `sourceTime` into two adjacent clips in the same array slot, preserving
-// playback order. No-op (returns the same array reference) if `sourceTime` isn't strictly inside
-// any clip, or is too close to that clip's own edges to leave two meaningful pieces.
-export function splitClipAt(clips: Clip[], sourceTime: number): Clip[] {
-  const index = clipIndexAt(clips, sourceTime);
-  if (index === -1) return clips;
+// Splits the clip at `index` into two adjacent clips (same sourcePath) in its old array slot,
+// preserving playback order. No-op (returns the same array reference) if `index` is out of range,
+// or `sourceTime` is too close to that clip's own edges to leave two meaningful pieces.
+export function splitClipAt(clips: Clip[], index: number, sourceTime: number): Clip[] {
   const clip = clips[index];
+  if (!clip) return clips;
   if (sourceTime - clip.start < MIN_CLIP_LENGTH || clip.end - sourceTime < MIN_CLIP_LENGTH) return clips;
   return [
     ...clips.slice(0, index),
-    { id: crypto.randomUUID(), start: clip.start, end: sourceTime },
-    { id: crypto.randomUUID(), start: sourceTime, end: clip.end },
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime },
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end },
     ...clips.slice(index + 1),
   ];
 }
 
-// Removes the clip at `sourceTime` outright - what was that stretch of source video is simply no
+// Removes the clip at `index` outright - what was that stretch of source video is simply no
 // longer represented anywhere in the array, no separate "deleted range" bookkeeping needed.
-export function deleteClipAt(clips: Clip[], sourceTime: number): Clip[] {
-  const index = clipIndexAt(clips, sourceTime);
-  if (index === -1) return clips;
+export function deleteClipAt(clips: Clip[], index: number): Clip[] {
+  if (index < 0 || index >= clips.length) return clips;
   return clips.filter((_, i) => i !== index);
 }
 
@@ -65,19 +67,29 @@ export function reorderClip(clips: Clip[], fromIndex: number, toIndex: number): 
   return next;
 }
 
+// Inserts a brand-new clip (dragged in from the Briefcast library or an external file) at
+// `index`, shifting everything from that position onward later in the playback order. Clamped so
+// dropping before the first clip or past the last one still lands somewhere valid.
+export function insertClip(clips: Clip[], index: number, newClip: Clip): Clip[] {
+  const clamped = Math.max(0, Math.min(index, clips.length));
+  return [...clips.slice(0, clamped), newClip, ...clips.slice(clamped)];
+}
+
 // Drags one edge of a single clip - independent of every other clip. Clamped only against that
-// clip's own opposite edge and the overall video duration; deliberately not clamped against
+// clip's own opposite edge and `maxEnd` (the *that clip's own source file's* duration, looked up
+// by the caller - every clip can come from a different file, so there's no single shared
+// duration to clamp every clip's end against anymore); deliberately not clamped against
 // neighboring clips, since clips are addressed by array order (playback position) rather than
 // source-time adjacency and are allowed to have gaps or, if dragged that far, overlaps between
 // them in source time.
-export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end", duration: number, time: number): Clip[] {
+export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end", maxEnd: number, time: number): Clip[] {
   return clips.map((c) => {
     if (c.id !== id) return c;
     if (edge === "start") {
       const clamped = Math.max(0, Math.min(time, c.end - MIN_CLIP_LENGTH));
       return { ...c, start: clamped };
     }
-    const clamped = Math.min(duration, Math.max(time, c.start + MIN_CLIP_LENGTH));
+    const clamped = Math.min(maxEnd, Math.max(time, c.start + MIN_CLIP_LENGTH));
     return { ...c, end: clamped };
   });
 }

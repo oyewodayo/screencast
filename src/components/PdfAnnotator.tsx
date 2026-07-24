@@ -1,16 +1,19 @@
 // components/PdfAnnotator.tsx
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { IoContract } from "react-icons/io5";
+import { invoke } from "@tauri-apps/api/tauri";
 import usePdfDocument from "../hooks/usePdfDocument";
 import useAnnotationStore from "../hooks/useAnnotationStore";
 import usePageRenderCache from "../hooks/usePageRenderCache";
 import { AnnotationObject, AnnotationTool } from "../utils/pdfAnnotationTypes";
 import { makeImageObject } from "../handlers/pdfAnnotationHandlers";
+import { exportAnnotatedPdf } from "../handlers/pdfExportHandlers";
 import { fileToDataUrl } from "../utils/imageObjectCache";
 import AnnotationToolbar from "./pdf/AnnotationToolbar";
 import PdfPage from "./pdf/PdfPage";
 import PdfSidebar, { PdfSidebarView } from "./pdf/PdfSidebar";
 import { loadSettings } from "../utils/appSettings";
+import Toast from "./custom/Toast";
 
 const IMAGE_MAX_DIMENSION_PX = 2048; // downscale threshold before embedding into the sidecar JSON
 const IMAGE_MAX_INITIAL_WIDTH_FRACTION = 0.5; // fraction of the page's width, at 100% zoom, an inserted image is capped to
@@ -70,6 +73,14 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
   // holding the matching object — see PdfPage's selectedImageId/onSelectImage props.
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Export-to-flattened-PDF state, kept local to this component rather than in useAnnotationStore
+  // — it's a one-shot rendering/IO action over the current doc, not part of the store's own
+  // load/edit/autosave lifecycle.
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [exportProgress, setExportProgress] = useState<{ completed: number; total: number } | null>(null);
+  const [exportMessage, setExportMessage] = useState<string>("");
+  const [exportError, setExportError] = useState<string>("");
 
   const activeColor = tool === "highlighter" ? highlighterColor : tool === "text" ? textColor : penColor;
   const setActiveColor = tool === "highlighter" ? setHighlighterColor : tool === "text" ? setTextColor : setPenColor;
@@ -157,6 +168,31 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
     e.target.value = ""; // allow re-selecting the same file consecutively
     if (file) void insertImageFile(file);
   };
+
+  // Flattens every page's bitmap + its annotations into a brand-new standalone PDF (see
+  // pdfExportHandlers.ts) and writes it to "<name> (annotated).pdf" next to the source file — so
+  // the markup survives moving/sharing just the PDF, not only autosaving to this app's own
+  // sidecar JSON.
+  const handleExport = useCallback(async (): Promise<void> => {
+    if (!pdfDoc || numPages === 0 || isExporting) return;
+    setIsExporting(true);
+    setExportProgress({ completed: 0, total: numPages });
+    setExportError("");
+    try {
+      const bytes = await exportAnnotatedPdf(pdfDoc, numPages, store.getPageObjects, (completed, total) =>
+        setExportProgress({ completed, total })
+      );
+      const outputPath = await invoke<string>("save_exported_pdf", { pdfPath: sourcePath, bytes: Array.from(bytes) });
+      const outputName = outputPath.split(/[\\/]/).pop() ?? outputPath;
+      setExportMessage(`Exported to ${outputName}`);
+    } catch (err) {
+      console.error("Failed to export annotated PDF:", err);
+      setExportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsExporting(false);
+      setExportProgress(null);
+    }
+  }, [pdfDoc, numPages, isExporting, store.getPageObjects, sourcePath]);
 
   // Global paste-image support: works regardless of which tool is active, as long as focus isn't
   // in an editable element that should receive the paste itself (e.g. a text-note textarea).
@@ -518,8 +554,16 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
           onRedo={store.redo}
           isSaving={store.isSaving}
           saveError={store.saveError}
+          isExporting={isExporting}
+          exportProgress={exportProgress}
+          onExport={handleExport}
         />
       )}
+
+      <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
+        {exportMessage && <Toast key={`export-msg-${exportMessage}`} message={exportMessage} variant="info" onDismiss={() => setExportMessage("")} />}
+        {exportError && <Toast key={`export-err-${exportError}`} message={`Export failed: ${exportError}`} variant="error" onDismiss={() => setExportError("")} />}
+      </div>
 
       {/* min-h-0 here (and min-w-0 one level down) is load-bearing: without it a flex child can't
           shrink below its content's intrinsic size in either axis, so overflow-auto never

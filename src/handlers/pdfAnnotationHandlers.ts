@@ -490,6 +490,25 @@ function renderTextObject(
   // approach in practice.
   const lines = wrapTextBlock(ctx, object.text, deviceMaxWidth);
   const lineHeight = deviceFontSize * TEXT_LINE_HEIGHT_MULTIPLIER;
+
+  // Fill behind the text, matching TextNoteEditor's live backdrop 1:1 (same padding, same "no
+  // backgroundColor == no fill" rule) so what was being edited is what ends up baked into the page.
+  if (object.backgroundColor) {
+    const padding = 2 * scale;
+    const boxX = topLeft.x - padding;
+    const boxY = topLeft.y - padding;
+    const boxWidth = deviceMaxWidth + padding * 2;
+    const boxHeight = lines.length * lineHeight + padding * 2;
+    ctx.fillStyle = object.backgroundColor;
+    if (typeof ctx.roundRect === "function") {
+      ctx.beginPath();
+      ctx.roundRect(boxX, boxY, boxWidth, boxHeight, 4 * scale);
+      ctx.fill();
+    } else {
+      ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+    }
+  }
+
   const colorRuns = object.colorRuns ?? [];
   const boldRuns = object.boldRuns ?? [];
   const italicRuns = object.italicRuns ?? [];
