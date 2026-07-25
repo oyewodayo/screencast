@@ -608,7 +608,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           for (const o of current.imageOverlays) {
             // eslint-disable-next-line no-await-in-loop
             const rendered = await renderImageOverlayToPng(o, pxW, pxH);
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: false });
+            // "slide" has no export-side equivalent yet (would need a time-varying ffmpeg overlay
+            // x/y expression, not just the alpha fade filter this "fade" flag already drives) -
+            // preview-only for now, same as every other overlay aesthetic was before its own
+            // burn-in support was added.
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: o.animation === "fade" });
           }
         }
 

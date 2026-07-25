@@ -459,12 +459,21 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
   const endOverlayDrag = () => {
     if (!overlayDrag) return;
-    const { id, isDragging, liveStartTime } = overlayDrag;
+    const { id, isDragging, liveStartTime, duration } = overlayDrag;
     setOverlayDrag(null);
     if (isDragging) {
       editStore.moveTextOverlayTime(id, liveStartTime);
     }
     onSelectOverlay?.(id);
+    // Selecting a text overlay only actually opens it for editing in the main preview once the
+    // playhead sits inside its own time range - VideoOverlayLayer's editingSession is gated on
+    // "active at currentOutputTime" (so text off-screen at the current moment doesn't render an
+    // editor for it). Without this, clicking a chip whose range the playhead wasn't already inside
+    // updated selectedOverlayId but visibly did nothing in the preview, which read as "selecting
+    // from the timeline doesn't work" even though the click itself was registering correctly.
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
+      seekToOutputTime(liveStartTime);
+    }
   };
 
   // Same shape as the text-overlay lane's drag state just above, retiming an ImageOverlay instead
@@ -545,12 +554,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
   const endImageOverlayDrag = () => {
     if (!imageOverlayDrag) return;
-    const { id, isDragging, liveStartTime } = imageOverlayDrag;
+    const { id, isDragging, liveStartTime, duration } = imageOverlayDrag;
     setImageOverlayDrag(null);
     if (isDragging) {
       editStore.moveImageOverlayTime(id, liveStartTime);
     }
     onSelectImageOverlay?.(id);
+    // Same reasoning as endOverlayDrag's own comment: image overlays are also only rendered (and
+    // so only visibly show selection handles) while the playhead is inside their own time range
+    // (see activeImageOverlays' overlaysActiveAt filter in VideoOverlayLayer.tsx), so selecting one
+    // from the timeline while the playhead is elsewhere needs to bring the playhead along with it.
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
+      seekToOutputTime(liveStartTime);
+    }
   };
 
   const ticks = useMemo(() => {
@@ -1295,6 +1311,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     onPointerDown={beginOverlayDrag(overlay)}
                     onPointerMove={handleOverlayDragMove}
                     onPointerUp={endOverlayDrag}
+                    onPointerCancel={endOverlayDrag}
                     title={overlay.text || "Text overlay"}
                     className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center px-2 text-[11px] text-white truncate cursor-grab active:cursor-grabbing ${
                       isSelected ? "border-dashed border-white" : "border-purple-400"
@@ -1345,6 +1362,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     onPointerDown={beginImageOverlayDrag(overlay)}
                     onPointerMove={handleImageOverlayDragMove}
                     onPointerUp={endImageOverlayDrag}
+                    onPointerCancel={endImageOverlayDrag}
                     title={fileName}
                     className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center gap-1 px-2 text-[11px] text-white truncate cursor-grab active:cursor-grabbing ${
                       isSelected ? "border-dashed border-white" : "border-amber-400"

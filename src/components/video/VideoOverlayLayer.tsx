@@ -23,7 +23,7 @@ import { IoChevronDown, IoChevronUp } from "react-icons/io5";
 import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { FrameRect } from "../../utils/videoFrameRect";
-import { ImageOverlay, TextOverlay, TextOverlayAnimation, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
+import { ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { renderFormattedSegments } from "../../utils/textFormatting";
 import { TEXT_FONT_FAMILY, measureTextBlock } from "../../handlers/pdfAnnotationHandlers";
@@ -44,10 +44,6 @@ export const DEFAULT_OVERLAY_DURATION_SEC = 5;
 const legacyPaddingFraction = (frameHeightPx: number): number => (frameHeightPx > 0 ? 2 / frameHeightPx : 0);
 const DEFAULT_IMAGE_WIDTH_FRACTION = 0.25;
 const MIN_IMAGE_WIDTH_PX = 24;
-// First/last this many seconds of an overlay's time range ramp opacity for the "fade" animation -
-// clamped against the overlay's own duration so a very short overlay still fades fully in before
-// fading back out rather than the two ramps overlapping oddly.
-const TEXT_FADE_DURATION_SEC = 0.4;
 
 const TEXT_STYLE_PRESETS: { name: string; patch: TextOverlayContentPatch }[] = [
   { name: "Clean", patch: { backgroundColor: undefined, strokeColor: undefined, strokeWidth: undefined, cornerStyle: "square" } },
@@ -92,6 +88,7 @@ type ImageOverlayContentPatch = Partial<
     | "shadow"
     | "flipHorizontal"
     | "flipVertical"
+    | "animation"
     | "src"
     | "cropX"
     | "cropY"
@@ -137,6 +134,62 @@ const cropBackgroundStyle = (o: ImageOverlay): React.CSSProperties => {
     backgroundSize: `${cropWidth > 0 ? 100 / cropWidth : 100}% ${cropHeight > 0 ? 100 / cropHeight : 100}%`,
     backgroundPosition: `${posX} ${posY}`,
   };
+};
+
+// Shared entry/exit timing envelope for OverlayAnimation - text and image overlays both use the
+// exact same "ramp over the first/last ANIMATION_RAMP_DURATION_SEC of the overlay's own time
+// range" shape, just driving different CSS (opacity for fade, a translate offset for slide), so
+// this is one function feeding both render paths below instead of two near-duplicates.
+const ANIMATION_RAMP_DURATION_SEC = 0.4;
+// How far off its resting position a "slide" overlay sits at the very start/end of its ramp, as a
+// fraction of the frame dimension it travels along - large enough to read clearly as a slide,
+// small enough that it doesn't travel distractingly far across the frame.
+const SLIDE_DISTANCE_FRACTION = 0.12;
+
+interface OverlayAnimationStyle {
+  opacity: number;
+  translateXPx: number;
+  translateYPx: number;
+}
+
+const overlayAnimationStyle = (
+  animation: OverlayAnimation | undefined,
+  startTime: number,
+  endTime: number,
+  currentTime: number,
+  frameWidth: number,
+  frameHeight: number
+): OverlayAnimationStyle => {
+  if (!animation || animation === "none") return { opacity: 1, translateXPx: 0, translateYPx: 0 };
+
+  const ramp = Math.min(ANIMATION_RAMP_DURATION_SEC, (endTime - startTime) / 2);
+  // 0 right at either edge of the overlay's time range, ramping up to 1 once fully "arrived" -
+  // clamped to half the overlay's own duration so a very short overlay still finishes entering
+  // before it starts leaving, same reasoning fade already used before this was generalized.
+  const progress = ramp <= 0 ? 1 : Math.max(0, Math.min(1, (currentTime - startTime) / ramp, (endTime - currentTime) / ramp));
+
+  if (animation === "fade") return { opacity: progress, translateXPx: 0, translateYPx: 0 };
+
+  // Slide keeps full opacity throughout - only its position ramps. `remaining` is "how far from
+  // fully in place" (1 at either edge, 0 once arrived), so multiplying it by the travel distance
+  // gives an offset that shrinks to 0 as the overlay settles in, then grows back as it leaves -
+  // out the same side it came in from, a deliberate "peek and retreat" rather than a conveyor
+  // that enters one side and exits the other.
+  const remaining = 1 - progress;
+  const distanceX = frameWidth * SLIDE_DISTANCE_FRACTION;
+  const distanceY = frameHeight * SLIDE_DISTANCE_FRACTION;
+  switch (animation) {
+    case "slide-left":
+      return { opacity: 1, translateXPx: -distanceX * remaining, translateYPx: 0 };
+    case "slide-right":
+      return { opacity: 1, translateXPx: distanceX * remaining, translateYPx: 0 };
+    case "slide-up":
+      return { opacity: 1, translateXPx: 0, translateYPx: -distanceY * remaining };
+    case "slide-down":
+      return { opacity: 1, translateXPx: 0, translateYPx: distanceY * remaining };
+    default:
+      return { opacity: 1, translateXPx: 0, translateYPx: 0 };
+  }
 };
 
 // Local, not-yet-persisted position/size for whichever text overlay is currently open for editing
@@ -357,6 +410,89 @@ const SteppedNumberField: React.FC<SteppedNumberFieldProps> = ({ valuePx, min, m
         </button>
       </div>
     </div>
+  );
+};
+
+const ANIMATION_OPTIONS: { value: OverlayAnimation; label: string }[] = [
+  { value: "none", label: "None" },
+  { value: "fade", label: "Fade" },
+  { value: "slide-left", label: "Slide ←" },
+  { value: "slide-right", label: "Slide →" },
+  { value: "slide-up", label: "Slide ↑" },
+  { value: "slide-down", label: "Slide ↓" },
+];
+
+// A single button (shared by the text and image style panels) that opens a small menu of
+// entry/exit animations - portal-rendered and positioned from the trigger's own
+// getBoundingClientRect() rather than a plain CSS-relative dropdown, for the same reason the
+// context menu elsewhere in this file already is: both style panels can sit close enough to
+// .video-container's own overflow:hidden edge that a dropdown anchored purely by CSS position
+// would get clipped right when there's least room for it. onMouseDown={preventDefault} on the
+// trigger (not the options - see below) keeps it from stealing focus from TextNoteEditor's
+// textarea, the same trap every other button in these panels already avoids.
+interface AnimationPickerProps {
+  value: OverlayAnimation | undefined;
+  onChange: (next: OverlayAnimation) => void;
+}
+const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) => {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
+  const current = ANIMATION_OPTIONS.find((o) => o.value === (value ?? "none")) ?? ANIMATION_OPTIONS[0];
+
+  useEffect(() => {
+    if (!menuPos) return;
+    const close = () => setMenuPos(null);
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [menuPos]);
+
+  return (
+    <>
+      <button
+        ref={buttonRef}
+        type="button"
+        title="Entry/exit animation"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={(e) => {
+          e.stopPropagation();
+          const rect = buttonRef.current?.getBoundingClientRect();
+          if (rect) setMenuPos({ left: rect.left, top: rect.bottom + 4 });
+        }}
+        className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+          current.value !== "none" ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+        }`}
+      >
+        {current.label}
+      </button>
+      {menuPos &&
+        createPortal(
+          // Stops the document-level pointerdown-to-close listener from tearing this menu down on
+          // the same press that's clicking one of its own options - same reasoning/fix as the
+          // right-click context menu's own portal further down this file.
+          <div
+            onPointerDown={(e) => e.stopPropagation()}
+            style={{ position: "fixed", left: menuPos.left, top: menuPos.top, zIndex: 9999 }}
+            className="w-28 py-1 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10"
+          >
+            {ANIMATION_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => {
+                  onChange(opt.value);
+                  setMenuPos(null);
+                }}
+                className={`w-full text-left px-2.5 py-1 text-[11px] transition-colors ${
+                  opt.value === current.value ? "text-blue-400 bg-blue-500/10" : "text-white/80 hover:bg-white/10"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>,
+          document.body
+        )}
+    </>
   );
 };
 
@@ -885,17 +1021,6 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   });
   const selectedImageOverlayData = selectedImageOverlayId ? activeImageOverlays.find((o) => o.id === selectedImageOverlayId) : undefined;
 
-  // Fade-in/out opacity envelope for text overlays with animation:"fade" - ramps over the first/
-  // last TEXT_FADE_DURATION_SEC of the overlay's own time range, clamped to half its duration so a
-  // very short overlay still reaches full opacity before starting to fade back out.
-  const fadeOpacity = (o: TextOverlay): number => {
-    if (o.animation !== "fade") return 1;
-    const ramp = Math.min(TEXT_FADE_DURATION_SEC, (o.endTime - o.startTime) / 2);
-    if (ramp <= 0) return 1;
-    const sinceStart = currentOutputTime - o.startTime;
-    const untilEnd = o.endTime - currentOutputTime;
-    return Math.max(0, Math.min(1, sinceStart / ramp, untilEnd / ramp));
-  };
 
   const cornerRadiusCss = (style: TextOverlayCornerStyle | undefined, heightPx: number): number => {
     if (style === "pill") return heightPx / 2;
@@ -1007,6 +1132,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         const roomAbovePx = o.y * frameRect.height;
         const rotateHandleRise = rotateHandleRiseFor(roomAbovePx);
         const showRotateStem = roomAbovePx >= 32;
+        const anim = overlayAnimationStyle(o.animation, o.startTime, o.endTime, currentOutputTime, frameRect.width, frameRect.height);
         return (
           <div
             key={o.id}
@@ -1022,9 +1148,18 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               top: o.y * frameRect.height,
               width: o.width * frameRect.width,
               height: o.height * frameRect.height,
-              opacity: o.opacity,
+              opacity: o.opacity * anim.opacity,
               borderRadius: radiusPx,
-              transform: o.rotation ? `rotate(${o.rotation}deg)` : undefined,
+              // translate (slide animation) is listed before rotate so it applies in screen-space,
+              // outside the image's own local rotation - see overlayAnimationStyle's own comment on
+              // why "peek and retreat" rather than a conveyor, and CSS's own transform-composition
+              // order (each function transforms the *coordinate system* for the ones after it, so
+              // rotate here only ever spins the box around its own center, never around some
+              // already-translated point).
+              transform:
+                [anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null, o.rotation ? `rotate(${o.rotation}deg)` : null]
+                  .filter(Boolean)
+                  .join(" ") || undefined,
               // Border and drop shadow combine into one box-shadow rather than a real `border` - a
               // real border adds to the box's layout size unless box-sizing is pinned, and
               // box-shadow already composes multiple layers for free via commas. Both are drawn as
@@ -1116,6 +1251,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         .map((o) => {
           const paddingPx = o.padding !== undefined ? o.padding * frameRect.height : 2;
           const heightPx = o.fontSize * frameRect.height * 1.3 + paddingPx * 2;
+          const anim = overlayAnimationStyle(o.animation, o.startTime, o.endTime, currentOutputTime, frameRect.width, frameRect.height);
           return (
             <div
               key={o.id}
@@ -1131,7 +1267,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 padding: paddingPx,
                 textAlign: o.textAlign ?? "left",
                 pointerEvents: placingAnything ? "none" : "auto",
-                opacity: fadeOpacity(o),
+                opacity: anim.opacity,
+                transform: anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : undefined,
                 background: o.backgroundColor ?? "transparent",
                 borderRadius: cornerRadiusCss(o.cornerStyle, heightPx),
                 // -webkit-text-stroke draws centered on the glyph outline by default, which can eat
@@ -1287,19 +1424,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               </button>
             ))}
             <div className="w-px h-4 bg-white/15" />
-            <button
-              type="button"
-              title="Fade in/out over the overlay's time range"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() =>
-                onUpdateTextOverlayContent(editingOverlayData.id, { animation: editingOverlayData.animation === "fade" ? "none" : ("fade" as TextOverlayAnimation) })
-              }
-              className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-                editingOverlayData.animation === "fade" ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-              }`}
-            >
-              Fade
-            </button>
+            <AnimationPicker value={editingOverlayData.animation} onChange={(next) => onUpdateTextOverlayContent(editingOverlayData.id, { animation: next })} />
             <div className="w-px h-4 bg-white/15" />
             <button
               type="button"
@@ -1449,6 +1574,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           >
             Flip V
           </button>
+          <div className="w-px h-4 bg-white/15" />
+          <AnimationPicker
+            value={selectedImageOverlayData.animation}
+            onChange={(next) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { animation: next })}
+          />
           <div className="w-px h-4 bg-white/15" />
           <button
             type="button"

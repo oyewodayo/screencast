@@ -22,11 +22,15 @@ export interface Clip {
 // when a backgroundColor is set (an invisible box has no edges to round). Video-only: TextObject
 // (PDF notes) has no equivalent, since a PDF page has no notion of a "caption chip" aesthetic.
 export type TextOverlayCornerStyle = "square" | "rounded" | "pill";
-// Video-only, same reasoning: a still PDF page has no time axis to fade across, so this concept
-// has nothing to mirror on the TextObject side. "fade" ramps opacity 0->1 over the first
-// TEXT_FADE_DURATION_SEC of the overlay's time range and 1->0 over the last, clamped so a very
-// short overlay still fades fully in before fading back out rather than overlapping oddly.
-export type TextOverlayAnimation = "none" | "fade";
+// Video-only, same reasoning: a still PDF page has no time axis to animate across, so this concept
+// has nothing to mirror on TextObject. Shared by both TextOverlay and ImageOverlay (see each
+// type's own `animation` field) rather than declared twice - entering/leaving an overlay's time
+// range is the same underlying timing envelope regardless of what's inside the box. "fade" ramps
+// opacity 0->1 over the first OVERLAY_ANIMATION_RAMP_SEC of the overlay's time range and 1->0 over
+// the last; "slide-<direction>" instead keeps opacity at 1 and, over that same ramp, slides the box
+// in from (and back out to) the named off-screen side. Both clamp their ramp to half the overlay's
+// own duration so a very short overlay still finishes entering before it starts leaving.
+export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down";
 
 // A caption/title composited over the video preview (v1 is preview-only - not yet burned into
 // exported files, see export_trimmed_video). Core text/formatting mirrors TextObject
@@ -56,7 +60,7 @@ export interface TextOverlay {
   strokeColor?: string;
   strokeWidth?: number;
   cornerStyle?: TextOverlayCornerStyle; // undefined means "square", the pre-existing look
-  animation?: TextOverlayAnimation; // undefined means "none", the pre-existing look
+  animation?: OverlayAnimation; // undefined means "none", the pre-existing look
   // Breathing room around the text inside its box, most visible with backgroundColor/stroke set -
   // fraction of frameRect.height (same basis as fontSize, not width - padding is a vertical-scale
   // concept here). Undefined means the pre-existing fixed 2px look, both in the live preview
@@ -102,6 +106,7 @@ export interface ImageOverlay {
   shadow?: boolean; // undefined/false means no drop shadow
   flipHorizontal?: boolean; // undefined/false means not mirrored
   flipVertical?: boolean;
+  animation?: OverlayAnimation; // undefined means "none", the pre-existing look
   // The visible sub-rectangle of the source picture, set via the dedicated Crop mode
   // (ImageOverlayCropPanel.tsx) - fractions of the SOURCE IMAGE's own natural pixel dimensions,
   // unlike every other field on this type (all normalized against the video frame instead). All
