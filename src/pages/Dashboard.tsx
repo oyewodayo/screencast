@@ -1688,7 +1688,12 @@ const setScreen = () => {
                   </div>
                 )}
 
-                <div className="p-3 text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200">
+                {/* pb tracks --docker-height (published by BottomDocker's ResizeObserver, see
+                    player.css for the sibling usage) so the last row can always scroll clear of
+                    the fixed bottom icon bar instead of rendering underneath it, unclickable. */}
+                <div
+                  className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200"
+                >
                 {activeFileCategory === "trash" ? (
                   trashItems.length === 0 ? (
                     <p>Trash is empty</p>
@@ -2239,6 +2244,7 @@ const setScreen = () => {
         setAudioDevice={setAudioDevice}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
+        isHome={selectedFile === null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}

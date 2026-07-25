@@ -60,6 +60,7 @@ interface Props {
   onToggleArmPlaceImage?: () => void;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
+  isHome: boolean;
   handleOpenSettings: () => void;
   handleOpenExternalFile: () => void;
   showFileList: boolean;
@@ -137,6 +138,7 @@ const BottomDocker = ({
   onToggleArmPlaceImage,
   handleFolderSettings,
   handleGoHome,
+  isHome,
   handleOpenSettings,
   handleOpenExternalFile,
   showFileList,
@@ -404,6 +406,7 @@ const BottomDocker = ({
             recordType={recordType}
             handleFolderSettings={handleFolderSettings}
             handleGoHome={handleGoHome}
+            isHome={isHome}
             handleOpenSettings={handleOpenSettings}
             handleOpenExternalFile={handleOpenExternalFile}
             handleVideoOverlayAction={handleVideoOverlayAction}
