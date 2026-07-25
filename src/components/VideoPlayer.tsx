@@ -1,5 +1,5 @@
 import './player.css';
-import React, { useState, useRef, useEffect, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import { IoPause, IoPlay, IoPlayCircleOutline, IoPlayCircle } from 'react-icons/io5';
@@ -25,6 +25,7 @@ import {
 
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
+import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
 
 
 
@@ -87,6 +88,12 @@ interface VideoPlayerProps {
   // caller (Dashboard) is the only place autoplay-next state can actually persist.
   autoplayNext?: boolean;
   onAutoplayNextChange?: () => void;
+  // Renders arbitrary content positioned/sized to exactly the letterboxed picture area (not the
+  // whole container) - a render-prop rather than a plain node so the caller can convert its own
+  // content's normalized coordinates using the same pixel rect this component already computes,
+  // without re-measuring it independently. Keeps VideoPlayer itself fully generic - it has no
+  // idea what's actually being rendered inside (text overlays, or anything else later).
+  overlay?: (frameRect: FrameRect) => React.ReactNode;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -108,7 +115,7 @@ export interface VideoPlayerHandle {
   loadSource: (src: string, seekTime: number) => void;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -160,6 +167,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [isRecovering, setIsRecovering] = useState<boolean>(false);
   // 0-100, updated live from the backend's conversion-progress events while isRecovering.
   const [recoveryProgress, setRecoveryProgress] = useState<number>(0);
+  // Intrinsic pixel size of the loaded video (from loadedmetadata) and the live size of its
+  // container (via ResizeObserver, since window resize/theater-mode/fullscreen all change this
+  // without the video itself reloading) - together these are exactly what computeLetterboxRect
+  // needs to derive the visible (letterboxed) picture rect for the `overlay` render-prop.
+  const [videoIntrinsicSize, setVideoIntrinsicSize] = useState<{ width: number; height: number } | null>(null);
+  const [containerSize, setContainerSize] = useState<{ width: number; height: number } | null>(null);
   // Core player state
   const [, setIsPaused] = useState<boolean>(true);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -237,6 +250,29 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (autoPlay) videoRef.current.play().catch(() => {});
     }
   }, [mediaType, src, autoPlay]);
+
+  // Tracks the container's live box size for the `overlay` render-prop's letterbox math - window
+  // resize, theater mode, and fullscreen all change this without the <video> itself reloading (so
+  // this can't just be read once off loadedmetadata the way videoIntrinsicSize below is).
+  useEffect(() => {
+    const el = videoContainerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setContainerSize({ width: entry.contentRect.width, height: entry.contentRect.height });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const frameRect = useMemo(
+    () =>
+      containerSize && videoIntrinsicSize
+        ? computeLetterboxRect(containerSize.width, containerSize.height, videoIntrinsicSize.width, videoIntrinsicSize.height)
+        : null,
+    [containerSize, videoIntrinsicSize]
+  );
 
   // Some containers/codecs this app can record (most notably .avi - WebView2's <video> element
   // has no container support for it at all, regardless of what's encoded inside) can never play
@@ -874,6 +910,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							if (initialTime && Number.isFinite(initialTime) && initialTime > 0 && initialTime < videoRef.current.duration) {
 								videoRef.current.currentTime = initialTime;
 							}
+							setVideoIntrinsicSize({ width: videoRef.current.videoWidth, height: videoRef.current.videoHeight });
 							}
 						}}
 					>
@@ -889,6 +926,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						<div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none bg-black/40">
 							<div className="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />
 							<div className="text-white text-sm">Preparing video{recoveryProgress > 0 ? ` — ${recoveryProgress}%` : '...'}</div>
+						</div>
+					)}
+					{overlay && frameRect && (
+						<div
+							className="absolute pointer-events-none"
+							style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height }}
+						>
+							{overlay(frameRect)}
 						</div>
 					)}
 					</>

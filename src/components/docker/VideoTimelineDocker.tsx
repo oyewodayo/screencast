@@ -31,10 +31,11 @@ import {
   IoPlay,
   IoPause,
   IoAddCircleOutline,
+  IoImageOutline,
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
-import useVideoEditStore from "../../hooks/useVideoEditStore";
-import { Clip } from "../../utils/videoEditTypes";
+import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
+import { Clip, ImageOverlay, TextOverlay } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 
 const MIN_PX_PER_SEC = 8;
@@ -44,6 +45,7 @@ const THUMB_TARGET_WIDTH = 100; // px - roughly how wide each filmstrip frame sh
 const NICE_TICK_INTERVALS = [1, 2, 3, 5, 10, 15, 30, 60, 120, 300, 600]; // seconds
 const MIN_TICK_SPACING_PX = 70;
 const MIN_CLIP_LENGTH = 0.05;
+const MIN_OVERLAY_DURATION = 0.1; // matches videoEditHandlers.ts's own MIN_OVERLAY_DURATION
 // Generous tolerance on the "still inside the tracked clip" check in the live-preview tracking
 // effect below - seeking to an arbitrary time doesn't always land exactly there (keyframe-
 // interval snapping, decoder rounding), so a strict [start,end) check evaluated on the very first
@@ -105,6 +107,10 @@ const ActionButton: React.FC<{
 interface VideoTimelineDockerProps {
   file: DockerFile;
   playableSrc: string;
+  // Lifted to Dashboard.tsx (single call site - useVideoEditStore is a stateful hook, unsafe to
+  // call from more than one component) so the preview-layer text-overlay editor near VideoPlayer
+  // and this docker's timeline lane can share the exact same edit state/undo-redo stack.
+  editStore: UseVideoEditStoreResult;
   currentTime: number;
   // sourcePath names which file's timeline `time` belongs to - required now that a clip dragged
   // in from elsewhere means "seek to this time" is ambiguous without saying which file. Dashboard
@@ -141,6 +147,28 @@ interface VideoTimelineDockerProps {
   // different native window, only Tauri's own file-drop event is, and that carries no position).
   pendingTimelineInsert: { paths: string[]; clientX: number } | null;
   onTimelineInsertHandled: () => void;
+
+  // Reports the current position on the assembled/output timeline (same space text overlay
+  // start/endTime use) upward, so the preview-layer overlay (mounted next to VideoPlayer, a
+  // sibling subtree Dashboard owns) can time-gate which overlays are visible without duplicating
+  // this component's own tricky SEEK_TOLERANCE_SEC-guarded active-clip tracking.
+  onOutputTimeChange?: (outputTime: number) => void;
+
+  // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
+  // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
+  // whichever overlay (if any) is actually open for editing there.
+  selectedOverlayId?: string | null;
+  onSelectOverlay?: (id: string | null) => void;
+  // Whether the "Text" tool is armed - the next click on the video preview places a new overlay
+  // (handled by VideoOverlayLayer) and disarms this. Lifted for the same reason as above.
+  isPlacingText?: boolean;
+  onToggleArmPlaceText?: () => void;
+
+  // Image-overlay selection/placement, same threading/reasoning as the text-overlay props above.
+  selectedImageOverlayId?: string | null;
+  onSelectImageOverlay?: (id: string | null) => void;
+  isPlacingImage?: boolean;
+  onToggleArmPlaceImage?: () => void;
 }
 
 // The video-specific "file tools" docker: a scrubbable timeline (ruler + playhead + reorderable
@@ -153,6 +181,7 @@ interface VideoTimelineDockerProps {
 const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   file,
   playableSrc,
+  editStore,
   currentTime,
   onSeek,
   isPlaying,
@@ -164,14 +193,26 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   draggingLibraryFile,
   pendingTimelineInsert,
   onTimelineInsertHandled,
+  onOutputTimeChange,
+  selectedOverlayId = null,
+  onSelectOverlay,
+  isPlacingText = false,
+  onToggleArmPlaceText,
+  selectedImageOverlayId = null,
+  onSelectImageOverlay,
+  isPlacingImage = false,
+  onToggleArmPlaceImage,
 }) => {
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
   const trackAreaRef = useRef<HTMLDivElement>(null);
 
-  const editStore = useVideoEditStore(file.path);
-
   const [duration, setDuration] = useState<number>(0);
+  // Native pixel size of the primary file, read off the same hidden capture <video> already used
+  // for thumbnails once its metadata loads - Save needs this to know what resolution to render
+  // text/image overlay PNGs at for burn-in (see videoOverlayRender.ts / exportEdited), since
+  // TextOverlay/ImageOverlay only store position/size as frame-relative fractions.
+  const [videoPixelSize, setVideoPixelSize] = useState<{ width: number; height: number } | null>(null);
   const [pxPerSec, setPxPerSec] = useState<number>(DEFAULT_PX_PER_SEC);
   const [thumbnails, setThumbnails] = useState<ThumbFrame[]>([]);
   const [coverThumbnail, setCoverThumbnail] = useState<string | null>(null);
@@ -241,6 +282,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       if (!Number.isFinite(total) || total <= 0) return;
       setDuration(total);
       editStore.setDuration(total);
+      if (video.videoWidth > 0 && video.videoHeight > 0) setVideoPixelSize({ width: video.videoWidth, height: video.videoHeight });
 
       const containerWidth = trackAreaRef.current?.clientWidth ?? 600;
       const count = Math.max(4, Math.min(40, Math.round(containerWidth / THUMB_TARGET_WIDTH)));
@@ -336,6 +378,180 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }
   const totalOutputDuration = clipDurations.reduce((a, b) => a + b, 0);
   const totalWidth = Math.max(1, totalOutputDuration * pxPerSec);
+
+  // Live drag state for the text-overlay lane below - same delta-based/live-preview shape as
+  // resizeDrag/clipDrag above, just retiming a TextOverlay instead of a Clip. Kept as separate
+  // state (rather than reusing resizeDrag/clipDrag) since the clamping rules differ (against
+  // totalOutputDuration, not a source file's own duration) and an overlay id could otherwise be
+  // mistaken for a clip id sharing the same drag state shape.
+  const [overlayResizeDrag, setOverlayResizeDrag] = useState<null | {
+    id: string;
+    edge: "start" | "end";
+    startClientX: number;
+    startValue: number;
+    oppositeBound: number;
+    liveValue: number;
+  }>(null);
+  const [overlayDrag, setOverlayDrag] = useState<null | {
+    id: string;
+    startClientX: number;
+    startTime: number;
+    duration: number;
+    isDragging: boolean;
+    liveStartTime: number;
+  }>(null);
+
+  const renderOverlays: TextOverlay[] = editStore.textOverlays.map((o) => {
+    if (overlayResizeDrag && o.id === overlayResizeDrag.id) {
+      return overlayResizeDrag.edge === "start" ? { ...o, startTime: overlayResizeDrag.liveValue } : { ...o, endTime: overlayResizeDrag.liveValue };
+    }
+    if (overlayDrag && o.id === overlayDrag.id) {
+      return { ...o, startTime: overlayDrag.liveStartTime, endTime: overlayDrag.liveStartTime + overlayDrag.duration };
+    }
+    return o;
+  });
+
+  const beginOverlayResizeDrag = (overlay: TextOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    onSelectOverlay?.(overlay.id);
+    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
+    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
+    setOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
+  };
+  const handleOverlayResizeDragMove = (e: React.PointerEvent) => {
+    if (!overlayResizeDrag) return;
+    e.stopPropagation();
+    const deltaSec = (e.clientX - overlayResizeDrag.startClientX) / pxPerSec;
+    const raw = overlayResizeDrag.startValue + deltaSec;
+    const clamped =
+      overlayResizeDrag.edge === "start"
+        ? Math.max(0, Math.min(raw, overlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
+        : Math.min(totalOutputDuration, Math.max(raw, overlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
+    setOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
+  };
+  const endOverlayResizeDrag = () => {
+    if (!overlayResizeDrag) return;
+    const { id, edge, liveValue } = overlayResizeDrag;
+    setOverlayResizeDrag(null);
+    editStore.resizeTextOverlayTime(id, edge, liveValue);
+  };
+
+  const beginOverlayDrag = (overlay: TextOverlay) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setOverlayDrag({
+      id: overlay.id,
+      startClientX: e.clientX,
+      startTime: overlay.startTime,
+      duration: overlay.endTime - overlay.startTime,
+      isDragging: false,
+      liveStartTime: overlay.startTime,
+    });
+  };
+  const handleOverlayDragMove = (e: React.PointerEvent) => {
+    if (!overlayDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - overlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    const deltaSec = (e.clientX - overlayDrag.startClientX) / pxPerSec;
+    const liveStartTime = Math.max(0, Math.min(overlayDrag.startTime + deltaSec, totalOutputDuration - overlayDrag.duration));
+    setOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endOverlayDrag = () => {
+    if (!overlayDrag) return;
+    const { id, isDragging, liveStartTime } = overlayDrag;
+    setOverlayDrag(null);
+    if (isDragging) {
+      editStore.moveTextOverlayTime(id, liveStartTime);
+    }
+    onSelectOverlay?.(id);
+  };
+
+  // Same shape as the text-overlay lane's drag state just above, retiming an ImageOverlay instead
+  // - kept as its own state for the same reason overlayResizeDrag/overlayDrag are kept separate
+  // from resizeDrag/clipDrag (a shared id namespace between drag kinds would be a real hazard).
+  const [imageOverlayResizeDrag, setImageOverlayResizeDrag] = useState<null | {
+    id: string;
+    edge: "start" | "end";
+    startClientX: number;
+    startValue: number;
+    oppositeBound: number;
+    liveValue: number;
+  }>(null);
+  const [imageOverlayDrag, setImageOverlayDrag] = useState<null | {
+    id: string;
+    startClientX: number;
+    startTime: number;
+    duration: number;
+    isDragging: boolean;
+    liveStartTime: number;
+  }>(null);
+
+  const renderImageOverlays: ImageOverlay[] = editStore.imageOverlays.map((o) => {
+    if (imageOverlayResizeDrag && o.id === imageOverlayResizeDrag.id) {
+      return imageOverlayResizeDrag.edge === "start" ? { ...o, startTime: imageOverlayResizeDrag.liveValue } : { ...o, endTime: imageOverlayResizeDrag.liveValue };
+    }
+    if (imageOverlayDrag && o.id === imageOverlayDrag.id) {
+      return { ...o, startTime: imageOverlayDrag.liveStartTime, endTime: imageOverlayDrag.liveStartTime + imageOverlayDrag.duration };
+    }
+    return o;
+  });
+
+  const beginImageOverlayResizeDrag = (overlay: ImageOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    onSelectImageOverlay?.(overlay.id);
+    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
+    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
+    setImageOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
+  };
+  const handleImageOverlayResizeDragMove = (e: React.PointerEvent) => {
+    if (!imageOverlayResizeDrag) return;
+    e.stopPropagation();
+    const deltaSec = (e.clientX - imageOverlayResizeDrag.startClientX) / pxPerSec;
+    const raw = imageOverlayResizeDrag.startValue + deltaSec;
+    const clamped =
+      imageOverlayResizeDrag.edge === "start"
+        ? Math.max(0, Math.min(raw, imageOverlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
+        : Math.min(totalOutputDuration, Math.max(raw, imageOverlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
+    setImageOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
+  };
+  const endImageOverlayResizeDrag = () => {
+    if (!imageOverlayResizeDrag) return;
+    const { id, edge, liveValue } = imageOverlayResizeDrag;
+    setImageOverlayResizeDrag(null);
+    editStore.resizeImageOverlayTime(id, edge, liveValue);
+  };
+
+  const beginImageOverlayDrag = (overlay: ImageOverlay) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setImageOverlayDrag({
+      id: overlay.id,
+      startClientX: e.clientX,
+      startTime: overlay.startTime,
+      duration: overlay.endTime - overlay.startTime,
+      isDragging: false,
+      liveStartTime: overlay.startTime,
+    });
+  };
+  const handleImageOverlayDragMove = (e: React.PointerEvent) => {
+    if (!imageOverlayDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - imageOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    const deltaSec = (e.clientX - imageOverlayDrag.startClientX) / pxPerSec;
+    const liveStartTime = Math.max(0, Math.min(imageOverlayDrag.startTime + deltaSec, totalOutputDuration - imageOverlayDrag.duration));
+    setImageOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endImageOverlayDrag = () => {
+    if (!imageOverlayDrag) return;
+    const { id, isDragging, liveStartTime } = imageOverlayDrag;
+    setImageOverlayDrag(null);
+    if (isDragging) {
+      editStore.moveImageOverlayTime(id, liveStartTime);
+    }
+    onSelectImageOverlay?.(id);
+  };
 
   const ticks = useMemo(() => {
     if (totalOutputDuration <= 0) return [];
@@ -487,6 +703,61 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     editStore.deleteClipAt(index);
     if (selectedIndex !== -1) setSelectedClipId(null);
   };
+
+  // Delete/Backspace deletes whatever is actually selected - a text overlay takes priority over a
+  // clip (an overlay chip and a clip can't be selected at the same time in this UI, but if that
+  // ever changed, the overlay is the more "local" selection). Deliberately does NOT fall back to
+  // handleDeleteSegment's own "nothing selected -> delete the clip at the playhead" behavior the
+  // toolbar button uses - that's fine for a deliberate button click, but a bare keypress with
+  // nothing selected acting on whatever the playhead happens to be sitting on would be a surprising
+  // way to lose a clip. Same target.tagName/isContentEditable guard Dashboard's own arrow-key
+  // navigation effect uses, so this doesn't hijack Delete/Backspace while typing anywhere (renaming
+  // a file, typing in a text overlay, etc).
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+
+      // Ctrl/Cmd+Z undoes, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redoes - the two conventional redo
+      // bindings, kept both since Windows apps commonly use either. Checked ahead of Delete/
+      // Backspace below since they share nothing (different key, mutually exclusive on any given
+      // keydown) but both live in this one listener to avoid a second document-level effect doing
+      // the same target-is-typing guard. Note TextNoteEditor's own textarea already
+      // stopPropagation()s every keydown (see its onKeyDown) specifically so the browser's native
+      // in-field undo isn't fought over by this listener - it never even sees those events.
+      const key = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && key === "z") {
+        e.preventDefault();
+        if (e.shiftKey) editStore.redo();
+        else editStore.undo();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && key === "y") {
+        e.preventDefault();
+        editStore.redo();
+        return;
+      }
+
+      if (e.key !== "Delete" && e.key !== "Backspace") return;
+
+      if (selectedOverlayId) {
+        e.preventDefault();
+        editStore.deleteTextOverlay(selectedOverlayId);
+        onSelectOverlay?.(null);
+      } else if (selectedImageOverlayId) {
+        e.preventDefault();
+        editStore.deleteImageOverlay(selectedImageOverlayId);
+        onSelectImageOverlay?.(null);
+      } else if (selectedClipId) {
+        e.preventDefault();
+        handleDeleteSegment();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedOverlayId, selectedImageOverlayId, selectedClipId, editStore]);
+
   // Pressing Play after the sequence has already played through to the end needs to restart from
   // clip 0 - native <video> never auto-rewinds on .play() once it's reached "ended", it just sits
   // at the last frame, so without this a stalled-at-the-end timeline looked like Play did nothing
@@ -507,7 +778,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
 
   const handleSave = async () => {
-    const result = await editStore.exportEdited();
+    const result = await editStore.exportEdited(videoPixelSize);
     if (result) onExported(result.path, result.name);
   };
 
@@ -617,14 +888,21 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
   // Playhead position on the (output/assembled) ruler - maps currentTime (a raw source
   // timestamp) via whichever clip is currently tracked as active (activeClipIndexRef, clamped
-  // into range in case clips changed shape since it was last set).
+  // into range in case clips changed shape since it was last set). Also the "current output
+  // time" text overlays are time-gated against - factored out under its own name (rather than
+  // just feeding playheadLeft) so it can be reported upward via onOutputTimeChange too.
   const activeIndexForDisplay = Math.min(Math.max(activeClipIndexRef.current, 0), renderClips.length - 1);
-  const playheadLeft =
+  const currentOutputTime =
     renderClips.length > 0
-      ? (outputStarts[activeIndexForDisplay] +
-          Math.max(0, Math.min(currentTime - renderClips[activeIndexForDisplay].start, clipDurations[activeIndexForDisplay]))) *
-        pxPerSec
+      ? outputStarts[activeIndexForDisplay] +
+        Math.max(0, Math.min(currentTime - renderClips[activeIndexForDisplay].start, clipDurations[activeIndexForDisplay]))
       : 0;
+  const playheadLeft = currentOutputTime * pxPerSec;
+
+  useEffect(() => {
+    onOutputTimeChange?.(currentOutputTime);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentOutputTime]);
 
   return (
     <div className="w-full flex flex-col gap-2">
@@ -661,7 +939,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <ToolButton title="Crop"><IoCropOutline size={15} /></ToolButton>
           <ToolButton title="Mirror"><MdFlip size={15} /></ToolButton>
           <ToolButton title="Effects"><IoSparklesOutline size={15} /></ToolButton>
-          <ToolButton title="Text"><IoText size={15} /></ToolButton>
+          <ActionButton
+            title={isPlacingText ? "Click the video preview to place text" : "Add text overlay"}
+            onClick={() => onToggleArmPlaceText?.()}
+          >
+            <IoText size={15} className={isPlacingText ? "text-blue-400" : undefined} />
+          </ActionButton>
+          <ActionButton
+            title={isPlacingImage ? "Choosing an image…" : "Add image overlay"}
+            onClick={() => onToggleArmPlaceImage?.()}
+          >
+            <IoImageOutline size={15} className={isPlacingImage ? "text-amber-400" : undefined} />
+          </ActionButton>
           <ToolButton title="Audio"><IoMusicalNotesOutline size={15} /></ToolButton>
         </div>
 
@@ -970,6 +1259,109 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerUp={endResizeDrag}
                       title="Drag to trim this clip's end"
                       className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
+                      style={{ left: left + width }}
+                    />
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
+            {/* Text-overlay lane - chips positioned/sized by time (not source-time, since
+                overlays have no source file of their own), sharing the same pxPerSec scale as
+                the clip track above. Whole-chip drag retimes both edges together (moveTextOverlayTime);
+                the two edge handles retime just one side (resizeTextOverlayTime) - same
+                move-vs-resize split as the clip track, adapted from beginClipDrag/beginResizeDrag. */}
+            <div className="h-8 relative border-t border-neutral-800">
+              {renderOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
+                const isSelected = selectedOverlayId === overlay.id;
+                return (
+                  <div
+                    key={overlay.id}
+                    onPointerDown={beginOverlayDrag(overlay)}
+                    onPointerMove={handleOverlayDragMove}
+                    onPointerUp={endOverlayDrag}
+                    title={overlay.text || "Text overlay"}
+                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center px-2 text-[11px] text-white truncate cursor-grab active:cursor-grabbing ${
+                      isSelected ? "border-dashed border-white" : "border-purple-400"
+                    }`}
+                    style={{ left, width }}
+                  >
+                    {overlay.text || "Text"}
+                  </div>
+                );
+              })}
+              {renderOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = (overlay.endTime - overlay.startTime) * pxPerSec;
+                return (
+                  <React.Fragment key={`overlay-resize-${overlay.id}`}>
+                    <div
+                      onPointerDown={beginOverlayResizeDrag(overlay, "start")}
+                      onPointerMove={handleOverlayResizeDragMove}
+                      onPointerUp={endOverlayResizeDrag}
+                      title="Drag to retime this overlay's start"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-purple-400 hover:bg-purple-300 rounded cursor-ew-resize z-10"
+                      style={{ left }}
+                    />
+                    <div
+                      onPointerDown={beginOverlayResizeDrag(overlay, "end")}
+                      onPointerMove={handleOverlayResizeDragMove}
+                      onPointerUp={endOverlayResizeDrag}
+                      title="Drag to retime this overlay's end"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-purple-400 hover:bg-purple-300 rounded cursor-ew-resize z-10"
+                      style={{ left: left + width }}
+                    />
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
+            {/* Image-overlay lane - same time-based chip/drag/resize pattern as the text-overlay
+                lane above, just amber instead of purple and with no editable text to show. */}
+            <div className="h-8 relative border-t border-neutral-800">
+              {renderImageOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
+                const isSelected = selectedImageOverlayId === overlay.id;
+                const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
+                return (
+                  <div
+                    key={overlay.id}
+                    onPointerDown={beginImageOverlayDrag(overlay)}
+                    onPointerMove={handleImageOverlayDragMove}
+                    onPointerUp={endImageOverlayDrag}
+                    title={fileName}
+                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center gap-1 px-2 text-[11px] text-white truncate cursor-grab active:cursor-grabbing ${
+                      isSelected ? "border-dashed border-white" : "border-amber-400"
+                    }`}
+                    style={{ left, width }}
+                  >
+                    <IoImageOutline size={11} className="shrink-0" />
+                    {fileName}
+                  </div>
+                );
+              })}
+              {renderImageOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = (overlay.endTime - overlay.startTime) * pxPerSec;
+                return (
+                  <React.Fragment key={`image-overlay-resize-${overlay.id}`}>
+                    <div
+                      onPointerDown={beginImageOverlayResizeDrag(overlay, "start")}
+                      onPointerMove={handleImageOverlayResizeDragMove}
+                      onPointerUp={endImageOverlayResizeDrag}
+                      title="Drag to retime this image's start"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-amber-400 hover:bg-amber-300 rounded cursor-ew-resize z-10"
+                      style={{ left }}
+                    />
+                    <div
+                      onPointerDown={beginImageOverlayResizeDrag(overlay, "end")}
+                      onPointerMove={handleImageOverlayResizeDragMove}
+                      onPointerUp={endImageOverlayResizeDrag}
+                      title="Drag to retime this image's end"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-amber-400 hover:bg-amber-300 rounded cursor-ew-resize z-10"
                       style={{ left: left + width }}
                     />
                   </React.Fragment>

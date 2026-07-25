@@ -2,16 +2,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { listen } from "@tauri-apps/api/event";
-import { Clip, EditableFields, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
+import { Clip, EditableFields, ImageOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
 import {
   applyCommand,
+  addOverlay,
   deleteClipAt as deleteClipAtHandler,
+  deleteOverlay,
+  duplicateOverlay,
   insertClip as insertClipHandler,
+  makeImageOverlay,
+  makeTextOverlay,
+  moveOverlayTime,
   reorderClip as reorderClipHandler,
   resizeClipEdge as resizeClipEdgeHandler,
+  resizeOverlayTime,
   splitClipAt,
   toKeepSegments,
+  updateOverlay,
 } from "../handlers/videoEditHandlers";
+import { renderImageOverlayToPng, renderTextOverlayToPng } from "../utils/videoOverlayRender";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
@@ -40,12 +49,48 @@ async function fetchDuration(path: string): Promise<number | null> {
   }
 }
 
-interface UseVideoEditStoreResult {
+type TextOverlayContentPatch = Partial<
+  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize">
+>;
+type ImageOverlayContentPatch = Partial<Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow">>;
+
+export interface UseVideoEditStoreResult {
   loading: boolean;
   // Ordered clips - array order is playback order in preview/export, independent of each clip's
   // own source start/end or which file it comes from. This is the single source of truth;
   // there's no separate trim/gap state.
   clips: Clip[];
+  // Text overlays (captions/titles) and image overlays (logos/watermarks/stickers), both
+  // positioned/timed on the same output/assembled timeline as clips. Preview-only in v1 - not yet
+  // burned into exported files (see exportEdited below).
+  textOverlays: TextOverlay[];
+  imageOverlays: ImageOverlay[];
+  // Returns the new overlay's id so the caller (VideoOverlayLayer) can immediately select it and
+  // open TextNoteEditor for first-time typing, same "isNew" flow PdfPage's text tool uses.
+  addTextOverlay: (x: number, y: number, width: number, fontSize: number, startTime: number, endTime: number) => string;
+  // The one generic patch entry point for content/formatting/position/size edits - mirrors
+  // updateOverlay (videoEditHandlers.ts) being "the one generic patch fn every edit goes through"
+  // for the same reasons resizeClipEdge covers both a clip's edges under one function.
+  updateTextOverlayContent: (id: string, patch: TextOverlayContentPatch) => void;
+  // Drags one edge of an overlay's time range (the timeline lane's resize handles) - clamped
+  // against the current total output duration, computed internally from `clips`.
+  resizeTextOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
+  // Drags a whole overlay chip (both edges together, preserving duration) - the timeline lane's
+  // move-the-chip-body case.
+  moveTextOverlayTime: (id: string, newStartTime: number) => void;
+  deleteTextOverlay: (id: string) => void;
+  // Clones the overlay (new id, nudged position, same everything else - see duplicateOverlay in
+  // videoEditHandlers.ts) and returns the copy's id so the caller can select it right away.
+  duplicateTextOverlay: (id: string) => string;
+  // Same shape as the text-overlay methods above, minus a "content-only, no id yet" add step -
+  // an image overlay's identity (the file it points at) is only known once a file's been picked,
+  // so it's created with its full src/geometry in one call rather than an empty placeholder.
+  addImageOverlay: (src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number) => string;
+  updateImageOverlayContent: (id: string, patch: ImageOverlayContentPatch) => void;
+  resizeImageOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
+  moveImageOverlayTime: (id: string, newStartTime: number) => void;
+  deleteImageOverlay: (id: string) => void;
+  duplicateImageOverlay: (id: string) => string;
   // Called once the real video duration is known (from the hidden capture <video>'s
   // loadedmetadata) - only seeds a fresh, unedited state; a no-op once real state exists (either
   // loaded from the sidecar or already seeded), so it's safe to call on every metadata load.
@@ -69,7 +114,10 @@ interface UseVideoEditStoreResult {
   isExporting: boolean;
   exportProgress: number | null;
   exportError: string | null;
-  exportEdited: () => Promise<{ path: string; name: string } | null>;
+  // videoPixelSize (the primary file's native resolution) is required to render text/image
+  // overlays for burn-in - pass null (no overlays possible, e.g. audio-only export path) to skip
+  // rendering them and export a plain trim, same as before overlays existed.
+  exportEdited: (videoPixelSize: { width: number; height: number } | null) => Promise<{ path: string; name: string } | null>;
 }
 
 // Non-destructive edit state (an ordered, reorderable, multi-source-capable list of clips) for
@@ -141,7 +189,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           try {
             const parsed = JSON.parse(json);
             if (isVideoEditState(parsed)) {
-              setState(parsed);
+              // textOverlays/imageOverlays didn't exist when isVideoEditState's shape was first
+              // written - default them here (once, at load) rather than in the type guard, so
+              // sidecars saved before these features existed still load instead of being treated
+              // as corrupt.
+              setState({ ...parsed, textOverlays: parsed.textOverlays ?? [], imageOverlays: parsed.imageOverlays ?? [] });
               // Any clip referencing a file other than the primary one (dragged in from
               // elsewhere) needs its duration re-fetched after a reload, since the cache above is
               // purely in-memory and doesn't survive switching away and back, let alone a restart.
@@ -214,13 +266,24 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [scheduleAutosave]
   );
 
+  // Snapshot helper - every pushCommand call needs the *other* two overlay arrays passed through
+  // unchanged alongside whichever one an operation actually touches, so this is the one place that
+  // shape is assembled rather than repeating `{ clips, textOverlays, imageOverlays }` at every call
+  // site with the risk of one field silently missing from a future addition.
+  const snapshot = (current: VideoEditState, patch: Partial<EditableFields>): EditableFields => ({
+    clips: current.clips,
+    textOverlays: current.textOverlays,
+    imageOverlays: current.imageOverlays,
+    ...patch,
+  });
+
   const splitAt = useCallback(
     (index: number, sourceTime: number) => {
       const current = stateRef.current;
       if (!current) return;
       const clips = splitClipAt(current.clips, index, sourceTime);
       if (clips === current.clips) return; // too close to an edge - no-op
-      pushCommand({ clips: current.clips }, { clips }, "split");
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "split");
     },
     [pushCommand]
   );
@@ -231,7 +294,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       if (!current || current.clips.length <= 1) return; // never delete down to nothing left
       const clips = deleteClipAtHandler(current.clips, index);
       if (clips === current.clips) return;
-      pushCommand({ clips: current.clips }, { clips }, "delete");
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "delete");
     },
     [pushCommand]
   );
@@ -242,7 +305,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       if (!current) return;
       const clips = reorderClipHandler(current.clips, fromIndex, toIndex);
       if (clips === current.clips) return;
-      pushCommand({ clips: current.clips }, { clips }, "reorder");
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "reorder");
     },
     [pushCommand]
   );
@@ -255,9 +318,150 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       if (!target) return;
       const maxEnd = getSourceDuration(target.sourcePath) ?? Number.POSITIVE_INFINITY;
       const clips = resizeClipEdgeHandler(current.clips, id, edge, maxEnd, time);
-      pushCommand({ clips: current.clips }, { clips }, "trim");
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "trim");
     },
     [pushCommand, getSourceDuration]
+  );
+
+  // Total duration of the assembled/output timeline right now - the same quantity
+  // VideoTimelineDocker derives as `totalOutputDuration` from its (possibly live-drag) render
+  // clips, recomputed here from the last *committed* clips since overlay time edits are a
+  // separate operation from an in-progress clip resize, never concurrent with one.
+  const totalOutputDuration = (clips: Clip[]): number => clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0);
+
+  const addTextOverlay = useCallback(
+    (x: number, y: number, width: number, fontSize: number, startTime: number, endTime: number): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const overlay = makeTextOverlay(x, y, width, fontSize, startTime, endTime);
+      const textOverlays = addOverlay(current.textOverlays, overlay);
+      pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "add-text");
+      return overlay.id;
+    },
+    [pushCommand]
+  );
+
+  const updateTextOverlayContent = useCallback(
+    (id: string, patch: TextOverlayContentPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const textOverlays = updateOverlay<TextOverlay>(current.textOverlays, id, patch);
+      pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "edit-text");
+    },
+    [pushCommand]
+  );
+
+  const resizeTextOverlayTime = useCallback(
+    (id: string, edge: "start" | "end", time: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const textOverlays = resizeOverlayTime(current.textOverlays, id, edge, totalOutputDuration(current.clips), time);
+      pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "edit-text");
+    },
+    [pushCommand]
+  );
+
+  const moveTextOverlayTime = useCallback(
+    (id: string, newStartTime: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const textOverlays = moveOverlayTime(current.textOverlays, id, newStartTime, totalOutputDuration(current.clips));
+      pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "edit-text");
+    },
+    [pushCommand]
+  );
+
+  const deleteTextOverlay = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const textOverlays = deleteOverlay(current.textOverlays, id);
+      pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "delete-text");
+    },
+    [pushCommand]
+  );
+
+  // Returns the new copy's id so the caller (VideoOverlayLayer, from either the right-click menu
+  // or the style panel's Duplicate button) can immediately select it, same "hand the new id back"
+  // shape addTextOverlay already uses for its own "select it right away" flow.
+  const duplicateTextOverlay = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const original = current.textOverlays.find((o) => o.id === id);
+      if (!original) return "";
+      const copy = duplicateOverlay(original);
+      const textOverlays = addOverlay(current.textOverlays, copy);
+      pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "add-text");
+      return copy.id;
+    },
+    [pushCommand]
+  );
+
+  const addImageOverlay = useCallback(
+    (src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const overlay = makeImageOverlay(src, x, y, width, height, startTime, endTime);
+      const imageOverlays = addOverlay(current.imageOverlays, overlay);
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "add-image");
+      return overlay.id;
+    },
+    [pushCommand]
+  );
+
+  const updateImageOverlayContent = useCallback(
+    (id: string, patch: ImageOverlayContentPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const imageOverlays = updateOverlay<ImageOverlay>(current.imageOverlays, id, patch);
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
+    },
+    [pushCommand]
+  );
+
+  const resizeImageOverlayTime = useCallback(
+    (id: string, edge: "start" | "end", time: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const imageOverlays = resizeOverlayTime(current.imageOverlays, id, edge, totalOutputDuration(current.clips), time);
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
+    },
+    [pushCommand]
+  );
+
+  const moveImageOverlayTime = useCallback(
+    (id: string, newStartTime: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const imageOverlays = moveOverlayTime(current.imageOverlays, id, newStartTime, totalOutputDuration(current.clips));
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
+    },
+    [pushCommand]
+  );
+
+  const deleteImageOverlay = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const imageOverlays = deleteOverlay(current.imageOverlays, id);
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "delete-image");
+    },
+    [pushCommand]
+  );
+
+  const duplicateImageOverlay = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const original = current.imageOverlays.find((o) => o.id === id);
+      if (!original) return "";
+      const copy = duplicateOverlay(original);
+      const imageOverlays = addOverlay(current.imageOverlays, copy);
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "add-image");
+      return copy.id;
+    },
+    [pushCommand]
   );
 
   const insertClipAt = useCallback(
@@ -279,7 +483,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       if (!latest) return;
       const newClip: Clip = { id: crypto.randomUUID(), sourcePath: newClipSourcePath, start: 0, end: duration };
       const clips = insertClipHandler(latest.clips, atIndex, newClip);
-      pushCommand({ clips: latest.clips }, { clips }, "insert");
+      pushCommand(snapshot(latest, {}), snapshot(latest, { clips }), "insert");
     },
     [pushCommand, getSourceDuration, registerSourceDuration]
   );
@@ -327,30 +531,68 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     return () => unlisten?.();
   }, [sourcePath]);
 
-  const exportEdited = useCallback(async (): Promise<{ path: string; name: string } | null> => {
-    const current = stateRef.current;
-    if (!sourcePath || !current || current.clips.length === 0) return null;
-    setIsExporting(true);
-    setExportError(null);
-    try {
-      const outputPath = await invoke<string>("export_trimmed_video", {
-        outputBasePath: sourcePath,
-        segments: toKeepSegments(current.clips),
-      });
-      const name = outputPath.split(/[\\/]/).pop() ?? outputPath;
-      return { path: outputPath, name };
-    } catch (err) {
-      setExportError(err instanceof Error ? err.message : String(err));
-      return null;
-    } finally {
-      setIsExporting(false);
-      setExportProgress(null);
-    }
-  }, [sourcePath]);
+  // `videoPixelSize` is the primary file's native pixel resolution - the caller (VideoTimelineDocker)
+  // already reads it off the same hidden capture <video> it uses for thumbnails, since
+  // TextOverlay/ImageOverlay only ever store position/size as frame-relative fractions (see
+  // videoEditTypes.ts) and rendering an overlay to a real PNG needs real pixel dimensions.
+  // Overlays whose own render comes back null (empty text, zero-size box, an image that failed to
+  // decode) are just skipped rather than failing the whole export.
+  const exportEdited = useCallback(
+    async (videoPixelSize: { width: number; height: number } | null): Promise<{ path: string; name: string } | null> => {
+      const current = stateRef.current;
+      if (!sourcePath || !current || current.clips.length === 0) return null;
+      setIsExporting(true);
+      setExportError(null);
+      try {
+        const overlays: { dataBase64: string; x: number; y: number; startTime: number; endTime: number; fade: boolean }[] = [];
+        if (videoPixelSize) {
+          const { width: pxW, height: pxH } = videoPixelSize;
+          for (const o of current.textOverlays) {
+            const rendered = renderTextOverlayToPng(o, pxW, pxH);
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: o.animation === "fade" });
+          }
+          for (const o of current.imageOverlays) {
+            // eslint-disable-next-line no-await-in-loop
+            const rendered = await renderImageOverlayToPng(o, pxW, pxH);
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: false });
+          }
+        }
+
+        const outputPath = await invoke<string>("export_trimmed_video", {
+          outputBasePath: sourcePath,
+          segments: toKeepSegments(current.clips),
+          overlays,
+        });
+        const name = outputPath.split(/[\\/]/).pop() ?? outputPath;
+        return { path: outputPath, name };
+      } catch (err) {
+        setExportError(err instanceof Error ? err.message : String(err));
+        return null;
+      } finally {
+        setIsExporting(false);
+        setExportProgress(null);
+      }
+    },
+    [sourcePath]
+  );
 
   return {
     loading,
     clips: state?.clips ?? [],
+    textOverlays: state?.textOverlays ?? [],
+    imageOverlays: state?.imageOverlays ?? [],
+    addTextOverlay,
+    updateTextOverlayContent,
+    resizeTextOverlayTime,
+    moveTextOverlayTime,
+    deleteTextOverlay,
+    duplicateTextOverlay,
+    addImageOverlay,
+    updateImageOverlayContent,
+    resizeImageOverlayTime,
+    moveImageOverlayTime,
+    deleteImageOverlay,
+    duplicateImageOverlay,
     setDuration,
     getSourceDuration,
     splitAt,

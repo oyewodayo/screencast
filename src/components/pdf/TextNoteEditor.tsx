@@ -1,10 +1,18 @@
 // components/pdf/TextNoteEditor.tsx
 import React, { useEffect, useRef, useState } from "react";
-import { MdFormatBold, MdFormatItalic } from "react-icons/md";
+import { MdFormatAlignCenter, MdFormatAlignJustify, MdFormatAlignLeft, MdFormatAlignRight, MdFormatBold, MdFormatItalic } from "react-icons/md";
 import { TEXT_FONT_FAMILY, applyColorRun, shiftColorRunsForEdit, shiftTextRangesForEdit, toggleTextRange } from "../../handlers/pdfAnnotationHandlers";
-import { TextColorRun, TextRange } from "../../utils/pdfAnnotationTypes";
+import { TextAlign, TextColorRun, TextRange } from "../../utils/pdfAnnotationTypes";
+import { renderFormattedSegments } from "../../utils/textFormatting";
 import BackgroundSwatchPicker from "./BackgroundSwatchPicker";
 import ColorSwatchPicker from "./ColorSwatchPicker";
+
+const ALIGN_OPTIONS: { value: TextAlign; icon: React.ComponentType<{ size?: number }>; title: string }[] = [
+  { value: "left", icon: MdFormatAlignLeft, title: "Align left" },
+  { value: "center", icon: MdFormatAlignCenter, title: "Align center" },
+  { value: "right", icon: MdFormatAlignRight, title: "Align right" },
+  { value: "justify", icon: MdFormatAlignJustify, title: "Justify" },
+];
 
 const MIN_FONT_SIZE_DEVICE_PX = 8;
 const MAX_FONT_SIZE_DEVICE_PX = 200;
@@ -23,66 +31,25 @@ interface TextNoteEditorProps {
   initialColorRuns: TextColorRun[];
   initialBoldRuns: TextRange[];
   initialItalicRuns: TextRange[];
-  // Fired after every change (keystroke, color pick, bold/italic toggle) with the full current
-  // content — the parent stages it in refs (not state) and only actually persists it at commit,
-  // same "not React state up there" reasoning liveTextRef used before this component started
-  // managing its own live formatting state locally for the backdrop preview below.
+  initialTextAlign: TextAlign;
+  // Fired after every change (keystroke, color pick, bold/italic toggle, alignment) with the full
+  // current content — the parent stages it in refs (not state) and only actually persists it at
+  // commit, same "not React state up there" reasoning liveTextRef used before this component
+  // started managing its own live formatting state locally for the backdrop preview below.
   onContentChange: (
     text: string,
     color: string,
     backgroundColor: string | undefined,
     colorRuns: TextColorRun[],
     boldRuns: TextRange[],
-    italicRuns: TextRange[]
+    italicRuns: TextRange[],
+    textAlign: TextAlign
   ) => void;
   onCommit: () => void;
   onCancel: () => void;
   onMoveEnd: (newLeft: number, newTop: number) => void;
   onResizeEnd: (newFontSize: number) => void;
   onResizeWidthEnd: (newWidth: number) => void;
-}
-
-// Splits `text` into colored/bold/italic <span> segments at every formatting boundary — the DOM
-// counterpart to renderTextObject's canvas version in pdfAnnotationHandlers.ts, same boundary-cut
-// approach, just emitting React nodes instead of fillText calls (the browser does the actual line
-// wrapping here, via the backdrop's own CSS, rather than a manual wrapTextBlock pass).
-function renderFormattedSegments(
-  text: string,
-  colorRuns: TextColorRun[],
-  boldRuns: TextRange[],
-  italicRuns: TextRange[],
-  baseColor: string
-): React.ReactNode {
-  if (text.length === 0) return null;
-
-  const cutSet = new Set<number>([0, text.length]);
-  const addBoundaries = (ranges: TextRange[]): void => {
-    for (const range of ranges) {
-      cutSet.add(Math.max(0, Math.min(text.length, range.start)));
-      cutSet.add(Math.max(0, Math.min(text.length, range.end)));
-    }
-  };
-  addBoundaries(colorRuns);
-  addBoundaries(boldRuns);
-  addBoundaries(italicRuns);
-  const cuts = Array.from(cutSet).sort((a, b) => a - b);
-
-  const nodes: React.ReactNode[] = [];
-  for (let i = 0; i < cuts.length - 1; i++) {
-    const start = cuts[i];
-    const end = cuts[i + 1];
-    if (end <= start) continue;
-    const segment = text.slice(start, end);
-    const color = colorRuns.find((run) => run.start <= start && run.end >= end)?.color ?? baseColor;
-    const bold = boldRuns.some((run) => run.start <= start && run.end >= end);
-    const italic = italicRuns.some((run) => run.start <= start && run.end >= end);
-    nodes.push(
-      <span key={start} style={{ color, fontWeight: bold ? 700 : 400, fontStyle: italic ? "italic" : "normal" }}>
-        {segment}
-      </span>
-    );
-  }
-  return nodes;
 }
 
 // A real DOM <textarea> overlaid on the page at the note's position — canvas can't accept
@@ -108,6 +75,7 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
   initialColorRuns,
   initialBoldRuns,
   initialItalicRuns,
+  initialTextAlign,
   onContentChange,
   onCommit,
   onCancel,
@@ -129,6 +97,7 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
   const [colorRuns, setColorRuns] = useState<TextColorRun[]>(initialColorRuns);
   const [boldRuns, setBoldRuns] = useState<TextRange[]>(initialBoldRuns);
   const [italicRuns, setItalicRuns] = useState<TextRange[]>(initialItalicRuns);
+  const [textAlign, setTextAlign] = useState<TextAlign>(initialTextAlign);
 
   const commit = (): void => {
     if (resolvedRef.current) return;
@@ -154,8 +123,8 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
   // content itself changes — the initial fire on mount is a harmless no-op re-write of what the
   // parent already staged.
   useEffect(() => {
-    onContentChange(text, color, backgroundColor, colorRuns, boldRuns, italicRuns);
-  }, [text, color, backgroundColor, colorRuns, boldRuns, italicRuns, onContentChange]);
+    onContentChange(text, color, backgroundColor, colorRuns, boldRuns, italicRuns, textAlign);
+  }, [text, color, backgroundColor, colorRuns, boldRuns, italicRuns, textAlign, onContentChange]);
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>): void => {
     const newText = e.target.value;
@@ -331,6 +300,26 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
           >
             <MdFormatItalic size={14} />
           </button>
+          <div className="w-px h-4 bg-black/10 dark:bg-white/15 mx-0.5" />
+          {/* Alignment applies to the whole box, not a character selection - a plain single-select
+              group (unlike bold/italic's per-selection toggle), so it stays active regardless of
+              caret position. */}
+          {ALIGN_OPTIONS.map(({ value, icon: Icon, title }) => (
+            <button
+              key={value}
+              type="button"
+              title={title}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => setTextAlign(value)}
+              className={`w-5 h-5 flex items-center justify-center rounded transition-colors ${
+                textAlign === value
+                  ? "text-blue-600 dark:text-blue-400 bg-blue-500/10"
+                  : "text-black/60 dark:text-white/70 hover:text-black dark:hover:text-white hover:bg-black/10 dark:hover:bg-white/10"
+              }`}
+            >
+              <Icon size={14} />
+            </button>
+          ))}
         </div>
       </div>
       <div
@@ -364,6 +353,7 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
             font: `${fontSize}px ${TEXT_FONT_FAMILY}`,
             lineHeight: 1.3,
             padding: 2,
+            textAlign,
             border: "1px dashed rgba(0,0,0,0.3)",
             borderTop: "none",
             // Matches what actually gets baked into the page at commit (renderTextObject draws the
@@ -405,6 +395,7 @@ const TextNoteEditor: React.FC<TextNoteEditorProps> = ({
             color: "transparent",
             caretColor: CARET_COLOR,
             lineHeight: 1.3,
+            textAlign,
             background: "transparent",
             border: "1px dashed transparent",
             borderTop: "none",

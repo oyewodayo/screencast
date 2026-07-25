@@ -13,6 +13,7 @@ import {
 import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory";
 import { FILE_TOOLS_COPY } from "./fileToolsConfig";
 import VideoTimelineDocker from "./VideoTimelineDocker";
+import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
 
 // `path` here is always the real filesystem path (never the asset:// URL used for playback) —
 // every action below (ffprobe, rename, reveal, trash) needs the real path, same convention as
@@ -41,6 +42,10 @@ interface FileToolsDockerProps {
   // Asset:// URL for `file`, needed only by the video category's timeline (it loads its own
   // hidden <video> to capture thumbnail frames - ffprobe/canvas can't do that on the real fs path).
   playableSrc: string | null;
+  // Video-only: Dashboard's single, lifted useVideoEditStore instance - threaded straight through
+  // to VideoTimelineDocker, same as onExported/draggingLibraryFile below. Unused (but harmlessly
+  // present) for every non-video category.
+  editStore: UseVideoEditStoreResult;
   currentTime: number;
   onSeek: (sourcePath: string, time: number) => void;
   // Video-only: lets the timeline's own transport button show accurate state and drive real
@@ -59,6 +64,22 @@ interface FileToolsDockerProps {
   draggingLibraryFile: { path: string; name: string } | null;
   pendingTimelineInsert: { paths: string[]; clientX: number } | null;
   onTimelineInsertHandled: () => void;
+
+  // Video-only: reports the timeline's current output-timeline position upward, threaded
+  // straight through to VideoTimelineDocker - see its own prop doc comment.
+  onOutputTimeChange?: (outputTime: number) => void;
+  // Video-only: text-overlay selection/placement state, threaded straight through to
+  // VideoTimelineDocker - see its own prop doc comments.
+  selectedOverlayId?: string | null;
+  onSelectOverlay?: (id: string | null) => void;
+  isPlacingText?: boolean;
+  onToggleArmPlaceText?: () => void;
+  // Video-only: image-overlay selection/placement state, same threading as the text-overlay props
+  // above.
+  selectedImageOverlayId?: string | null;
+  onSelectImageOverlay?: (id: string | null) => void;
+  isPlacingImage?: boolean;
+  onToggleArmPlaceImage?: () => void;
 }
 
 // The file-type-specific alternative to RecordingDocker (see BottomDocker's dockerMode switch):
@@ -70,6 +91,7 @@ interface FileToolsDockerProps {
 const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   file,
   playableSrc,
+  editStore,
   currentTime,
   onSeek,
   isPlaying,
@@ -81,6 +103,15 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   draggingLibraryFile,
   pendingTimelineInsert,
   onTimelineInsertHandled,
+  onOutputTimeChange,
+  selectedOverlayId,
+  onSelectOverlay,
+  isPlacingText,
+  onToggleArmPlaceText,
+  selectedImageOverlayId,
+  onSelectImageOverlay,
+  isPlacingImage,
+  onToggleArmPlaceImage,
 }) => {
   const category = getFileCategory(file.name);
   const copy = category ? FILE_TOOLS_COPY[category] : null;
@@ -91,6 +122,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
       <VideoTimelineDocker
         file={file}
         playableSrc={playableSrc}
+        editStore={editStore}
         currentTime={currentTime}
         onSeek={onSeek}
         isPlaying={isPlaying}
@@ -102,6 +134,15 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         draggingLibraryFile={draggingLibraryFile}
         pendingTimelineInsert={pendingTimelineInsert}
         onTimelineInsertHandled={onTimelineInsertHandled}
+        onOutputTimeChange={onOutputTimeChange}
+        selectedOverlayId={selectedOverlayId}
+        onSelectOverlay={onSelectOverlay}
+        isPlacingText={isPlacingText}
+        onToggleArmPlaceText={onToggleArmPlaceText}
+        selectedImageOverlayId={selectedImageOverlayId}
+        onSelectImageOverlay={onSelectImageOverlay}
+        isPlacingImage={isPlacingImage}
+        onToggleArmPlaceImage={onToggleArmPlaceImage}
       />
     );
   }

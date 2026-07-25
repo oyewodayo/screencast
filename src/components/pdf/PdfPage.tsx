@@ -1,7 +1,7 @@
 // components/pdf/PdfPage.tsx
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy, PageViewport } from "pdfjs-dist";
-import { AnnotationObject, AnnotationTool, ImageObject, Pt, TextColorRun, TextObject, TextRange } from "../../utils/pdfAnnotationTypes";
+import { AnnotationObject, AnnotationTool, ImageObject, Pt, TextAlign, TextColorRun, TextObject, TextRange } from "../../utils/pdfAnnotationTypes";
 import {
   clearCanvas,
   devicePointToPdfPoint,
@@ -134,6 +134,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
   const liveColorRunsRef = useRef<TextColorRun[]>([]);
   const liveBoldRunsRef = useRef<TextRange[]>([]);
   const liveItalicRunsRef = useRef<TextRange[]>([]);
+  const liveTextAlignRef = useRef<TextAlign>("left");
 
   useEffect(() => {
     let cancelled = false;
@@ -264,6 +265,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
     const colorRuns = liveColorRunsRef.current;
     const boldRuns = liveBoldRunsRef.current;
     const italicRuns = liveItalicRunsRef.current;
+    const textAlign = liveTextAlignRef.current;
     const isEmpty = text.trim().length === 0;
 
     if (session.isNew) {
@@ -276,6 +278,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
         colorRuns: colorRuns.length > 0 ? colorRuns : undefined,
         boldRuns: boldRuns.length > 0 ? boldRuns : undefined,
         italicRuns: italicRuns.length > 0 ? italicRuns : undefined,
+        textAlign: textAlign !== "left" ? textAlign : undefined,
       });
       return;
     }
@@ -291,11 +294,12 @@ const PdfPage: React.FC<PdfPageProps> = ({
     const moved = session.x !== original.x || session.y !== original.y;
     const resized = session.fontSize !== original.fontSize || session.width !== original.width;
     const recolored = color !== original.color || backgroundColor !== original.backgroundColor;
+    const realigned = textAlign !== (original.textAlign ?? "left");
     const runsChanged =
       JSON.stringify(colorRuns) !== JSON.stringify(original.colorRuns ?? []) ||
       JSON.stringify(boldRuns) !== JSON.stringify(original.boldRuns ?? []) ||
       JSON.stringify(italicRuns) !== JSON.stringify(original.italicRuns ?? []);
-    if (text !== original.text || moved || resized || recolored || runsChanged) {
+    if (text !== original.text || moved || resized || recolored || realigned || runsChanged) {
       const { height } = measureTextBlock(text, session.fontSize, session.width);
       onObjectEdit(original, {
         ...original,
@@ -310,6 +314,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
         colorRuns: colorRuns.length > 0 ? colorRuns : undefined,
         boldRuns: boldRuns.length > 0 ? boldRuns : undefined,
         italicRuns: italicRuns.length > 0 ? italicRuns : undefined,
+        textAlign: textAlign !== "left" ? textAlign : undefined,
         updatedAt: Date.now(),
       });
     }
@@ -330,13 +335,15 @@ const PdfPage: React.FC<PdfPageProps> = ({
       backgroundColor: string | undefined,
       colorRuns: TextColorRun[],
       boldRuns: TextRange[],
-      italicRuns: TextRange[]
+      italicRuns: TextRange[],
+      textAlign: TextAlign
     ): void => {
       liveTextRef.current = text;
       liveColorRef.current = color;
       liveBackgroundColorRef.current = backgroundColor;
       liveColorRunsRef.current = colorRuns;
       liveBoldRunsRef.current = boldRuns;
+      liveTextAlignRef.current = textAlign;
       liveItalicRunsRef.current = italicRuns;
     },
     []
@@ -416,6 +423,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
         liveColorRunsRef.current = existing.colorRuns ?? [];
         liveBoldRunsRef.current = existing.boldRuns ?? [];
         liveItalicRunsRef.current = existing.italicRuns ?? [];
+        liveTextAlignRef.current = existing.textAlign ?? "left";
         setEditingText({
           id: existing.id,
           isNew: false,
@@ -431,6 +439,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
         liveColorRunsRef.current = [];
         liveBoldRunsRef.current = [];
         liveItalicRunsRef.current = [];
+        liveTextAlignRef.current = "left";
         setEditingText({
           id: crypto.randomUUID(),
           isNew: true,
@@ -679,6 +688,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
           initialColorRuns={liveColorRunsRef.current}
           initialBoldRuns={liveBoldRunsRef.current}
           initialItalicRuns={liveItalicRunsRef.current}
+          initialTextAlign={liveTextAlignRef.current}
           onContentChange={handleNoteContentChange}
           onCommit={commitEditingText}
           onCancel={cancelEditingText}

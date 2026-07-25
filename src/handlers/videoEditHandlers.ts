@@ -3,9 +3,10 @@
 // Pure functions only, mirroring pdfAnnotationHandlers.ts's style: no React, callers pass in
 // everything they need explicitly. useVideoEditStore is the only caller.
 
-import { Clip, EditableFields, KeepSegment, VideoEditCommand } from "../utils/videoEditTypes";
+import { Clip, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
+const MIN_OVERLAY_DURATION = 0.1;
 
 export function applyCommand(command: VideoEditCommand): EditableFields {
   return command.after;
@@ -92,4 +93,114 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
     const clamped = Math.min(maxEnd, Math.max(time, c.start + MIN_CLIP_LENGTH));
     return { ...c, end: clamped };
   });
+}
+
+// ---- Overlays (text + image) -----------------------------------------------------------------
+//
+// Same pure/no-React style as the clip functions above. CRUD and timing logic (update/delete/
+// retime/move/active-at) is identical in shape for text and image overlays - both are just
+// {id, startTime, endTime, updatedAt}-shaped rows on the same output timeline - so it's written
+// once here, generically, rather than duplicated per overlay kind. Formatting mutation specific to
+// TEXT content (color runs, bold/italic ranges) is handled by the generic helpers already in
+// pdfAnnotationHandlers.ts (applyColorRun, shiftColorRunsForEdit, toggleTextRange, etc.) - nothing
+// here duplicates those either.
+
+export function makeTextOverlay(x: number, y: number, width: number, fontSize: number, startTime: number, endTime: number): TextOverlay {
+  const now = Date.now();
+  return {
+    id: crypto.randomUUID(),
+    text: "",
+    color: "#ffffff",
+    x,
+    y,
+    width,
+    height: fontSize * 1.3,
+    fontSize,
+    startTime,
+    endTime,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export function makeImageOverlay(src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number): ImageOverlay {
+  const now = Date.now();
+  return { id: crypto.randomUUID(), src, x, y, width, height, opacity: 1, startTime, endTime, createdAt: now, updatedAt: now };
+}
+
+export function addOverlay<T>(overlays: T[], overlay: T): T[] {
+  return [...overlays, overlay];
+}
+
+// The one generic patch function every overlay edit goes through - content, color/bold/italic,
+// move, box-resize, font-resize, and retime are all just a Partial<T> from the caller's point of
+// view, the same way resizeClipEdge is the one function covering both a clip's edges.
+export function updateOverlay<T extends { id: string; updatedAt: number }>(overlays: T[], id: string, patch: Partial<T>): T[] {
+  return overlays.map((o) => (o.id === id ? { ...o, ...patch, updatedAt: Date.now() } : o));
+}
+
+export function deleteOverlay<T extends { id: string }>(overlays: T[], id: string): T[] {
+  return overlays.filter((o) => o.id !== id);
+}
+
+// Which overlays should be visible/rendered at this point on the output timeline.
+export function overlaysActiveAt<T extends { startTime: number; endTime: number }>(overlays: T[], outputTime: number): T[] {
+  return overlays.filter((o) => outputTime >= o.startTime && outputTime < o.endTime);
+}
+
+// Drags one edge of a single overlay's time range - same shape as resizeClipEdge, but clamped
+// against the assembled timeline's own total duration (overlays have no per-file source duration
+// to clamp against) and a minimum overlay length instead of MIN_CLIP_LENGTH.
+export function resizeOverlayTime<T extends { id: string; startTime: number; endTime: number; updatedAt: number }>(
+  overlays: T[],
+  id: string,
+  edge: "start" | "end",
+  maxEnd: number,
+  time: number
+): T[] {
+  return overlays.map((o) => {
+    if (o.id !== id) return o;
+    if (edge === "start") {
+      const clamped = Math.max(0, Math.min(time, o.endTime - MIN_OVERLAY_DURATION));
+      return { ...o, startTime: clamped, updatedAt: Date.now() };
+    }
+    const clamped = Math.min(maxEnd, Math.max(time, o.startTime + MIN_OVERLAY_DURATION));
+    return { ...o, endTime: clamped, updatedAt: Date.now() };
+  });
+}
+
+// Moves a whole overlay's time range (both edges together, preserving its duration) - the drag-
+// the-chip-body case, as opposed to resizeOverlayTime's drag-one-edge case. Clamped so the range
+// never slides past either end of the assembled timeline.
+export function moveOverlayTime<T extends { id: string; startTime: number; endTime: number; updatedAt: number }>(
+  overlays: T[],
+  id: string,
+  newStartTime: number,
+  maxEnd: number
+): T[] {
+  return overlays.map((o) => {
+    if (o.id !== id) return o;
+    const duration = o.endTime - o.startTime;
+    const clampedStart = Math.max(0, Math.min(newStartTime, maxEnd - duration));
+    return { ...o, startTime: clampedStart, endTime: clampedStart + duration, updatedAt: Date.now() };
+  });
+}
+
+// A small position nudge so a freshly duplicated overlay doesn't land exactly on top of the
+// original (which would look like nothing happened until you dragged one aside) - same idea as
+// most design tools' "paste in place, offset a few px" convention. Time range is copied as-is;
+// only position is nudged, since retiming a duplicate is exactly the kind of thing the timeline
+// lane's own drag already handles well.
+const DUPLICATE_POSITION_OFFSET = 0.03;
+
+export function duplicateOverlay<T extends { id: string; x: number; y: number; createdAt: number; updatedAt: number }>(overlay: T): T {
+  const now = Date.now();
+  return {
+    ...overlay,
+    id: crypto.randomUUID(),
+    x: Math.min(1, overlay.x + DUPLICATE_POSITION_OFFSET),
+    y: Math.min(1, overlay.y + DUPLICATE_POSITION_OFFSET),
+    createdAt: now,
+    updatedAt: now,
+  };
 }

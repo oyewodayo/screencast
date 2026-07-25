@@ -7,6 +7,7 @@ import ActiveRecordingState from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
+import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -18,6 +19,10 @@ interface Props {
   // Asset:// URL for activeFile (already converted for the main player) — needed only by the
   // video-tools timeline, which loads its own hidden <video> to capture thumbnail frames.
   activeFilePlayableSrc: string | null;
+  // Video-only: Dashboard's single, lifted useVideoEditStore instance - threaded straight through
+  // to FileToolsDocker/VideoTimelineDocker so the preview-layer text-overlay editor near the main
+  // player and the timeline's own lane share the exact same edit state/undo-redo stack.
+  editStore: UseVideoEditStoreResult;
   // Live playback position of the main player, and a way to seek it - what lets the video-tools
   // timeline's playhead track and drive real playback instead of being purely decorative.
   activeFileCurrentTime: number;
@@ -37,6 +42,21 @@ interface Props {
   draggingLibraryFile: { path: string; name: string } | null;
   pendingTimelineInsert: { paths: string[]; clientX: number } | null;
   onTimelineInsertHandled: () => void;
+  // Video-only: reports the timeline's current output-timeline position upward, threaded
+  // straight through to FileToolsDocker/VideoTimelineDocker.
+  onOutputTimeChange?: (outputTime: number) => void;
+  // Video-only: text-overlay selection/placement state, threaded straight through to
+  // FileToolsDocker/VideoTimelineDocker.
+  selectedOverlayId?: string | null;
+  onSelectOverlay?: (id: string | null) => void;
+  isPlacingText?: boolean;
+  onToggleArmPlaceText?: () => void;
+  // Video-only: image-overlay selection/placement state, same threading as the text-overlay props
+  // above.
+  selectedImageOverlayId?: string | null;
+  onSelectImageOverlay?: (id: string | null) => void;
+  isPlacingImage?: boolean;
+  onToggleArmPlaceImage?: () => void;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
   handleOpenSettings: () => void;
@@ -93,6 +113,7 @@ const BottomDocker = ({
   dockerMode,
   activeFile,
   activeFilePlayableSrc,
+  editStore,
   activeFileCurrentTime,
   onSeekActiveFile,
   activeFileIsPlaying,
@@ -104,6 +125,15 @@ const BottomDocker = ({
   draggingLibraryFile,
   pendingTimelineInsert,
   onTimelineInsertHandled,
+  onOutputTimeChange,
+  selectedOverlayId,
+  onSelectOverlay,
+  isPlacingText,
+  onToggleArmPlaceText,
+  selectedImageOverlayId,
+  onSelectImageOverlay,
+  isPlacingImage,
+  onToggleArmPlaceImage,
   handleFolderSettings,
   handleGoHome,
   handleOpenSettings,
@@ -387,6 +417,7 @@ const BottomDocker = ({
           <FileToolsDocker
             file={activeFile}
             playableSrc={activeFilePlayableSrc}
+            editStore={editStore}
             currentTime={activeFileCurrentTime}
             onSeek={onSeekActiveFile}
             isPlaying={activeFileIsPlaying}
@@ -398,6 +429,15 @@ const BottomDocker = ({
             draggingLibraryFile={draggingLibraryFile}
             pendingTimelineInsert={pendingTimelineInsert}
             onTimelineInsertHandled={onTimelineInsertHandled}
+            onOutputTimeChange={onOutputTimeChange}
+            selectedOverlayId={selectedOverlayId}
+            onSelectOverlay={onSelectOverlay}
+            isPlacingText={isPlacingText}
+            onToggleArmPlaceText={onToggleArmPlaceText}
+            selectedImageOverlayId={selectedImageOverlayId}
+            onSelectImageOverlay={onSelectImageOverlay}
+            isPlacingImage={isPlacingImage}
+            onToggleArmPlaceImage={onToggleArmPlaceImage}
           />
         ) : (
           <RecordingDocker

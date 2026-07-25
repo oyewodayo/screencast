@@ -149,6 +149,7 @@ fn main() {
             commands::conversion::convert_image,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
+            commands::conversion::read_image_data_url,
 
             commands::native_playback::start_native_playback,
             commands::native_playback::get_next_video_frame,

@@ -49,6 +49,14 @@ export interface TextColorRun extends TextRange {
   color: string;
 }
 
+// Paragraph-level (not per-character, unlike color/bold/italic runs above) horizontal alignment -
+// shared by TextObject here and TextOverlay (videoEditTypes.ts), both edited through the same
+// TextNoteEditor. "justify" has full native support in every DOM-rendered context (TextNoteEditor's
+// own live backdrop/textarea, and the video overlay's read-only preview) via CSS text-align, but
+// renderTextObject's canvas bake (this file) falls back to "left" for it - see that function's own
+// comment for why.
+export type TextAlign = "left" | "center" | "right" | "justify";
+
 // A jotted note: a fixed-width, word-wrapped text block anchored at its top-left corner.
 // `x`/`y` and `width` are PDF page-space units (zoom-independent), matching Pt's convention —
 // `y` is the TOP edge, and since PDF space is y-up while screen space is y-down, the block
@@ -68,6 +76,8 @@ export interface TextObject extends BaseObject {
   colorRuns?: TextColorRun[];
   boldRuns?: TextRange[];
   italicRuns?: TextRange[];
+  // Undefined means "left" - the pre-existing behavior for notes saved before this existed.
+  textAlign?: TextAlign;
   fontSize: number;
   x: number;
   y: number;

@@ -9,6 +9,8 @@ import { WebviewWindow, appWindow } from '@tauri-apps/api/window';
 import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
 import { formatFileName } from "../utils/Formater";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
+import useVideoEditStore from "../hooks/useVideoEditStore";
+import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
 import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -217,6 +219,22 @@ const Dashboard = () => {
   const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(new Set());
   const [bulkMoveMenuOpen, setBulkMoveMenuOpen] = useState<boolean>(false);
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
+  // Lifted here (single call site - useVideoEditStore is a stateful hook, unsafe to call from
+  // more than one component) so both the video-tools timeline (via BottomDocker/FileToolsDocker/
+  // VideoTimelineDocker) and the text-overlay preview layer mounted alongside VideoPlayer below
+  // share the exact same edit state/undo-redo stack. Gated to video files only so selecting a
+  // pdf/audio/image never triggers a wasted load_video_edit_state invoke.
+  const editStore = useVideoEditStore(
+    selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
+  );
+  // Text-overlay UI state - lifted here (rather than local to either subtree) because it's shared
+  // by two siblings: the preview-layer editor mounted next to VideoPlayer below, and the timeline
+  // lane's chips inside VideoTimelineDocker (reached via BottomDocker/FileToolsDocker).
+  const [currentOutputTime, setCurrentOutputTime] = useState<number>(0);
+  const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
+  const [isPlacingText, setIsPlacingText] = useState<boolean>(false);
+  const [selectedImageOverlayId, setSelectedImageOverlayId] = useState<string | null>(null);
+  const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
@@ -1962,6 +1980,35 @@ const setScreen = () => {
                 onAutoplayNextChange={() =>
                   isAudioSelected ? setAudioAutoplayNext((prev) => !prev) : setVideoAutoplayNext((prev) => !prev)
                 }
+                overlay={
+                  getFileCategory(selectedFile.name) === "video"
+                    ? (frameRect) => (
+                        <VideoOverlayLayer
+                          frameRect={frameRect}
+                          overlays={editStore.textOverlays}
+                          imageOverlays={editStore.imageOverlays}
+                          currentOutputTime={currentOutputTime}
+                          selectedOverlayId={selectedOverlayId}
+                          onSelectOverlay={setSelectedOverlayId}
+                          selectedImageOverlayId={selectedImageOverlayId}
+                          onSelectImageOverlay={setSelectedImageOverlayId}
+                          isPlacingText={isPlacingText}
+                          onPlacementConsumed={() => setIsPlacingText(false)}
+                          onAddTextOverlay={editStore.addTextOverlay}
+                          onUpdateTextOverlayContent={editStore.updateTextOverlayContent}
+                          onDeleteTextOverlay={editStore.deleteTextOverlay}
+                          onDuplicateTextOverlay={(id) => setSelectedOverlayId(editStore.duplicateTextOverlay(id))}
+                          isPlacingImage={isPlacingImage}
+                          onPlacementImageConsumed={() => setIsPlacingImage(false)}
+                          onAddImageOverlay={editStore.addImageOverlay}
+                          onUpdateImageOverlayContent={editStore.updateImageOverlayContent}
+                          onDeleteImageOverlay={editStore.deleteImageOverlay}
+                          onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
+                          totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
+                        />
+                      )
+                    : undefined
+                }
               />
             )
           ) : (
@@ -2020,6 +2067,7 @@ const setScreen = () => {
         dockerMode={dockerMode}
         activeFile={selectedFile ? { name: selectedFile.name, path: selectedFile.sourcePath } : null}
         activeFilePlayableSrc={selectedFile?.path ?? null}
+        editStore={editStore}
         activeFileCurrentTime={playerCurrentTime}
         onSeekActiveFile={handleSeekActiveFile}
         activeFileIsPlaying={playerIsPlaying}
@@ -2035,6 +2083,15 @@ const setScreen = () => {
         }
         pendingTimelineInsert={pendingTimelineInsert}
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
+        onOutputTimeChange={setCurrentOutputTime}
+        selectedOverlayId={selectedOverlayId}
+        onSelectOverlay={setSelectedOverlayId}
+        isPlacingText={isPlacingText}
+        onToggleArmPlaceText={() => setIsPlacingText((v) => !v)}
+        selectedImageOverlayId={selectedImageOverlayId}
+        onSelectImageOverlay={setSelectedImageOverlayId}
+        isPlacingImage={isPlacingImage}
+        onToggleArmPlaceImage={() => setIsPlacingImage((v) => !v)}
         selectScreen={selectScreen}
         setScreen={setScreen}
         unSetScreen={unSetScreen}

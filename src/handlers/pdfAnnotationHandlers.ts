@@ -514,13 +514,25 @@ function renderTextObject(
   const italicRuns = object.italicRuns ?? [];
   const hasFormatting = colorRuns.length > 0 || boldRuns.length > 0 || italicRuns.length > 0;
 
+  // "justify" has no simple canvas equivalent - unlike the live DOM preview (TextNoteEditor's own
+  // backdrop) and the video overlay's read-only rendering, both of which get it for free via CSS
+  // text-align, baking it correctly here would mean redistributing extra space between words on
+  // every line but the last, which the per-formatting-segment draw pass below isn't built for.
+  // Falls back to left, same "known limitation" pattern as the base-font-metrics wrapping note
+  // above, rather than silently baking something that doesn't match what was previewed.
+  const align = object.textAlign ?? "left";
+  const effectiveAlign = align === "justify" ? "left" : align;
+  const computeOffset = (naturalWidth: number): number =>
+    effectiveAlign === "center" ? (deviceMaxWidth - naturalWidth) / 2 : effectiveAlign === "right" ? deviceMaxWidth - naturalWidth : 0;
+
   lines.forEach((line, i) => {
     const y = topLeft.y + i * lineHeight;
 
     if (!hasFormatting) {
       ctx.font = baseFont;
+      const xOffset = effectiveAlign === "left" ? 0 : computeOffset(ctx.measureText(line.text).width);
       ctx.fillStyle = object.color;
-      ctx.fillText(line.text, topLeft.x, y);
+      ctx.fillText(line.text, topLeft.x + xOffset, y);
       return;
     }
 
@@ -543,7 +555,11 @@ function renderTextObject(
     addBoundaries(italicRuns);
     const cuts = Array.from(cutSet).sort((a, b) => a - b);
 
-    let x = topLeft.x;
+    // Precomputed once - both the alignment offset (needs the line's total natural width before
+    // any drawing starts) and the actual draw pass below read from this, rather than measuring
+    // every segment twice.
+    const segments: { text: string; font: string; color: string; width: number }[] = [];
+    let naturalWidth = 0;
     for (let s = 0; s < cuts.length - 1; s++) {
       const segStart = cuts[s];
       const segEnd = cuts[s + 1];
@@ -554,11 +570,19 @@ function renderTextObject(
       const coveringColor = colorRuns.find((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
       const isBold = boldRuns.some((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
       const isItalic = italicRuns.some((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
+      const font = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}${baseFont}`;
+      ctx.font = font;
+      const width = ctx.measureText(segment).width;
+      segments.push({ text: segment, font, color: coveringColor?.color ?? object.color, width });
+      naturalWidth += width;
+    }
 
-      ctx.font = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}${baseFont}`;
-      ctx.fillStyle = coveringColor?.color ?? object.color;
-      ctx.fillText(segment, x, y);
-      x += ctx.measureText(segment).width;
+    let x = topLeft.x + (effectiveAlign === "left" ? 0 : computeOffset(naturalWidth));
+    for (const seg of segments) {
+      ctx.font = seg.font;
+      ctx.fillStyle = seg.color;
+      ctx.fillText(seg.text, x, y);
+      x += seg.width;
     }
   });
 }
