@@ -60,8 +60,10 @@ transcoding, and probing.
   scrollable grid of real page thumbnails or the PDF's own outline/bookmarks (when it
   has one), both clickable to jump straight to a page.
 - **Zoom, two-page spreads, and a fullscreen presentation mode** that hides all chrome
-  down to a single "exit" control — with trackpad pinch-to-zoom and scroll-past-the-
-  edge page turning.
+  down to a single "exit" control — with trackpad pinch-to-zoom, direct two-finger
+  touchscreen pinch-to-zoom, and scroll-past-the-edge page turning. Fullscreen pages
+  are centered rather than pinned to the top, while still scrolling correctly when a
+  page is taller than the viewport.
 - Annotations are saved alongside the source PDF and reload automatically the next
   time you open it.
 
@@ -75,25 +77,71 @@ transcoding, and probing.
 - **Trash** — deleting a file soft-deletes it to a recoverable Trash view (restore or
   delete forever), with an optional auto-purge after a configurable number of days.
 - **Rename** files inline from the sidebar.
+- **Import** files from anywhere on disk into the Briefcast library via the sidebar's
+  "Open file from anywhere" icon, or open one ad hoc without importing it.
+- **Collapsible folders** — folder rows in the sidebar have a chevron to collapse/
+  expand their contents, state remembered per folder for the session.
 - **File tools docker** — select a file and toggle the wrench icon next to "new
   folder" to swap the bottom panel from recording controls to quick actions for that
   file: rename, convert, reveal in its folder, delete, and at-a-glance
-  duration/resolution/size info. Video files get a richer timeline docker instead —
-  a scrubbable, zoomable filmstrip of real thumbnails with a playhead synced to the
-  actual player (its fuller toolbar — split, crop, effects, etc. — is a visual
-  scaffold for tools still to come).
+  duration/resolution/size info.
+
+### Non-destructive video editing
+
+Video files get a full timeline docker instead of the simple file-tools panel — clips,
+text, image, and audio overlays are stored as an ordered edit list next to the source
+file and only baked into pixels/audio at export time, so nothing here ever touches the
+original recording.
+
+- **Timeline & clips** — a scrubbable, zoomable filmstrip of real thumbnails with a
+  playhead synced to the actual player; split, trim, reorder, and delete clips; drag a
+  file straight from the sidebar onto the timeline to insert it as a new clip.
+- **Text overlays** — click-to-place captions with per-character rich formatting
+  (color, bold, italic), a background with adjustable padding, drag to reposition,
+  resize/rotate handles (with angle snapping and a numeric input), and a timeline lane
+  chip to retime when it appears/disappears.
+- **Image overlays** — place an image on the video, drag/resize (aspect-locked or
+  free), rotate, flip horizontal/vertical, replace the source image in place, and crop
+  via a dedicated crop panel.
+- **Audio overlays** — add background music/voiceover tracks with a real waveform
+  (decoded from the actual audio), trim-to-resize semantics, volume, fade in/out, and
+  mute — mixed into the export alongside the video's own audio without auto-ducking
+  either track.
+- **Main video audio control** — mute or adjust the volume of the original video's own
+  audio track, independent of the audio overlays and independent of the player's own
+  local listening-volume slider.
+- **Entry/exit animations** for text and image overlays.
+- **Layering** — bring an overlay to front or send it to back when overlays stack.
+- **Duplicate** — Ctrl+D, or right-click a text/image overlay for a context menu.
+- **Arrow-key nudge** for fine-positioning a selected overlay.
+- **Undo/redo** across the whole edit (clips, overlays, trims, and audio settings)
+  via Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y.
+- **Export** renders the full edit — trimmed/reordered clips, burned-in text and image
+  overlays (with animations), and the mixed audio (video track + overlays, muted/
+  volume-adjusted as configured) — to a single output file via FFmpeg.
 
 ### Customization
 
-Settings (gear icon) covers appearance (light/dark/system theme), recording defaults
-(type, format, file name prefix), PDF annotator defaults (starting tool, zoom, pen/
-highlighter color, stroke width), and trash auto-purge retention.
+Settings (gear icon) is organized into sections — Appearance, Recording, Storage,
+Annotation, Files, and PDF Annotator:
+
+- **Appearance** — light/dark/system theme, and the home screen's background style
+  (a subtle graph-paper-line backdrop, or plain).
+- **Recording** — default recording type, output format, and file name prefix.
+- **Storage** — relocate where Briefcast stores its files via a folder picker (with a
+  reset-to-default option); the file list refreshes automatically after a move.
+- **PDF Annotator** — starting tool, default zoom, pen/highlighter color, stroke width.
+- **Files** — trash auto-purge retention.
 
 ## Keyboard shortcuts
 
 | Context | Keys | Action |
 |---|---|---|
 | Global | `Ctrl+Shift+H` | Show/hide the floating recording overlay |
+| Video editor (timeline) | `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` | Undo / redo |
+| | `Ctrl+D` | Duplicate the selected text/image/audio overlay |
+| | `Delete` / `Backspace` | Delete the selected clip or overlay |
+| | `←` `→` `↑` `↓` | Nudge the selected overlay |
 | Video/audio player | `K` / `Space` | Play/pause |
 | | `F` | Fullscreen |
 | | `T` | Theater mode |
@@ -118,9 +166,6 @@ highlighter color, stroke width), and trash auto-purge retention.
 - **System audio capture** is Windows/WASAPI-only, and its start may lag the screen
   capture's own start by up to roughly a hundred milliseconds, which can show up as a
   small (sub-second) audio/video sync offset.
-- The video-tools timeline docker's fuller toolbar (split, crop, mirror, effects,
-  text, audio) is a visual scaffold — only the playhead/scrubbing, zoom, and the
-  "..." rename/convert/reveal/delete menu are wired up so far.
 
 ## Platform support
 
@@ -181,6 +226,8 @@ npm run build
   subfolders you create. Trashed files move to a hidden `.trash` folder inside it
   (with a small JSON manifest) rather than being deleted outright.
 - **PDF annotations** are saved alongside their source PDF.
+- **Video edits** (clips, text/image/audio overlays) are saved as a sidecar JSON next
+  to the source video and reload automatically the next time you open it.
 - **Logs** (`app.log`, `panic.log`) are written to the app's data directory, typically
   `%LOCALAPPDATA%\Briefcast\`.
 
@@ -193,15 +240,20 @@ screencast/
 │   ├── components/
 │   │   ├── docker/                  # Bottom panel: recording setup, per-file tools, video timeline
 │   │   ├── pdf/                     # PDF toolbar, page rendering, thumbnails/outline sidebar
+│   │   ├── video/                   # Video-only overlay editing surface (text/image overlays, crop panel)
 │   │   ├── Modals/                  # Settings and recording-completed modals
 │   │   ├── custom/                  # Small shared UI primitives (toasts, dropdowns, alerts)
 │   │   ├── BottomDocker.tsx         # Switches between the docker/ panels above
+│   │   ├── ActiveRecordingState.tsx # Fixed bottom icon bar (folder/open/home/settings) + recording controls
 │   │   ├── VideoPlayer.tsx          # Video/audio/image player
 │   │   └── PdfAnnotator.tsx         # PDF viewer + markup surface
-│   ├── handlers/                    # Keyboard/media event handler builders
-│   ├── hooks/                       # Shared React hooks (PDF rendering, annotation store, ...)
+│   ├── handlers/
+│   │   └── videoEditHandlers.ts     # Pure-function overlay/clip CRUD shared by the video edit store
+│   ├── hooks/
+│   │   ├── useVideoEditStore.ts     # Video edit state, undo/redo, export, sidecar persistence
+│   │   └── useClampedPopoverPosition.ts # Keeps floating overlay popovers inside the viewport
 │   ├── contexts/ThemeContext.tsx    # Light/dark/system theme
-│   └── utils/                       # Formatting, file-category, and media-handling helpers
+│   └── utils/                       # Formatting, file-category, media-handling, and video overlay/render helpers
 ├── src-tauri/                        # Rust backend
 │   ├── src/
 │   │   ├── main.rs                  # Entry point, logging, window/command setup
