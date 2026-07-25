@@ -582,7 +582,19 @@ pub async fn export_trimmed_video(
     let total_duration: f64 = segments.iter().map(|s| s.end - s.start).sum();
     let mut temp_overlay_paths: Vec<PathBuf> = Vec::new();
     for (i, ov) in overlays.iter().enumerate() {
-        let path = write_temp_overlay_png(&ov.data_base64, i)?;
+        // Deliberately not `?` here - that would return before the cleanup loop further down ever
+        // runs, permanently leaking every overlay PNG already written earlier in this same loop
+        // (e.g. overlay 0 succeeds, overlay 1 fails to decode - overlay 0's temp file would
+        // otherwise sit in the temp dir forever, since its deterministic name never gets reused).
+        let path = match write_temp_overlay_png(&ov.data_base64, i) {
+            Ok(path) => path,
+            Err(e) => {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(e);
+            }
+        };
         temp_overlay_paths.push(path.clone());
         // -loop 1 turns the single PNG frame into a looped stream; -t caps it at the *whole*
         // output's duration rather than just this overlay's own [start,end) window - the overlay

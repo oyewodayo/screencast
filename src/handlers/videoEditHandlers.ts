@@ -279,7 +279,12 @@ export function duplicateTimedOverlay<T extends { id: string; startTime: number;
   maxOutputEnd: number
 ): T {
   const now = Date.now();
-  const duration = overlay.endTime - overlay.startTime;
+  // Clamping duration itself first (not just startTime) matters when the overlay is already
+  // longer than the current timeline - nothing re-clamps an overlay's own endTime when clips are
+  // trimmed shorter after it was placed, so `duration > maxOutputEnd` is a real, reachable case,
+  // not just a defensive check. Without this, Math.max(0, ...) below would floor startTime at 0
+  // but leave endTime (= startTime + the ORIGINAL duration) still overshooting maxOutputEnd.
+  const duration = Math.min(overlay.endTime - overlay.startTime, Math.max(0, maxOutputEnd));
   const startTime = Math.max(0, Math.min(overlay.startTime + DUPLICATE_TIME_OFFSET_SEC, maxOutputEnd - duration));
   return { ...overlay, id: crypto.randomUUID(), startTime, endTime: startTime + duration, createdAt: now, updatedAt: now };
 }

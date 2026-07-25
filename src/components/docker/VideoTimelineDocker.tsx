@@ -1240,8 +1240,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         <audio
           key={o.id}
           ref={(el) => {
-            if (el) audioElementsRef.current.set(o.id, el);
-            else audioElementsRef.current.delete(o.id);
+            if (el) {
+              audioElementsRef.current.set(o.id, el);
+            } else {
+              // Removing a playing <audio> element from the DOM does NOT stop it per the HTML
+              // media spec - it keeps playing until garbage collected, which is not deterministic
+              // and can easily be seconds later. Without this, deleting an audio overlay while
+              // it's audibly playing left it audibly playing with no visible chip/UI left to
+              // indicate anything was still running.
+              audioElementsRef.current.get(o.id)?.pause();
+              audioElementsRef.current.delete(o.id);
+            }
           }}
           src={convertFileSrc(o.src)}
           preload="auto"
@@ -1566,6 +1575,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     onPointerDown={isPending ? undefined : beginClipDrag(baseClips[i], i)}
                     onPointerMove={handleClipDragMove}
                     onPointerUp={endClipDrag}
+                    onPointerCancel={endClipDrag}
                     title={isPending ? undefined : `Clip ${i + 1} of ${renderClips.length} — click to select, drag to reorder`}
                     className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-black flex ${
                       isPending ? "" : "cursor-grab active:cursor-grabbing"
@@ -1602,6 +1612,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerDown={beginResizeDrag(baseClips[i], "start")}
                       onPointerMove={handleResizeDragMove}
                       onPointerUp={endResizeDrag}
+                      onPointerCancel={endResizeDrag}
                       title="Drag to trim this clip's start"
                       className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
                       style={{ left }}
@@ -1610,6 +1621,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerDown={beginResizeDrag(baseClips[i], "end")}
                       onPointerMove={handleResizeDragMove}
                       onPointerUp={endResizeDrag}
+                      onPointerCancel={endResizeDrag}
                       title="Drag to trim this clip's end"
                       className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
                       style={{ left: left + width }}
@@ -1655,6 +1667,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerDown={beginOverlayResizeDrag(overlay, "start")}
                       onPointerMove={handleOverlayResizeDragMove}
                       onPointerUp={endOverlayResizeDrag}
+                      onPointerCancel={endOverlayResizeDrag}
                       title="Drag to retime this overlay's start"
                       className="absolute inset-y-1 w-2 -ml-1 bg-purple-400 hover:bg-purple-300 rounded cursor-ew-resize z-10"
                       style={{ left }}
@@ -1663,6 +1676,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerDown={beginOverlayResizeDrag(overlay, "end")}
                       onPointerMove={handleOverlayResizeDragMove}
                       onPointerUp={endOverlayResizeDrag}
+                      onPointerCancel={endOverlayResizeDrag}
                       title="Drag to retime this overlay's end"
                       className="absolute inset-y-1 w-2 -ml-1 bg-purple-400 hover:bg-purple-300 rounded cursor-ew-resize z-10"
                       style={{ left: left + width }}
@@ -1707,6 +1721,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerDown={beginImageOverlayResizeDrag(overlay, "start")}
                       onPointerMove={handleImageOverlayResizeDragMove}
                       onPointerUp={endImageOverlayResizeDrag}
+                      onPointerCancel={endImageOverlayResizeDrag}
                       title="Drag to retime this image's start"
                       className="absolute inset-y-1 w-2 -ml-1 bg-amber-400 hover:bg-amber-300 rounded cursor-ew-resize z-10"
                       style={{ left }}
@@ -1715,6 +1730,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerDown={beginImageOverlayResizeDrag(overlay, "end")}
                       onPointerMove={handleImageOverlayResizeDragMove}
                       onPointerUp={endImageOverlayResizeDrag}
+                      onPointerCancel={endImageOverlayResizeDrag}
                       title="Drag to retime this image's end"
                       className="absolute inset-y-1 w-2 -ml-1 bg-amber-400 hover:bg-amber-300 rounded cursor-ew-resize z-10"
                       style={{ left: left + width }}

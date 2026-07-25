@@ -181,6 +181,14 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+  // Tracks the CURRENT sourcePath prop (as opposed to whatever `sourcePath` an in-flight async
+  // callback's own closure captured at call time) - written directly during render, not via an
+  // effect, so it's already accurate before any awaited callback in this render's closures could
+  // possibly resume. insertClipAt's own race guard is the one thing that needs this: `stateRef`
+  // alone can't tell "did the user switch files while I was awaiting a duration lookup", since
+  // switching files still leaves stateRef.current non-null (just pointing at the NEW file's state).
+  const sourcePathRef = useRef(sourcePath);
+  sourcePathRef.current = sourcePath;
 
   const getSourceDuration = useCallback((path: string): number | null => sourceDurationsRef.current[path] ?? null, []);
 
@@ -647,20 +655,29 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       // possible race right after opening a file), which would silently swallow every insert.
       console.log("[useVideoEditStore] insertClipAt called", { newClipSourcePath, atIndex, hasState: !!current });
       if (!current) return;
+      // Captured before the await below - if the user switches to a different video while a
+      // duration lookup is in flight, sourcePathRef.current no longer matches this by the time we
+      // come back, and the insert (meant for the file open when the drag happened) must be
+      // dropped instead of landing on whatever file happens to be open now. Without this,
+      // `stateRef.current` after the await still looks perfectly valid - it's just the NEW file's
+      // state - so the insert would silently land in the wrong video's edit history.
+      const requestedForSourcePath = sourcePath;
       let duration = getSourceDuration(newClipSourcePath);
       if (duration == null) {
         duration = await fetchDuration(newClipSourcePath);
         console.log("[useVideoEditStore] fetched duration for inserted clip", { newClipSourcePath, duration });
         if (duration == null) return; // couldn't read this file - nothing to insert
+        if (sourcePathRef.current !== requestedForSourcePath) return; // switched files mid-lookup
         registerSourceDuration(newClipSourcePath, duration);
       }
+      if (sourcePathRef.current !== requestedForSourcePath) return; // switched files mid-lookup
       const latest = stateRef.current;
       if (!latest) return;
       const newClip: Clip = { id: crypto.randomUUID(), sourcePath: newClipSourcePath, start: 0, end: duration };
       const clips = insertClipHandler(latest.clips, atIndex, newClip);
       pushCommand(snapshot(latest, {}), snapshot(latest, { clips }), "insert");
     },
-    [pushCommand, getSourceDuration, registerSourceDuration]
+    [pushCommand, getSourceDuration, registerSourceDuration, sourcePath]
   );
 
   const undo = useCallback(() => {
