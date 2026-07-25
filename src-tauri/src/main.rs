@@ -173,6 +173,7 @@ fn main() {
             services::utility::get_default_briefcast_dir,
             services::utility::set_briefcast_dir,
             services::utility::reset_briefcast_dir,
+            services::utility::repair_stale_file_references,
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
             services::pdf_annotations::save_exported_pdf,

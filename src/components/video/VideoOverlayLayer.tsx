@@ -31,6 +31,7 @@ import { TextAlign, TextColorRun, TextRange } from "../../utils/pdfAnnotationTyp
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import TextNoteEditor from "../pdf/TextNoteEditor";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
+import ImageOverlayCropPanel from "./ImageOverlayCropPanel";
 
 export const DEFAULT_OVERLAY_WIDTH_FRACTION = 0.4;
 export const DEFAULT_OVERLAY_FONT_FRACTION = 0.06;
@@ -78,7 +79,25 @@ type TextOverlayContentPatch = Partial<
   >
 >;
 type ImageOverlayContentPatch = Partial<
-  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src">
+  Pick<
+    ImageOverlay,
+    | "x"
+    | "y"
+    | "width"
+    | "height"
+    | "opacity"
+    | "cornerRadius"
+    | "rotation"
+    | "borderColor"
+    | "shadow"
+    | "flipHorizontal"
+    | "flipVertical"
+    | "src"
+    | "cropX"
+    | "cropY"
+    | "cropWidth"
+    | "cropHeight"
+  >
 >;
 // "rounded" is a flat px amount (converted to a frameRect.height fraction at click time) rather
 // than scaling with the image's own size - same known simplification as the text overlay's own
@@ -94,6 +113,31 @@ const IMAGE_ROUNDED_CORNER_PX = 12;
 // of drawing directly on top of it) - see rotateHandleRise's own inline comment for why the rise
 // itself is clamped this way against .video-container's overflow:hidden.
 const rotateHandleRiseFor = (roomAbovePx: number): number => Math.min(32, Math.max(10, roomAbovePx - 2));
+
+// All four crop fields are optional/undefined for the common "never cropped" case (see
+// ImageOverlay.cropX's own doc comment) - true only once a real, non-full crop rect has actually
+// been applied via ImageOverlayCropPanel.
+const hasActiveCrop = (o: ImageOverlay): boolean =>
+  o.cropWidth != null && o.cropHeight != null && (o.cropWidth < 1 || o.cropHeight < 1 || (o.cropX ?? 0) > 0 || (o.cropY ?? 0) > 0);
+
+// The standard CSS trick for showing just a sub-rectangle of an image: scale the (fixed-aspect)
+// background up by 1/cropWidth x 1/cropHeight so the cropped region alone would fill the element,
+// then position it so that region's own top-left lands at the element's own top-left. The
+// background-position percentage formula (position% = point / (1 - size%)) is the standard one for
+// "align this fraction of an oversized background to the matching edge" - guarded against /0 on
+// either axis when that axis isn't actually cropped (cropWidth/cropHeight === 1).
+const cropBackgroundStyle = (o: ImageOverlay): React.CSSProperties => {
+  const cropX = o.cropX ?? 0;
+  const cropY = o.cropY ?? 0;
+  const cropWidth = o.cropWidth ?? 1;
+  const cropHeight = o.cropHeight ?? 1;
+  const posX = cropWidth < 1 ? `${(cropX / (1 - cropWidth)) * 100}%` : "0%";
+  const posY = cropHeight < 1 ? `${(cropY / (1 - cropHeight)) * 100}%` : "0%";
+  return {
+    backgroundSize: `${cropWidth > 0 ? 100 / cropWidth : 100}% ${cropHeight > 0 ? 100 / cropHeight : 100}%`,
+    backgroundPosition: `${posX} ${posY}`,
+  };
+};
 
 // Local, not-yet-persisted position/size for whichever text overlay is currently open for editing
 // - same reasoning as PdfPage's EditingTextState: position/size come from drag/resize handles and
@@ -622,6 +666,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   // progress can't reinterpret deltas that were already applied under the old mode.
   const [aspectLocked, setAspectLocked] = useState(true);
 
+  // Which image overlay (if any) has the dedicated crop panel open - see ImageOverlayCropPanel.tsx,
+  // mounted near the bottom of this component's return. Its own Apply/Cancel own everything about
+  // the crop session; this is only "is it open, and for which overlay".
+  const [croppingOverlayId, setCroppingOverlayId] = useState<string | null>(null);
+
   const [imageResizeDrag, setImageResizeDrag] = useState<null | {
     id: string;
     startClientX: number;
@@ -989,19 +1038,43 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               pointerEvents: placingAnything ? "none" : "auto",
             }}
           >
-            <img
-              src={convertFileSrc(o.src)}
-              draggable={false}
-              alt=""
-              className="w-full h-full object-contain pointer-events-none select-none"
-              style={{
-                borderRadius: radiusPx,
-                // Flip lives on the <img> itself, not the container above - the container also
-                // positions the resize/rotate handles, which should stay in their normal spots
-                // (bottom-right, top-center) regardless of whether the picture is mirrored.
-                transform: o.flipHorizontal || o.flipVertical ? `scale(${o.flipHorizontal ? -1 : 1}, ${o.flipVertical ? -1 : 1})` : undefined,
-              }}
-            />
+            {hasActiveCrop(o) ? (
+              // object-fit can only ever show the *whole* picture (letterboxed or covering) - it
+              // has no way to show a sub-rectangle of it, so a crop needs a different technique
+              // entirely: an oversized background-image, scaled/positioned so only the cropped
+              // region falls within this element, clipped by overflow:hidden on a wrapper. That
+              // wrapper is its own inner div rather than the outer container above - the outer one
+              // hosts the resize/rotate handles positioned *outside* the box via negative offsets
+              // (e.g. -right-1.5 -bottom-1.5), and overflow:hidden there would clip those too.
+              <div className="absolute inset-0 pointer-events-none" style={{ borderRadius: radiusPx, overflow: "hidden" }}>
+                <div
+                  className="absolute inset-0"
+                  style={{
+                    backgroundImage: `url(${convertFileSrc(o.src)})`,
+                    backgroundRepeat: "no-repeat",
+                    ...cropBackgroundStyle(o),
+                    // Flip lives here, not the outer container - same reasoning as the uncropped
+                    // <img> case below: the container also positions the handles, which should
+                    // stay in their normal spots regardless of whether the picture is mirrored.
+                    transform: o.flipHorizontal || o.flipVertical ? `scale(${o.flipHorizontal ? -1 : 1}, ${o.flipVertical ? -1 : 1})` : undefined,
+                  }}
+                />
+              </div>
+            ) : (
+              <img
+                src={convertFileSrc(o.src)}
+                draggable={false}
+                alt=""
+                className="w-full h-full object-contain pointer-events-none select-none"
+                style={{
+                  borderRadius: radiusPx,
+                  // Flip lives on the <img> itself, not the container above - the container also
+                  // positions the resize/rotate handles, which should stay in their normal spots
+                  // (bottom-right, top-center) regardless of whether the picture is mirrored.
+                  transform: o.flipHorizontal || o.flipVertical ? `scale(${o.flipHorizontal ? -1 : 1}, ${o.flipVertical ? -1 : 1})` : undefined,
+                }}
+              />
+            )}
             {isSelected && (
               <>
                 <div
@@ -1389,6 +1462,16 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           <div className="w-px h-4 bg-white/15" />
           <button
             type="button"
+            title="Crop to a sub-region of the picture"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => setCroppingOverlayId(selectedImageOverlayData.id)}
+            className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+          >
+            Crop
+          </button>
+          <div className="w-px h-4 bg-white/15" />
+          <button
+            type="button"
             title="Duplicate this image overlay"
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => onDuplicateImageOverlay(selectedImageOverlayData.id)}
@@ -1472,6 +1555,22 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           </div>,
           document.body
         )}
+
+      {croppingOverlayId &&
+        (() => {
+          const overlay = imageOverlays.find((o) => o.id === croppingOverlayId);
+          if (!overlay) return null;
+          return (
+            <ImageOverlayCropPanel
+              overlay={overlay}
+              onCancel={() => setCroppingOverlayId(null)}
+              onApply={(crop) => {
+                onUpdateImageOverlayContent(overlay.id, crop);
+                setCroppingOverlayId(null);
+              }}
+            />
+          );
+        })()}
     </>
   );
 };

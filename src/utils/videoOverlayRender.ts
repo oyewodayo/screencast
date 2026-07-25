@@ -236,7 +236,17 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
   // flip lives on the <img> itself rather than its container (see VideoOverlayLayer's own comment
   // on that same split).
   if (overlay.flipHorizontal || overlay.flipVertical) ctx.scale(overlay.flipHorizontal ? -1 : 1, overlay.flipVertical ? -1 : 1);
-  ctx.drawImage(img, -w / 2, -h / 2, w, h);
+  // Source rect (sx/sy/sWidth/sHeight) is the cropped sub-region set via ImageOverlayCropPanel, in
+  // the source image's own natural pixel space (see ImageOverlay.cropX's own doc comment) -
+  // defaults to the whole image when never cropped, same as the always-full-image drawImage call
+  // this replaced. drawImage always fills the dest rect (w x h) regardless of the source rect's own
+  // aspect ratio - matches this function's own pre-existing stretch-to-fill behavior, just now
+  // reading from the cropped sub-region instead of the whole picture.
+  const sx = (overlay.cropX ?? 0) * img.naturalWidth;
+  const sy = (overlay.cropY ?? 0) * img.naturalHeight;
+  const sWidth = (overlay.cropWidth ?? 1) * img.naturalWidth;
+  const sHeight = (overlay.cropHeight ?? 1) * img.naturalHeight;
+  ctx.drawImage(img, sx, sy, sWidth, sHeight, -w / 2, -h / 2, w, h);
   ctx.restore();
 
   if (overlay.borderColor) {

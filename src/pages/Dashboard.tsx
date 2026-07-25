@@ -675,6 +675,20 @@ const setScreen = () => {
 		handleDirectoryFiles();
 	}, []);
 
+	// Best-effort, once per launch: self-heals absolute file paths baked into .edits.json/trash
+	// manifest sidecars that no longer resolve (e.g. an image overlay's `src` left pointing at the
+	// old Briefcast folder after a Settings > Storage relocation, or any file moved/renamed by hand
+	// outside the app) - see repair_stale_file_references's own comment in utility.rs. Silent when
+	// nothing needed fixing; only surfaces a message when it actually changed something, so this
+	// isn't a mysterious toast on every ordinary launch.
+	useEffect(() => {
+		invoke<number>("repair_stale_file_references")
+			.then((count) => {
+				if (count > 0) setMessage(`Fixed ${count} file reference${count === 1 ? "" : "s"} broken by a previous move`);
+			})
+			.catch((error) => console.error("Failed to repair stale file references:", error));
+	}, []);
+
 	// Runs once per launch, not a background timer — same "check whenever it's opened" policy
 	// the backend's purge_expired_trash itself is built around (see its own comment for why).
 	useEffect(() => {

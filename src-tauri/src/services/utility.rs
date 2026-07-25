@@ -151,7 +151,116 @@ fn relocate_briefcast_dir(old_root: &Path, new_root: &Path) -> Result<(), String
         }
         copy_then_remove(&src, &dest)?;
     }
-    fs::remove_dir_all(old_root).map_err(|e| format!("Failed to remove the old Briefcast folder: {}", e))
+    fs::remove_dir_all(old_root).map_err(|e| format!("Failed to remove the old Briefcast folder: {}", e))?;
+
+    // Every file/folder now genuinely lives under new_root, but nothing above touched the
+    // *contents* of any sidecar JSON (video_edits.rs's .edits.json, trash.rs's manifest.json) -
+    // those still hold absolute paths baked in under the old root (an image overlay's `src`, a
+    // clip's `sourcePath`, a trashed item's `original_path`), which is exactly why an image
+    // overlay can go blank after a relocation even though the picture itself moved along with
+    // everything else. Self-heals them here rather than leaving that for whoever notices later.
+    repair_stale_file_references_in(new_root);
+    Ok(())
+}
+
+// Rewrites any absolute path found inside a sidecar JSON file (.edits.json, trash's manifest.json)
+// that no longer resolves, by looking up its filename among everything actually present under
+// `root` and pointing it there instead - generic by design (walks the JSON tree blindly rather
+// than knowing field names like "src"/"sourcePath"/"original_path") so it doesn't couple this
+// Rust module to the frontend's evolving edit-state shape (see video_edits.rs's own header
+// comment: the backend deliberately treats that JSON as opaque). Covers both the relocation case
+// above and, as a standalone command, the same class of breakage from any other cause (a file
+// renamed/moved by hand outside the app, etc.) - called once from the frontend on startup as a
+// cheap best-effort safety net, not just right after a move.
+fn repair_stale_file_references_in(root: &Path) -> u32 {
+    let mut files_by_name: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    index_files_by_name(root, &mut files_by_name);
+
+    let mut repaired_count = 0u32;
+    repair_sidecars_in_tree(root, &files_by_name, &mut repaired_count);
+    repaired_count
+}
+
+fn index_files_by_name(dir: &Path, index: &mut std::collections::HashMap<String, PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            index_files_by_name(&path, index);
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            // A duplicate basename in two different folders just keeps whichever is seen last -
+            // this repair only ever replaces a reference that's already broken (see the `!exists()`
+            // check below), so an ambiguous guess is still strictly no worse than the untouched
+            // broken path it started from.
+            index.insert(name.to_string(), path);
+        }
+    }
+}
+
+fn repair_value_paths(value: &mut serde_json::Value, index: &std::collections::HashMap<String, PathBuf>, fixed_any: &mut bool) {
+    match value {
+        serde_json::Value::String(s) => {
+            let candidate = Path::new(s.as_str());
+            if candidate.is_absolute() && !candidate.exists() {
+                if let Some(name) = candidate.file_name().and_then(|n| n.to_str()) {
+                    if let Some(real_path) = index.get(name).and_then(|p| p.to_str()) {
+                        *s = real_path.to_string();
+                        *fixed_any = true;
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                repair_value_paths(item, index, fixed_any);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                repair_value_paths(item, index, fixed_any);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn repair_sidecars_in_tree(dir: &Path, index: &std::collections::HashMap<String, PathBuf>, repaired_count: &mut u32) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            repair_sidecars_in_tree(&path, index, repaired_count);
+            continue;
+        }
+        let is_sidecar = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".edits.json") || n == "manifest.json")
+            .unwrap_or(false);
+        if !is_sidecar {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else { continue };
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&contents) else { continue };
+        let mut fixed_any = false;
+        repair_value_paths(&mut value, index, &mut fixed_any);
+        if fixed_any {
+            if let Ok(rewritten) = serde_json::to_string_pretty(&value) {
+                if fs::write(&path, rewritten).is_ok() {
+                    *repaired_count += 1;
+                }
+            }
+        }
+    }
+}
+
+#[command]
+pub fn repair_stale_file_references() -> Result<u32, String> {
+    let root = briefcast_dir()?;
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    Ok(repair_stale_file_references_in(&root))
 }
 
 fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), String> {

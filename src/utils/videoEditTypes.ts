@@ -102,6 +102,15 @@ export interface ImageOverlay {
   shadow?: boolean; // undefined/false means no drop shadow
   flipHorizontal?: boolean; // undefined/false means not mirrored
   flipVertical?: boolean;
+  // The visible sub-rectangle of the source picture, set via the dedicated Crop mode
+  // (ImageOverlayCropPanel.tsx) - fractions of the SOURCE IMAGE's own natural pixel dimensions,
+  // unlike every other field on this type (all normalized against the video frame instead). All
+  // four undefined means "uncropped" (equivalent to 0,0,1,1) - existing overlays render exactly as
+  // before with no migration needed.
+  cropX?: number;
+  cropY?: number;
+  cropWidth?: number;
+  cropHeight?: number;
   startTime: number;
   endTime: number;
   createdAt: number;
