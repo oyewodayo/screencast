@@ -13,6 +13,7 @@ import {
 import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory";
 import { FILE_TOOLS_COPY } from "./fileToolsConfig";
 import VideoTimelineDocker from "./VideoTimelineDocker";
+import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
 
 // `path` here is always the real filesystem path (never the asset:// URL used for playback) —
 // every action below (ffprobe, rename, reveal, trash) needs the real path, same convention as
@@ -41,11 +42,44 @@ interface FileToolsDockerProps {
   // Asset:// URL for `file`, needed only by the video category's timeline (it loads its own
   // hidden <video> to capture thumbnail frames - ffprobe/canvas can't do that on the real fs path).
   playableSrc: string | null;
+  // Video-only: Dashboard's single, lifted useVideoEditStore instance - threaded straight through
+  // to VideoTimelineDocker, same as onExported/draggingLibraryFile below. Unused (but harmlessly
+  // present) for every non-video category.
+  editStore: UseVideoEditStoreResult;
   currentTime: number;
-  onSeek: (time: number) => void;
+  onSeek: (sourcePath: string, time: number) => void;
+  // Video-only: lets the timeline's own transport button show accurate state and drive real
+  // playback, same round-trip idea as currentTime/onSeek.
+  isPlaying: boolean;
+  onTogglePlay: () => void;
   onConvert: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
+  // Video-only: fired once a timeline Save export finishes. See VideoTimelineDocker's own prop
+  // doc comment - the source file is never modified, this is always a newly rendered file.
+  onExported: (newPath: string, newFileName: string) => void;
+
+  // Video-only: drag-in-a-clip support, threaded straight through to VideoTimelineDocker - see
+  // its own prop doc comments for what each of these actually does.
+  draggingLibraryFile: { path: string; name: string } | null;
+  pendingTimelineInsert: { paths: string[]; clientX: number } | null;
+  onTimelineInsertHandled: () => void;
+
+  // Video-only: reports the timeline's current output-timeline position upward, threaded
+  // straight through to VideoTimelineDocker - see its own prop doc comment.
+  onOutputTimeChange?: (outputTime: number) => void;
+  // Video-only: text-overlay selection/placement state, threaded straight through to
+  // VideoTimelineDocker - see its own prop doc comments.
+  selectedOverlayId?: string | null;
+  onSelectOverlay?: (id: string | null) => void;
+  isPlacingText?: boolean;
+  onToggleArmPlaceText?: () => void;
+  // Video-only: image-overlay selection/placement state, same threading as the text-overlay props
+  // above.
+  selectedImageOverlayId?: string | null;
+  onSelectImageOverlay?: (id: string | null) => void;
+  isPlacingImage?: boolean;
+  onToggleArmPlaceImage?: () => void;
 }
 
 // The file-type-specific alternative to RecordingDocker (see BottomDocker's dockerMode switch):
@@ -54,7 +88,31 @@ interface FileToolsDockerProps {
 // component rather than four near-identical ones — the info/actions block is identical across
 // categories today, and a category's own editing controls (once built) can be added as an
 // additional branch here without duplicating the shared parts.
-const FileToolsDocker: React.FC<FileToolsDockerProps> = ({ file, playableSrc, currentTime, onSeek, onConvert, onRename, onDelete }) => {
+const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
+  file,
+  playableSrc,
+  editStore,
+  currentTime,
+  onSeek,
+  isPlaying,
+  onTogglePlay,
+  onConvert,
+  onRename,
+  onDelete,
+  onExported,
+  draggingLibraryFile,
+  pendingTimelineInsert,
+  onTimelineInsertHandled,
+  onOutputTimeChange,
+  selectedOverlayId,
+  onSelectOverlay,
+  isPlacingText,
+  onToggleArmPlaceText,
+  selectedImageOverlayId,
+  onSelectImageOverlay,
+  isPlacingImage,
+  onToggleArmPlaceImage,
+}) => {
   const category = getFileCategory(file.name);
   const copy = category ? FILE_TOOLS_COPY[category] : null;
 
@@ -64,11 +122,27 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({ file, playableSrc, cu
       <VideoTimelineDocker
         file={file}
         playableSrc={playableSrc}
+        editStore={editStore}
         currentTime={currentTime}
         onSeek={onSeek}
+        isPlaying={isPlaying}
+        onTogglePlay={onTogglePlay}
         onConvert={onConvert}
         onRename={onRename}
         onDelete={onDelete}
+        onExported={onExported}
+        draggingLibraryFile={draggingLibraryFile}
+        pendingTimelineInsert={pendingTimelineInsert}
+        onTimelineInsertHandled={onTimelineInsertHandled}
+        onOutputTimeChange={onOutputTimeChange}
+        selectedOverlayId={selectedOverlayId}
+        onSelectOverlay={onSelectOverlay}
+        isPlacingText={isPlacingText}
+        onToggleArmPlaceText={onToggleArmPlaceText}
+        selectedImageOverlayId={selectedImageOverlayId}
+        onSelectImageOverlay={onSelectImageOverlay}
+        isPlacingImage={isPlacingImage}
+        onToggleArmPlaceImage={onToggleArmPlaceImage}
       />
     );
   }
@@ -150,10 +224,10 @@ const FileToolsDockerGeneric: React.FC<{
   const hasInfo = info.duration || info.resolution || info.size;
 
   return (
-    <div className="w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
-      <div className="flex flex-wrap items-end gap-3">
+    <div className="docker-panel w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
+      <div className="docker-fields-row flex flex-wrap items-end gap-3">
         <div>
-          <div className="p-1 text-sm">Rename</div>
+          <div className="docker-field-label p-1 text-sm">Rename</div>
           <div className="flex items-center gap-1">
             <input
               type="text"
@@ -177,7 +251,7 @@ const FileToolsDockerGeneric: React.FC<{
         </div>
 
         <div>
-          <div className="p-1 text-sm">Info</div>
+          <div className="docker-field-label p-1 text-sm">Info</div>
           <div className="flex items-center gap-3 p-2.5 rounded-md text-xs bg-white dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-700 min-h-[42px]">
             {category === "pdf" ? (
               <span className="text-neutral-400 dark:text-neutral-500 italic">No file info for PDFs</span>
@@ -212,7 +286,7 @@ const FileToolsDockerGeneric: React.FC<{
       </div>
 
       <div className="flex flex-col items-end gap-2">
-        <div className="flex items-end gap-2">
+        <div className="docker-actions-row flex items-end gap-2">
           {isConvertibleCategory(category) && (
             <button
               type="button"

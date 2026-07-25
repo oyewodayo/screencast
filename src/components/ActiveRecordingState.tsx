@@ -8,6 +8,7 @@ interface Props {
     recordingStartTime: number | null;
     handleFolderSettings:()=>void;
     handleGoHome:()=>void;
+    isHome:boolean;
     handleOpenSettings:()=>void;
     handleOpenExternalFile:()=>void;
     handleVideoOverlayAction: ()=>void;
@@ -18,7 +19,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,handleOpenSettings,handleOpenExternalFile, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenSettings,handleOpenExternalFile, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -60,38 +61,61 @@ const ActiveRecordingState = (
         // black video behind it would make unstyled icons/text disappear entirely. The
         // gradient scrim guarantees legibility regardless of what's playing, same technique
         // the video player's own control bar uses (player.css .video-controls-container).
-        <div className="bg-gradient-to-t from-black/30 via-black/20 to-transparent pt-5">
+        <div className="bg-gradient-to-t from-black/20 via-black/10 to-transparent pt-3">
             <div className='mx-2 h-4' data-tauri-drag-region />
             <div className='flex justify-between pl-2 pb-2 items-center align-middle'>
+                {/* Each icon gets its own padded hit-area that darkens on hover/focus so it
+                    reads clearly regardless of what's playing behind this bar (light or dark
+                    video frame, or the plain home screen) - a bare white icon with no feedback
+                    was easy to miss/misclick against bright content. */}
                 <div className="flex items-center">
                    {showFileList ? (
-                        <IoFolderOpen
-                        className="cursor-pointer mr-4 text-white text-xl"
+                        <button
+                        type="button"
+                        className="cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 hover:bg-black/40 active:bg-black/60 active:scale-90 focus-visible:bg-black/40 outline-none"
                         onClick={() => handleFolderSettings()}
                         title="Toggle file list"
-                        />
+                        >
+                          <IoFolderOpen />
+                        </button>
                     ) : (
-                        <IoFolder
-                        className="cursor-pointer mr-4 text-white text-xl"
+                        <button
+                        type="button"
+                        className="cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 hover:bg-black/40 active:bg-black/60 active:scale-90 focus-visible:bg-black/40 outline-none"
                         onClick={() => handleFolderSettings()}
                         title="Toggle file list"
-                        />
+                        >
+                          <IoFolder />
+                        </button>
                     )}
-                    <IoDocumentAttachOutline
-                    className="cursor-pointer mr-4 text-white text-xl"
+                    <button
+                    type="button"
+                    className="cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 hover:bg-black/40 active:bg-black/60 active:scale-90 focus-visible:bg-black/40 outline-none"
                     onClick={() => handleOpenExternalFile()}
                     title="Open file from anywhere"
-                    />
-                    <IoHomeOutline
-                    className="cursor-pointer mr-4 text-white text-xl"
+                    >
+                      <IoDocumentAttachOutline />
+                    </button>
+                    <button
+                    type="button"
+                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
+                      isHome
+                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
+                        : "hover:bg-black/40 active:bg-black/60"
+                    }`}
                     onClick={() => handleGoHome()}
                     title="Home"
-                    />
-                    <IoSettingsOutline
-                    className="cursor-pointer mr-4 text-white text-xl"
+                    >
+                      <IoHomeOutline />
+                    </button>
+                    <button
+                    type="button"
+                    className="cursor-pointer p-2 rounded-md text-white text-xl transition-all duration-150 hover:bg-black/40 active:bg-black/60 active:scale-90 focus-visible:bg-black/40 outline-none"
                     onClick={() => handleOpenSettings()}
                     title="Settings"
-                    />
+                    >
+                      <IoSettingsOutline />
+                    </button>
                 </div>
                 <div className='flex items-center'>
 

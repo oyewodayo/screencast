@@ -1,4 +1,5 @@
 import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
+import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
 import { message } from "@tauri-apps/api/dialog";
@@ -7,6 +8,7 @@ import ActiveRecordingState from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
+import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -18,15 +20,47 @@ interface Props {
   // Asset:// URL for activeFile (already converted for the main player) — needed only by the
   // video-tools timeline, which loads its own hidden <video> to capture thumbnail frames.
   activeFilePlayableSrc: string | null;
+  // Video-only: Dashboard's single, lifted useVideoEditStore instance - threaded straight through
+  // to FileToolsDocker/VideoTimelineDocker so the preview-layer text-overlay editor near the main
+  // player and the timeline's own lane share the exact same edit state/undo-redo stack.
+  editStore: UseVideoEditStoreResult;
   // Live playback position of the main player, and a way to seek it - what lets the video-tools
   // timeline's playhead track and drive real playback instead of being purely decorative.
   activeFileCurrentTime: number;
-  onSeekActiveFile: (time: number) => void;
+  // sourcePath names which file's timeline `time` belongs to - a timeline clip dragged in from
+  // elsewhere means "seek to this time" is ambiguous without also saying which file.
+  onSeekActiveFile: (sourcePath: string, time: number) => void;
+  // Same round-trip as activeFileCurrentTime/onSeekActiveFile, for play/pause - lets the video-
+  // tools timeline show an accurate transport button and drive real playback from it.
+  activeFileIsPlaying: boolean;
+  onTogglePlayActiveFile: () => void;
   onConvertFile: (file: DockerFile) => void;
   onRenameFile: (file: DockerFile, newName: string) => Promise<void>;
   onDeleteFile: (file: DockerFile) => Promise<void>;
+  onExportedFile: (newPath: string, newFileName: string) => void;
+  // Video-only: drag-in-a-clip support for the timeline, threaded straight through to
+  // VideoTimelineDocker - see its own prop doc comments for what each of these actually does.
+  draggingLibraryFile: { path: string; name: string } | null;
+  pendingTimelineInsert: { paths: string[]; clientX: number } | null;
+  onTimelineInsertHandled: () => void;
+  // Video-only: reports the timeline's current output-timeline position upward, threaded
+  // straight through to FileToolsDocker/VideoTimelineDocker.
+  onOutputTimeChange?: (outputTime: number) => void;
+  // Video-only: text-overlay selection/placement state, threaded straight through to
+  // FileToolsDocker/VideoTimelineDocker.
+  selectedOverlayId?: string | null;
+  onSelectOverlay?: (id: string | null) => void;
+  isPlacingText?: boolean;
+  onToggleArmPlaceText?: () => void;
+  // Video-only: image-overlay selection/placement state, same threading as the text-overlay props
+  // above.
+  selectedImageOverlayId?: string | null;
+  onSelectImageOverlay?: (id: string | null) => void;
+  isPlacingImage?: boolean;
+  onToggleArmPlaceImage?: () => void;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
+  isHome: boolean;
   handleOpenSettings: () => void;
   handleOpenExternalFile: () => void;
   showFileList: boolean;
@@ -81,13 +115,30 @@ const BottomDocker = ({
   dockerMode,
   activeFile,
   activeFilePlayableSrc,
+  editStore,
   activeFileCurrentTime,
   onSeekActiveFile,
+  activeFileIsPlaying,
+  onTogglePlayActiveFile,
   onConvertFile,
   onRenameFile,
   onDeleteFile,
+  onExportedFile,
+  draggingLibraryFile,
+  pendingTimelineInsert,
+  onTimelineInsertHandled,
+  onOutputTimeChange,
+  selectedOverlayId,
+  onSelectOverlay,
+  isPlacingText,
+  onToggleArmPlaceText,
+  selectedImageOverlayId,
+  onSelectImageOverlay,
+  isPlacingImage,
+  onToggleArmPlaceImage,
   handleFolderSettings,
   handleGoHome,
+  isHome,
   handleOpenSettings,
   handleOpenExternalFile,
   showFileList,
@@ -355,6 +406,7 @@ const BottomDocker = ({
             recordType={recordType}
             handleFolderSettings={handleFolderSettings}
             handleGoHome={handleGoHome}
+            isHome={isHome}
             handleOpenSettings={handleOpenSettings}
             handleOpenExternalFile={handleOpenExternalFile}
             handleVideoOverlayAction={handleVideoOverlayAction}
@@ -364,16 +416,32 @@ const BottomDocker = ({
             showFileList={showFileList} 
         />
       
-      {showDocker && (<div className="w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
+      {showDocker && (<div className="docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
         {dockerMode === "file-tools" && activeFile ? (
           <FileToolsDocker
             file={activeFile}
             playableSrc={activeFilePlayableSrc}
+            editStore={editStore}
             currentTime={activeFileCurrentTime}
             onSeek={onSeekActiveFile}
+            isPlaying={activeFileIsPlaying}
+            onTogglePlay={onTogglePlayActiveFile}
             onConvert={onConvertFile}
             onRename={onRenameFile}
             onDelete={onDeleteFile}
+            onExported={onExportedFile}
+            draggingLibraryFile={draggingLibraryFile}
+            pendingTimelineInsert={pendingTimelineInsert}
+            onTimelineInsertHandled={onTimelineInsertHandled}
+            onOutputTimeChange={onOutputTimeChange}
+            selectedOverlayId={selectedOverlayId}
+            onSelectOverlay={onSelectOverlay}
+            isPlacingText={isPlacingText}
+            onToggleArmPlaceText={onToggleArmPlaceText}
+            selectedImageOverlayId={selectedImageOverlayId}
+            onSelectImageOverlay={onSelectImageOverlay}
+            isPlacingImage={isPlacingImage}
+            onToggleArmPlaceImage={onToggleArmPlaceImage}
           />
         ) : (
           <RecordingDocker

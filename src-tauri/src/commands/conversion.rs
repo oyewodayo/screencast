@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tauri::async_runtime::Mutex;
 use std::io::{BufRead, BufReader};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
 use crate::services::utility::{path_to_str, get_ffmpeg_path, get_ffprobe_path};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -87,28 +89,53 @@ fn unique_output_path(path: PathBuf) -> PathBuf {
 }
 
 
-// Shared conversion runner used by both convert_to_mp4 and convert_video, so every target
-// format gets the same stderr progress-parsing thread (convert_video previously lacked one,
-// so its progress bar silently never moved).
+// One `-i` worth of input - `pre_args` is whatever ffmpeg input-level flags need to appear
+// *before* that `-i` (input-level options only take effect on the input they immediately
+// precede, unlike output-level options like `-c:v`). Every existing caller just needs a plain
+// path (empty pre_args); export_trimmed_video's overlay PNGs are the one case that needs
+// `-loop 1 -t <duration>` ahead of theirs, to turn a single still frame into a looped stream long
+// enough to composite across the whole output - see its own comment for why.
+struct InputSpec {
+    path: String,
+    pre_args: Vec<String>,
+}
+
+impl InputSpec {
+    fn plain(path: String) -> Self {
+        Self { path, pre_args: Vec::new() }
+    }
+}
+
+// Shared conversion runner used by every command in this file, so every target format gets the
+// same stderr progress-parsing thread (convert_video previously lacked one, so its progress bar
+// silently never moved). Takes a *list* of inputs (each becomes its own `-i`) rather than a
+// single path - export_trimmed_video needs that to pull clips from more than one source file;
+// every other caller here just passes a single-element list. `progress_key` is what's reported
+// as `input_path` on emitted events - for single-input callers that's just the input path
+// itself, for a multi-input export it's the output file's own base path, since there's no one
+// "the input" to name it after and the frontend already keys its progress listener off whatever
+// it originally requested the export under.
 async fn run_conversion(
     app_handle: &AppHandle,
     window: &Window,
     state: &State<'_, ConversionState>,
-    input_path: &str,
+    inputs: &[InputSpec],
+    progress_key: &str,
     output: PathBuf,
     codec_args: &[&str],
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-    let input = PathBuf::from(input_path);
 
-    if !input.exists() {
-        return Err("Input file does not exist".to_string());
+    for input in inputs {
+        if !PathBuf::from(&input.path).exists() {
+            return Err(format!("Input file does not exist: {}", input.path));
+        }
     }
 
     let output = unique_output_path(output);
 
     let _ = window.emit("conversion-progress", ConversionProgress {
-        input_path: input_path.to_string(),
+        input_path: progress_key.to_string(),
         output_path: output.to_string_lossy().to_string(),
         progress: 0.0,
         status: ConversionStatus::Starting,
@@ -116,14 +143,20 @@ async fn run_conversion(
     });
 
     let mut cmd = Command::new(&ffmpeg_path);
-    cmd.arg("-i").arg(path_to_str(&input)?);
+    for input in inputs {
+        for arg in &input.pre_args {
+            cmd.arg(arg);
+        }
+        cmd.arg("-i").arg(path_to_str(&PathBuf::from(&input.path))?);
+    }
     cmd.args(codec_args);
     // -progress pipe:1 makes ffmpeg write machine-readable key=value progress lines to
     // stdout, newline-terminated. Without it, ffmpeg only prints a human-readable status
     // line to stderr that it rewrites in place with '\r' (never '\n'), which BufReader's
     // line-based reader never yields as a line - so progress silently never updated.
     // -nostats suppresses that human status line so it doesn't clutter the stderr scan below.
-    cmd.args(["-y", "-progress", "pipe:1", "-nostats", path_to_str(&output)?]);
+    cmd.args(["-y", "-progress", "pipe:1", "-nostats"]);
+    cmd.arg(path_to_str(&output)?);
     // No interactive input is ever needed (the -y above suppresses overwrite prompts), and
     // leaving stdin inherited from the parent risks ffmpeg blocking on a read that never
     // resolves when run from a console-attached dev build.
@@ -177,7 +210,7 @@ async fn run_conversion(
     });
 
     let window_clone = window.clone();
-    let input_path_clone = input_path.to_string();
+    let progress_key_clone = progress_key.to_string();
     let output_path_clone = output.to_string_lossy().to_string();
 
     std::thread::spawn(move || {
@@ -200,7 +233,7 @@ async fn run_conversion(
             let progress = (current_time / total_duration * 100.0).clamp(0.0, 99.0);
 
             let _ = window_clone.emit("conversion-progress", ConversionProgress {
-                input_path: input_path_clone.clone(),
+                input_path: progress_key_clone.clone(),
                 output_path: output_path_clone.clone(),
                 progress,
                 status: ConversionStatus::Processing,
@@ -223,7 +256,7 @@ async fn run_conversion(
 
     if result.success() {
         let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: input_path.to_string(),
+            input_path: progress_key.to_string(),
             output_path: output.to_string_lossy().to_string(),
             progress: 100.0,
             status: ConversionStatus::Completed,
@@ -239,7 +272,7 @@ async fn run_conversion(
         );
 
         let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: input_path.to_string(),
+            input_path: progress_key.to_string(),
             output_path: output.to_string_lossy().to_string(),
             progress: 0.0,
             status: ConversionStatus::Failed,
@@ -274,7 +307,7 @@ pub async fn convert_to_mp4(
         "-movflags", "+faststart",
     ];
 
-    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+    let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -355,7 +388,7 @@ pub async fn get_playable_preview(
         "-movflags", "+faststart",
     ];
 
-    run_conversion(&app_handle, &window, &state, &input_path, cache_path, &codec_args).await
+    run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, cache_path, &codec_args).await
 }
 
 // Convert a still image (screenshot) between png/jpeg/webp/bmp. No audio/video codec args
@@ -383,7 +416,7 @@ pub async fn convert_image(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+    let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -422,13 +455,325 @@ pub async fn convert_audio(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+    let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
     }
 
     Ok(result)
+}
+
+// rename_all is needed here (unlike this command's own top-level camelCase args, which Tauri's
+// invoke_handler macro converts automatically) because this struct is deserialized as the
+// *value* of the `segments` array by serde directly, not through that per-command conversion -
+// without it, the frontend's `sourcePath` would fail to match `source_path`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepSegment {
+    pub source_path: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+// One text or image overlay, already fully rendered client-side to a transparent PNG matching
+// what the live preview shows (font/stroke/background/corner-radius for text; rotation/corner-
+// radius/border/shadow for images - see videoOverlayRender.ts) - this command only knows about a
+// flat image plus where/when to composite it, never about TextOverlay/ImageOverlay's own richer
+// shape. `x`/`y` are already resolved to real output-video pixels by the frontend (it knows the
+// loaded video's native width/height from the same hidden <video> element the timeline's filmstrip
+// capture already uses), so no resolution lookup is needed on this side at all. `start_time`/
+// `end_time` are seconds on the *output* (post-trim/concat) timeline, same space `segments` above
+// occupies once trimmed.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayImage {
+    pub data_base64: String,
+    pub x: i64,
+    pub y: i64,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub fade: bool,
+}
+
+// A background music/voiceover track to mix into the output's own audio - unlike OverlayImage,
+// there's no client-side rendering step for this at all: the frontend never touches the source
+// audio, it just names it (source_path) and passes the same trim/volume/fade parameters the
+// AudioOverlay/AudioOverlayPopover editing UI already tracks (see videoEditTypes.ts's AudioOverlay
+// and VideoTimelineDocker.tsx). trim_start/start_time/end_time are already resolved by the
+// frontend (start_time/end_time are output-timeline seconds, same space `segments` occupies;
+// trim_start is seconds into this track's own source file) - this command only builds the ffmpeg
+// filter chain from them, same "just compositing, no richer shape known here" split OverlayImage
+// already draws.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayAudio {
+    pub source_path: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub trim_start: f64,
+    pub volume: f64,
+    pub fade_in: f64,
+    pub fade_out: f64,
+}
+
+// Decodes one overlay's PNG payload and writes it to a fresh temp file - ffmpeg needs a real path
+// for `-i`, not a data URL. `data_base64` may carry a "data:image/png;base64," prefix (what
+// canvas.toDataURL() produces) or be the bare payload; splitting on the last comma handles both
+// without the caller needing to know which.
+fn write_temp_overlay_png(data_base64: &str, index: usize) -> Result<PathBuf, String> {
+    let payload = data_base64.rsplit(',').next().unwrap_or(data_base64);
+    let bytes = BASE64.decode(payload).map_err(|e| format!("Failed to decode overlay image: {}", e))?;
+    let path = std::env::temp_dir().join(format!("briefcast_overlay_{}_{}.png", std::process::id(), index));
+    std::fs::write(&path, &bytes).map_err(|e| format!("Failed to write overlay temp file: {}", e))?;
+    Ok(path)
+}
+
+// Renders the edited (trimmed/split/reordered) video described by `segments` - an ordered list
+// of the *kept* time ranges, each independently naming which source file it comes from, produced
+// by VideoTimelineDocker's trim handles, split+delete tool, and drag-to-reorder/drag-in - to a
+// brand-new file next to `output_base_path`, with any text/image overlays composited on top.
+// Every source segments reference is opened read-only and never touched: unlike
+// convert_to_mp4/convert_video/convert_audio above, there is no `preserve_original` parameter
+// here at all, because there is no "false" branch to have.
+//
+// `output_base_path` only names/locates the output - it's the file the timeline was opened on,
+// which is not necessarily the source of any particular segment once clips have been dragged in
+// from elsewhere (see DockerFile/DockerFile.path in VideoTimelineDocker.tsx).
+//
+// A single kept segment with no overlays (plain trim, no cuts, no drag-ins, nothing composited)
+// uses fast, low-artifact `-ss`/`-to` range extraction on that one input and no filter graph at
+// all. Anything else - multiple segments, multiple distinct source files, and/or any overlays -
+// needs an actual filter graph: trim+concat can't be expressed as simple `-ss`/`-to` since ffmpeg
+// only accepts one input range per input stream (each segment gets its own `-i` so segments can
+// come from entirely different files), and compositing an overlay is a filter graph operation by
+// definition.
+#[tauri::command]
+pub async fn export_trimmed_video(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    output_base_path: String,
+    segments: Vec<KeepSegment>,
+    overlays: Vec<OverlayImage>,
+    audio_overlays: Vec<OverlayAudio>,
+    audio_muted: bool,
+    audio_volume: f64,
+) -> Result<String, String> {
+    if segments.is_empty() {
+        return Err("No segments to export".to_string());
+    }
+
+    // The primary video's OWN audio level (distinct from any audio overlay's own volume/muted,
+    // which are separate mixed-in tracks) - 0.0 when muted, otherwise whatever the editor's track
+    // volume slider was set to.
+    let effective_video_volume = if audio_muted { 0.0 } else { audio_volume.max(0.0) };
+
+    let base = PathBuf::from(&output_base_path);
+    let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = base.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
+    let parent = base.parent().map(PathBuf::from).unwrap_or_default();
+    let output = parent.join(format!("{} (edited).{}", stem, ext));
+
+    let mut inputs: Vec<InputSpec> = segments.iter().map(|s| InputSpec::plain(s.source_path.clone())).collect();
+
+    // Written to temp files up front (ffmpeg needs real file paths, not data URLs) and cleaned up
+    // unconditionally once the export attempt finishes below, success or failure.
+    let total_duration: f64 = segments.iter().map(|s| s.end - s.start).sum();
+    let mut temp_overlay_paths: Vec<PathBuf> = Vec::new();
+    for (i, ov) in overlays.iter().enumerate() {
+        // Deliberately not `?` here - that would return before the cleanup loop further down ever
+        // runs, permanently leaking every overlay PNG already written earlier in this same loop
+        // (e.g. overlay 0 succeeds, overlay 1 fails to decode - overlay 0's temp file would
+        // otherwise sit in the temp dir forever, since its deterministic name never gets reused).
+        let path = match write_temp_overlay_png(&ov.data_base64, i) {
+            Ok(path) => path,
+            Err(e) => {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(e);
+            }
+        };
+        temp_overlay_paths.push(path.clone());
+        // -loop 1 turns the single PNG frame into a looped stream; -t caps it at the *whole*
+        // output's duration rather than just this overlay's own [start,end) window - the overlay
+        // filter's own enable='between(t,start,end)' below is what actually gates when it's
+        // visible, so the input stream itself doesn't need to be time-shifted to line up.
+        inputs.push(InputSpec {
+            path: path.to_string_lossy().to_string(),
+            pre_args: vec!["-loop".into(), "1".into(), "-t".into(), format!("{:.3}", total_duration.max(0.01))],
+        });
+    }
+
+    // Audio overlays need no temp file and no -loop/-t pre_args at all, unlike the PNGs above -
+    // there's no client-side rendering step for audio (see OverlayAudio's own doc comment), so
+    // this just opens each track's original source file directly, atrim-ing into it in the filter
+    // graph below rather than pre-shaping the input stream itself.
+    for audio_ov in &audio_overlays {
+        inputs.push(InputSpec::plain(audio_ov.source_path.clone()));
+    }
+
+    let has_video_overlays = !overlays.is_empty();
+    let has_audio_overlays = !audio_overlays.is_empty();
+
+    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_audio_overlays {
+        // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
+        // filter graph needed just for it.
+        let seg = &segments[0];
+        let mut args = vec![
+            "-ss".into(), format!("{:.3}", seg.start),
+            "-to".into(), format!("{:.3}", seg.end),
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), "medium".into(),
+            "-crf".into(), "23".into(),
+            "-c:a".into(), "aac".into(),
+            "-b:a".into(), "128k".into(),
+            "-movflags".into(), "+faststart".into(),
+        ];
+        if (effective_video_volume - 1.0).abs() > 0.001 {
+            args.push("-af".into());
+            args.push(format!("volume={:.3}", effective_video_volume));
+        }
+        args
+    } else {
+        let mut filter = String::new();
+
+        // Base video (trim, or trim+concat) always lands in a [base] node so the overlay chain
+        // below has one consistent label to start from regardless of how many segments there were.
+        if segments.len() == 1 {
+            let seg = &segments[0];
+            filter.push_str(&format!(
+                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS[base];[0:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[outa];",
+                seg.start, seg.end
+            ));
+        } else {
+            // Same segment-major trim+concat pattern as before this function grew overlay support
+            // - concat's inputs must interleave [v0][a0][v1][a1]..., not group all video labels
+            // before all audio ones, or ffmpeg rejects the whole filtergraph ("Media type
+            // mismatch").
+            let mut concat_inputs = String::new();
+            for (i, seg) in segments.iter().enumerate() {
+                filter.push_str(&format!(
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS[v{2}];[{2}:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
+                    seg.start, seg.end, i
+                ));
+                concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
+            }
+            filter.push_str(&format!("{}concat=n={}:v=1:a=1[base][outa];", concat_inputs, segments.len()));
+        }
+
+        // Chains each overlay onto [base] in turn, the last one landing on [outv]. A still PNG is
+        // "faded" via ffmpeg's own fade filter for overlays with animation:"fade" set in the
+        // editor - alpha=1 fades the alpha channel itself rather than to black, which is exactly
+        // what a transparent-background overlay needs - before being composited via `overlay`
+        // gated to that overlay's own [start,end) window on the output timeline either way.
+        let mut current_label = "base".to_string();
+        let overlay_input_base = segments.len();
+        for (i, ov) in overlays.iter().enumerate() {
+            let source_label = format!("{}:v", overlay_input_base + i);
+            let composited_label = if ov.fade {
+                let faded_label = format!("ovfade{}", i);
+                let fade_out_start = (ov.end_time - 0.4).max(ov.start_time);
+                filter.push_str(&format!(
+                    "[{}]fade=in:st={:.3}:d=0.4:alpha=1,fade=out:st={:.3}:d=0.4:alpha=1[{}];",
+                    source_label, ov.start_time, fade_out_start, faded_label
+                ));
+                faded_label
+            } else {
+                source_label
+            };
+            let next_label = if i + 1 == overlays.len() { "outv".to_string() } else { format!("ov{}", i) };
+            filter.push_str(&format!(
+                "[{}][{}]overlay=x={}:y={}:enable='between(t,{:.3},{:.3})'[{}];",
+                current_label, composited_label, ov.x, ov.y, ov.start_time, ov.end_time, next_label
+            ));
+            current_label = next_label;
+        }
+        // Multiple segments, no video overlays: [base] from the concat above still needs to end up
+        // named [outv] for the -map below - the loop that would normally do that (ending on
+        // "outv") never runs when there are no video overlays to chain.
+        if !has_video_overlays {
+            filter.push_str("[base]copy[outv];");
+        }
+
+        // Applies the track-level mute/volume to [outa] (the original video's own trimmed/
+        // concatenated audio, built above) before anything else reads it - both the no-overlays
+        // map below and the amix mixing block further down consume whichever label this produces.
+        // Skipped entirely (base_audio_label just stays "outa") when the volume is untouched, so a
+        // video nobody's adjusted this for doesn't grow an extra no-op filter node.
+        let base_audio_label = if (effective_video_volume - 1.0).abs() > 0.001 {
+            filter.push_str(&format!("[outa]volume={:.3}[outa_vol];", effective_video_volume));
+            "outa_vol"
+        } else {
+            "outa"
+        };
+
+        // Mixes each audio overlay into base_audio_label - amix's `normalize=0` is the detail that
+        // matters here: amix auto-attenuates every input by 1/inputs by default, which would
+        // quietly turn the original video's own audio down just because background music was
+        // added. normalize=0 keeps each track at whatever level its own `volume=` filter below
+        // already set (the track volume above for the original track, whatever the user picked for
+        // each overlay) - "30% volume" means 30%, not 30% further divided by however many tracks
+        // happen to be mixed in.
+        let audio_label = if has_audio_overlays {
+            let audio_input_base = segments.len() + overlays.len();
+            let mut mix_inputs = format!("[{}]", base_audio_label);
+            for (i, audio_ov) in audio_overlays.iter().enumerate() {
+                let input_index = audio_input_base + i;
+                let trim_end = audio_ov.trim_start + (audio_ov.end_time - audio_ov.start_time);
+                let mut chain = format!(
+                    "[{}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,volume={:.3}",
+                    input_index, audio_ov.trim_start, trim_end, audio_ov.volume
+                );
+                if audio_ov.fade_in > 0.0 {
+                    chain.push_str(&format!(",afade=t=in:st=0:d={:.3}", audio_ov.fade_in));
+                }
+                if audio_ov.fade_out > 0.0 {
+                    let track_duration = audio_ov.end_time - audio_ov.start_time;
+                    let fade_out_start = (track_duration - audio_ov.fade_out).max(0.0);
+                    chain.push_str(&format!(",afade=t=out:st={:.3}:d={:.3}", fade_out_start, audio_ov.fade_out));
+                }
+                let delay_ms = (audio_ov.start_time * 1000.0).round().max(0.0);
+                let track_label = format!("aov{}", i);
+                filter.push_str(&format!("{},adelay={:.0}:all=1[{}];", chain, delay_ms, track_label));
+                mix_inputs.push_str(&format!("[{}]", track_label));
+            }
+            filter.push_str(&format!(
+                "{}amix=inputs={}:duration=first:dropout_transition=0:normalize=0[outa_mixed];",
+                mix_inputs,
+                audio_overlays.len() + 1
+            ));
+            "outa_mixed".to_string()
+        } else {
+            base_audio_label.to_string()
+        };
+
+        // Trailing `;` is harmless to ffmpeg either way, but trimmed for consistency with how the
+        // original concat-only filter string here was always built without one.
+        let filter = filter.trim_end_matches(';').to_string();
+
+        vec![
+            "-filter_complex".into(), filter,
+            "-map".into(), "[outv]".into(),
+            "-map".into(), format!("[{}]", audio_label),
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), "medium".into(),
+            "-crf".into(), "23".into(),
+            "-c:a".into(), "aac".into(),
+            "-b:a".into(), "128k".into(),
+            "-movflags".into(), "+faststart".into(),
+        ]
+    };
+    let codec_args: Vec<&str> = owned_args.iter().map(|s| s.as_str()).collect();
+
+    let result = run_conversion(&app_handle, &window, &state, &inputs, &output_base_path, output, &codec_args).await;
+
+    for temp_path in &temp_overlay_paths {
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    result
 }
 
 // Cancel ongoing conversion
@@ -523,6 +868,31 @@ pub async fn batch_convert_to_mp4(
     }
 
     Ok(results)
+}
+
+// Reads an arbitrary image file and returns it as a `data:` URL - used by the frontend's
+// videoOverlayRender.ts to load an image overlay's source into a canvas (for rotation/corner-
+// radius/border/shadow compositing before export burn-in) without tainting that canvas. Loading
+// the same file via Tauri's asset:// protocol + <img> works fine for plain on-screen display, but
+// the browser treats that protocol as cross-origin - drawing a cross-origin image onto a canvas
+// taints it, and a tainted canvas throws on toDataURL() ("Tainted canvases may not be exported").
+// A `data:` URL has no origin of its own, so it never triggers that. Going through a Rust command
+// also sidesteps the frontend fs allowlist entirely (scoped to $VIDEO/Briefcast/**, which an
+// externally-picked image needn't live under) - Rust's own filesystem access is unrestricted by
+// that allowlist regardless of which folder the file is actually in.
+#[tauri::command]
+pub async fn read_image_data_url(path: String) -> Result<String, String> {
+    let file_path = PathBuf::from(&path);
+    let bytes = std::fs::read(&file_path).map_err(|e| format!("Failed to read image file: {}", e))?;
+    let mime = match file_path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) {
+        Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg",
+        Some(ext) if ext == "gif" => "image/gif",
+        Some(ext) if ext == "webp" => "image/webp",
+        Some(ext) if ext == "bmp" => "image/bmp",
+        Some(ext) if ext == "svg" => "image/svg+xml",
+        _ => "image/png",
+    };
+    Ok(format!("data:{};base64,{}", mime, BASE64.encode(&bytes)))
 }
 
 // Get file information before conversion
@@ -658,7 +1028,7 @@ pub async fn convert_video(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let result = run_conversion(&app_handle, &window, &state, &input_path, output, &codec_args).await?;
+    let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);

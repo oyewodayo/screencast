@@ -1,0 +1,77 @@
+/* pdf/pdfTextLayer.css
+ *
+ * Trimmed, non-nested port of pdfjs-dist's own web/pdf_viewer.css ".textLayer" rules — just the
+ * subset PdfTextLayer.tsx actually needs (span positioning/sizing, rotation, selection tint),
+ * renamed to .pdfTextLayer so it can't collide with anything else. The full stylesheet also
+ * carries pdf.js's own toolbar/sidebar/annotation-editor UI, none of which applies here.
+ */
+
+.pdfTextLayer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  text-align: initial;
+  overflow: clip;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor, 1) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+/* Every text run pdf.js lays out is an absolutely-positioned <span> (or a bare <br> at a line's
+   end) — invisible (color: transparent) since the real glyphs are already painted by the page's
+   own canvas underneath; this is purely a same-position, same-size hit target for native
+   click-drag selection. */
+.pdfTextLayer span,
+.pdfTextLayer br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+}
+
+/* PdfTextLayer.tsx sets --font-height/--scale-x/--rotate per span (via TextLayer.render()) —
+   these are just the defaults/formula those custom properties feed into. */
+.pdfTextLayer > :not(.markedContent),
+.pdfTextLayer .markedContent span:not(.markedContent) {
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.pdfTextLayer .markedContent {
+  display: contents;
+}
+
+.pdfTextLayer span[role="img"] {
+  user-select: none;
+  cursor: default;
+}
+
+/* The only actually-visible output of this layer: a translucent band over whatever's selected,
+   sitting above the real (opaque) glyphs painted on the canvas below. */
+.pdfTextLayer ::selection {
+  background: rgba(0, 90, 255, 0.28);
+}
+
+.pdfTextLayer[data-main-rotation="90"] {
+  transform: rotate(90deg) translateY(-100%);
+}
+.pdfTextLayer[data-main-rotation="180"] {
+  transform: rotate(180deg) translate(-100%, -100%);
+}
+.pdfTextLayer[data-main-rotation="270"] {
+  transform: rotate(270deg) translateX(-100%);
+}

@@ -55,10 +55,10 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   onStopRecordingClick,
 }) => {
   return (
-    <div className="w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
-      <div className="flex flex-wrap items-end gap-3">
+    <div className="docker-panel w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
+      <div className="docker-fields-row flex flex-wrap items-end gap-3">
         <div>
-          <div className="p-1 text-sm">Save file as</div>
+          <div className="docker-field-label p-1 text-sm">Save file as</div>
           <input
             type="text"
             className="file_name p-2.5 rounded-l text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
@@ -71,7 +71,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
         </div>
 
         <div>
-          <div className="p-1 text-sm flex items-center justify-between">
+          <div className="docker-field-label p-1 text-sm flex items-center justify-between">
             Type{" "}
             <button type="button">
               <IoInformationCircle onClick={onShowVideoFormatInfo} />
@@ -110,7 +110,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
         </div>
 
         <div>
-          <div className="p-1 text-sm">Recording options</div>
+          <div className="docker-field-label p-1 text-sm">Recording options</div>
           <select
             name="record_type"
             id="record_type"
@@ -128,7 +128,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
         </div>
 
         <div>
-          <div className="p-1 text-sm">Audio device</div>
+          <div className="docker-field-label p-1 text-sm">Audio device</div>
           <select
             name="audioDevice"
             id="audioDevice"
@@ -152,10 +152,10 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             screen at all, so there's no "what's playing while I record" scenario for them. */}
         {(recordType === "sva" || recordType === "sa" || recordType === "s") && (
           <div>
-            <div className="p-1 text-sm">&nbsp;</div>
+            <div className="docker-field-label p-1 text-sm">&nbsp;</div>
             <label
               title="Captures whatever's playing through your speakers (e.g. a video open in another app) via WASAPI loopback, alongside the screen capture. Windows only."
-              className="flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 cursor-pointer"
+              className="docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 cursor-pointer"
             >
               <input type="checkbox" checked={includeSystemAudio} onChange={onToggleIncludeSystemAudio} />
               System audio
@@ -165,8 +165,8 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
 
         <div className="flex items-end gap-1">
           <div>
-            <div className="p-1 text-sm">Video device(s)</div>
-            <div className="p-2 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 max-h-28 overflow-y-auto min-w-[180px]">
+            <div className="docker-field-label p-1 text-sm">Video device(s)</div>
+            <div className="docker-video-devices p-2 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 max-h-28 overflow-y-auto min-w-[180px]">
               {connectedCameraDevices && connectedCameraDevices.length > 0 ? (
                 connectedCameraDevices.map((device, index) => (
                   <label key={index} className="flex items-center gap-2 py-0.5 cursor-pointer">
@@ -194,7 +194,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
         </div>
       </div>
 
-      <div className="flex items-end gap-2">
+      <div className="docker-actions-row flex items-end gap-2">
         <button
           onClick={onScreenshotClick}
           disabled={isRecording}

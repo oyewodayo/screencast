@@ -14,6 +14,8 @@ import {
   IoExpand,
   IoGridOutline,
   IoListOutline,
+  IoImageOutline,
+  IoDownloadOutline,
 } from "react-icons/io5";
 import { IoIosArrowBack, IoIosArrowForward } from "react-icons/io";
 import { BsHighlighter, BsCursor } from "react-icons/bs";
@@ -30,6 +32,7 @@ interface AnnotationToolbarProps {
   tool: AnnotationTool | null;
   onToolChange: (tool: AnnotationTool) => void;
   onDeselectTool: () => void;
+  onInsertImageClick: () => void;
   color: string;
   onColorChange: (color: string) => void;
   strokeWidth: number;
@@ -54,6 +57,9 @@ interface AnnotationToolbarProps {
   onRedo: () => void;
   isSaving: boolean;
   saveError: string | null;
+  isExporting: boolean;
+  exportProgress: { completed: number; total: number } | null;
+  onExport: () => void;
 }
 
 const TOOL_BUTTONS: { tool: AnnotationTool; label: string; shortcut: string; icon: React.ReactNode }[] = [
@@ -213,6 +219,7 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   tool,
   onToolChange,
   onDeselectTool,
+  onInsertImageClick,
   color,
   onColorChange,
   strokeWidth,
@@ -234,6 +241,9 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   onRedo,
   isSaving,
   saveError,
+  isExporting,
+  exportProgress,
+  onExport,
 }) => {
   return (
     <div className="shrink-0 px-4 pt-3 pb-2">
@@ -276,6 +286,13 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             </IconButton>
           ))}
         </div>
+
+        {/* Inserting an image isn't a persistent "tool" the way pen/highlighter/text are — it's a
+            one-shot action (pick a file, it appears selected and ready to drag/resize/rotate) —
+            so it lives here as a standalone button rather than in the tool segmented control. */}
+        <IconButton title="Insert image" onClick={onInsertImageClick}>
+          <IoImageOutline size={16} />
+        </IconButton>
 
         {tool && tool !== "eraser" && (
           <>
@@ -355,6 +372,23 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
         </div>
 
         <Divider />
+
+        {/* Flattens annotations into a brand-new standalone PDF next to the source file — unlike
+            the sidecar JSON SaveStatus reports on, this is what makes markup readable outside
+            this app (a real PDF, not something that needs to be re-composited on load). */}
+        <IconButton
+          title={
+            isExporting
+              ? exportProgress
+                ? `Exporting… page ${exportProgress.completed}/${exportProgress.total}`
+                : "Exporting…"
+              : "Export annotated PDF"
+          }
+          disabled={isExporting}
+          onClick={onExport}
+        >
+          <IoDownloadOutline size={16} className={isExporting ? "animate-pulse" : undefined} />
+        </IconButton>
 
         <div className="pr-1">
           <SaveStatus isSaving={isSaving} saveError={saveError} />

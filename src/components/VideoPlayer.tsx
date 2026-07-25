@@ -1,5 +1,5 @@
 import './player.css';
-import React, { useState, useRef, useEffect, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import { IoPause, IoPlay, IoPlayCircleOutline, IoPlayCircle } from 'react-icons/io5';
@@ -25,6 +25,7 @@ import {
 
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
+import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
 
 
 
@@ -76,6 +77,10 @@ interface VideoPlayerProps {
   loop?: boolean;
   onTimeUpdate?: (time: number) => void;
   onEnded?: () => void;
+  // Round-trips play/pause state out, mirroring onTimeUpdate - fires from the native <video>
+  // 'play'/'pause' events, so it stays correct regardless of what triggered the change (this
+  // player's own button, togglePlay() from outside, keyboard shortcuts, autoplay, etc).
+  onPlayStateChange?: (isPlaying: boolean) => void;
   // Controls the Autoplay toggle (button + settings row). When the caller passes both of these,
   // the toggle becomes fully controlled - its displayed state and every click are driven by the
   // caller instead of local state. This matters because this component is fully remounted (`key`)
@@ -83,17 +88,42 @@ interface VideoPlayerProps {
   // caller (Dashboard) is the only place autoplay-next state can actually persist.
   autoplayNext?: boolean;
   onAutoplayNextChange?: () => void;
+  // Renders arbitrary content positioned/sized to exactly the letterboxed picture area (not the
+  // whole container) - a render-prop rather than a plain node so the caller can convert its own
+  // content's normalized coordinates using the same pixel rect this component already computes,
+  // without re-measuring it independently. Keeps VideoPlayer itself fully generic - it has no
+  // idea what's actually being rendered inside (text overlays, or anything else later).
+  overlay?: (frameRect: FrameRect) => React.ReactNode;
+  // The primary video's own persisted/exported audio level (useVideoEditStore's
+  // videoAudioMuted/videoAudioVolume) - distinct from this component's own volume slider/mute
+  // button just below, which is pure local listening convenience that never leaves this session.
+  // Applied multiplicatively on top of that local volume (see the effect that computes .volume),
+  // so turning either one down is audible, and the local control never overrides what the track
+  // itself is actually set to.
+  trackVolume?: number; // 0..1, defaults to 1
+  trackMuted?: boolean;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
 // this player from the outside — there's no controlled "currentTime" prop, since native
 // <video>/timeupdate already round-trips position out via onTimeUpdate; this is just the one
-// missing direction back in.
+// missing direction back in. togglePlay is the same idea for play/pause - onPlayStateChange
+// below is its own round-trip out, mirroring onTimeUpdate.
+//
+// loadSource swaps the underlying <video>'s source *without* going through the `src` prop or
+// Dashboard's `selectedFile` state - needed for previewing a timeline clip that references a
+// different file than the one actually open (a clip dragged in from elsewhere): swapping
+// `selectedFile` itself would change what the *whole app* considers open (title, sidebar
+// selection, which edit session's timeline is showing), which is wrong for what's meant to be a
+// transient preview-only switch. Since the `src` prop is unchanged across this, VideoPlayer's own
+// prop-driven load effect never fights this override - it only re-runs when `src` itself changes.
 export interface VideoPlayerHandle {
   seek: (time: number) => void;
+  togglePlay: () => void;
+  loadSource: (src: string, seekTime: number) => void;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, autoplayNext, onAutoplayNextChange }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -103,6 +133,22 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (!video) return;
       const duration = video.duration;
       video.currentTime = Number.isFinite(duration) ? Math.max(0, Math.min(time, duration)) : Math.max(0, time);
+    },
+    // togglePauseAndPlay is declared further down in this component, but this factory only
+    // actually runs (via useImperativeHandle's internal effect) after the whole render body -
+    // including that declaration - has executed, so the forward reference is safe.
+    togglePlay: () => togglePauseAndPlay(),
+    loadSource: (src: string, seekTime: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      const onLoaded = () => {
+        video.removeEventListener("loadedmetadata", onLoaded);
+        video.currentTime = seekTime;
+        video.play().catch(() => {});
+      };
+      video.addEventListener("loadedmetadata", onLoaded);
+      video.src = src;
+      video.load();
     },
   }), []);
 
@@ -129,6 +175,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [isRecovering, setIsRecovering] = useState<boolean>(false);
   // 0-100, updated live from the backend's conversion-progress events while isRecovering.
   const [recoveryProgress, setRecoveryProgress] = useState<number>(0);
+  // Intrinsic pixel size of the loaded video (from loadedmetadata) and the live size of its
+  // container (via ResizeObserver, since window resize/theater-mode/fullscreen all change this
+  // without the video itself reloading) - together these are exactly what computeLetterboxRect
+  // needs to derive the visible (letterboxed) picture rect for the `overlay` render-prop.
+  const [videoIntrinsicSize, setVideoIntrinsicSize] = useState<{ width: number; height: number } | null>(null);
+  const [containerSize, setContainerSize] = useState<{ width: number; height: number } | null>(null);
   // Core player state
   const [, setIsPaused] = useState<boolean>(true);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -206,6 +258,29 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (autoPlay) videoRef.current.play().catch(() => {});
     }
   }, [mediaType, src, autoPlay]);
+
+  // Tracks the container's live box size for the `overlay` render-prop's letterbox math - window
+  // resize, theater mode, and fullscreen all change this without the <video> itself reloading (so
+  // this can't just be read once off loadedmetadata the way videoIntrinsicSize below is).
+  useEffect(() => {
+    const el = videoContainerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setContainerSize({ width: entry.contentRect.width, height: entry.contentRect.height });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const frameRect = useMemo(
+    () =>
+      containerSize && videoIntrinsicSize
+        ? computeLetterboxRect(containerSize.width, containerSize.height, videoIntrinsicSize.width, videoIntrinsicSize.height)
+        : null,
+    [containerSize, videoIntrinsicSize]
+  );
 
   // Some containers/codecs this app can record (most notably .avi - WebView2's <video> element
   // has no container support for it at all, regardless of what's encoded inside) can never play
@@ -339,10 +414,24 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const handleVolumeChange = (e: ChangeEvent<HTMLInputElement>): void => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
     const newVolume = parseFloat(e.target.value);
+    // Only updates local intent here - the effect below (keyed on [volume, trackVolume,
+    // trackMuted]) is what actually writes video.volume, combined with the track-level level, so
+    // there's one single place that ever does that DOM write. volumeLevel (the speaker icon) is
+    // left to the existing native 'volumechange' listener further down, which already resyncs it
+    // from the real (combined) video.volume whenever it changes for any reason - setting it here
+    // too, from the un-combined newVolume, would just flicker to the wrong icon for a frame.
     setVolumeState(newVolume);
-    setVolume(videoRef.current, newVolume);
-    setVolumeLevel(getVolumeLevel(newVolume, videoRef.current?.muted ?? false));
   };
+
+  // Actual video.volume is always the LOCAL listening volume times the track-level one (see
+  // VideoPlayerProps.trackVolume's own doc comment) - the one place either axis actually reaches
+  // the DOM, so the local slider and the persisted/exported track level can never fight over it.
+  // trackMuted collapses this to 0 outright rather than touching video.muted - silence from a 0
+  // volume and silence from the muted flag are indistinguishable to the ear, so there's no need to
+  // juggle two separate "why is this silent" states for what the local mute button already owns.
+  useEffect(() => {
+    setVolume(videoRef.current, volume * (trackMuted ? 0 : trackVolume));
+  }, [volume, trackVolume, trackMuted]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);
@@ -502,12 +591,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const handlePlay = (): void => {
       setIsPlaying(true);
       setIsPaused(false);
+      onPlayStateChange?.(true);
       updateTimeline();
     };
 
     const handlePause = (): void => {
       setIsPlaying(false);
       setIsPaused(true);
+      onPlayStateChange?.(false);
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
@@ -552,7 +643,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [mediaType, onEnded]);
+  }, [mediaType, onEnded, onPlayStateChange]);
 
   // Unmount-only: cancels a throttled drag-seek that's still pending if the player goes away
   // mid-drag (window mousemove/mouseup listeners from handleTimelineMouseDown clean themselves
@@ -841,6 +932,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							if (initialTime && Number.isFinite(initialTime) && initialTime > 0 && initialTime < videoRef.current.duration) {
 								videoRef.current.currentTime = initialTime;
 							}
+							setVideoIntrinsicSize({ width: videoRef.current.videoWidth, height: videoRef.current.videoHeight });
 							}
 						}}
 					>
@@ -856,6 +948,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						<div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none bg-black/40">
 							<div className="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />
 							<div className="text-white text-sm">Preparing video{recoveryProgress > 0 ? ` — ${recoveryProgress}%` : '...'}</div>
+						</div>
+					)}
+					{overlay && frameRect && (
+						<div
+							className="absolute pointer-events-none"
+							style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height }}
+						>
+							{overlay(frameRect)}
 						</div>
 					)}
 					</>

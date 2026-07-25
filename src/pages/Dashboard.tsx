@@ -9,11 +9,13 @@ import { WebviewWindow, appWindow } from '@tauri-apps/api/window';
 import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
 import { formatFileName } from "../utils/Formater";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
+import useVideoEditStore from "../hooks/useVideoEditStore";
+import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
 import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
-import { loadSettings } from "../utils/appSettings";
+import { AppSettings, loadSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, isConvertibleCategory } from "../utils/fileCategory";
 import {
   IoVideocam,
@@ -131,6 +133,31 @@ const Dashboard = () => {
   const [fileExt, setFileExt] = useState(() => loadSettings().defaultFileExt);
   const [recordType, setRecordType] = useState(() => loadSettings().defaultRecordType);
   const [showSettings, setShowSettings] = useState<boolean>(false);
+
+  // The main window is created hidden (tauri.conf.json's "visible": false on the main window
+  // entry) specifically so this can show it only once there's real, already-painted UI behind it
+  // to reveal - showing it immediately on native window creation (the default) meant the window
+  // appeared before WebView2 had finished loading/painting the bundled app, showing its own blank
+  // default background (black) for a beat first. A hidden window's webview still loads and paints
+  // normally in the background, so by the time this effect fires (useEffect intentionally, not
+  // useLayoutEffect - it's deferred until *after* the browser has actually painted this render),
+  // there's already a fully rendered frame ready to reveal instantly instead of a flash of black.
+  // Scoped correctly to only the main window: Dashboard only ever mounts on the "/" route (see
+  // App.tsx's router), never in the recording-overlay/screenshot-overlay/annotation-overlay
+  // windows, which manage their own visibility entirely separately.
+  useEffect(() => {
+    const revealWindow = (): void => {
+      appWindow.show().catch((err) => console.error("Failed to show main window:", err));
+      appWindow.setFocus().catch((err) => console.error("Failed to focus main window:", err));
+    };
+    revealWindow();
+    // Safety net: showing an already-visible window is a harmless no-op, so retrying shortly
+    // after is free insurance against this specific call failing/never resolving for some
+    // reason - a bug in this effect must never be able to leave the user with an app that looks
+    // like it silently failed to launch (permanently hidden behind nothing).
+    const fallbackTimer = window.setTimeout(revealWindow, 1500);
+    return () => window.clearTimeout(fallbackTimer);
+  }, []);
   // Presentation mode for the PDF viewer: hides the sidebar and BottomDocker (not just the PDF's
   // own toolbar, which PdfAnnotator hides itself) and puts the actual OS window into fullscreen,
   // so it reads as a real presentation rather than just a bigger PDF pane with app chrome still
@@ -166,17 +193,85 @@ const Dashboard = () => {
   // if none is. "" means creating a top-level folder directly under Briefcast.
   const [creatingFolderIn, setCreatingFolderIn] = useState<string | null>(null);
   const [newFolderValue, setNewFolderValue] = useState<string>("");
+  // Folder relative-paths whose file list is currently hidden - in-memory only (resets on
+  // restart), same as every other sidebar UI toggle here. A folder isn't in this set until
+  // explicitly collapsed, so everything starts expanded, matching the pre-existing behavior.
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
+  const toggleFolderCollapsed = (folder: string): void => {
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(folder)) next.delete(folder);
+      else next.add(folder);
+      return next;
+    });
+  };
   // Drag-and-drop move: the file(s) currently being dragged (more than one if the dragged file
   // was part of the active multi-selection below), and whichever folder header the pointer is
   // presently over (for the drop-target highlight). Both null outside a drag gesture.
   const [draggingFiles, setDraggingFiles] = useState<FileEntry[] | null>(null);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
+  // Sidebar-file-to-timeline dragging runs on plain pointer events, not the native HTML5 drag-and-
+  // drop API (draggable/onDragStart/onDrop) that the folder-move feature above uses - the same
+  // root cause as the external Explorer-drag investigation turned out to be broader than just
+  // "cross-window drags": this app's window has a native OS-level drop-target hook registered
+  // (needed for onFileDropEvent, the only way to get real filesystem paths out of an external
+  // drop at all), and that hook appears to take over drag handling for the whole webview, not just
+  // drags that cross a window boundary - confirmed by this exact pattern (native DnD -> plain
+  // pointer events) being what got clip-reordering inside the timeline itself working earlier.
+  // The click-vs-drag threshold mirrors VideoTimelineDocker's own clip-drag handling: a plain tap
+  // still opens/plays the file, it only becomes a drag once the pointer moves a few px.
+  const SIDEBAR_DRAG_THRESHOLD_PX = 4;
+  const sidebarDragRef = useRef<{ file: FileEntry; startX: number; startY: number; isDragging: boolean } | null>(null);
+
+  const handleSidebarFilePointerDown = (file: FileEntry) => (e: React.PointerEvent) => {
+    if (getFileCategory(file.name) !== "video") return; // only meaningful for the video timeline
+    e.currentTarget.setPointerCapture(e.pointerId);
+    sidebarDragRef.current = { file, startX: e.clientX, startY: e.clientY, isDragging: false };
+  };
+  const handleSidebarFilePointerMove = (e: React.PointerEvent) => {
+    const drag = sidebarDragRef.current;
+    if (!drag) return;
+    if (!drag.isDragging && Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) >= SIDEBAR_DRAG_THRESHOLD_PX) {
+      drag.isDragging = true;
+      setDraggingFiles([drag.file]);
+    }
+  };
+  const handleSidebarFilePointerUp = (file: FileEntry) => (e: React.PointerEvent) => {
+    const drag = sidebarDragRef.current;
+    sidebarDragRef.current = null;
+    if (!drag?.isDragging) {
+      // No real drag happened - a plain tap, handled the same as clicking the filename always has.
+      handleFileClick(file);
+      return;
+    }
+    setDraggingFiles(null);
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (el?.closest("[data-timeline-track]")) {
+      setPendingTimelineInsert({ paths: [file.path], clientX: e.clientX });
+    }
+  };
   // Multi-select for bulk move — a set of file.path values, spanning whichever folders are
   // currently visible under the active category. Cleared whenever the category tab changes so
   // a stale selection from "Video" doesn't silently carry over into "Audio".
   const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(new Set());
   const [bulkMoveMenuOpen, setBulkMoveMenuOpen] = useState<boolean>(false);
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
+  // Lifted here (single call site - useVideoEditStore is a stateful hook, unsafe to call from
+  // more than one component) so both the video-tools timeline (via BottomDocker/FileToolsDocker/
+  // VideoTimelineDocker) and the text-overlay preview layer mounted alongside VideoPlayer below
+  // share the exact same edit state/undo-redo stack. Gated to video files only so selecting a
+  // pdf/audio/image never triggers a wasted load_video_edit_state invoke.
+  const editStore = useVideoEditStore(
+    selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
+  );
+  // Text-overlay UI state - lifted here (rather than local to either subtree) because it's shared
+  // by two siblings: the preview-layer editor mounted next to VideoPlayer below, and the timeline
+  // lane's chips inside VideoTimelineDocker (reached via BottomDocker/FileToolsDocker).
+  const [currentOutputTime, setCurrentOutputTime] = useState<number>(0);
+  const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
+  const [isPlacingText, setIsPlacingText] = useState<boolean>(false);
+  const [selectedImageOverlayId, setSelectedImageOverlayId] = useState<string | null>(null);
+  const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
@@ -193,9 +288,59 @@ const [conversionFile, setConversionFile] = useState<{path: string; name: string
   // straight off the ref) so the timeline re-renders as playback advances.
   const videoPlayerRef = useRef<VideoPlayerHandle>(null);
   const [playerCurrentTime, setPlayerCurrentTime] = useState<number>(0);
+  // Mirrors playerCurrentTime's round-trip, but for play/pause state - lets the video-tools
+  // timeline show an accurate Play/Pause icon and toggle real playback from its own transport
+  // button, the same way its playhead already tracks and drives the real player.
+  const [playerIsPlaying, setPlayerIsPlaying] = useState<boolean>(false);
   useEffect(() => {
     setPlayerCurrentTime(0);
+    setPlayerIsPlaying(false);
+    // A cross-clip preview switch (see resolvePreviewAssetUrl/handleSeekActiveFile below) may have
+    // left the player pointed at some *other* file's asset URL - opening a genuinely different
+    // file here always starts fresh, so the "what's actually loaded" tracker needs to reset too.
+    previewSourcePathRef.current = selectedFile?.sourcePath ?? null;
   }, [selectedFile?.path]);
+
+  // Asset URLs for files referenced by a timeline clip other than the one currently open -
+  // resolved on demand (same convert_file_path_to_url + convertFileSrc round-trip
+  // loadFileForPlayback already does for the primary file) and cached forever per path, since a
+  // given file's asset URL never changes for the life of the app.
+  const previewAssetUrlCacheRef = useRef<Map<string, string>>(new Map());
+  // Which source file's content is actually loaded into the player right now - starts matching
+  // selectedFile.sourcePath, but a cross-clip preview seek (see handleSeekActiveFile below) can
+  // point it at a different file entirely without touching selectedFile itself.
+  const previewSourcePathRef = useRef<string | null>(null);
+
+  const resolvePreviewAssetUrl = async (sourcePath: string): Promise<string> => {
+    const cached = previewAssetUrlCacheRef.current.get(sourcePath);
+    if (cached) return cached;
+    const absolutePath = await invoke<string>("convert_file_path_to_url", { filepath: sourcePath });
+    const url = convertFileSrc(absolutePath);
+    previewAssetUrlCacheRef.current.set(sourcePath, url);
+    return url;
+  };
+
+  // The video-tools timeline's own seek, extended to know *which file* it's seeking within -
+  // once a clip can be dragged in from a different file than the one currently open, "seek to
+  // this time" is ambiguous without also saying which file's timeline that time belongs to. Swaps
+  // the player's actual source (via the imperative loadSource, not the `src` prop/selectedFile -
+  // see VideoPlayerHandle's own comment for why) only when the target differs from what's already
+  // loaded, so scrubbing within the same clip stays a plain, cheap seek.
+  const handleSeekActiveFile = (sourcePath: string, time: number) => {
+    if (previewSourcePathRef.current === sourcePath) {
+      videoPlayerRef.current?.seek(time);
+      return;
+    }
+    previewSourcePathRef.current = sourcePath;
+    if (sourcePath === selectedFile?.sourcePath) {
+      // Back to the primary file - its asset URL is already resolved (selectedFile.path).
+      videoPlayerRef.current?.loadSource(selectedFile.path, time);
+      return;
+    }
+    resolvePreviewAssetUrl(sourcePath)
+      .then((url) => videoPlayerRef.current?.loadSource(url, time))
+      .catch((error) => console.error("Failed to load preview source for", sourcePath, error));
+  };
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -208,6 +353,9 @@ const [conversionFile, setConversionFile] = useState<{path: string; name: string
   // handleSettingsSaved and the effect below that creates/hides the overlay window and
   // registers/unregisters ANNOTATION_TOGGLE_SHORTCUT whenever this changes.
   const [annotationEnabled, setAnnotationEnabled] = useState<boolean>(() => loadSettings().enableAnnotationTool);
+  // The "Nothing playing yet" home screen's backdrop (Settings > Appearance > "Home screen
+  // background") - see the decorative block a few hundred lines down in this file's JSX.
+  const [homeBackgroundStyle, setHomeBackgroundStyle] = useState<AppSettings["homeBackgroundStyle"]>(() => loadSettings().homeBackgroundStyle);
   // Mirrors whether the overlay is currently in "draw mode" (capturing input) vs click-through.
   // A ref, not state — read inside the global-shortcut callback and the turn-off-request
   // listener, both registered once and needing the *current* value, not whatever was in scope
@@ -555,6 +703,20 @@ const setScreen = () => {
 		handleDirectoryFiles();
 	}, []);
 
+	// Best-effort, once per launch: self-heals absolute file paths baked into .edits.json/trash
+	// manifest sidecars that no longer resolve (e.g. an image overlay's `src` left pointing at the
+	// old Briefcast folder after a Settings > Storage relocation, or any file moved/renamed by hand
+	// outside the app) - see repair_stale_file_references's own comment in utility.rs. Silent when
+	// nothing needed fixing; only surfaces a message when it actually changed something, so this
+	// isn't a mysterious toast on every ordinary launch.
+	useEffect(() => {
+		invoke<number>("repair_stale_file_references")
+			.then((count) => {
+				if (count > 0) setMessage(`Fixed ${count} file reference${count === 1 ? "" : "s"} broken by a previous move`);
+			})
+			.catch((error) => console.error("Failed to repair stale file references:", error));
+	}, []);
+
 	// Runs once per launch, not a background timer — same "check whenever it's opened" policy
 	// the backend's purge_expired_trash itself is built around (see its own comment for why).
 	useEffect(() => {
@@ -660,6 +822,14 @@ const setScreen = () => {
 		setFileExt(settings.defaultFileExt);
 		setRecordType(settings.defaultRecordType);
 		setAnnotationEnabled(settings.enableAnnotationTool);
+		setHomeBackgroundStyle(settings.homeBackgroundStyle);
+	};
+	// After the Briefcast folder itself has been relocated (see SettingsModal's Storage section):
+	// re-list from the new location, and drop whatever's currently open - its sourcePath was inside
+	// the old root and no longer resolves to anything now that everything has actually moved.
+	const handleStorageChanged = () => {
+		handleDirectoryFiles();
+		setSelectedFile(null);
 	};
 
 	// Shows/hides the annotation overlay and flips its click-through state, and tells its own page
@@ -822,6 +992,26 @@ const setScreen = () => {
 		await loadFileForPlayback(file.path, file.name);
 	};
 
+	// Fired by VideoTimelineDocker's Save button once export_trimmed_video finishes - same
+	// refresh-list-then-select-the-result shape as ConversionDialog's onConverted below, since
+	// this is exactly the same kind of event (a new file appeared in the library, backed by a
+	// real render already sitting on disk). The video that was being edited is left exactly as it
+	// was; this just adds its trimmed/cut sibling alongside it.
+	const handleVideoExported = async (newPath: string, newFileName: string) => {
+		await handleDirectoryFiles();
+		setMessage(`Saved edited video: ${formatFileName(newFileName)}`);
+		await loadFileForPlayback(newPath, newFileName);
+	};
+
+	// Small icon shown next to a file name in the home-screen "From your library" preview list.
+	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
+		FILE_CATEGORY_TABS.find((tab) => tab.category === category)?.icon ?? <IoDocumentText size={18} />;
+
+	// A handful of files to surface on the empty home screen so it isn't just a blank void —
+	// not meant to be "recent" (FileEntry carries no timestamp from the backend), just enough
+	// of a taste of the library to invite a click instead of forcing a trip to the sidebar.
+	const libraryPreviewFiles = Object.values(files).flat().slice(0, 6);
+
 	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
 	// the currently selected file happens to live in, so prev/next still works when a category
 	// is split across multiple folders.
@@ -935,13 +1125,19 @@ const setScreen = () => {
 	// Video equivalent of handleAudioEnded — advances to the next video in the list when the
 	// player's own Autoplay toggle is on. No repeat mode for video, so a non-wrapping advance
 	// (stops at the last file rather than looping) is the only behavior.
+	//
+	// Suppressed entirely while the video-tools timeline panel is open: autoplaying away from the
+	// video someone is mid-edit on is disorienting (the player silently switches out from under
+	// them) and is also what was quietly discarding in-session undo/redo history - see
+	// useVideoEditStore's per-path history cache for the other half of that fix.
 	const handleVideoEnded = useCallback(() => {
 		const current = selectedFileRef.current;
 		if (!current || getFileCategory(current.name) !== "video") return;
 		if (!videoAutoplayNext) return;
+		if (dockerMode === "file-tools") return;
 		navigateVideo(1, { wrap: false });
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [videoAutoplayNext, files]);
+	}, [videoAutoplayNext, files, dockerMode]);
 
 	// Single onEnded handed to VideoPlayer for both audio and video playback — each of the two
 	// handlers above bails immediately if the file that just ended isn't its category, so exactly
@@ -1048,6 +1244,14 @@ const setScreen = () => {
 		setCreatingFolderIn(parentFolder);
 		setNewFolderValue("");
 		setOpenMenu(null);
+		// The new-subfolder input renders inside parentFolder's own (collapsible) body - expand it
+		// first so starting to create a folder never opens an input the user can't actually see.
+		setCollapsedFolders((prev) => {
+			if (!prev.has(parentFolder)) return prev;
+			const next = new Set(prev);
+			next.delete(parentFolder);
+			return next;
+		});
 	};
 
 	const commitCreateFolder = async () => {
@@ -1105,6 +1309,123 @@ const setScreen = () => {
 			setError(`Failed to move files: ${error}`);
 		}
 	};
+
+	// Copies files dragged in from outside the app (e.g. Windows Explorer) into destFolder — the
+	// external-source counterpart to handleMoveFiles above, same Promise.allSettled/refresh/
+	// combined-message shape, but via the import_file command (fs::copy, source left in place)
+	// rather than move_file. `paths` are real absolute filesystem paths, which (unlike a plain
+	// HTML5 drop's dataTransfer.files) only Tauri's own native file-drop event actually provides —
+	// see the onFileDropEvent listener below for why.
+	const handleImportFiles = async (paths: string[], destFolder: string) => {
+		if (paths.length === 0) return;
+		const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p;
+		try {
+			const results = await Promise.allSettled(
+				paths.map((path) => invoke<string>("import_file", { sourcePath: path, destFolderPath: destFolder }))
+			);
+			await handleDirectoryFiles();
+
+			const failedCount = results.filter((r) => r.status === "rejected").length;
+			if (failedCount > 0) {
+				const firstError = results.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason;
+				setError(`Imported ${paths.length - failedCount} of ${paths.length} file(s) — ${failedCount} failed: ${firstError}`);
+			} else if (paths.length === 1) {
+				setMessage(`Imported ${formatFileName(baseName(paths[0]))} to ${folderDisplayName(destFolder)}`);
+			} else {
+				setMessage(`Imported ${paths.length} files to ${folderDisplayName(destFolder)}`);
+			}
+		} catch (error) {
+			console.error("Error importing files:", error);
+			setError(`Failed to import files: ${error}`);
+		}
+	};
+
+	// Real OS file drops never reach the browser's own `drop` event with usable data on Tauri v1 —
+	// browsers/webviews never expose an absolute filesystem path on a dropped File object (that's
+	// what Tauri's native file-drop event exists to provide instead). So targeting still comes from
+	// plain DOM dragover on each folder <div> (dragOverFolder, updated below) for the *visual*
+	// highlight and "which folder" tracking, while the *paths* come from here — read via a ref
+	// since this listener is registered once and would otherwise close over a stale dragOverFolder.
+	// Tauri v1's FileDropEvent payload carries no cursor position, which is the reason this can't be
+	// done with the native event alone.
+	const dragOverFolderRef = useRef<string | null>(null);
+	useEffect(() => {
+		dragOverFolderRef.current = dragOverFolder;
+	}, [dragOverFolder]);
+
+	// The video-tools timeline's own drop target has the *same* "no cursor position in the native
+	// event" problem as dragOverFolderRef above, but plain DOM dragover can't solve it the same way
+	// here: that only works because an in-page drag (e.g. dragging a Briefcast sidebar row) never
+	// leaves the webview, so Chromium's own drag-tracking dispatches it normally. A drag whose
+	// *origin* is a different native window (Explorer) is a real OS-level drag session - Tauri's
+	// file-drop event fires reliably for it, but WebView2's DOM dragover does not (confirmed: it
+	// silently never fired, so the timeline's drop target was never detected and every external
+	// drop fell through to a library import instead). The fix is to poll the cursor position
+	// (get_cursor_position_in_window) each time Tauri's own 'hover' event fires and hit-test it
+	// against the DOM directly - which works regardless of whether Chromium ever saw a dragover.
+	//
+	// get_cursor_position_in_window does the whole cursor-position-to-client-coordinates
+	// conversion natively in one Win32-only call rather than combining a native GetCursorPos with
+	// this window's own innerPosition()/scaleFactor() - an earlier version mixed those two sources
+	// and produced consistently wrong coordinates on a 250%-scaled display (confirmed: a drop over
+	// the visible timeline resolved to a DOM element in the sidebar instead), most likely because
+	// Tauri 1.8.3 itself depends on an older `windows` crate than this app's own Rust code and the
+	// two disagree on DPI virtualization for a plain cross-process GetCursorPos call.
+	//
+	// The actual insert can't happen here - it needs editStore, which lives inside
+	// VideoTimelineDocker - so a confirmed timeline-targeted drop is just handed down as
+	// pendingTimelineInsert for that component to act on and then clear.
+	const dragOverTimelineXRef = useRef<number | null>(null);
+	const [pendingTimelineInsert, setPendingTimelineInsert] = useState<{ paths: string[]; clientX: number } | null>(null);
+	const hoverTokenRef = useRef(0);
+
+	const resolveExternalDropClientX = async (): Promise<number | null> => {
+		try {
+			const [clientX, clientY] = await invoke<[number, number]>("get_cursor_position_in_window");
+			const el = document.elementFromPoint(clientX, clientY);
+			const overTimeline = !!el?.closest("[data-timeline-track]");
+			// Temporary diagnostic - if clientX/clientY now land on the timeline while it's visibly
+			// under the cursor, the DPI fix worked; if they're still off, something else is wrong.
+			console.log("[Dashboard] resolveExternalDropClientX", { clientX, clientY, elementTag: el?.tagName, overTimeline });
+			return overTimeline ? clientX : null;
+		} catch (error) {
+			console.error("Failed to resolve external drag position:", error);
+			return null;
+		}
+	};
+
+	useEffect(() => {
+		const unlistenPromise = appWindow.onFileDropEvent(async (event) => {
+			console.log("[Dashboard] onFileDropEvent", event.payload.type, event.payload.type !== "cancel" ? event.payload.paths : undefined);
+			if (event.payload.type === "hover") {
+				// Only the most recently *requested* hover's resolution is ever applied - hover events
+				// can arrive faster than the position round-trip resolves, and an out-of-order stale
+				// result landing last would leave dragOverTimelineXRef pointing at an old position.
+				const token = ++hoverTokenRef.current;
+				const clientX = await resolveExternalDropClientX();
+				if (hoverTokenRef.current === token) dragOverTimelineXRef.current = clientX;
+				return;
+			}
+			if (event.payload.type === "drop") {
+				console.log("[Dashboard] drop - dragOverTimelineXRef was", dragOverTimelineXRef.current);
+				if (dragOverTimelineXRef.current !== null) {
+					setPendingTimelineInsert({ paths: event.payload.paths, clientX: dragOverTimelineXRef.current });
+					dragOverTimelineXRef.current = null;
+					return;
+				}
+				const destFolder = dragOverFolderRef.current ?? "";
+				setDragOverFolder(null);
+				handleImportFiles(event.payload.paths, destFolder);
+			} else if (event.payload.type === "cancel") {
+				setDragOverFolder(null);
+				dragOverTimelineXRef.current = null;
+			}
+		});
+		return () => {
+			unlistenPromise.then((unlisten) => unlisten());
+		};
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, []);
 
 	const handleDeleteFolder = async (folder: string) => {
 		try {
@@ -1367,7 +1688,12 @@ const setScreen = () => {
                   </div>
                 )}
 
-                <div className="p-3 text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200">
+                {/* pb tracks --docker-height (published by BottomDocker's ResizeObserver, see
+                    player.css for the sibling usage) so the last row can always scroll clear of
+                    the fixed bottom icon bar instead of rendering underneath it, unclickable. */}
+                <div
+                  className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200"
+                >
                 {activeFileCategory === "trash" ? (
                   trashItems.length === 0 ? (
                     <p>Trash is empty</p>
@@ -1425,10 +1751,18 @@ const setScreen = () => {
                     <div
                       key={folder}
                       className="mb-3"
-                      // Folder-as-drop-target: only reacts while a file is actually being
-                      // dragged, so plain mouse hovering never lights it up.
+                      // Folder-as-drop-target: reacts to an in-app file drag (draggingFiles) or an
+                      // OS file being dragged in from outside (e.dataTransfer.types includes
+                      // "Files", e.g. from Windows Explorer — this "types" check works during
+                      // dragover regardless of Tauri's native file-drop interception, which only
+                      // affects the final `drop` event's data, not the drag session itself) —
+                      // plain mouse hovering does neither, so it never lights up on its own.
+                      // This is purely visual/targeting state: for an external OS drag, the actual
+                      // import happens in the top-level onFileDropEvent listener above (which is
+                      // where the real file paths are available), not in onDrop below — a plain
+                      // HTML5 drop of an OS file never carries a usable path here.
                       onDragOver={(e) => {
-                        if (!draggingFiles) return;
+                        if (!draggingFiles && !e.dataTransfer.types.includes("Files")) return;
                         e.preventDefault();
                         if (dragOverFolder !== folder) setDragOverFolder(folder);
                       }}
@@ -1445,9 +1779,11 @@ const setScreen = () => {
                         style={{ paddingLeft: 4 + folderDepth(folder) * 10 }}
                       >
                         <h4
-                          className="text-xs font-semibold text-gray-500 dark:text-neutral-400 flex items-center gap-1 min-w-0 truncate"
-                          title={folderDisplayName(folder)}
+                          className="text-xs font-semibold text-gray-500 dark:text-neutral-400 flex items-center gap-1 min-w-0 truncate cursor-pointer"
+                          title={collapsedFolders.has(folder) ? `Expand ${folderDisplayName(folder)}` : `Collapse ${folderDisplayName(folder)}`}
+                          onClick={() => toggleFolderCollapsed(folder)}
                         >
+                          <IoChevronForward size={10} className={`shrink-0 transition-transform ${collapsedFolders.has(folder) ? "" : "rotate-90"}`} />
                           <IoFolderOutline size={12} className="shrink-0" />
                           <span className="truncate">{folderDisplayName(folder)}</span>
                         </h4>
@@ -1473,7 +1809,7 @@ const setScreen = () => {
                         </div>
                       </div>
 
-                      {creatingFolderIn === folder && (
+                      {!collapsedFolders.has(folder) && creatingFolderIn === folder && (
                         <div className="flex items-center gap-1 mt-1" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
                           <IoFolderOutline size={12} className="text-gray-400 shrink-0" />
                           <input
@@ -1491,7 +1827,7 @@ const setScreen = () => {
                         </div>
                       )}
 
-                      {fileList.length === 0 ? (
+                      {collapsedFolders.has(folder) ? null : fileList.length === 0 ? (
                         <p
                           className="text-[11px] text-neutral-400 dark:text-neutral-500 italic mt-1"
                           style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}
@@ -1546,7 +1882,9 @@ const setScreen = () => {
                                     selectedFile?.sourcePath === file.path ? 'text-blue-600 dark:text-blue-400 font-medium' : ''
                                   }`}
                                   title={file.name}
-                                  onClick={() => handleFileClick(file)}
+                                  onPointerDown={handleSidebarFilePointerDown(file)}
+                                  onPointerMove={handleSidebarFilePointerMove}
+                                  onPointerUp={handleSidebarFilePointerUp(file)}
                                 >
                                   {formatFileName(file.name)}
                                 </div>
@@ -1713,16 +2051,128 @@ const setScreen = () => {
                   handleAudioTimeUpdate(time);
                   setPlayerCurrentTime(time);
                 }}
+                onPlayStateChange={setPlayerIsPlaying}
                 onEnded={handleMediaEnded}
                 autoplayNext={isAudioSelected ? audioAutoplayNext : videoAutoplayNext}
                 onAutoplayNextChange={() =>
                   isAudioSelected ? setAudioAutoplayNext((prev) => !prev) : setVideoAutoplayNext((prev) => !prev)
                 }
+                overlay={
+                  getFileCategory(selectedFile.name) === "video"
+                    ? (frameRect) => (
+                        <VideoOverlayLayer
+                          frameRect={frameRect}
+                          overlays={editStore.textOverlays}
+                          imageOverlays={editStore.imageOverlays}
+                          currentOutputTime={currentOutputTime}
+                          selectedOverlayId={selectedOverlayId}
+                          onSelectOverlay={setSelectedOverlayId}
+                          selectedImageOverlayId={selectedImageOverlayId}
+                          onSelectImageOverlay={setSelectedImageOverlayId}
+                          isPlacingText={isPlacingText}
+                          onPlacementConsumed={() => setIsPlacingText(false)}
+                          onAddTextOverlay={editStore.addTextOverlay}
+                          onUpdateTextOverlayContent={editStore.updateTextOverlayContent}
+                          onDeleteTextOverlay={editStore.deleteTextOverlay}
+                          onDuplicateTextOverlay={(id) => setSelectedOverlayId(editStore.duplicateTextOverlay(id))}
+                          onBringTextOverlayToFront={editStore.bringTextOverlayToFront}
+                          onSendTextOverlayToBack={editStore.sendTextOverlayToBack}
+                          isPlacingImage={isPlacingImage}
+                          onPlacementImageConsumed={() => setIsPlacingImage(false)}
+                          onAddImageOverlay={editStore.addImageOverlay}
+                          onUpdateImageOverlayContent={editStore.updateImageOverlayContent}
+                          onDeleteImageOverlay={editStore.deleteImageOverlay}
+                          onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
+                          onBringImageOverlayToFront={editStore.bringImageOverlayToFront}
+                          onSendImageOverlayToBack={editStore.sendImageOverlayToBack}
+                          totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
+                        />
+                      )
+                    : undefined
+                }
+                trackVolume={editStore.videoAudioVolume}
+                trackMuted={editStore.videoAudioMuted}
               />
             )
           ) : (
-            <div className="flex items-center justify-center h-full w-full text-gray-500 dark:text-neutral-400 italic">
-              Select a file from the list to play
+            <div className="relative flex flex-col items-center justify-center h-full w-full gap-6 px-8 overflow-hidden">
+              {/* Purely decorative - a soft color glow plus a faint graph-paper line grid, sat
+                  behind everything else in this empty state via z-index/pointer-events:none. Only
+                  rendered on this "nothing open yet" screen, not the shared bg-neutral-950
+                  container real video/PDF content plays inside a few lines up - a colorful
+                  backdrop behind actual footage would fight with it instead of the empty state,
+                  where there's nothing else competing for attention. Gated on Settings >
+                  Appearance > "Home screen background" (homeBackgroundStyle) - "plain" skips this
+                  whole block and falls back to the container's own flat themed background. */}
+              {homeBackgroundStyle === "graph" && (
+                <div className="absolute inset-0 pointer-events-none overflow-hidden">
+                  {/* Deliberately faint and static (no drift/animation - motion is what actually
+                      catches the eye, more than raw opacity does) - meant to read as a barely-
+                      there warmth in the corner, not a "glow" anyone would consciously notice. */}
+                  <div className="absolute -top-1/4 -left-1/4 w-[35%] h-[35%] rounded-full blur-2xl opacity-[0.07] dark:opacity-[0.05] bg-[radial-gradient(circle,theme(colors.blue.400),transparent_45%)]" />
+                  <svg className="absolute inset-0 w-full h-full text-gray-400/40 dark:text-neutral-500/30" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                      <pattern id="home-empty-grid" width="36" height="36" patternUnits="userSpaceOnUse">
+                        <path d="M 36 0 L 0 0 0 36" fill="none" stroke="currentColor" strokeWidth="1" />
+                      </pattern>
+                      {/* Fades the grid out toward the edges so it reads as a subtle texture behind
+                          the centered content rather than a hard-edged tiled pattern. */}
+                      <radialGradient id="home-empty-grid-fade" cx="50%" cy="45%" r="65%">
+                        <stop offset="0%" stopColor="white" stopOpacity="1" />
+                        <stop offset="100%" stopColor="white" stopOpacity="0" />
+                      </radialGradient>
+                      <mask id="home-empty-grid-mask">
+                        <rect width="100%" height="100%" fill="url(#home-empty-grid-fade)" />
+                      </mask>
+                    </defs>
+                    <rect width="100%" height="100%" fill="url(#home-empty-grid)" mask="url(#home-empty-grid-mask)" />
+                  </svg>
+                </div>
+              )}
+
+              <div className="relative flex flex-col items-center gap-3 text-center">
+                <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
+                  <IoVideocam size={28} />
+                </div>
+                <div>
+                  <p className="text-gray-700 dark:text-neutral-200 font-medium">Nothing playing yet</p>
+                  <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
+                    Pick a file from the sidebar, or open one from your computer.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleOpenExternalFile}
+                  className="mt-1 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity"
+                >
+                  Open a file
+                </button>
+              </div>
+
+              {libraryPreviewFiles.length > 0 && (
+                <div className="relative w-full max-w-md">
+                  <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
+                    From your library
+                  </p>
+                  <div className="flex flex-col gap-1">
+                    {libraryPreviewFiles.map((file) => (
+                      <button
+                        key={file.path}
+                        type="button"
+                        onClick={() => handleFileClick(file)}
+                        className="flex items-center gap-3 px-3 py-2 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
+                      >
+                        <span className="text-gray-400 dark:text-neutral-500 shrink-0">
+                          {categoryIcon(getFileCategory(file.name))}
+                        </span>
+                        <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
+                          {formatFileName(file.name)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1734,11 +2184,31 @@ const setScreen = () => {
         dockerMode={dockerMode}
         activeFile={selectedFile ? { name: selectedFile.name, path: selectedFile.sourcePath } : null}
         activeFilePlayableSrc={selectedFile?.path ?? null}
+        editStore={editStore}
         activeFileCurrentTime={playerCurrentTime}
-        onSeekActiveFile={(time) => videoPlayerRef.current?.seek(time)}
+        onSeekActiveFile={handleSeekActiveFile}
+        activeFileIsPlaying={playerIsPlaying}
+        onTogglePlayActiveFile={() => videoPlayerRef.current?.togglePlay()}
         onConvertFile={(file) => setConversionFile(file)}
         onRenameFile={renameFile}
         onDeleteFile={handleDeleteFile}
+        onExportedFile={handleVideoExported}
+        draggingLibraryFile={
+          draggingFiles && draggingFiles.length === 1 && getFileCategory(draggingFiles[0].name) === "video"
+            ? { path: draggingFiles[0].path, name: draggingFiles[0].name }
+            : null
+        }
+        pendingTimelineInsert={pendingTimelineInsert}
+        onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
+        onOutputTimeChange={setCurrentOutputTime}
+        selectedOverlayId={selectedOverlayId}
+        onSelectOverlay={setSelectedOverlayId}
+        isPlacingText={isPlacingText}
+        onToggleArmPlaceText={() => setIsPlacingText((v) => !v)}
+        selectedImageOverlayId={selectedImageOverlayId}
+        onSelectImageOverlay={setSelectedImageOverlayId}
+        isPlacingImage={isPlacingImage}
+        onToggleArmPlaceImage={() => setIsPlacingImage((v) => !v)}
         selectScreen={selectScreen}
         setScreen={setScreen}
         unSetScreen={unSetScreen}
@@ -1774,13 +2244,14 @@ const setScreen = () => {
         setAudioDevice={setAudioDevice}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
+        isHome={selectedFile === null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}
       />
       )}
 
-      {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} />}
+      {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} onStorageChanged={handleStorageChanged} />}
 
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
         {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}

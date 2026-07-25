@@ -1,14 +1,22 @@
 // components/PdfAnnotator.tsx
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { IoContract } from "react-icons/io5";
+import { invoke } from "@tauri-apps/api/tauri";
 import usePdfDocument from "../hooks/usePdfDocument";
 import useAnnotationStore from "../hooks/useAnnotationStore";
 import usePageRenderCache from "../hooks/usePageRenderCache";
 import { AnnotationObject, AnnotationTool } from "../utils/pdfAnnotationTypes";
+import { makeImageObject } from "../handlers/pdfAnnotationHandlers";
+import { exportAnnotatedPdf } from "../handlers/pdfExportHandlers";
+import { fileToDataUrl } from "../utils/imageObjectCache";
 import AnnotationToolbar from "./pdf/AnnotationToolbar";
 import PdfPage from "./pdf/PdfPage";
 import PdfSidebar, { PdfSidebarView } from "./pdf/PdfSidebar";
 import { loadSettings } from "../utils/appSettings";
+import Toast from "./custom/Toast";
+
+const IMAGE_MAX_DIMENSION_PX = 2048; // downscale threshold before embedding into the sidecar JSON
+const IMAGE_MAX_INITIAL_WIDTH_FRACTION = 0.5; // fraction of the page's width, at 100% zoom, an inserted image is capped to
 
 interface PdfAnnotatorProps {
   src: string; // asset:// URL, for loading PDF bytes via pdf.js
@@ -59,6 +67,21 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
   // point range (~10-48) rather than reusing the raw 1-20 value, which would be unreadably small.
   const textFontSize = 8 + strokeWidth * 2;
 
+  // Which image annotation (if any) currently shows move/resize/rotate handles. Lifted up here
+  // (rather than living inside PdfPage) because an image can be inserted/pasted while any page is
+  // showing, and selection needs to follow it regardless of which <PdfPage> instance ends up
+  // holding the matching object — see PdfPage's selectedImageId/onSelectImage props.
+  const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Export-to-flattened-PDF state, kept local to this component rather than in useAnnotationStore
+  // — it's a one-shot rendering/IO action over the current doc, not part of the store's own
+  // load/edit/autosave lifecycle.
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [exportProgress, setExportProgress] = useState<{ completed: number; total: number } | null>(null);
+  const [exportMessage, setExportMessage] = useState<string>("");
+  const [exportError, setExportError] = useState<string>("");
+
   const activeColor = tool === "highlighter" ? highlighterColor : tool === "text" ? textColor : penColor;
   const setActiveColor = tool === "highlighter" ? setHighlighterColor : tool === "text" ? setTextColor : setPenColor;
 
@@ -90,12 +113,108 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
   };
 
   const handleToolChange = (nextTool: AnnotationTool): void => {
+    setSelectedImageId(null); // switching to a drawing tool exits image-selection mode
     setTool((prev) => (prev === nextTool ? null : nextTool));
   };
 
   const handleDeselectTool = (): void => {
     setTool(null);
   };
+
+  // Selecting an image only ever makes sense on the page it's actually on — clear it on every
+  // navigation rather than leaving a stale id around that happens to self-clean once the relevant
+  // <PdfPage> re-renders with different `objects`.
+  useEffect(() => {
+    setSelectedImageId(null);
+  }, [clampedPageIndex]);
+
+  // Reads a File (from the hidden file input or a paste event) into an ImageObject sized to fit
+  // the current page and centered on the current viewport, adds it, and selects it so its
+  // move/resize/rotate handles show immediately.
+  const insertImageFile = useCallback(
+    async (file: File): Promise<void> => {
+      if (!pdfDoc) return;
+      try {
+        const loaded = await fileToDataUrl(file, IMAGE_MAX_DIMENSION_PX);
+        const page = await pdfDoc.getPage(clampedPageIndex + 1);
+        const pageViewportAtScale1 = page.getViewport({ scale: 1 });
+        const zoomViewport = page.getViewport({ scale: zoom });
+        const [pdfCenterX, pdfCenterY] = zoomViewport.convertToPdfPoint(zoomViewport.width / 2, zoomViewport.height / 2);
+
+        const width = Math.min(loaded.width, pageViewportAtScale1.width * IMAGE_MAX_INITIAL_WIDTH_FRACTION);
+        const height = width * (loaded.height / loaded.width);
+        const x = pdfCenterX - width / 2;
+        const y = pdfCenterY + height / 2;
+
+        const object = makeImageObject(clampedPageIndex, x, y, width, height, loaded.dataUrl);
+        store.addObject(object);
+        setSelectedImageId(object.id);
+      } catch (err) {
+        console.error("Failed to insert image:", err);
+      }
+    },
+    // store.addObject specifically (not the whole `store`) — useAnnotationStore returns a fresh
+    // object every render, so depending on `store` itself would tear down and resubscribe the
+    // paste listener effect below on every render instead of just when addObject actually changes.
+    [pdfDoc, clampedPageIndex, zoom, store.addObject]
+  );
+
+  const handleInsertImageClick = (): void => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>): void => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file consecutively
+    if (file) void insertImageFile(file);
+  };
+
+  // Flattens every page's bitmap + its annotations into a brand-new standalone PDF (see
+  // pdfExportHandlers.ts) and writes it to "<name> (annotated).pdf" next to the source file — so
+  // the markup survives moving/sharing just the PDF, not only autosaving to this app's own
+  // sidecar JSON.
+  const handleExport = useCallback(async (): Promise<void> => {
+    if (!pdfDoc || numPages === 0 || isExporting) return;
+    setIsExporting(true);
+    setExportProgress({ completed: 0, total: numPages });
+    setExportError("");
+    try {
+      const bytes = await exportAnnotatedPdf(pdfDoc, numPages, store.getPageObjects, (completed, total) =>
+        setExportProgress({ completed, total })
+      );
+      const outputPath = await invoke<string>("save_exported_pdf", { pdfPath: sourcePath, bytes: Array.from(bytes) });
+      const outputName = outputPath.split(/[\\/]/).pop() ?? outputPath;
+      setExportMessage(`Exported to ${outputName}`);
+    } catch (err) {
+      console.error("Failed to export annotated PDF:", err);
+      setExportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsExporting(false);
+      setExportProgress(null);
+    }
+  }, [pdfDoc, numPages, isExporting, store.getPageObjects, sourcePath]);
+
+  // Global paste-image support: works regardless of which tool is active, as long as focus isn't
+  // in an editable element that should receive the paste itself (e.g. a text-note textarea).
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent): void => {
+      const target = e.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
+        return;
+      }
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const imageItem = Array.from(items).find((item) => item.type.startsWith("image/"));
+      if (!imageItem) return;
+      const file = imageItem.getAsFile();
+      if (!file) return;
+      e.preventDefault();
+      void insertImageFile(file);
+    };
+
+    document.addEventListener("paste", handlePaste);
+    return () => document.removeEventListener("paste", handlePaste);
+  }, [insertImageFile]);
 
   const handleSidebarViewChange = (view: PdfSidebarView): void => {
     setSidebarView((prev) => (prev === view ? null : view));
@@ -197,21 +316,51 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
       }
     };
 
-    // Touch: tracked as a discrete start->end swipe rather than continuous deltas, so it doesn't
-    // fight the browser's native momentum scrolling while the gesture is still in progress —
-    // the decision only gets made once, when the finger lifts.
+    // Touch: single-finger tracked as a discrete start->end swipe rather than continuous deltas,
+    // so it doesn't fight the browser's native momentum scrolling while the gesture is still in
+    // progress - the page-turn decision only gets made once, when the finger lifts. Two-finger
+    // pinch is genuinely continuous instead (zoom needs to visibly track the fingers as they
+    // move, not just resolve once at the end) - tracked by the distance between the two touch
+    // points, compared move-to-move (not against the gesture's starting distance) so each step's
+    // zoom factor is small and incremental, the same shape handlePinchZoom already uses for wheel
+    // deltas, via the same functional setZoom updater (sidesteps needing a ref to the latest zoom
+    // value, since this effect's own closures don't get to see it change without re-running).
     let touchStartY: number | null = null;
     let touchIsMulti = false;
+    let lastPinchDistance: number | null = null;
+
+    const touchDistance = (touches: TouchList): number => {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.hypot(dx, dy);
+    };
 
     const handleTouchStart = (e: TouchEvent): void => {
       touchIsMulti = e.touches.length > 1;
       touchStartY = touchIsMulti ? null : e.touches[0].clientY;
+      lastPinchDistance = touchIsMulti ? touchDistance(e.touches) : null;
     };
     const handleTouchMove = (e: TouchEvent): void => {
-      if (e.touches.length > 1) {
+      if (e.touches.length < 2) return; // single-finger case stays untouched (native scroll)
+
+      const currentDistance = touchDistance(e.touches);
+      if (!touchIsMulti || lastPinchDistance === null) {
+        // A second finger just landed mid-gesture (this touch sequence started as a single-finger
+        // swipe) - baseline here instead of computing a factor against a distance that was never
+        // actually measured between two points.
         touchIsMulti = true;
         touchStartY = null;
+        lastPinchDistance = currentDistance;
+        return;
       }
+      // Stops the OS/WebView's own native viewport pinch-zoom from firing instead - same reason
+      // handleWheel's ctrlKey branch calls preventDefault, just for the touch-native equivalent.
+      e.preventDefault();
+      if (lastPinchDistance > 0) {
+        const factor = currentDistance / lastPinchDistance;
+        setZoom((z) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z * factor)));
+      }
+      lastPinchDistance = currentDistance;
     };
     const handleTouchEnd = (e: TouchEvent): void => {
       if (touchIsMulti || touchStartY === null || withinCooldown()) {
@@ -233,7 +382,9 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
 
     el.addEventListener("wheel", handleWheel, { passive: false });
     el.addEventListener("touchstart", handleTouchStart, { passive: true });
-    el.addEventListener("touchmove", handleTouchMove, { passive: true });
+    // Not passive - the pinch branch inside handleTouchMove needs to call preventDefault, which a
+    // passive listener would silently (and, in Chromium, noisily-in-the-console) ignore.
+    el.addEventListener("touchmove", handleTouchMove, { passive: false });
     el.addEventListener("touchend", handleTouchEnd, { passive: true });
 
     return () => {
@@ -267,7 +418,10 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
       if (e.key === "Escape") {
         e.preventDefault();
         if (isFullscreen) onToggleFullscreen();
-        else handleDeselectTool();
+        else {
+          handleDeselectTool();
+          setSelectedImageId(null);
+        }
         return;
       }
 
@@ -293,10 +447,15 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
         } else if (key === "y" || (key === "z" && e.shiftKey)) {
           e.preventDefault();
           if (store.canRedo) store.redo();
-        } else if (key === "=" || key === "+") {
+        } else if (key === "=" || key === "+" || e.code === "Equal" || e.code === "NumpadAdd") {
+          // e.code (the physical key position, unaffected by Shift/layout/locale) is checked
+          // alongside e.key - on some keyboard layouts a Ctrl-held combo can report a `.key` that
+          // doesn't match the plain unshifted character the layout's own base key would normally
+          // produce, which is exactly the kind of thing that'd make this shortcut work on some
+          // machines and not others for no reason visible in the code itself.
           e.preventDefault();
           setZoom((z) => Math.min(MAX_ZOOM, Math.round((z + 0.25) * 100) / 100));
-        } else if (key === "-") {
+        } else if (key === "-" || e.code === "Minus" || e.code === "NumpadSubtract") {
           e.preventDefault();
           setZoom((z) => Math.max(MIN_ZOOM, Math.round((z - 0.25) * 100) / 100));
         } else if (key === "0") {
@@ -375,6 +534,8 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
       textFontSize={textFontSize}
       eraserRadius={Math.max(12, strokeWidth * 3)}
       interactive={!store.loading}
+      selectedImageId={selectedImageId}
+      onSelectImage={setSelectedImageId}
       onStrokeComplete={(object: AnnotationObject) => store.addObject(object)}
       onObjectEdit={store.editObject}
       onObjectDelete={store.deleteObject}
@@ -386,6 +547,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
 
   return (
     <div className="w-full h-screen flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950">
+      <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileInputChange} className="hidden" />
       {isFullscreen ? (
         // Presentation mode: no toolbar chrome at all — just the page(s) and a single,
         // always-visible way back out (the shortcuts — F, Escape — still work with nothing
@@ -407,6 +569,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
           tool={tool}
           onToolChange={handleToolChange}
           onDeselectTool={handleDeselectTool}
+          onInsertImageClick={handleInsertImageClick}
           color={activeColor}
           onColorChange={setActiveColor}
           strokeWidth={strokeWidth}
@@ -428,8 +591,16 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
           onRedo={store.redo}
           isSaving={store.isSaving}
           saveError={store.saveError}
+          isExporting={isExporting}
+          exportProgress={exportProgress}
+          onExport={handleExport}
         />
       )}
+
+      <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
+        {exportMessage && <Toast key={`export-msg-${exportMessage}`} message={exportMessage} variant="info" onDismiss={() => setExportMessage("")} />}
+        {exportError && <Toast key={`export-err-${exportError}`} message={`Export failed: ${exportError}`} variant="error" onDismiss={() => setExportError("")} />}
+      </div>
 
       {/* min-h-0 here (and min-w-0 one level down) is load-bearing: without it a flex child can't
           shrink below its content's intrinsic size in either axis, so overflow-auto never
@@ -440,9 +611,19 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
         {!isFullscreen && sidebarView && pdfDoc && (
           <PdfSidebar pdfDoc={pdfDoc} numPages={numPages} currentPageIndex={clampedPageIndex} onPageChange={handlePageChange} view={sidebarView} />
         )}
-        <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex items-start justify-center p-8">
+        {/* align-items: safe center (not plain items-start, and not plain items-center either) -
+            the page should sit centered in the available space when it comfortably fits (the
+            "clinging to the top" look otherwise, most obvious in fullscreen/presentation mode
+            where there's no toolbar chrome to visually anchor the top and the empty band below the
+            page reads as a bug), but a page taller than the viewport (high zoom) still needs to
+            start-align - plain centering an overflowing flex item makes the CSS spec push its
+            "before" overflow equally past both edges, and only the "after" edge is ever reachable
+            by scrolling, so the top of a tall page would become permanently unscrollable-to. The
+            `safe` keyword is exactly the built-in escape hatch for this: center when it fits,
+            fall back to start-alignment the moment it doesn't. */}
+        <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex [align-items:safe_center] justify-center p-8">
           {pdfLoading || !pdfDoc || store.loading ? (
-            <div className="text-gray-500 dark:text-neutral-400 italic mt-20">Loading…</div>
+            <div className="text-gray-500 dark:text-neutral-400 italic">Loading…</div>
           ) : twoPageMode ? (
             <div className="flex items-start gap-4">
               {renderPage(clampedPageIndex, "left")}

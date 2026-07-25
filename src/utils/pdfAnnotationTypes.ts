@@ -35,6 +35,28 @@ export interface HighlightObject extends BaseObject {
   blend?: "multiply";
 }
 
+// A character range into a TextObject's `text` — [start, end), start inclusive/end exclusive.
+// The base unit every per-character formatting overlay (color, bold, italic) is built from.
+export interface TextRange {
+  start: number;
+  end: number;
+}
+
+// A colored sub-range — [start, end) plus the color. Optional/additive on top of TextObject.color
+// (the base color for anything not covered by a run), so notes saved before this existed keep
+// rendering exactly as they did before.
+export interface TextColorRun extends TextRange {
+  color: string;
+}
+
+// Paragraph-level (not per-character, unlike color/bold/italic runs above) horizontal alignment -
+// shared by TextObject here and TextOverlay (videoEditTypes.ts), both edited through the same
+// TextNoteEditor. "justify" has full native support in every DOM-rendered context (TextNoteEditor's
+// own live backdrop/textarea, and the video overlay's read-only preview) via CSS text-align, but
+// renderTextObject's canvas bake (this file) falls back to "left" for it - see that function's own
+// comment for why.
+export type TextAlign = "left" | "center" | "right" | "justify";
+
 // A jotted note: a fixed-width, word-wrapped text block anchored at its top-left corner.
 // `x`/`y` and `width` are PDF page-space units (zoom-independent), matching Pt's convention —
 // `y` is the TOP edge, and since PDF space is y-up while screen space is y-down, the block
@@ -47,6 +69,15 @@ export interface TextObject extends BaseObject {
   type: "text";
   text: string;
   color: string;
+  // Fill behind the note's text, in the same PDF page-space box its text occupies (see below).
+  // Omitted/undefined means no fill — fully transparent, i.e. the pre-existing behavior for notes
+  // saved before this existed.
+  backgroundColor?: string;
+  colorRuns?: TextColorRun[];
+  boldRuns?: TextRange[];
+  italicRuns?: TextRange[];
+  // Undefined means "left" - the pre-existing behavior for notes saved before this existed.
+  textAlign?: TextAlign;
   fontSize: number;
   x: number;
   y: number;
@@ -54,9 +85,23 @@ export interface TextObject extends BaseObject {
   height: number;
 }
 
+// A raster image placed on the page: draggable, resizable (aspect-locked, center-anchored), and
+// rotatable. `x`/`y` are the top-left corner *before* rotation is applied (same top-left-anchored
+// PDF-space convention as TextObject); rotation is applied around the box's center at render time,
+// so `x`/`y`/`width`/`height` never change just because the object is rotated.
+export interface ImageObject extends BaseObject {
+  type: "image";
+  src: string; // base64 data URL, embedded directly in the sidecar JSON
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotation: number; // radians
+}
+
 // Discriminated union. Phase 2 still has room for 'shape'/'note' (sticky-note) variants beyond
 // this — purely additive, no migration needed as long as readers skip unknown types.
-export type AnnotationObject = StrokeObject | HighlightObject | TextObject;
+export type AnnotationObject = StrokeObject | HighlightObject | TextObject | ImageObject;
 
 export interface PdfAnnotationPage {
   pageIndex: number;

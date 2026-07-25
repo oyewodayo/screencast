@@ -1,12 +1,18 @@
 // components/Modals/SettingsModal.tsx
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { IoClose, IoSettingsOutline, IoSunny, IoMoon, IoContrast } from "react-icons/io5";
+import { open as openFileDialog } from "@tauri-apps/api/dialog";
+import { invoke } from "@tauri-apps/api/tauri";
 import { AppSettings, DEFAULT_SETTINGS, loadSettings, saveSettings } from "../../utils/appSettings";
 import { ThemePreference, useTheme } from "../../contexts/ThemeContext";
 
 interface SettingsModalProps {
   onClose: () => void;
   onSave: (settings: AppSettings) => void;
+  // Fired after the Briefcast storage folder has actually moved (see the Storage section below) -
+  // Dashboard.tsx owns the file list and whichever file is currently open, neither of which this
+  // modal has access to, so it can't refresh/invalidate those itself.
+  onStorageChanged: () => void;
 }
 
 const RECORD_TYPE_OPTIONS: { value: string; label: string; category: "video" | "audio" | "image" }[] = [
@@ -55,9 +61,50 @@ const THEME_OPTIONS: { value: ThemePreference; label: string; icon: React.ReactN
   { value: "system", label: "System", icon: <IoContrast size={15} /> },
 ];
 
-const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave }) => {
+const HOME_BACKGROUND_OPTIONS: { value: AppSettings["homeBackgroundStyle"]; label: string }[] = [
+  { value: "graph", label: "Graph-like" },
+  { value: "plain", label: "Plain" },
+];
+
+type SectionKey = "appearance" | "recording" | "storage" | "annotation" | "files" | "pdf";
+const SECTION_NAV: { key: SectionKey; label: string }[] = [
+  { key: "appearance", label: "Appearance" },
+  { key: "recording", label: "Recording" },
+  { key: "storage", label: "Storage" },
+  { key: "annotation", label: "Annotation" },
+  { key: "files", label: "Files" },
+  { key: "pdf", label: "PDF Annotator" },
+];
+
+// Both the picked-folder path (change location) and the OS default path (reset) already come from
+// Rust as a real, OS-native path string - joining "Briefcast" onto it for the confirm preview
+// re-uses whichever separator that string already uses instead of hardcoding one, so the preview
+// doesn't show a mismatched slash direction on Windows.
+const joinDisplayPath = (parent: string, child: string): string => `${parent}${parent.includes("\\") ? "\\" : "/"}${child}`;
+
+const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorageChanged }) => {
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const { theme, setTheme } = useTheme();
+  const [activeSection, setActiveSection] = useState<SectionKey>("appearance");
+
+  const [currentDir, setCurrentDir] = useState<string | null>(null);
+  const [defaultDir, setDefaultDir] = useState<string | null>(null);
+  const [pendingParentDir, setPendingParentDir] = useState<string | null>(null); // picked, awaiting confirm
+  const [pendingIsReset, setPendingIsReset] = useState(false);
+  const [storageBusy, setStorageBusy] = useState(false);
+  const [storageError, setStorageError] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [cur, def] = await Promise.all([invoke<string>("get_briefcast_dir"), invoke<string>("get_default_briefcast_dir")]);
+        setCurrentDir(cur);
+        setDefaultDir(def);
+      } catch (err) {
+        console.error("Failed to load the current storage location:", err);
+      }
+    })();
+  }, []);
 
   const recordCategory = RECORD_TYPE_OPTIONS.find((o) => o.value === settings.defaultRecordType)?.category ?? "video";
 
@@ -94,189 +141,356 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave }) => {
     setTheme(DEFAULT_SETTINGS.theme);
   };
 
+  const handlePickLocation = async (): Promise<void> => {
+    setStorageError(null);
+    try {
+      const selected = await openFileDialog({ directory: true, multiple: false, title: "Choose a new location for your Briefcast folder" });
+      if (!selected || Array.isArray(selected)) return; // cancelled
+      setPendingIsReset(false);
+      setPendingParentDir(selected);
+    } catch (err) {
+      console.error("Failed to open folder picker:", err);
+    }
+  };
+
+  const handleArmReset = (): void => {
+    setStorageError(null);
+    setPendingParentDir(null);
+    setPendingIsReset(true);
+  };
+
+  const handleCancelStorageChange = (): void => {
+    setPendingParentDir(null);
+    setPendingIsReset(false);
+    setStorageError(null);
+  };
+
+  // Both branches end up calling the same Rust-side "move everything from the current root to a
+  // new one" logic (see set_briefcast_dir/reset_briefcast_dir in services/utility.rs) - this just
+  // picks which command and which resulting path to expect back.
+  const handleConfirmStorageChange = async (): Promise<void> => {
+    if (!pendingIsReset && pendingParentDir == null) return;
+    setStorageBusy(true);
+    setStorageError(null);
+    try {
+      const newDir = pendingIsReset
+        ? await invoke<string>("reset_briefcast_dir")
+        : await invoke<string>("set_briefcast_dir", { newParentDir: pendingParentDir });
+      setCurrentDir(newDir);
+      setPendingParentDir(null);
+      setPendingIsReset(false);
+      onStorageChanged();
+    } catch (err) {
+      setStorageError(String(err));
+    } finally {
+      setStorageBusy(false);
+    }
+  };
+
+  const hasPendingStorageChange = pendingParentDir != null || pendingIsReset;
+
   return (
     <div
       className="fixed inset-0 z-[9998] flex items-center justify-center bg-black/30 backdrop-blur-sm"
       onMouseDown={(e) => {
+        if (storageBusy) return; // a move is in flight - don't let the modal get yanked away mid-move
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="w-[440px] max-h-[85vh] overflow-y-auto rounded-2xl bg-white dark:bg-neutral-900 shadow-[0_16px_48px_rgba(0,0,0,0.2)] ring-1 ring-black/[0.06] dark:ring-white/[0.08]">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-neutral-100 dark:border-neutral-800 sticky top-0 bg-white dark:bg-neutral-900 rounded-t-2xl">
+      <div className="w-[760px] h-[560px] max-h-[85vh] flex flex-col rounded-2xl bg-white dark:bg-neutral-900 shadow-[0_16px_48px_rgba(0,0,0,0.2)] ring-1 ring-black/[0.06] dark:ring-white/[0.08] overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-neutral-100 dark:border-neutral-800 shrink-0">
           <div className="flex items-center gap-2">
             <IoSettingsOutline className="text-neutral-500 dark:text-neutral-400" size={18} />
             <h2 className="text-sm font-semibold text-neutral-800 dark:text-neutral-100">Settings</h2>
           </div>
-          <button type="button" title="Close" onClick={onClose} className="p-1 rounded-full hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200">
+          <button
+            type="button"
+            title="Close"
+            disabled={storageBusy}
+            onClick={onClose}
+            className="p-1 rounded-full hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 disabled:opacity-40"
+          >
             <IoClose size={18} />
           </button>
         </div>
 
-        <div className="px-5 py-5">
-          <Section title="Appearance">
-            <div className="flex items-center gap-1.5 p-1 rounded-lg bg-neutral-100 dark:bg-neutral-800">
-              {THEME_OPTIONS.map((opt) => (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => handleThemeChange(opt.value)}
-                  className={`flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                    theme === opt.value
-                      ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-neutral-50 shadow-sm"
-                      : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
-                  }`}
+        <div className="flex-1 flex min-h-0">
+          <div className="w-44 shrink-0 border-r border-neutral-100 dark:border-neutral-800 overflow-y-auto py-3 px-2 flex flex-col gap-0.5">
+            {SECTION_NAV.map((s) => (
+              <button
+                key={s.key}
+                type="button"
+                onClick={() => setActiveSection(s.key)}
+                className={`text-left px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  activeSection === s.key
+                    ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                    : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-6 py-5">
+            {activeSection === "appearance" && (
+              <Section title="Appearance">
+                <div className="flex items-center gap-1.5 p-1 rounded-lg bg-neutral-100 dark:bg-neutral-800">
+                  {THEME_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => handleThemeChange(opt.value)}
+                      className={`flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                        theme === opt.value
+                          ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-neutral-50 shadow-sm"
+                          : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+                      }`}
+                    >
+                      {opt.icon}
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div>
+                  <p className="text-xs text-neutral-500 dark:text-neutral-400 mb-1.5">Home screen background</p>
+                  <div className="flex items-center gap-1.5 p-1 rounded-lg bg-neutral-100 dark:bg-neutral-800">
+                    {HOME_BACKGROUND_OPTIONS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => update("homeBackgroundStyle", opt.value)}
+                        className={`flex-1 px-2.5 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                          settings.homeBackgroundStyle === opt.value
+                            ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-neutral-50 shadow-sm"
+                            : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </Section>
+            )}
+
+            {activeSection === "recording" && (
+              <Section title="Recording defaults">
+                <Field label="Recording type">
+                  <select className={fieldInputClass} value={settings.defaultRecordType} onChange={(e) => handleRecordTypeChange(e.target.value)}>
+                    {RECORD_TYPE_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="File format">
+                  <select className={fieldInputClass} value={settings.defaultFileExt} onChange={(e) => update("defaultFileExt", e.target.value)}>
+                    {EXT_OPTIONS[recordCategory].map((ext) => (
+                      <option key={ext} value={ext}>
+                        {ext.toUpperCase()}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="File name prefix">
+                  <input
+                    type="text"
+                    className={`${fieldInputClass} w-36`}
+                    value={settings.defaultFileNamePrefix}
+                    onChange={(e) => update("defaultFileNamePrefix", e.target.value)}
+                    placeholder="Recording"
+                  />
+                </Field>
+              </Section>
+            )}
+
+            {activeSection === "storage" && (
+              <Section title="Storage location">
+                <div className="text-sm text-neutral-700 dark:text-neutral-300">Briefcast files are stored at:</div>
+                <div
+                  className="text-xs font-mono px-2.5 py-1.5 rounded-lg bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 truncate"
+                  title={currentDir ?? undefined}
                 >
-                  {opt.icon}
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </Section>
+                  {currentDir ?? "Loading…"}
+                </div>
 
-          <Section title="Recording defaults">
-            <Field label="Recording type">
-              <select
-                className={fieldInputClass}
-                value={settings.defaultRecordType}
-                onChange={(e) => handleRecordTypeChange(e.target.value)}
-              >
-                {RECORD_TYPE_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="File format">
-              <select className={fieldInputClass} value={settings.defaultFileExt} onChange={(e) => update("defaultFileExt", e.target.value)}>
-                {EXT_OPTIONS[recordCategory].map((ext) => (
-                  <option key={ext} value={ext}>
-                    {ext.toUpperCase()}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="File name prefix">
-              <input
-                type="text"
-                className={`${fieldInputClass} w-36`}
-                value={settings.defaultFileNamePrefix}
-                onChange={(e) => update("defaultFileNamePrefix", e.target.value)}
-                placeholder="Recording"
-              />
-            </Field>
-          </Section>
+                {hasPendingStorageChange ? (
+                  <div className="flex flex-col gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-500/10 ring-1 ring-amber-200 dark:ring-amber-500/20">
+                    <p className="text-xs text-neutral-700 dark:text-neutral-300">
+                      Move all files and folders to{" "}
+                      <span className="font-mono break-all">
+                        {pendingIsReset ? defaultDir : pendingParentDir != null ? joinDisplayPath(pendingParentDir, "Briefcast") : ""}
+                      </span>
+                      ?
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={storageBusy}
+                        onClick={() => void handleConfirmStorageChange()}
+                        className="px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        {storageBusy ? "Moving…" : "Move"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={storageBusy}
+                        onClick={handleCancelStorageChange}
+                        className="px-3 py-1.5 rounded-lg text-xs text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => void handlePickLocation()}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200 dark:hover:bg-neutral-700"
+                    >
+                      Change Location…
+                    </button>
+                    {defaultDir != null && currentDir !== null && currentDir !== defaultDir && (
+                      <button type="button" onClick={handleArmReset} className="text-xs text-neutral-400 dark:text-neutral-500 hover:text-neutral-600 dark:hover:text-neutral-300">
+                        Reset to default location
+                      </button>
+                    )}
+                  </div>
+                )}
 
-          <Section title="Presentation annotation">
-            <Field label="Enable annotation tool">
-              <input
-                type="checkbox"
-                checked={settings.enableAnnotationTool}
-                onChange={(e) => update("enableAnnotationTool", e.target.checked)}
-                className="w-4 h-4 accent-blue-500 cursor-pointer"
-              />
-            </Field>
-            <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
-              While enabled, press Ctrl+Shift+D (Cmd+Shift+D on Mac) anywhere to draw on screen — circle or underline
-              anything to emphasize it. Strokes fade out on their own after a few seconds.
-            </p>
-          </Section>
+                {storageError && <p className="text-xs text-red-500">{storageError}</p>}
+                <p className="text-xs text-neutral-400 dark:text-neutral-500">
+                  Choosing a new location moves every existing file and folder there — nothing is duplicated or left behind.
+                </p>
+              </Section>
+            )}
 
-          <Section title="Files">
-            <Field label="Auto-delete trash after">
-              <div className="flex items-center gap-2">
-                <input
-                  type="number"
-                  min={0}
-                  max={365}
-                  className={`${fieldInputClass} w-16 text-right`}
-                  value={settings.trashRetentionDays}
-                  onChange={(e) => update("trashRetentionDays", Math.max(0, Number(e.target.value) || 0))}
-                />
-                <span className="text-sm text-neutral-500 dark:text-neutral-400">
-                  {settings.trashRetentionDays <= 0 ? "never" : "days"}
-                </span>
-              </div>
-            </Field>
-          </Section>
+            {activeSection === "annotation" && (
+              <Section title="Presentation annotation">
+                <Field label="Enable annotation tool">
+                  <input
+                    type="checkbox"
+                    checked={settings.enableAnnotationTool}
+                    onChange={(e) => update("enableAnnotationTool", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  While enabled, press Ctrl+Shift+D (Cmd+Shift+D on Mac) anywhere to draw on screen — circle or underline
+                  anything to emphasize it. Strokes fade out on their own after a few seconds.
+                </p>
+              </Section>
+            )}
 
-          <Section title="PDF annotator defaults">
-            <Field label="Starting tool">
-              <select
-                className={fieldInputClass}
-                value={settings.pdfDefaultTool}
-                onChange={(e) => update("pdfDefaultTool", e.target.value as AppSettings["pdfDefaultTool"])}
-              >
-                {PDF_TOOL_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="Default zoom">
-              <div className="flex items-center gap-2">
-                <input
-                  type="range"
-                  min={15}
-                  max={300}
-                  step={5}
-                  value={Math.round(settings.pdfDefaultZoom * 100)}
-                  onChange={(e) => update("pdfDefaultZoom", Number(e.target.value) / 100)}
-                  className="w-28 accent-blue-500"
-                />
-                <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-10 text-right">{Math.round(settings.pdfDefaultZoom * 100)}%</span>
-              </div>
-            </Field>
-            <Field label="Pen color">
-              <input
-                type="color"
-                value={settings.pdfDefaultPenColor}
-                onChange={(e) => update("pdfDefaultPenColor", e.target.value)}
-                className="w-7 h-7 p-0 border-0 rounded-full cursor-pointer bg-transparent"
-              />
-            </Field>
-            <Field label="Highlighter color">
-              <input
-                type="color"
-                value={settings.pdfDefaultHighlighterColor}
-                onChange={(e) => update("pdfDefaultHighlighterColor", e.target.value)}
-                className="w-7 h-7 p-0 border-0 rounded-full cursor-pointer bg-transparent"
-              />
-            </Field>
-            <Field label="Default stroke width">
-              <div className="flex items-center gap-2">
-                <input
-                  type="range"
-                  min={1}
-                  max={20}
-                  step={1}
-                  value={settings.pdfDefaultStrokeWidth}
-                  onChange={(e) => update("pdfDefaultStrokeWidth", Number(e.target.value))}
-                  className="w-28 accent-blue-500"
-                />
-                <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-6 text-right">{settings.pdfDefaultStrokeWidth}</span>
-              </div>
-            </Field>
-          </Section>
+            {activeSection === "files" && (
+              <Section title="Files">
+                <Field label="Auto-delete trash after">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      max={365}
+                      className={`${fieldInputClass} w-16 text-right`}
+                      value={settings.trashRetentionDays}
+                      onChange={(e) => update("trashRetentionDays", Math.max(0, Number(e.target.value) || 0))}
+                    />
+                    <span className="text-sm text-neutral-500 dark:text-neutral-400">{settings.trashRetentionDays <= 0 ? "never" : "days"}</span>
+                  </div>
+                </Field>
+              </Section>
+            )}
+
+            {activeSection === "pdf" && (
+              <Section title="PDF annotator defaults">
+                <Field label="Starting tool">
+                  <select
+                    className={fieldInputClass}
+                    value={settings.pdfDefaultTool}
+                    onChange={(e) => update("pdfDefaultTool", e.target.value as AppSettings["pdfDefaultTool"])}
+                  >
+                    {PDF_TOOL_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Default zoom">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={15}
+                      max={300}
+                      step={5}
+                      value={Math.round(settings.pdfDefaultZoom * 100)}
+                      onChange={(e) => update("pdfDefaultZoom", Number(e.target.value) / 100)}
+                      className="w-28 accent-blue-500"
+                    />
+                    <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-10 text-right">{Math.round(settings.pdfDefaultZoom * 100)}%</span>
+                  </div>
+                </Field>
+                <Field label="Pen color">
+                  <input
+                    type="color"
+                    value={settings.pdfDefaultPenColor}
+                    onChange={(e) => update("pdfDefaultPenColor", e.target.value)}
+                    className="w-7 h-7 p-0 border-0 rounded-full cursor-pointer bg-transparent"
+                  />
+                </Field>
+                <Field label="Highlighter color">
+                  <input
+                    type="color"
+                    value={settings.pdfDefaultHighlighterColor}
+                    onChange={(e) => update("pdfDefaultHighlighterColor", e.target.value)}
+                    className="w-7 h-7 p-0 border-0 rounded-full cursor-pointer bg-transparent"
+                  />
+                </Field>
+                <Field label="Default stroke width">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={1}
+                      max={20}
+                      step={1}
+                      value={settings.pdfDefaultStrokeWidth}
+                      onChange={(e) => update("pdfDefaultStrokeWidth", Number(e.target.value))}
+                      className="w-28 accent-blue-500"
+                    />
+                    <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-6 text-right">{settings.pdfDefaultStrokeWidth}</span>
+                  </div>
+                </Field>
+              </Section>
+            )}
+          </div>
         </div>
 
-        <div className="flex items-center justify-between px-5 py-4 border-t border-neutral-100 dark:border-neutral-800">
-          <button type="button" onClick={handleResetDefaults} className="text-xs text-neutral-400 dark:text-neutral-500 hover:text-neutral-600 dark:hover:text-neutral-300">
+        <div className="flex items-center justify-between px-5 py-4 border-t border-neutral-100 dark:border-neutral-800 shrink-0">
+          <button
+            type="button"
+            disabled={storageBusy}
+            onClick={handleResetDefaults}
+            className="text-xs text-neutral-400 dark:text-neutral-500 hover:text-neutral-600 dark:hover:text-neutral-300 disabled:opacity-40"
+          >
             Reset to defaults
           </button>
           <div className="flex items-center gap-2">
             <button
               type="button"
+              disabled={storageBusy}
               onClick={onClose}
-              className="px-3.5 py-1.5 rounded-lg text-sm text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              className="px-3.5 py-1.5 rounded-lg text-sm text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-40"
             >
               Cancel
             </button>
             <button
               type="button"
+              disabled={storageBusy}
               onClick={handleSave}
-              className="px-3.5 py-1.5 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700"
+              className="px-3.5 py-1.5 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
             >
               Save
             </button>

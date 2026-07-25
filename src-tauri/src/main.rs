@@ -19,6 +19,7 @@ mod commands {
 mod services {
     pub mod utility;
     pub mod pdf_annotations;
+    pub mod video_edits;
     pub mod trash;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
@@ -147,6 +148,8 @@ fn main() {
             commands::conversion::convert_video,
             commands::conversion::convert_image,
             commands::conversion::convert_audio,
+            commands::conversion::export_trimmed_video,
+            commands::conversion::read_image_data_url,
 
             commands::native_playback::start_native_playback,
             commands::native_playback::get_next_video_frame,
@@ -159,13 +162,23 @@ fn main() {
             services::utility::open_file_from_directory,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
+            services::utility::get_cursor_position_in_window,
             services::utility::rename_file,
             services::utility::create_folder,
             services::utility::delete_folder,
             services::utility::move_file,
+            services::utility::import_file,
             services::utility::get_platform,
+            services::utility::get_briefcast_dir,
+            services::utility::get_default_briefcast_dir,
+            services::utility::set_briefcast_dir,
+            services::utility::reset_briefcast_dir,
+            services::utility::repair_stale_file_references,
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
+            services::pdf_annotations::save_exported_pdf,
+            services::video_edits::save_video_edit_state,
+            services::video_edits::load_video_edit_state,
 
             services::trash::move_to_trash,
             services::trash::list_trash,
