@@ -55,19 +55,23 @@ pub struct FileEntry {
     path: String,
 }
 
-// Windows/Linux both conventionally keep recordings under ~/Videos; macOS uses ~/Movies instead.
-// The one place this app's "where do Briefcast's files live" convention is decided — shared by
-// list_briefcast_files below, trash.rs, and commands/recording.rs. Previously each of the first
-// two had their own copy of this, and utility.rs's specifically only ever checked USERPROFILE
-// (Windows' home-dir env var), meaning file listing silently returned nothing at all on
-// macOS/Linux regardless of anything else already being cross-platform there.
-pub fn briefcast_dir() -> Result<PathBuf, String> {
+fn home_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let home = env::var("USERPROFILE");
     #[cfg(not(target_os = "windows"))]
     let home = env::var("HOME");
 
-    let mut path = PathBuf::from(home.map_err(|_| "Failed to get user's home directory".to_string())?);
+    home.map(PathBuf::from).map_err(|_| "Failed to get user's home directory".to_string())
+}
+
+// Windows/Linux both conventionally keep recordings under ~/Videos; macOS uses ~/Movies instead.
+// The out-of-the-box location, used whenever no custom location has been configured (see
+// briefcast_dir below) — Previously this *was* briefcast_dir itself, and utility.rs's own copy
+// specifically only ever checked USERPROFILE (Windows' home-dir env var), meaning file listing
+// silently returned nothing at all on macOS/Linux regardless of anything else already being
+// cross-platform there.
+fn default_briefcast_dir() -> Result<PathBuf, String> {
+    let mut path = home_dir()?;
 
     #[cfg(target_os = "macos")]
     path.push("Movies");
@@ -76,6 +80,177 @@ pub fn briefcast_dir() -> Result<PathBuf, String> {
 
     path.push("Briefcast");
     Ok(path)
+}
+
+// Where a user-chosen storage location (see set_briefcast_dir) is remembered — deliberately a
+// dotfile under the user's home directory rather than inside the Briefcast folder itself (which
+// would make it impossible to read once that folder has been relocated) or Tauri's own
+// app_config_dir (which would require threading an AppHandle through every one of the many
+// existing call sites below and in trash.rs/recording.rs for no real benefit - this is the same
+// plain env-var home-dir lookup default_briefcast_dir already uses).
+fn config_file_path() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".briefcast").join("config.json"))
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct AppConfig {
+    custom_briefcast_dir: Option<String>,
+}
+
+fn read_custom_briefcast_dir() -> Result<Option<PathBuf>, String> {
+    let path = config_file_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path).map_err(|e| format!("Failed to read config: {}", e))?;
+    let config: AppConfig = serde_json::from_str(&contents).unwrap_or_default();
+    Ok(config.custom_briefcast_dir.filter(|s| !s.is_empty()).map(PathBuf::from))
+}
+
+fn write_custom_briefcast_dir(dir: Option<&Path>) -> Result<(), String> {
+    let path = config_file_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create config directory: {}", e))?;
+    }
+    let config = AppConfig { custom_briefcast_dir: dir.map(|d| d.display().to_string()) };
+    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("Failed to serialize config: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write config: {}", e))
+}
+
+// The one place this app's "where do Briefcast's files live" convention is decided — shared by
+// list_briefcast_files below, trash.rs, and commands/recording.rs. Checks for a user-configured
+// override (see set_briefcast_dir) before falling back to default_briefcast_dir's out-of-the-box
+// location - every existing caller already treats this as opaque (just "the Briefcast root"), so
+// none of them need to change for a relocated folder to take effect everywhere at once.
+pub fn briefcast_dir() -> Result<PathBuf, String> {
+    if let Some(custom) = read_custom_briefcast_dir()? {
+        return Ok(custom);
+    }
+    default_briefcast_dir()
+}
+
+// Moves every top-level entry of `old_root` into `new_root` (which must already exist), then
+// removes the now-empty old_root - used by both set_briefcast_dir and reset_briefcast_dir, the
+// only difference between them being what new_root resolves to. fs::rename is tried first for
+// each entry (an instant metadata-only op, even for a large video file) and only falls back to a
+// recursive copy+delete when rename fails - the normal reason being old_root/new_root sitting on
+// different volumes/drives, which fs::rename can never succeed across no matter how it's retried.
+// This carries .trash (services/trash.rs) and any per-video .edits.json sidecar along for free,
+// with no special-casing needed - they move as part of whatever folder already contains them.
+fn relocate_briefcast_dir(old_root: &Path, new_root: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(old_root).map_err(|e| format!("Failed to read {}: {}", old_root.display(), e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read {}: {}", old_root.display(), e))?;
+        let src = entry.path();
+        let dest = new_root.join(entry.file_name());
+        if dest.exists() {
+            return Err(format!("\"{}\" already exists at the new location", entry.file_name().to_string_lossy()));
+        }
+        if fs::rename(&src, &dest).is_ok() {
+            continue;
+        }
+        copy_then_remove(&src, &dest)?;
+    }
+    fs::remove_dir_all(old_root).map_err(|e| format!("Failed to remove the old Briefcast folder: {}", e))
+}
+
+fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), String> {
+    if src.is_dir() {
+        fs::create_dir_all(dest).map_err(|e| format!("Failed to create \"{}\": {}", dest.display(), e))?;
+        for entry in fs::read_dir(src).map_err(|e| format!("Failed to read {}: {}", src.display(), e))? {
+            let entry = entry.map_err(|e| format!("Failed to read {}: {}", src.display(), e))?;
+            copy_then_remove(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        fs::remove_dir(src).map_err(|e| format!("Failed to remove \"{}\": {}", src.display(), e))
+    } else {
+        fs::copy(src, dest).map_err(|e| format!("Failed to copy \"{}\": {}", src.display(), e))?;
+        fs::remove_file(src).map_err(|e| format!("Failed to remove \"{}\": {}", src.display(), e))
+    }
+}
+
+#[command]
+pub fn get_briefcast_dir() -> Result<String, String> {
+    briefcast_dir().and_then(|p| path_to_str(&p).map(|s| s.to_string()))
+}
+
+#[command]
+pub fn get_default_briefcast_dir() -> Result<String, String> {
+    default_briefcast_dir().and_then(|p| path_to_str(&p).map(|s| s.to_string()))
+}
+
+// new_parent_dir is a folder the user picked (e.g. the Desktop) - the actual new root always nests
+// a "Briefcast" subfolder under it (matching the existing Videos/Briefcast convention) rather than
+// using the picked folder directly, so this never dumps app files loose into an unrelated folder
+// and never has to decide how to merge with whatever else might already be sitting in it.
+// A plain (non-async) command, like every other one in this file - Tauri v1 already dispatches
+// these on its own worker thread pool rather than the event loop, which is what keeps a large
+// library move from freezing the UI without this needing to manually manage a runtime/thread pool
+// of its own (that would require adding tokio as a direct dependency here just to reach a
+// scheduler tauri already owns and uses internally for exactly this).
+#[command]
+pub fn set_briefcast_dir(new_parent_dir: String) -> Result<String, String> {
+    let new_parent = PathBuf::from(&new_parent_dir);
+    if !new_parent.is_dir() {
+        return Err("Selected location does not exist".to_string());
+    }
+    let new_root = new_parent.join("Briefcast");
+    let old_root = briefcast_dir()?;
+
+    if new_root == old_root {
+        return path_to_str(&new_root).map(|s| s.to_string());
+    }
+    // Neither folder may sit inside the other - moving a directory into its own descendant is
+    // meaningless (and would recurse forever), and the reverse would leave the "old" root still
+    // existing as an ancestor of the very folder that's supposed to replace it.
+    if new_root.starts_with(&old_root) {
+        return Err("The new location can't be inside the current Briefcast folder".to_string());
+    }
+    if old_root.exists() && old_root.starts_with(&new_root) {
+        return Err("The new location can't be a parent of the current Briefcast folder".to_string());
+    }
+
+    if new_root.exists() {
+        let has_entries = fs::read_dir(&new_root).map(|mut d| d.next().is_some()).unwrap_or(false);
+        if has_entries {
+            return Err("A non-empty \"Briefcast\" folder already exists at that location".to_string());
+        }
+    } else {
+        fs::create_dir_all(&new_root).map_err(|e| format!("Failed to create the new Briefcast folder: {}", e))?;
+    }
+
+    if old_root.exists() {
+        relocate_briefcast_dir(&old_root, &new_root)?;
+    }
+
+    write_custom_briefcast_dir(Some(&new_root))?;
+    path_to_str(&new_root).map(|s| s.to_string())
+}
+
+#[command]
+pub fn reset_briefcast_dir() -> Result<String, String> {
+    let old_root = briefcast_dir()?;
+    let new_root = default_briefcast_dir()?;
+
+    if old_root == new_root {
+        write_custom_briefcast_dir(None)?;
+        return path_to_str(&new_root).map(|s| s.to_string());
+    }
+
+    if new_root.exists() {
+        let has_entries = fs::read_dir(&new_root).map(|mut d| d.next().is_some()).unwrap_or(false);
+        if has_entries {
+            return Err("A non-empty \"Briefcast\" folder already exists at the default location".to_string());
+        }
+    } else {
+        fs::create_dir_all(&new_root).map_err(|e| format!("Failed to create the default Briefcast folder: {}", e))?;
+    }
+
+    if old_root.exists() {
+        relocate_briefcast_dir(&old_root, &new_root)?;
+    }
+
+    write_custom_briefcast_dir(None)?;
+    path_to_str(&new_root).map(|s| s.to_string())
 }
 
 #[command]

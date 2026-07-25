@@ -19,6 +19,7 @@
 // instead of it never having existed.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { IoChevronDown, IoChevronUp } from "react-icons/io5";
 import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { FrameRect } from "../../utils/videoFrameRect";
@@ -150,50 +151,75 @@ interface VideoOverlayLayerProps {
   onSendImageOverlayToBack: (id: string) => void;
 }
 
-// A pill-shaped numeric control combining two interactions in one target: drag left/right to
-// scrub the value (the safe control style established for this panel - see the removed
-// beginFontSizeDrag's old comment, still true below - a native <input> stealing focus would blur
-// TextNoteEditor's textarea and force-commit/close the whole editing session out from under it),
-// OR click without dragging to type an exact value instead. Typing never focuses a real DOM
-// element either - a document-level keydown listener (capture phase) intercepts digits while in
-// edit mode and preventDefault+stopPropagation keeps them from reaching whatever's actually
-// focused (the textarea), so this can sit right next to TextNoteEditor without ever touching its
-// focus. Purely local/session state in the caller (onChangePx) - this component holds no value of
-// its own beyond the transient drag/typing buffer.
-interface ScrubNumberFieldProps {
+// A compact numeric stepper matching the image panel's own rotation input (a native
+// <input type="number">, which browsers already render with an up/down spinner) - up/down caret
+// buttons step the value in real time (tap once, hold to repeat), and clicking the value itself
+// types an exact number. Can't actually BE a native number input here, though: focusing one shifts
+// keyboard focus there, which blurs TextNoteEditor's textarea and fires its own onBlur={commit},
+// closing/deleting the whole editing session out from under the input the instant it's clicked
+// (TextNoteEditor is reused as-is - see this file's own top comment - so that behavior isn't
+// something this file can intercept). The caret buttons dodge this the same way every other button
+// in this panel does (onMouseDown={preventDefault} - a *button* just never takes focus at all), and
+// typing dodges it by never focusing anything either - a document-level keydown listener (capture
+// phase) intercepts digits while in type mode and preventDefault+stopPropagation keeps them from
+// reaching whatever's actually focused (the textarea). Purely local/session state in the caller
+// (onChangePx) - this component holds no value of its own beyond the transient typing buffer.
+interface SteppedNumberFieldProps {
   valuePx: number;
   min: number;
   max: number;
+  step?: number;
   title: string;
   onChangePx: (px: number) => void;
 }
-const ScrubNumberField: React.FC<ScrubNumberFieldProps> = ({ valuePx, min, max, title, onChangePx }) => {
-  const [drag, setDrag] = useState<null | { startClientX: number; startValue: number; moved: boolean }>(null);
+const STEP_REPEAT_DELAY_MS = 350;
+const STEP_REPEAT_INTERVAL_MS = 60;
+const SteppedNumberField: React.FC<SteppedNumberFieldProps> = ({ valuePx, min, max, step = 1, title, onChangePx }) => {
   const [editText, setEditText] = useState<string | null>(null);
 
-  const beginDrag = (e: React.PointerEvent) => {
-    if (editText != null) {
-      e.stopPropagation();
-      return;
+  // Tracks the in-progress value across repeated ticks independent of the `valuePx` prop, which
+  // only catches up once the parent re-renders after each onChangePx call (a render cycle behind
+  // during a fast hold) - reading the stale prop inside a setInterval closure would otherwise step
+  // from the same starting number every tick instead of accumulating.
+  const liveValueRef = useRef(valuePx);
+  const repeatTimeoutRef = useRef<number | null>(null);
+  const repeatIntervalRef = useRef<number | null>(null);
+
+  const stopRepeat = useCallback(() => {
+    if (repeatTimeoutRef.current != null) {
+      window.clearTimeout(repeatTimeoutRef.current);
+      repeatTimeoutRef.current = null;
     }
-    e.preventDefault();
-    e.stopPropagation();
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    setDrag({ startClientX: e.clientX, startValue: valuePx, moved: false });
+    if (repeatIntervalRef.current != null) {
+      window.clearInterval(repeatIntervalRef.current);
+      repeatIntervalRef.current = null;
+    }
+  }, []);
+  useEffect(() => stopRepeat, [stopRepeat]);
+
+  const stepOnce = useCallback(
+    (delta: number) => {
+      liveValueRef.current = Math.max(min, Math.min(max, Math.round(liveValueRef.current + delta)));
+      onChangePx(liveValueRef.current);
+    },
+    [min, max, onChangePx]
+  );
+  // Tap once to step, hold to ramp into continuous change - the standard spinner-button convention.
+  const beginRepeat = (delta: number) => {
+    liveValueRef.current = valuePx;
+    stepOnce(delta);
+    stopRepeat();
+    repeatTimeoutRef.current = window.setTimeout(() => {
+      repeatIntervalRef.current = window.setInterval(() => stepOnce(delta), STEP_REPEAT_INTERVAL_MS);
+    }, STEP_REPEAT_DELAY_MS);
   };
-  const handleDragMove = (e: React.PointerEvent) => {
-    if (!drag) return;
-    e.stopPropagation();
-    const dx = e.clientX - drag.startClientX;
-    if (!drag.moved && Math.abs(dx) > 3) setDrag((prev) => (prev ? { ...prev, moved: true } : prev));
-    onChangePx(Math.max(min, Math.min(max, Math.round(drag.startValue + dx))));
-  };
-  const endDrag = () => {
-    if (!drag) return;
-    const wasClick = !drag.moved;
-    setDrag(null);
-    if (wasClick) setEditText(String(valuePx));
-  };
+  // Window-level fallback so a release outside the button's own bounds (cursor drifted off it
+  // while holding) still stops the repeat, same "don't let a drag/hold get stuck" reasoning as the
+  // pointer-cancel handlers elsewhere in this file.
+  useEffect(() => {
+    window.addEventListener("mouseup", stopRepeat);
+    return () => window.removeEventListener("mouseup", stopRepeat);
+  }, [stopRepeat]);
 
   const commitEdit = useCallback(() => {
     setEditText((current) => {
@@ -243,16 +269,49 @@ const ScrubNumberField: React.FC<ScrubNumberFieldProps> = ({ valuePx, min, max, 
 
   return (
     <div
-      onPointerDown={beginDrag}
-      onPointerMove={handleDragMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
       title={editText != null ? "Type a value, Enter to confirm" : title}
-      className={`w-11 h-5 px-1 rounded text-[10px] text-white flex items-center justify-center select-none ${
-        editText != null ? "bg-blue-500/30 ring-1 ring-blue-400 cursor-text" : "bg-white/10 cursor-ew-resize"
-      }`}
+      className={`flex items-stretch h-5 rounded overflow-hidden select-none ${editText != null ? "ring-1 ring-blue-400" : ""}`}
     >
-      {editText != null ? `${editText}px` : `${valuePx}px`}
+      <div
+        onClick={(e) => {
+          e.stopPropagation();
+          if (editText == null) setEditText(String(valuePx));
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+        className={`w-9 px-1 text-[10px] text-white flex items-center justify-center cursor-text ${editText != null ? "bg-blue-500/30" : "bg-white/10"}`}
+      >
+        {editText != null ? editText || "0" : valuePx}
+      </div>
+      <div className="flex flex-col w-3.5 bg-white/10 border-l border-black/30">
+        <button
+          type="button"
+          tabIndex={-1}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            beginRepeat(step);
+          }}
+          onMouseUp={stopRepeat}
+          onMouseLeave={stopRepeat}
+          className="flex-1 flex items-center justify-center hover:bg-white/20 active:bg-white/30"
+        >
+          <IoChevronUp size={7} />
+        </button>
+        <button
+          type="button"
+          tabIndex={-1}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            beginRepeat(-step);
+          }}
+          onMouseUp={stopRepeat}
+          onMouseLeave={stopRepeat}
+          className="flex-1 flex items-center justify-center hover:bg-white/20 active:bg-white/30 border-t border-black/30"
+        >
+          <IoChevronDown size={7} />
+        </button>
+      </div>
     </div>
   );
 };
@@ -1066,16 +1125,17 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             }}
             className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-neutral-900/90 backdrop-blur-md shadow-lg ring-1 ring-white/10 whitespace-nowrap"
           >
-            {/* Font size - drag left/right to scrub, or click (no drag) to type an exact value.
+            {/* Font size - caret buttons step it in real time (matches the image panel's own
+                rotation input's up/down spinner), or click the value to type an exact number.
                 Reads/writes editingSession.fontSize (the staged, not-yet-committed value the
                 corner drag handle also uses), so this and that handle stay two ways of setting the
                 exact same in-progress number instead of racing each other, both flushing together
                 at the normal commit point. */}
-            <ScrubNumberField
+            <SteppedNumberField
               valuePx={Math.round(editingSession.fontSize * frameRect.height)}
               min={4}
               max={500}
-              title="Font size - drag to scrub, click to type"
+              title="Font size - click the arrows or type a value"
               onChangePx={(px) => {
                 if (frameRect.height <= 0) return;
                 setEditingOverlay((prev) => (prev ? { ...prev, fontSize: px / frameRect.height } : prev));
@@ -1088,11 +1148,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 fixed-padding chrome and has no padding prop of its own to drive - it becomes
                 visible the moment editing ends, same as this panel's other aesthetic controls
                 (stroke/corner/fade) already work. */}
-            <ScrubNumberField
+            <SteppedNumberField
               valuePx={Math.round(editingSession.padding * frameRect.height)}
               min={0}
               max={100}
-              title="Padding - drag to scrub, click to type"
+              title="Padding - click the arrows or type a value"
               onChangePx={(px) => {
                 if (frameRect.height <= 0) return;
                 setEditingOverlay((prev) => (prev ? { ...prev, padding: px / frameRect.height } : prev));

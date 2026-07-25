@@ -781,6 +781,13 @@ const setScreen = () => {
 		setRecordType(settings.defaultRecordType);
 		setAnnotationEnabled(settings.enableAnnotationTool);
 	};
+	// After the Briefcast folder itself has been relocated (see SettingsModal's Storage section):
+	// re-list from the new location, and drop whatever's currently open - its sourcePath was inside
+	// the old root and no longer resolves to anything now that everything has actually moved.
+	const handleStorageChanged = () => {
+		handleDirectoryFiles();
+		setSelectedFile(null);
+	};
 
 	// Shows/hides the annotation overlay and flips its click-through state, and tells its own page
 	// to show/hide the floating toolbar. Called both by the global hotkey (toggles) and by the
@@ -2159,7 +2166,7 @@ const setScreen = () => {
       />
       )}
 
-      {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} />}
+      {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} onStorageChanged={handleStorageChanged} />}
 
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
         {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}

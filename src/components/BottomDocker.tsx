@@ -1,4 +1,5 @@
 import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
+import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
 import { message } from "@tauri-apps/api/dialog";
@@ -412,7 +413,7 @@ const BottomDocker = ({
             showFileList={showFileList} 
         />
       
-      {showDocker && (<div className="w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
+      {showDocker && (<div className="docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
         {dockerMode === "file-tools" && activeFile ? (
           <FileToolsDocker
             file={activeFile}

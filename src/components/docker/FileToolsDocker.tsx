@@ -224,10 +224,10 @@ const FileToolsDockerGeneric: React.FC<{
   const hasInfo = info.duration || info.resolution || info.size;
 
   return (
-    <div className="w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
-      <div className="flex flex-wrap items-end gap-3">
+    <div className="docker-panel w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
+      <div className="docker-fields-row flex flex-wrap items-end gap-3">
         <div>
-          <div className="p-1 text-sm">Rename</div>
+          <div className="docker-field-label p-1 text-sm">Rename</div>
           <div className="flex items-center gap-1">
             <input
               type="text"
@@ -251,7 +251,7 @@ const FileToolsDockerGeneric: React.FC<{
         </div>
 
         <div>
-          <div className="p-1 text-sm">Info</div>
+          <div className="docker-field-label p-1 text-sm">Info</div>
           <div className="flex items-center gap-3 p-2.5 rounded-md text-xs bg-white dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-700 min-h-[42px]">
             {category === "pdf" ? (
               <span className="text-neutral-400 dark:text-neutral-500 italic">No file info for PDFs</span>
@@ -286,7 +286,7 @@ const FileToolsDockerGeneric: React.FC<{
       </div>
 
       <div className="flex flex-col items-end gap-2">
-        <div className="flex items-end gap-2">
+        <div className="docker-actions-row flex items-end gap-2">
           {isConvertibleCategory(category) && (
             <button
               type="button"

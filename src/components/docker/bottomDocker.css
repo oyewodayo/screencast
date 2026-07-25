@@ -1,0 +1,68 @@
+/* components/docker/bottomDocker.css
+ *
+ * The recording docker's fields (file name/type/recording-options/audio-device/etc.) are sized
+ * with plain Tailwind utility classes (p-2.5, text-sm) that never got smaller on their own as the
+ * window shrank - flex-wrap just pushed fields onto more rows instead, growing the docker's own
+ * height at exactly the window sizes where vertical space is already tightest. A CSS container
+ * query (rather than Tailwind's viewport-width breakpoints, or a JS-measured one) reacts to this
+ * panel's own rendered width specifically - the thing that actually determines whether its fields
+ * fit comfortably - regardless of what else in the window (sidebar, etc.) is also competing for
+ * space, and regardless of OS display-scaling making the *reported* window size look larger than
+ * the CSS pixels actually available to this panel.
+ *
+ * .docker-container (the ancestor - see BottomDocker.tsx) establishes the query context;
+ * .docker-panel (RecordingDocker's own root - and reused by FileToolsDocker's quick-actions row)
+ * and its descendants are what actually shrink.
+ */
+.docker-container {
+  container-type: inline-size;
+}
+
+@container (max-width: 760px) {
+  .docker-panel {
+    gap: 8px !important;
+  }
+  .docker-panel .docker-fields-row,
+  .docker-panel .docker-actions-row {
+    gap: 6px !important;
+  }
+  .docker-panel .docker-field-label {
+    font-size: 0.7rem;
+    padding: 1px 2px;
+  }
+  .docker-panel input[type="text"],
+  .docker-panel select,
+  .docker-panel button,
+  .docker-panel .docker-checkbox-field {
+    padding: 6px 8px;
+    font-size: 0.75rem;
+  }
+  .docker-panel .docker-checkbox-field {
+    height: 34px;
+  }
+  .docker-panel .docker-video-devices {
+    min-width: 130px;
+    max-height: 64px;
+    padding: 6px;
+  }
+}
+
+@container (max-width: 520px) {
+  .docker-panel .docker-field-label {
+    font-size: 0.65rem;
+  }
+  .docker-panel input[type="text"],
+  .docker-panel select,
+  .docker-panel button,
+  .docker-panel .docker-checkbox-field {
+    padding: 4px 6px;
+    font-size: 0.7rem;
+  }
+  .docker-panel .docker-checkbox-field {
+    height: 28px;
+  }
+  .docker-panel .docker-video-devices {
+    min-width: 100px;
+    max-height: 52px;
+  }
+}
