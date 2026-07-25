@@ -316,21 +316,51 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
       }
     };
 
-    // Touch: tracked as a discrete start->end swipe rather than continuous deltas, so it doesn't
-    // fight the browser's native momentum scrolling while the gesture is still in progress —
-    // the decision only gets made once, when the finger lifts.
+    // Touch: single-finger tracked as a discrete start->end swipe rather than continuous deltas,
+    // so it doesn't fight the browser's native momentum scrolling while the gesture is still in
+    // progress - the page-turn decision only gets made once, when the finger lifts. Two-finger
+    // pinch is genuinely continuous instead (zoom needs to visibly track the fingers as they
+    // move, not just resolve once at the end) - tracked by the distance between the two touch
+    // points, compared move-to-move (not against the gesture's starting distance) so each step's
+    // zoom factor is small and incremental, the same shape handlePinchZoom already uses for wheel
+    // deltas, via the same functional setZoom updater (sidesteps needing a ref to the latest zoom
+    // value, since this effect's own closures don't get to see it change without re-running).
     let touchStartY: number | null = null;
     let touchIsMulti = false;
+    let lastPinchDistance: number | null = null;
+
+    const touchDistance = (touches: TouchList): number => {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.hypot(dx, dy);
+    };
 
     const handleTouchStart = (e: TouchEvent): void => {
       touchIsMulti = e.touches.length > 1;
       touchStartY = touchIsMulti ? null : e.touches[0].clientY;
+      lastPinchDistance = touchIsMulti ? touchDistance(e.touches) : null;
     };
     const handleTouchMove = (e: TouchEvent): void => {
-      if (e.touches.length > 1) {
+      if (e.touches.length < 2) return; // single-finger case stays untouched (native scroll)
+
+      const currentDistance = touchDistance(e.touches);
+      if (!touchIsMulti || lastPinchDistance === null) {
+        // A second finger just landed mid-gesture (this touch sequence started as a single-finger
+        // swipe) - baseline here instead of computing a factor against a distance that was never
+        // actually measured between two points.
         touchIsMulti = true;
         touchStartY = null;
+        lastPinchDistance = currentDistance;
+        return;
       }
+      // Stops the OS/WebView's own native viewport pinch-zoom from firing instead - same reason
+      // handleWheel's ctrlKey branch calls preventDefault, just for the touch-native equivalent.
+      e.preventDefault();
+      if (lastPinchDistance > 0) {
+        const factor = currentDistance / lastPinchDistance;
+        setZoom((z) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z * factor)));
+      }
+      lastPinchDistance = currentDistance;
     };
     const handleTouchEnd = (e: TouchEvent): void => {
       if (touchIsMulti || touchStartY === null || withinCooldown()) {
@@ -352,7 +382,9 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
 
     el.addEventListener("wheel", handleWheel, { passive: false });
     el.addEventListener("touchstart", handleTouchStart, { passive: true });
-    el.addEventListener("touchmove", handleTouchMove, { passive: true });
+    // Not passive - the pinch branch inside handleTouchMove needs to call preventDefault, which a
+    // passive listener would silently (and, in Chromium, noisily-in-the-console) ignore.
+    el.addEventListener("touchmove", handleTouchMove, { passive: false });
     el.addEventListener("touchend", handleTouchEnd, { passive: true });
 
     return () => {
@@ -415,10 +447,15 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
         } else if (key === "y" || (key === "z" && e.shiftKey)) {
           e.preventDefault();
           if (store.canRedo) store.redo();
-        } else if (key === "=" || key === "+") {
+        } else if (key === "=" || key === "+" || e.code === "Equal" || e.code === "NumpadAdd") {
+          // e.code (the physical key position, unaffected by Shift/layout/locale) is checked
+          // alongside e.key - on some keyboard layouts a Ctrl-held combo can report a `.key` that
+          // doesn't match the plain unshifted character the layout's own base key would normally
+          // produce, which is exactly the kind of thing that'd make this shortcut work on some
+          // machines and not others for no reason visible in the code itself.
           e.preventDefault();
           setZoom((z) => Math.min(MAX_ZOOM, Math.round((z + 0.25) * 100) / 100));
-        } else if (key === "-") {
+        } else if (key === "-" || e.code === "Minus" || e.code === "NumpadSubtract") {
           e.preventDefault();
           setZoom((z) => Math.max(MIN_ZOOM, Math.round((z - 0.25) * 100) / 100));
         } else if (key === "0") {
@@ -574,9 +611,19 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
         {!isFullscreen && sidebarView && pdfDoc && (
           <PdfSidebar pdfDoc={pdfDoc} numPages={numPages} currentPageIndex={clampedPageIndex} onPageChange={handlePageChange} view={sidebarView} />
         )}
-        <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex items-start justify-center p-8">
+        {/* align-items: safe center (not plain items-start, and not plain items-center either) -
+            the page should sit centered in the available space when it comfortably fits (the
+            "clinging to the top" look otherwise, most obvious in fullscreen/presentation mode
+            where there's no toolbar chrome to visually anchor the top and the empty band below the
+            page reads as a bug), but a page taller than the viewport (high zoom) still needs to
+            start-align - plain centering an overflowing flex item makes the CSS spec push its
+            "before" overflow equally past both edges, and only the "after" edge is ever reachable
+            by scrolling, so the top of a tall page would become permanently unscrollable-to. The
+            `safe` keyword is exactly the built-in escape hatch for this: center when it fits,
+            fall back to start-alignment the moment it doesn't. */}
+        <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex [align-items:safe_center] justify-center p-8">
           {pdfLoading || !pdfDoc || store.loading ? (
-            <div className="text-gray-500 dark:text-neutral-400 italic mt-20">Loading…</div>
+            <div className="text-gray-500 dark:text-neutral-400 italic">Loading…</div>
           ) : twoPageMode ? (
             <div className="flex items-start gap-4">
               {renderPage(clampedPageIndex, "left")}
