@@ -25,6 +25,7 @@ import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { FrameRect } from "../../utils/videoFrameRect";
 import { ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
+import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { renderFormattedSegments } from "../../utils/textFormatting";
 import { TEXT_FONT_FAMILY, measureTextBlock } from "../../handlers/pdfAnnotationHandlers";
 import { TextAlign, TextColorRun, TextRange } from "../../utils/pdfAnnotationTypes";
@@ -437,6 +438,12 @@ interface AnimationPickerProps {
 const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) => {
   const buttonRef = useRef<HTMLButtonElement>(null);
   const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
+  // Measures the menu's own rendered size and nudges it back on-screen if the raw anchor (just
+  // below the trigger button) would otherwise push it past the window's edge - the same fix
+  // AudioOverlayPopover needed after its own version of this overflowed the bottom of the window
+  // near the audio-overlay timeline lane; this trigger sits in a floating panel that can end up
+  // just as close to an edge.
+  const { ref: menuRef, position: clampedMenuPos } = useClampedPopoverPosition(menuPos ?? { left: 0, top: 0 });
   const current = ANIMATION_OPTIONS.find((o) => o.value === (value ?? "none")) ?? ANIMATION_OPTIONS[0];
 
   useEffect(() => {
@@ -470,8 +477,9 @@ const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) =>
           // the same press that's clicking one of its own options - same reasoning/fix as the
           // right-click context menu's own portal further down this file.
           <div
+            ref={menuRef}
             onPointerDown={(e) => e.stopPropagation()}
-            style={{ position: "fixed", left: menuPos.left, top: menuPos.top, zIndex: 9999 }}
+            style={{ position: "fixed", left: clampedMenuPos.left, top: clampedMenuPos.top, zIndex: 9999 }}
             className="w-28 py-1 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10"
           >
             {ANIMATION_OPTIONS.map((opt) => (

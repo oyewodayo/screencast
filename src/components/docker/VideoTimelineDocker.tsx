@@ -1,7 +1,7 @@
 // components/docker/VideoTimelineDocker.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/tauri";
+import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { BsCursor } from "react-icons/bs";
 import { MdFlip } from "react-icons/md";
@@ -35,8 +35,12 @@ import {
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { Clip, ImageOverlay, TextOverlay } from "../../utils/videoEditTypes";
+import { AudioOverlay, Clip, ImageOverlay, TextOverlay } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
+import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
+import { overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler } from "../../handlers/videoEditHandlers";
+import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
+import AudioOverlayPopover from "./AudioOverlayPopover";
 
 const MIN_PX_PER_SEC = 8;
 const MAX_PX_PER_SEC = 200;
@@ -103,6 +107,94 @@ const ActionButton: React.FC<{
     {children}
   </button>
 );
+
+// The audio-overlay chip's real waveform - a genuine decode (see audioWaveform.ts), not a
+// decorative placeholder. Needs its own component (rather than being computed inline in the
+// lane's .map() below) because decoding is async and per-file: each chip tracks its own decoded
+// peaks via its own hook state, which .map() callbacks can't own directly. Re-slices (not
+// re-decodes) whenever the visible window (trimStart/duration, from drag or resize) or pixel size
+// changes, so a live trim drag updates the waveform every frame from already-decoded data.
+const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number }> = ({ overlay, widthPx, heightPx }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [peaks, setPeaks] = useState<number[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getWaveformPeaks(overlay.src)
+      .then((p) => {
+        if (!cancelled) setPeaks(p);
+      })
+      .catch(() => {
+        /* getWaveformPeaks already logs - a failed decode just leaves the chip waveform-less */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [overlay.src]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !peaks || widthPx <= 0 || heightPx <= 0) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(widthPx * dpr));
+    canvas.height = Math.max(1, Math.round(heightPx * dpr));
+    ctx.scale(dpr, dpr);
+
+    const duration = overlay.endTime - overlay.startTime;
+    const buckets = Math.max(8, Math.floor(widthPx / 2));
+    const windowed = sliceWaveformWindow(peaks, overlay.sourceDuration, overlay.trimStart, duration, buckets);
+    const barWidth = widthPx / buckets;
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    windowed.forEach((amp, i) => {
+      const barHeight = Math.max(1, amp * heightPx);
+      ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
+    });
+  }, [peaks, widthPx, heightPx, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration]);
+
+  return <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" style={{ width: widthPx, height: heightPx }} />;
+};
+
+// The main video's own audio level (volume + mute) - see videoEditTypes.ts's
+// videoAudioMuted/videoAudioVolume doc comment for why this is separate from any AudioOverlay's
+// own volume/mute. Its own component (rather than inlined in the lane's JSX) purely so
+// useClampedPopoverPosition - which measures this popover's actual rendered size to keep it
+// on-screen, see that hook's own comment for why the raw anchor alone isn't enough near the
+// bottom of the window - can be called unconditionally the way hooks require; the parent only
+// mounts this at all while the popover should be showing.
+const TrackAudioPopover: React.FC<{
+  anchor: PopoverAnchor;
+  volume: number;
+  muted: boolean;
+  onSetVolume: (volume: number) => void;
+  onSetMuted: (muted: boolean) => void;
+}> = ({ anchor, volume, muted, onSetVolume, onSetMuted }) => {
+  const { ref, position } = useClampedPopoverPosition(anchor);
+  return createPortal(
+    <div
+      ref={ref}
+      data-track-audio-popover
+      style={{ position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
+      className="w-56 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-2.5"
+    >
+      <span className="text-xs font-medium">Video audio</span>
+      <label className="flex items-center gap-2 text-[11px]">
+        <span className="w-12 shrink-0 text-white/60">Volume</span>
+        <input type="range" min={0} max={1} step={0.01} value={volume} onChange={(e) => onSetVolume(Number(e.target.value))} className="flex-1 accent-teal-400" />
+        <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(volume * 100)}%</span>
+      </label>
+      <button
+        type="button"
+        onClick={() => onSetMuted(!muted)}
+        className={`self-start px-2 py-1 rounded text-[11px] transition-colors ${muted ? "text-red-400 bg-red-500/10" : "text-white/70 hover:text-white hover:bg-white/10"}`}
+      >
+        {muted ? "Muted" : "Mute"}
+      </button>
+    </div>,
+    document.body
+  );
+};
 
 interface VideoTimelineDockerProps {
   file: DockerFile;
@@ -205,6 +297,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 }) => {
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
+  // One hidden <audio> per audio overlay, kept in sync with the main player below - no existing
+  // pattern for this in the codebase (see the plan's own Context: every other `new Audio(...)`
+  // usage is a one-shot UI sound effect, not a seekable/synced source).
+  const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const trackAreaRef = useRef<HTMLDivElement>(null);
 
   const [duration, setDuration] = useState<number>(0);
@@ -217,11 +313,21 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [thumbnails, setThumbnails] = useState<ThumbFrame[]>([]);
   const [coverThumbnail, setCoverThumbnail] = useState<string | null>(null);
 
-  // Cosmetic-only track state (visibility/lock/mute) - no backend behind these yet, but they're
-  // real toggles rather than dead buttons, unlike the top toolbar's placeholders.
+  // Visibility/lock are still cosmetic-only (no backend behind them yet) - mute/volume are real,
+  // backed by editStore.videoAudioMuted/videoAudioVolume (see the track-audio popover further
+  // down), unlike when this comment was first written.
   const [trackVisible, setTrackVisible] = useState(true);
   const [trackLocked, setTrackLocked] = useState(false);
-  const [trackMuted, setTrackMuted] = useState(false);
+  const [trackAudioPopoverAnchor, setTrackAudioPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
+  useEffect(() => {
+    if (!trackAudioPopoverAnchor) return;
+    const close = (e: PointerEvent) => {
+      if (e.target instanceof Element && e.target.closest("[data-track-audio-popover]")) return;
+      setTrackAudioPopoverAnchor(null);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [trackAudioPopoverAnchor]);
   const [menuOpen, setMenuOpen] = useState(false);
   // The "..." menu is rendered through a portal (see moreMenuButtonRef/moreMenuPosition below)
   // rather than as a normal absolutely-positioned child - the Timeline panel has overflow-hidden
@@ -231,6 +337,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // viewport rect instead of relying on CSS positioning relative to an ancestor.
   const moreMenuButtonRef = useRef<HTMLButtonElement>(null);
   const [moreMenuPosition, setMoreMenuPosition] = useState<{ top: number; left: number } | null>(null);
+
+  // Audio overlay selection/placement - unlike text/image, fully local to this component (see the
+  // plan's own Context: audio has no box on the video frame, so VideoOverlayLayer/Dashboard never
+  // need to know about it at all).
+  const [isPlacingAudio, setIsPlacingAudio] = useState(false);
+  const [selectedAudioOverlayId, setSelectedAudioOverlayId] = useState<string | null>(null);
+  const [audioPopoverAnchor, setAudioPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
 
   const baseName = (name: string): string => {
     const dotIndex = name.lastIndexOf(".");
@@ -569,6 +682,153 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
   };
 
+  // ---- Audio overlay placement / drag (move) / resize (trim into source) ---------------------
+  //
+  // Fully local to this component (see this file's own top-of-plan Context: an audio overlay has
+  // no box on the video frame, so unlike text/image, neither VideoOverlayLayer nor Dashboard ever
+  // need to know about its selection/placement state at all).
+  //
+  // Placement mirrors VideoOverlayLayer.tsx's own isPlacingImage effect, including its context-ref
+  // snapshot - onAddAudioOverlay-equivalent work here reads currentOutputTime/totalOutputDuration,
+  // both of which change continuously during playback, and depending on isPlacingAudio alone (via
+  // this ref) is what keeps the effect from tearing down and re-running (re-opening the file
+  // dialog) while the async picker is still open - the exact "endless file-dialog" bug that
+  // pattern was built to fix for images.
+  // Initialized with placeholder 0s, not the real currentOutputTime/totalOutputDuration - both are
+  // locals computed later in this component's own body (currentOutputTime from the clip-tracking
+  // logic further down), so reading them directly here would be a genuine temporal-dead-zone
+  // reference, unlike VideoOverlayLayer's own version of this pattern where the equivalent values
+  // are props (available from the top of that function). The effect below - which, unlike this
+  // initializer, is a closure not invoked until after the full render completes - overwrites this
+  // with real values on every render, well before isPlacingAudio can ever actually flip true.
+  const placeAudioContextRef = useRef({ currentOutputTime: 0, totalOutputDuration: 0 });
+  useEffect(() => {
+    placeAudioContextRef.current = { currentOutputTime, totalOutputDuration };
+  });
+  useEffect(() => {
+    if (!isPlacingAudio) return;
+    const { currentOutputTime, totalOutputDuration } = placeAudioContextRef.current;
+    let cancelled = false;
+    (async () => {
+      try {
+        const selected = await openFileDialog({ multiple: false, filters: [{ name: "Audio", extensions: FILE_CATEGORY_EXTENSIONS.audio }] });
+        if (cancelled || !selected || Array.isArray(selected)) return; // cancelled
+
+        const info = await invoke<Record<string, string>>("get_conversion_info", { inputPath: selected });
+        const match = info.duration?.match(/[\d.]+/);
+        const sourceDuration = match ? parseFloat(match[0]) : NaN;
+        if (cancelled || !Number.isFinite(sourceDuration) || sourceDuration <= 0) return;
+
+        const startTime = currentOutputTime;
+        // Defaults to the source's *full* natural length (clamped to what's left of the output
+        // timeline), unlike text/image's arbitrary short default - music/voiceover overlays
+        // usually want to play out completely rather than needing an immediate manual resize.
+        const endTime = Math.min(totalOutputDuration, startTime + sourceDuration);
+        if (endTime <= startTime) return; // no room left on the timeline to place it
+
+        const id = editStore.addAudioOverlay(selected, sourceDuration, startTime, endTime);
+        setSelectedAudioOverlayId(id);
+      } catch (err) {
+        console.error("Failed to add audio overlay:", err);
+      } finally {
+        if (!cancelled) setIsPlacingAudio(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlacingAudio]);
+
+  const [audioOverlayDrag, setAudioOverlayDrag] = useState<null | {
+    id: string;
+    startClientX: number;
+    startTime: number;
+    duration: number;
+    isDragging: boolean;
+    liveStartTime: number;
+  }>(null);
+  const [audioOverlayResizeDrag, setAudioOverlayResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; liveValue: number }>(null);
+
+  const renderAudioOverlays: AudioOverlay[] = editStore.audioOverlays.map((o) => {
+    if (audioOverlayResizeDrag && o.id === audioOverlayResizeDrag.id) {
+      return audioOverlayResizeDrag.edge === "start" ? { ...o, startTime: audioOverlayResizeDrag.liveValue } : { ...o, endTime: audioOverlayResizeDrag.liveValue };
+    }
+    if (audioOverlayDrag && o.id === audioOverlayDrag.id) {
+      return { ...o, startTime: audioOverlayDrag.liveStartTime, endTime: audioOverlayDrag.liveStartTime + audioOverlayDrag.duration };
+    }
+    return o;
+  });
+
+  const selectAudioOverlay = (id: string, e: React.PointerEvent) => {
+    setSelectedAudioOverlayId(id);
+    setAudioPopoverAnchor({ left: e.currentTarget.getBoundingClientRect().left, top: e.currentTarget.getBoundingClientRect().bottom + 6 });
+  };
+
+  // Resize's live preview reuses the exact same pure resizeAudioOverlayTime handler the eventual
+  // commit calls (rather than re-deriving its own clamping math) - guarantees the chip's live size
+  // during the drag can never show something the commit would then clamp back from, which would
+  // otherwise read as the chip "snapping" once you let go.
+  const beginAudioOverlayResizeDrag = (overlay: AudioOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    selectAudioOverlay(overlay.id, e);
+    setAudioOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, liveValue: edge === "start" ? overlay.startTime : overlay.endTime });
+  };
+  const handleAudioOverlayResizeDragMove = (e: React.PointerEvent) => {
+    if (!audioOverlayResizeDrag) return;
+    e.stopPropagation();
+    const overlay = editStore.audioOverlays.find((o) => o.id === audioOverlayResizeDrag.id);
+    if (!overlay) return;
+    const deltaSec = (e.clientX - audioOverlayResizeDrag.startClientX) / pxPerSec;
+    const raw = (audioOverlayResizeDrag.edge === "start" ? overlay.startTime : overlay.endTime) + deltaSec;
+    const preview = resizeAudioOverlayTimeHandler([overlay], overlay.id, audioOverlayResizeDrag.edge, totalOutputDuration, raw)[0];
+    const liveValue = audioOverlayResizeDrag.edge === "start" ? preview.startTime : preview.endTime;
+    setAudioOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
+  };
+  const endAudioOverlayResizeDrag = () => {
+    if (!audioOverlayResizeDrag) return;
+    const { id, edge, liveValue } = audioOverlayResizeDrag;
+    setAudioOverlayResizeDrag(null);
+    editStore.resizeAudioOverlayTime(id, edge, liveValue);
+  };
+
+  const beginAudioOverlayDrag = (overlay: AudioOverlay) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setAudioOverlayDrag({
+      id: overlay.id,
+      startClientX: e.clientX,
+      startTime: overlay.startTime,
+      duration: overlay.endTime - overlay.startTime,
+      isDragging: false,
+      liveStartTime: overlay.startTime,
+    });
+  };
+  const handleAudioOverlayDragMove = (e: React.PointerEvent) => {
+    if (!audioOverlayDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - audioOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    const deltaSec = (e.clientX - audioOverlayDrag.startClientX) / pxPerSec;
+    const liveStartTime = Math.max(0, Math.min(audioOverlayDrag.startTime + deltaSec, totalOutputDuration - audioOverlayDrag.duration));
+    setAudioOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endAudioOverlayDrag = (e: React.PointerEvent) => {
+    if (!audioOverlayDrag) return;
+    const { id, isDragging, liveStartTime, duration } = audioOverlayDrag;
+    setAudioOverlayDrag(null);
+    if (isDragging) {
+      editStore.moveAudioOverlayTime(id, liveStartTime);
+    }
+    selectAudioOverlay(id, e);
+    // Same reasoning as endOverlayDrag/endImageOverlayDrag: bring the playhead along if it isn't
+    // already inside the (possibly just-moved) overlay's own range, so selecting it from the
+    // timeline is never visibly a no-op.
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
+      seekToOutputTime(liveStartTime);
+    }
+  };
+
   const ticks = useMemo(() => {
     if (totalOutputDuration <= 0) return [];
     const result: number[] = [];
@@ -763,6 +1023,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onSelectOverlay?.(editStore.duplicateTextOverlay(selectedOverlayId));
         } else if (selectedImageOverlayId) {
           onSelectImageOverlay?.(editStore.duplicateImageOverlay(selectedImageOverlayId));
+        } else if (selectedAudioOverlayId) {
+          setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(selectedAudioOverlayId));
+          setAudioPopoverAnchor(null);
         }
         return;
       }
@@ -777,6 +1040,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         e.preventDefault();
         editStore.deleteImageOverlay(selectedImageOverlayId);
         onSelectImageOverlay?.(null);
+      } else if (selectedAudioOverlayId) {
+        e.preventDefault();
+        editStore.deleteAudioOverlay(selectedAudioOverlayId);
+        setSelectedAudioOverlayId(null);
+        setAudioPopoverAnchor(null);
       } else if (selectedClipId) {
         e.preventDefault();
         handleDeleteSegment();
@@ -785,7 +1053,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedOverlayId, selectedImageOverlayId, selectedClipId, editStore]);
+  }, [selectedOverlayId, selectedImageOverlayId, selectedAudioOverlayId, selectedClipId, editStore]);
 
   // Pressing Play after the sequence has already played through to the end needs to restart from
   // clip 0 - native <video> never auto-rewinds on .play() once it's reached "ended", it just sits
@@ -933,11 +1201,53 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOutputTime]);
 
+  // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
+  // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
+  // gating text/image overlays already use for visibility), otherwise playing/paused to match
+  // isPlaying with its own currentTime hard-set only on a real discontinuity (a scrub/seek, or
+  // more than ~150ms of drift) - letting the browser's own playback clock advance it the rest of
+  // the time avoids fighting/stuttering it every frame the way resetting currentTime continuously
+  // would. Volume applies both the overlay's own level and a linear fade in/out envelope.
+  useEffect(() => {
+    const activeIds = new Set(overlaysActiveAt(editStore.audioOverlays, currentOutputTime).map((o) => o.id));
+    editStore.audioOverlays.forEach((o) => {
+      const audio = audioElementsRef.current.get(o.id);
+      if (!audio) return;
+      if (!activeIds.has(o.id)) {
+        if (!audio.paused) audio.pause();
+        return;
+      }
+      const desiredTime = o.trimStart + (currentOutputTime - o.startTime);
+      if (Math.abs(audio.currentTime - desiredTime) > 0.15) audio.currentTime = desiredTime;
+      if (isPlaying && audio.paused) audio.play().catch(() => {});
+      if (!isPlaying && !audio.paused) audio.pause();
+
+      const fadeIn = o.fadeInSec ?? 0;
+      const fadeOut = o.fadeOutSec ?? 0;
+      let envelope = 1;
+      if (fadeIn > 0) envelope = Math.min(envelope, (currentOutputTime - o.startTime) / fadeIn);
+      if (fadeOut > 0) envelope = Math.min(envelope, (o.endTime - currentOutputTime) / fadeOut);
+      audio.volume = o.muted ? 0 : o.volume * Math.max(0, Math.min(1, envelope));
+    });
+  }, [currentOutputTime, isPlaying, editStore.audioOverlays]);
+
   return (
     <div className="w-full flex flex-col gap-2">
       {/* Hidden capture rig - never shown, just decodes frames for the filmstrip/cover. */}
       <video ref={hiddenVideoRef} src={playableSrc} muted preload="metadata" style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }} />
       <canvas ref={captureCanvasRef} style={{ display: "none" }} />
+      {editStore.audioOverlays.map((o) => (
+        <audio
+          key={o.id}
+          ref={(el) => {
+            if (el) audioElementsRef.current.set(o.id, el);
+            else audioElementsRef.current.delete(o.id);
+          }}
+          src={convertFileSrc(o.src)}
+          preload="auto"
+          style={{ display: "none" }}
+        />
+      ))}
 
       {/* Toolbar */}
       <div className="flex items-center justify-between gap-2 px-1 py-1 rounded-md bg-neutral-900 text-neutral-200">
@@ -980,7 +1290,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoImageOutline size={15} className={isPlacingImage ? "text-amber-400" : undefined} />
           </ActionButton>
-          <ToolButton title="Audio"><IoMusicalNotesOutline size={15} /></ToolButton>
+          <ActionButton
+            title={isPlacingAudio ? "Choosing an audio file…" : "Add audio overlay"}
+            onClick={() => setIsPlacingAudio((v) => !v)}
+          >
+            <IoMusicalNotesOutline size={15} className={isPlacingAudio ? "text-teal-400" : undefined} />
+          </ActionButton>
         </div>
 
         <div className="flex items-center gap-2">
@@ -1067,11 +1382,20 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </button>
           <button
             type="button"
-            title={trackMuted ? "Unmute track" : "Mute track"}
-            onClick={() => setTrackMuted((v) => !v)}
-            className="text-neutral-400 hover:text-neutral-200"
+            title="Track volume/mute"
+            onClick={(e) => {
+              // Always (re)opens rather than toggling - closing is the outside-pointerdown effect's
+              // job alone (see trackAudioPopoverAnchor's own effect above). A toggle here would race
+              // it: pointerdown fires (and could close it) before this click handler runs, so a
+              // toggle keyed off the pre-click state could immediately reopen what the same press
+              // had just closed - same reasoning AudioOverlayPopover/AnimationPicker's own triggers
+              // already settled on elsewhere in this codebase.
+              const rect = e.currentTarget.getBoundingClientRect();
+              setTrackAudioPopoverAnchor({ left: rect.right + 8, top: rect.top - 4 });
+            }}
+            className={editStore.videoAudioMuted ? "text-red-400 hover:text-red-300" : "text-neutral-400 hover:text-neutral-200"}
           >
-            {trackMuted ? <IoVolumeMuteOutline size={15} /> : <IoVolumeHighOutline size={15} />}
+            {editStore.videoAudioMuted ? <IoVolumeMuteOutline size={15} /> : <IoVolumeHighOutline size={15} />}
           </button>
           <button
             type="button"
@@ -1400,6 +1724,61 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               })}
             </div>
 
+            {/* Audio-overlay lane - same time-based chip pattern as the text/image lanes above,
+                teal instead of purple/amber, with a real waveform instead of an icon+filename and
+                edge handles that trim into the source (resizeAudioOverlayTime) instead of just
+                retiming an empty box. */}
+            <div className="h-8 relative border-t border-neutral-800">
+              {renderAudioOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
+                const isSelected = selectedAudioOverlayId === overlay.id;
+                const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
+                return (
+                  <div
+                    key={overlay.id}
+                    onPointerDown={beginAudioOverlayDrag(overlay)}
+                    onPointerMove={handleAudioOverlayDragMove}
+                    onPointerUp={endAudioOverlayDrag}
+                    onPointerCancel={endAudioOverlayDrag}
+                    title={fileName}
+                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 cursor-grab active:cursor-grabbing ${
+                      isSelected ? "border-dashed border-white" : "border-teal-400"
+                    } ${overlay.muted ? "opacity-50" : ""}`}
+                    style={{ left, width }}
+                  >
+                    <AudioChipWaveform overlay={overlay} widthPx={width} heightPx={28} />
+                  </div>
+                );
+              })}
+              {renderAudioOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = (overlay.endTime - overlay.startTime) * pxPerSec;
+                return (
+                  <React.Fragment key={`audio-overlay-resize-${overlay.id}`}>
+                    <div
+                      onPointerDown={beginAudioOverlayResizeDrag(overlay, "start")}
+                      onPointerMove={handleAudioOverlayResizeDragMove}
+                      onPointerUp={endAudioOverlayResizeDrag}
+                      onPointerCancel={endAudioOverlayResizeDrag}
+                      title="Drag to trim this audio's start"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
+                      style={{ left }}
+                    />
+                    <div
+                      onPointerDown={beginAudioOverlayResizeDrag(overlay, "end")}
+                      onPointerMove={handleAudioOverlayResizeDragMove}
+                      onPointerUp={endAudioOverlayResizeDrag}
+                      onPointerCancel={endAudioOverlayResizeDrag}
+                      title="Drag to trim this audio's end"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
+                      style={{ left: left + width }}
+                    />
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
             {/* Playhead */}
             <div className="absolute top-0 bottom-0 w-px bg-white pointer-events-none" style={{ left: playheadLeft }}>
               <div className="w-2.5 h-2.5 bg-white rounded-sm -ml-[5px] -mt-0.5" />
@@ -1407,6 +1786,44 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </div>
         </div>
       </div>
+
+      {selectedAudioOverlayId &&
+        audioPopoverAnchor &&
+        (() => {
+          const overlay = editStore.audioOverlays.find((o) => o.id === selectedAudioOverlayId);
+          if (!overlay) return null;
+          return (
+            <AudioOverlayPopover
+              overlay={overlay}
+              anchor={audioPopoverAnchor}
+              onUpdate={(patch) => editStore.updateAudioOverlayContent(overlay.id, patch)}
+              onDuplicate={() => {
+                setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(overlay.id));
+                setAudioPopoverAnchor(null);
+              }}
+              onDelete={() => {
+                editStore.deleteAudioOverlay(overlay.id);
+                setSelectedAudioOverlayId(null);
+                setAudioPopoverAnchor(null);
+              }}
+              onClose={() => setAudioPopoverAnchor(null)}
+            />
+          );
+        })()}
+
+      {/* The main video's own audio level - see videoEditTypes.ts's videoAudioMuted/videoAudioVolume
+          doc comment for why this is a separate control from any AudioOverlay's own volume/mute.
+          Inlined here (not its own component file) since it's only two controls, unlike
+          AudioOverlayPopover's fuller set (fades, duplicate, delete). */}
+      {trackAudioPopoverAnchor && (
+        <TrackAudioPopover
+          anchor={trackAudioPopoverAnchor}
+          volume={editStore.videoAudioVolume}
+          muted={editStore.videoAudioMuted}
+          onSetVolume={editStore.setVideoAudioVolume}
+          onSetMuted={editStore.setVideoAudioMuted}
+        />
+      )}
     </div>
   );
 };

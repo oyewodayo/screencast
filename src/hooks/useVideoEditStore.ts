@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { listen } from "@tauri-apps/api/event";
-import { Clip, EditableFields, ImageOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
+import { AudioOverlay, Clip, EditableFields, ImageOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
@@ -10,11 +10,14 @@ import {
   deleteClipAt as deleteClipAtHandler,
   deleteOverlay,
   duplicateOverlay,
+  duplicateTimedOverlay,
   insertClip as insertClipHandler,
+  makeAudioOverlay,
   makeImageOverlay,
   makeTextOverlay,
   moveOverlayTime,
   reorderClip as reorderClipHandler,
+  resizeAudioOverlayTime,
   resizeClipEdge as resizeClipEdgeHandler,
   resizeOverlayTime,
   sendOverlayToBack,
@@ -57,6 +60,7 @@ type TextOverlayContentPatch = Partial<
 type ImageOverlayContentPatch = Partial<
   Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src">
 >;
+type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -101,6 +105,28 @@ export interface UseVideoEditStoreResult {
   duplicateImageOverlay: (id: string) => string;
   bringImageOverlayToFront: (id: string) => void;
   sendImageOverlayToBack: (id: string) => void;
+  // Background music/voiceover overlays - unlike text/image, these have no position on the frame
+  // (VideoOverlayLayer isn't involved at all) and their whole UI lives in VideoTimelineDocker's own
+  // timeline lane. `addAudioOverlay` takes the source file's own duration (already known by the
+  // caller, via get_conversion_info) rather than looking it up itself, matching how addImageOverlay
+  // is given its content up front instead of a "content added later" placeholder flow.
+  audioOverlays: AudioOverlay[];
+  addAudioOverlay: (src: string, sourceDuration: number, startTime: number, endTime: number) => string;
+  updateAudioOverlayContent: (id: string, patch: AudioOverlayContentPatch) => void;
+  // Trims into the source (see resizeAudioOverlayTime in videoEditHandlers.ts) rather than just
+  // retiming an empty box - the one meaningful behavioral difference from resizeTextOverlayTime/
+  // resizeImageOverlayTime.
+  resizeAudioOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
+  moveAudioOverlayTime: (id: string, newStartTime: number) => void;
+  deleteAudioOverlay: (id: string) => void;
+  duplicateAudioOverlay: (id: string) => string;
+  // The primary video's OWN audio level - see VideoEditState.videoAudioMuted's own doc comment for
+  // why this is distinct from any AudioOverlay's own volume/muted. Read by VideoPlayer.tsx (stacked
+  // multiplicatively on top of its own local listening volume) and export_trimmed_video.
+  videoAudioMuted: boolean;
+  videoAudioVolume: number;
+  setVideoAudioMuted: (muted: boolean) => void;
+  setVideoAudioVolume: (volume: number) => void;
   // Called once the real video duration is known (from the hidden capture <video>'s
   // loadedmetadata) - only seeds a fresh, unedited state; a no-op once real state exists (either
   // loaded from the sidecar or already seeded), so it's safe to call on every metadata load.
@@ -203,7 +229,14 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
               // written - default them here (once, at load) rather than in the type guard, so
               // sidecars saved before these features existed still load instead of being treated
               // as corrupt.
-              setState({ ...parsed, textOverlays: parsed.textOverlays ?? [], imageOverlays: parsed.imageOverlays ?? [] });
+              setState({
+                ...parsed,
+                textOverlays: parsed.textOverlays ?? [],
+                imageOverlays: parsed.imageOverlays ?? [],
+                audioOverlays: parsed.audioOverlays ?? [],
+                videoAudioMuted: parsed.videoAudioMuted ?? false,
+                videoAudioVolume: parsed.videoAudioVolume ?? 1,
+              });
               // Any clip referencing a file other than the primary one (dragged in from
               // elsewhere) needs its duration re-fetched after a reload, since the cache above is
               // purely in-memory and doesn't survive switching away and back, let alone a restart.
@@ -284,6 +317,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     clips: current.clips,
     textOverlays: current.textOverlays,
     imageOverlays: current.imageOverlays,
+    audioOverlays: current.audioOverlays,
+    videoAudioMuted: current.videoAudioMuted,
+    videoAudioVolume: current.videoAudioVolume,
     ...patch,
   });
 
@@ -518,6 +554,91 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const addAudioOverlay = useCallback(
+    (src: string, sourceDuration: number, startTime: number, endTime: number): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const overlay = makeAudioOverlay(src, sourceDuration, startTime, endTime);
+      const audioOverlays = addOverlay(current.audioOverlays, overlay);
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "add-audio");
+      return overlay.id;
+    },
+    [pushCommand]
+  );
+
+  const updateAudioOverlayContent = useCallback(
+    (id: string, patch: AudioOverlayContentPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const audioOverlays = updateOverlay<AudioOverlay>(current.audioOverlays, id, patch);
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "edit-audio");
+    },
+    [pushCommand]
+  );
+
+  const resizeAudioOverlayTimeCb = useCallback(
+    (id: string, edge: "start" | "end", time: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const audioOverlays = resizeAudioOverlayTime(current.audioOverlays, id, edge, totalOutputDuration(current.clips), time);
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "edit-audio");
+    },
+    [pushCommand]
+  );
+
+  const moveAudioOverlayTime = useCallback(
+    (id: string, newStartTime: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const audioOverlays = moveOverlayTime(current.audioOverlays, id, newStartTime, totalOutputDuration(current.clips));
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "edit-audio");
+    },
+    [pushCommand]
+  );
+
+  const deleteAudioOverlay = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const audioOverlays = deleteOverlay(current.audioOverlays, id);
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "delete-audio");
+    },
+    [pushCommand]
+  );
+
+  const duplicateAudioOverlay = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const original = current.audioOverlays.find((o) => o.id === id);
+      if (!original) return "";
+      const copy = duplicateTimedOverlay(original, totalOutputDuration(current.clips));
+      const audioOverlays = addOverlay(current.audioOverlays, copy);
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "add-audio");
+      return copy.id;
+    },
+    [pushCommand]
+  );
+
+  const setVideoAudioMuted = useCallback(
+    (muted: boolean) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { videoAudioMuted: muted }), "edit-track-audio");
+    },
+    [pushCommand]
+  );
+
+  const setVideoAudioVolume = useCallback(
+    (volume: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clamped = Math.max(0, Math.min(1, volume));
+      pushCommand(snapshot(current, {}), snapshot(current, { videoAudioVolume: clamped }), "edit-track-audio");
+    },
+    [pushCommand]
+  );
+
   const insertClipAt = useCallback(
     async (newClipSourcePath: string, atIndex: number) => {
       const current = stateRef.current;
@@ -616,10 +737,28 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           }
         }
 
+        // No client-side rendering step for audio (unlike text/image, which render to a PNG first)
+        // - these just pass straight through to Rust, which reads the original source file
+        // directly and builds the amix/afade/adelay filter chain itself (see export_trimmed_video).
+        const audioOverlays = current.audioOverlays
+          .filter((o) => !o.muted)
+          .map((o) => ({
+            sourcePath: o.src,
+            startTime: o.startTime,
+            endTime: o.endTime,
+            trimStart: o.trimStart,
+            volume: o.volume,
+            fadeIn: o.fadeInSec ?? 0,
+            fadeOut: o.fadeOutSec ?? 0,
+          }));
+
         const outputPath = await invoke<string>("export_trimmed_video", {
           outputBasePath: sourcePath,
           segments: toKeepSegments(current.clips),
           overlays,
+          audioOverlays,
+          audioMuted: current.videoAudioMuted,
+          audioVolume: current.videoAudioVolume,
         });
         const name = outputPath.split(/[\\/]/).pop() ?? outputPath;
         return { path: outputPath, name };
@@ -639,6 +778,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     clips: state?.clips ?? [],
     textOverlays: state?.textOverlays ?? [],
     imageOverlays: state?.imageOverlays ?? [],
+    audioOverlays: state?.audioOverlays ?? [],
     addTextOverlay,
     updateTextOverlayContent,
     resizeTextOverlayTime,
@@ -655,6 +795,16 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     duplicateImageOverlay,
     bringImageOverlayToFront,
     sendImageOverlayToBack,
+    addAudioOverlay,
+    updateAudioOverlayContent,
+    resizeAudioOverlayTime: resizeAudioOverlayTimeCb,
+    moveAudioOverlayTime,
+    deleteAudioOverlay,
+    duplicateAudioOverlay,
+    videoAudioMuted: state?.videoAudioMuted ?? false,
+    videoAudioVolume: state?.videoAudioVolume ?? 1,
+    setVideoAudioMuted,
+    setVideoAudioVolume,
     setDuration,
     getSourceDuration,
     splitAt,

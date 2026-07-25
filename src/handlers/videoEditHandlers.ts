@@ -3,7 +3,7 @@
 // Pure functions only, mirroring pdfAnnotationHandlers.ts's style: no React, callers pass in
 // everything they need explicitly. useVideoEditStore is the only caller.
 
-import { Clip, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
+import { AudioOverlay, Clip, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
 const MIN_OVERLAY_DURATION = 0.1;
@@ -227,4 +227,59 @@ export function sendOverlayToBack<T extends { id: string }>(overlays: T[], id: s
   const [item] = next.splice(index, 1);
   next.unshift(item);
   return next;
+}
+
+// ---- Audio overlays ----------------------------------------------------------------------------
+//
+// Not folded into the generic overlay functions above: an audio overlay has a finite SOURCE file
+// behind it (unlike text/image, which have nothing to "run out of"), so its own resize/duplicate
+// need source-aware logic the shape-only generics can't express. addOverlay/updateOverlay/
+// deleteOverlay/overlaysActiveAt/moveOverlayTime above are still reused as-is for audio - a move
+// (drag the chip body) is exactly "shift startTime/endTime together, leave everything else alone"
+// regardless of overlay kind.
+
+export function makeAudioOverlay(src: string, sourceDuration: number, startTime: number, endTime: number): AudioOverlay {
+  const now = Date.now();
+  return { id: crypto.randomUUID(), src, sourceDuration, startTime, endTime, trimStart: 0, volume: 1, createdAt: now, updatedAt: now };
+}
+
+// Drags one edge of an audio overlay's time range - unlike resizeOverlayTime (text/image, which
+// can freely stretch an empty box), this trims *into the source audio* the same way resizeClipEdge
+// trims a video clip: the dragged edge's own output-timeline boundary and its corresponding
+// trimStart offset move together, so (endTime-startTime) always stays equal to however much of the
+// source is actually selected - never time-stretched, always 1x playback.
+export function resizeAudioOverlayTime(overlays: AudioOverlay[], id: string, edge: "start" | "end", maxOutputEnd: number, time: number): AudioOverlay[] {
+  return overlays.map((o) => {
+    if (o.id !== id) return o;
+    if (edge === "start") {
+      // Can't reveal more of the source than exists before the current trim window (trimStart
+      // can't go below 0), and can't push the start past leaving MIN_OVERLAY_DURATION before end.
+      const minStart = o.startTime - o.trimStart;
+      const clampedStart = Math.max(minStart, Math.min(time, o.endTime - MIN_OVERLAY_DURATION));
+      const trimStart = o.trimStart + (clampedStart - o.startTime);
+      return { ...o, startTime: clampedStart, trimStart, updatedAt: Date.now() };
+    }
+    // End edge: can't extend past whatever's left of the source after the current trim window
+    // (trimStart + duration can't exceed sourceDuration), or past the assembled timeline's own end.
+    const trimEnd = o.trimStart + (o.endTime - o.startTime);
+    const roomInSource = o.sourceDuration - trimEnd;
+    const maxEnd = Math.min(maxOutputEnd, o.endTime + Math.max(0, roomInSource));
+    const clampedEnd = Math.min(maxEnd, Math.max(time, o.startTime + MIN_OVERLAY_DURATION));
+    return { ...o, endTime: clampedEnd, updatedAt: Date.now() };
+  });
+}
+
+// A time-offset sibling to duplicateOverlay above (which requires x/y - meaningless for an audio
+// overlay, which has no position on the frame) - nudges startTime/endTime together by a small
+// constant instead, clamped to the assembled timeline's own end the same way moveOverlayTime is.
+const DUPLICATE_TIME_OFFSET_SEC = 0.5;
+
+export function duplicateTimedOverlay<T extends { id: string; startTime: number; endTime: number; createdAt: number; updatedAt: number }>(
+  overlay: T,
+  maxOutputEnd: number
+): T {
+  const now = Date.now();
+  const duration = overlay.endTime - overlay.startTime;
+  const startTime = Math.max(0, Math.min(overlay.startTime + DUPLICATE_TIME_OFFSET_SEC, maxOutputEnd - duration));
+  return { ...overlay, id: crypto.randomUUID(), startTime, endTime: startTime + duration, createdAt: now, updatedAt: now };
 }

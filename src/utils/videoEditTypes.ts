@@ -122,6 +122,31 @@ export interface ImageOverlay {
   updatedAt: number;
 }
 
+// A background music/voiceover clip composited into the video's own audio track - same output-
+// timeline positioning as TextOverlay/ImageOverlay, but with a finite SOURCE file it plays a
+// sub-window of (trimStart) rather than an abstract, freely-stretchable time window - dragging an
+// edge on the timeline trims *into the source*, the same way a Clip's own start/end already does,
+// not just retiming an empty box the way text/image edges do. No `trimEnd` field: always derived
+// as `trimStart + (endTime - startTime)`, which structurally guarantees "1x playback, no time-
+// stretch" instead of needing two fields kept in sync by every mutation.
+export interface AudioOverlay {
+  id: string;
+  src: string;
+  startTime: number;
+  endTime: number;
+  trimStart: number;
+  // The source file's own full duration, fetched once (ffprobe, via get_conversion_info) at
+  // placement time - lets trim handles clamp against the source's real bounds without an async
+  // lookup on every drag frame.
+  sourceDuration: number;
+  volume: number; // 0..1, defaults to 1
+  fadeInSec?: number; // undefined/0 means no fade
+  fadeOutSec?: number;
+  muted?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 // What export_trimmed_video (Rust) actually consumes - plain, ordered [start,end) ranges, each
 // naming its own source file. Kept as a separate type from Clip (rather than reusing Clip
 // directly) so call sites are explicit about which shape they need; the id is UI-only and never
@@ -140,6 +165,14 @@ export interface VideoEditState {
   clips: Clip[];
   textOverlays: TextOverlay[];
   imageOverlays: ImageOverlay[];
+  audioOverlays: AudioOverlay[];
+  // The primary video's OWN audio level - distinct from any AudioOverlay's own volume/muted (those
+  // are separate mixed-in tracks; this is the original soundtrack that was always there). A plain
+  // pair of fields rather than an array item like the overlays above, matching the "one track"
+  // mental model VideoTimelineDocker's own trackVisible/trackLocked/trackMuted rail already assumes
+  // - there's only ever one of these per edit session, never a list.
+  videoAudioMuted: boolean;
+  videoAudioVolume: number; // 0..1, defaults to 1
   updatedAt: string;
 }
 
@@ -150,6 +183,9 @@ export interface EditableFields {
   clips: Clip[];
   textOverlays: TextOverlay[];
   imageOverlays: ImageOverlay[];
+  audioOverlays: AudioOverlay[];
+  videoAudioMuted: boolean;
+  videoAudioVolume: number;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -171,7 +207,11 @@ export interface VideoEditCommand {
     | "delete-text"
     | "add-image"
     | "edit-image"
-    | "delete-image";
+    | "delete-image"
+    | "add-audio"
+    | "edit-audio"
+    | "delete-audio"
+    | "edit-track-audio";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {
@@ -180,6 +220,9 @@ export function createEmptyState(sourcePath: string, duration: number): VideoEdi
     clips: [{ id: crypto.randomUUID(), sourcePath, start: 0, end: duration }],
     textOverlays: [],
     imageOverlays: [],
+    audioOverlays: [],
+    videoAudioMuted: false,
+    videoAudioVolume: 1,
     updatedAt: new Date().toISOString(),
   };
 }

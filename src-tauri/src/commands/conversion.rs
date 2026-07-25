@@ -496,6 +496,27 @@ pub struct OverlayImage {
     pub fade: bool,
 }
 
+// A background music/voiceover track to mix into the output's own audio - unlike OverlayImage,
+// there's no client-side rendering step for this at all: the frontend never touches the source
+// audio, it just names it (source_path) and passes the same trim/volume/fade parameters the
+// AudioOverlay/AudioOverlayPopover editing UI already tracks (see videoEditTypes.ts's AudioOverlay
+// and VideoTimelineDocker.tsx). trim_start/start_time/end_time are already resolved by the
+// frontend (start_time/end_time are output-timeline seconds, same space `segments` occupies;
+// trim_start is seconds into this track's own source file) - this command only builds the ffmpeg
+// filter chain from them, same "just compositing, no richer shape known here" split OverlayImage
+// already draws.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayAudio {
+    pub source_path: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub trim_start: f64,
+    pub volume: f64,
+    pub fade_in: f64,
+    pub fade_out: f64,
+}
+
 // Decodes one overlay's PNG payload and writes it to a fresh temp file - ffmpeg needs a real path
 // for `-i`, not a data URL. `data_base64` may carry a "data:image/png;base64," prefix (what
 // canvas.toDataURL() produces) or be the bare payload; splitting on the last comma handles both
@@ -535,10 +556,18 @@ pub async fn export_trimmed_video(
     output_base_path: String,
     segments: Vec<KeepSegment>,
     overlays: Vec<OverlayImage>,
+    audio_overlays: Vec<OverlayAudio>,
+    audio_muted: bool,
+    audio_volume: f64,
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
     }
+
+    // The primary video's OWN audio level (distinct from any audio overlay's own volume/muted,
+    // which are separate mixed-in tracks) - 0.0 when muted, otherwise whatever the editor's track
+    // volume slider was set to.
+    let effective_video_volume = if audio_muted { 0.0 } else { audio_volume.max(0.0) };
 
     let base = PathBuf::from(&output_base_path);
     let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -565,12 +594,22 @@ pub async fn export_trimmed_video(
         });
     }
 
-    let has_overlays = !overlays.is_empty();
+    // Audio overlays need no temp file and no -loop/-t pre_args at all, unlike the PNGs above -
+    // there's no client-side rendering step for audio (see OverlayAudio's own doc comment), so
+    // this just opens each track's original source file directly, atrim-ing into it in the filter
+    // graph below rather than pre-shaping the input stream itself.
+    for audio_ov in &audio_overlays {
+        inputs.push(InputSpec::plain(audio_ov.source_path.clone()));
+    }
 
-    let owned_args: Vec<String> = if segments.len() == 1 && !has_overlays {
-        // Unchanged fast path - nothing to composite, so no filter graph is needed at all.
+    let has_video_overlays = !overlays.is_empty();
+    let has_audio_overlays = !audio_overlays.is_empty();
+
+    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_audio_overlays {
+        // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
+        // filter graph needed just for it.
         let seg = &segments[0];
-        vec![
+        let mut args = vec![
             "-ss".into(), format!("{:.3}", seg.start),
             "-to".into(), format!("{:.3}", seg.end),
             "-c:v".into(), "libx264".into(),
@@ -579,7 +618,12 @@ pub async fn export_trimmed_video(
             "-c:a".into(), "aac".into(),
             "-b:a".into(), "128k".into(),
             "-movflags".into(), "+faststart".into(),
-        ]
+        ];
+        if (effective_video_volume - 1.0).abs() > 0.001 {
+            args.push("-af".into());
+            args.push(format!("volume={:.3}", effective_video_volume));
+        }
+        args
     } else {
         let mut filter = String::new();
 
@@ -634,12 +678,65 @@ pub async fn export_trimmed_video(
             ));
             current_label = next_label;
         }
-        // Multiple segments, no overlays: [base] from the concat above still needs to end up
+        // Multiple segments, no video overlays: [base] from the concat above still needs to end up
         // named [outv] for the -map below - the loop that would normally do that (ending on
-        // "outv") never runs when there are no overlays to chain.
-        if !has_overlays {
+        // "outv") never runs when there are no video overlays to chain.
+        if !has_video_overlays {
             filter.push_str("[base]copy[outv];");
         }
+
+        // Applies the track-level mute/volume to [outa] (the original video's own trimmed/
+        // concatenated audio, built above) before anything else reads it - both the no-overlays
+        // map below and the amix mixing block further down consume whichever label this produces.
+        // Skipped entirely (base_audio_label just stays "outa") when the volume is untouched, so a
+        // video nobody's adjusted this for doesn't grow an extra no-op filter node.
+        let base_audio_label = if (effective_video_volume - 1.0).abs() > 0.001 {
+            filter.push_str(&format!("[outa]volume={:.3}[outa_vol];", effective_video_volume));
+            "outa_vol"
+        } else {
+            "outa"
+        };
+
+        // Mixes each audio overlay into base_audio_label - amix's `normalize=0` is the detail that
+        // matters here: amix auto-attenuates every input by 1/inputs by default, which would
+        // quietly turn the original video's own audio down just because background music was
+        // added. normalize=0 keeps each track at whatever level its own `volume=` filter below
+        // already set (the track volume above for the original track, whatever the user picked for
+        // each overlay) - "30% volume" means 30%, not 30% further divided by however many tracks
+        // happen to be mixed in.
+        let audio_label = if has_audio_overlays {
+            let audio_input_base = segments.len() + overlays.len();
+            let mut mix_inputs = format!("[{}]", base_audio_label);
+            for (i, audio_ov) in audio_overlays.iter().enumerate() {
+                let input_index = audio_input_base + i;
+                let trim_end = audio_ov.trim_start + (audio_ov.end_time - audio_ov.start_time);
+                let mut chain = format!(
+                    "[{}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,volume={:.3}",
+                    input_index, audio_ov.trim_start, trim_end, audio_ov.volume
+                );
+                if audio_ov.fade_in > 0.0 {
+                    chain.push_str(&format!(",afade=t=in:st=0:d={:.3}", audio_ov.fade_in));
+                }
+                if audio_ov.fade_out > 0.0 {
+                    let track_duration = audio_ov.end_time - audio_ov.start_time;
+                    let fade_out_start = (track_duration - audio_ov.fade_out).max(0.0);
+                    chain.push_str(&format!(",afade=t=out:st={:.3}:d={:.3}", fade_out_start, audio_ov.fade_out));
+                }
+                let delay_ms = (audio_ov.start_time * 1000.0).round().max(0.0);
+                let track_label = format!("aov{}", i);
+                filter.push_str(&format!("{},adelay={:.0}:all=1[{}];", chain, delay_ms, track_label));
+                mix_inputs.push_str(&format!("[{}]", track_label));
+            }
+            filter.push_str(&format!(
+                "{}amix=inputs={}:duration=first:dropout_transition=0:normalize=0[outa_mixed];",
+                mix_inputs,
+                audio_overlays.len() + 1
+            ));
+            "outa_mixed".to_string()
+        } else {
+            base_audio_label.to_string()
+        };
+
         // Trailing `;` is harmless to ffmpeg either way, but trimmed for consistency with how the
         // original concat-only filter string here was always built without one.
         let filter = filter.trim_end_matches(';').to_string();
@@ -647,7 +744,7 @@ pub async fn export_trimmed_video(
         vec![
             "-filter_complex".into(), filter,
             "-map".into(), "[outv]".into(),
-            "-map".into(), "[outa]".into(),
+            "-map".into(), format!("[{}]", audio_label),
             "-c:v".into(), "libx264".into(),
             "-preset".into(), "medium".into(),
             "-crf".into(), "23".into(),

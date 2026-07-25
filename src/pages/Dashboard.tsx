@@ -2056,6 +2056,8 @@ const setScreen = () => {
                       )
                     : undefined
                 }
+                trackVolume={editStore.videoAudioVolume}
+                trackMuted={editStore.videoAudioMuted}
               />
             )
           ) : (

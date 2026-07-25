@@ -94,6 +94,14 @@ interface VideoPlayerProps {
   // without re-measuring it independently. Keeps VideoPlayer itself fully generic - it has no
   // idea what's actually being rendered inside (text overlays, or anything else later).
   overlay?: (frameRect: FrameRect) => React.ReactNode;
+  // The primary video's own persisted/exported audio level (useVideoEditStore's
+  // videoAudioMuted/videoAudioVolume) - distinct from this component's own volume slider/mute
+  // button just below, which is pure local listening convenience that never leaves this session.
+  // Applied multiplicatively on top of that local volume (see the effect that computes .volume),
+  // so turning either one down is audible, and the local control never overrides what the track
+  // itself is actually set to.
+  trackVolume?: number; // 0..1, defaults to 1
+  trackMuted?: boolean;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -115,7 +123,7 @@ export interface VideoPlayerHandle {
   loadSource: (src: string, seekTime: number) => void;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -406,10 +414,24 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const handleVolumeChange = (e: ChangeEvent<HTMLInputElement>): void => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
     const newVolume = parseFloat(e.target.value);
+    // Only updates local intent here - the effect below (keyed on [volume, trackVolume,
+    // trackMuted]) is what actually writes video.volume, combined with the track-level level, so
+    // there's one single place that ever does that DOM write. volumeLevel (the speaker icon) is
+    // left to the existing native 'volumechange' listener further down, which already resyncs it
+    // from the real (combined) video.volume whenever it changes for any reason - setting it here
+    // too, from the un-combined newVolume, would just flicker to the wrong icon for a frame.
     setVolumeState(newVolume);
-    setVolume(videoRef.current, newVolume);
-    setVolumeLevel(getVolumeLevel(newVolume, videoRef.current?.muted ?? false));
   };
+
+  // Actual video.volume is always the LOCAL listening volume times the track-level one (see
+  // VideoPlayerProps.trackVolume's own doc comment) - the one place either axis actually reaches
+  // the DOM, so the local slider and the persisted/exported track level can never fight over it.
+  // trackMuted collapses this to 0 outright rather than touching video.muted - silence from a 0
+  // volume and silence from the muted flag are indistinguishable to the ear, so there's no need to
+  // juggle two separate "why is this silent" states for what the local mute button already owns.
+  useEffect(() => {
+    setVolume(videoRef.current, volume * (trackMuted ? 0 : trackVolume));
+  }, [volume, trackVolume, trackMuted]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);
