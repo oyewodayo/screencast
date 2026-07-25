@@ -6,6 +6,7 @@ import { Clip, EditableFields, ImageOverlay, TextOverlay, VideoEditCommand, Vide
 import {
   applyCommand,
   addOverlay,
+  bringOverlayToFront,
   deleteClipAt as deleteClipAtHandler,
   deleteOverlay,
   duplicateOverlay,
@@ -16,6 +17,7 @@ import {
   reorderClip as reorderClipHandler,
   resizeClipEdge as resizeClipEdgeHandler,
   resizeOverlayTime,
+  sendOverlayToBack,
   splitClipAt,
   toKeepSegments,
   updateOverlay,
@@ -52,7 +54,9 @@ async function fetchDuration(path: string): Promise<number | null> {
 type TextOverlayContentPatch = Partial<
   Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize">
 >;
-type ImageOverlayContentPatch = Partial<Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow">>;
+type ImageOverlayContentPatch = Partial<
+  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src">
+>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -82,6 +86,10 @@ export interface UseVideoEditStoreResult {
   // Clones the overlay (new id, nudged position, same everything else - see duplicateOverlay in
   // videoEditHandlers.ts) and returns the copy's id so the caller can select it right away.
   duplicateTextOverlay: (id: string) => string;
+  // Reorders within textOverlays only - array order is what determines stacking (later renders on
+  // top), and text/image overlays are separate render passes, so this never crosses kinds.
+  bringTextOverlayToFront: (id: string) => void;
+  sendTextOverlayToBack: (id: string) => void;
   // Same shape as the text-overlay methods above, minus a "content-only, no id yet" add step -
   // an image overlay's identity (the file it points at) is only known once a file's been picked,
   // so it's created with its full src/geometry in one call rather than an empty placeholder.
@@ -91,6 +99,8 @@ export interface UseVideoEditStoreResult {
   moveImageOverlayTime: (id: string, newStartTime: number) => void;
   deleteImageOverlay: (id: string) => void;
   duplicateImageOverlay: (id: string) => string;
+  bringImageOverlayToFront: (id: string) => void;
+  sendImageOverlayToBack: (id: string) => void;
   // Called once the real video duration is known (from the hidden capture <video>'s
   // loadedmetadata) - only seeds a fresh, unedited state; a no-op once real state exists (either
   // loaded from the sidecar or already seeded), so it's safe to call on every metadata load.
@@ -398,6 +408,28 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const bringTextOverlayToFront = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const textOverlays = bringOverlayToFront(current.textOverlays, id);
+      if (textOverlays === current.textOverlays) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "edit-text");
+    },
+    [pushCommand]
+  );
+
+  const sendTextOverlayToBack = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const textOverlays = sendOverlayToBack(current.textOverlays, id);
+      if (textOverlays === current.textOverlays) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "edit-text");
+    },
+    [pushCommand]
+  );
+
   const addImageOverlay = useCallback(
     (src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number): string => {
       const current = stateRef.current;
@@ -460,6 +492,28 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const imageOverlays = addOverlay(current.imageOverlays, copy);
       pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "add-image");
       return copy.id;
+    },
+    [pushCommand]
+  );
+
+  const bringImageOverlayToFront = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const imageOverlays = bringOverlayToFront(current.imageOverlays, id);
+      if (imageOverlays === current.imageOverlays) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
+    },
+    [pushCommand]
+  );
+
+  const sendImageOverlayToBack = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const imageOverlays = sendOverlayToBack(current.imageOverlays, id);
+      if (imageOverlays === current.imageOverlays) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
     },
     [pushCommand]
   );
@@ -587,12 +641,16 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     moveTextOverlayTime,
     deleteTextOverlay,
     duplicateTextOverlay,
+    bringTextOverlayToFront,
+    sendTextOverlayToBack,
     addImageOverlay,
     updateImageOverlayContent,
     resizeImageOverlayTime,
     moveImageOverlayTime,
     deleteImageOverlay,
     duplicateImageOverlay,
+    bringImageOverlayToFront,
+    sendImageOverlayToBack,
     setDuration,
     getSourceDuration,
     splitAt,

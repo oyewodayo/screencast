@@ -58,7 +58,10 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
   const { lines, lineHeight, height: textHeightPx } = measureTextBlock(overlay.text, fontSizePx, maxWidthPx);
   if (maxWidthPx <= 0 || textHeightPx <= 0) return null;
 
-  const padding = 2;
+  // Mirrors VideoOverlayLayer's own read-only render: undefined means the pre-existing fixed 2px
+  // look, otherwise a frameRect.height fraction (same basis as fontSize) - see TextOverlay.padding's
+  // own doc comment.
+  const padding = overlay.padding !== undefined ? overlay.padding * framePixelHeight : 2;
   const canvasWidth = Math.max(1, Math.ceil(maxWidthPx + padding * 2));
   const canvasHeight = Math.max(1, Math.ceil(textHeightPx + padding * 2));
 
@@ -228,6 +231,11 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
   ctx.globalAlpha = overlay.opacity;
   roundedRectPath(ctx, -w / 2, -h / 2, w, h, radius);
   ctx.clip();
+  // Flip only affects the drawImage call, not the shadow/border shapes just above/below (which
+  // are symmetric rectangles a mirror wouldn't visibly change anyway) - matches the preview, where
+  // flip lives on the <img> itself rather than its container (see VideoOverlayLayer's own comment
+  // on that same split).
+  if (overlay.flipHorizontal || overlay.flipVertical) ctx.scale(overlay.flipHorizontal ? -1 : 1, overlay.flipVertical ? -1 : 1);
   ctx.drawImage(img, -w / 2, -h / 2, w, h);
   ctx.restore();
 

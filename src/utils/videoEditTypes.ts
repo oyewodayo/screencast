@@ -57,6 +57,12 @@ export interface TextOverlay {
   strokeWidth?: number;
   cornerStyle?: TextOverlayCornerStyle; // undefined means "square", the pre-existing look
   animation?: TextOverlayAnimation; // undefined means "none", the pre-existing look
+  // Breathing room around the text inside its box, most visible with backgroundColor/stroke set -
+  // fraction of frameRect.height (same basis as fontSize, not width - padding is a vertical-scale
+  // concept here). Undefined means the pre-existing fixed 2px look, both in the live preview
+  // (VideoOverlayLayer) and export burn-in (videoOverlayRender.ts) - kept as a fraction rather than
+  // raw px so it scales consistently with the frame the same way fontSize/x/y already do.
+  padding?: number;
   // Normalized 0..1 fractions of the letterboxed VIDEO FRAME (not the player container) - stays
   // pixel-stable relative to the actual picture regardless of window size/fullscreen, since
   // object-fit:contain preserves the frame's own aspect ratio. y-down (top edge), unlike
@@ -94,6 +100,8 @@ export interface ImageOverlay {
   rotation?: number; // degrees, clockwise; undefined means 0
   borderColor?: string; // undefined means no border
   shadow?: boolean; // undefined/false means no drop shadow
+  flipHorizontal?: boolean; // undefined/false means not mirrored
+  flipVertical?: boolean;
   startTime: number;
   endTime: number;
   createdAt: number;

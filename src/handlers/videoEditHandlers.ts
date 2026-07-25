@@ -204,3 +204,27 @@ export function duplicateOverlay<T extends { id: string; x: number; y: number; c
     updatedAt: now,
   };
 }
+
+// Stacking order within one overlay kind's own array is just array order (later = rendered on
+// top - see VideoOverlayLayer's activeOverlays/activeImageOverlays .map() calls) - "front"/"back"
+// are therefore just "move to the end"/"move to the start" of that same array. Note text and
+// image overlays are two entirely separate render passes (all images render, then all text -
+// see VideoOverlayLayer's return), so these only ever reorder within one kind; there's no single
+// combined z-order across both yet.
+export function bringOverlayToFront<T extends { id: string }>(overlays: T[], id: string): T[] {
+  const index = overlays.findIndex((o) => o.id === id);
+  if (index === -1 || index === overlays.length - 1) return overlays;
+  const next = [...overlays];
+  const [item] = next.splice(index, 1);
+  next.push(item);
+  return next;
+}
+
+export function sendOverlayToBack<T extends { id: string }>(overlays: T[], id: string): T[] {
+  const index = overlays.findIndex((o) => o.id === id);
+  if (index <= 0) return overlays;
+  const next = [...overlays];
+  const [item] = next.splice(index, 1);
+  next.unshift(item);
+  return next;
+}

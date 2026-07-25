@@ -34,6 +34,12 @@ import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 export const DEFAULT_OVERLAY_WIDTH_FRACTION = 0.4;
 export const DEFAULT_OVERLAY_FONT_FRACTION = 0.06;
 export const DEFAULT_OVERLAY_DURATION_SEC = 5;
+// The padding every text overlay had before `padding` existed as its own field (a plain 2px,
+// unaffected by frame size) - expressed as a frameRect.height fraction so newly-opened editing
+// sessions (which stage padding as a fraction, same basis as fontSize) start from the exact same
+// visual size old overlays already render at, rather than a value that would visibly jump the box
+// the moment you touch any other field on the same overlay.
+const legacyPaddingFraction = (frameHeightPx: number): number => (frameHeightPx > 0 ? 2 / frameHeightPx : 0);
 const DEFAULT_IMAGE_WIDTH_FRACTION = 0.25;
 const MIN_IMAGE_WIDTH_PX = 24;
 // First/last this many seconds of an overlay's time range ramp opacity for the "fade" animation -
@@ -67,9 +73,12 @@ type TextOverlayContentPatch = Partial<
     | "width"
     | "height"
     | "fontSize"
+    | "padding"
   >
 >;
-type ImageOverlayContentPatch = Partial<Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow">>;
+type ImageOverlayContentPatch = Partial<
+  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src">
+>;
 // "rounded" is a flat px amount (converted to a frameRect.height fraction at click time) rather
 // than scaling with the image's own size - same known simplification as the text overlay's own
 // "rounded" corner option (see CORNER_OPTIONS above), simpler than keeping a radius visually
@@ -78,6 +87,12 @@ type ImageOverlayContentPatch = Partial<Pick<ImageOverlay, "x" | "y" | "width" |
 // it off proportionally; acceptable for what's meant to be a quick decorative toggle, not a
 // tracked corner-shape mode.
 const IMAGE_ROUNDED_CORNER_PX = 12;
+
+// Shared by the rotate handle's own position (per-overlay, in the render loop below) and the style
+// panel's position (so the panel can reserve enough room above the box to clear the handle instead
+// of drawing directly on top of it) - see rotateHandleRise's own inline comment for why the rise
+// itself is clamped this way against .video-container's overflow:hidden.
+const rotateHandleRiseFor = (roomAbovePx: number): number => Math.min(32, Math.max(10, roomAbovePx - 2));
 
 // Local, not-yet-persisted position/size for whichever text overlay is currently open for editing
 // - same reasoning as PdfPage's EditingTextState: position/size come from drag/resize handles and
@@ -90,6 +105,12 @@ interface EditingOverlayState {
   y: number;
   width: number;
   fontSize: number;
+  // Fraction of frameRect.height, same basis as fontSize (see TextOverlay.padding's own comment) -
+  // staged here rather than patched straight to the store like the other style-panel buttons below,
+  // since (unlike a discrete one-click style choice) this is meant to be scrubbed/typed
+  // continuously and should land as one undo step alongside the rest of this edit, not one per
+  // pixel dragged.
+  padding: number;
 }
 
 interface VideoOverlayLayerProps {
@@ -111,6 +132,8 @@ interface VideoOverlayLayerProps {
   onUpdateTextOverlayContent: (id: string, patch: TextOverlayContentPatch) => void;
   onDeleteTextOverlay: (id: string) => void;
   onDuplicateTextOverlay: (id: string) => void;
+  onBringTextOverlayToFront: (id: string) => void;
+  onSendTextOverlayToBack: (id: string) => void;
   // Image tool armed the same way, but consumed immediately (opens the file picker as soon as
   // it's armed - no click-on-video step, unlike text, since an image's aspect ratio isn't known
   // until a file's actually picked, so there's nothing useful a pre-pick click position would add).
@@ -123,7 +146,116 @@ interface VideoOverlayLayerProps {
   // duplicate UI for.
   onDeleteImageOverlay: (id: string) => void;
   onDuplicateImageOverlay: (id: string) => void;
+  onBringImageOverlayToFront: (id: string) => void;
+  onSendImageOverlayToBack: (id: string) => void;
 }
+
+// A pill-shaped numeric control combining two interactions in one target: drag left/right to
+// scrub the value (the safe control style established for this panel - see the removed
+// beginFontSizeDrag's old comment, still true below - a native <input> stealing focus would blur
+// TextNoteEditor's textarea and force-commit/close the whole editing session out from under it),
+// OR click without dragging to type an exact value instead. Typing never focuses a real DOM
+// element either - a document-level keydown listener (capture phase) intercepts digits while in
+// edit mode and preventDefault+stopPropagation keeps them from reaching whatever's actually
+// focused (the textarea), so this can sit right next to TextNoteEditor without ever touching its
+// focus. Purely local/session state in the caller (onChangePx) - this component holds no value of
+// its own beyond the transient drag/typing buffer.
+interface ScrubNumberFieldProps {
+  valuePx: number;
+  min: number;
+  max: number;
+  title: string;
+  onChangePx: (px: number) => void;
+}
+const ScrubNumberField: React.FC<ScrubNumberFieldProps> = ({ valuePx, min, max, title, onChangePx }) => {
+  const [drag, setDrag] = useState<null | { startClientX: number; startValue: number; moved: boolean }>(null);
+  const [editText, setEditText] = useState<string | null>(null);
+
+  const beginDrag = (e: React.PointerEvent) => {
+    if (editText != null) {
+      e.stopPropagation();
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    setDrag({ startClientX: e.clientX, startValue: valuePx, moved: false });
+  };
+  const handleDragMove = (e: React.PointerEvent) => {
+    if (!drag) return;
+    e.stopPropagation();
+    const dx = e.clientX - drag.startClientX;
+    if (!drag.moved && Math.abs(dx) > 3) setDrag((prev) => (prev ? { ...prev, moved: true } : prev));
+    onChangePx(Math.max(min, Math.min(max, Math.round(drag.startValue + dx))));
+  };
+  const endDrag = () => {
+    if (!drag) return;
+    const wasClick = !drag.moved;
+    setDrag(null);
+    if (wasClick) setEditText(String(valuePx));
+  };
+
+  const commitEdit = useCallback(() => {
+    setEditText((current) => {
+      if (current != null && current.length > 0) {
+        const parsed = parseInt(current, 10);
+        if (Number.isFinite(parsed)) onChangePx(Math.max(min, Math.min(max, parsed)));
+      }
+      return null;
+    });
+  }, [min, max, onChangePx]);
+
+  useEffect(() => {
+    if (editText == null) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key >= "0" && e.key <= "9") {
+        e.preventDefault();
+        e.stopPropagation();
+        setEditText((prev) => ((prev ?? "") + e.key).slice(0, 4));
+      } else if (e.key === "Backspace") {
+        e.preventDefault();
+        e.stopPropagation();
+        setEditText((prev) => (prev ?? "").slice(0, -1));
+      } else if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        e.stopPropagation();
+        commitEdit();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        setEditText(null);
+      } else {
+        // Blocks everything else (e.g. plain letters) from leaking through to whatever's actually
+        // focused underneath while this field is "typing" - it never takes real focus itself.
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => document.removeEventListener("keydown", handleKeyDown, true);
+  }, [editText, commitEdit]);
+
+  useEffect(() => {
+    if (editText == null) return;
+    document.addEventListener("pointerdown", commitEdit);
+    return () => document.removeEventListener("pointerdown", commitEdit);
+  }, [editText, commitEdit]);
+
+  return (
+    <div
+      onPointerDown={beginDrag}
+      onPointerMove={handleDragMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      title={editText != null ? "Type a value, Enter to confirm" : title}
+      className={`w-11 h-5 px-1 rounded text-[10px] text-white flex items-center justify-center select-none ${
+        editText != null ? "bg-blue-500/30 ring-1 ring-blue-400 cursor-text" : "bg-white/10 cursor-ew-resize"
+      }`}
+    >
+      {editText != null ? `${editText}px` : `${valuePx}px`}
+    </div>
+  );
+};
 
 const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   frameRect,
@@ -141,12 +273,16 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onUpdateTextOverlayContent,
   onDeleteTextOverlay,
   onDuplicateTextOverlay,
+  onBringTextOverlayToFront,
+  onSendTextOverlayToBack,
   isPlacingImage,
   onPlacementImageConsumed,
   onAddImageOverlay,
   onUpdateImageOverlayContent,
   onDeleteImageOverlay,
   onDuplicateImageOverlay,
+  onBringImageOverlayToFront,
+  onSendImageOverlayToBack,
 }) => {
   const [editingOverlay, setEditingOverlay] = useState<EditingOverlayState | null>(null);
   const editingOverlayRef = useRef(editingOverlay);
@@ -209,6 +345,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       width: session.width,
       fontSize: session.fontSize,
       height: frameRect.height > 0 ? heightPx / frameRect.height : session.fontSize * 1.3,
+      padding: session.padding,
     });
   }, [frameRect, onSelectOverlay, onUpdateTextOverlayContent, onDeleteTextOverlay]);
 
@@ -245,7 +382,15 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     liveBoldRunsRef.current = existing.boldRuns ?? [];
     liveItalicRunsRef.current = existing.italicRuns ?? [];
     liveTextAlignRef.current = existing.textAlign ?? "left";
-    setEditingOverlay({ id: existing.id, isNew: false, x: existing.x, y: existing.y, width: existing.width, fontSize: existing.fontSize });
+    setEditingOverlay({
+      id: existing.id,
+      isNew: false,
+      x: existing.x,
+      y: existing.y,
+      width: existing.width,
+      fontSize: existing.fontSize,
+      padding: existing.padding ?? legacyPaddingFraction(frameRect.height),
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedOverlayId]);
 
@@ -313,11 +458,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       liveBoldRunsRef.current = [];
       liveItalicRunsRef.current = [];
       liveTextAlignRef.current = "left";
-      setEditingOverlay({ id, isNew: true, x: nx, y: ny, width, fontSize });
+      setEditingOverlay({ id, isNew: true, x: nx, y: ny, width, fontSize, padding: legacyPaddingFraction(frameRect.height) });
       onSelectOverlay(id);
       onPlacementConsumed();
     },
-    [currentOutputTime, totalOutputDuration, onAddTextOverlay, onSelectOverlay, onPlacementConsumed]
+    [currentOutputTime, totalOutputDuration, onAddTextOverlay, onSelectOverlay, onPlacementConsumed, frameRect]
   );
 
   // Everything the image-placement effect below needs, refreshed every render but read through a
@@ -411,15 +556,32 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   const imageDragRafRef = useRef<number | null>(null);
   const imageDragLatestRef = useRef<{ clientX: number; clientY: number } | null>(null);
 
-  const [imageResizeDrag, setImageResizeDrag] = useState<null | { id: string; startClientX: number; startWidthPx: number; aspect: number; liveWidthPx: number }>(null);
+  // Whether the corner handle's drag preserves the image's own aspect ratio - a toggle in the
+  // style panel, not a per-overlay stored property, since it's how the *next* resize interaction
+  // behaves rather than a lasting trait of the overlay itself. Captured into the drag state at
+  // the moment a resize begins (not read live mid-drag) so flipping it while a drag is already in
+  // progress can't reinterpret deltas that were already applied under the old mode.
+  const [aspectLocked, setAspectLocked] = useState(true);
+
+  const [imageResizeDrag, setImageResizeDrag] = useState<null | {
+    id: string;
+    startClientX: number;
+    startClientY: number;
+    startWidthPx: number;
+    startHeightPx: number;
+    aspect: number;
+    aspectLocked: boolean;
+    liveWidthPx: number;
+    liveHeightPx: number;
+  }>(null);
   const imageResizeRafRef = useRef<number | null>(null);
-  const imageResizeLatestRef = useRef<number | null>(null);
+  const imageResizeLatestRef = useRef<{ clientX: number; clientY: number } | null>(null);
 
   const [imageRotateDrag, setImageRotateDrag] = useState<null | { id: string; centerX: number; centerY: number; startAngle: number; startRotation: number; liveRotation: number }>(
     null
   );
   const imageRotateRafRef = useRef<number | null>(null);
-  const imageRotateLatestRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const imageRotateLatestRef = useRef<{ clientX: number; clientY: number; shiftKey: boolean } | null>(null);
 
   // Cancels any still-pending animation frame from an interrupted drag on unmount (e.g. switching
   // files mid-drag) - without this a late rAF callback could fire after the component's gone,
@@ -472,18 +634,41 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     onSelectImageOverlay(overlay.id);
     const startWidthPx = overlay.width * frameRect.width;
     const startHeightPx = overlay.height * frameRect.height;
-    setImageResizeDrag({ id: overlay.id, startClientX: e.clientX, startWidthPx, aspect: startHeightPx > 0 ? startWidthPx / startHeightPx : 1, liveWidthPx: startWidthPx });
+    setImageResizeDrag({
+      id: overlay.id,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      startWidthPx,
+      startHeightPx,
+      aspect: startHeightPx > 0 ? startWidthPx / startHeightPx : 1,
+      aspectLocked,
+      liveWidthPx: startWidthPx,
+      liveHeightPx: startHeightPx,
+    });
   };
   const handleImageResizeDragMove = (e: React.PointerEvent) => {
     if (!imageResizeDrag) return;
     e.stopPropagation();
-    imageResizeLatestRef.current = e.clientX;
+    imageResizeLatestRef.current = { clientX: e.clientX, clientY: e.clientY };
     if (imageResizeRafRef.current != null) return;
     imageResizeRafRef.current = requestAnimationFrame(() => {
       imageResizeRafRef.current = null;
-      const latestClientX = imageResizeLatestRef.current;
-      if (latestClientX == null) return;
-      setImageResizeDrag((prev) => (prev ? { ...prev, liveWidthPx: Math.max(MIN_IMAGE_WIDTH_PX, prev.startWidthPx + (latestClientX - prev.startClientX)) } : prev));
+      const latest = imageResizeLatestRef.current;
+      if (!latest) return;
+      setImageResizeDrag((prev) => {
+        if (!prev) return prev;
+        const dx = latest.clientX - prev.startClientX;
+        if (prev.aspectLocked) {
+          const liveWidthPx = Math.max(MIN_IMAGE_WIDTH_PX, prev.startWidthPx + dx);
+          return { ...prev, liveWidthPx, liveHeightPx: liveWidthPx / prev.aspect };
+        }
+        const dy = latest.clientY - prev.startClientY;
+        return {
+          ...prev,
+          liveWidthPx: Math.max(MIN_IMAGE_WIDTH_PX, prev.startWidthPx + dx),
+          liveHeightPx: Math.max(MIN_IMAGE_WIDTH_PX, prev.startHeightPx + dy),
+        };
+      });
     });
   };
   const endImageResizeDrag = () => {
@@ -492,9 +677,9 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       cancelAnimationFrame(imageResizeRafRef.current);
       imageResizeRafRef.current = null;
     }
-    if (frameRect.width > 0) {
-      const { id, liveWidthPx, aspect } = imageResizeDrag;
-      onUpdateImageOverlayContent(id, { width: liveWidthPx / frameRect.width, height: liveWidthPx / aspect / frameRect.height });
+    if (frameRect.width > 0 && frameRect.height > 0) {
+      const { id, liveWidthPx, liveHeightPx } = imageResizeDrag;
+      onUpdateImageOverlayContent(id, { width: liveWidthPx / frameRect.width, height: liveHeightPx / frameRect.height });
     }
     setImageResizeDrag(null);
   };
@@ -514,10 +699,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     const startRotation = overlay.rotation ?? 0;
     setImageRotateDrag({ id: overlay.id, centerX, centerY, startAngle, startRotation, liveRotation: startRotation });
   };
+  const ROTATE_SNAP_DEGREES = 15;
   const handleImageRotateDragMove = (e: React.PointerEvent) => {
     if (!imageRotateDrag) return;
     e.stopPropagation();
-    imageRotateLatestRef.current = { clientX: e.clientX, clientY: e.clientY };
+    imageRotateLatestRef.current = { clientX: e.clientX, clientY: e.clientY, shiftKey: e.shiftKey };
     if (imageRotateRafRef.current != null) return;
     imageRotateRafRef.current = requestAnimationFrame(() => {
       imageRotateRafRef.current = null;
@@ -526,7 +712,10 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       setImageRotateDrag((prev) => {
         if (!prev) return prev;
         const angle = (Math.atan2(latest.clientY - prev.centerY, latest.clientX - prev.centerX) * 180) / Math.PI;
-        const rotation = (((prev.startRotation + (angle - prev.startAngle)) % 360) + 360) % 360;
+        let rotation = (((prev.startRotation + (angle - prev.startAngle)) % 360) + 360) % 360;
+        // Shift held snaps to 15deg increments - the common "hold to constrain" convention most
+        // design tools use for rotation, handy for landing exactly on 0/45/90/etc. by feel.
+        if (latest.shiftKey) rotation = (Math.round(rotation / ROTATE_SNAP_DEGREES) * ROTATE_SNAP_DEGREES) % 360;
         return { ...prev, liveRotation: rotation };
       });
     });
@@ -542,14 +731,46 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     onUpdateImageOverlayContent(id, { rotation: liveRotation });
   };
 
+  // Swaps the picture a placed image overlay points at while keeping everything else about it -
+  // position, size, rotation, corner radius, border, shadow - exactly as it was, rather than the
+  // delete-and-re-add-from-scratch that was previously the only way to change a picked image.
+  const handleReplaceImage = useCallback(
+    async (id: string) => {
+      try {
+        const selected = await openFileDialog({ multiple: false, filters: [{ name: "Image", extensions: FILE_CATEGORY_EXTENSIONS.image }] });
+        if (!selected || Array.isArray(selected)) return; // cancelled
+        onUpdateImageOverlayContent(id, { src: selected });
+      } catch (err) {
+        console.error("Failed to replace image overlay:", err);
+      }
+    },
+    [onUpdateImageOverlayContent]
+  );
+
   const activeOverlays = overlaysActiveAt(overlays, currentOutputTime);
   const editingSession = editingOverlay && activeOverlays.some((o) => o.id === editingOverlay.id) ? editingOverlay : null;
   const editingOverlayData = editingSession ? overlays.find((o) => o.id === editingSession.id) : undefined;
 
+  // Force-commits an in-progress edit the instant the playhead moves outside this overlay's own
+  // time range while it's still open (scrubbing away, or just letting playback run past a short
+  // caption) - editingSession above already stops rendering TextNoteEditor at that point, which
+  // unmounts it, but a plain unmount can't be trusted to reliably fire the textarea's own blur-to-
+  // commit first (removing a focused element from the DOM doesn't guarantee a blur event across
+  // every removal path). This calls the exact same commitEditingOverlay a deliberate blur/Escape
+  // already does, from here instead, so nothing typed is ever lost to the timing of a browser
+  // event that was never actually guaranteed. Only fires on the non-null -> null transition
+  // (editingOverlay still set but editingSession just became null) - an explicit commit/cancel
+  // already sets editingOverlay itself to null, which short-circuits this before it can re-fire.
+  useEffect(() => {
+    if (editingOverlay && !editingSession) {
+      commitEditingOverlay();
+    }
+  }, [editingOverlay, editingSession, commitEditingOverlay]);
+
   const activeImageOverlays = overlaysActiveAt(imageOverlays, currentOutputTime).map((o) => {
     if (imageDrag && o.id === imageDrag.id) return { ...o, x: imageDrag.liveX, y: imageDrag.liveY };
-    if (imageResizeDrag && o.id === imageResizeDrag.id && frameRect.width > 0) {
-      return { ...o, width: imageResizeDrag.liveWidthPx / frameRect.width, height: imageResizeDrag.liveWidthPx / imageResizeDrag.aspect / frameRect.height };
+    if (imageResizeDrag && o.id === imageResizeDrag.id && frameRect.width > 0 && frameRect.height > 0) {
+      return { ...o, width: imageResizeDrag.liveWidthPx / frameRect.width, height: imageResizeDrag.liveHeightPx / frameRect.height };
     }
     if (imageRotateDrag && o.id === imageRotateDrag.id) return { ...o, rotation: imageRotateDrag.liveRotation };
     return o;
@@ -578,8 +799,16 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   // Same .video-container overflow:hidden clipping the rotate handle's own comment explains -
   // a style panel anchored purely above a box (topPx - PANEL_HEIGHT_PX) silently disappears once
   // that box sits close enough to the frame's top edge. Flips to sitting just below the box's own
-  // bottom edge instead once there isn't room above, rather than letting it clip.
-  const panelTopPx = (topPx: number, boxHeightPx: number): number => (topPx >= PANEL_HEIGHT_PX ? topPx - PANEL_HEIGHT_PX : topPx + boxHeightPx + 6);
+  // bottom edge instead once there isn't room above, rather than letting it clip. extraClearanceAbove
+  // reserves additional room between the panel's bottom edge and the box's top edge - the image
+  // panel passes the rotate handle's own rise + its grip radius here, since both the panel and the
+  // handle used to anchor to the same spot right above the box and the panel (rendered later in DOM,
+  // with an explicit z-index) was painting directly over the handle, making it unreachable/invisible
+  // even though it was still there.
+  const panelTopPx = (topPx: number, boxHeightPx: number, extraClearanceAbove: number = 0): number => {
+    const spaceNeededAbove = PANEL_HEIGHT_PX + extraClearanceAbove;
+    return topPx >= spaceNeededAbove ? topPx - PANEL_HEIGHT_PX - extraClearanceAbove : topPx + boxHeightPx + 6;
+  };
 
   const placingAnything = isPlacingText || isPlacingImage;
 
@@ -605,6 +834,41 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     else onSelectImageOverlay(id);
     setContextMenu({ kind, id, clientX: e.clientX, clientY: e.clientY });
   };
+
+  // Arrow-key nudging for the selected image overlay, 1px per press / 10px with Shift held - the
+  // usual precision-positioning convention. Deliberately scoped to *image* overlays only: a
+  // selected text overlay always has its own TextNoteEditor open with its textarea auto-focused
+  // (selecting one *is* opening it for editing - see the "seed local editing state" effect
+  // above), and that textarea already stopPropagation()s every keydown specifically so arrow keys
+  // move the caret instead of leaking out to a listener like this one; there's no equivalent
+  // focus-trap for images; to nudge, so this is where it's safe to add.
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!selectedImageOverlayId) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+      if (frameRect.width <= 0 || frameRect.height <= 0) return;
+      const overlay = imageOverlays.find((o) => o.id === selectedImageOverlayId);
+      if (!overlay) return;
+
+      e.preventDefault();
+      const stepPx = e.shiftKey ? 10 : 1;
+      let dxPx = 0;
+      let dyPx = 0;
+      if (e.key === "ArrowLeft") dxPx = -stepPx;
+      else if (e.key === "ArrowRight") dxPx = stepPx;
+      else if (e.key === "ArrowUp") dyPx = -stepPx;
+      else dyPx = stepPx;
+
+      onUpdateImageOverlayContent(overlay.id, {
+        x: Math.max(0, Math.min(1, overlay.x + dxPx / frameRect.width)),
+        y: Math.max(0, Math.min(1, overlay.y + dyPx / frameRect.height)),
+      });
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [selectedImageOverlayId, imageOverlays, frameRect, onUpdateImageOverlayContent]);
 
   return (
     <>
@@ -633,7 +897,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         // Clamping the rise to whatever room is actually available keeps the handle grabbable
         // (even if that means it sits closer to, or slightly over, the image) instead of vanishing.
         const roomAbovePx = o.y * frameRect.height;
-        const rotateHandleRise = Math.min(32, Math.max(10, roomAbovePx - 2));
+        const rotateHandleRise = rotateHandleRiseFor(roomAbovePx);
         const showRotateStem = roomAbovePx >= 32;
         return (
           <div
@@ -653,10 +917,16 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               opacity: o.opacity,
               borderRadius: radiusPx,
               transform: o.rotation ? `rotate(${o.rotation}deg)` : undefined,
-              // Border (inset) and drop shadow (outer) combine into one box-shadow rather than a
-              // real `border` - a real border adds to the box's layout size unless box-sizing is
-              // pinned, and box-shadow already composes multiple layers for free via commas.
-              boxShadow: [o.borderColor ? `inset 0 0 0 3px ${o.borderColor}` : null, o.shadow ? "0 6px 16px rgba(0,0,0,0.45)" : null].filter(Boolean).join(", ") || undefined,
+              // Border and drop shadow combine into one box-shadow rather than a real `border` - a
+              // real border adds to the box's layout size unless box-sizing is pinned, and
+              // box-shadow already composes multiple layers for free via commas. Both are drawn as
+              // OUTER shadows (no `inset`) - box-shadow paints as part of the box's own border step,
+              // which happens before its children paint, so an inset ring here would sit entirely
+              // behind the <img> child below and never actually be visible (this was the "border
+              // doesn't show" bug: it was rendering, just permanently hidden under the picture). An
+              // outer ring instead grows 3px past the box's own edge, into space the <img> doesn't
+              // reach, so nothing paints over it.
+              boxShadow: [o.borderColor ? `0 0 0 3px ${o.borderColor}` : null, o.shadow ? "0 6px 16px rgba(0,0,0,0.45)" : null].filter(Boolean).join(", ") || undefined,
               pointerEvents: placingAnything ? "none" : "auto",
             }}
           >
@@ -665,7 +935,13 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               draggable={false}
               alt=""
               className="w-full h-full object-contain pointer-events-none select-none"
-              style={{ borderRadius: radiusPx }}
+              style={{
+                borderRadius: radiusPx,
+                // Flip lives on the <img> itself, not the container above - the container also
+                // positions the resize/rotate handles, which should stay in their normal spots
+                // (bottom-right, top-center) regardless of whether the picture is mirrored.
+                transform: o.flipHorizontal || o.flipVertical ? `scale(${o.flipHorizontal ? -1 : 1}, ${o.flipVertical ? -1 : 1})` : undefined,
+              }}
             />
             {isSelected && (
               <>
@@ -706,7 +982,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       {activeOverlays
         .filter((o) => o.id !== editingSession?.id)
         .map((o) => {
-          const heightPx = o.fontSize * frameRect.height * 1.3;
+          const paddingPx = o.padding !== undefined ? o.padding * frameRect.height : 2;
+          const heightPx = o.fontSize * frameRect.height * 1.3 + paddingPx * 2;
           return (
             <div
               key={o.id}
@@ -719,7 +996,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 width: o.width * frameRect.width,
                 font: `${o.fontSize * frameRect.height}px ${TEXT_FONT_FAMILY}`,
                 lineHeight: 1.3,
-                padding: 2,
+                padding: paddingPx,
                 textAlign: o.textAlign ?? "left",
                 pointerEvents: placingAnything ? "none" : "auto",
                 opacity: fadeOpacity(o),
@@ -789,6 +1066,39 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             }}
             className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-neutral-900/90 backdrop-blur-md shadow-lg ring-1 ring-white/10 whitespace-nowrap"
           >
+            {/* Font size - drag left/right to scrub, or click (no drag) to type an exact value.
+                Reads/writes editingSession.fontSize (the staged, not-yet-committed value the
+                corner drag handle also uses), so this and that handle stay two ways of setting the
+                exact same in-progress number instead of racing each other, both flushing together
+                at the normal commit point. */}
+            <ScrubNumberField
+              valuePx={Math.round(editingSession.fontSize * frameRect.height)}
+              min={4}
+              max={500}
+              title="Font size - drag to scrub, click to type"
+              onChangePx={(px) => {
+                if (frameRect.height <= 0) return;
+                setEditingOverlay((prev) => (prev ? { ...prev, fontSize: px / frameRect.height } : prev));
+              }}
+            />
+            {/* Padding around the text inside its box - most visible once a background/pill is
+                applied. Same staged-in-session treatment as font size above, for the same reason
+                (one undo step per edit, not one per pixel/keystroke). Note this doesn't preview
+                live *while* the editor is open - TextNoteEditor (reused as-is) draws its own
+                fixed-padding chrome and has no padding prop of its own to drive - it becomes
+                visible the moment editing ends, same as this panel's other aesthetic controls
+                (stroke/corner/fade) already work. */}
+            <ScrubNumberField
+              valuePx={Math.round(editingSession.padding * frameRect.height)}
+              min={0}
+              max={100}
+              title="Padding - drag to scrub, click to type"
+              onChangePx={(px) => {
+                if (frameRect.height <= 0) return;
+                setEditingOverlay((prev) => (prev ? { ...prev, padding: px / frameRect.height } : prev));
+              }}
+            />
+            <div className="w-px h-4 bg-white/15" />
             {TEXT_STYLE_PRESETS.map((preset) => (
               <button
                 key={preset.name}
@@ -876,7 +1186,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           style={{
             position: "absolute",
             left: selectedImageOverlayData.x * frameRect.width,
-            top: panelTopPx(selectedImageOverlayData.y * frameRect.height, selectedImageOverlayData.height * frameRect.height),
+            top: panelTopPx(
+              selectedImageOverlayData.y * frameRect.height,
+              selectedImageOverlayData.height * frameRect.height,
+              rotateHandleRiseFor(selectedImageOverlayData.y * frameRect.height) + 16
+            ),
             pointerEvents: "auto",
             zIndex: 21,
           }}
@@ -951,6 +1265,68 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             Shadow
           </button>
           <div className="w-px h-4 bg-white/15" />
+          <input
+            type="number"
+            min={-360}
+            max={360}
+            title="Rotation (degrees)"
+            value={Math.round(selectedImageOverlayData.rotation ?? 0)}
+            onPointerDown={(e) => e.stopPropagation()}
+            onChange={(e) => {
+              const deg = parseFloat(e.target.value);
+              if (!Number.isFinite(deg)) return;
+              onUpdateImageOverlayContent(selectedImageOverlayData.id, { rotation: ((deg % 360) + 360) % 360 });
+            }}
+            className="w-11 h-5 px-1 rounded bg-white/10 text-[10px] text-white text-center outline-none focus:ring-1 focus:ring-blue-400"
+          />
+          <div className="w-px h-4 bg-white/15" />
+          {/* Governs how the corner resize handle behaves on its *next* drag - see aspectLocked's
+              own comment above for why this is a plain toggle rather than a stored overlay field. */}
+          <button
+            type="button"
+            title={aspectLocked ? "Resize freely (currently locked to aspect ratio)" : "Lock to aspect ratio (currently free)"}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => setAspectLocked((v) => !v)}
+            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+              aspectLocked ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+            }`}
+          >
+            {aspectLocked ? "Locked" : "Free"}
+          </button>
+          <div className="w-px h-4 bg-white/15" />
+          <button
+            type="button"
+            title="Flip horizontal"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => onUpdateImageOverlayContent(selectedImageOverlayData.id, { flipHorizontal: !selectedImageOverlayData.flipHorizontal })}
+            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+              selectedImageOverlayData.flipHorizontal ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+            }`}
+          >
+            Flip H
+          </button>
+          <button
+            type="button"
+            title="Flip vertical"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => onUpdateImageOverlayContent(selectedImageOverlayData.id, { flipVertical: !selectedImageOverlayData.flipVertical })}
+            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+              selectedImageOverlayData.flipVertical ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+            }`}
+          >
+            Flip V
+          </button>
+          <div className="w-px h-4 bg-white/15" />
+          <button
+            type="button"
+            title="Replace the picture, keeping position/size/style"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => void handleReplaceImage(selectedImageOverlayData.id)}
+            className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+          >
+            Replace
+          </button>
+          <div className="w-px h-4 bg-white/15" />
           <button
             type="button"
             title="Duplicate this image overlay"
@@ -994,6 +1370,28 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               }}
             >
               Duplicate
+            </button>
+            <button
+              type="button"
+              className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
+              onClick={() => {
+                if (contextMenu.kind === "text") onBringTextOverlayToFront(contextMenu.id);
+                else onBringImageOverlayToFront(contextMenu.id);
+                setContextMenu(null);
+              }}
+            >
+              Bring to Front
+            </button>
+            <button
+              type="button"
+              className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
+              onClick={() => {
+                if (contextMenu.kind === "text") onSendTextOverlayToBack(contextMenu.id);
+                else onSendImageOverlayToBack(contextMenu.id);
+                setContextMenu(null);
+              }}
+            >
+              Send to Back
             </button>
             <button
               type="button"

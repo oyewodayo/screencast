@@ -737,6 +737,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         editStore.redo();
         return;
       }
+      // Ctrl/Cmd+D duplicates whatever overlay is currently selected - same "text takes priority
+      // over image" ordering as Delete/Backspace below, for the same reason (the two can't be
+      // selected at once in this UI, but if that ever changed, the more "local" selection wins).
+      // preventDefault() here also stops the browser's own Ctrl+D "bookmark this page" default.
+      if ((e.ctrlKey || e.metaKey) && key === "d") {
+        e.preventDefault();
+        if (selectedOverlayId) {
+          onSelectOverlay?.(editStore.duplicateTextOverlay(selectedOverlayId));
+        } else if (selectedImageOverlayId) {
+          onSelectImageOverlay?.(editStore.duplicateImageOverlay(selectedImageOverlayId));
+        }
+        return;
+      }
 
       if (e.key !== "Delete" && e.key !== "Backspace") return;
 

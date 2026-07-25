@@ -168,6 +168,18 @@ const Dashboard = () => {
   // if none is. "" means creating a top-level folder directly under Briefcast.
   const [creatingFolderIn, setCreatingFolderIn] = useState<string | null>(null);
   const [newFolderValue, setNewFolderValue] = useState<string>("");
+  // Folder relative-paths whose file list is currently hidden - in-memory only (resets on
+  // restart), same as every other sidebar UI toggle here. A folder isn't in this set until
+  // explicitly collapsed, so everything starts expanded, matching the pre-existing behavior.
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
+  const toggleFolderCollapsed = (folder: string): void => {
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(folder)) next.delete(folder);
+      else next.add(folder);
+      return next;
+    });
+  };
   // Drag-and-drop move: the file(s) currently being dragged (more than one if the dragged file
   // was part of the active multi-selection below), and whichever folder header the pointer is
   // presently over (for the drop-target highlight). Both null outside a drag gesture.
@@ -1182,6 +1194,14 @@ const setScreen = () => {
 		setCreatingFolderIn(parentFolder);
 		setNewFolderValue("");
 		setOpenMenu(null);
+		// The new-subfolder input renders inside parentFolder's own (collapsible) body - expand it
+		// first so starting to create a folder never opens an input the user can't actually see.
+		setCollapsedFolders((prev) => {
+			if (!prev.has(parentFolder)) return prev;
+			const next = new Set(prev);
+			next.delete(parentFolder);
+			return next;
+		});
 	};
 
 	const commitCreateFolder = async () => {
@@ -1704,9 +1724,11 @@ const setScreen = () => {
                         style={{ paddingLeft: 4 + folderDepth(folder) * 10 }}
                       >
                         <h4
-                          className="text-xs font-semibold text-gray-500 dark:text-neutral-400 flex items-center gap-1 min-w-0 truncate"
-                          title={folderDisplayName(folder)}
+                          className="text-xs font-semibold text-gray-500 dark:text-neutral-400 flex items-center gap-1 min-w-0 truncate cursor-pointer"
+                          title={collapsedFolders.has(folder) ? `Expand ${folderDisplayName(folder)}` : `Collapse ${folderDisplayName(folder)}`}
+                          onClick={() => toggleFolderCollapsed(folder)}
                         >
+                          <IoChevronForward size={10} className={`shrink-0 transition-transform ${collapsedFolders.has(folder) ? "" : "rotate-90"}`} />
                           <IoFolderOutline size={12} className="shrink-0" />
                           <span className="truncate">{folderDisplayName(folder)}</span>
                         </h4>
@@ -1732,7 +1754,7 @@ const setScreen = () => {
                         </div>
                       </div>
 
-                      {creatingFolderIn === folder && (
+                      {!collapsedFolders.has(folder) && creatingFolderIn === folder && (
                         <div className="flex items-center gap-1 mt-1" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
                           <IoFolderOutline size={12} className="text-gray-400 shrink-0" />
                           <input
@@ -1750,7 +1772,7 @@ const setScreen = () => {
                         </div>
                       )}
 
-                      {fileList.length === 0 ? (
+                      {collapsedFolders.has(folder) ? null : fileList.length === 0 ? (
                         <p
                           className="text-[11px] text-neutral-400 dark:text-neutral-500 italic mt-1"
                           style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}
@@ -1998,12 +2020,16 @@ const setScreen = () => {
                           onUpdateTextOverlayContent={editStore.updateTextOverlayContent}
                           onDeleteTextOverlay={editStore.deleteTextOverlay}
                           onDuplicateTextOverlay={(id) => setSelectedOverlayId(editStore.duplicateTextOverlay(id))}
+                          onBringTextOverlayToFront={editStore.bringTextOverlayToFront}
+                          onSendTextOverlayToBack={editStore.sendTextOverlayToBack}
                           isPlacingImage={isPlacingImage}
                           onPlacementImageConsumed={() => setIsPlacingImage(false)}
                           onAddImageOverlay={editStore.addImageOverlay}
                           onUpdateImageOverlayContent={editStore.updateImageOverlayContent}
                           onDeleteImageOverlay={editStore.deleteImageOverlay}
                           onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
+                          onBringImageOverlayToFront={editStore.bringImageOverlayToFront}
+                          onSendImageOverlayToBack={editStore.sendImageOverlayToBack}
                           totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
                         />
                       )
