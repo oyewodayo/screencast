@@ -504,6 +504,63 @@ const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) =>
   );
 };
 
+// Collapses the tail end of a style panel (the less-reached-for controls) behind a single caret
+// button - both the image and text overlay toolbars kept a straight line of buttons that grows
+// with every new aesthetic option (border, shadow, rotation, flip, animation, replace, crop,
+// duplicate, ...), which was already wide enough to need real design attention. Same
+// button+portal+useClampedPopoverPosition shape as AnimationPicker just above, but the popover
+// lists its children in a vertical stack (each still its own row, grouped controls kept together
+// on one row) instead of a flat option list.
+const ToolbarOverflowMenu: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
+  const { ref: menuRef, position: clampedMenuPos } = useClampedPopoverPosition(menuPos ?? { left: 0, top: 0 });
+
+  useEffect(() => {
+    if (!menuPos) return;
+    const close = () => setMenuPos(null);
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [menuPos]);
+
+  return (
+    <>
+      <button
+        ref={buttonRef}
+        type="button"
+        title="More options"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (menuPos) {
+            setMenuPos(null);
+            return;
+          }
+          const rect = buttonRef.current?.getBoundingClientRect();
+          if (rect) setMenuPos({ left: rect.left, top: rect.bottom + 4 });
+        }}
+        className={`w-5 h-5 flex items-center justify-center rounded transition-colors ${
+          menuPos ? "bg-blue-500/20 text-blue-400" : "text-white/70 hover:text-white hover:bg-white/10"
+        }`}
+      >
+        <IoChevronDown size={12} />
+      </button>
+      {menuPos &&
+        createPortal(
+          <div
+            ref={menuRef}
+            onPointerDown={(e) => e.stopPropagation()}
+            style={{ position: "fixed", left: clampedMenuPos.left, top: clampedMenuPos.top, zIndex: 9999 }}
+            className="flex flex-col gap-1.5 p-2 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 whitespace-nowrap"
+          >
+            {children}
+          </div>,
+          document.body
+        )}
+    </>
+  );
+};
+
 const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   frameRect,
   overlays,
@@ -531,6 +588,29 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onBringImageOverlayToFront,
   onSendImageOverlayToBack,
 }) => {
+  // Text and image overlays are selected/edited independently by id, but their toolbars
+  // (including the animation-picker popover each one owns) are two visually separate floating
+  // panels - if both selections were allowed to stay non-null at once, clicking a text overlay
+  // while an image overlay's toolbar/popover was already open left both toolbars rendered on top
+  // of each other. Clicking *directly* on a different overlay never reaches the "click elsewhere
+  // deselects both" backdrop below (that overlay's own element eats the click first), so each
+  // selection setter needs to clear the *other* kind itself - centralized here once rather than
+  // duplicated at every call site below.
+  const selectTextOverlayExclusive = useCallback(
+    (id: string | null) => {
+      onSelectOverlay(id);
+      if (id !== null) onSelectImageOverlay(null);
+    },
+    [onSelectOverlay, onSelectImageOverlay]
+  );
+  const selectImageOverlayExclusive = useCallback(
+    (id: string | null) => {
+      onSelectImageOverlay(id);
+      if (id !== null) onSelectOverlay(null);
+    },
+    [onSelectOverlay, onSelectImageOverlay]
+  );
+
   const [editingOverlay, setEditingOverlay] = useState<EditingOverlayState | null>(null);
   const editingOverlayRef = useRef(editingOverlay);
   useEffect(() => {
@@ -706,10 +786,10 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       liveItalicRunsRef.current = [];
       liveTextAlignRef.current = "left";
       setEditingOverlay({ id, isNew: true, x: nx, y: ny, width, fontSize, padding: legacyPaddingFraction(frameRect.height) });
-      onSelectOverlay(id);
+      selectTextOverlayExclusive(id);
       onPlacementConsumed();
     },
-    [currentOutputTime, totalOutputDuration, onAddTextOverlay, onSelectOverlay, onPlacementConsumed, frameRect]
+    [currentOutputTime, totalOutputDuration, onAddTextOverlay, selectTextOverlayExclusive, onPlacementConsumed, frameRect]
   );
 
   // Everything the image-placement effect below needs, refreshed every render but read through a
@@ -726,11 +806,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     currentOutputTime,
     totalOutputDuration,
     onAddImageOverlay,
-    onSelectImageOverlay,
+    onSelectImageOverlay: selectImageOverlayExclusive,
     onPlacementImageConsumed,
   });
   useEffect(() => {
-    placeImageContextRef.current = { frameRect, currentOutputTime, totalOutputDuration, onAddImageOverlay, onSelectImageOverlay, onPlacementImageConsumed };
+    placeImageContextRef.current = { frameRect, currentOutputTime, totalOutputDuration, onAddImageOverlay, onSelectImageOverlay: selectImageOverlayExclusive, onPlacementImageConsumed };
   });
 
   // Image placement: unlike text, there's no useful "click the video first" step - an image's
@@ -849,7 +929,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   const beginImageDrag = (overlay: ImageOverlay) => (e: React.PointerEvent) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectImageOverlay(overlay.id);
+    selectImageOverlayExclusive(overlay.id);
     setImageDrag({ id: overlay.id, startClientX: e.clientX, startClientY: e.clientY, startX: overlay.x, startY: overlay.y, liveX: overlay.x, liveY: overlay.y });
   };
   const handleImageDragMove = (e: React.PointerEvent) => {
@@ -883,7 +963,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   const beginImageResizeDrag = (overlay: ImageOverlay) => (e: React.PointerEvent) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectImageOverlay(overlay.id);
+    selectImageOverlayExclusive(overlay.id);
     const startWidthPx = overlay.width * frameRect.width;
     const startHeightPx = overlay.height * frameRect.height;
     setImageResizeDrag({
@@ -943,7 +1023,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   const beginImageRotateDrag = (overlay: ImageOverlay) => (e: React.PointerEvent) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectImageOverlay(overlay.id);
+    selectImageOverlayExclusive(overlay.id);
     const containerRect = (e.currentTarget as HTMLElement).parentElement?.getBoundingClientRect();
     const centerX = containerRect ? containerRect.left + containerRect.width / 2 : e.clientX;
     const centerY = containerRect ? containerRect.top + containerRect.height / 2 : e.clientY;
@@ -1071,8 +1151,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   const openContextMenu = (kind: "text" | "image", id: string) => (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (kind === "text") onSelectOverlay(id);
-    else onSelectImageOverlay(id);
+    if (kind === "text") selectTextOverlayExclusive(id);
+    else selectImageOverlayExclusive(id);
     setContextMenu({ kind, id, clientX: e.clientX, clientY: e.clientY });
   };
 
@@ -1263,7 +1343,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           return (
             <div
               key={o.id}
-              onClick={() => onSelectOverlay(o.id)}
+              onClick={() => selectTextOverlayExclusive(o.id)}
               onContextMenu={openContextMenu("text", o.id)}
               className="absolute whitespace-pre-wrap break-words cursor-text outline outline-2 outline-transparent hover:outline-white/40 transition-colors"
               style={{
@@ -1359,23 +1439,6 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 setEditingOverlay((prev) => (prev ? { ...prev, fontSize: px / frameRect.height } : prev));
               }}
             />
-            {/* Padding around the text inside its box - most visible once a background/pill is
-                applied. Same staged-in-session treatment as font size above, for the same reason
-                (one undo step per edit, not one per pixel/keystroke). Note this doesn't preview
-                live *while* the editor is open - TextNoteEditor (reused as-is) draws its own
-                fixed-padding chrome and has no padding prop of its own to drive - it becomes
-                visible the moment editing ends, same as this panel's other aesthetic controls
-                (stroke/corner/fade) already work. */}
-            <SteppedNumberField
-              valuePx={Math.round(editingSession.padding * frameRect.height)}
-              min={0}
-              max={100}
-              title="Padding - click the arrows or type a value"
-              onChangePx={(px) => {
-                if (frameRect.height <= 0) return;
-                setEditingOverlay((prev) => (prev ? { ...prev, padding: px / frameRect.height } : prev));
-              }}
-            />
             <div className="w-px h-4 bg-white/15" />
             {TEXT_STYLE_PRESETS.map((preset) => (
               <button
@@ -1390,59 +1453,90 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               </button>
             ))}
             <div className="w-px h-4 bg-white/15" />
-            <div onMouseDown={(e) => e.preventDefault()} title="Outline color/width">
-              <ColorSwatchPicker
-                color={editingOverlayData.strokeColor ?? "#000000"}
-                onChange={(c) => onUpdateTextOverlayContent(editingOverlayData.id, { strokeColor: c, strokeWidth: editingOverlayData.strokeWidth || 2 })}
-                size="sm"
-              />
-            </div>
-            <button
-              type="button"
-              title={editingOverlayData.strokeWidth ? "Remove outline" : "Add outline"}
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() =>
-                onUpdateTextOverlayContent(editingOverlayData.id, {
-                  strokeWidth: editingOverlayData.strokeWidth ? undefined : 2,
-                  strokeColor: editingOverlayData.strokeColor ?? "#000000",
-                })
-              }
-              className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-                editingOverlayData.strokeWidth ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-              }`}
-            >
-              Outline
-            </button>
-            <div className="w-px h-4 bg-white/15" />
-            {CORNER_OPTIONS.map((corner) => (
-              <button
-                key={corner}
-                type="button"
-                title={corner === "square" ? "Square corners" : corner === "rounded" ? "Rounded corners" : "Pill shape"}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => onUpdateTextOverlayContent(editingOverlayData.id, { cornerStyle: corner })}
-                className={`w-5 h-5 flex items-center justify-center rounded transition-colors ${
-                  (editingOverlayData.cornerStyle ?? "square") === corner ? "bg-blue-500/20 ring-1 ring-blue-400" : "hover:bg-white/10"
-                }`}
-              >
-                <span
-                  className="block w-2.5 h-2.5 bg-white/80"
-                  style={{ borderRadius: corner === "pill" ? 999 : corner === "rounded" ? 3 : 0 }}
+            {/* Everything past this point is reached for less often than font size/style presets
+                above - tucked behind a caret instead of growing this row every time a new text
+                aesthetic ships (padding, then outline, then corners, then animations, ...). */}
+            <ToolbarOverflowMenu>
+              {/* Padding around the text inside its box - most visible once a background/pill is
+                  applied. Same staged-in-session treatment as font size above, for the same reason
+                  (one undo step per edit, not one per pixel/keystroke). Note this doesn't preview
+                  live *while* the editor is open - TextNoteEditor (reused as-is) draws its own
+                  fixed-padding chrome and has no padding prop of its own to drive - it becomes
+                  visible the moment editing ends, same as this panel's other aesthetic controls
+                  (stroke/corner/fade) already work. */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-white/50 w-12">Padding</span>
+                <SteppedNumberField
+                  valuePx={Math.round(editingSession.padding * frameRect.height)}
+                  min={0}
+                  max={100}
+                  title="Padding - click the arrows or type a value"
+                  onChangePx={(px) => {
+                    if (frameRect.height <= 0) return;
+                    setEditingOverlay((prev) => (prev ? { ...prev, padding: px / frameRect.height } : prev));
+                  }}
                 />
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-white/50 w-12">Outline</span>
+                <div onMouseDown={(e) => e.preventDefault()} title="Outline color/width">
+                  <ColorSwatchPicker
+                    color={editingOverlayData.strokeColor ?? "#000000"}
+                    onChange={(c) => onUpdateTextOverlayContent(editingOverlayData.id, { strokeColor: c, strokeWidth: editingOverlayData.strokeWidth || 2 })}
+                    size="sm"
+                  />
+                </div>
+                <button
+                  type="button"
+                  title={editingOverlayData.strokeWidth ? "Remove outline" : "Add outline"}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() =>
+                    onUpdateTextOverlayContent(editingOverlayData.id, {
+                      strokeWidth: editingOverlayData.strokeWidth ? undefined : 2,
+                      strokeColor: editingOverlayData.strokeColor ?? "#000000",
+                    })
+                  }
+                  className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+                    editingOverlayData.strokeWidth ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+                  }`}
+                >
+                  {editingOverlayData.strokeWidth ? "On" : "Off"}
+                </button>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-white/50 w-12">Corners</span>
+                {CORNER_OPTIONS.map((corner) => (
+                  <button
+                    key={corner}
+                    type="button"
+                    title={corner === "square" ? "Square corners" : corner === "rounded" ? "Rounded corners" : "Pill shape"}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => onUpdateTextOverlayContent(editingOverlayData.id, { cornerStyle: corner })}
+                    className={`w-5 h-5 flex items-center justify-center rounded transition-colors ${
+                      (editingOverlayData.cornerStyle ?? "square") === corner ? "bg-blue-500/20 ring-1 ring-blue-400" : "hover:bg-white/10"
+                    }`}
+                  >
+                    <span
+                      className="block w-2.5 h-2.5 bg-white/80"
+                      style={{ borderRadius: corner === "pill" ? 999 : corner === "rounded" ? 3 : 0 }}
+                    />
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-white/50 w-12">Animate</span>
+                <AnimationPicker value={editingOverlayData.animation} onChange={(next) => onUpdateTextOverlayContent(editingOverlayData.id, { animation: next })} />
+              </div>
+              <button
+                type="button"
+                title="Duplicate this text overlay"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => onDuplicateTextOverlay(editingOverlayData.id)}
+                className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+              >
+                Duplicate
               </button>
-            ))}
-            <div className="w-px h-4 bg-white/15" />
-            <AnimationPicker value={editingOverlayData.animation} onChange={(next) => onUpdateTextOverlayContent(editingOverlayData.id, { animation: next })} />
-            <div className="w-px h-4 bg-white/15" />
-            <button
-              type="button"
-              title="Duplicate this text overlay"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => onDuplicateTextOverlay(editingOverlayData.id)}
-              className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-            >
-              Duplicate
-            </button>
+            </ToolbarOverflowMenu>
           </div>
         </>
       )}
@@ -1519,104 +1613,118 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             Border
           </button>
           <div className="w-px h-4 bg-white/15" />
-          <button
-            type="button"
-            title="Drop shadow"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onUpdateImageOverlayContent(selectedImageOverlayData.id, { shadow: !selectedImageOverlayData.shadow })}
-            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-              selectedImageOverlayData.shadow ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-            }`}
-          >
-            Shadow
-          </button>
-          <div className="w-px h-4 bg-white/15" />
-          <input
-            type="number"
-            min={-360}
-            max={360}
-            title="Rotation (degrees)"
-            value={Math.round(selectedImageOverlayData.rotation ?? 0)}
-            onPointerDown={(e) => e.stopPropagation()}
-            onChange={(e) => {
-              const deg = parseFloat(e.target.value);
-              if (!Number.isFinite(deg)) return;
-              onUpdateImageOverlayContent(selectedImageOverlayData.id, { rotation: ((deg % 360) + 360) % 360 });
-            }}
-            className="w-11 h-5 px-1 rounded bg-white/10 text-[10px] text-white text-center outline-none focus:ring-1 focus:ring-blue-400"
-          />
-          <div className="w-px h-4 bg-white/15" />
-          {/* Governs how the corner resize handle behaves on its *next* drag - see aspectLocked's
-              own comment above for why this is a plain toggle rather than a stored overlay field. */}
-          <button
-            type="button"
-            title={aspectLocked ? "Resize freely (currently locked to aspect ratio)" : "Lock to aspect ratio (currently free)"}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => setAspectLocked((v) => !v)}
-            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-              aspectLocked ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-            }`}
-          >
-            {aspectLocked ? "Locked" : "Free"}
-          </button>
-          <div className="w-px h-4 bg-white/15" />
-          <button
-            type="button"
-            title="Flip horizontal"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onUpdateImageOverlayContent(selectedImageOverlayData.id, { flipHorizontal: !selectedImageOverlayData.flipHorizontal })}
-            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-              selectedImageOverlayData.flipHorizontal ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-            }`}
-          >
-            Flip H
-          </button>
-          <button
-            type="button"
-            title="Flip vertical"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onUpdateImageOverlayContent(selectedImageOverlayData.id, { flipVertical: !selectedImageOverlayData.flipVertical })}
-            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-              selectedImageOverlayData.flipVertical ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-            }`}
-          >
-            Flip V
-          </button>
-          <div className="w-px h-4 bg-white/15" />
-          <AnimationPicker
-            value={selectedImageOverlayData.animation}
-            onChange={(next) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { animation: next })}
-          />
-          <div className="w-px h-4 bg-white/15" />
-          <button
-            type="button"
-            title="Replace the picture, keeping position/size/style"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => void handleReplaceImage(selectedImageOverlayData.id)}
-            className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-          >
-            Replace
-          </button>
-          <div className="w-px h-4 bg-white/15" />
-          <button
-            type="button"
-            title="Crop to a sub-region of the picture"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => setCroppingOverlayId(selectedImageOverlayData.id)}
-            className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-          >
-            Crop
-          </button>
-          <div className="w-px h-4 bg-white/15" />
-          <button
-            type="button"
-            title="Duplicate this image overlay"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onDuplicateImageOverlay(selectedImageOverlayData.id)}
-            className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-          >
-            Duplicate
-          </button>
+          {/* Everything past this point is reached for less often than opacity/corners/border
+              above - tucked behind a caret instead of growing this row every time a new image
+              aesthetic ships (shadow, then rotation, then flip, then animation, ...). */}
+          <ToolbarOverflowMenu>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-white/50 w-14">Shadow</span>
+              <button
+                type="button"
+                title="Drop shadow"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => onUpdateImageOverlayContent(selectedImageOverlayData.id, { shadow: !selectedImageOverlayData.shadow })}
+                className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+                  selectedImageOverlayData.shadow ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                {selectedImageOverlayData.shadow ? "On" : "Off"}
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-white/50 w-14">Rotation</span>
+              <input
+                type="number"
+                min={-360}
+                max={360}
+                title="Rotation (degrees)"
+                value={Math.round(selectedImageOverlayData.rotation ?? 0)}
+                onPointerDown={(e) => e.stopPropagation()}
+                onChange={(e) => {
+                  const deg = parseFloat(e.target.value);
+                  if (!Number.isFinite(deg)) return;
+                  onUpdateImageOverlayContent(selectedImageOverlayData.id, { rotation: ((deg % 360) + 360) % 360 });
+                }}
+                className="w-11 h-5 px-1 rounded bg-white/10 text-[10px] text-white text-center outline-none focus:ring-1 focus:ring-blue-400"
+              />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-white/50 w-14">Resize</span>
+              {/* Governs how the corner resize handle behaves on its *next* drag - see
+                  aspectLocked's own comment above for why this is a plain toggle rather than a
+                  stored overlay field. */}
+              <button
+                type="button"
+                title={aspectLocked ? "Resize freely (currently locked to aspect ratio)" : "Lock to aspect ratio (currently free)"}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setAspectLocked((v) => !v)}
+                className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+                  aspectLocked ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                {aspectLocked ? "Locked" : "Free"}
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-white/50 w-14">Flip</span>
+              <button
+                type="button"
+                title="Flip horizontal"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => onUpdateImageOverlayContent(selectedImageOverlayData.id, { flipHorizontal: !selectedImageOverlayData.flipHorizontal })}
+                className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+                  selectedImageOverlayData.flipHorizontal ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                Flip H
+              </button>
+              <button
+                type="button"
+                title="Flip vertical"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => onUpdateImageOverlayContent(selectedImageOverlayData.id, { flipVertical: !selectedImageOverlayData.flipVertical })}
+                className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+                  selectedImageOverlayData.flipVertical ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                Flip V
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-white/50 w-14">Animate</span>
+              <AnimationPicker
+                value={selectedImageOverlayData.animation}
+                onChange={(next) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { animation: next })}
+              />
+            </div>
+            <button
+              type="button"
+              title="Replace the picture, keeping position/size/style"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => void handleReplaceImage(selectedImageOverlayData.id)}
+              className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+            >
+              Replace
+            </button>
+            <button
+              type="button"
+              title="Crop to a sub-region of the picture"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => setCroppingOverlayId(selectedImageOverlayData.id)}
+              className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+            >
+              Crop
+            </button>
+            <button
+              type="button"
+              title="Duplicate this image overlay"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => onDuplicateImageOverlay(selectedImageOverlayData.id)}
+              className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+            >
+              Duplicate
+            </button>
+          </ToolbarOverflowMenu>
         </div>
       )}
 

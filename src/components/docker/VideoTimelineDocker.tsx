@@ -1219,7 +1219,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       }
       const desiredTime = o.trimStart + (currentOutputTime - o.startTime);
       if (Math.abs(audio.currentTime - desiredTime) > 0.15) audio.currentTime = desiredTime;
-      if (isPlaying && audio.paused) audio.play().catch(() => {});
+      if (isPlaying && audio.paused) {
+        audio.play().catch((err) => console.error("Audio overlay failed to play:", o.src, err));
+      }
       if (!isPlaying && !audio.paused) audio.pause();
 
       const fadeIn = o.fadeInSec ?? 0;
@@ -1254,6 +1256,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           }}
           src={convertFileSrc(o.src)}
           preload="auto"
+          onError={(e) => {
+            const el = e.currentTarget;
+            console.error("Audio overlay failed to load:", o.src, "mediaError:", el.error?.code, el.error?.message);
+          }}
           style={{ display: "none" }}
         />
       ))}
