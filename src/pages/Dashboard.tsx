@@ -15,7 +15,7 @@ import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
-import { loadSettings } from "../utils/appSettings";
+import { AppSettings, loadSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, isConvertibleCategory } from "../utils/fileCategory";
 import {
   IoVideocam,
@@ -133,6 +133,31 @@ const Dashboard = () => {
   const [fileExt, setFileExt] = useState(() => loadSettings().defaultFileExt);
   const [recordType, setRecordType] = useState(() => loadSettings().defaultRecordType);
   const [showSettings, setShowSettings] = useState<boolean>(false);
+
+  // The main window is created hidden (tauri.conf.json's "visible": false on the main window
+  // entry) specifically so this can show it only once there's real, already-painted UI behind it
+  // to reveal - showing it immediately on native window creation (the default) meant the window
+  // appeared before WebView2 had finished loading/painting the bundled app, showing its own blank
+  // default background (black) for a beat first. A hidden window's webview still loads and paints
+  // normally in the background, so by the time this effect fires (useEffect intentionally, not
+  // useLayoutEffect - it's deferred until *after* the browser has actually painted this render),
+  // there's already a fully rendered frame ready to reveal instantly instead of a flash of black.
+  // Scoped correctly to only the main window: Dashboard only ever mounts on the "/" route (see
+  // App.tsx's router), never in the recording-overlay/screenshot-overlay/annotation-overlay
+  // windows, which manage their own visibility entirely separately.
+  useEffect(() => {
+    const revealWindow = (): void => {
+      appWindow.show().catch((err) => console.error("Failed to show main window:", err));
+      appWindow.setFocus().catch((err) => console.error("Failed to focus main window:", err));
+    };
+    revealWindow();
+    // Safety net: showing an already-visible window is a harmless no-op, so retrying shortly
+    // after is free insurance against this specific call failing/never resolving for some
+    // reason - a bug in this effect must never be able to leave the user with an app that looks
+    // like it silently failed to launch (permanently hidden behind nothing).
+    const fallbackTimer = window.setTimeout(revealWindow, 1500);
+    return () => window.clearTimeout(fallbackTimer);
+  }, []);
   // Presentation mode for the PDF viewer: hides the sidebar and BottomDocker (not just the PDF's
   // own toolbar, which PdfAnnotator hides itself) and puts the actual OS window into fullscreen,
   // so it reads as a real presentation rather than just a bigger PDF pane with app chrome still
@@ -328,6 +353,9 @@ const [conversionFile, setConversionFile] = useState<{path: string; name: string
   // handleSettingsSaved and the effect below that creates/hides the overlay window and
   // registers/unregisters ANNOTATION_TOGGLE_SHORTCUT whenever this changes.
   const [annotationEnabled, setAnnotationEnabled] = useState<boolean>(() => loadSettings().enableAnnotationTool);
+  // The "Nothing playing yet" home screen's backdrop (Settings > Appearance > "Home screen
+  // background") - see the decorative block a few hundred lines down in this file's JSX.
+  const [homeBackgroundStyle, setHomeBackgroundStyle] = useState<AppSettings["homeBackgroundStyle"]>(() => loadSettings().homeBackgroundStyle);
   // Mirrors whether the overlay is currently in "draw mode" (capturing input) vs click-through.
   // A ref, not state — read inside the global-shortcut callback and the turn-off-request
   // listener, both registered once and needing the *current* value, not whatever was in scope
@@ -794,6 +822,7 @@ const setScreen = () => {
 		setFileExt(settings.defaultFileExt);
 		setRecordType(settings.defaultRecordType);
 		setAnnotationEnabled(settings.enableAnnotationTool);
+		setHomeBackgroundStyle(settings.homeBackgroundStyle);
 	};
 	// After the Briefcast folder itself has been relocated (see SettingsModal's Storage section):
 	// re-list from the new location, and drop whatever's currently open - its sourcePath was inside
@@ -2061,8 +2090,42 @@ const setScreen = () => {
               />
             )
           ) : (
-            <div className="flex flex-col items-center justify-center h-full w-full gap-6 px-8">
-              <div className="flex flex-col items-center gap-3 text-center">
+            <div className="relative flex flex-col items-center justify-center h-full w-full gap-6 px-8 overflow-hidden">
+              {/* Purely decorative - a soft color glow plus a faint graph-paper line grid, sat
+                  behind everything else in this empty state via z-index/pointer-events:none. Only
+                  rendered on this "nothing open yet" screen, not the shared bg-neutral-950
+                  container real video/PDF content plays inside a few lines up - a colorful
+                  backdrop behind actual footage would fight with it instead of the empty state,
+                  where there's nothing else competing for attention. Gated on Settings >
+                  Appearance > "Home screen background" (homeBackgroundStyle) - "plain" skips this
+                  whole block and falls back to the container's own flat themed background. */}
+              {homeBackgroundStyle === "graph" && (
+                <div className="absolute inset-0 pointer-events-none overflow-hidden">
+                  {/* Deliberately faint and static (no drift/animation - motion is what actually
+                      catches the eye, more than raw opacity does) - meant to read as a barely-
+                      there warmth in the corner, not a "glow" anyone would consciously notice. */}
+                  <div className="absolute -top-1/4 -left-1/4 w-[35%] h-[35%] rounded-full blur-2xl opacity-[0.07] dark:opacity-[0.05] bg-[radial-gradient(circle,theme(colors.blue.400),transparent_45%)]" />
+                  <svg className="absolute inset-0 w-full h-full text-gray-400/40 dark:text-neutral-500/30" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                      <pattern id="home-empty-grid" width="36" height="36" patternUnits="userSpaceOnUse">
+                        <path d="M 36 0 L 0 0 0 36" fill="none" stroke="currentColor" strokeWidth="1" />
+                      </pattern>
+                      {/* Fades the grid out toward the edges so it reads as a subtle texture behind
+                          the centered content rather than a hard-edged tiled pattern. */}
+                      <radialGradient id="home-empty-grid-fade" cx="50%" cy="45%" r="65%">
+                        <stop offset="0%" stopColor="white" stopOpacity="1" />
+                        <stop offset="100%" stopColor="white" stopOpacity="0" />
+                      </radialGradient>
+                      <mask id="home-empty-grid-mask">
+                        <rect width="100%" height="100%" fill="url(#home-empty-grid-fade)" />
+                      </mask>
+                    </defs>
+                    <rect width="100%" height="100%" fill="url(#home-empty-grid)" mask="url(#home-empty-grid-mask)" />
+                  </svg>
+                </div>
+              )}
+
+              <div className="relative flex flex-col items-center gap-3 text-center">
                 <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
                   <IoVideocam size={28} />
                 </div>
@@ -2082,7 +2145,7 @@ const setScreen = () => {
               </div>
 
               {libraryPreviewFiles.length > 0 && (
-                <div className="w-full max-w-md">
+                <div className="relative w-full max-w-md">
                   <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
                     From your library
                   </p>
@@ -2092,7 +2155,7 @@ const setScreen = () => {
                         key={file.path}
                         type="button"
                         onClick={() => handleFileClick(file)}
-                        className="flex items-center gap-3 px-3 py-2 rounded-md bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
+                        className="flex items-center gap-3 px-3 py-2 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
                       >
                         <span className="text-gray-400 dark:text-neutral-500 shrink-0">
                           {categoryIcon(getFileCategory(file.name))}

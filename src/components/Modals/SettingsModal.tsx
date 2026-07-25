@@ -61,6 +61,11 @@ const THEME_OPTIONS: { value: ThemePreference; label: string; icon: React.ReactN
   { value: "system", label: "System", icon: <IoContrast size={15} /> },
 ];
 
+const HOME_BACKGROUND_OPTIONS: { value: AppSettings["homeBackgroundStyle"]; label: string }[] = [
+  { value: "graph", label: "Graph-like" },
+  { value: "plain", label: "Plain" },
+];
+
 type SectionKey = "appearance" | "recording" | "storage" | "annotation" | "files" | "pdf";
 const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "appearance", label: "Appearance" },
@@ -246,6 +251,26 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                       {opt.label}
                     </button>
                   ))}
+                </div>
+
+                <div>
+                  <p className="text-xs text-neutral-500 dark:text-neutral-400 mb-1.5">Home screen background</p>
+                  <div className="flex items-center gap-1.5 p-1 rounded-lg bg-neutral-100 dark:bg-neutral-800">
+                    {HOME_BACKGROUND_OPTIONS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => update("homeBackgroundStyle", opt.value)}
+                        className={`flex-1 px-2.5 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                          settings.homeBackgroundStyle === opt.value
+                            ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-neutral-50 shadow-sm"
+                            : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </Section>
             )}

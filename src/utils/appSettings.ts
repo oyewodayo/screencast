@@ -16,6 +16,9 @@ export interface AppSettings {
   pdfDefaultStrokeWidth: number;
   // "system" follows the OS light/dark preference; "light"/"dark" pin it explicitly.
   theme: "light" | "dark" | "system";
+  // The "Nothing playing yet" home screen's backdrop (Dashboard.tsx) - "graph" is the decorative
+  // glow + faint line-grid look, "plain" is just the flat themed background with no decoration.
+  homeBackgroundStyle: "graph" | "plain";
   // Days a deleted file sits in the trash before purge_expired_trash removes it for good, run
   // once on app launch. 0 (or negative) means "never auto-purge — keep until Empty Trash".
   trashRetentionDays: number;
@@ -42,6 +45,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pdfDefaultHighlighterColor: "#ffd43b",
   pdfDefaultStrokeWidth: 4,
   theme: "system",
+  homeBackgroundStyle: "graph",
   trashRetentionDays: 30,
   // The overlay this drives now stays hidden except for the brief, user-initiated span while
   // draw mode is actually on (see ensure_annotation_overlay/toggleAnnotationDrawMode) - a hidden
