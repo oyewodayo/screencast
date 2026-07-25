@@ -923,6 +923,15 @@ const setScreen = () => {
 		await loadFileForPlayback(newPath, newFileName);
 	};
 
+	// Small icon shown next to a file name in the home-screen "From your library" preview list.
+	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
+		FILE_CATEGORY_TABS.find((tab) => tab.category === category)?.icon ?? <IoDocumentText size={18} />;
+
+	// A handful of files to surface on the empty home screen so it isn't just a blank void —
+	// not meant to be "recent" (FileEntry carries no timestamp from the backend), just enough
+	// of a taste of the library to invite a click instead of forcing a trip to the sidebar.
+	const libraryPreviewFiles = Object.values(files).flat().slice(0, 6);
+
 	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
 	// the currently selected file happens to live in, so prev/next still works when a category
 	// is split across multiple folders.
@@ -1956,8 +1965,50 @@ const setScreen = () => {
               />
             )
           ) : (
-            <div className="flex items-center justify-center h-full w-full text-gray-500 dark:text-neutral-400 italic">
-              Select a file from the list to play
+            <div className="flex flex-col items-center justify-center h-full w-full gap-6 px-8">
+              <div className="flex flex-col items-center gap-3 text-center">
+                <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
+                  <IoVideocam size={28} />
+                </div>
+                <div>
+                  <p className="text-gray-700 dark:text-neutral-200 font-medium">Nothing playing yet</p>
+                  <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
+                    Pick a file from the sidebar, or open one from your computer.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleOpenExternalFile}
+                  className="mt-1 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity"
+                >
+                  Open a file
+                </button>
+              </div>
+
+              {libraryPreviewFiles.length > 0 && (
+                <div className="w-full max-w-md">
+                  <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
+                    From your library
+                  </p>
+                  <div className="flex flex-col gap-1">
+                    {libraryPreviewFiles.map((file) => (
+                      <button
+                        key={file.path}
+                        type="button"
+                        onClick={() => handleFileClick(file)}
+                        className="flex items-center gap-3 px-3 py-2 rounded-md bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
+                      >
+                        <span className="text-gray-400 dark:text-neutral-500 shrink-0">
+                          {categoryIcon(getFileCategory(file.name))}
+                        </span>
+                        <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
+                          {formatFileName(file.name)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
