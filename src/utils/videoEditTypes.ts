@@ -122,6 +122,38 @@ export interface ImageOverlay {
   updatedAt: number;
 }
 
+// A blurred region composited over the video preview - spatially fraction-of-frame like
+// ImageOverlay (same x/y/width/height basis), but with no picture/text content of its own: what
+// renders inside the box is whatever the underlying video frame looks like, sampled and blurred,
+// not a separate layer stacked on top. That's also why this has no z-order (bringToFront/
+// sendToBack) the way TextOverlay/ImageOverlay do - there's nothing for a blur region to stack
+// against except the video itself, which is always "behind" by construction. Export burns this in
+// via ffmpeg (see export_trimmed_video) - a plain axis-aligned rectangle (shape:"rectangle", no
+// cornerRadius/rotation) uses a mask-free crop+boxblur+overlay chain; ellipse/rounded/rotated
+// instead render a client-side mask PNG first (renderBlurMaskToPng, videoOverlayRender.ts) and
+// apply it via crop+boxblur+alphamerge+overlay - see blurNeedsMask's own doc comment.
+export type BlurShape = "rectangle" | "ellipse";
+
+export interface BlurOverlay {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  // 0..1 - strength of the blur, resolved to a pixel radius at render/export time (see
+  // BLUR_PREVIEW_SCALE in VideoOverlayLayer.tsx and the matching radius formula in
+  // export_trimmed_video) rather than stored as a raw px radius, so it stays meaningful
+  // independent of the frame's/output video's actual resolution.
+  intensity: number;
+  shape?: BlurShape; // undefined means "rectangle", the pre-existing look
+  cornerRadius?: number; // fraction of frameRect.height, rectangle only - same basis as ImageOverlay.cornerRadius
+  rotation?: number; // degrees, clockwise - same basis as ImageOverlay.rotation
+  startTime: number;
+  endTime: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 // A background music/voiceover clip composited into the video's own audio track - same output-
 // timeline positioning as TextOverlay/ImageOverlay, but with a finite SOURCE file it plays a
 // sub-window of (trimStart) rather than an abstract, freely-stretchable time window - dragging an
@@ -165,6 +197,7 @@ export interface VideoEditState {
   clips: Clip[];
   textOverlays: TextOverlay[];
   imageOverlays: ImageOverlay[];
+  blurOverlays: BlurOverlay[];
   audioOverlays: AudioOverlay[];
   // The primary video's OWN audio level - distinct from any AudioOverlay's own volume/muted (those
   // are separate mixed-in tracks; this is the original soundtrack that was always there). A plain
@@ -183,6 +216,7 @@ export interface EditableFields {
   clips: Clip[];
   textOverlays: TextOverlay[];
   imageOverlays: ImageOverlay[];
+  blurOverlays: BlurOverlay[];
   audioOverlays: AudioOverlay[];
   videoAudioMuted: boolean;
   videoAudioVolume: number;
@@ -208,6 +242,9 @@ export interface VideoEditCommand {
     | "add-image"
     | "edit-image"
     | "delete-image"
+    | "add-blur"
+    | "edit-blur"
+    | "delete-blur"
     | "add-audio"
     | "edit-audio"
     | "delete-audio"
@@ -220,6 +257,7 @@ export function createEmptyState(sourcePath: string, duration: number): VideoEdi
     clips: [{ id: crypto.randomUUID(), sourcePath, start: 0, end: duration }],
     textOverlays: [],
     imageOverlays: [],
+    blurOverlays: [],
     audioOverlays: [],
     videoAudioMuted: false,
     videoAudioVolume: 1,

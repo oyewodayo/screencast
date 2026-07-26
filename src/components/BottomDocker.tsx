@@ -58,6 +58,12 @@ interface Props {
   onSelectImageOverlay?: (id: string | null) => void;
   isPlacingImage?: boolean;
   onToggleArmPlaceImage?: () => void;
+  // Video-only: blur-overlay selection/placement state, same threading as the text/image-overlay
+  // props above.
+  selectedBlurOverlayId?: string | null;
+  onSelectBlurOverlay?: (id: string | null) => void;
+  isPlacingBlur?: boolean;
+  onToggleArmPlaceBlur?: () => void;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
   isHome: boolean;
@@ -136,6 +142,10 @@ const BottomDocker = ({
   onSelectImageOverlay,
   isPlacingImage,
   onToggleArmPlaceImage,
+  selectedBlurOverlayId,
+  onSelectBlurOverlay,
+  isPlacingBlur,
+  onToggleArmPlaceBlur,
   handleFolderSettings,
   handleGoHome,
   isHome,
@@ -442,6 +452,10 @@ const BottomDocker = ({
             onSelectImageOverlay={onSelectImageOverlay}
             isPlacingImage={isPlacingImage}
             onToggleArmPlaceImage={onToggleArmPlaceImage}
+            selectedBlurOverlayId={selectedBlurOverlayId}
+            onSelectBlurOverlay={onSelectBlurOverlay}
+            isPlacingBlur={isPlacingBlur}
+            onToggleArmPlaceBlur={onToggleArmPlaceBlur}
           />
         ) : (
           <RecordingDocker

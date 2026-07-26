@@ -23,7 +23,7 @@ import { IoChevronDown, IoChevronUp } from "react-icons/io5";
 import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { FrameRect } from "../../utils/videoFrameRect";
-import { ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
+import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { renderFormattedSegments } from "../../utils/textFormatting";
@@ -45,6 +45,16 @@ export const DEFAULT_OVERLAY_DURATION_SEC = 5;
 const legacyPaddingFraction = (frameHeightPx: number): number => (frameHeightPx > 0 ? 2 / frameHeightPx : 0);
 const DEFAULT_IMAGE_WIDTH_FRACTION = 0.25;
 const MIN_IMAGE_WIDTH_PX = 24;
+const DEFAULT_BLUR_WIDTH_FRACTION = 0.18;
+const DEFAULT_BLUR_HEIGHT_FRACTION = 0.18;
+// Blur strength is stored as 0..1 (BlurOverlay.intensity), not a raw px radius, so it stays
+// meaningful regardless of the frame's actual size - resolved to a CSS px radius here as a
+// fraction of frameRect.height, the same "fraction of the frame, not a fixed px" convention
+// fontSize/padding already use. Doesn't need to exactly match the export-side radius formula in
+// export_trimmed_video (crop pixels vs CSS backdrop-filter px are different spaces entirely) -
+// just to look comparably strong at intensity 0 vs 1.
+const BLUR_PREVIEW_SCALE = 0.12;
+const MIN_BLUR_WIDTH_PX = 24;
 
 const TEXT_STYLE_PRESETS: { name: string; patch: TextOverlayContentPatch }[] = [
   { name: "Clean", patch: { backgroundColor: undefined, strokeColor: undefined, strokeWidth: undefined, cornerStyle: "square" } },
@@ -247,6 +257,20 @@ interface VideoOverlayLayerProps {
   onDuplicateImageOverlay: (id: string) => void;
   onBringImageOverlayToFront: (id: string) => void;
   onSendImageOverlayToBack: (id: string) => void;
+  // Blur tool armed/consumed the same click-to-place way as text (not image's file-picker-first
+  // flow - a blur region has no external content to pick, just a box to drop).
+  blurOverlays: BlurOverlay[];
+  selectedBlurOverlayId: string | null;
+  onSelectBlurOverlay: (id: string | null) => void;
+  isPlacingBlur: boolean;
+  onPlacementBlurConsumed: () => void;
+  onAddBlurOverlay: (x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number) => string;
+  onUpdateBlurOverlayContent: (
+    id: string,
+    patch: Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>
+  ) => void;
+  onDeleteBlurOverlay: (id: string) => void;
+  onDuplicateBlurOverlay: (id: string) => void;
 }
 
 // A compact numeric stepper matching the image panel's own rotation input (a native
@@ -587,6 +611,15 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onDuplicateImageOverlay,
   onBringImageOverlayToFront,
   onSendImageOverlayToBack,
+  blurOverlays,
+  selectedBlurOverlayId,
+  onSelectBlurOverlay,
+  isPlacingBlur,
+  onPlacementBlurConsumed,
+  onAddBlurOverlay,
+  onUpdateBlurOverlayContent,
+  onDeleteBlurOverlay,
+  onDuplicateBlurOverlay,
 }) => {
   // Text and image overlays are selected/edited independently by id, but their toolbars
   // (including the animation-picker popover each one owns) are two visually separate floating
@@ -599,16 +632,32 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   const selectTextOverlayExclusive = useCallback(
     (id: string | null) => {
       onSelectOverlay(id);
-      if (id !== null) onSelectImageOverlay(null);
+      if (id !== null) {
+        onSelectImageOverlay(null);
+        onSelectBlurOverlay(null);
+      }
     },
-    [onSelectOverlay, onSelectImageOverlay]
+    [onSelectOverlay, onSelectImageOverlay, onSelectBlurOverlay]
   );
   const selectImageOverlayExclusive = useCallback(
     (id: string | null) => {
       onSelectImageOverlay(id);
-      if (id !== null) onSelectOverlay(null);
+      if (id !== null) {
+        onSelectOverlay(null);
+        onSelectBlurOverlay(null);
+      }
     },
-    [onSelectOverlay, onSelectImageOverlay]
+    [onSelectOverlay, onSelectImageOverlay, onSelectBlurOverlay]
+  );
+  const selectBlurOverlayExclusive = useCallback(
+    (id: string | null) => {
+      onSelectBlurOverlay(id);
+      if (id !== null) {
+        onSelectOverlay(null);
+        onSelectImageOverlay(null);
+      }
+    },
+    [onSelectOverlay, onSelectImageOverlay, onSelectBlurOverlay]
   );
 
   const [editingOverlay, setEditingOverlay] = useState<EditingOverlayState | null>(null);
@@ -790,6 +839,27 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       onPlacementConsumed();
     },
     [currentOutputTime, totalOutputDuration, onAddTextOverlay, selectTextOverlayExclusive, onPlacementConsumed, frameRect]
+  );
+
+  // Click-to-place, same shape as handlePlaceText above (not image's file-picker-first flow - a
+  // blur region has no external content to pick, just a box to drop) - places a default-sized box
+  // centered under the click, selects it immediately so its intensity slider/resize handle are
+  // right there without a second click.
+  const handlePlaceBlur = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>): void => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const width = DEFAULT_BLUR_WIDTH_FRACTION;
+      const height = DEFAULT_BLUR_HEIGHT_FRACTION;
+      const nx = Math.max(0, Math.min((e.clientX - rect.left) / rect.width - width / 2, 1 - width));
+      const ny = Math.max(0, Math.min((e.clientY - rect.top) / rect.height - height / 2, 1 - height));
+      const startTime = currentOutputTime;
+      const endTime = Math.min(totalOutputDuration, startTime + DEFAULT_OVERLAY_DURATION_SEC);
+
+      const id = onAddBlurOverlay(nx, ny, width, height, 0.5, startTime, endTime > startTime ? endTime : startTime + DEFAULT_OVERLAY_DURATION_SEC);
+      selectBlurOverlayExclusive(id);
+      onPlacementBlurConsumed();
+    },
+    [currentOutputTime, totalOutputDuration, onAddBlurOverlay, selectBlurOverlayExclusive, onPlacementBlurConsumed]
   );
 
   // Everything the image-placement effect below needs, refreshed every render but read through a
@@ -1063,6 +1133,155 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     onUpdateImageOverlayContent(id, { rotation: liveRotation });
   };
 
+  // ---- Blur overlay drag (move) / resize (corner handle, free - no aspect lock) / rotate -------
+  //
+  // Same rAF-throttled shape, and the same nested-child-handle structure, as the image drag/
+  // resize/rotate block above - the resize/rotate handles are children of the box div itself (see
+  // the render loop below), so they inherit both its pointer-events opt-in and its CSS transform
+  // (rotate) for free, the same way image overlay's own handles do.
+
+  const [blurDrag, setBlurDrag] = useState<null | { id: string; startClientX: number; startClientY: number; startX: number; startY: number; liveX: number; liveY: number }>(null);
+  const blurDragRafRef = useRef<number | null>(null);
+  const blurDragLatestRef = useRef<{ clientX: number; clientY: number } | null>(null);
+
+  const [blurResizeDrag, setBlurResizeDrag] = useState<null | {
+    id: string;
+    startClientX: number;
+    startClientY: number;
+    startWidthPx: number;
+    startHeightPx: number;
+    liveWidthPx: number;
+    liveHeightPx: number;
+  }>(null);
+  const blurResizeRafRef = useRef<number | null>(null);
+  const blurResizeLatestRef = useRef<{ clientX: number; clientY: number } | null>(null);
+
+  const [blurRotateDrag, setBlurRotateDrag] = useState<null | { id: string; centerX: number; centerY: number; startAngle: number; startRotation: number; liveRotation: number }>(
+    null
+  );
+  const blurRotateRafRef = useRef<number | null>(null);
+  const blurRotateLatestRef = useRef<{ clientX: number; clientY: number; shiftKey: boolean } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (blurDragRafRef.current != null) cancelAnimationFrame(blurDragRafRef.current);
+      if (blurResizeRafRef.current != null) cancelAnimationFrame(blurResizeRafRef.current);
+      if (blurRotateRafRef.current != null) cancelAnimationFrame(blurRotateRafRef.current);
+    };
+  }, []);
+
+  const beginBlurDrag = (overlay: BlurOverlay) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    selectBlurOverlayExclusive(overlay.id);
+    setBlurDrag({ id: overlay.id, startClientX: e.clientX, startClientY: e.clientY, startX: overlay.x, startY: overlay.y, liveX: overlay.x, liveY: overlay.y });
+  };
+  const handleBlurDragMove = (e: React.PointerEvent) => {
+    if (!blurDrag) return;
+    e.stopPropagation();
+    blurDragLatestRef.current = { clientX: e.clientX, clientY: e.clientY };
+    if (blurDragRafRef.current != null) return;
+    blurDragRafRef.current = requestAnimationFrame(() => {
+      blurDragRafRef.current = null;
+      const latest = blurDragLatestRef.current;
+      if (!latest || frameRect.width <= 0 || frameRect.height <= 0) return;
+      setBlurDrag((prev) => {
+        if (!prev) return prev;
+        const dx = (latest.clientX - prev.startClientX) / frameRect.width;
+        const dy = (latest.clientY - prev.startClientY) / frameRect.height;
+        return { ...prev, liveX: Math.max(0, Math.min(1, prev.startX + dx)), liveY: Math.max(0, Math.min(1, prev.startY + dy)) };
+      });
+    });
+  };
+  const endBlurDrag = () => {
+    if (!blurDrag) return;
+    if (blurDragRafRef.current != null) {
+      cancelAnimationFrame(blurDragRafRef.current);
+      blurDragRafRef.current = null;
+    }
+    const { id, liveX, liveY } = blurDrag;
+    setBlurDrag(null);
+    onUpdateBlurOverlayContent(id, { x: liveX, y: liveY });
+  };
+
+  const beginBlurResizeDrag = (overlay: BlurOverlay) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    selectBlurOverlayExclusive(overlay.id);
+    const startWidthPx = overlay.width * frameRect.width;
+    const startHeightPx = overlay.height * frameRect.height;
+    setBlurResizeDrag({ id: overlay.id, startClientX: e.clientX, startClientY: e.clientY, startWidthPx, startHeightPx, liveWidthPx: startWidthPx, liveHeightPx: startHeightPx });
+  };
+  const handleBlurResizeDragMove = (e: React.PointerEvent) => {
+    if (!blurResizeDrag) return;
+    e.stopPropagation();
+    blurResizeLatestRef.current = { clientX: e.clientX, clientY: e.clientY };
+    if (blurResizeRafRef.current != null) return;
+    blurResizeRafRef.current = requestAnimationFrame(() => {
+      blurResizeRafRef.current = null;
+      const latest = blurResizeLatestRef.current;
+      if (!latest) return;
+      setBlurResizeDrag((prev) => {
+        if (!prev) return prev;
+        const dx = latest.clientX - prev.startClientX;
+        const dy = latest.clientY - prev.startClientY;
+        return { ...prev, liveWidthPx: Math.max(MIN_BLUR_WIDTH_PX, prev.startWidthPx + dx), liveHeightPx: Math.max(MIN_BLUR_WIDTH_PX, prev.startHeightPx + dy) };
+      });
+    });
+  };
+  const endBlurResizeDrag = () => {
+    if (!blurResizeDrag) return;
+    if (blurResizeRafRef.current != null) {
+      cancelAnimationFrame(blurResizeRafRef.current);
+      blurResizeRafRef.current = null;
+    }
+    if (frameRect.width > 0 && frameRect.height > 0) {
+      const { id, liveWidthPx, liveHeightPx } = blurResizeDrag;
+      onUpdateBlurOverlayContent(id, { width: liveWidthPx / frameRect.width, height: liveHeightPx / frameRect.height });
+    }
+    setBlurResizeDrag(null);
+  };
+
+  const beginBlurRotateDrag = (overlay: BlurOverlay) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    selectBlurOverlayExclusive(overlay.id);
+    const containerRect = (e.currentTarget as HTMLElement).parentElement?.getBoundingClientRect();
+    const centerX = containerRect ? containerRect.left + containerRect.width / 2 : e.clientX;
+    const centerY = containerRect ? containerRect.top + containerRect.height / 2 : e.clientY;
+    const startAngle = (Math.atan2(e.clientY - centerY, e.clientX - centerX) * 180) / Math.PI;
+    const startRotation = overlay.rotation ?? 0;
+    setBlurRotateDrag({ id: overlay.id, centerX, centerY, startAngle, startRotation, liveRotation: startRotation });
+  };
+  const handleBlurRotateDragMove = (e: React.PointerEvent) => {
+    if (!blurRotateDrag) return;
+    e.stopPropagation();
+    blurRotateLatestRef.current = { clientX: e.clientX, clientY: e.clientY, shiftKey: e.shiftKey };
+    if (blurRotateRafRef.current != null) return;
+    blurRotateRafRef.current = requestAnimationFrame(() => {
+      blurRotateRafRef.current = null;
+      const latest = blurRotateLatestRef.current;
+      if (!latest) return;
+      setBlurRotateDrag((prev) => {
+        if (!prev) return prev;
+        const angle = (Math.atan2(latest.clientY - prev.centerY, latest.clientX - prev.centerX) * 180) / Math.PI;
+        let rotation = (((prev.startRotation + (angle - prev.startAngle)) % 360) + 360) % 360;
+        if (latest.shiftKey) rotation = (Math.round(rotation / 15) * 15) % 360;
+        return { ...prev, liveRotation: rotation };
+      });
+    });
+  };
+  const endBlurRotateDrag = () => {
+    if (!blurRotateDrag) return;
+    if (blurRotateRafRef.current != null) {
+      cancelAnimationFrame(blurRotateRafRef.current);
+      blurRotateRafRef.current = null;
+    }
+    const { id, liveRotation } = blurRotateDrag;
+    setBlurRotateDrag(null);
+    onUpdateBlurOverlayContent(id, { rotation: liveRotation });
+  };
+
   // Swaps the picture a placed image overlay points at while keeping everything else about it -
   // position, size, rotation, corner radius, border, shadow - exactly as it was, rather than the
   // delete-and-re-add-from-scratch that was previously the only way to change a picked image.
@@ -1109,6 +1328,15 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   });
   const selectedImageOverlayData = selectedImageOverlayId ? activeImageOverlays.find((o) => o.id === selectedImageOverlayId) : undefined;
 
+  const activeBlurOverlays = overlaysActiveAt(blurOverlays, currentOutputTime).map((o) => {
+    if (blurDrag && o.id === blurDrag.id) return { ...o, x: blurDrag.liveX, y: blurDrag.liveY };
+    if (blurResizeDrag && o.id === blurResizeDrag.id && frameRect.width > 0 && frameRect.height > 0) {
+      return { ...o, width: blurResizeDrag.liveWidthPx / frameRect.width, height: blurResizeDrag.liveHeightPx / frameRect.height };
+    }
+    if (blurRotateDrag && o.id === blurRotateDrag.id) return { ...o, rotation: blurRotateDrag.liveRotation };
+    return o;
+  });
+  const selectedBlurOverlayData = selectedBlurOverlayId ? activeBlurOverlays.find((o) => o.id === selectedBlurOverlayId) : undefined;
 
   const cornerRadiusCss = (style: TextOverlayCornerStyle | undefined, heightPx: number): number => {
     if (style === "pill") return heightPx / 2;
@@ -1131,7 +1359,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     return topPx >= spaceNeededAbove ? topPx - PANEL_HEIGHT_PX - extraClearanceAbove : topPx + boxHeightPx + 6;
   };
 
-  const placingAnything = isPlacingText || isPlacingImage;
+  const placingAnything = isPlacingText || isPlacingImage || isPlacingBlur;
 
   // Right-click menu (Duplicate/Delete) for either overlay kind - rendered through a portal to
   // document.body, same reason ColorSwatchPicker's own popover does: .video-container clips with
@@ -1140,7 +1368,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   // directly from the contextmenu event's own clientX/clientY rather than getBoundingClientRect()
   // on some anchor - there isn't a stable anchor element to measure here the way ColorSwatchPicker
   // has its trigger button.
-  const [contextMenu, setContextMenu] = useState<{ kind: "text" | "image"; id: string; clientX: number; clientY: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ kind: "text" | "image" | "blur"; id: string; clientX: number; clientY: number } | null>(null);
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
@@ -1148,11 +1376,12 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     return () => document.removeEventListener("pointerdown", close);
   }, [contextMenu]);
 
-  const openContextMenu = (kind: "text" | "image", id: string) => (e: React.MouseEvent) => {
+  const openContextMenu = (kind: "text" | "image" | "blur", id: string) => (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
     if (kind === "text") selectTextOverlayExclusive(id);
-    else selectImageOverlayExclusive(id);
+    else if (kind === "image") selectImageOverlayExclusive(id);
+    else selectBlurOverlayExclusive(id);
     setContextMenu({ kind, id, clientX: e.clientX, clientY: e.clientY });
   };
 
@@ -1191,6 +1420,37 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [selectedImageOverlayId, imageOverlays, frameRect, onUpdateImageOverlayContent]);
 
+  // Same arrow-key nudging as the image overlay effect above (1px per press, 10px with Shift),
+  // scoped to blur overlays for the same reason - no focus trap here, unlike a selected text
+  // overlay's always-open, always-focused TextNoteEditor textarea.
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!selectedBlurOverlayId) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+      if (frameRect.width <= 0 || frameRect.height <= 0) return;
+      const overlay = blurOverlays.find((o) => o.id === selectedBlurOverlayId);
+      if (!overlay) return;
+
+      e.preventDefault();
+      const stepPx = e.shiftKey ? 10 : 1;
+      let dxPx = 0;
+      let dyPx = 0;
+      if (e.key === "ArrowLeft") dxPx = -stepPx;
+      else if (e.key === "ArrowRight") dxPx = stepPx;
+      else if (e.key === "ArrowUp") dyPx = -stepPx;
+      else dyPx = stepPx;
+
+      onUpdateBlurOverlayContent(overlay.id, {
+        x: Math.max(0, Math.min(1, overlay.x + dxPx / frameRect.width)),
+        y: Math.max(0, Math.min(1, overlay.y + dyPx / frameRect.height)),
+      });
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [selectedBlurOverlayId, blurOverlays, frameRect, onUpdateBlurOverlayContent]);
+
   return (
     <>
       {/* Click-elsewhere-to-deselect: only mounted while something's actually selected (so it
@@ -1198,16 +1458,87 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           so it sits behind every real overlay below in stacking order - a click that actually
           lands on an overlay hits that overlay's own element first, never reaches this one, and
           each overlay's own handler already calls onSelectOverlay/onSelectImageOverlay itself. */}
-      {(selectedOverlayId || selectedImageOverlayId) && !placingAnything && (
+      {(selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId) && !placingAnything && (
         <div
           className="absolute inset-0"
           style={{ pointerEvents: "auto" }}
           onClick={() => {
             onSelectOverlay(null);
             onSelectImageOverlay(null);
+            onSelectBlurOverlay(null);
           }}
         />
       )}
+      {/* Blur-region boxes render first (bottom of stacking order) so text/image overlays always
+          paint on top of them, matching export's own compositing order (crop+boxblur applied to
+          the base video, with text/image overlays composited on top of that - see
+          export_trimmed_video). backdrop-filter approximates the ffmpeg boxblur's own crop+blur
+          for live preview - not pixel-identical (different blur algorithms entirely), just
+          comparably strong, same "close enough for a live preview" spirit as every other overlay
+          aesthetic here that has a real export-side implementation. */}
+      {activeBlurOverlays.map((o) => {
+        const isSelected = selectedBlurOverlayId === o.id;
+        const blurPx = Math.max(0, o.intensity) * frameRect.height * BLUR_PREVIEW_SCALE;
+        // Same clamped-rise reasoning as the image overlay's own rotate handle just below (see
+        // that block's comment) - reused here via the same rotateHandleRiseFor/roomAbovePx shape
+        // rather than a second copy of the same logic.
+        const roomAbovePx = o.y * frameRect.height;
+        const rotateHandleRise = rotateHandleRiseFor(roomAbovePx);
+        const showRotateStem = roomAbovePx >= 32;
+        return (
+          <div
+            key={o.id}
+            onPointerDown={beginBlurDrag(o)}
+            onPointerMove={handleBlurDragMove}
+            onPointerUp={endBlurDrag}
+            onPointerCancel={endBlurDrag}
+            onContextMenu={openContextMenu("blur", o.id)}
+            title="Drag to move"
+            className={`absolute cursor-move outline outline-2 transition-colors ${
+              isSelected ? "outline-dashed outline-white" : "outline-transparent hover:outline-white/40"
+            }`}
+            style={{
+              left: o.x * frameRect.width,
+              top: o.y * frameRect.height,
+              width: o.width * frameRect.width,
+              height: o.height * frameRect.height,
+              backdropFilter: `blur(${blurPx}px)`,
+              WebkitBackdropFilter: `blur(${blurPx}px)`,
+              borderRadius: o.shape === "ellipse" ? "50%" : (o.cornerRadius ?? 0) * frameRect.height,
+              transform: o.rotation ? `rotate(${o.rotation}deg)` : undefined,
+              pointerEvents: placingAnything ? "none" : "auto",
+            }}
+          >
+            {isSelected && (
+              <>
+                <div
+                  onPointerDown={beginBlurResizeDrag(o)}
+                  onPointerMove={handleBlurResizeDragMove}
+                  onPointerUp={endBlurResizeDrag}
+                  onPointerCancel={endBlurResizeDrag}
+                  title="Drag to resize"
+                  className="absolute -right-1.5 -bottom-1.5 w-3.5 h-3.5 rounded-full bg-sky-400 hover:bg-sky-300 ring-2 ring-white/80 cursor-nwse-resize"
+                />
+                {showRotateStem && (
+                  <div
+                    className="absolute left-1/2 -translate-x-1/2 w-px bg-sky-400/80 pointer-events-none"
+                    style={{ top: -(rotateHandleRise - 8), height: rotateHandleRise - 8 }}
+                  />
+                )}
+                <div
+                  onPointerDown={beginBlurRotateDrag(o)}
+                  onPointerMove={handleBlurRotateDragMove}
+                  onPointerUp={endBlurRotateDrag}
+                  onPointerCancel={endBlurRotateDrag}
+                  title="Drag to rotate"
+                  className="absolute left-1/2 -translate-x-1/2 w-3.5 h-3.5 rounded-full bg-sky-400 hover:bg-sky-300 ring-2 ring-white/80 cursor-grab active:cursor-grabbing"
+                  style={{ top: -rotateHandleRise }}
+                />
+              </>
+            )}
+          </div>
+        );
+      })}
       {activeImageOverlays.map((o) => {
         const isSelected = selectedImageOverlayId === o.id;
         const radiusPx = (o.cornerRadius ?? 0) * frameRect.height;
@@ -1728,6 +2059,100 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         </div>
       )}
 
+      {selectedBlurOverlayData && (
+        <div
+          style={{
+            position: "absolute",
+            left: selectedBlurOverlayData.x * frameRect.width,
+            // Extra clearance matches the image overlay panel's own call just below - without it,
+            // the panel (opaque background, rendered after the rotate handle in DOM with its own
+            // z-index) paints directly over the handle whenever the box sits close enough to the
+            // frame's top edge that both anchor to roughly the same spot, making the handle
+            // invisible/unclickable even though it's still there (same bug that call's own comment
+            // already documents for images).
+            top: panelTopPx(
+              selectedBlurOverlayData.y * frameRect.height,
+              selectedBlurOverlayData.height * frameRect.height,
+              rotateHandleRiseFor(selectedBlurOverlayData.y * frameRect.height) + 16
+            ),
+            pointerEvents: "auto",
+            zIndex: 21,
+          }}
+          className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-neutral-900/90 backdrop-blur-md shadow-lg ring-1 ring-white/10 whitespace-nowrap"
+        >
+          <span className="text-[10px] text-white/50">Blur</span>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={selectedBlurOverlayData.intensity}
+            onPointerDown={(e) => e.stopPropagation()}
+            onChange={(e) => onUpdateBlurOverlayContent(selectedBlurOverlayData.id, { intensity: parseFloat(e.target.value) })}
+            title="Blur intensity"
+            className="w-16 accent-sky-400"
+          />
+          <div className="w-px h-4 bg-white/15" />
+          {/* Three discrete presets, same square/rounded/round picker convention the image
+              overlay panel already uses just below (IMAGE_ROUNDED_CORNER_PX) rather than a
+              separate shape toggle plus a continuous radius slider - one less control, and a
+              rounded rect vs. a full ellipse read as distinct shapes at a glance the same way
+              they do there. */}
+          {(["square", "rounded", "ellipse"] as const).map((preset) => {
+            const patch: { shape: BlurShape; cornerRadius?: number } =
+              preset === "ellipse"
+                ? { shape: "ellipse", cornerRadius: undefined }
+                : preset === "rounded"
+                ? { shape: "rectangle", cornerRadius: frameRect.height > 0 ? IMAGE_ROUNDED_CORNER_PX / frameRect.height : 0 }
+                : { shape: "rectangle", cornerRadius: 0 };
+            const isActive =
+              preset === "ellipse"
+                ? selectedBlurOverlayData.shape === "ellipse"
+                : (selectedBlurOverlayData.shape ?? "rectangle") === "rectangle" &&
+                  (preset === "rounded") === !!(selectedBlurOverlayData.cornerRadius && selectedBlurOverlayData.cornerRadius > 0);
+            return (
+              <button
+                key={preset}
+                type="button"
+                title={preset === "square" ? "Rectangle" : preset === "rounded" ? "Rounded rectangle" : "Ellipse"}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => onUpdateBlurOverlayContent(selectedBlurOverlayData.id, patch)}
+                className={`w-5 h-5 flex items-center justify-center rounded transition-colors ${
+                  isActive ? "bg-blue-500/20 ring-1 ring-blue-400" : "hover:bg-white/10"
+                }`}
+              >
+                <span
+                  className="block w-2.5 h-2.5 bg-white/80"
+                  style={{ borderRadius: preset === "ellipse" ? "50%" : preset === "rounded" ? 3 : 0 }}
+                />
+              </button>
+            );
+          })}
+          <div className="w-px h-4 bg-white/15" />
+          <button
+            type="button"
+            title="Duplicate this blur region"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => onDuplicateBlurOverlay(selectedBlurOverlayData.id)}
+            className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+          >
+            Duplicate
+          </button>
+          <button
+            type="button"
+            title="Delete this blur region"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              onDeleteBlurOverlay(selectedBlurOverlayData.id);
+              onSelectBlurOverlay(null);
+            }}
+            className="px-1.5 h-5 flex items-center rounded text-[10px] text-red-400 hover:bg-white/10 transition-colors"
+          >
+            Delete
+          </button>
+        </div>
+      )}
+
       {isPlacingText && (
         <div
           className="absolute inset-0 cursor-text pointer-events-auto outline outline-2 outline-dashed outline-blue-400/70 -outline-offset-2 flex items-start justify-center"
@@ -1735,6 +2160,17 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         >
           <span className="mt-2 px-2 py-0.5 rounded bg-blue-500/90 text-white text-xs pointer-events-none">
             Click anywhere on the video to place text
+          </span>
+        </div>
+      )}
+
+      {isPlacingBlur && (
+        <div
+          className="absolute inset-0 cursor-crosshair pointer-events-auto outline outline-2 outline-dashed outline-sky-400/70 -outline-offset-2 flex items-start justify-center"
+          onClick={handlePlaceBlur}
+        >
+          <span className="mt-2 px-2 py-0.5 rounded bg-sky-500/90 text-white text-xs pointer-events-none">
+            Click anywhere on the video to place a blur region
           </span>
         </div>
       )}
@@ -1754,34 +2190,41 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
               onClick={() => {
                 if (contextMenu.kind === "text") onDuplicateTextOverlay(contextMenu.id);
-                else onDuplicateImageOverlay(contextMenu.id);
+                else if (contextMenu.kind === "image") onDuplicateImageOverlay(contextMenu.id);
+                else onDuplicateBlurOverlay(contextMenu.id);
                 setContextMenu(null);
               }}
             >
               Duplicate
             </button>
-            <button
-              type="button"
-              className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
-              onClick={() => {
-                if (contextMenu.kind === "text") onBringTextOverlayToFront(contextMenu.id);
-                else onBringImageOverlayToFront(contextMenu.id);
-                setContextMenu(null);
-              }}
-            >
-              Bring to Front
-            </button>
-            <button
-              type="button"
-              className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
-              onClick={() => {
-                if (contextMenu.kind === "text") onSendTextOverlayToBack(contextMenu.id);
-                else onSendImageOverlayToBack(contextMenu.id);
-                setContextMenu(null);
-              }}
-            >
-              Send to Back
-            </button>
+            {/* No z-order for a blur region (see BlurOverlay's own doc comment) - nothing for it
+                to stack against except the video itself, which is always behind by construction. */}
+            {contextMenu.kind !== "blur" && (
+              <>
+                <button
+                  type="button"
+                  className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
+                  onClick={() => {
+                    if (contextMenu.kind === "text") onBringTextOverlayToFront(contextMenu.id);
+                    else onBringImageOverlayToFront(contextMenu.id);
+                    setContextMenu(null);
+                  }}
+                >
+                  Bring to Front
+                </button>
+                <button
+                  type="button"
+                  className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
+                  onClick={() => {
+                    if (contextMenu.kind === "text") onSendTextOverlayToBack(contextMenu.id);
+                    else onSendImageOverlayToBack(contextMenu.id);
+                    setContextMenu(null);
+                  }}
+                >
+                  Send to Back
+                </button>
+              </>
+            )}
             <button
               type="button"
               className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-red-400 transition-colors"
@@ -1789,9 +2232,12 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 if (contextMenu.kind === "text") {
                   onDeleteTextOverlay(contextMenu.id);
                   onSelectOverlay(null);
-                } else {
+                } else if (contextMenu.kind === "image") {
                   onDeleteImageOverlay(contextMenu.id);
                   onSelectImageOverlay(null);
+                } else {
+                  onDeleteBlurOverlay(contextMenu.id);
+                  onSelectBlurOverlay(null);
                 }
                 setContextMenu(null);
               }}

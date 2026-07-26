@@ -496,6 +496,32 @@ pub struct OverlayImage {
     pub fade: bool,
 }
 
+// A blurred region burned into the output video for its own [start_time,end_time) window - unlike
+// OverlayImage, there's no *picture* content to pre-render: this only ever reads pixels that are
+// already decoded into the filter graph's own current_label node (see export_trimmed_video's blur
+// pass, built via ffmpeg's own split+crop+boxblur[+alphamerge]+overlay). `x`/`y`/`width`/`height`
+// are already resolved to real output-video pixels by the frontend, same as OverlayImage's own
+// x/y - for a plain rectangle these are the region itself; for anything mask-shaped they're the
+// mask's own bounding box (see mask_data_base64's own doc comment).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayBlur {
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub intensity: f64, // 0..1
+    // A black/white mask PNG (frontend: renderBlurMaskToPng, only rendered when blurNeedsMask(o)
+    // is true - ellipse, rounded corners, rotated, or a freeform quad) - None for a plain axis-
+    // aligned rectangle, which needs no mask at all since ffmpeg's own `crop` already produces
+    // exactly that shape. When present, written to a temp file the same way OverlayImage's own
+    // data_base64 already is (see write_temp_overlay_png) and applied via `alphamerge` instead of
+    // a bare crop+boxblur+overlay.
+    pub mask_data_base64: Option<String>,
+    pub start_time: f64,
+    pub end_time: f64,
+}
+
 // A background music/voiceover track to mix into the output's own audio - unlike OverlayImage,
 // there's no client-side rendering step for this at all: the frontend never touches the source
 // audio, it just names it (source_path) and passes the same trim/volume/fade parameters the
@@ -556,6 +582,7 @@ pub async fn export_trimmed_video(
     output_base_path: String,
     segments: Vec<KeepSegment>,
     overlays: Vec<OverlayImage>,
+    blur_overlays: Vec<OverlayBlur>,
     audio_overlays: Vec<OverlayAudio>,
     audio_muted: bool,
     audio_volume: f64,
@@ -606,6 +633,38 @@ pub async fn export_trimmed_video(
         });
     }
 
+    // Blur masks (ellipse/rounded/rotated/freeform - see OverlayBlur.mask_data_base64's own doc
+    // comment) get the same "-loop 1 -t total_duration" treatment as the image overlay PNGs above,
+    // appended right after them - blur_mask_input_index remembers which ffmpeg input index (if
+    // any) each blur_overlays[i] ended up with, so the filter-graph loop below doesn't need to
+    // redo this bookkeeping. Filename indices start at overlays.len() (not 0) so they can never
+    // collide with an image overlay PNG's own deterministic filename above.
+    let mut blur_mask_input_index: Vec<Option<usize>> = Vec::with_capacity(blur_overlays.len());
+    for (i, bv) in blur_overlays.iter().enumerate() {
+        match &bv.mask_data_base64 {
+            Some(data) => {
+                let path = match write_temp_overlay_png(data, overlays.len() + i) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        for temp_path in &temp_overlay_paths {
+                            let _ = std::fs::remove_file(temp_path);
+                        }
+                        return Err(e);
+                    }
+                };
+                temp_overlay_paths.push(path.clone());
+                let input_index = inputs.len();
+                inputs.push(InputSpec {
+                    path: path.to_string_lossy().to_string(),
+                    pre_args: vec!["-loop".into(), "1".into(), "-t".into(), format!("{:.3}", total_duration.max(0.01))],
+                });
+                blur_mask_input_index.push(Some(input_index));
+            }
+            None => blur_mask_input_index.push(None),
+        }
+    }
+    let blur_mask_count = blur_mask_input_index.iter().filter(|idx| idx.is_some()).count();
+
     // Audio overlays need no temp file and no -loop/-t pre_args at all, unlike the PNGs above -
     // there's no client-side rendering step for audio (see OverlayAudio's own doc comment), so
     // this just opens each track's original source file directly, atrim-ing into it in the filter
@@ -615,9 +674,10 @@ pub async fn export_trimmed_video(
     }
 
     let has_video_overlays = !overlays.is_empty();
+    let has_blur_overlays = !blur_overlays.is_empty();
     let has_audio_overlays = !audio_overlays.is_empty();
 
-    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_audio_overlays {
+    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_blur_overlays && !has_audio_overlays {
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
         let seg = &segments[0];
@@ -663,12 +723,70 @@ pub async fn export_trimmed_video(
             filter.push_str(&format!("{}concat=n={}:v=1:a=1[base][outa];", concat_inputs, segments.len()));
         }
 
-        // Chains each overlay onto [base] in turn, the last one landing on [outv]. A still PNG is
-        // "faded" via ffmpeg's own fade filter for overlays with animation:"fade" set in the
-        // editor - alpha=1 fades the alpha channel itself rather than to black, which is exactly
-        // what a transparent-background overlay needs - before being composited via `overlay`
-        // gated to that overlay's own [start,end) window on the output timeline either way.
+        // Blur regions are chained onto [base] first, ahead of the text/image overlay loop below,
+        // so blur always sits *underneath* text/image in the composite (matching the live preview,
+        // where VideoOverlayLayer paints its blur boxes before its image/text ones - see that
+        // file's own render-order comment). Each blur reads straight off whatever node it's
+        // chained from (no separate `-i` input for the video itself - see OverlayBlur's own doc
+        // comment): `split` duplicates that node, `crop` isolates the region on one copy, `boxblur`
+        // blurs just that crop, and `overlay` composites the (possibly masked) blurred crop back
+        // onto the *other*, unblurred copy at the same x/y - the standard ffmpeg technique for
+        // "blur only part of a frame" (blurring the whole frame and overlaying a crop of the
+        // ORIGINAL on top would do it backwards).
         let mut current_label = "base".to_string();
+        for (i, bv) in blur_overlays.iter().enumerate() {
+            // Scaled off the region's own height (not a fixed px count) so a small region doesn't
+            // get an absurdly large radius relative to itself and vice versa; clamped both for
+            // sane performance (boxblur's cost scales with radius) and so intensity:1 still reads
+            // as "blurred", not "solid color", on a very tall region.
+            let radius = ((bv.intensity.max(0.0).min(1.0)) * (bv.height as f64) * 0.08).round().clamp(1.0, 60.0) as i64;
+            let src_label = format!("bb{}src", i);
+            let bg_label = format!("bb{}bg", i);
+            let out_label = format!("bb{}out", i);
+            filter.push_str(&format!("[{}]split=2[{}][{}];", current_label, src_label, bg_label));
+
+            // A plain axis-aligned rectangle (blur_mask_input_index[i] is None) needs nothing past
+            // the bare crop+boxblur - ffmpeg's crop already produces exactly that shape. Anything
+            // mask-shaped instead formats the blurred crop to rgba and merges in the mask PNG's own
+            // luma as its alpha channel (`alphamerge`) before compositing, so only the masked-in
+            // shape stays blurred and the rest of the crop shows through to bg's original pixels
+            // once `overlay` blends by alpha below.
+            let composited_label = match blur_mask_input_index[i] {
+                None => {
+                    let blurred_label = format!("bb{}blur", i);
+                    filter.push_str(&format!(
+                        "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1[{}];",
+                        src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, blurred_label
+                    ));
+                    blurred_label
+                }
+                Some(mask_input) => {
+                    let cropped_label = format!("bb{}crop", i);
+                    let mask_gray_label = format!("bb{}maskgray", i);
+                    let masked_label = format!("bb{}masked", i);
+                    filter.push_str(&format!(
+                        "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1,format=rgba[{}];",
+                        src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, cropped_label
+                    ));
+                    filter.push_str(&format!("[{}:v]format=gray[{}];", mask_input, mask_gray_label));
+                    filter.push_str(&format!("[{}][{}]alphamerge[{}];", cropped_label, mask_gray_label, masked_label));
+                    masked_label
+                }
+            };
+
+            filter.push_str(&format!(
+                "[{}][{}]overlay=x={}:y={}:enable='between(t,{:.3},{:.3})'[{}];",
+                bg_label, composited_label, bv.x, bv.y, bv.start_time, bv.end_time, out_label
+            ));
+            current_label = out_label;
+        }
+
+        // Chains each overlay onto whatever the blur pass above left [current_label] pointing at
+        // (still "base" if there were no blur regions) in turn, the last one landing on [outv]. A
+        // still PNG is "faded" via ffmpeg's own fade filter for overlays with animation:"fade" set
+        // in the editor - alpha=1 fades the alpha channel itself rather than to black, which is
+        // exactly what a transparent-background overlay needs - before being composited via
+        // `overlay` gated to that overlay's own [start,end) window on the output timeline either way.
         let overlay_input_base = segments.len();
         for (i, ov) in overlays.iter().enumerate() {
             let source_label = format!("{}:v", overlay_input_base + i);
@@ -690,11 +808,13 @@ pub async fn export_trimmed_video(
             ));
             current_label = next_label;
         }
-        // Multiple segments, no video overlays: [base] from the concat above still needs to end up
-        // named [outv] for the -map below - the loop that would normally do that (ending on
-        // "outv") never runs when there are no video overlays to chain.
-        if !has_video_overlays {
-            filter.push_str("[base]copy[outv];");
+        // Whatever [current_label] is pointing at (the plain trim/concat [base], or the last blur/
+        // image/text stage that actually ran) needs to end up named [outv] for the -map below -
+        // covers all four combinations of "any blur regions" x "any text/image overlays" with one
+        // check, rather than the single `!has_video_overlays` special case this used to be before
+        // blur support existed (back when [base] was the only possible "nothing chained" label).
+        if current_label != "outv" {
+            filter.push_str(&format!("[{}]copy[outv];", current_label));
         }
 
         // Applies the track-level mute/volume to [outa] (the original video's own trimmed/
@@ -717,7 +837,10 @@ pub async fn export_trimmed_video(
         // each overlay) - "30% volume" means 30%, not 30% further divided by however many tracks
         // happen to be mixed in.
         let audio_label = if has_audio_overlays {
-            let audio_input_base = segments.len() + overlays.len();
+            // Inputs so far, in push order: segments, then image overlay PNGs, then blur mask PNGs
+            // (see blur_mask_input_index above) - audio overlay sources were appended right after
+            // all of those, so this has to account for all three groups, not just the first two.
+            let audio_input_base = segments.len() + overlays.len() + blur_mask_count;
             let mut mix_inputs = format!("[{}]", base_audio_label);
             for (i, audio_ov) in audio_overlays.iter().enumerate() {
                 let input_index = audio_input_base + i;

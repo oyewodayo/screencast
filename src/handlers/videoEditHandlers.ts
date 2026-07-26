@@ -3,7 +3,7 @@
 // Pure functions only, mirroring pdfAnnotationHandlers.ts's style: no React, callers pass in
 // everything they need explicitly. useVideoEditStore is the only caller.
 
-import { AudioOverlay, Clip, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
 const MIN_OVERLAY_DURATION = 0.1;
@@ -126,6 +126,11 @@ export function makeTextOverlay(x: number, y: number, width: number, fontSize: n
 export function makeImageOverlay(src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number): ImageOverlay {
   const now = Date.now();
   return { id: crypto.randomUUID(), src, x, y, width, height, opacity: 1, startTime, endTime, createdAt: now, updatedAt: now };
+}
+
+export function makeBlurOverlay(x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number): BlurOverlay {
+  const now = Date.now();
+  return { id: crypto.randomUUID(), x, y, width, height, intensity, startTime, endTime, createdAt: now, updatedAt: now };
 }
 
 export function addOverlay<T>(overlays: T[], overlay: T): T[] {

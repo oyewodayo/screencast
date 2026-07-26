@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { listen } from "@tauri-apps/api/event";
-import { AudioOverlay, Clip, EditableFields, ImageOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
@@ -13,6 +13,7 @@ import {
   duplicateTimedOverlay,
   insertClip as insertClipHandler,
   makeAudioOverlay,
+  makeBlurOverlay,
   makeImageOverlay,
   makeTextOverlay,
   moveOverlayTime,
@@ -25,7 +26,7 @@ import {
   toKeepSegments,
   updateOverlay,
 } from "../handlers/videoEditHandlers";
-import { renderImageOverlayToPng, renderTextOverlayToPng } from "../utils/videoOverlayRender";
+import { blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderTextOverlayToPng } from "../utils/videoOverlayRender";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
@@ -60,6 +61,7 @@ type TextOverlayContentPatch = Partial<
 type ImageOverlayContentPatch = Partial<
   Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src">
 >;
+type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
 
 export interface UseVideoEditStoreResult {
@@ -105,6 +107,16 @@ export interface UseVideoEditStoreResult {
   duplicateImageOverlay: (id: string) => string;
   bringImageOverlayToFront: (id: string) => void;
   sendImageOverlayToBack: (id: string) => void;
+  // Blurred regions - same frame-relative x/y/width/height basis as image overlays, but with no
+  // z-order of their own (see BlurOverlay's own doc comment in videoEditTypes.ts for why) and no
+  // content to swap out (only `intensity` is ever patched, alongside position/size).
+  blurOverlays: BlurOverlay[];
+  addBlurOverlay: (x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number) => string;
+  updateBlurOverlayContent: (id: string, patch: BlurOverlayContentPatch) => void;
+  resizeBlurOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
+  moveBlurOverlayTime: (id: string, newStartTime: number) => void;
+  deleteBlurOverlay: (id: string) => void;
+  duplicateBlurOverlay: (id: string) => string;
   // Background music/voiceover overlays - unlike text/image, these have no position on the frame
   // (VideoOverlayLayer isn't involved at all) and their whole UI lives in VideoTimelineDocker's own
   // timeline lane. `addAudioOverlay` takes the source file's own duration (already known by the
@@ -241,6 +253,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 ...parsed,
                 textOverlays: parsed.textOverlays ?? [],
                 imageOverlays: parsed.imageOverlays ?? [],
+                blurOverlays: parsed.blurOverlays ?? [],
                 audioOverlays: parsed.audioOverlays ?? [],
                 videoAudioMuted: parsed.videoAudioMuted ?? false,
                 videoAudioVolume: parsed.videoAudioVolume ?? 1,
@@ -325,6 +338,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     clips: current.clips,
     textOverlays: current.textOverlays,
     imageOverlays: current.imageOverlays,
+    blurOverlays: current.blurOverlays,
     audioOverlays: current.audioOverlays,
     videoAudioMuted: current.videoAudioMuted,
     videoAudioVolume: current.videoAudioVolume,
@@ -562,6 +576,72 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const addBlurOverlay = useCallback(
+    (x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const overlay = makeBlurOverlay(x, y, width, height, intensity, startTime, endTime);
+      const blurOverlays = addOverlay(current.blurOverlays, overlay);
+      pushCommand(snapshot(current, {}), snapshot(current, { blurOverlays }), "add-blur");
+      return overlay.id;
+    },
+    [pushCommand]
+  );
+
+  const updateBlurOverlayContent = useCallback(
+    (id: string, patch: BlurOverlayContentPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const blurOverlays = updateOverlay<BlurOverlay>(current.blurOverlays, id, patch);
+      pushCommand(snapshot(current, {}), snapshot(current, { blurOverlays }), "edit-blur");
+    },
+    [pushCommand]
+  );
+
+  const resizeBlurOverlayTime = useCallback(
+    (id: string, edge: "start" | "end", time: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const blurOverlays = resizeOverlayTime(current.blurOverlays, id, edge, totalOutputDuration(current.clips), time);
+      pushCommand(snapshot(current, {}), snapshot(current, { blurOverlays }), "edit-blur");
+    },
+    [pushCommand]
+  );
+
+  const moveBlurOverlayTime = useCallback(
+    (id: string, newStartTime: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const blurOverlays = moveOverlayTime(current.blurOverlays, id, newStartTime, totalOutputDuration(current.clips));
+      pushCommand(snapshot(current, {}), snapshot(current, { blurOverlays }), "edit-blur");
+    },
+    [pushCommand]
+  );
+
+  const deleteBlurOverlay = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const blurOverlays = deleteOverlay(current.blurOverlays, id);
+      pushCommand(snapshot(current, {}), snapshot(current, { blurOverlays }), "delete-blur");
+    },
+    [pushCommand]
+  );
+
+  const duplicateBlurOverlay = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const original = current.blurOverlays.find((o) => o.id === id);
+      if (!original) return "";
+      const copy = duplicateOverlay(original);
+      const blurOverlays = addOverlay(current.blurOverlays, copy);
+      pushCommand(snapshot(current, {}), snapshot(current, { blurOverlays }), "add-blur");
+      return copy.id;
+    },
+    [pushCommand]
+  );
+
   const addAudioOverlay = useCallback(
     (src: string, sourceDuration: number, startTime: number, endTime: number): string => {
       const current = stateRef.current;
@@ -754,6 +834,33 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           }
         }
 
+        // A plain rectangle has no fixed content to pre-render (it depends on whatever the
+        // underlying frame looks like at each instant), so it just resolves position/size to real
+        // output pixels and lets Rust build the crop+boxblur+overlay filter chain directly off the
+        // video's own decoded frames (see export_trimmed_video). Anything else - ellipse, rounded
+        // corners, or rotated - can't be expressed as filter parameters the way a plain crop can,
+        // so it DOES get a client-side render step: a black/white mask PNG (renderBlurMaskToPng),
+        // sent alongside the overlay so Rust can apply it via `alphamerge` instead of a bare crop
+        // (see blurNeedsMask's own doc comment for why this is one branch, not three).
+        const blurOverlays = videoPixelSize
+          ? current.blurOverlays.map((o) => {
+              const base = {
+                x: Math.round(o.x * videoPixelSize.width),
+                y: Math.round(o.y * videoPixelSize.height),
+                width: Math.round(o.width * videoPixelSize.width),
+                height: Math.round(o.height * videoPixelSize.height),
+                intensity: o.intensity,
+                startTime: o.startTime,
+                endTime: o.endTime,
+                maskDataBase64: undefined as string | undefined,
+              };
+              if (!blurNeedsMask(o)) return base;
+              const mask = renderBlurMaskToPng(o, videoPixelSize.width, videoPixelSize.height);
+              if (!mask) return base;
+              return { ...base, x: mask.xPx, y: mask.yPx, width: mask.widthPx, height: mask.heightPx, maskDataBase64: mask.dataUrl };
+            })
+          : [];
+
         // No client-side rendering step for audio (unlike text/image, which render to a PNG first)
         // - these just pass straight through to Rust, which reads the original source file
         // directly and builds the amix/afade/adelay filter chain itself (see export_trimmed_video).
@@ -773,6 +880,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           outputBasePath: sourcePath,
           segments: toKeepSegments(current.clips),
           overlays,
+          blurOverlays,
           audioOverlays,
           audioMuted: current.videoAudioMuted,
           audioVolume: current.videoAudioVolume,
@@ -795,6 +903,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     clips: state?.clips ?? [],
     textOverlays: state?.textOverlays ?? [],
     imageOverlays: state?.imageOverlays ?? [],
+    blurOverlays: state?.blurOverlays ?? [],
     audioOverlays: state?.audioOverlays ?? [],
     addTextOverlay,
     updateTextOverlayContent,
@@ -812,6 +921,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     duplicateImageOverlay,
     bringImageOverlayToFront,
     sendImageOverlayToBack,
+    addBlurOverlay,
+    updateBlurOverlayContent,
+    resizeBlurOverlayTime,
+    moveBlurOverlayTime,
+    deleteBlurOverlay,
+    duplicateBlurOverlay,
     addAudioOverlay,
     updateAudioOverlayContent,
     resizeAudioOverlayTime: resizeAudioOverlayTimeCb,

@@ -80,6 +80,12 @@ interface FileToolsDockerProps {
   onSelectImageOverlay?: (id: string | null) => void;
   isPlacingImage?: boolean;
   onToggleArmPlaceImage?: () => void;
+  // Video-only: blur-overlay selection/placement state, same threading as the text/image-overlay
+  // props above.
+  selectedBlurOverlayId?: string | null;
+  onSelectBlurOverlay?: (id: string | null) => void;
+  isPlacingBlur?: boolean;
+  onToggleArmPlaceBlur?: () => void;
 }
 
 // The file-type-specific alternative to RecordingDocker (see BottomDocker's dockerMode switch):
@@ -112,6 +118,10 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onSelectImageOverlay,
   isPlacingImage,
   onToggleArmPlaceImage,
+  selectedBlurOverlayId,
+  onSelectBlurOverlay,
+  isPlacingBlur,
+  onToggleArmPlaceBlur,
 }) => {
   const category = getFileCategory(file.name);
   const copy = category ? FILE_TOOLS_COPY[category] : null;
@@ -143,6 +153,10 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onSelectImageOverlay={onSelectImageOverlay}
         isPlacingImage={isPlacingImage}
         onToggleArmPlaceImage={onToggleArmPlaceImage}
+        selectedBlurOverlayId={selectedBlurOverlayId}
+        onSelectBlurOverlay={onSelectBlurOverlay}
+        isPlacingBlur={isPlacingBlur}
+        onToggleArmPlaceBlur={onToggleArmPlaceBlur}
       />
     );
   }

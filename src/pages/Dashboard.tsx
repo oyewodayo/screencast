@@ -272,6 +272,8 @@ const Dashboard = () => {
   const [isPlacingText, setIsPlacingText] = useState<boolean>(false);
   const [selectedImageOverlayId, setSelectedImageOverlayId] = useState<string | null>(null);
   const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
+  const [selectedBlurOverlayId, setSelectedBlurOverlayId] = useState<string | null>(null);
+  const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
@@ -2085,6 +2087,15 @@ const setScreen = () => {
                           onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
                           onBringImageOverlayToFront={editStore.bringImageOverlayToFront}
                           onSendImageOverlayToBack={editStore.sendImageOverlayToBack}
+                          blurOverlays={editStore.blurOverlays}
+                          selectedBlurOverlayId={selectedBlurOverlayId}
+                          onSelectBlurOverlay={setSelectedBlurOverlayId}
+                          isPlacingBlur={isPlacingBlur}
+                          onPlacementBlurConsumed={() => setIsPlacingBlur(false)}
+                          onAddBlurOverlay={editStore.addBlurOverlay}
+                          onUpdateBlurOverlayContent={editStore.updateBlurOverlayContent}
+                          onDeleteBlurOverlay={editStore.deleteBlurOverlay}
+                          onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
                           totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
                         />
                       )
@@ -2209,6 +2220,10 @@ const setScreen = () => {
         onSelectImageOverlay={setSelectedImageOverlayId}
         isPlacingImage={isPlacingImage}
         onToggleArmPlaceImage={() => setIsPlacingImage((v) => !v)}
+        selectedBlurOverlayId={selectedBlurOverlayId}
+        onSelectBlurOverlay={setSelectedBlurOverlayId}
+        isPlacingBlur={isPlacingBlur}
+        onToggleArmPlaceBlur={() => setIsPlacingBlur((v) => !v)}
         selectScreen={selectScreen}
         setScreen={setScreen}
         unSetScreen={unSetScreen}

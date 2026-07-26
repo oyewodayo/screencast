@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdFlip } from "react-icons/md";
+import { MdBlurOn, MdFlip } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -35,7 +35,7 @@ import {
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AudioOverlay, Clip, ImageOverlay, TextOverlay } from "../../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, TextOverlay } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
 import { overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler } from "../../handlers/videoEditHandlers";
@@ -261,6 +261,12 @@ interface VideoTimelineDockerProps {
   onSelectImageOverlay?: (id: string | null) => void;
   isPlacingImage?: boolean;
   onToggleArmPlaceImage?: () => void;
+
+  // Blur-region selection/placement, same threading/reasoning as the text/image-overlay props above.
+  selectedBlurOverlayId?: string | null;
+  onSelectBlurOverlay?: (id: string | null) => void;
+  isPlacingBlur?: boolean;
+  onToggleArmPlaceBlur?: () => void;
 }
 
 // The video-specific "file tools" docker: a scrubbable timeline (ruler + playhead + reorderable
@@ -294,6 +300,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onSelectImageOverlay,
   isPlacingImage = false,
   onToggleArmPlaceImage,
+  selectedBlurOverlayId = null,
+  onSelectBlurOverlay,
+  isPlacingBlur = false,
+  onToggleArmPlaceBlur,
 }) => {
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -682,6 +692,94 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
   };
 
+  // ---- Blur-overlay lane drag (move) / resize (retime) - same shape as the image-overlay block
+  // above, just against editStore's blur methods and onSelectBlurOverlay instead. ----------------
+  const [blurOverlayResizeDrag, setBlurOverlayResizeDrag] = useState<null | {
+    id: string;
+    edge: "start" | "end";
+    startClientX: number;
+    startValue: number;
+    oppositeBound: number;
+    liveValue: number;
+  }>(null);
+  const [blurOverlayDrag, setBlurOverlayDrag] = useState<null | {
+    id: string;
+    startClientX: number;
+    startTime: number;
+    duration: number;
+    isDragging: boolean;
+    liveStartTime: number;
+  }>(null);
+
+  const renderBlurOverlays: BlurOverlay[] = editStore.blurOverlays.map((o) => {
+    if (blurOverlayResizeDrag && o.id === blurOverlayResizeDrag.id) {
+      return blurOverlayResizeDrag.edge === "start" ? { ...o, startTime: blurOverlayResizeDrag.liveValue } : { ...o, endTime: blurOverlayResizeDrag.liveValue };
+    }
+    if (blurOverlayDrag && o.id === blurOverlayDrag.id) {
+      return { ...o, startTime: blurOverlayDrag.liveStartTime, endTime: blurOverlayDrag.liveStartTime + blurOverlayDrag.duration };
+    }
+    return o;
+  });
+
+  const beginBlurOverlayResizeDrag = (overlay: BlurOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    onSelectBlurOverlay?.(overlay.id);
+    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
+    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
+    setBlurOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
+  };
+  const handleBlurOverlayResizeDragMove = (e: React.PointerEvent) => {
+    if (!blurOverlayResizeDrag) return;
+    e.stopPropagation();
+    const deltaSec = (e.clientX - blurOverlayResizeDrag.startClientX) / pxPerSec;
+    const raw = blurOverlayResizeDrag.startValue + deltaSec;
+    const clamped =
+      blurOverlayResizeDrag.edge === "start"
+        ? Math.max(0, Math.min(raw, blurOverlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
+        : Math.min(totalOutputDuration, Math.max(raw, blurOverlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
+    setBlurOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
+  };
+  const endBlurOverlayResizeDrag = () => {
+    if (!blurOverlayResizeDrag) return;
+    const { id, edge, liveValue } = blurOverlayResizeDrag;
+    setBlurOverlayResizeDrag(null);
+    editStore.resizeBlurOverlayTime(id, edge, liveValue);
+  };
+
+  const beginBlurOverlayDrag = (overlay: BlurOverlay) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setBlurOverlayDrag({
+      id: overlay.id,
+      startClientX: e.clientX,
+      startTime: overlay.startTime,
+      duration: overlay.endTime - overlay.startTime,
+      isDragging: false,
+      liveStartTime: overlay.startTime,
+    });
+  };
+  const handleBlurOverlayDragMove = (e: React.PointerEvent) => {
+    if (!blurOverlayDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - blurOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    const deltaSec = (e.clientX - blurOverlayDrag.startClientX) / pxPerSec;
+    const liveStartTime = Math.max(0, Math.min(blurOverlayDrag.startTime + deltaSec, totalOutputDuration - blurOverlayDrag.duration));
+    setBlurOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endBlurOverlayDrag = () => {
+    if (!blurOverlayDrag) return;
+    const { id, isDragging, liveStartTime, duration } = blurOverlayDrag;
+    setBlurOverlayDrag(null);
+    if (isDragging) {
+      editStore.moveBlurOverlayTime(id, liveStartTime);
+    }
+    onSelectBlurOverlay?.(id);
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
+      seekToOutputTime(liveStartTime);
+    }
+  };
+
   // ---- Audio overlay placement / drag (move) / resize (trim into source) ---------------------
   //
   // Fully local to this component (see this file's own top-of-plan Context: an audio overlay has
@@ -1023,6 +1121,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onSelectOverlay?.(editStore.duplicateTextOverlay(selectedOverlayId));
         } else if (selectedImageOverlayId) {
           onSelectImageOverlay?.(editStore.duplicateImageOverlay(selectedImageOverlayId));
+        } else if (selectedBlurOverlayId) {
+          onSelectBlurOverlay?.(editStore.duplicateBlurOverlay(selectedBlurOverlayId));
         } else if (selectedAudioOverlayId) {
           setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(selectedAudioOverlayId));
           setAudioPopoverAnchor(null);
@@ -1040,6 +1140,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         e.preventDefault();
         editStore.deleteImageOverlay(selectedImageOverlayId);
         onSelectImageOverlay?.(null);
+      } else if (selectedBlurOverlayId) {
+        e.preventDefault();
+        editStore.deleteBlurOverlay(selectedBlurOverlayId);
+        onSelectBlurOverlay?.(null);
       } else if (selectedAudioOverlayId) {
         e.preventDefault();
         editStore.deleteAudioOverlay(selectedAudioOverlayId);
@@ -1053,7 +1157,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedOverlayId, selectedImageOverlayId, selectedAudioOverlayId, selectedClipId, editStore]);
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAudioOverlayId, selectedClipId, editStore]);
 
   // Pressing Play after the sequence has already played through to the end needs to restart from
   // clip 0 - native <video> never auto-rewinds on .play() once it's reached "ended", it just sits
@@ -1304,6 +1408,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             onClick={() => onToggleArmPlaceImage?.()}
           >
             <IoImageOutline size={15} className={isPlacingImage ? "text-amber-400" : undefined} />
+          </ActionButton>
+          <ActionButton
+            title={isPlacingBlur ? "Click the video preview to place a blur region" : "Add blur region"}
+            onClick={() => onToggleArmPlaceBlur?.()}
+          >
+            <MdBlurOn size={15} className={isPlacingBlur ? "text-sky-400" : undefined} />
           </ActionButton>
           <ActionButton
             title={isPlacingAudio ? "Choosing an audio file…" : "Add audio overlay"}
@@ -1739,6 +1849,59 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerCancel={endImageOverlayResizeDrag}
                       title="Drag to retime this image's end"
                       className="absolute inset-y-1 w-2 -ml-1 bg-amber-400 hover:bg-amber-300 rounded cursor-ew-resize z-10"
+                      style={{ left: left + width }}
+                    />
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
+            {/* Blur-overlay lane - same time-based chip/drag/resize pattern as the text/image
+                lanes above, sky-blue instead of purple/amber and with no filename/text to show. */}
+            <div className="h-8 relative border-t border-neutral-800">
+              {renderBlurOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
+                const isSelected = selectedBlurOverlayId === overlay.id;
+                return (
+                  <div
+                    key={overlay.id}
+                    onPointerDown={beginBlurOverlayDrag(overlay)}
+                    onPointerMove={handleBlurOverlayDragMove}
+                    onPointerUp={endBlurOverlayDrag}
+                    onPointerCancel={endBlurOverlayDrag}
+                    title="Blur region"
+                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center gap-1 px-2 text-[11px] text-white truncate cursor-grab active:cursor-grabbing ${
+                      isSelected ? "border-dashed border-white" : "border-sky-400"
+                    }`}
+                    style={{ left, width }}
+                  >
+                    <MdBlurOn size={12} className="shrink-0" />
+                    Blur
+                  </div>
+                );
+              })}
+              {renderBlurOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = (overlay.endTime - overlay.startTime) * pxPerSec;
+                return (
+                  <React.Fragment key={`blur-overlay-resize-${overlay.id}`}>
+                    <div
+                      onPointerDown={beginBlurOverlayResizeDrag(overlay, "start")}
+                      onPointerMove={handleBlurOverlayResizeDragMove}
+                      onPointerUp={endBlurOverlayResizeDrag}
+                      onPointerCancel={endBlurOverlayResizeDrag}
+                      title="Drag to retime this blur region's start"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-sky-400 hover:bg-sky-300 rounded cursor-ew-resize z-10"
+                      style={{ left }}
+                    />
+                    <div
+                      onPointerDown={beginBlurOverlayResizeDrag(overlay, "end")}
+                      onPointerMove={handleBlurOverlayResizeDragMove}
+                      onPointerUp={endBlurOverlayResizeDrag}
+                      onPointerCancel={endBlurOverlayResizeDrag}
+                      title="Drag to retime this blur region's end"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-sky-400 hover:bg-sky-300 rounded cursor-ew-resize z-10"
                       style={{ left: left + width }}
                     />
                   </React.Fragment>
