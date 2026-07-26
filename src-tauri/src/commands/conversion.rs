@@ -512,11 +512,10 @@ pub struct OverlayBlur {
     pub height: i64,
     pub intensity: f64, // 0..1
     // A black/white mask PNG (frontend: renderBlurMaskToPng, only rendered when blurNeedsMask(o)
-    // is true - ellipse, rounded corners, rotated, or a freeform quad) - None for a plain axis-
-    // aligned rectangle, which needs no mask at all since ffmpeg's own `crop` already produces
-    // exactly that shape. When present, written to a temp file the same way OverlayImage's own
-    // data_base64 already is (see write_temp_overlay_png) and applied via `alphamerge` instead of
-    // a bare crop+boxblur+overlay.
+    // is true - ellipse, rounded corners, or rotated) - None for a plain axis-aligned rectangle,
+    // which needs no mask at all since ffmpeg's own `crop` already produces exactly that shape.
+    // When present, written to a temp file the same way OverlayImage's own data_base64 already is
+    // (see write_temp_overlay_png) and applied via `alphamerge` instead of a bare crop+boxblur+overlay.
     pub mask_data_base64: Option<String>,
     pub start_time: f64,
     pub end_time: f64,
@@ -633,8 +632,8 @@ pub async fn export_trimmed_video(
         });
     }
 
-    // Blur masks (ellipse/rounded/rotated/freeform - see OverlayBlur.mask_data_base64's own doc
-    // comment) get the same "-loop 1 -t total_duration" treatment as the image overlay PNGs above,
+    // Blur masks (ellipse/rounded/rotated - see OverlayBlur.mask_data_base64's own doc comment)
+    // get the same "-loop 1 -t total_duration" treatment as the image overlay PNGs above,
     // appended right after them - blur_mask_input_index remembers which ffmpeg input index (if
     // any) each blur_overlays[i] ended up with, so the filter-graph loop below doesn't need to
     // redo this bookkeeping. Filename indices start at overlays.len() (not 0) so they can never
