@@ -19,6 +19,11 @@ log = "0.4.22"
 simplelog = "0.12.2"
 urlencoding = "2.1"
 base64 = "0.22"
+# Backs the Briefcast-folder file watcher (services/file_watcher.rs) that keeps the sidebar's file
+# list live when files are added/removed from outside the app (Explorer, another app saving into
+# the folder, etc.) - notify-debouncer-mini re-exports a compatible `notify` itself, so it isn't
+# also listed as a direct dependency here.
+notify-debouncer-mini = "0.7"
 
 # Win32 bindings — only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the

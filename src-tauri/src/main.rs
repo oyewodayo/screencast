@@ -21,6 +21,7 @@ mod services {
     pub mod pdf_annotations;
     pub mod video_edits;
     pub mod trash;
+    pub mod file_watcher;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
@@ -120,6 +121,21 @@ fn main() {
         .manage(AppState::default())
         .manage(commands::conversion::ConversionState::default())
         .manage(commands::native_playback::NativePlaybackState::default())
+        .manage(services::file_watcher::FileWatcherState::default())
+        .setup(|app| {
+            // Start watching the Briefcast folder for external changes right away, so the sidebar
+            // stays live without needing a restart or a manual refresh click - see
+            // services/file_watcher.rs. Best-effort: failures are logged inside start_watching
+            // itself and never block startup.
+            match services::utility::briefcast_dir() {
+                Ok(dir) => {
+                    let _ = std::fs::create_dir_all(&dir);
+                    services::file_watcher::start_watching(&app.handle(), &dir);
+                }
+                Err(e) => log::warn!("Could not resolve Briefcast dir for file watcher: {}", e),
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::system_info::get_ram_info,
             get_os_info,

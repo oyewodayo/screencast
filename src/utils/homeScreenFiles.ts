@@ -34,13 +34,15 @@ export function getRecentPaths(): string[] {
   return loadPaths(RECENT_KEY);
 }
 
-// Pins are stored oldest-first. Pinning past MAX_HOME_SCREEN_FILES evicts the oldest pin (FIFO)
-// rather than refusing the new one — the home screen only ever has that many slots to show.
+// Pins are stored newest-first — pinning a file puts it at the top, ahead of everything already
+// pinned, which stays in place otherwise. Pinning past MAX_HOME_SCREEN_FILES evicts only the
+// single oldest pin (now at the tail) rather than refusing the new one or disturbing the rest —
+// the home screen only ever has that many slots to show.
 export function togglePin(path: string): string[] {
   const pinned = getPinnedPaths();
   const next = pinned.includes(path)
     ? pinned.filter((p) => p !== path)
-    : [...pinned, path].slice(-MAX_HOME_SCREEN_FILES);
+    : [path, ...pinned].slice(0, MAX_HOME_SCREEN_FILES);
   savePaths(PINNED_KEY, next);
   return next;
 }

@@ -297,7 +297,7 @@ pub fn get_default_briefcast_dir() -> Result<String, String> {
 // of its own (that would require adding tokio as a direct dependency here just to reach a
 // scheduler tauri already owns and uses internally for exactly this).
 #[command]
-pub fn set_briefcast_dir(new_parent_dir: String) -> Result<String, String> {
+pub fn set_briefcast_dir(new_parent_dir: String, app_handle: AppHandle) -> Result<String, String> {
     let new_parent = PathBuf::from(&new_parent_dir);
     if !new_parent.is_dir() {
         return Err("Selected location does not exist".to_string());
@@ -332,11 +332,12 @@ pub fn set_briefcast_dir(new_parent_dir: String) -> Result<String, String> {
     }
 
     write_custom_briefcast_dir(Some(&new_root))?;
+    crate::services::file_watcher::start_watching(&app_handle, &new_root);
     path_to_str(&new_root).map(|s| s.to_string())
 }
 
 #[command]
-pub fn reset_briefcast_dir() -> Result<String, String> {
+pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
     let old_root = briefcast_dir()?;
     let new_root = default_briefcast_dir()?;
 
@@ -359,6 +360,7 @@ pub fn reset_briefcast_dir() -> Result<String, String> {
     }
 
     write_custom_briefcast_dir(None)?;
+    crate::services::file_watcher::start_watching(&app_handle, &new_root);
     path_to_str(&new_root).map(|s| s.to_string())
 }
 

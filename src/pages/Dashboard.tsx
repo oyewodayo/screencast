@@ -43,6 +43,7 @@ import {
   IoAddCircleOutline,
   IoBuildOutline,
   IoPin,
+  IoRefresh,
 } from "react-icons/io5";
 import { MdCreateNewFolder } from "react-icons/md";
 
@@ -200,6 +201,8 @@ const Dashboard = () => {
   // localStorage on every render) so toggling a pin or opening a file re-renders that preview.
   const [pinnedPaths, setPinnedPaths] = useState<string[]>(() => getPinnedPaths());
   const [recentPaths, setRecentPaths] = useState<string[]>(() => getRecentPaths());
+  // Spins the sidebar's manual refresh icon while a refresh is in flight — see handleRefreshFiles.
+  const [isRefreshingFiles, setIsRefreshingFiles] = useState<boolean>(false);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>("");
   // "Move to ▸" flyout inside a file's 3-dot menu — keyed by file.path, separate from openMenu
@@ -761,6 +764,19 @@ const setScreen = () => {
 		}
 	};
 
+	// Manual escape hatch for the sidebar's "Files:" refresh button — the backend also watches the
+	// Briefcast folder itself and emits refresh-file-list on external changes (see the
+	// 'refresh-file-list' listener below), but this covers watcher failures/platforms without one,
+	// and just gives an immediate, visible "yes, it's current" action for the user to reach for.
+	const handleRefreshFiles = async () => {
+		setIsRefreshingFiles(true);
+		try {
+			await Promise.all([handleDirectoryFiles(), loadTrash()]);
+		} finally {
+			setIsRefreshingFiles(false);
+		}
+	};
+
 	const handleDeleteFile = async (file: FileEntry) => {
 		try {
 			await invoke("move_to_trash", { path: file.path });
@@ -1034,10 +1050,12 @@ const setScreen = () => {
 	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
 		FILE_CATEGORY_TABS.find((tab) => tab.category === category)?.icon ?? <IoDocumentText size={18} />;
 
-	// What to surface on the empty home screen so it isn't just a blank void. Priority order:
-	// pinned files (in pin order — see utils/homeScreenFiles.ts's FIFO-on-overflow toggling) if
-	// there are any; otherwise the most recently opened/edited/viewed files; otherwise just a
-	// taste of the library so a fresh install isn't a blank void either.
+	// What to surface on the empty home screen so it isn't just a blank void. Pinned files (in pin
+	// order — see utils/homeScreenFiles.ts's newest-pin-first toggling) always come first, but they
+	// only ever ADD to the top of the list — they never wholesale replace what's already showing
+	// below. The rest of the slots fill in with recently opened/edited/viewed files (or, absent any
+	// open history, just a taste of the library), skipping anything already pinned so nothing shows
+	// twice.
 	const allLibraryFiles = Object.values(files).flat();
 	const libraryFilesByPath = new Map(allLibraryFiles.map((file) => [file.path, file]));
 	const pinnedLibraryFiles = pinnedPaths
@@ -1046,12 +1064,10 @@ const setScreen = () => {
 	const recentLibraryFiles = recentPaths
 		.map((path) => libraryFilesByPath.get(path))
 		.filter((file): file is FileEntry => !!file);
-	const libraryPreviewFiles =
-		pinnedLibraryFiles.length > 0
-			? pinnedLibraryFiles.slice(0, MAX_HOME_SCREEN_FILES)
-			: recentLibraryFiles.length > 0
-			? recentLibraryFiles.slice(0, MAX_HOME_SCREEN_FILES)
-			: allLibraryFiles.slice(0, MAX_HOME_SCREEN_FILES);
+	const fillerFiles = (recentLibraryFiles.length > 0 ? recentLibraryFiles : allLibraryFiles).filter(
+		(file) => !pinnedPaths.includes(file.path)
+	);
+	const libraryPreviewFiles = [...pinnedLibraryFiles, ...fillerFiles].slice(0, MAX_HOME_SCREEN_FILES);
 
 	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
 	// the currently selected file happens to live in, so prev/next still works when a category
@@ -1604,6 +1620,15 @@ const setScreen = () => {
                 <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
                   <h3 className="font-semibold text-gray-700 dark:text-neutral-300 text-sm truncate">{sidebarHeaderLabel}</h3>
                   <div className="flex items-center gap-0.5 shrink-0">
+                    <button
+                      type="button"
+                      title="Refresh files"
+                      onClick={handleRefreshFiles}
+                      disabled={isRefreshingFiles}
+                      className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                    >
+                      <IoRefresh size={15} className={isRefreshingFiles ? "animate-spin" : ""} />
+                    </button>
                     {activeFileCategory !== "trash" && (
                       <button
                         type="button"
@@ -1948,6 +1973,14 @@ const setScreen = () => {
                                 >
                                   {formatFileName(file.name)}
                                 </div>
+                              )}
+
+                              {pinnedPaths.includes(file.path) && (
+                                <IoPin
+                                  size={12}
+                                  className="shrink-0 text-gray-400 dark:text-neutral-500"
+                                  title="Pinned to home"
+                                />
                               )}
 
                               {/* Three vertical dots menu */}
