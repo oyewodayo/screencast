@@ -161,7 +161,17 @@ interface OverlayAnimationStyle {
   opacity: number;
   translateXPx: number;
   translateYPx: number;
+  scale: number;
 }
+
+// Standard ease-out-back overshoot curve (t:0..1 -> slightly past 1, settling back to 1) - the
+// "pop" animation's whole visual identity is that overshoot, so a plain ease-out wouldn't read as
+// distinct from a slower fade/scale.
+const easeOutBack = (t: number): number => {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2;
+};
 
 const overlayAnimationStyle = (
   animation: OverlayAnimation | undefined,
@@ -171,7 +181,7 @@ const overlayAnimationStyle = (
   frameWidth: number,
   frameHeight: number
 ): OverlayAnimationStyle => {
-  if (!animation || animation === "none") return { opacity: 1, translateXPx: 0, translateYPx: 0 };
+  if (!animation || animation === "none") return { opacity: 1, translateXPx: 0, translateYPx: 0, scale: 1 };
 
   const ramp = Math.min(ANIMATION_RAMP_DURATION_SEC, (endTime - startTime) / 2);
   // 0 right at either edge of the overlay's time range, ramping up to 1 once fully "arrived" -
@@ -179,7 +189,15 @@ const overlayAnimationStyle = (
   // before it starts leaving, same reasoning fade already used before this was generalized.
   const progress = ramp <= 0 ? 1 : Math.max(0, Math.min(1, (currentTime - startTime) / ramp, (endTime - currentTime) / ramp));
 
-  if (animation === "fade") return { opacity: progress, translateXPx: 0, translateYPx: 0 };
+  if (animation === "fade") return { opacity: progress, translateXPx: 0, translateYPx: 0, scale: 1 };
+
+  // Pop keeps full opacity throughout - only its scale ramps, overshooting past 1 before settling
+  // (same overall shape as CSS's ease-out-back), symmetric on both entry and exit since `progress`
+  // already accounts for both edges via the min() above.
+  if (animation === "pop") {
+    const scale = progress >= 1 ? 1 : easeOutBack(progress);
+    return { opacity: 1, translateXPx: 0, translateYPx: 0, scale };
+  }
 
   // Slide keeps full opacity throughout - only its position ramps. `remaining` is "how far from
   // fully in place" (1 at either edge, 0 once arrived), so multiplying it by the travel distance
@@ -191,15 +209,15 @@ const overlayAnimationStyle = (
   const distanceY = frameHeight * SLIDE_DISTANCE_FRACTION;
   switch (animation) {
     case "slide-left":
-      return { opacity: 1, translateXPx: -distanceX * remaining, translateYPx: 0 };
+      return { opacity: 1, translateXPx: -distanceX * remaining, translateYPx: 0, scale: 1 };
     case "slide-right":
-      return { opacity: 1, translateXPx: distanceX * remaining, translateYPx: 0 };
+      return { opacity: 1, translateXPx: distanceX * remaining, translateYPx: 0, scale: 1 };
     case "slide-up":
-      return { opacity: 1, translateXPx: 0, translateYPx: -distanceY * remaining };
+      return { opacity: 1, translateXPx: 0, translateYPx: -distanceY * remaining, scale: 1 };
     case "slide-down":
-      return { opacity: 1, translateXPx: 0, translateYPx: distanceY * remaining };
+      return { opacity: 1, translateXPx: 0, translateYPx: distanceY * remaining, scale: 1 };
     default:
-      return { opacity: 1, translateXPx: 0, translateYPx: 0 };
+      return { opacity: 1, translateXPx: 0, translateYPx: 0, scale: 1 };
   }
 };
 
@@ -441,6 +459,7 @@ const SteppedNumberField: React.FC<SteppedNumberFieldProps> = ({ valuePx, min, m
 const ANIMATION_OPTIONS: { value: OverlayAnimation; label: string }[] = [
   { value: "none", label: "None" },
   { value: "fade", label: "Fade" },
+  { value: "pop", label: "Pop" },
   { value: "slide-left", label: "Slide ←" },
   { value: "slide-right", label: "Slide →" },
   { value: "slide-up", label: "Slide ↑" },
@@ -1576,7 +1595,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               // rotate here only ever spins the box around its own center, never around some
               // already-translated point).
               transform:
-                [anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null, o.rotation ? `rotate(${o.rotation}deg)` : null]
+                [
+                  anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
+                  anim.scale !== 1 ? `scale(${anim.scale})` : null,
+                  o.rotation ? `rotate(${o.rotation}deg)` : null,
+                ]
                   .filter(Boolean)
                   .join(" ") || undefined,
               // Border and drop shadow combine into one box-shadow rather than a real `border` - a
@@ -1687,7 +1710,10 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 textAlign: o.textAlign ?? "left",
                 pointerEvents: placingAnything ? "none" : "auto",
                 opacity: anim.opacity,
-                transform: anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : undefined,
+                transform:
+                  [anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null, anim.scale !== 1 ? `scale(${anim.scale})` : null]
+                    .filter(Boolean)
+                    .join(" ") || undefined,
                 background: o.backgroundColor ?? "transparent",
                 borderRadius: cornerRadiusCss(o.cornerStyle, heightPx),
                 // -webkit-text-stroke draws centered on the glyph outline by default, which can eat

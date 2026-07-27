@@ -20,7 +20,14 @@ export function invertCommand(command: VideoEditCommand): VideoEditCommand {
 // the same order as `clips` - that order is exactly the desired playback/output order, so this is
 // a type-only projection, not a sort or a merge.
 export function toKeepSegments(clips: Clip[]): KeepSegment[] {
-  return clips.map(({ sourcePath, start, end }) => ({ sourcePath, start, end }));
+  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn }) => ({
+    sourcePath,
+    start,
+    end,
+    colorFilter,
+    kenBurns,
+    transitionIn,
+  }));
 }
 
 // Which clip (by array position) `sourceTime` falls into, restricted to `sourcePath` - without
@@ -43,8 +50,12 @@ export function splitClipAt(clips: Clip[], index: number, sourceTime: number): C
   if (sourceTime - clip.start < MIN_CLIP_LENGTH || clip.end - sourceTime < MIN_CLIP_LENGTH) return clips;
   return [
     ...clips.slice(0, index),
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime },
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end },
+    // First half keeps transitionIn (still the same pairing with whatever precedes it) plus the
+    // look/motion effects - both halves keep colorFilter/kenBurns (splitting a graded/panned clip
+    // shouldn't silently reset its look), but only the first half is actually adjacent to the
+    // clip that used to precede the whole thing.
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn },
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns },
     ...clips.slice(index + 1),
   ];
 }
@@ -93,6 +104,14 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
     const clamped = Math.min(maxEnd, Math.max(time, c.start + MIN_CLIP_LENGTH));
     return { ...c, end: clamped };
   });
+}
+
+// The one generic patch entry point for a clip's non-geometric fields (color grade, Ken Burns,
+// transition) - same "one function, Partial<T> patch" shape as updateOverlay, but standalone
+// since Clip (unlike every overlay type) has no updatedAt for anything to read back, so it can't
+// reuse updateOverlay<T extends {id,updatedAt}> as-is.
+export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn">>): Clip[] {
+  return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
 
 // ---- Overlays (text + image) -----------------------------------------------------------------

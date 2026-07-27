@@ -11,6 +11,7 @@ import { formatFileName } from "../utils/Formater";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import useVideoEditStore from "../hooks/useVideoEditStore";
 import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
+import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -268,6 +269,11 @@ const Dashboard = () => {
   // by two siblings: the preview-layer editor mounted next to VideoPlayer below, and the timeline
   // lane's chips inside VideoTimelineDocker (reached via BottomDocker/FileToolsDocker).
   const [currentOutputTime, setCurrentOutputTime] = useState<number>(0);
+  // The active clip's own color grade/Ken Burns fields, reported up by VideoTimelineDocker
+  // (onActiveClipChange) and threaded straight into VideoPlayer (activeClipEffects) - same "held
+  // in Dashboard state, passed to both the timeline docker and the sibling player" shape as
+  // currentOutputTime just above.
+  const [activeClipEffects, setActiveClipEffects] = useState<ActiveClipEffects | null>(null);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [isPlacingText, setIsPlacingText] = useState<boolean>(false);
   const [selectedImageOverlayId, setSelectedImageOverlayId] = useState<string | null>(null);
@@ -2103,6 +2109,7 @@ const setScreen = () => {
                 }
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted}
+                activeClipEffects={activeClipEffects}
               />
             )
           ) : (
@@ -2212,6 +2219,7 @@ const setScreen = () => {
         pendingTimelineInsert={pendingTimelineInsert}
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         onOutputTimeChange={setCurrentOutputTime}
+        onActiveClipChange={setActiveClipEffects}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={setSelectedOverlayId}
         isPlacingText={isPlacingText}

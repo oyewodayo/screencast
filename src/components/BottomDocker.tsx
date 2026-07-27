@@ -9,6 +9,7 @@ import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
+import { ActiveClipEffects } from "../utils/videoColorFilters";
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -46,6 +47,9 @@ interface Props {
   // Video-only: reports the timeline's current output-timeline position upward, threaded
   // straight through to FileToolsDocker/VideoTimelineDocker.
   onOutputTimeChange?: (outputTime: number) => void;
+  // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
+  // onOutputTimeChange above.
+  onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // FileToolsDocker/VideoTimelineDocker.
   selectedOverlayId?: string | null;
@@ -134,6 +138,7 @@ const BottomDocker = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  onActiveClipChange,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -444,6 +449,7 @@ const BottomDocker = ({
             pendingTimelineInsert={pendingTimelineInsert}
             onTimelineInsertHandled={onTimelineInsertHandled}
             onOutputTimeChange={onOutputTimeChange}
+            onActiveClipChange={onActiveClipChange}
             selectedOverlayId={selectedOverlayId}
             onSelectOverlay={onSelectOverlay}
             isPlacingText={isPlacingText}

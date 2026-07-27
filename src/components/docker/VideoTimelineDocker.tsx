@@ -41,6 +41,8 @@ import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform
 import { overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import AudioOverlayPopover from "./AudioOverlayPopover";
+import ClipEffectsPopover from "./ClipEffectsPopover";
+import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 
 const MIN_PX_PER_SEC = 8;
 const MAX_PX_PER_SEC = 200;
@@ -245,6 +247,11 @@ interface VideoTimelineDockerProps {
   // sibling subtree Dashboard owns) can time-gate which overlays are visible without duplicating
   // this component's own tricky SEEK_TOLERANCE_SEC-guarded active-clip tracking.
   onOutputTimeChange?: (outputTime: number) => void;
+  // Reports the ACTIVE clip's own color/Ken Burns effect fields upward, so VideoPlayer (mounted
+  // as a sibling subtree by Dashboard) can drive live CSS filter/transform on the <video> element
+  // without needing to know about clips at all - same "report state this component already tracks
+  // upward for a sibling to consume" reasoning as onOutputTimeChange just above.
+  onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
   // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
@@ -292,6 +299,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  onActiveClipChange,
   selectedOverlayId = null,
   onSelectOverlay,
   isPlacingText = false,
@@ -440,6 +448,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [pxPerSec]);
 
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  // Effects popover (color grade/Ken Burns/transition) for whichever clip is selected - opened
+  // from the toolbar's Effects button, closed the same "outside click" way AudioOverlayPopover
+  // closes itself, plus whenever selection moves to a different clip (below) so it never keeps
+  // pointing at a clip that's no longer selected.
+  const [effectsPopoverAnchor, setEffectsPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
+  const effectsButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    setEffectsPopoverAnchor(null);
+  }, [selectedClipId]);
 
   // Live drag state for resizing a single clip's start/end edge - delta-based (pixels moved since
   // the drag began, converted to a time delta) rather than re-deriving from click position, so it
@@ -1305,6 +1322,20 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOutputTime]);
 
+  // Reports the ACTIVE clip's own color/Ken Burns fields upward - only recomputes when the active
+  // clip's identity or its own effect fields actually change (not every tick, unlike
+  // currentOutputTime above), since color/Ken Burns preview is driven off video.currentTime
+  // directly by VideoPlayer's own rAF loop, not by React state per frame.
+  const activeClip = renderClips[activeIndexForDisplay] as Clip | undefined;
+  useEffect(() => {
+    onActiveClipChange?.(
+      activeClip
+        ? { sourceStart: activeClip.start, sourceEnd: activeClip.end, colorFilter: activeClip.colorFilter, kenBurns: activeClip.kenBurns }
+        : null
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns]);
+
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
   // gating text/image overlays already use for visibility), otherwise playing/paused to match
@@ -1396,7 +1427,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <div className="w-px h-5 bg-neutral-700 mx-1" />
           <ToolButton title="Crop"><IoCropOutline size={15} /></ToolButton>
           <ToolButton title="Mirror"><MdFlip size={15} /></ToolButton>
-          <ToolButton title="Effects"><IoSparklesOutline size={15} /></ToolButton>
+          <button
+            ref={effectsButtonRef}
+            type="button"
+            title={selectedClipId ? "Clip effects" : "Select a clip to edit its effects"}
+            disabled={!selectedClipId}
+            onClick={() => {
+              if (effectsPopoverAnchor) {
+                setEffectsPopoverAnchor(null);
+                return;
+              }
+              const rect = effectsButtonRef.current?.getBoundingClientRect();
+              if (rect) setEffectsPopoverAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+              effectsPopoverAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoSparklesOutline size={15} />
+          </button>
           <ActionButton
             title={isPlacingText ? "Click the video preview to place text" : "Add text overlay"}
             onClick={() => onToggleArmPlaceText?.()}
@@ -1715,6 +1764,27 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 );
               })}
 
+              {/* Transition markers - purely decorative (not interactive; edit the transition
+                  itself via the selected clip's Effects popover), at each boundary where the clip
+                  on the RIGHT has transitionIn set. Communicates the documented preview-vs-export
+                  gap (see ClipTransitionIn's own doc comment): live preview shows a hard cut here
+                  regardless of which transition style is picked - the real transition only
+                  renders in the exported file. */}
+              {renderClips.map((clip, i) => {
+                if (i === 0 || clip.id === "__pending__" || !clip.transitionIn) return null;
+                const left = outputStarts[i] * pxPerSec;
+                return (
+                  <div
+                    key={`transition-${clip.id}`}
+                    title={`${TRANSITION_PRESETS.find((p) => p.value === clip.transitionIn?.type)?.label ?? "Transition"} (preview shows a hard cut; export renders the real transition)`}
+                    className="absolute inset-y-1 w-4 -ml-2 flex items-center justify-center rounded bg-blue-500/80 z-10 pointer-events-none"
+                    style={{ left }}
+                  >
+                    <IoSwapHorizontalOutline size={10} className="text-white" />
+                  </div>
+                );
+              })}
+
               {/* Resize handles - two per real clip (start/end edges), kept as separate overlay
                   elements (not nested inside the draggable clip block above) so interacting with
                   them can't accidentally trigger that block's native drag-to-reorder. */}
@@ -1971,6 +2041,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </div>
         </div>
       </div>
+
+      {selectedClipId &&
+        effectsPopoverAnchor &&
+        (() => {
+          const clipIndex = editStore.clips.findIndex((c) => c.id === selectedClipId);
+          const clip = editStore.clips[clipIndex];
+          if (!clip) return null;
+          return (
+            <ClipEffectsPopover
+              clip={clip}
+              hasPrecedingClip={clipIndex > 0}
+              anchor={effectsPopoverAnchor}
+              onUpdate={(patch) => editStore.updateClipEffects(clip.id, patch)}
+              onClose={() => setEffectsPopoverAnchor(null)}
+            />
+          );
+        })()}
 
       {selectedAudioOverlayId &&
         audioPopoverAnchor &&

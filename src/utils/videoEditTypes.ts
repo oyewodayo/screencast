@@ -11,11 +11,69 @@
 
 import { TextAlign, TextColorRun, TextRange } from "./pdfAnnotationTypes";
 
+// A per-clip color grade, applied to that clip's own trimmed segment (both live preview -
+// VideoPlayer's CSS `filter`, see cssFilterForColorPreset in videoColorFilters.ts - and export
+// burn-in - ffmpeg `eq`/`colorbalance`/`vignette` chained onto that segment's own trim step
+// before concat, see color_filter_chain in conversion.rs). "none"/undefined both mean the
+// pre-existing unfiltered look - "none" is a real selectable choice (so a style-panel button can
+// show it as the active one) while undefined is simply "never touched this clip's grade at all".
+export type ColorFilterPreset = "none" | "vibrant" | "cinematic" | "bw" | "warm" | "cool" | "vignette";
+export interface ClipColorFilter {
+  preset: ColorFilterPreset;
+  intensity: number; // 0..1, scales the preset's own strength from identity (0) to full (1)
+}
+
+// A simple, non-keyframed motion effect animated across THIS clip's own [start,end) source
+// range, not the output timeline - preview (VideoPlayer, driven off video.currentTime directly
+// via rAF, not React state - see the effect in VideoPlayer.tsx) and export (a time-varying
+// ffmpeg crop+scale chain, see ken_burns_chain in conversion.rs) both compute progress the same
+// way: 0 at the clip's own start, 1 at its own end.
+export type KenBurnsPreset = "zoom-in" | "zoom-out" | "pan-left" | "pan-right";
+export interface ClipKenBurns {
+  preset: KenBurnsPreset;
+  intensity?: number; // 0..1, undefined means 0.5 (moderate) - how far the zoom/pan travels
+}
+
+// A transition INTO this clip FROM whichever clip immediately precedes it in playback (array)
+// order - deliberately not "transitionOut" on the earlier clip, so reordering clips naturally
+// keeps "the transition" attached to whichever pairing is now adjacent, with no extra
+// bookkeeping. Meaningless (ignored) on the very first clip - there's nothing to transition
+// from. Preview-only shows a hard cut at the boundary regardless of which transition is picked
+// (see the transition marker in VideoTimelineDocker) - the real transition only renders in the
+// export, same "one side documented as behind" precedent TextOverlay/ImageOverlay's own "slide"
+// animation already set.
+// Names ffmpeg's own `xfade` filter transition names directly (see conversion.rs's
+// TRANSITION_ALLOWLIST) rather than inventing a separate friendly-name-to-xfade-name mapping
+// layer - one flat vocabulary shared by the UI, the sidecar JSON, and the export filter string,
+// so adding another xfade transition later is a one-line addition to both this union and the
+// Rust allowlist, not a new translation table entry too.
+export type TransitionType =
+  | "fade"
+  | "fadeblack"
+  | "wipeleft"
+  | "wiperight"
+  | "slideleft"
+  | "slideright"
+  | "circleopen"
+  | "zoomin"
+  | "pixelize"
+  | "radial"
+  | "dissolve";
+export interface ClipTransitionIn {
+  type: TransitionType;
+  duration: number; // seconds, e.g. 0.5 - clamped against both flanking clips' own durations
+                     // server-side (see export_trimmed_video) so a too-long transition can't
+                     // produce an invalid ffmpeg offset.
+}
+
 export interface Clip {
   id: string;
   sourcePath: string;
   start: number;
   end: number;
+  colorFilter?: ClipColorFilter;
+  kenBurns?: ClipKenBurns;
+  transitionIn?: ClipTransitionIn;
 }
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
@@ -30,7 +88,10 @@ export type TextOverlayCornerStyle = "square" | "rounded" | "pill";
 // the last; "slide-<direction>" instead keeps opacity at 1 and, over that same ramp, slides the box
 // in from (and back out to) the named off-screen side. Both clamp their ramp to half the overlay's
 // own duration so a very short overlay still finishes entering before it starts leaving.
-export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down";
+// "pop" is preview-only, same as every "slide-*" variant already was before this comment existed
+// - see exportEdited's own comment (useVideoEditStore.ts) for why burning a scale-varying overlay
+// into the export is deferred rather than attempted here.
+export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down" | "pop";
 
 // A caption/title composited over the video preview (v1 is preview-only - not yet burned into
 // exported files, see export_trimmed_video). Core text/formatting mirrors TextObject
@@ -187,6 +248,9 @@ export interface KeepSegment {
   sourcePath: string;
   start: number;
   end: number;
+  colorFilter?: ClipColorFilter;
+  kenBurns?: ClipKenBurns;
+  transitionIn?: ClipTransitionIn;
 }
 
 export interface VideoEditState {
@@ -236,6 +300,7 @@ export interface VideoEditCommand {
     | "delete"
     | "reorder"
     | "insert"
+    | "edit-clip-effects"
     | "add-text"
     | "edit-text"
     | "delete-text"

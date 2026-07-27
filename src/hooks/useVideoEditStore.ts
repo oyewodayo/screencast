@@ -24,6 +24,7 @@ import {
   sendOverlayToBack,
   splitClipAt,
   toKeepSegments,
+  updateClip as updateClipHandler,
   updateOverlay,
 } from "../handlers/videoEditHandlers";
 import { blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderTextOverlayToPng } from "../utils/videoOverlayRender";
@@ -63,6 +64,7 @@ type ImageOverlayContentPatch = Partial<
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -151,6 +153,10 @@ export interface UseVideoEditStoreResult {
   deleteClipAt: (index: number) => void;
   reorderClip: (fromIndex: number, toIndex: number) => void;
   resizeClipEdge: (id: string, edge: "start" | "end", time: number) => void;
+  // Color grade / Ken Burns / crossfade-in, all three on one patch entry point - same "one
+  // generic patch fn" shape as updateTextOverlayContent, just for a clip's own non-geometric
+  // fields (see updateClip, videoEditHandlers.ts).
+  updateClipEffects: (id: string, patch: ClipEffectsPatch) => void;
   // Inserts a whole new clip - from the Briefcast library or an external file dropped onto the
   // timeline - at `atIndex`, fetching its duration first if not already known. Resolves once the
   // clip has actually been added (or been skipped, if the duration lookup failed).
@@ -389,6 +395,17 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "trim");
     },
     [pushCommand, getSourceDuration]
+  );
+
+  const updateClipEffects = useCallback(
+    (id: string, patch: ClipEffectsPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = updateClipHandler(current.clips, id, patch);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "edit-clip-effects");
+    },
+    [pushCommand]
   );
 
   // Total duration of the assembled/output timeline right now - the same quantity
@@ -826,10 +843,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           for (const o of current.imageOverlays) {
             // eslint-disable-next-line no-await-in-loop
             const rendered = await renderImageOverlayToPng(o, pxW, pxH);
-            // "slide" has no export-side equivalent yet (would need a time-varying ffmpeg overlay
-            // x/y expression, not just the alpha fade filter this "fade" flag already drives) -
-            // preview-only for now, same as every other overlay aesthetic was before its own
-            // burn-in support was added.
+            // "slide" and "pop" have no export-side equivalent yet (would need a time-varying
+            // ffmpeg overlay x/y or scale expression, not just the alpha fade filter this "fade"
+            // flag already drives) - preview-only for now, same as every other overlay aesthetic
+            // was before its own burn-in support was added.
             if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: o.animation === "fade" });
           }
         }
@@ -884,6 +901,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           audioOverlays,
           audioMuted: current.videoAudioMuted,
           audioVolume: current.videoAudioVolume,
+          videoWidth: videoPixelSize?.width ?? null,
+          videoHeight: videoPixelSize?.height ?? null,
         });
         const name = outputPath.split(/[\\/]/).pop() ?? outputPath;
         return { path: outputPath, name };
@@ -943,6 +962,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     deleteClipAt,
     reorderClip,
     resizeClipEdge,
+    updateClipEffects,
     insertClipAt,
     undo,
     redo,

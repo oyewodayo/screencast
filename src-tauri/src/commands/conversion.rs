@@ -468,12 +468,50 @@ pub async fn convert_audio(
 // invoke_handler macro converts automatically) because this struct is deserialized as the
 // *value* of the `segments` array by serde directly, not through that per-command conversion -
 // without it, the frontend's `sourcePath` would fail to match `source_path`.
+// A per-segment color grade - see color_filter_chain, applied to that segment's own trim step
+// before concat so different clips can carry different looks. `preset` mirrors
+// ColorFilterPreset (videoEditTypes.ts) as a plain string rather than a Rust enum - same
+// "trust the frontend's own validated union, match on &str with a catch-all" convention this
+// file has no existing enum-from-string precedent to follow, so a string keeps the two sides
+// in sync with a one-line match arm instead of a serde enum needing its own rename mapping.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipColorFilter {
+    pub preset: String,
+    pub intensity: f64, // 0..1
+}
+
+// A per-segment Ken Burns zoom/pan - see ken_burns_chain. `intensity` is optional (None means
+// "moderate", matching ClipKenBurns.intensity's own undefined-means-0.5 convention in
+// videoEditTypes.ts) since the frontend only sends it once a user has actually touched the
+// slider away from its default.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipKenBurns {
+    pub preset: String,
+    pub intensity: Option<f64>,
+}
+
+// A crossfade transition INTO this segment from whichever segment immediately precedes it -
+// see the has_transitions fold in export_trimmed_video. Meaningless on segments[0] (nothing
+// precedes it) - never read for that index.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipTransitionIn {
+    #[serde(rename = "type")]
+    pub transition_type: String, // "crossfade" - only variant in v1
+    pub duration: f64,           // seconds
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeepSegment {
     pub source_path: String,
     pub start: f64,
     pub end: f64,
+    pub color_filter: Option<ClipColorFilter>,
+    pub ken_burns: Option<ClipKenBurns>,
+    pub transition_in: Option<ClipTransitionIn>,
 }
 
 // One text or image overlay, already fully rendered client-side to a transparent PNG matching
@@ -542,6 +580,117 @@ pub struct OverlayAudio {
     pub fade_out: f64,
 }
 
+// Per-segment color grade fragment, chained directly onto that segment's own trim step (before
+// concat). Formulas are deliberately simple/approximate (not colorimetrically "correct") - a
+// quick preset gallery, not a grading tool - and are meant to visually match their CSS-preview
+// counterpart (cssFilterForColorPreset, src/utils/videoColorFilters.ts); if one is retuned, retune
+// the other so preview and export don't silently drift apart. Empty string (no-op) for
+// "none"/unrecognized so callers can unconditionally append the result without an extra branch.
+fn color_filter_chain(cf: &ClipColorFilter) -> String {
+    let t = cf.intensity.max(0.0).min(1.0);
+    match cf.preset.as_str() {
+        "vibrant" => format!(",eq=saturation={:.3}:contrast={:.3}", 1.0 + 0.6 * t, 1.0 + 0.15 * t),
+        "cinematic" => format!(
+            ",eq=contrast={:.3}:saturation={:.3}:gamma={:.3},colorbalance=rs={:.3}:bs={:.3}:rm={:.3}:bm={:.3}",
+            1.0 + 0.2 * t, 1.0 - 0.15 * t, 1.0 - 0.05 * t, -0.10 * t, 0.15 * t, -0.05 * t, 0.10 * t
+        ),
+        "bw" => format!(",eq=saturation={:.3}", 1.0 - t),
+        "warm" => format!(",colorbalance=rs={:.3}:bs={:.3}:rm={:.3}:bm={:.3}", 0.20 * t, -0.20 * t, 0.15 * t, -0.15 * t),
+        "cool" => format!(",colorbalance=rs={:.3}:bs={:.3}:rm={:.3}:bm={:.3}", -0.20 * t, 0.20 * t, -0.15 * t, 0.15 * t),
+        "vignette" => format!(",vignette=angle=PI/{:.3}", (6.0 - 4.0 * t).max(2.2)),
+        _ => String::new(),
+    }
+}
+
+// Per-segment Ken Burns fragment - a time-varying `crop` (using ffmpeg's own `t`/`iw`/`ih`/`ow`/
+// `oh` expression variables - the same "expression string, not a filter option" idiom the
+// enable='between(t,...)' chains elsewhere in this file already rely on), then a fixed `scale=`
+// back to the export's own output resolution. The trailing scale is required, not cosmetic:
+// concat needs every segment at matching resolution, and a shrinking crop window alone would
+// leave this segment's frames smaller than its neighbors'. Chosen over ffmpeg's `zoompan` filter
+// deliberately - zoompan's own output-size handling is more version-sensitive across ffmpeg
+// builds than crop's plain expression support, and this only needs to spike-test cleanly once.
+fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64) -> String {
+    let amount = kb.intensity.unwrap_or(0.5).max(0.0).min(1.0);
+    let d = duration.max(0.01);
+    match kb.preset.as_str() {
+        "zoom-in" | "zoom-out" => {
+            let z = 1.0 + 0.30 * amount;
+            let p = if kb.preset == "zoom-in" {
+                format!("(1+({z:.4}-1)*min(t/{d:.3},1))")
+            } else {
+                format!("({z:.4}-({z:.4}-1)*min(t/{d:.3},1))")
+            };
+            format!(",crop=w='iw/{p}':h='ih/{p}':x='(iw-ow)/2':y='(ih-oh)/2',scale={out_w}:{out_h}")
+        }
+        "pan-left" | "pan-right" => {
+            let z = 1.0 + 0.15 * amount;
+            let dir = if kb.preset == "pan-right" { format!("min(t/{d:.3},1)") } else { format!("1-min(t/{d:.3},1)") };
+            format!(",crop=w='iw/{z:.4}':h='ih/{z:.4}':x='(iw-ow)*({dir})':y='(ih-oh)/2',scale={out_w}:{out_h}")
+        }
+        _ => String::new(),
+    }
+}
+
+// One extra filter-string fragment for a segment's color grade + Ken Burns, ready to append right
+// after that segment's own `setpts=PTS-STARTPTS` in its trim step - the single call site both the
+// single-segment and multi-segment branches below share, so the two branches can't drift apart on
+// how a segment's effects get spliced in.
+fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>) -> String {
+    let mut extra = String::new();
+    if let Some(cf) = &seg.color_filter {
+        if cf.preset != "none" {
+            extra.push_str(&color_filter_chain(cf));
+        }
+    }
+    if let (Some(kb), Some(w), Some(h)) = (&seg.ken_burns, out_w, out_h) {
+        extra.push_str(&ken_burns_chain(kb, seg.end - seg.start, w, h));
+    }
+    extra
+}
+
+// Frame rate of a source file's first video stream, as a plain f64 (e.g. 30.0, 59.94) - only ever
+// needed for the crossfade fold below, which requires every input at a matching constant frame
+// rate before chaining more than one `xfade` in sequence (spike-tested: without this, ffmpeg
+// rejects the second xfade in a chain with "needs to be a constant frame rate"). Defaults to 30.0
+// on any probe failure (missing ffprobe, unparseable output, a 0/0 rate) rather than erroring the
+// whole export over a cosmetic transition detail.
+// Allowlist of ffmpeg `xfade` transition names this app exposes (mirrors TransitionType,
+// videoEditTypes.ts, exactly - one flat vocabulary, no separate friendly-name mapping table).
+// `transition_type` is interpolated directly into the filter_complex string below (see the
+// has_transitions fold), so this is a real security boundary, not just UI validation - an
+// unrecognized value (a hand-edited sidecar, a future frontend/backend version mismatch) falls
+// back to "fade" rather than ever reaching the format! call unchecked.
+const ALLOWED_TRANSITIONS: &[&str] = &["fade", "fadeblack", "wipeleft", "wiperight", "slideleft", "slideright", "circleopen", "zoomin", "pixelize", "radial", "dissolve"];
+
+fn sanitize_transition_name(name: &str) -> &str {
+    ALLOWED_TRANSITIONS.iter().find(|&&t| t == name).copied().unwrap_or("fade")
+}
+
+fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
+    const FALLBACK_FPS: f64 = 30.0;
+    let output = match Command::new(ffprobe_path)
+        .args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", source_path])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return FALLBACK_FPS,
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    let parsed = match text.split_once('/') {
+        Some((num, den)) => match (num.parse::<f64>(), den.parse::<f64>()) {
+            (Ok(n), Ok(d)) if d > 0.0 => Some(n / d),
+            _ => None,
+        },
+        None => text.parse::<f64>().ok(),
+    };
+    match parsed {
+        Some(fps) if fps.is_finite() && fps > 0.0 => fps,
+        _ => FALLBACK_FPS,
+    }
+}
+
 // Decodes one overlay's PNG payload and writes it to a fresh temp file - ffmpeg needs a real path
 // for `-i`, not a data URL. `data_base64` may carry a "data:image/png;base64," prefix (what
 // canvas.toDataURL() produces) or be the bare payload; splitting on the last comma handles both
@@ -585,6 +734,13 @@ pub async fn export_trimmed_video(
     audio_overlays: Vec<OverlayAudio>,
     audio_muted: bool,
     audio_volume: f64,
+    // The primary file's native pixel resolution, already resolved by the frontend (same value
+    // used for text/image overlay burn-in) - reused here as the Ken Burns crop's own trailing
+    // `scale=` target rather than a fresh ffprobe lookup. None (e.g. an audio-only export path)
+    // just means Ken Burns is silently skipped per-segment, same "skip gracefully" convention
+    // exportEdited already uses for overlay rendering when videoPixelSize itself is null.
+    video_width: Option<i64>,
+    video_height: Option<i64>,
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
@@ -675,8 +831,18 @@ pub async fn export_trimmed_video(
     let has_video_overlays = !overlays.is_empty();
     let has_blur_overlays = !blur_overlays.is_empty();
     let has_audio_overlays = !audio_overlays.is_empty();
+    // Any clip-level effect also needs the full filter graph - the fast -ss/-to path below has no
+    // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
+    let has_clip_effects = segments.iter().any(|s| {
+        s.color_filter.as_ref().map_or(false, |cf| cf.preset != "none") || s.ken_burns.is_some() || s.transition_in.is_some()
+    });
+    // Any segment beyond the first requesting a transition - gates the pairwise xfade/acrossfade
+    // fold below instead of the plain all-at-once `concat=n=N` the multi-segment branch has always
+    // used, so a timeline with no transitions set takes the exact same, already-proven path it did
+    // before this feature existed.
+    let has_transitions = segments.iter().skip(1).any(|s| s.transition_in.is_some());
 
-    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_blur_overlays && !has_audio_overlays {
+    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_blur_overlays && !has_audio_overlays && !has_clip_effects {
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
         let seg = &segments[0];
@@ -702,24 +868,87 @@ pub async fn export_trimmed_video(
         // below has one consistent label to start from regardless of how many segments there were.
         if segments.len() == 1 {
             let seg = &segments[0];
+            let extra = segment_effect_chain(seg, video_width, video_height);
             filter.push_str(&format!(
-                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS[base];[0:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[outa];",
-                seg.start, seg.end
+                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{2}[base];[0:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[outa];",
+                seg.start, seg.end, extra
             ));
-        } else {
+        } else if !has_transitions {
             // Same segment-major trim+concat pattern as before this function grew overlay support
             // - concat's inputs must interleave [v0][a0][v1][a1]..., not group all video labels
             // before all audio ones, or ffmpeg rejects the whole filtergraph ("Media type
-            // mismatch").
+            // mismatch"). Untouched from before clip effects existed except for `extra` - a
+            // timeline with no transitions takes this exact path regardless of color/Ken Burns.
             let mut concat_inputs = String::new();
             for (i, seg) in segments.iter().enumerate() {
+                let extra = segment_effect_chain(seg, video_width, video_height);
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS[v{2}];[{2}:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
-                    seg.start, seg.end, i
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3}[v{2}];[{2}:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
+                    seg.start, seg.end, i, extra
                 ));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
             }
             filter.push_str(&format!("{}concat=n={}:v=1:a=1[base][outa];", concat_inputs, segments.len()));
+        } else {
+            // At least one segment (beyond the first) has a crossfade transition - fold pairwise
+            // left-to-right instead of one all-at-once concat, so each transitioned boundary can
+            // use `xfade`/`acrossfade` in place of a plain 2-way concat at that one boundary only.
+            //
+            // xfade needs every input at a matching CONSTANT frame rate before it'll chain more
+            // than one in sequence (spike-tested against this app's own bundled ffmpeg: omitting
+            // this makes the *second* xfade in a chain fail with "needs to be a constant frame
+            // rate, current rate of 1/0 is invalid", even though the first one alone works fine) -
+            // so every segment gets an explicit `fps=` up front, using the first segment's own
+            // source file's frame rate as the shared target (screen recordings from this app are
+            // effectively always one consistent rate throughout a session either way).
+            let ffprobe_path = get_ffprobe_path(&app_handle)?;
+            let target_fps = probe_frame_rate(&ffprobe_path, &segments[0].source_path);
+
+            for (i, seg) in segments.iter().enumerate() {
+                let extra = segment_effect_chain(seg, video_width, video_height);
+                filter.push_str(&format!(
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3},fps={4:.3}[v{2}];[{2}:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
+                    seg.start, seg.end, i, extra, target_fps
+                ));
+            }
+
+            // Folds left-to-right: `accumulated` tracks the CURRENT duration of whatever
+            // [cur_v]/[cur_a] point at right now, since xfade's own `offset` is relative to its
+            // first input's timeline (not the original segment's own duration) once more than one
+            // fold has already happened.
+            let mut cur_v = "v0".to_string();
+            let mut cur_a = "a0".to_string();
+            let mut accumulated = segments[0].end - segments[0].start;
+            for i in 1..segments.len() {
+                let seg = &segments[i];
+                let seg_dur = seg.end - seg.start;
+                let next_v = format!("fold{}v", i);
+                let next_a = format!("fold{}a", i);
+                let use_transition = seg.transition_in.as_ref().map_or(false, |tr| tr.duration > 0.0);
+                if use_transition {
+                    let tr = seg.transition_in.as_ref().unwrap();
+                    let transition_name = sanitize_transition_name(&tr.transition_type);
+                    // Clamped so the transition can never exceed 90% of either flanking segment's
+                    // own duration - an unclamped duration could push `offset` negative (transition
+                    // longer than everything accumulated so far) or overlap more of the next
+                    // segment than actually exists.
+                    let d = tr.duration.min(accumulated * 0.9).min(seg_dur * 0.9).max(0.05);
+                    let offset = (accumulated - d).max(0.0);
+                    // acrossfade has no equivalent "transition style" concept of its own (audio has
+                    // no visual wipe/circle/pixelize shape to speak of) - every visual transition
+                    // style shares the exact same linear audio crossfade underneath.
+                    filter.push_str(&format!(
+                        "[{cur_v}][v{i}]xfade=transition={transition_name}:duration={d:.3}:offset={offset:.3}[{next_v}];[{cur_a}][a{i}]acrossfade=d={d:.3}[{next_a}];"
+                    ));
+                    accumulated += seg_dur - d;
+                } else {
+                    filter.push_str(&format!("[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"));
+                    accumulated += seg_dur;
+                }
+                cur_v = next_v;
+                cur_a = next_a;
+            }
+            filter.push_str(&format!("[{cur_v}]copy[base];[{cur_a}]acopy[outa];"));
         }
 
         // Blur regions are chained onto [base] first, ahead of the text/image overlay loop below,

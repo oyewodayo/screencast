@@ -26,6 +26,7 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
+import { ActiveClipEffects, cssFilterForColorPreset, kenBurnsTransform } from '../utils/videoColorFilters';
 
 
 
@@ -102,6 +103,12 @@ interface VideoPlayerProps {
   // itself is actually set to.
   trackVolume?: number; // 0..1, defaults to 1
   trackMuted?: boolean;
+  // The currently active clip's own color grade/Ken Burns fields (VideoTimelineDocker's
+  // onActiveClipChange, threaded through by Dashboard) - null/undefined means "no clip tracked
+  // yet or neither effect set", same as trackVolume/trackMuted this component stays fully clip-
+  // unaware otherwise, just applying whatever small descriptor it's handed straight to the
+  // <video> element's own CSS.
+  activeClipEffects?: ActiveClipEffects | null;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -123,7 +130,7 @@ export interface VideoPlayerHandle {
   loadSource: (src: string, seekTime: number) => void;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -432,6 +439,46 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   useEffect(() => {
     setVolume(videoRef.current, volume * (trackMuted ? 0 : trackVolume));
   }, [volume, trackVolume, trackMuted]);
+
+  // Live-preview color grade - a direct CSS `filter` write on the <video> element itself, the
+  // export-side counterpart being ffmpeg's eq/colorbalance/vignette chain (conversion.rs). Cleared
+  // (empty string) whenever there's no color filter, or it's explicitly "none", so switching away
+  // from a graded clip doesn't leave a stale filter applied.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const cf = activeClipEffects?.colorFilter;
+    video.style.filter = cf && cf.preset !== 'none' ? cssFilterForColorPreset(cf) : '';
+  }, [activeClipEffects?.colorFilter]);
+
+  // Live-preview Ken Burns - its own rAF loop reading video.currentTime directly rather than React
+  // state per tick, since the 'timeupdate' event this component otherwise relies on fires far too
+  // coarsely (roughly 4x/sec) for a smooth slow zoom/pan to read as smooth. Safe to transform the
+  // <video> element itself: it fills its container at 100%/100% with object-fit:contain handling
+  // the letterboxing, so scaling/translating the element scales/pans the picture uniformly around
+  // its own center exactly like a Ken Burns effect should.
+  useEffect(() => {
+    const video = videoRef.current;
+    const kb = activeClipEffects?.kenBurns;
+    if (!video || !kb) {
+      if (video) video.style.transform = '';
+      return;
+    }
+    const { sourceStart, sourceEnd } = activeClipEffects!;
+    let raf: number;
+    const tick = () => {
+      const duration = Math.max(0.01, sourceEnd - sourceStart);
+      const progress = Math.max(0, Math.min(1, (video.currentTime - sourceStart) / duration));
+      video.style.transform = kenBurnsTransform(kb, progress);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      video.style.transform = '';
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);
@@ -957,6 +1004,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						>
 							{overlay(frameRect)}
 						</div>
+					)}
+					{activeClipEffects?.colorFilter?.preset === 'vignette' && frameRect && (
+						// No CSS `filter` primitive produces a vignette, unlike every other color preset
+						// above - a radial-gradient div positioned to the exact same frameRect the overlay
+						// render-prop div just above already uses is the simplest equivalent.
+						<div
+							className="absolute pointer-events-none"
+							style={{
+								left: frameRect.left,
+								top: frameRect.top,
+								width: frameRect.width,
+								height: frameRect.height,
+								background: `radial-gradient(ellipse at center, transparent ${40 - 15 * activeClipEffects.colorFilter.intensity}%, rgba(0,0,0,${(0.6 * activeClipEffects.colorFilter.intensity).toFixed(3)}) 100%)`,
+							}}
+						/>
 					)}
 					</>
 				)
