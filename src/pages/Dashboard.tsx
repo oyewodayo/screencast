@@ -19,6 +19,15 @@ import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, isConvertibleCategory } from "../utils/fileCategory";
 import {
+  MAX_HOME_SCREEN_FILES,
+  getPinnedPaths,
+  getRecentPaths,
+  togglePin,
+  recordFileOpened,
+  repathFile,
+  forgetFile,
+} from "../utils/homeScreenFiles";
+import {
   IoVideocam,
   IoMusicalNotes,
   IoImage,
@@ -33,6 +42,7 @@ import {
   IoFolderOutline,
   IoAddCircleOutline,
   IoBuildOutline,
+  IoPin,
 } from "react-icons/io5";
 import { MdCreateNewFolder } from "react-icons/md";
 
@@ -185,6 +195,11 @@ const Dashboard = () => {
   const [activeFileCategory, setActiveFileCategory] = useState<SidebarTab>("video");
   const [trashItems, setTrashItems] = useState<TrashEntry[]>([]);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
+  // Pinned + recently-opened file paths behind the home screen's "From your library" preview —
+  // see utils/homeScreenFiles.ts. Mirrored into React state (rather than read fresh from
+  // localStorage on every render) so toggling a pin or opening a file re-renders that preview.
+  const [pinnedPaths, setPinnedPaths] = useState<string[]>(() => getPinnedPaths());
+  const [recentPaths, setRecentPaths] = useState<string[]>(() => getRecentPaths());
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>("");
   // "Move to ▸" flyout inside a file's 3-dot menu — keyed by file.path, separate from openMenu
@@ -751,6 +766,9 @@ const setScreen = () => {
 			await invoke("move_to_trash", { path: file.path });
 			if (selectedFile?.sourcePath === file.path) setSelectedFile(null);
 			setOpenMenu(null);
+			const { pinned, recent } = forgetFile(file.path);
+			setPinnedPaths(pinned);
+			setRecentPaths(recent);
 			await handleDirectoryFiles();
 			setMessage(`Moved to trash: ${formatFileName(file.name)}`);
 		} catch (error) {
@@ -988,6 +1006,7 @@ const setScreen = () => {
 		name: fileName,
 		sourcePath: filePath
 		});
+		setRecentPaths(recordFileOpened(filePath));
 
 		console.log('File selected for playback:', fileName);
 	} catch (error) {
@@ -1015,10 +1034,24 @@ const setScreen = () => {
 	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
 		FILE_CATEGORY_TABS.find((tab) => tab.category === category)?.icon ?? <IoDocumentText size={18} />;
 
-	// A handful of files to surface on the empty home screen so it isn't just a blank void —
-	// not meant to be "recent" (FileEntry carries no timestamp from the backend), just enough
-	// of a taste of the library to invite a click instead of forcing a trip to the sidebar.
-	const libraryPreviewFiles = Object.values(files).flat().slice(0, 6);
+	// What to surface on the empty home screen so it isn't just a blank void. Priority order:
+	// pinned files (in pin order — see utils/homeScreenFiles.ts's FIFO-on-overflow toggling) if
+	// there are any; otherwise the most recently opened/edited/viewed files; otherwise just a
+	// taste of the library so a fresh install isn't a blank void either.
+	const allLibraryFiles = Object.values(files).flat();
+	const libraryFilesByPath = new Map(allLibraryFiles.map((file) => [file.path, file]));
+	const pinnedLibraryFiles = pinnedPaths
+		.map((path) => libraryFilesByPath.get(path))
+		.filter((file): file is FileEntry => !!file);
+	const recentLibraryFiles = recentPaths
+		.map((path) => libraryFilesByPath.get(path))
+		.filter((file): file is FileEntry => !!file);
+	const libraryPreviewFiles =
+		pinnedLibraryFiles.length > 0
+			? pinnedLibraryFiles.slice(0, MAX_HOME_SCREEN_FILES)
+			: recentLibraryFiles.length > 0
+			? recentLibraryFiles.slice(0, MAX_HOME_SCREEN_FILES)
+			: allLibraryFiles.slice(0, MAX_HOME_SCREEN_FILES);
 
 	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
 	// the currently selected file happens to live in, so prev/next still works when a category
@@ -1292,6 +1325,17 @@ const setScreen = () => {
 			const results = await Promise.allSettled(
 				toMove.map((file) => invoke<string>("move_file", { sourcePath: file.path, destFolderPath: destFolder }))
 			);
+
+			// Keep pin/recent-history pointed at each moved file's new path — repathFile reads then
+			// writes localStorage synchronously, so chaining through fulfilled results in order is safe.
+			results.forEach((result, i) => {
+				if (result.status === "fulfilled") {
+					const { pinned, recent } = repathFile(toMove[i].path, result.value);
+					setPinnedPaths(pinned);
+					setRecentPaths(recent);
+				}
+			});
+
 			await handleDirectoryFiles();
 
 			// The file's playback URL is derived from its old absolute path, so a currently-open
@@ -1446,6 +1490,11 @@ const setScreen = () => {
 		}
 	};
 
+	const handleTogglePin = (file: FileEntry) => {
+		setPinnedPaths(togglePin(file.path));
+		setOpenMenu(null);
+	};
+
 	const startRename = (file: FileEntry) => {
 		const dotIndex = file.name.lastIndexOf('.');
 		setRenameValue(dotIndex > 0 ? file.name.slice(0, dotIndex) : file.name);
@@ -1461,6 +1510,9 @@ const setScreen = () => {
 		if (!newName || newName === file.name) return;
 		try {
 			const newPath = await invoke<string>('rename_file', { oldPath: file.path, newName });
+			const { pinned, recent } = repathFile(file.path, newPath);
+			setPinnedPaths(pinned);
+			setRecentPaths(recent);
 			await handleDirectoryFiles();
 			if (selectedFile?.sourcePath === file.path) {
 				const newFileName = newPath.split(/[\\/]/).pop() ?? newName;
@@ -1920,6 +1972,15 @@ const setScreen = () => {
                                       className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
                                       onClick={(e) => {
                                         e.stopPropagation();
+                                        handleTogglePin(file);
+                                      }}
+                                    >
+                                      {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
+                                    </button>
+                                    <button
+                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
                                         startRename(file);
                                       }}
                                     >
@@ -2186,6 +2247,9 @@ const setScreen = () => {
                         <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
                           {formatFileName(file.name)}
                         </span>
+                        {pinnedPaths.includes(file.path) && (
+                          <IoPin size={13} className="ml-auto text-gray-400 dark:text-neutral-500 shrink-0" />
+                        )}
                       </button>
                     ))}
                   </div>
