@@ -64,7 +64,7 @@ type ImageOverlayContentPatch = Partial<
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;

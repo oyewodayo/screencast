@@ -492,6 +492,20 @@ pub struct ClipKenBurns {
     pub intensity: Option<f64>,
 }
 
+// A free-form crop window into this segment's own frame - see crop_chain. NOT locked to the
+// source frame's own aspect ratio (independent width/height), matching ClipCrop's own doc comment
+// in videoEditTypes.ts: since the cropped region's own aspect generally won't match the export's
+// fixed output resolution, crop_chain's trailing `scale=out_w:out_h` stretches it to fill rather
+// than letterboxing/padding.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipCrop {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 // A crossfade transition INTO this segment from whichever segment immediately precedes it -
 // see the has_transitions fold in export_trimmed_video. Meaningless on segments[0] (nothing
 // precedes it) - never read for that index.
@@ -512,6 +526,7 @@ pub struct KeepSegment {
     pub color_filter: Option<ClipColorFilter>,
     pub ken_burns: Option<ClipKenBurns>,
     pub transition_in: Option<ClipTransitionIn>,
+    pub crop: Option<ClipCrop>,
 }
 
 // One text or image overlay, already fully rendered client-side to a transparent PNG matching
@@ -632,15 +647,48 @@ fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64) -> 
     }
 }
 
-// One extra filter-string fragment for a segment's color grade + Ken Burns, ready to append right
-// after that segment's own `setpts=PTS-STARTPTS` in its trim step - the single call site both the
-// single-segment and multi-segment branches below share, so the two branches can't drift apart on
-// how a segment's effects get spliced in.
+// Per-segment crop fragment - a static (non-time-varying) version of ken_burns_chain's own crop
+// idiom, generalized to independent width/height: crop a free-form window out of the frame.
+// Deliberately does NOT scale back to the export's own output resolution itself - unlike
+// ken_burns_chain, whose own trailing `scale` is the only one that will ever run for that segment.
+// segment_effect_chain below appends `scale=out_w:out_h` itself, but only when Ken Burns isn't ALSO
+// set on the same segment: when it is, its own crop+scale runs immediately after this one and
+// already ends in that exact scale, so adding a second one here would resample the frame twice for
+// the same final pixels - wasted encode time and a marginally softer image from the extra
+// resampling pass. Ken Burns' own crop math is proportional (iw/ih-relative) regardless of what
+// this crop left iw/ih at, so skipping the scale here doesn't change what it produces. width/height
+// are clamped away from 0 to avoid a degenerate near-zero-area crop, and x/y are clamped so the
+// window can never crop past its own edge. The STRETCH (no force_original_aspect_ratio) that
+// whichever trailing scale ends up running still applies - deliberate, see ClipCrop's own doc
+// comment for why (letterboxing/padding was the alternative, not chosen).
+fn crop_chain(c: &ClipCrop) -> String {
+    let width = c.width.max(0.05).min(1.0);
+    let height = c.height.max(0.05).min(1.0);
+    let x = c.x.max(0.0).min(1.0 - width);
+    let y = c.y.max(0.0).min(1.0 - height);
+    format!(",crop=w='iw*{width:.4}':h='ih*{height:.4}':x='iw*{x:.4}':y='ih*{y:.4}'")
+}
+
+// One extra filter-string fragment for a segment's color grade + crop + Ken Burns, ready to
+// append right after that segment's own `setpts=PTS-STARTPTS` in its trim step - the single call
+// site both the single-segment and multi-segment branches below share, so the two branches can't
+// drift apart on how a segment's effects get spliced in. Crop is applied before Ken Burns (not
+// after) so Ken Burns' own zoom/pan animates within the already-cropped window, matching the live
+// preview's own composition order (VideoPlayer.tsx). Whichever of crop/Ken Burns runs LAST is what
+// actually rescales back to out_w:out_h - concat needs every segment at matching dimensions
+// regardless of which effects it has, so at least one of them always has to; see crop_chain's own
+// doc comment for why that's never both.
 fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>) -> String {
     let mut extra = String::new();
     if let Some(cf) = &seg.color_filter {
         if cf.preset != "none" {
             extra.push_str(&color_filter_chain(cf));
+        }
+    }
+    if let (Some(crop), Some(w), Some(h)) = (&seg.crop, out_w, out_h) {
+        extra.push_str(&crop_chain(crop));
+        if seg.ken_burns.is_none() {
+            extra.push_str(&format!(",scale={w}:{h}"));
         }
     }
     if let (Some(kb), Some(w), Some(h)) = (&seg.ken_burns, out_w, out_h) {
@@ -688,6 +736,64 @@ fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
     match parsed {
         Some(fps) if fps.is_finite() && fps > 0.0 => fps,
         _ => FALLBACK_FPS,
+    }
+}
+
+// Whether `source_path` has at least one audio stream - screen recordings captured with no
+// microphone/system audio are a real, common case (see the crop bug this was written for: cropping
+// such a recording routes it into the filter-graph export path below, whose `[i:a]atrim=...`
+// branches used to be unconditional and made ffmpeg reject the whole graph with "Stream specifier
+// ':a' ... matches no streams" the moment a segment's source had no audio track at all). Defaults
+// to true on any probe failure so an unreadable/unusual file keeps the previous "always assume
+// audio" behavior rather than silently dropping a real track.
+fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
+    let output = match Command::new(ffprobe_path)
+        .args(["-v", "quiet", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", source_path])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return true,
+    };
+    !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
+// Native pixel size of `source_path`'s first video stream - the frontend normally already knows
+// this (videoPixelSize, read off the same hidden capture <video> used for thumbnails) and passes it
+// through as video_width/video_height, but that can still be None if Save is clicked before that
+// metadata has loaded (a just-added clip, or an unusual codec). segment_effect_chain needs a
+// concrete out_w/out_h to build the crop/Ken Burns filters at all, so without this fallback probe a
+// segment with either effect set would take the (already forced, since has_clip_effects) filter-
+// graph export path but have that one effect silently skipped - an uncropped/unpanned file, no
+// error, no indication anything was dropped.
+fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
+    let output = Command::new(ffprobe_path)
+        .args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", source_path])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (w, h) = text.trim().split_once('x')?;
+    match (w.parse::<i64>(), h.parse::<i64>()) {
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
+}
+
+// One segment's audio branch of the filter graph, trimmed to [start,end) and labeled `out_label` -
+// a real `atrim` off the segment's own input when it has audio, otherwise a synthesized silent
+// track of the same duration (`anullsrc`, a filter *source*, needs no `-i` input of its own) so
+// concat/xfade/acrossfade downstream always have a real audio stream to work with regardless of
+// whether the source did.
+fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, out_label: &str) -> String {
+    if has_audio {
+        format!(
+            "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS[{out}];",
+            idx = input_index, out = out_label
+        )
+    } else {
+        format!(
+            "anullsrc=channel_layout=stereo:sample_rate=44100:duration={dur:.3}[{out}];",
+            dur = (end - start).max(0.01), out = out_label
+        )
     }
 }
 
@@ -834,7 +940,7 @@ pub async fn export_trimmed_video(
     // Any clip-level effect also needs the full filter graph - the fast -ss/-to path below has no
     // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
     let has_clip_effects = segments.iter().any(|s| {
-        s.color_filter.as_ref().map_or(false, |cf| cf.preset != "none") || s.ken_burns.is_some() || s.transition_in.is_some()
+        s.color_filter.as_ref().map_or(false, |cf| cf.preset != "none") || s.ken_burns.is_some() || s.transition_in.is_some() || s.crop.is_some()
     });
     // Any segment beyond the first requesting a transition - gates the pairwise xfade/acrossfade
     // fold below instead of the plain all-at-once `concat=n=N` the multi-segment branch has always
@@ -863,6 +969,58 @@ pub async fn export_trimmed_video(
         args
     } else {
         let mut filter = String::new();
+        // Probed once up front (not per-branch) since all three shapes below - single segment,
+        // plain concat, transition fold - need it: see audio_trim_chain's own doc comment for why.
+        let ffprobe_path = get_ffprobe_path(&app_handle)?;
+
+        // One audio probe per UNIQUE source file, not one per segment - a timeline built by
+        // splitting a single recording into several clips would otherwise spawn a redundant
+        // ffprobe process per clip asking the exact same file the exact same question. Each probe
+        // (and the dimensions probe just below) runs on the async runtime's blocking thread pool
+        // via spawn_blocking rather than blocking whatever thread is running this command with a
+        // synchronous Command::output() call - same reasoning as child.wait() further up. Spawned
+        // before anything awaits, so they all actually run concurrently rather than one after
+        // another.
+        let unique_source_paths: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            segments.iter().map(|s| s.source_path.clone()).filter(|p| seen.insert(p.clone())).collect()
+        };
+        let audio_probe_handles: Vec<_> = unique_source_paths
+            .iter()
+            .map(|path| {
+                let ffprobe_path = ffprobe_path.clone();
+                let path = path.clone();
+                tauri::async_runtime::spawn_blocking(move || (path.clone(), probe_has_audio(&ffprobe_path, &path)))
+            })
+            .collect();
+        // Falls back to a real probe only when the frontend didn't already resolve this AND some
+        // segment actually needs it (crop/Ken Burns) - see probe_video_dimensions' own doc comment.
+        let dimensions_probe_handle = if (video_width.is_none() || video_height.is_none()) && has_clip_effects {
+            let ffprobe_path = ffprobe_path.clone();
+            let first_source = segments[0].source_path.clone();
+            Some(tauri::async_runtime::spawn_blocking(move || probe_video_dimensions(&ffprobe_path, &first_source)))
+        } else {
+            None
+        };
+
+        let mut has_audio_by_path: HashMap<String, bool> = HashMap::new();
+        for handle in audio_probe_handles {
+            // A probe task can only fail here by panicking (probe_has_audio itself never returns
+            // Err) - falls back to the same "assume audio" default probe_has_audio's own I/O
+            // failure branch already uses.
+            if let Ok((path, has_audio)) = handle.await {
+                has_audio_by_path.insert(path, has_audio);
+            }
+        }
+        let segment_has_audio: Vec<bool> = segments.iter().map(|s| *has_audio_by_path.get(&s.source_path).unwrap_or(&true)).collect();
+
+        let (video_width, video_height): (Option<i64>, Option<i64>) = match dimensions_probe_handle {
+            Some(handle) => match handle.await.ok().flatten() {
+                Some((w, h)) => (Some(w), Some(h)),
+                None => (video_width, video_height),
+            },
+            None => (video_width, video_height),
+        };
 
         // Base video (trim, or trim+concat) always lands in a [base] node so the overlay chain
         // below has one consistent label to start from regardless of how many segments there were.
@@ -870,9 +1028,10 @@ pub async fn export_trimmed_video(
             let seg = &segments[0];
             let extra = segment_effect_chain(seg, video_width, video_height);
             filter.push_str(&format!(
-                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{2}[base];[0:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[outa];",
+                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{2}[base];",
                 seg.start, seg.end, extra
             ));
+            filter.push_str(&audio_trim_chain(segment_has_audio[0], 0, seg.start, seg.end, "outa"));
         } else if !has_transitions {
             // Same segment-major trim+concat pattern as before this function grew overlay support
             // - concat's inputs must interleave [v0][a0][v1][a1]..., not group all video labels
@@ -883,9 +1042,10 @@ pub async fn export_trimmed_video(
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height);
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3}[v{2}];[{2}:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3}[v{2}];",
                     seg.start, seg.end, i, extra
                 ));
+                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, &format!("a{}", i)));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
             }
             filter.push_str(&format!("{}concat=n={}:v=1:a=1[base][outa];", concat_inputs, segments.len()));
@@ -901,15 +1061,15 @@ pub async fn export_trimmed_video(
             // so every segment gets an explicit `fps=` up front, using the first segment's own
             // source file's frame rate as the shared target (screen recordings from this app are
             // effectively always one consistent rate throughout a session either way).
-            let ffprobe_path = get_ffprobe_path(&app_handle)?;
             let target_fps = probe_frame_rate(&ffprobe_path, &segments[0].source_path);
 
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height);
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3},fps={4:.3}[v{2}];[{2}:a]atrim=start={0:.3}:end={1:.3},asetpts=PTS-STARTPTS[a{2}];",
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3},fps={4:.3}[v{2}];",
                     seg.start, seg.end, i, extra, target_fps
                 ));
+                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, &format!("a{}", i)));
             }
 
             // Folds left-to-right: `accumulated` tracks the CURRENT duration of whatever

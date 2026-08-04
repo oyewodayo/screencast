@@ -274,6 +274,14 @@ interface VideoTimelineDockerProps {
   onSelectBlurOverlay?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
+
+  // Whether the on-canvas crop tool (ClipCropOverlay, mounted as a sibling next to VideoPlayer by
+  // Dashboard) is armed - unlike text/image/blur, there's nothing to "place", it just shows/hides
+  // a drag window over whichever clip is currently on screen, so there's no onPlacementConsumed
+  // counterpart here; toggling this button again (or the same toggle inside ClipEffectsPopover) is
+  // what turns it back off.
+  isCroppingClip?: boolean;
+  onToggleCroppingClip?: () => void;
 }
 
 // The video-specific "file tools" docker: a scrubbable timeline (ruler + playhead + reorderable
@@ -312,6 +320,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onSelectBlurOverlay,
   isPlacingBlur = false,
   onToggleArmPlaceBlur,
+  isCroppingClip = false,
+  onToggleCroppingClip,
 }) => {
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -1330,11 +1340,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   useEffect(() => {
     onActiveClipChange?.(
       activeClip
-        ? { sourceStart: activeClip.start, sourceEnd: activeClip.end, colorFilter: activeClip.colorFilter, kenBurns: activeClip.kenBurns }
+        ? { id: activeClip.id, sourceStart: activeClip.start, sourceEnd: activeClip.end, colorFilter: activeClip.colorFilter, kenBurns: activeClip.kenBurns, crop: activeClip.crop }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns]);
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -1425,7 +1435,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoTrashOutline size={15} />
           </ActionButton>
           <div className="w-px h-5 bg-neutral-700 mx-1" />
-          <ToolButton title="Crop"><IoCropOutline size={15} /></ToolButton>
+          <ActionButton
+            title={selectedClipId ? (isCroppingClip ? "Stop cropping" : "Crop clip") : "Select a clip to crop"}
+            onClick={() => onToggleCroppingClip?.()}
+            disabled={!selectedClipId}
+          >
+            <IoCropOutline size={15} className={isCroppingClip ? "text-blue-400" : undefined} />
+          </ActionButton>
           <ToolButton title="Mirror"><MdFlip size={15} /></ToolButton>
           <button
             ref={effectsButtonRef}
@@ -2055,6 +2071,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               anchor={effectsPopoverAnchor}
               onUpdate={(patch) => editStore.updateClipEffects(clip.id, patch)}
               onClose={() => setEffectsPopoverAnchor(null)}
+              isCropping={isCroppingClip}
+              onToggleCropping={() => onToggleCroppingClip?.()}
             />
           );
         })()}

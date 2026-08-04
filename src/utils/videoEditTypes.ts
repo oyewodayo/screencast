@@ -34,6 +34,22 @@ export interface ClipKenBurns {
   intensity?: number; // 0..1, undefined means 0.5 (moderate) - how far the zoom/pan travels
 }
 
+// A free-form crop window into this clip's own frame - independent x/y/width/height (fractions of
+// the source frame), NOT locked to the frame's own aspect ratio, so e.g. trimming a browser-tab
+// strip off just the top (full width, shorter height) is representable. Since the cropped region's
+// own aspect generally won't match the export's fixed output resolution, both preview and export
+// STRETCH it to fill that resolution rather than letterboxing/padding - preview via a non-uniform
+// CSS scale+translate on the <video> element (see cropStaticTransform in videoColorFilters.ts),
+// export via crop_chain's own trailing `scale=out_w:out_h` (conversion.rs), which stretches by
+// design (no force_original_aspect_ratio). All four undefined means uncropped (equivalent to
+// {x:0,y:0,width:1,height:1}).
+export interface ClipCrop {
+  x: number; // 0..(1-width), left edge, fraction of source frame width
+  y: number; // 0..(1-height), top edge, fraction of source frame height
+  width: number; // 0 < width <= 1, fraction of source frame width
+  height: number; // 0 < height <= 1, fraction of source frame height
+}
+
 // A transition INTO this clip FROM whichever clip immediately precedes it in playback (array)
 // order - deliberately not "transitionOut" on the earlier clip, so reordering clips naturally
 // keeps "the transition" attached to whichever pairing is now adjacent, with no extra
@@ -74,6 +90,7 @@ export interface Clip {
   colorFilter?: ClipColorFilter;
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
+  crop?: ClipCrop;
 }
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
@@ -251,6 +268,7 @@ export interface KeepSegment {
   colorFilter?: ClipColorFilter;
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
+  crop?: ClipCrop;
 }
 
 export interface VideoEditState {

@@ -10,10 +10,13 @@ import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortc
 import { formatFileName } from "../utils/Formater";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import useVideoEditStore from "../hooks/useVideoEditStore";
+import useImageEditStore from "../hooks/useImageEditStore";
 import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
+import ClipCropOverlay from "../components/video/ClipCropOverlay";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
+import ImageEditor from "../components/ImageEditor";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings } from "../utils/appSettings";
@@ -283,6 +286,24 @@ const Dashboard = () => {
   const editStore = useVideoEditStore(
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
+  // Same lifting reasoning as editStore just above, for the image editor: ImageEditor (the main
+  // content pane) and ImageCollageDocker (the bottom panel's thumbnail strip, reached via
+  // BottomDocker/FileToolsDocker) both need the exact same document/undo-redo stack, not two
+  // independent copies that could drift out of sync. Gated to image files only for the same
+  // wasted-load-avoidance reason editStore already is.
+  const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
+  const imageEditStore = useImageEditStore(
+    isImageFileSelected ? selectedFile!.sourcePath : undefined,
+    isImageFileSelected ? selectedFile!.path : undefined
+  );
+  // Which placed object (if any) is selected on the image-edit canvas - lifted for the same
+  // reason selectedImageOverlayId is: ImageEditor's own canvas and ImageCollageDocker's thumbnail
+  // strip both need to read/drive the same selection ("click a thumbnail to jump to it on the
+  // canvas" only works if they share this).
+  const [selectedImageEditObjectId, setSelectedImageEditObjectId] = useState<string | null>(null);
+  useEffect(() => {
+    setSelectedImageEditObjectId(null);
+  }, [selectedFile?.path]);
   // Text-overlay UI state - lifted here (rather than local to either subtree) because it's shared
   // by two siblings: the preview-layer editor mounted next to VideoPlayer below, and the timeline
   // lane's chips inside VideoTimelineDocker (reached via BottomDocker/FileToolsDocker).
@@ -298,6 +319,16 @@ const Dashboard = () => {
   const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
   const [selectedBlurOverlayId, setSelectedBlurOverlayId] = useState<string | null>(null);
   const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
+  // Arms the on-canvas crop tool (ClipCropOverlay, mounted as a sibling to VideoOverlayLayer just
+  // below) - unlike the placement tools above, there's no "consumed" step, it just shows/hides a
+  // drag window over whichever clip activeClipEffects currently points at. Deliberately NOT reset
+  // when the active CLIP changes within the same file's timeline (playhead crossing a cut, or a
+  // new clip getting selected) - it's meant to follow whichever clip is on screen, per its own
+  // comment above. Only reset when the open FILE itself changes, below.
+  const [isCroppingClip, setIsCroppingClip] = useState<boolean>(false);
+  useEffect(() => {
+    setIsCroppingClip(false);
+  }, [selectedFile?.path]);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
@@ -1046,6 +1077,15 @@ const setScreen = () => {
 		await loadFileForPlayback(newPath, newFileName);
 	};
 
+	// Fired by ImageEditor's "Save a copy" once save_edited_image finishes - same
+	// refresh-list-then-select-the-result shape as handleVideoExported above; the source image is
+	// left untouched, this just adds its edited sibling alongside it.
+	const handleImageSaved = async (newPath: string, newFileName: string) => {
+		await handleDirectoryFiles();
+		setMessage(`Saved edited image: ${formatFileName(newFileName)}`);
+		await loadFileForPlayback(newPath, newFileName);
+	};
+
 	// Small icon shown next to a file name in the home-screen "From your library" preview list.
 	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
 		FILE_CATEGORY_TABS.find((tab) => tab.category === category)?.icon ?? <IoDocumentText size={18} />;
@@ -1647,7 +1687,11 @@ const setScreen = () => {
                           !selectedFile
                             ? "Select a file to see its tools"
                             : dockerMode === "file-tools"
-                            ? "Show recording controls"
+                            ? isImageFileSelected
+                              ? "Exit collage mode"
+                              : "Show recording controls"
+                            : isImageFileSelected
+                            ? "Collage tools"
                             : "Show tools for this file"
                         }
                         onClick={() => setDockerMode((prev) => (prev === "record" ? "file-tools" : "record"))}
@@ -2139,6 +2183,17 @@ const setScreen = () => {
                 isFullscreen={isPdfFullscreen}
                 onToggleFullscreen={handleTogglePdfFullscreen}
               />
+            ) : getFileCategory(selectedFile.name) === "image" ? (
+              <ImageEditor
+                key={selectedFile.path}
+                sourcePath={selectedFile.sourcePath}
+                title={selectedFile.name}
+                onSaved={handleImageSaved}
+                store={imageEditStore}
+                isCollageMode={dockerMode === "file-tools"}
+                selectedObjectId={selectedImageEditObjectId}
+                onSelectObject={setSelectedImageEditObjectId}
+              />
             ) : (
               <VideoPlayer
                 ref={videoPlayerRef}
@@ -2162,7 +2217,8 @@ const setScreen = () => {
                 overlay={
                   getFileCategory(selectedFile.name) === "video"
                     ? (frameRect) => (
-                        <VideoOverlayLayer
+                        <>
+                          <VideoOverlayLayer
                           frameRect={frameRect}
                           overlays={editStore.textOverlays}
                           imageOverlays={editStore.imageOverlays}
@@ -2198,6 +2254,23 @@ const setScreen = () => {
                           onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
                           totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
                         />
+                        {isCroppingClip && activeClipEffects && (
+                          // Keyed on the active clip's own id so a clip change mid-drag (playback
+                          // crossing a cut while the user is still holding a handle down - rare,
+                          // but possible) unmounts/remounts this instead of silently committing
+                          // the in-progress drag to whatever clip happens to be active at release:
+                          // onChange closes over `activeClipEffects.id` fresh every render, so
+                          // without this key a mid-drag identity change would let the commit land
+                          // on the wrong clip using frame geometry computed against the OLD one.
+                          <ClipCropOverlay
+                            key={activeClipEffects.id}
+                            frameRect={frameRect}
+                            crop={activeClipEffects.crop}
+                            onChange={(crop) => editStore.updateClipEffects(activeClipEffects.id, { crop })}
+                            onLivePreview={(crop) => videoPlayerRef.current?.previewCropLive(crop)}
+                          />
+                        )}
+                      </>
                       )
                     : undefined
                 }
@@ -2300,6 +2373,9 @@ const setScreen = () => {
         activeFile={selectedFile ? { name: selectedFile.name, path: selectedFile.sourcePath } : null}
         activeFilePlayableSrc={selectedFile?.path ?? null}
         editStore={editStore}
+        imageEditStore={imageEditStore}
+        selectedImageEditObjectId={selectedImageEditObjectId}
+        onSelectImageEditObject={setSelectedImageEditObjectId}
         activeFileCurrentTime={playerCurrentTime}
         onSeekActiveFile={handleSeekActiveFile}
         activeFileIsPlaying={playerIsPlaying}
@@ -2329,6 +2405,8 @@ const setScreen = () => {
         onSelectBlurOverlay={setSelectedBlurOverlayId}
         isPlacingBlur={isPlacingBlur}
         onToggleArmPlaceBlur={() => setIsPlacingBlur((v) => !v)}
+        isCroppingClip={isCroppingClip}
+        onToggleCroppingClip={() => setIsCroppingClip((v) => !v)}
         selectScreen={selectScreen}
         setScreen={setScreen}
         unSetScreen={unSetScreen}

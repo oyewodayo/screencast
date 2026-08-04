@@ -3,7 +3,7 @@
 // Pure functions only, mirroring pdfAnnotationHandlers.ts's style: no React, callers pass in
 // everything they need explicitly. useVideoEditStore is the only caller.
 
-import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
 const MIN_OVERLAY_DURATION = 0.1;
@@ -16,17 +16,30 @@ export function invertCommand(command: VideoEditCommand): VideoEditCommand {
   return { before: command.after, after: command.before, label: command.label };
 }
 
+// Rust's ClipCrop (conversion.rs) requires width/height as plain (non-Option) f64 - a crop object
+// missing them, e.g. a stale {x,y,size} value left over from an older shape this type used earlier
+// (in-memory state from before a shape change, or an already-saved sidecar file written by that
+// older version), would otherwise fail JSON deserialization on invoke and hard-error the whole
+// export. Dropping it back to "uncropped" here is the same defensive fallback ClipCropOverlay's
+// own `committed`/cropStaticTransform already use for display - export just needs the same safety
+// net at its own boundary.
+function sanitizeCrop(crop: ClipCrop | undefined): ClipCrop | undefined {
+  if (!crop || !Number.isFinite(crop.width) || !Number.isFinite(crop.height) || crop.width <= 0 || crop.height <= 0) return undefined;
+  return crop;
+}
+
 // The plain [start,end) ranges export_trimmed_video needs, each naming its own source file, in
 // the same order as `clips` - that order is exactly the desired playback/output order, so this is
 // a type-only projection, not a sort or a merge.
 export function toKeepSegments(clips: Clip[]): KeepSegment[] {
-  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn }) => ({
+  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn, crop }) => ({
     sourcePath,
     start,
     end,
     colorFilter,
     kenBurns,
     transitionIn,
+    crop: sanitizeCrop(crop),
   }));
 }
 
@@ -51,11 +64,11 @@ export function splitClipAt(clips: Clip[], index: number, sourceTime: number): C
   return [
     ...clips.slice(0, index),
     // First half keeps transitionIn (still the same pairing with whatever precedes it) plus the
-    // look/motion effects - both halves keep colorFilter/kenBurns (splitting a graded/panned clip
-    // shouldn't silently reset its look), but only the first half is actually adjacent to the
-    // clip that used to precede the whole thing.
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn },
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns },
+    // look/motion effects - both halves keep colorFilter/kenBurns/crop (splitting a graded/panned/
+    // cropped clip shouldn't silently reset its look), but only the first half is actually
+    // adjacent to the clip that used to precede the whole thing.
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn, crop: clip.crop },
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, crop: clip.crop },
     ...clips.slice(index + 1),
   ];
 }
@@ -110,7 +123,7 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
 // transition) - same "one function, Partial<T> patch" shape as updateOverlay, but standalone
 // since Clip (unlike every overlay type) has no updatedAt for anything to read back, so it can't
 // reuse updateOverlay<T extends {id,updatedAt}> as-is.
-export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn">>): Clip[] {
+export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop">>): Clip[] {
   return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
 

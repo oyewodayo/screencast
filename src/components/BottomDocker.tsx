@@ -9,6 +9,7 @@ import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
+import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 
 interface Props {
@@ -25,6 +26,11 @@ interface Props {
   // to FileToolsDocker/VideoTimelineDocker so the preview-layer text-overlay editor near the main
   // player and the timeline's own lane share the exact same edit state/undo-redo stack.
   editStore: UseVideoEditStoreResult;
+  // Image-only: Dashboard's single, lifted useImageEditStore instance - same lifting reasoning as
+  // editStore above, threaded straight through to FileToolsDocker/ImageCollageDocker.
+  imageEditStore: UseImageEditStoreResult;
+  selectedImageEditObjectId: string | null;
+  onSelectImageEditObject: (id: string | null) => void;
   // Live playback position of the main player, and a way to seek it - what lets the video-tools
   // timeline's playhead track and drive real playback instead of being purely decorative.
   activeFileCurrentTime: number;
@@ -68,6 +74,9 @@ interface Props {
   onSelectBlurOverlay?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
+  // Video-only: on-canvas crop-tool arm state, same threading as the overlay props above.
+  isCroppingClip?: boolean;
+  onToggleCroppingClip?: () => void;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
   isHome: boolean;
@@ -126,6 +135,9 @@ const BottomDocker = ({
   activeFile,
   activeFilePlayableSrc,
   editStore,
+  imageEditStore,
+  selectedImageEditObjectId,
+  onSelectImageEditObject,
   activeFileCurrentTime,
   onSeekActiveFile,
   activeFileIsPlaying,
@@ -151,6 +163,8 @@ const BottomDocker = ({
   onSelectBlurOverlay,
   isPlacingBlur,
   onToggleArmPlaceBlur,
+  isCroppingClip,
+  onToggleCroppingClip,
   handleFolderSettings,
   handleGoHome,
   isHome,
@@ -437,6 +451,9 @@ const BottomDocker = ({
             file={activeFile}
             playableSrc={activeFilePlayableSrc}
             editStore={editStore}
+            imageEditStore={imageEditStore}
+            selectedImageEditObjectId={selectedImageEditObjectId}
+            onSelectImageEditObject={onSelectImageEditObject}
             currentTime={activeFileCurrentTime}
             onSeek={onSeekActiveFile}
             isPlaying={activeFileIsPlaying}
@@ -462,6 +479,8 @@ const BottomDocker = ({
             onSelectBlurOverlay={onSelectBlurOverlay}
             isPlacingBlur={isPlacingBlur}
             onToggleArmPlaceBlur={onToggleArmPlaceBlur}
+            isCroppingClip={isCroppingClip}
+            onToggleCroppingClip={onToggleCroppingClip}
           />
         ) : (
           <RecordingDocker

@@ -19,6 +19,7 @@ mod commands {
 mod services {
     pub mod utility;
     pub mod pdf_annotations;
+    pub mod image_annotations;
     pub mod video_edits;
     pub mod trash;
     pub mod file_watcher;
@@ -193,6 +194,9 @@ fn main() {
             services::pdf_annotations::save_pdf_annotations,
             services::pdf_annotations::load_pdf_annotations,
             services::pdf_annotations::save_exported_pdf,
+            services::image_annotations::save_image_annotations,
+            services::image_annotations::load_image_annotations,
+            services::image_annotations::save_edited_image,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

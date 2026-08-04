@@ -6,7 +6,7 @@
 // byte-identical output (a CSS `filter` and an ffmpeg pixel filter are never going to match
 // exactly). If one side's formula is retuned, retune the other so preview and export don't
 // silently drift apart - see the cross-reference comment on color_filter_chain itself.
-import { ClipColorFilter, ClipKenBurns, ColorFilterPreset, KenBurnsPreset, TransitionType } from "./videoEditTypes";
+import { ClipColorFilter, ClipCrop, ClipKenBurns, ColorFilterPreset, KenBurnsPreset, TransitionType } from "./videoEditTypes";
 
 export const COLOR_FILTER_PRESETS: { value: ColorFilterPreset; label: string }[] = [
   { value: "none", label: "None" },
@@ -85,13 +85,49 @@ export function kenBurnsTransform(kb: ClipKenBurns, progress: number): string {
   }
 }
 
+// CSS `transform` for a static free-form crop window (see ClipCrop's own doc comment,
+// videoEditTypes.ts) - the preview counterpart to crop_chain's ffmpeg crop+scale (conversion.rs).
+// Non-uniformly scales the <video> element by 1/width horizontally and 1/height vertically (a
+// two-argument `scale(sx, sy)`, unlike kenBurnsTransform's uniform zoom - the whole point of a
+// free-form crop is that its own aspect ratio can differ from the frame's), then translates so the
+// window's own center lands on the element's center - object-fit:contain handles the letterboxing
+// the same way it already does for kenBurnsTransform, so this is safe to compose directly with it
+// (see VideoPlayer.tsx, which appends kenBurnsTransform's own transform string after this one so
+// Ken Burns zooms/pans within the already-cropped window, matching crop_chain running before
+// ken_burns_chain on the export side). The non-uniform scale is exactly what makes this preview
+// "stretch to fill" rather than letterbox, matching crop_chain's own plain `scale=out_w:out_h`.
+export function cropStaticTransform(crop: ClipCrop): string {
+  // Falls back to uncropped (1) rather than propagating NaN when width/height aren't valid
+  // numbers - guards against a stale {x,y,size} value left over from an older shape this type
+  // used earlier (in-memory state from before a shape change, or an already-saved sidecar file
+  // written by that older version), same defensive fallback ClipCropOverlay's own `committed`
+  // uses for the same reason.
+  const width = Number.isFinite(crop.width) ? Math.max(0.05, Math.min(1, crop.width)) : 1;
+  const height = Number.isFinite(crop.height) ? Math.max(0.05, Math.min(1, crop.height)) : 1;
+  const centerX = crop.x + width / 2;
+  const centerY = crop.y + height / 2;
+  // translate() percentages resolve against this element's own untransformed border box, and
+  // since `scale(...) translate(...)` applies translate BEFORE scale (rightmost function acts on
+  // the point first), the offset needed to re-center the window is independent of `scale` itself
+  // - same "no division by the scale factor" shape kenBurnsTransform's own translateX(...%)
+  // panning already relies on.
+  const dxPct = (0.5 - centerX) * 100;
+  const dyPct = (0.5 - centerY) * 100;
+  return `scale(${1 / width}, ${1 / height}) translate(${dxPct}%, ${dyPct}%)`;
+}
+
 // What VideoTimelineDocker reports upward (onActiveClipChange) and VideoPlayer consumes
 // (activeClipEffects prop) - just enough of the active clip's own fields to drive live preview,
 // not the whole Clip (id/sourcePath/transitionIn are irrelevant to what's rendered on-screen
 // moment to moment).
 export interface ActiveClipEffects {
+  // The clip's own id - unlike every other field here, not read for live-preview rendering
+  // itself, but needed by Dashboard to call updateClipEffects(id, ...) when the on-canvas crop
+  // tool (ClipCropOverlay) commits a drag directly against whichever clip is currently on screen.
+  id: string;
   sourceStart: number;
   sourceEnd: number;
   colorFilter?: ClipColorFilter;
   kenBurns?: ClipKenBurns;
+  crop?: ClipCrop;
 }
