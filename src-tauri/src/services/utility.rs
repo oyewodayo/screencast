@@ -412,10 +412,12 @@ fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<File
             }
         }
          else if entry_path.is_dir() {
-            // Trashed files live here (see services/trash.rs) and must never surface in the
-            // normal file list — that's the whole point of trash being "hidden" rather than
-            // just another folder.
-            if entry_path.file_name().and_then(|n| n.to_str()) == Some(".trash") {
+            // Trashed files (.trash, see services/trash.rs) and board projects/assets (Boards,
+            // see services/boards.rs) both live here but must never surface in the normal file
+            // list — that's the whole point of both being "hidden" rather than just another
+            // folder.
+            let dir_name = entry_path.file_name().and_then(|n| n.to_str());
+            if dir_name == Some(".trash") || dir_name == Some(super::boards::BOARDS_DIR_NAME) {
                 continue;
             }
             subdirs.push(entry_path);

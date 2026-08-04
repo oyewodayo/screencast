@@ -7,6 +7,17 @@
   color-scheme: light;
 }
 
+/* WebView2 (Chromium) treats a two-finger trackpad pinch as a page-zoom gesture by default, and
+   lets scroll hit an edge "bounce" (overscroll) rather than just stopping - combined with this
+   app's full-height flex layouts, both read as the whole window jumping/dragging when you pinch
+   or scroll past a list's end. `pan-x pan-y` keeps normal one/two-finger scrolling working while
+   dropping the pinch-to-scale gesture entirely; `overscroll-behavior: none` stops the bounce
+   instead of letting it chain up through nested scroll containers to the document. */
+html, body {
+  touch-action: pan-x pan-y;
+  overscroll-behavior: none;
+}
+
 html.dark {
   color-scheme: dark;
 }

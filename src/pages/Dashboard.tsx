@@ -17,6 +17,7 @@ import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
+import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings } from "../utils/appSettings";
@@ -47,6 +48,8 @@ import {
   IoBuildOutline,
   IoPin,
   IoRefresh,
+  IoSearch,
+  IoClose,
 } from "react-icons/io5";
 import { MdCreateNewFolder } from "react-icons/md";
 
@@ -198,12 +201,19 @@ const Dashboard = () => {
   const [files, setFiles] = useState<FileMap>({});
   const [activeFileCategory, setActiveFileCategory] = useState<SidebarTab>("video");
   const [trashItems, setTrashItems] = useState<TrashEntry[]>([]);
+  // Sidebar file-list search - filters the active category's files (and trash) by name, case-
+  // insensitive substring match. Kept as a single query shared across every tab/trash rather than
+  // per-tab state, same as a normal file explorer's search box.
+  const [fileSearchQuery, setFileSearchQuery] = useState<string>("");
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   // Pinned + recently-opened file paths behind the home screen's "From your library" preview —
   // see utils/homeScreenFiles.ts. Mirrored into React state (rather than read fresh from
   // localStorage on every render) so toggling a pin or opening a file re-renders that preview.
   const [pinnedPaths, setPinnedPaths] = useState<string[]>(() => getPinnedPaths());
   const [recentPaths, setRecentPaths] = useState<string[]>(() => getRecentPaths());
+  // Which Board screen (if any) is showing in the main content pane - null means Board mode is
+  // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
+  const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
   // Spins the sidebar's manual refresh icon while a refresh is in flight — see handleRefreshFiles.
   const [isRefreshingFiles, setIsRefreshingFiles] = useState<boolean>(false);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
@@ -886,7 +896,8 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => setSelectedFile(null);
+	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); };
+	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); };
 	const handleOpenSettings = () => setShowSettings(true);
 	const handleCloseSettings = () => setShowSettings(false);
 	// Settings apply immediately to the current session too, not just future ones — otherwise
@@ -1053,6 +1064,7 @@ const setScreen = () => {
 		name: fileName,
 		sourcePath: filePath
 		});
+		setBoardScreen(null);
 		setRecentPaths(recordFileOpened(filePath));
 
 		console.log('File selected for playback:', fileName);
@@ -1594,15 +1606,28 @@ const setScreen = () => {
 	// tab happens to be open. Sorted lexicographically on the relative-path key, which conveniently
 	// also sorts every folder after its own parent ("Workshops" before "Workshops/Papers") and
 	// puts the root ("") first, so this doubles as the hierarchical display order.
+	const normalizedSearchQuery = fileSearchQuery.trim().toLowerCase();
+	const isSearchingFiles = normalizedSearchQuery.length > 0;
 	const filteredEntries = Object.entries(files)
 		.map(([folder, fileList]) => [
 			folder,
-			fileList.filter((file) => getFileCategory(file.name) === activeFileCategory),
+			fileList.filter(
+				(file) => getFileCategory(file.name) === activeFileCategory && (!isSearchingFiles || file.name.toLowerCase().includes(normalizedSearchQuery))
+			),
 		] as [string, FileEntry[]])
+		// A folder with zero matches is only worth hiding while actively searching - normally
+		// every real folder stays visible (even empty ones, per this file's own comment above)
+		// so it's still usable as a create-subfolder/move/drop target.
+		.filter(([, fileList]) => !isSearchingFiles || fileList.length > 0)
 		.sort(([a], [b]) => a.localeCompare(b));
+	const filteredTrashItems = isSearchingFiles
+		? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery))
+		: trashItems;
 	const sidebarHeaderLabel =
 		activeFileCategory === "trash"
 			? "Trash:"
+			: isSearchingFiles
+			? "Search results:"
 			: filteredEntries.length === 1 ? `${folderDisplayName(filteredEntries[0][0])}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
 	const isAudioSelected = selectedFile !== null && getFileCategory(selectedFile.name) === "audio";
 
@@ -1653,6 +1678,31 @@ const setScreen = () => {
                     <IoTrashOutline size={18} />
                     <span>Trash</span>
                   </button>
+                </div>
+
+                {/* File search - filters the active tab's files (and trash) by name as you type.
+                    Fixed below the tabs, same as the folder-label bar beneath it. */}
+                <div className="px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
+                  <div className="relative">
+                    <IoSearch size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 dark:text-neutral-500 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={fileSearchQuery}
+                      onChange={(e) => setFileSearchQuery(e.target.value)}
+                      placeholder="Search files"
+                      className="w-full pl-7 pr-7 py-1.5 rounded-md text-xs bg-gray-100 dark:bg-neutral-800 border border-transparent focus:border-blue-400 dark:focus:border-blue-500 outline-none text-neutral-800 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500"
+                    />
+                    {fileSearchQuery && (
+                      <button
+                        type="button"
+                        title="Clear search"
+                        onClick={() => setFileSearchQuery("")}
+                        className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                      >
+                        <IoClose size={13} />
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {/* Folder label + prev/next/repeat/shuffle/autoplay controls — fixed below the
@@ -1824,13 +1874,13 @@ const setScreen = () => {
                   className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200"
                 >
                 {activeFileCategory === "trash" ? (
-                  trashItems.length === 0 ? (
-                    <p>Trash is empty</p>
+                  filteredTrashItems.length === 0 ? (
+                    <p>{isSearchingFiles ? "No matching trash items" : "Trash is empty"}</p>
                   ) : (
                     <>
                       <div className="flex items-center justify-between mb-3">
                         <span className="text-xs text-neutral-500 dark:text-neutral-400">
-                          {trashItems.length} item{trashItems.length === 1 ? "" : "s"}
+                          {filteredTrashItems.length} item{filteredTrashItems.length === 1 ? "" : "s"}
                         </span>
                         <button
                           type="button"
@@ -1841,7 +1891,7 @@ const setScreen = () => {
                         </button>
                       </div>
                       <ul className="space-y-0.5">
-                        {trashItems.map((item) => (
+                        {filteredTrashItems.map((item) => (
                           <li
                             key={item.trashed_name}
                             className="flex items-center justify-between gap-2 group px-1 py-1.5 rounded hover:bg-gray-50 dark:hover:bg-neutral-800"
@@ -1874,7 +1924,7 @@ const setScreen = () => {
                     </>
                   )
                 ) : filteredEntries.length === 0 ? (
-                  <p>No {activeFileCategory} files found</p>
+                  <p>{isSearchingFiles ? `No ${activeFileCategory} files match "${fileSearchQuery.trim()}"` : `No ${activeFileCategory} files found`}</p>
                 ) : (
                   filteredEntries.map(([folder, fileList]) => (
                     <div
@@ -1956,7 +2006,7 @@ const setScreen = () => {
                         </div>
                       )}
 
-                      {collapsedFolders.has(folder) ? null : fileList.length === 0 ? (
+                      {collapsedFolders.has(folder) && !isSearchingFiles ? null : fileList.length === 0 ? (
                         <p
                           className="text-[11px] text-neutral-400 dark:text-neutral-500 italic mt-1"
                           style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}
@@ -2165,6 +2215,7 @@ const setScreen = () => {
                     name: newFileName,
                     sourcePath: newPath
                   });
+                  setBoardScreen(null);
                 } catch (error) {
                   console.error('Error loading converted file:', error);
                 }
@@ -2173,7 +2224,9 @@ const setScreen = () => {
           )}
          <div className="flex-1 min-w-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
 
-          {selectedFile ? (
+          {boardScreen ? (
+            <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
+          ) : selectedFile ? (
             getFileCategory(selectedFile.name) === "pdf" ? (
               <PdfAnnotator
                 key={selectedFile.path}
@@ -2442,7 +2495,9 @@ const setScreen = () => {
         setAudioDevice={setAudioDevice}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
-        isHome={selectedFile === null}
+        isHome={selectedFile === null && boardScreen === null}
+        handleOpenBoard={handleOpenBoard}
+        isBoard={boardScreen !== null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}
