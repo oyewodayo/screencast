@@ -255,7 +255,7 @@
    */
   export const handleAutoPlay = async (
     files: MediaFile[],
-    currentFileUrl: string | null,  // Update parameter type
+    currentFileUrl: string | null,  // Update parameter typeb
     videoElement: HTMLVideoElement | null,
     onStateChange: StateChangeCallback,
     autoPlay: boolean

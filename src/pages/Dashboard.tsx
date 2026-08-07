@@ -296,20 +296,14 @@ const Dashboard = () => {
   const editStore = useVideoEditStore(
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
-  // Same lifting reasoning as editStore just above, for the image editor: ImageEditor (the main
-  // content pane) and ImageCollageDocker (the bottom panel's thumbnail strip, reached via
-  // BottomDocker/FileToolsDocker) both need the exact same document/undo-redo stack, not two
-  // independent copies that could drift out of sync. Gated to image files only for the same
-  // wasted-load-avoidance reason editStore already is.
+  // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
+  // load_image_edit_state invoke.
   const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
   );
-  // Which placed object (if any) is selected on the image-edit canvas - lifted for the same
-  // reason selectedImageOverlayId is: ImageEditor's own canvas and ImageCollageDocker's thumbnail
-  // strip both need to read/drive the same selection ("click a thumbnail to jump to it on the
-  // canvas" only works if they share this).
+  // Which placed object (if any) is selected on the image-edit canvas.
   const [selectedImageEditObjectId, setSelectedImageEditObjectId] = useState<string | null>(null);
   useEffect(() => {
     setSelectedImageEditObjectId(null);
@@ -1738,10 +1732,10 @@ const setScreen = () => {
                             ? "Select a file to see its tools"
                             : dockerMode === "file-tools"
                             ? isImageFileSelected
-                              ? "Exit collage mode"
+                              ? "Hide image tools"
                               : "Show recording controls"
                             : isImageFileSelected
-                            ? "Collage tools"
+                            ? "Show image tools"
                             : "Show tools for this file"
                         }
                         onClick={() => setDockerMode((prev) => (prev === "record" ? "file-tools" : "record"))}
@@ -2243,7 +2237,8 @@ const setScreen = () => {
                 title={selectedFile.name}
                 onSaved={handleImageSaved}
                 store={imageEditStore}
-                isCollageMode={dockerMode === "file-tools"}
+                isToolsPanelOpen={dockerMode === "file-tools"}
+                onToolsPanelOpenChange={(open) => setDockerMode(open ? "file-tools" : "record")}
                 selectedObjectId={selectedImageEditObjectId}
                 onSelectObject={setSelectedImageEditObjectId}
               />
@@ -2426,9 +2421,6 @@ const setScreen = () => {
         activeFile={selectedFile ? { name: selectedFile.name, path: selectedFile.sourcePath } : null}
         activeFilePlayableSrc={selectedFile?.path ?? null}
         editStore={editStore}
-        imageEditStore={imageEditStore}
-        selectedImageEditObjectId={selectedImageEditObjectId}
-        onSelectImageEditObject={setSelectedImageEditObjectId}
         activeFileCurrentTime={playerCurrentTime}
         onSeekActiveFile={handleSeekActiveFile}
         activeFileIsPlaying={playerIsPlaying}

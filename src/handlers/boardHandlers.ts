@@ -4,7 +4,7 @@
 // for the Board feature: technique-only overlap with imageEditHandlers.ts (same hand-rolled
 // Canvas 2D approach - save/restore, translate/rotate, drawImage, rotation-aware hit-testing) but
 // no shared code, per the Board feature's "build from scratch" requirement (the single-image
-// editor's collage tool doesn't fit this feature's per-image padding/border/margin/radius needs).
+// editor's tools don't fit this feature's per-image padding/border/margin/radius needs).
 
 import { BoardCommand, BoardDocument, BoardImage } from "../utils/boardTypes";
 

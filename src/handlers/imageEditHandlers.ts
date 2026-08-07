@@ -569,55 +569,6 @@ export function invertCommand(command: ImageEditCommand): ImageEditCommand {
   }
 }
 
-// ---- Grid arrangement (join/collage) -----------------------------------------------------------
-//
-// "Arrange as grid": lays out every currently-placed image into equal-sized cells across a fixed
-// column count (rows follow from count/columns - there's no independent row input, so there's
-// never a "leftover" cell with nothing in it or an image with nowhere to go). Each image is
-// contain-fit (scaled to fit within its cell preserving its own current aspect ratio, then
-// centered) rather than stretched to fill the cell exactly - a straight stretch would visibly
-// distort any image whose aspect ratio doesn't match the cell's. Rotation resets to 0: a tilted
-// image sitting in an axis-aligned grid cell would overhang its neighbors, defeating the point of
-// arranging a tidy grid in the first place.
-export function arrangeImagesInGrid(
-  objects: PlacedImageObject[],
-  columns: number,
-  gap: number,
-  margin: number,
-  canvasWidth: number,
-  canvasHeight: number
-): PlacedImageObject[] {
-  const cols = Math.max(1, columns);
-  const rows = Math.max(1, Math.ceil(objects.length / cols));
-  const cellW = Math.max(1, (canvasWidth - margin * 2 - gap * (cols - 1)) / cols);
-  const cellH = Math.max(1, (canvasHeight - margin * 2 - gap * (rows - 1)) / rows);
-
-  return objects.map((object, i) => {
-    const col = i % cols;
-    const row = Math.floor(i / cols);
-    const cellX = margin + col * (cellW + gap);
-    const cellY = margin + row * (cellH + gap);
-
-    const aspect = object.width / object.height;
-    let w = cellW;
-    let h = cellW / aspect;
-    if (h > cellH) {
-      h = cellH;
-      w = cellH * aspect;
-    }
-
-    return {
-      ...object,
-      x: cellX + (cellW - w) / 2,
-      y: cellY + (cellH - h) / 2,
-      width: w,
-      height: h,
-      rotation: 0,
-      updatedAt: Date.now(),
-    };
-  });
-}
-
 export function currentGeometrySnapshot(doc: ImageEditDocument, currentBaseImageDataUrl: string): GeometrySnapshot {
   return {
     baseImageOverride: currentBaseImageDataUrl,

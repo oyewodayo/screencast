@@ -13,9 +13,7 @@ import {
 import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory";
 import { FILE_TOOLS_COPY } from "./fileToolsConfig";
 import VideoTimelineDocker from "./VideoTimelineDocker";
-import ImageCollageDocker from "./ImageCollageDocker";
 import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { UseImageEditStoreResult } from "../../hooks/useImageEditStore";
 import { ActiveClipEffects } from "../../utils/videoColorFilters";
 
 // `path` here is always the real filesystem path (never the asset:// URL used for playback) —
@@ -95,14 +93,6 @@ interface FileToolsDockerProps {
   // Video-only: on-canvas crop-tool arm state, same threading as the overlay props above.
   isCroppingClip?: boolean;
   onToggleCroppingClip?: () => void;
-
-  // Image-only: Dashboard's single, lifted useImageEditStore instance - same lifting reasoning as
-  // editStore above, threaded to ImageCollageDocker so its thumbnail strip shares the exact
-  // document/selection ImageEditor's own canvas (rendered separately, in the main content pane)
-  // is editing.
-  imageEditStore?: UseImageEditStoreResult;
-  selectedImageEditObjectId?: string | null;
-  onSelectImageEditObject?: (id: string | null) => void;
 }
 
 // The file-type-specific alternative to RecordingDocker (see BottomDocker's dockerMode switch):
@@ -142,25 +132,9 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onToggleArmPlaceBlur,
   isCroppingClip,
   onToggleCroppingClip,
-  imageEditStore,
-  selectedImageEditObjectId,
-  onSelectImageEditObject,
 }) => {
   const category = getFileCategory(file.name);
   const copy = category ? FILE_TOOLS_COPY[category] : null;
-
-  // Images get the collage docker (thumbnail strip + arrange-as-grid) instead of the generic
-  // info/actions panel below - same "own rich docker instead of the generic panel" split video
-  // gets just below.
-  if (category === "image" && imageEditStore) {
-    return (
-      <ImageCollageDocker
-        store={imageEditStore}
-        selectedObjectId={selectedImageEditObjectId ?? null}
-        onSelectObject={onSelectImageEditObject ?? (() => {})}
-      />
-    );
-  }
 
   // Video gets its own rich timeline docker instead of the generic info/actions panel below.
   if (category === "video" && playableSrc) {

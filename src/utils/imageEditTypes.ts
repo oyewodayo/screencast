@@ -158,15 +158,15 @@ export type ImageEditCommand =
   | { type: "add"; object: ImageAnnotationObject }
   | { type: "delete"; object: ImageAnnotationObject }
   | { type: "edit"; before: ImageAnnotationObject; after: ImageAnnotationObject }
-  // Multiple objects replaced at once as a single undo step - e.g. "Arrange as grid" repositioning
-  // every placed image in one action. Same before/after-pair shape as 'edit', just over an array;
-  // unlike 'geometry' this only ever touches the listed objects; everything else in the document
-  // (including any *other* objects not part of the arrangement) is untouched.
+  // Multiple objects replaced at once as a single undo step - e.g. repositioning several placed
+  // images in one action. Same before/after-pair shape as 'edit', just over an array; unlike
+  // 'geometry' this only ever touches the listed objects; everything else in the document
+  // (including any *other* objects not part of the batch) is untouched.
   | { type: "batch-edit"; before: ImageAnnotationObject[]; after: ImageAnnotationObject[] }
-  // The whole objects array reordered (drag-to-reorder in the collage docker's thumbnail strip) -
-  // stores the full before/after array rather than a single moved id, since that's the simplest
-  // representation that's still trivially invertible (swap before/after) and array order *is* the
-  // document's only concept of stacking/z-order.
+  // The whole objects array reordered (e.g. drag-to-reorder stacked objects) - stores the full
+  // before/after array rather than a single moved id, since that's the simplest representation
+  // that's still trivially invertible (swap before/after) and array order *is* the document's
+  // only concept of stacking/z-order.
   | { type: "reorder"; before: ImageAnnotationObject[]; after: ImageAnnotationObject[] }
   | { type: "geometry"; before: GeometrySnapshot; after: GeometrySnapshot }
   | { type: "adjustments"; before: ImageAdjustments; after: ImageAdjustments };

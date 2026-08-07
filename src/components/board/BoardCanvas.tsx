@@ -9,8 +9,8 @@
 // ratio needs to know a CSS/buffer size mismatch can exist.
 //
 // Live drag/resize/rotate updates are staged locally (liveImages) and only committed to the store
-// as a single edit/batch-edit on pointer release - same "stage locally, commit once" discipline
-// ImageCollageDocker.tsx's own drag-to-reorder uses, so a drag gesture is exactly one undo step.
+// as a single edit/batch-edit on pointer release - a "stage locally, commit once" discipline that
+// keeps a whole drag gesture to exactly one undo step.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { BoardDocument, BoardImage } from "../../utils/boardTypes";
 import {

@@ -35,7 +35,7 @@ export interface UseImageEditStoreResult {
   // and `after` must be the same objects (matched by id, same array order) before/after whatever
   // batch transform produced `after`.
   batchEditObjects: (before: ImageAnnotationObject[], after: ImageAnnotationObject[]) => void;
-  // Full replacement order for the whole objects array - the collage docker's drag-to-reorder.
+  // Full replacement order for the whole objects array - e.g. drag-to-reorder stacked objects.
   reorderObjects: (newOrder: ImageAnnotationObject[]) => void;
   commitAdjustments: (next: ImageAdjustments) => void;
   // `beforeImageDataUrl` is a snapshot of the fully composed canvas (base + adjustments + every

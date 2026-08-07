@@ -12,6 +12,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use crate::services::utility::{path_to_str, get_ffmpeg_path, get_ffprobe_path};
 
+#[cfg(windows)]
+use crate::commands::recording::hide_console_window;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConversionProgress {
     pub input_path: String,
@@ -143,6 +146,8 @@ async fn run_conversion(
     });
 
     let mut cmd = Command::new(&ffmpeg_path);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
     for input in inputs {
         for arg in &input.pre_args {
             cmd.arg(arg);
@@ -717,10 +722,11 @@ fn sanitize_transition_name(name: &str) -> &str {
 
 fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
     const FALLBACK_FPS: f64 = 30.0;
-    let output = match Command::new(ffprobe_path)
-        .args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", source_path])
-        .output()
-    {
+    let mut cmd = Command::new(ffprobe_path);
+    cmd.args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", source_path]);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let output = match cmd.output() {
         Ok(o) => o,
         Err(_) => return FALLBACK_FPS,
     };
@@ -747,10 +753,11 @@ fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
 // to true on any probe failure so an unreadable/unusual file keeps the previous "always assume
 // audio" behavior rather than silently dropping a real track.
 fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
-    let output = match Command::new(ffprobe_path)
-        .args(["-v", "quiet", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", source_path])
-        .output()
-    {
+    let mut cmd = Command::new(ffprobe_path);
+    cmd.args(["-v", "quiet", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", source_path]);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let output = match cmd.output() {
         Ok(o) => o,
         Err(_) => return true,
     };
@@ -766,10 +773,11 @@ fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
 // graph export path but have that one effect silently skipped - an uncropped/unpanned file, no
 // error, no indication anything was dropped.
 fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
-    let output = Command::new(ffprobe_path)
-        .args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", source_path])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(ffprobe_path);
+    cmd.args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", source_path]);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let output = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let (w, h) = text.trim().split_once('x')?;
     match (w.parse::<i64>(), h.parse::<i64>()) {
@@ -1297,9 +1305,10 @@ pub async fn cancel_conversion(
     if let Some(pid) = active_process.take() {
         #[cfg(windows)]
         {
-            Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .output()
+            let mut cmd = Command::new("taskkill");
+            cmd.args(["/F", "/PID", &pid.to_string()]);
+            hide_console_window(&mut cmd);
+            cmd.output()
                 .map_err(|e| format!("Failed to cancel conversion: {}", e))?;
         }
         
@@ -1419,15 +1428,17 @@ pub async fn get_conversion_info(
         return Err("Input file does not exist".to_string());
     }
 
-    let output = Command::new(&ffprobe_path)
-        .args([
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            path_to_str(&input)?,
-        ])
-        .output()
+    let mut cmd = Command::new(&ffprobe_path);
+    cmd.args([
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        path_to_str(&input)?,
+    ]);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let output = cmd.output()
         .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
 
     let mut info = HashMap::new();

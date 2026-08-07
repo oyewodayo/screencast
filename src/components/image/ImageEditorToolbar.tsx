@@ -1,9 +1,12 @@
 // components/image/ImageEditorToolbar.tsx
 //
-// Visually/structurally mirrors AnnotationToolbar.tsx (the PDF annotator's own floating toolbar)
-// - same pill-shaped segmented tool groups, icon buttons, and undo/redo/save layout - adapted for
-// the standalone image editor's own tool set (crop/rotate/flip + shapes/blur + adjustments instead
-// of pen/highlighter/text/eraser only).
+// The image editor's tools panel - a collapsible right-side panel (mounted only while
+// ImageEditor's isToolsPanelOpen is true; see ImageEditor.tsx and the sidebar's tools button in
+// Dashboard.tsx that toggles it) holding every control that actually edits the image: the
+// pen/shapes/blur tool set, crop/rotate/flip, insert image, color/width/font for whatever's armed
+// or selected, brightness/contrast/saturation, and undo/redo/delete. Zoom and "Save a copy" live
+// in ImageEditor's own persistent header instead - viewing and saving shouldn't depend on this
+// panel being open.
 import React from "react";
 import {
   IoArrowUndo,
@@ -19,10 +22,10 @@ import {
   IoEllipseOutline,
   IoCropOutline,
   IoTrashOutline,
-  IoDownloadOutline,
   IoCheckmark,
   IoCloseOutline,
   IoImageOutline,
+  IoClose,
 } from "react-icons/io5";
 import { BsHighlighter, BsCursor, BsArrowUpRight } from "react-icons/bs";
 import { TbFlipHorizontal, TbFlipVertical, TbRotate, TbRotateClockwise } from "react-icons/tb";
@@ -30,9 +33,7 @@ import { MdBlurOn } from "react-icons/md";
 import { ImageAdjustments, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../../utils/imageEditTypes";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 
-const Divider: React.FC = () => <div className="w-px h-6 bg-black/[0.06] dark:bg-white/[0.1] shrink-0" />;
-
-const IconButton: React.FC<{
+export const IconButton: React.FC<{
   title: string;
   onClick?: () => void;
   disabled?: boolean;
@@ -54,7 +55,7 @@ const IconButton: React.FC<{
   </button>
 );
 
-const SaveStatus: React.FC<{ isSaving: boolean; saveError: string | null }> = ({ isSaving, saveError }) => {
+export const SaveStatus: React.FC<{ isSaving: boolean; saveError: string | null }> = ({ isSaving, saveError }) => {
   if (saveError) {
     return (
       <div className="flex items-center gap-1.5 text-red-500 text-xs font-medium" title={saveError}>
@@ -79,6 +80,32 @@ const SaveStatus: React.FC<{ isSaving: boolean; saveError: string | null }> = ({
   );
 };
 
+export const ZoomControl: React.FC<{
+  zoom: number;
+  onZoomChange: (zoom: number) => void;
+  minZoom: number;
+  maxZoom: number;
+}> = ({ zoom, onZoomChange, minZoom, maxZoom }) => (
+  <div className="flex items-center gap-1 rounded-full bg-black/[0.045] dark:bg-white/[0.06] pl-1 pr-2 py-0.5">
+    <IconButton title="Zoom out (Ctrl+-)" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
+      <IoRemove size={16} />
+    </IconButton>
+    <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums w-10 text-center">{Math.round(zoom * 100)}%</span>
+    <IconButton title="Zoom in (Ctrl+=)" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
+      <IoAdd size={16} />
+    </IconButton>
+  </div>
+);
+
+// A labeled group within the panel - just a consistent heading + spacing wrapper, not a visual
+// box, so sections read as one continuous scroll rather than a stack of separate cards.
+const Section: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
+  <div className="flex flex-col gap-1.5">
+    <div className="px-0.5 text-[11px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">{label}</div>
+    {children}
+  </div>
+);
+
 const ADJUSTMENT_FIELDS: { key: keyof ImageAdjustments; label: string }[] = [
   { key: "brightness", label: "Brightness" },
   { key: "contrast", label: "Contrast" },
@@ -86,6 +113,7 @@ const ADJUSTMENT_FIELDS: { key: keyof ImageAdjustments; label: string }[] = [
 ];
 
 const TOOL_BUTTONS: { tool: ImageEditTool; label: string; shortcut: string; icon: React.ReactNode }[] = [
+  { tool: "select", label: "Select / move", shortcut: "V", icon: <BsCursor size={15} /> },
   { tool: "pen", label: "Pen", shortcut: "P", icon: <IoPencil size={16} /> },
   { tool: "highlighter", label: "Highlighter", shortcut: "H", icon: <BsHighlighter size={15} /> },
   { tool: "arrow", label: "Arrow", shortcut: "A", icon: <BsArrowUpRight size={15} /> },
@@ -95,12 +123,32 @@ const TOOL_BUTTONS: { tool: ImageEditTool; label: string; shortcut: string; icon
   { tool: "blur", label: "Blur (privacy)", shortcut: "B", icon: <MdBlurOn size={17} /> },
 ];
 
+// A full-width row (icon + label + shortcut) rather than an icon-only square - the panel has the
+// horizontal room a floating pill toolbar didn't, and spelling out what each tool does makes the
+// set discoverable without hovering every icon first.
+const ToolRow: React.FC<{ active: boolean; onClick: () => void; icon: React.ReactNode; label: string; shortcut: string }> = ({
+  active,
+  onClick,
+  icon,
+  label,
+  shortcut,
+}) => (
+  <button
+    type="button"
+    onClick={onClick}
+    className={`flex items-center gap-2.5 w-full px-2 py-1.5 rounded-lg text-sm text-left transition-colors duration-150 ${
+      active
+        ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
+        : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+    }`}
+  >
+    <span className="shrink-0 w-4 flex items-center justify-center">{icon}</span>
+    <span className="flex-1 min-w-0 truncate">{label}</span>
+    <span className="shrink-0 text-[10px] font-medium text-neutral-400 dark:text-neutral-500">{shortcut}</span>
+  </button>
+);
+
 interface ImageEditorToolbarProps {
-  title?: string;
-  // Hides Crop/Rotate/Flip, the pen/shapes/blur segmented tool control, and color/width/
-  // adjustments - the collage docker (bottom panel) takes over image-management/arrange duties
-  // instead. Insert image, Undo/Redo/Delete, zoom, and Save stay available in both modes.
-  isCollageMode: boolean;
   tool: ImageEditTool;
   onToolChange: (tool: ImageEditTool) => void;
   color: string;
@@ -128,18 +176,13 @@ interface ImageEditorToolbarProps {
   onRedo: () => void;
   hasSelection: boolean;
   onDeleteSelected: () => void;
-  zoom: number;
-  onZoomChange: (zoom: number) => void;
-  minZoom: number;
-  maxZoom: number;
-  isSaving: boolean;
-  saveError: string | null;
-  onSaveCopy: () => void;
+  onClose: () => void;
 }
 
+const PANEL_CLASSES =
+  "shrink-0 w-64 h-full flex flex-col bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-l border-black/[0.06] dark:border-white/[0.1] overflow-y-auto";
+
 const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
-  title,
-  isCollageMode,
   tool,
   onToolChange,
   color,
@@ -167,36 +210,34 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   onRedo,
   hasSelection,
   onDeleteSelected,
-  zoom,
-  onZoomChange,
-  minZoom,
-  maxZoom,
-  isSaving,
-  saveError,
-  onSaveCopy,
+  onClose,
 }) => {
   if (tool === "crop") {
-    // A focused, minimal bar while cropping - the full tool palette (shapes/adjustments/etc.)
+    // A focused, minimal panel while cropping - the full tool palette (shapes/adjustments/etc.)
     // isn't relevant mid-crop, and showing it alongside an Apply/Cancel decision just invites
     // clicking something else without realizing the crop is still pending.
     return (
-      <div className="shrink-0 px-4 pt-3 pb-2">
-        <div className="flex items-center gap-3 mx-auto max-w-fit px-3 py-2 rounded-2xl bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.04] dark:ring-white/[0.08]">
-          <span className="text-sm font-medium text-neutral-700 dark:text-neutral-200 pl-1">Drag to crop</span>
-          <Divider />
-          <button
-            type="button"
-            onClick={onCropCancel}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.05] dark:hover:bg-white/[0.08]"
-          >
-            <IoCloseOutline size={16} /> Cancel
-          </button>
+      <div className={PANEL_CLASSES}>
+        <div className="flex items-center justify-between px-3 py-2.5 border-b border-black/[0.06] dark:border-white/[0.1]">
+          <span className="text-sm font-medium text-neutral-700 dark:text-neutral-200">Drag to crop</span>
+          <IconButton title="Close panel" onClick={onClose}>
+            <IoClose size={16} />
+          </IconButton>
+        </div>
+        <div className="flex flex-col gap-2 p-3">
           <button
             type="button"
             onClick={onCropApply}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700"
+            className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700"
           >
             <IoCheckmark size={16} /> Apply crop
+          </button>
+          <button
+            type="button"
+            onClick={onCropCancel}
+            className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.05] dark:hover:bg-white/[0.08]"
+          >
+            <IoCloseOutline size={16} /> Cancel
           </button>
         </div>
       </div>
@@ -204,128 +245,103 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   }
 
   return (
-    <div className="shrink-0 px-4 pt-3 pb-2">
-      {/* max-w-full (not max-w-fit) is deliberate: this toolbar has far more controls than
-          AnnotationToolbar.tsx's (the pattern this was modeled on), so on a narrower window it
-          needs to actually wrap onto more rows rather than keep growing rightward past the
-          window edge, invisible and unclickable - max-w-fit has no width ceiling to wrap against,
-          so combined with flex-wrap it silently never wrapped at all. */}
-      <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-2 mx-auto max-w-full px-3 py-2 rounded-2xl bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.04] dark:ring-white/[0.08]">
-        {title && (
-          <>
-            <span className="text-sm font-medium text-neutral-600 dark:text-neutral-300 truncate max-w-[160px] pl-1" title={title}>
-              {title}
-            </span>
-            <Divider />
-          </>
-        )}
-
-        {/* Tool segmented control - "Select" is always present (same reasoning as
-            AnnotationToolbar's own Select button: an explicit, always-highlightable way back to
-            "nothing active", not just a side effect of re-clicking an active tool). Hidden
-            entirely in collage mode - the tool is forced to "select" there (see ImageEditor's own
-            effect), so there'd be nothing else for this control to switch to anyway. */}
-        {!isCollageMode && (
-          <>
-            <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045] dark:bg-white/[0.06]">
-              <IconButton title="Select / move (V)" active={tool === "select"} onClick={() => onToolChange("select")}>
-                <BsCursor size={14} />
-              </IconButton>
-              {TOOL_BUTTONS.map(({ tool: t, label, shortcut, icon }) => (
-                <IconButton key={t} title={`${label} (${shortcut})`} active={tool === t} onClick={() => onToolChange(t)}>
-                  {icon}
-                </IconButton>
-              ))}
-            </div>
-
-            <Divider />
-
-            {/* Geometry ops - each one flattens everything drawn so far into the new base bitmap
-                (see imageEditTypes.ts's GeometrySnapshot doc comment), so these live outside the
-                annotation-tool segmented control rather than alongside pen/arrow/etc. */}
-            <div className="flex items-center gap-0.5">
-              <IconButton title="Crop" onClick={() => onToolChange("crop")}>
-                <IoCropOutline size={16} />
-              </IconButton>
-              <IconButton title="Rotate left 90°" onClick={onRotateCCW}>
-                <TbRotate size={17} />
-              </IconButton>
-              <IconButton title="Rotate right 90°" onClick={onRotateCW}>
-                <TbRotateClockwise size={17} />
-              </IconButton>
-              <IconButton title="Flip horizontal" onClick={onFlipH}>
-                <TbFlipHorizontal size={17} />
-              </IconButton>
-              <IconButton title="Flip vertical" onClick={onFlipV}>
-                <TbFlipVertical size={17} />
-              </IconButton>
-            </div>
-
-            <Divider />
-          </>
-        )}
-
-        {/* Inserting an image isn't a persistent tool the way pen/arrow/etc. are - it's a
-            one-shot action (pick a file, it appears selected and ready to drag/resize/rotate) -
-            same reasoning and placement as AnnotationToolbar.tsx's own "Insert image" button. The
-            join/collage building block: insert another photo, then move/resize/rotate it into
-            place (ImageAnnotationEditor, via ImageEditorCanvas). Available in both modes -
-            arranging a collage still starts with adding images to it. */}
-        <IconButton title="Insert image" onClick={onInsertImageClick}>
-          <IoImageOutline size={16} />
+    <div className={PANEL_CLASSES}>
+      <div className="flex items-center justify-between px-3 py-2.5 border-b border-black/[0.06] dark:border-white/[0.1]">
+        <span className="text-sm font-medium text-neutral-700 dark:text-neutral-200">Tools</span>
+        <IconButton title="Close panel" onClick={onClose}>
+          <IoClose size={16} />
         </IconButton>
+      </div>
+
+      <div className="flex flex-col gap-4 p-3">
+        <Section label="Tools">
+          <div className="flex flex-col gap-0.5">
+            {TOOL_BUTTONS.map(({ tool: t, label, shortcut, icon }) => (
+              <ToolRow key={t} active={tool === t} onClick={() => onToolChange(t)} icon={icon} label={label} shortcut={shortcut} />
+            ))}
+          </div>
+        </Section>
+
+        {/* Geometry ops - each one flattens everything drawn so far into the new base bitmap (see
+            imageEditTypes.ts's GeometrySnapshot doc comment), so these live outside the
+            annotation-tool list above rather than alongside pen/arrow/etc. */}
+        <Section label="Transform">
+          <div className="flex items-center gap-1">
+            <IconButton title="Crop" onClick={() => onToolChange("crop")}>
+              <IoCropOutline size={16} />
+            </IconButton>
+            <IconButton title="Rotate left 90°" onClick={onRotateCCW}>
+              <TbRotate size={17} />
+            </IconButton>
+            <IconButton title="Rotate right 90°" onClick={onRotateCW}>
+              <TbRotateClockwise size={17} />
+            </IconButton>
+            <IconButton title="Flip horizontal" onClick={onFlipH}>
+              <TbFlipHorizontal size={17} />
+            </IconButton>
+            <IconButton title="Flip vertical" onClick={onFlipV}>
+              <TbFlipVertical size={17} />
+            </IconButton>
+          </div>
+        </Section>
+
+        {/* Inserting an image isn't a persistent tool the way pen/arrow/etc. are - it's a one-shot
+            action (pick a file, it appears selected and ready to drag/resize/rotate), same
+            reasoning and placement as AnnotationToolbar.tsx's own "Insert image" button. */}
+        <Section label="Insert">
+          <ToolRow active={false} onClick={onInsertImageClick} icon={<IoImageOutline size={16} />} label="Insert image" shortcut="" />
+        </Section>
 
         {/* Shown either while a color/width-bearing tool is armed (to set what gets drawn next)
             or while an existing color/width-bearing object is selected (to edit it directly) -
-            showColor/showWidth are computed by the parent, which is the one that knows about
-            both the active tool and the current selection. Suppressed in collage mode regardless
-            (that mode has no drawing tools to arm, and editing an old shape's color isn't part of
-            the focused collage workflow - switch back to normal mode for that). */}
-        {showColor && !isCollageMode && (
-          <>
-            <Divider />
-            <ColorSwatchPicker color={color} onChange={onColorChange} />
-          </>
-        )}
-        {showWidth && !isCollageMode && (
-          <input
-            type="range"
-            min={1}
-            max={24}
-            step={1}
-            value={strokeWidth}
-            onChange={(e) => onStrokeWidthChange(Number(e.target.value))}
-            title="Stroke width"
-            className="w-16 accent-blue-500"
-          />
+            showColor/showWidth are computed by the parent, which is the one that knows about both
+            the active tool and the current selection. */}
+        {(showColor || showWidth || showFontSize) && (
+          <Section label="Style">
+            <div className="flex flex-col gap-2.5">
+              {showColor && <ColorSwatchPicker color={color} onChange={onColorChange} />}
+              {showWidth && (
+                <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                  <span className="w-12 shrink-0">Width</span>
+                  <input
+                    type="range"
+                    min={1}
+                    max={24}
+                    step={1}
+                    value={strokeWidth}
+                    onChange={(e) => onStrokeWidthChange(Number(e.target.value))}
+                    title="Stroke width"
+                    className="flex-1 accent-blue-500"
+                  />
+                </label>
+              )}
+              {showFontSize && (
+                <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                  <span className="w-12 shrink-0">Size</span>
+                  <input
+                    type="range"
+                    min={12}
+                    max={96}
+                    step={1}
+                    value={fontSize}
+                    onChange={(e) => onFontSizeChange(Number(e.target.value))}
+                    title="Font size"
+                    className="flex-1 accent-blue-500"
+                  />
+                </label>
+              )}
+            </div>
+          </Section>
         )}
 
-        {showFontSize && !isCollageMode && (
-          <div className="flex items-center gap-1.5">
-            <span className="text-xs text-neutral-500 dark:text-neutral-400">Size</span>
-            <input
-              type="range"
-              min={12}
-              max={96}
-              step={1}
-              value={fontSize}
-              onChange={(e) => onFontSizeChange(Number(e.target.value))}
-              title="Font size"
-              className="w-16 accent-blue-500"
-            />
-          </div>
-        )}
-
-        {!isCollageMode && (
-          <>
-            <Divider />
-
-            {/* Live-adjusted while dragging (onAdjustmentsChange), one undo entry committed on
-                release (onAdjustmentsCommit) - see useImageEditStore's commitAdjustments. */}
-            <div className="flex items-center gap-2.5">
-              {ADJUSTMENT_FIELDS.map(({ key, label }) => (
+        {/* Live-adjusted while dragging (onAdjustmentsChange), one undo entry committed on release
+            (onAdjustmentsCommit) - see useImageEditStore's commitAdjustments. */}
+        <Section label="Adjustments">
+          <div className="flex flex-col gap-2">
+            {ADJUSTMENT_FIELDS.map(({ key, label }) => (
+              <label key={key} className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                <span className="w-16 shrink-0">{label}</span>
                 <input
-                  key={key}
                   type="range"
                   min={0.5}
                   max={1.5}
@@ -334,56 +350,35 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
                   title={`${label} (${Math.round(adjustments[key] * 100)}%)`}
                   onChange={(e) => onAdjustmentsChange({ ...adjustments, [key]: Number(e.target.value) })}
                   onPointerUp={(e) => onAdjustmentsCommit({ ...adjustments, [key]: Number(e.currentTarget.value) })}
-                  className="w-14 accent-blue-500"
+                  className="flex-1 accent-blue-500"
                 />
-              ))}
-              <button
-                type="button"
-                title="Reset adjustments"
-                onClick={() => onAdjustmentsCommit({ ...NEUTRAL_ADJUSTMENTS })}
-                className="text-xs text-neutral-400 dark:text-neutral-500 hover:text-neutral-600 dark:hover:text-neutral-300"
-              >
-                Reset
-              </button>
-            </div>
-          </>
-        )}
+                <span className="w-8 shrink-0 text-right tabular-nums">{Math.round(adjustments[key] * 100)}%</span>
+              </label>
+            ))}
+            <button
+              type="button"
+              title="Reset adjustments"
+              onClick={() => onAdjustmentsCommit({ ...NEUTRAL_ADJUSTMENTS })}
+              className="self-start text-xs text-neutral-400 dark:text-neutral-500 hover:text-neutral-600 dark:hover:text-neutral-300"
+            >
+              Reset
+            </button>
+          </div>
+        </Section>
 
-        <Divider />
-
-        <div className="flex items-center gap-0.5">
-          <IconButton title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={onUndo}>
-            <IoArrowUndo size={16} />
-          </IconButton>
-          <IconButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={onRedo}>
-            <IoArrowRedo size={16} />
-          </IconButton>
-          <IconButton title="Delete selected (Del)" disabled={!hasSelection} onClick={onDeleteSelected}>
-            <IoTrashOutline size={16} />
-          </IconButton>
-        </div>
-
-        <Divider />
-
-        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] dark:bg-white/[0.06] pl-1 pr-2 py-0.5">
-          <IconButton title="Zoom out (Ctrl+-)" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
-            <IoRemove size={16} />
-          </IconButton>
-          <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums w-10 text-center">{Math.round(zoom * 100)}%</span>
-          <IconButton title="Zoom in (Ctrl+=)" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
-            <IoAdd size={16} />
-          </IconButton>
-        </div>
-
-        <Divider />
-
-        <IconButton title="Save a copy" onClick={onSaveCopy}>
-          <IoDownloadOutline size={16} />
-        </IconButton>
-
-        <div className="pr-1">
-          <SaveStatus isSaving={isSaving} saveError={saveError} />
-        </div>
+        <Section label="Edit">
+          <div className="flex items-center gap-1">
+            <IconButton title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={onUndo}>
+              <IoArrowUndo size={16} />
+            </IconButton>
+            <IconButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={onRedo}>
+              <IoArrowRedo size={16} />
+            </IconButton>
+            <IconButton title="Delete selected (Del)" disabled={!hasSelection} onClick={onDeleteSelected}>
+              <IoTrashOutline size={16} />
+            </IconButton>
+          </div>
+        </Section>
       </div>
     </div>
   );

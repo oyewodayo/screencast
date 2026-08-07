@@ -8,18 +8,18 @@
 //
 // The store itself and the current selection are *not* owned here - both are lifted to
 // Dashboard.tsx (mirroring useVideoEditStore/selectedImageOverlayId's own lift for the video
-// editor) so the collage docker's thumbnail strip (ImageCollageDocker.tsx, reached via
-// FileToolsDocker/BottomDocker - a sibling of this component, not a descendant) can share the
-// exact same document and selection instead of a second, out-of-sync copy.
+// editor) so a future sibling panel could share the exact same document and selection instead of
+// a second, out-of-sync copy.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
+import { IoDownloadOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";
 import { cropCanvas, makePlacedImageObject, rotateFlipCanvas } from "../handlers/imageEditHandlers";
 import { ImageAdjustments, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../utils/imageEditTypes";
 import { fileToDataUrl } from "../utils/imageObjectCache";
 import ImageEditorCanvas, { ImageEditorCanvasHandle } from "./image/ImageEditorCanvas";
-import ImageEditorToolbar from "./image/ImageEditorToolbar";
+import ImageEditorToolbar, { IconButton, SaveStatus, ZoomControl } from "./image/ImageEditorToolbar";
 
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
@@ -37,11 +37,13 @@ interface ImageEditorProps {
   // Dashboard.tsx's handleVideoExported (refresh the file list, then select the new file).
   onSaved: (newPath: string, newFileName: string) => void;
   store: UseImageEditStoreResult;
-  // Toggled by the sidebar's tools button (same one that opens video's timeline docker) - hides
-  // the single-photo tools (crop/draw/blur/adjust) in favor of a focused collage-only toolbar,
-  // and is what makes ImageCollageDocker (the bottom panel) visible. See ImageEditorToolbar's own
-  // isCollageMode handling for exactly what's hidden.
-  isCollageMode: boolean;
+  // Toggled by the sidebar's tools button (same one that opens video's timeline docker) - shows
+  // or hides the ImageEditorToolbar side panel. The canvas and its tool/selection state are
+  // unaffected either way; this only controls whether the controls are on screen. Also flipped
+  // to true automatically when the Crop tool is armed (see the effect below) and to false by the
+  // panel's own close button, so it's a two-way toggle rather than a plain boolean prop.
+  isToolsPanelOpen: boolean;
+  onToolsPanelOpenChange: (open: boolean) => void;
   selectedObjectId: string | null;
   onSelectObject: (id: string | null) => void;
 }
@@ -52,7 +54,16 @@ const isEditableTarget = (el: Element | null): boolean => {
   return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT";
 };
 
-const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, store, isCollageMode, selectedObjectId, onSelectObject }) => {
+const ImageEditor: React.FC<ImageEditorProps> = ({
+  sourcePath,
+  title,
+  onSaved,
+  store,
+  isToolsPanelOpen,
+  onToolsPanelOpenChange,
+  selectedObjectId,
+  onSelectObject,
+}) => {
   const canvasRef = useRef<ImageEditorCanvasHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -82,12 +93,14 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
     didFitZoomRef.current = false;
   }, [sourcePath]);
 
-  // Collage mode forces the Select tool - none of the other tools' buttons are even shown (see
-  // ImageEditorToolbar), so there'd be no way back if some other tool were left active from
-  // before it was toggled on.
+  // The Crop tool's Apply/Cancel controls live in the (now collapsible) tools panel, not on the
+  // canvas itself - arming Crop from the keyboard shortcut ("C") while the panel is closed would
+  // otherwise strand the user mid-crop with no visible way to confirm it, so force the panel open
+  // whenever Crop becomes active regardless of how it was triggered.
   useEffect(() => {
-    if (isCollageMode) setTool("select");
-  }, [isCollageMode]);
+    if (tool === "crop" && !isToolsPanelOpen) onToolsPanelOpenChange(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool]);
 
   // Fits the image to the available viewport once its true dimensions are known (a large photo
   // otherwise opens zoomed to 100%, mostly offscreen) - same one-shot-on-load idea
@@ -320,7 +333,6 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
       }
 
       if (e.altKey) return;
-      if (isCollageMode) return; // every remaining shortcut below arms a tool that's hidden in collage mode
 
       switch (e.key.toLowerCase()) {
         case "v":
@@ -372,7 +384,7 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [tool, selectedObject, isCollageMode, store.canUndo, store.canRedo, store.undo, store.redo, handleCropCancel, handleDeleteSelected, onSelectObject]);
+  }, [tool, selectedObject, store.canUndo, store.canRedo, store.undo, store.redo, handleCropCancel, handleDeleteSelected, onSelectObject]);
 
   if (store.loadError && !store.doc) {
     return (
@@ -384,77 +396,94 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
 
   return (
     <div className="w-full h-full flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950">
-      <ImageEditorToolbar
-        title={title}
-        isCollageMode={isCollageMode}
-        tool={tool}
-        onToolChange={setTool}
-        color={color}
-        onColorChange={handleColorChange}
-        showColor={showColor}
-        strokeWidth={strokeWidth}
-        onStrokeWidthChange={handleStrokeWidthChange}
-        showWidth={showWidth}
-        fontSize={fontSize}
-        onFontSizeChange={(size) => {
-          setFontSize(size);
-          if (selectedObject?.type === "text") store.editObject(selectedObject, { ...selectedObject, fontSize: size });
-        }}
-        showFontSize={tool === "text" || selectedObject?.type === "text"}
-        onRotateCCW={handleRotateCCW}
-        onRotateCW={handleRotateCW}
-        onFlipH={handleFlipH}
-        onFlipV={handleFlipV}
-        onCropApply={handleCropApply}
-        onCropCancel={handleCropCancel}
-        onInsertImageClick={handleInsertImageClick}
-        adjustments={effectiveAdjustments}
-        onAdjustmentsChange={setLiveAdjustments}
-        onAdjustmentsCommit={(next) => {
-          store.commitAdjustments(next);
-          setLiveAdjustments(null);
-        }}
-        canUndo={store.canUndo}
-        canRedo={store.canRedo}
-        onUndo={store.undo}
-        onRedo={store.redo}
-        hasSelection={!!selectedObject}
-        onDeleteSelected={handleDeleteSelected}
-        zoom={zoom}
-        onZoomChange={setZoom}
-        minZoom={MIN_ZOOM}
-        maxZoom={MAX_ZOOM}
-        isSaving={isSavingCopy || store.isSaving}
-        saveError={saveCopyError ?? store.saveError}
-        onSaveCopy={handleSaveCopy}
-      />
+      {/* Persistent header - stays visible regardless of the tools panel, so viewing/zooming and
+          checking/triggering the autosave never depend on that panel being open. Everything that
+          actually edits the image (tools, geometry ops, adjustments, undo/redo) lives in the
+          panel instead, opened from the sidebar's tools button (see Dashboard.tsx). */}
+      <div className="shrink-0 flex items-center justify-between gap-3 px-4 py-2.5 bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-b border-black/[0.04] dark:border-white/[0.08]">
+        {title ? (
+          <span className="text-sm font-medium text-neutral-600 dark:text-neutral-300 truncate" title={title}>
+            {title}
+          </span>
+        ) : (
+          <span />
+        )}
+        <div className="flex items-center gap-3 shrink-0">
+          <ZoomControl zoom={zoom} onZoomChange={setZoom} minZoom={MIN_ZOOM} maxZoom={MAX_ZOOM} />
+          <IconButton title="Save a copy" onClick={handleSaveCopy}>
+            <IoDownloadOutline size={16} />
+          </IconButton>
+          <SaveStatus isSaving={isSavingCopy || store.isSaving} saveError={saveCopyError ?? store.saveError} />
+        </div>
+      </div>
 
       {geometryError && (
-        <div className="shrink-0 mx-auto -mt-1 mb-1 px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 text-xs">
+        <div className="shrink-0 mx-auto mt-2 px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 text-xs">
           Failed to apply crop/rotate/flip: {geometryError}
         </div>
       )}
 
-      <div ref={containerRef} className="flex-1 min-h-0 overflow-auto flex items-center justify-center p-6">
-        {store.doc ? (
-          <ImageEditorCanvas
-            ref={canvasRef}
-            doc={store.doc}
-            baseImageSrc={store.baseImageSrc}
-            adjustments={effectiveAdjustments}
+      <div className="flex-1 min-h-0 flex">
+        <div ref={containerRef} className="flex-1 min-w-0 overflow-auto flex items-center justify-center p-6">
+          {store.doc ? (
+            <ImageEditorCanvas
+              ref={canvasRef}
+              doc={store.doc}
+              baseImageSrc={store.baseImageSrc}
+              adjustments={effectiveAdjustments}
+              tool={tool}
+              color={color}
+              strokeWidth={strokeWidth}
+              fontSize={fontSize}
+              zoom={zoom}
+              selectedObjectId={selectedObjectId}
+              onSelectObject={onSelectObject}
+              onAddObject={store.addObject}
+              onEditObject={store.editObject}
+              onDeleteObject={store.deleteObject}
+            />
+          ) : (
+            <span className="text-neutral-400 dark:text-neutral-500 text-sm italic">Loading image…</span>
+          )}
+        </div>
+
+        {isToolsPanelOpen && (
+          <ImageEditorToolbar
             tool={tool}
+            onToolChange={setTool}
             color={color}
+            onColorChange={handleColorChange}
+            showColor={showColor}
             strokeWidth={strokeWidth}
+            onStrokeWidthChange={handleStrokeWidthChange}
+            showWidth={showWidth}
             fontSize={fontSize}
-            zoom={zoom}
-            selectedObjectId={selectedObjectId}
-            onSelectObject={onSelectObject}
-            onAddObject={store.addObject}
-            onEditObject={store.editObject}
-            onDeleteObject={store.deleteObject}
+            onFontSizeChange={(size) => {
+              setFontSize(size);
+              if (selectedObject?.type === "text") store.editObject(selectedObject, { ...selectedObject, fontSize: size });
+            }}
+            showFontSize={tool === "text" || selectedObject?.type === "text"}
+            onRotateCCW={handleRotateCCW}
+            onRotateCW={handleRotateCW}
+            onFlipH={handleFlipH}
+            onFlipV={handleFlipV}
+            onCropApply={handleCropApply}
+            onCropCancel={handleCropCancel}
+            onInsertImageClick={handleInsertImageClick}
+            adjustments={effectiveAdjustments}
+            onAdjustmentsChange={setLiveAdjustments}
+            onAdjustmentsCommit={(next) => {
+              store.commitAdjustments(next);
+              setLiveAdjustments(null);
+            }}
+            canUndo={store.canUndo}
+            canRedo={store.canRedo}
+            onUndo={store.undo}
+            onRedo={store.redo}
+            hasSelection={!!selectedObject}
+            onDeleteSelected={handleDeleteSelected}
+            onClose={() => onToolsPanelOpenChange(false)}
           />
-        ) : (
-          <span className="text-neutral-400 dark:text-neutral-500 text-sm italic">Loading image…</span>
         )}
       </div>
 
