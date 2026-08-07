@@ -31,10 +31,14 @@ export interface UseImageEditStoreResult {
   addObject: (object: ImageAnnotationObject) => void;
   editObject: (before: ImageAnnotationObject, after: ImageAnnotationObject) => void;
   deleteObject: (object: ImageAnnotationObject) => void;
-  // Replaces several objects at once as a single undo step - e.g. "Arrange as grid". `before`
-  // and `after` must be the same objects (matched by id, same array order) before/after whatever
-  // batch transform produced `after`.
+  // Replaces several objects at once as a single undo step - e.g. dragging a multi-selection.
+  // `before` and `after` must be the same objects (matched by id, same array order) before/after
+  // whatever batch transform produced `after`.
   batchEditObjects: (before: ImageAnnotationObject[], after: ImageAnnotationObject[]) => void;
+  // Adds/removes several objects at once as a single undo step - e.g. duplicating or deleting a
+  // multi-selection, so it costs one Undo press rather than one per object.
+  batchAddObjects: (objects: ImageAnnotationObject[]) => void;
+  batchDeleteObjects: (objects: ImageAnnotationObject[]) => void;
   // Full replacement order for the whole objects array - e.g. drag-to-reorder stacked objects.
   reorderObjects: (newOrder: ImageAnnotationObject[]) => void;
   commitAdjustments: (next: ImageAdjustments) => void;
@@ -162,6 +166,22 @@ export default function useImageEditStore(sourcePath: string | undefined, assetS
     [dispatch]
   );
 
+  const batchAddObjects = useCallback(
+    (objects: ImageAnnotationObject[]) => {
+      if (objects.length === 0) return;
+      dispatch({ type: "batch-add", objects });
+    },
+    [dispatch]
+  );
+
+  const batchDeleteObjects = useCallback(
+    (objects: ImageAnnotationObject[]) => {
+      if (objects.length === 0) return;
+      dispatch({ type: "batch-delete", objects });
+    },
+    [dispatch]
+  );
+
   const reorderObjects = useCallback(
     (newOrder: ImageAnnotationObject[]) => {
       const current = docRef.current;
@@ -236,6 +256,8 @@ export default function useImageEditStore(sourcePath: string | undefined, assetS
     editObject,
     deleteObject,
     batchEditObjects,
+    batchAddObjects,
+    batchDeleteObjects,
     reorderObjects,
     commitAdjustments,
     commitGeometry,

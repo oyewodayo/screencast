@@ -1,22 +1,23 @@
 // components/ImageEditor.tsx
 //
 // Top-level image-editing surface - the "image" category's counterpart to PdfAnnotator.tsx.
-// Owns tool/color/zoom state, wires ImageEditorToolbar <-> ImageEditorCanvas <-> the image-edit
-// store, and runs the two IO actions that aren't part of the store's own load/edit/autosave
-// lifecycle: geometry ops (crop/rotate/flip, which read/write the working canvas directly - see
-// ImageEditorCanvasHandle) and "Save a copy" (flattens to a real PNG file).
+// Owns tool/color/zoom/selection state, wires ImageEditorToolbar <-> ImageEditorCanvas <-> the
+// image-edit store, and runs the two IO actions that aren't part of the store's own load/edit/
+// autosave lifecycle: geometry ops (crop/rotate/flip, which read/write the working canvas directly
+// - see ImageEditorCanvasHandle) and "Save a copy" (flattens to a real PNG file).
 //
-// The store itself and the current selection are *not* owned here - both are lifted to
-// Dashboard.tsx (mirroring useVideoEditStore/selectedImageOverlayId's own lift for the video
-// editor) so a future sibling panel could share the exact same document and selection instead of
-// a second, out-of-sync copy.
-import React, { useCallback, useEffect, useRef, useState } from "react";
+// The store itself is lifted to Dashboard.tsx (mirroring useVideoEditStore for the video editor)
+// so a future sibling panel could share the exact same document instead of a second, out-of-sync
+// copy. Selection, by contrast, is owned entirely here - it used to be lifted too (for
+// ImageCollageDocker's thumbnail strip to share), but that docker is gone, and nothing else needs
+// to observe or drive it anymore.
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { IoBuildOutline, IoDownloadOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";
-import { cropCanvas, makePlacedImageObject, rotateFlipCanvas } from "../handlers/imageEditHandlers";
-import { ImageAdjustments, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../utils/imageEditTypes";
+import { cropCanvas, makePlacedImageObject, rotateFlipCanvas, translateObject } from "../handlers/imageEditHandlers";
+import { ImageAdjustments, ImageAnnotationObject, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../utils/imageEditTypes";
 import { fileToDataUrl } from "../utils/imageObjectCache";
 import ImageEditorCanvas, { ImageEditorCanvasHandle } from "./image/ImageEditorCanvas";
 import ImageEditorToolbar, { IconButton, SaveStatus, ZoomControl } from "./image/ImageEditorToolbar";
@@ -39,6 +40,24 @@ const PEN_MAX_WIDTH = 24;
 const HIGHLIGHT_MIN_WIDTH = 8;
 const HIGHLIGHT_MAX_WIDTH = 160;
 const DEFAULT_HIGHLIGHT_WIDTH = 32;
+// These are typically 4K screenshots (3840x2160), where the old 28px default read as a barely-
+// legible speck once the doc-fit zoom kicked in - see the text-editing input's own min-CSS-size
+// floor in ImageEditorCanvas.tsx for the other half of this fix.
+const DEFAULT_FONT_SIZE = 48;
+const DEFAULT_TEXT_BACKGROUND_COLOR = "#000000";
+
+// Fixed natural-pixel offset for a duplicated object, so the copy is never stacked exactly on top
+// of (and thus indistinguishable from) the original - same idea as most editors' paste offset.
+const DUPLICATE_OFFSET = 24;
+// Per keypress, in natural (canvas) pixels - Shift multiplies this, same convention most design
+// tools use for "small nudge" vs "big nudge".
+const NUDGE_STEP = 1;
+const NUDGE_STEP_SHIFT = 10;
+
+// Which tools' next-drawn object takes the armed color/width - module-level (not recreated every
+// render) since these never change; only used via .includes() below.
+const COLOR_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse", "text"];
+const WIDTH_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse"];
 
 interface ImageEditorProps {
   sourcePath: string; // raw filesystem path, for Save a copy
@@ -54,8 +73,6 @@ interface ImageEditorProps {
   // panel's own close button, so it's a two-way toggle rather than a plain boolean prop.
   isToolsPanelOpen: boolean;
   onToolsPanelOpenChange: (open: boolean) => void;
-  selectedObjectId: string | null;
-  onSelectObject: (id: string | null) => void;
 }
 
 const isEditableTarget = (el: Element | null): boolean => {
@@ -66,16 +83,7 @@ const isEditableTarget = (el: Element | null): boolean => {
 
 const clampZoom = (z: number): number => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(z * 100) / 100));
 
-const ImageEditor: React.FC<ImageEditorProps> = ({
-  sourcePath,
-  title,
-  onSaved,
-  store,
-  isToolsPanelOpen,
-  onToolsPanelOpenChange,
-  selectedObjectId,
-  onSelectObject,
-}) => {
+const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, store, isToolsPanelOpen, onToolsPanelOpenChange }) => {
   const canvasRef = useRef<ImageEditorCanvasHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -85,8 +93,15 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
   // Remembered separately from `strokeWidth` (pen/arrow/rect/ellipse) so switching tools never
   // clobbers either one's last-used value - see PEN_MIN_WIDTH/HIGHLIGHT_MIN_WIDTH above.
   const [highlightWidth, setHighlightWidth] = useState<number>(DEFAULT_HIGHLIGHT_WIDTH);
-  const [fontSize, setFontSize] = useState<number>(28);
+  const [fontSize, setFontSize] = useState<number>(DEFAULT_FONT_SIZE);
+  const [textBold, setTextBold] = useState<boolean>(false);
+  const [textBackground, setTextBackground] = useState<boolean>(false);
+  const [textBackgroundColor, setTextBackgroundColor] = useState<string>(DEFAULT_TEXT_BACKGROUND_COLOR);
   const [zoom, setZoom] = useState<number>(1);
+  // Which objects are selected - a plain id array (not a Set) since it's small and needs to be a
+  // stable, easily-diffed value for props/effect deps. Multi-object: populated by a marquee drag
+  // or shift-click in ImageEditorCanvas, not just single clicks.
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   // Live-previewed while a brightness/contrast/saturation slider is being dragged; committed to
   // the store (one undo entry) only on release - see ImageEditorToolbar's onAdjustmentsCommit.
   const [liveAdjustments, setLiveAdjustments] = useState<ImageAdjustments | null>(null);
@@ -104,12 +119,13 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
 
-  // Reset per-image tool/adjustment UI state when a different image is opened (selection itself
-  // is reset by Dashboard.tsx, which owns it) - a fresh doc always starts with nothing selected,
-  // and a stale tool/live-adjustment from the previous image would otherwise dangle.
+  // Reset per-image tool/adjustment/selection UI state when a different image is opened - a fresh
+  // doc always starts with nothing selected, and a stale tool/live-adjustment/selection from the
+  // previous image would otherwise dangle.
   useEffect(() => {
     setTool("select");
     setLiveAdjustments(null);
+    setSelectedIds([]);
     didFitZoomRef.current = false;
   }, [sourcePath]);
 
@@ -184,58 +200,97 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
     };
   }, []);
 
-  // Drops a selection that no longer exists - geometry ops clear every object, and undo/redo can
-  // land on a document where the currently-selected id was never re-added.
+  // Drops any selected id that no longer exists - geometry ops clear every object, and undo/redo
+  // can land on a document where a currently-selected id was never re-added.
   useEffect(() => {
-    if (selectedObjectId && !store.doc?.objects.some((o) => o.id === selectedObjectId)) onSelectObject(null);
-  }, [store.doc, selectedObjectId, onSelectObject]);
+    if (selectedIds.length === 0) return;
+    const existingIds = new Set(store.doc?.objects.map((o) => o.id) ?? []);
+    const filtered = selectedIds.filter((id) => existingIds.has(id));
+    if (filtered.length !== selectedIds.length) setSelectedIds(filtered);
+  }, [store.doc, selectedIds]);
 
-  const selectedObject = selectedObjectId ? store.doc?.objects.find((o) => o.id === selectedObjectId) ?? null : null;
+  // Memoized (not recomputed inline) so its reference is stable across renders that don't actually
+  // change the doc or the selection - it's a useCallback/useEffect dependency below, and a fresh
+  // array every render would tear down and rebuild the global keydown listener on every render.
+  const selectedObjects = useMemo(
+    () => (store.doc ? store.doc.objects.filter((o) => selectedIds.includes(o.id)) : []),
+    [store.doc, selectedIds]
+  );
+  // Color/width/font-size sync-from-selection and the onFontSizeChange dual-purpose edit below
+  // only make sense for exactly one selected object - a mixed multi-selection just leaves the
+  // panel's controls at whatever they last were rather than trying to show/edit "mixed" values.
+  const primarySelectedObject = selectedObjects.length === 1 ? selectedObjects[0] : null;
   const effectiveAdjustments = liveAdjustments ?? store.doc?.adjustments ?? NEUTRAL_ADJUSTMENTS;
 
   // Syncs the toolbar's color/width/font-size controls FROM whatever just got selected, so
   // clicking a shape shows *its* color rather than whatever was last picked for drawing a new
-  // one - keyed on selectedObjectId (not selectedObject itself, which changes reference on every
+  // one - keyed on the selected id (not the object itself, which changes reference on every
   // unrelated doc edit) so this runs once per selection change, not on every keystroke/drag that
   // happens to the currently-selected object afterward.
   useEffect(() => {
-    if (!selectedObject) return;
-    if ("color" in selectedObject) setColor(selectedObject.color);
-    if ("width" in selectedObject) {
-      if (selectedObject.type === "highlight") setHighlightWidth(selectedObject.width);
-      else setStrokeWidth(selectedObject.width);
+    if (!primarySelectedObject) return;
+    if ("color" in primarySelectedObject) setColor(primarySelectedObject.color);
+    if ("width" in primarySelectedObject) {
+      if (primarySelectedObject.type === "highlight") setHighlightWidth(primarySelectedObject.width);
+      else setStrokeWidth(primarySelectedObject.width);
     }
-    if (selectedObject.type === "text") setFontSize(selectedObject.fontSize);
+    if (primarySelectedObject.type === "text") {
+      setFontSize(primarySelectedObject.fontSize);
+      setTextBold(primarySelectedObject.bold);
+      setTextBackground(primarySelectedObject.background);
+      setTextBackgroundColor(primarySelectedObject.backgroundColor);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedObjectId]);
+  }, [
+    primarySelectedObject?.id,
+    // Also re-sync when fontSize changes on the *same* selected text object, not just when
+    // selection moves to a different one - TextAnnotationEditor's resize handle sets fontSize
+    // directly via store.editObject (ImageEditorCanvas.tsx), bypassing this component's own
+    // onFontSizeChange entirely, so without this the Size slider would keep showing the value
+    // from before the drag until the object was deselected and reselected.
+    primarySelectedObject?.type === "text" ? primarySelectedObject.fontSize : undefined,
+  ]);
 
   // Color/width apply to whichever color/width-bearing tool is armed (for the *next* thing
-  // drawn) or, when one's selected, edit that object directly instead - same dual-purpose
+  // drawn) or, when something's selected, edit those objects directly instead (every selected
+  // object that has the field, as one undo step when there's more than one) - same dual-purpose
   // pattern the pre-existing onFontSizeChange below already used for text.
-  const COLOR_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse", "text"];
-  const WIDTH_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse"];
-  const showColor = COLOR_TOOLS.includes(tool) || (!!selectedObject && "color" in selectedObject);
-  const showWidth = WIDTH_TOOLS.includes(tool) || (!!selectedObject && "width" in selectedObject);
+  const selectedWithColor = useMemo(() => selectedObjects.filter((o) => "color" in o), [selectedObjects]);
+  const selectedWithWidth = useMemo(() => selectedObjects.filter((o) => "width" in o), [selectedObjects]);
+  const showColor = COLOR_TOOLS.includes(tool) || selectedWithColor.length > 0;
+  const showWidth = WIDTH_TOOLS.includes(tool) || selectedWithWidth.length > 0;
   // Which Width scale is in play right now - the highlighter's own much wider one, or the shared
   // pen/arrow/rect/ellipse one - covers both "highlighter is armed" and "an existing highlight is
   // selected via the Select tool", same two cases showWidth itself already accounts for.
-  const isHighlightWidth = tool === "highlighter" || selectedObject?.type === "highlight";
+  const isHighlightWidth = tool === "highlighter" || primarySelectedObject?.type === "highlight";
   const activeWidth = isHighlightWidth ? highlightWidth : strokeWidth;
 
   const handleColorChange = useCallback(
     (next: string) => {
       setColor(next);
-      if (selectedObject && "color" in selectedObject) store.editObject(selectedObject, { ...selectedObject, color: next });
+      if (selectedWithColor.length === 1) store.editObject(selectedWithColor[0], { ...selectedWithColor[0], color: next });
+      else if (selectedWithColor.length > 1) {
+        store.batchEditObjects(
+          selectedWithColor,
+          selectedWithColor.map((o) => ({ ...o, color: next }))
+        );
+      }
     },
-    [selectedObject, store]
+    [selectedWithColor, store]
   );
   const handleStrokeWidthChange = useCallback(
     (next: number) => {
       if (isHighlightWidth) setHighlightWidth(next);
       else setStrokeWidth(next);
-      if (selectedObject && "width" in selectedObject) store.editObject(selectedObject, { ...selectedObject, width: next });
+      if (selectedWithWidth.length === 1) store.editObject(selectedWithWidth[0], { ...selectedWithWidth[0], width: next });
+      else if (selectedWithWidth.length > 1) {
+        store.batchEditObjects(
+          selectedWithWidth,
+          selectedWithWidth.map((o) => ({ ...o, width: next }))
+        );
+      }
     },
-    [selectedObject, store, isHighlightWidth]
+    [selectedWithWidth, store, isHighlightWidth]
   );
 
   // Every geometry op (crop/rotate/flip) follows the same shape: snapshot the canvas exactly as
@@ -251,14 +306,14 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
         const afterCanvas = transform(canvas);
         const afterDataUrl = afterCanvas.toDataURL("image/png");
         store.commitGeometry(beforeDataUrl, afterDataUrl, afterCanvas.width, afterCanvas.height);
-        onSelectObject(null);
+        setSelectedIds([]);
         setGeometryError(null);
       } catch (err) {
         console.error("Failed to apply crop/rotate/flip:", err);
         setGeometryError(err instanceof Error ? err.message : String(err));
       }
     },
-    [store, onSelectObject]
+    [store]
   );
 
   const handleRotateCCW = useCallback(() => applyGeometry((c) => rotateFlipCanvas(c, 3, false, false)), [applyGeometry]);
@@ -279,11 +334,36 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
   const handleCropCancel = useCallback(() => setTool("select"), []);
 
   const handleDeleteSelected = useCallback(() => {
-    if (selectedObject) {
-      store.deleteObject(selectedObject);
-      onSelectObject(null);
-    }
-  }, [selectedObject, store, onSelectObject]);
+    if (selectedObjects.length === 0) return;
+    if (selectedObjects.length === 1) store.deleteObject(selectedObjects[0]);
+    else store.batchDeleteObjects(selectedObjects);
+    setSelectedIds([]);
+  }, [selectedObjects, store]);
+
+  // Clones every selected object (fresh id/timestamps, nudged by DUPLICATE_OFFSET so the copy
+  // never sits exactly on top of the original) and selects the copies - one undo step regardless
+  // of how many objects were selected, via batchAddObjects.
+  const handleDuplicateSelected = useCallback(() => {
+    if (selectedObjects.length === 0) return;
+    const now = Date.now();
+    const clones: ImageAnnotationObject[] = selectedObjects.map((o) =>
+      translateObject({ ...o, id: crypto.randomUUID(), createdAt: now, updatedAt: now }, DUPLICATE_OFFSET, DUPLICATE_OFFSET)
+    );
+    if (clones.length === 1) store.addObject(clones[0]);
+    else store.batchAddObjects(clones);
+    setSelectedIds(clones.map((o) => o.id));
+  }, [selectedObjects, store]);
+
+  // Arrow-key nudge - moves every selected object by NUDGE_STEP (NUDGE_STEP_SHIFT with Shift) as
+  // one undo step, the fine-positioning counterpart to dragging with the mouse.
+  const handleNudgeSelected = useCallback(
+    (dx: number, dy: number) => {
+      if (selectedObjects.length === 0) return;
+      if (selectedObjects.length === 1) store.editObject(selectedObjects[0], translateObject(selectedObjects[0], dx, dy));
+      else store.batchEditObjects(selectedObjects, selectedObjects.map((o) => translateObject(o, dx, dy)));
+    },
+    [selectedObjects, store]
+  );
 
   // The "join/collage" building block: reads a picked/pasted file into a downscaled-if-needed
   // data URL (fileToDataUrl - same helper and size cap PdfAnnotator.tsx's own image insertion
@@ -308,12 +388,12 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
         const object = makePlacedImageObject(x, y, width, height, loaded.dataUrl);
         store.addObject(object);
         setTool("select");
-        onSelectObject(object.id);
+        setSelectedIds([object.id]);
       } catch (err) {
         console.error("Failed to insert image:", err);
       }
     },
-    [store, onSelectObject]
+    [store]
   );
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -378,14 +458,26 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
         if (tool === "crop") handleCropCancel();
         else {
           setTool("select");
-          onSelectObject(null);
+          setSelectedIds([]);
         }
         return;
       }
 
-      if ((e.key === "Delete" || e.key === "Backspace") && selectedObject) {
+      if ((e.key === "Delete" || e.key === "Backspace") && selectedObjects.length > 0) {
         e.preventDefault();
         handleDeleteSelected();
+        return;
+      }
+
+      if (
+        selectedObjects.length > 0 &&
+        (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight")
+      ) {
+        e.preventDefault();
+        const step = e.shiftKey ? NUDGE_STEP_SHIFT : NUDGE_STEP;
+        const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+        const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+        handleNudgeSelected(dx, dy);
         return;
       }
 
@@ -397,6 +489,12 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
         } else if (key === "y" || (key === "z" && e.shiftKey)) {
           e.preventDefault();
           if (store.canRedo) store.redo();
+        } else if (key === "d") {
+          e.preventDefault();
+          handleDuplicateSelected();
+        } else if (key === "a") {
+          e.preventDefault();
+          if (store.doc) setSelectedIds(store.doc.objects.map((o) => o.id));
         } else if (key === "=" || key === "+" || e.code === "Equal" || e.code === "NumpadAdd") {
           e.preventDefault();
           setZoom((z) => Math.min(MAX_ZOOM, Math.round((z + 0.25) * 100) / 100));
@@ -464,7 +562,23 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [tool, selectedObject, store.canUndo, store.canRedo, store.undo, store.redo, handleCropCancel, handleDeleteSelected, onSelectObject]);
+    // Depends on store.canUndo/canRedo/undo/redo/doc individually (not the whole `store` object,
+    // which useImageEditStore returns as a brand-new object literal every render) so this
+    // listener isn't torn down and rebuilt on every unrelated render - same reasoning
+    // selectedObjects itself is memoized for above.
+  }, [
+    tool,
+    selectedObjects,
+    store.canUndo,
+    store.canRedo,
+    store.undo,
+    store.redo,
+    store.doc,
+    handleCropCancel,
+    handleDeleteSelected,
+    handleDuplicateSelected,
+    handleNudgeSelected,
+  ]);
 
   if (store.loadError && !store.doc) {
     return (
@@ -522,11 +636,19 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
               color={color}
               strokeWidth={activeWidth}
               fontSize={fontSize}
+              textBold={textBold}
+              textBackground={textBackground}
+              textBackgroundColor={textBackgroundColor}
               zoom={zoom}
-              selectedObjectId={selectedObjectId}
-              onSelectObject={onSelectObject}
+              selectedObjectIds={selectedIds}
+              onSelectObjects={setSelectedIds}
               onAddObject={store.addObject}
+              onTextCommitted={(id) => {
+                setTool("select");
+                setSelectedIds([id]);
+              }}
               onEditObject={store.editObject}
+              onBatchEditObjects={store.batchEditObjects}
               onDeleteObject={store.deleteObject}
             />
           ) : (
@@ -549,9 +671,24 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
             fontSize={fontSize}
             onFontSizeChange={(size) => {
               setFontSize(size);
-              if (selectedObject?.type === "text") store.editObject(selectedObject, { ...selectedObject, fontSize: size });
+              if (primarySelectedObject?.type === "text") store.editObject(primarySelectedObject, { ...primarySelectedObject, fontSize: size });
             }}
-            showFontSize={tool === "text" || selectedObject?.type === "text"}
+            showFontSize={tool === "text" || primarySelectedObject?.type === "text"}
+            textBold={textBold}
+            onTextBoldChange={(bold) => {
+              setTextBold(bold);
+              if (primarySelectedObject?.type === "text") store.editObject(primarySelectedObject, { ...primarySelectedObject, bold });
+            }}
+            textBackground={textBackground}
+            onTextBackgroundChange={(background) => {
+              setTextBackground(background);
+              if (primarySelectedObject?.type === "text") store.editObject(primarySelectedObject, { ...primarySelectedObject, background });
+            }}
+            textBackgroundColor={textBackgroundColor}
+            onTextBackgroundColorChange={(next) => {
+              setTextBackgroundColor(next);
+              if (primarySelectedObject?.type === "text") store.editObject(primarySelectedObject, { ...primarySelectedObject, backgroundColor: next });
+            }}
             onRotateCCW={handleRotateCCW}
             onRotateCW={handleRotateCW}
             onFlipH={handleFlipH}
@@ -569,8 +706,9 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
             canRedo={store.canRedo}
             onUndo={store.undo}
             onRedo={store.redo}
-            hasSelection={!!selectedObject}
+            hasSelection={selectedObjects.length > 0}
             onDeleteSelected={handleDeleteSelected}
+            onDuplicateSelected={handleDuplicateSelected}
             onClose={() => onToolsPanelOpenChange(false)}
           />
         )}

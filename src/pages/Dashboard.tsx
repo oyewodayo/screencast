@@ -303,11 +303,6 @@ const Dashboard = () => {
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
   );
-  // Which placed object (if any) is selected on the image-edit canvas.
-  const [selectedImageEditObjectId, setSelectedImageEditObjectId] = useState<string | null>(null);
-  useEffect(() => {
-    setSelectedImageEditObjectId(null);
-  }, [selectedFile?.path]);
   // Text-overlay UI state - lifted here (rather than local to either subtree) because it's shared
   // by two siblings: the preview-layer editor mounted next to VideoPlayer below, and the timeline
   // lane's chips inside VideoTimelineDocker (reached via BottomDocker/FileToolsDocker).
@@ -1252,10 +1247,16 @@ const setScreen = () => {
 
 	// Arrow-key navigation — only active while an image or audio file is the currently displayed
 	// one, so it doesn't hijack arrow keys elsewhere (video seeking, PDF page turns, form inputs).
+	// Suppressed for images while the image tools panel is open (dockerMode === "file-tools"):
+	// ImageEditor.tsx binds its own arrow-key handler there to nudge a selected annotation object,
+	// and this listener - being on `document` same as that one, with no relation between the two -
+	// would otherwise ALSO fire for the exact same keypress and flip to the next/previous file out
+	// from under whatever the user was actually trying to nudge.
 	useEffect(() => {
 		if (!selectedFile) return;
 		const category = getFileCategory(selectedFile.name);
 		if (category !== "image" && category !== "audio") return;
+		if (category === "image" && dockerMode === "file-tools") return;
 
 		const handleKeyDown = (e: KeyboardEvent) => {
 			const target = e.target as HTMLElement | null;
@@ -1274,7 +1275,7 @@ const setScreen = () => {
 
 		document.addEventListener("keydown", handleKeyDown);
 		return () => document.removeEventListener("keydown", handleKeyDown);
-	}, [selectedFile, files, audioShuffle]);
+	}, [selectedFile, files, audioShuffle, dockerMode]);
 
 	// Opens a native OS file picker scoped to nowhere in particular — unlike the sidebar (which
 	// only ever lists files under the app's own Briefcast folder), this lets the user view/play
@@ -2239,8 +2240,6 @@ const setScreen = () => {
                 store={imageEditStore}
                 isToolsPanelOpen={dockerMode === "file-tools"}
                 onToolsPanelOpenChange={(open) => setDockerMode(open ? "file-tools" : "record")}
-                selectedObjectId={selectedImageEditObjectId}
-                onSelectObject={setSelectedImageEditObjectId}
               />
             ) : (
               <VideoPlayer

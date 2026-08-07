@@ -71,9 +71,11 @@ export interface EllipseObject extends BaseObject {
   filled: boolean;
 }
 
-// Single-line label - no PDF-TextObject-style wrapping/rich formatting (bold/italic/colorRuns).
+// Single-line label - no PDF-TextObject-style rich formatting (italic/colorRuns) or wrapping.
 // Screenshot annotations ("①", "click here") are short; multi-line rich text isn't worth the
-// added complexity for this editor.
+// added complexity for this editor. Bold and a translucent backdrop ARE supported (unlike the PDF
+// counterpart) since legibility over a busy screenshot - not just over a page background - is the
+// whole point of this tool.
 export interface TextObject extends BaseObject {
   type: "text";
   x: number;
@@ -81,6 +83,21 @@ export interface TextObject extends BaseObject {
   text: string;
   color: string;
   fontSize: number;
+  bold: boolean;
+  // A translucent backdrop sized to the text's own measured bounds (plus a little padding) - the
+  // single biggest legibility win for a label dropped on top of an arbitrary, often busy photo,
+  // where the annotation color alone can't guarantee contrast the way it can on a plain PDF page.
+  background: boolean;
+  // Backdrop's own color (independent of `color`, the text's) - rendered at a fixed alpha (see
+  // renderTextObject) so it stays translucent regardless of which color is picked. Only read while
+  // `background` is true, but always present so toggling background back on remembers the last
+  // color instead of resetting to a default.
+  backgroundColor: string;
+  // Radians, applied around the text's own center at render/hit-test time - same "stored
+  // unrotated, rotation applied only at render/hit-test time" convention PlacedImageObject's own
+  // doc comment describes (see there for why: x/y/fontSize never change just because the object is
+  // rotated, only the resize/rotate chrome touches rotation directly).
+  rotation: number;
 }
 
 // A rectangular region of the *base* photo (post-adjustments, pre-other-annotations - see
@@ -169,7 +186,12 @@ export type ImageEditCommand =
   // only concept of stacking/z-order.
   | { type: "reorder"; before: ImageAnnotationObject[]; after: ImageAnnotationObject[] }
   | { type: "geometry"; before: GeometrySnapshot; after: GeometrySnapshot }
-  | { type: "adjustments"; before: ImageAdjustments; after: ImageAdjustments };
+  | { type: "adjustments"; before: ImageAdjustments; after: ImageAdjustments }
+  // Multi-select add/delete as a single undo step - e.g. deleting or duplicating several
+  // marquee-selected objects at once. Symmetric inverse pair, same as 'add'/'delete' but over an
+  // array, so a bulk action costs exactly one Undo press instead of one per object.
+  | { type: "batch-add"; objects: ImageAnnotationObject[] }
+  | { type: "batch-delete"; objects: ImageAnnotationObject[] };
 
 export interface ImageEditDocument {
   version: typeof ANNOTATION_SCHEMA_VERSION;

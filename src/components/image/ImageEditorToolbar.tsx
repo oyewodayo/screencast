@@ -22,6 +22,7 @@ import {
   IoEllipseOutline,
   IoCropOutline,
   IoTrashOutline,
+  IoCopyOutline,
   IoCheckmark,
   IoCloseOutline,
   IoImageOutline,
@@ -29,7 +30,7 @@ import {
 } from "react-icons/io5";
 import { BsHighlighter, BsCursor, BsArrowUpRight } from "react-icons/bs";
 import { TbFlipHorizontal, TbFlipVertical, TbRotate, TbRotateClockwise } from "react-icons/tb";
-import { MdBlurOn } from "react-icons/md";
+import { MdBlurOn, MdFormatBold, MdFormatColorFill } from "react-icons/md";
 import { ImageAdjustments, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../../utils/imageEditTypes";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 
@@ -223,6 +224,12 @@ interface ImageEditorToolbarProps {
   fontSize: number;
   onFontSizeChange: (size: number) => void;
   showFontSize: boolean;
+  textBold: boolean;
+  onTextBoldChange: (bold: boolean) => void;
+  textBackground: boolean;
+  onTextBackgroundChange: (background: boolean) => void;
+  textBackgroundColor: string;
+  onTextBackgroundColorChange: (color: string) => void;
   onRotateCCW: () => void;
   onRotateCW: () => void;
   onFlipH: () => void;
@@ -239,6 +246,7 @@ interface ImageEditorToolbarProps {
   onRedo: () => void;
   hasSelection: boolean;
   onDeleteSelected: () => void;
+  onDuplicateSelected: () => void;
   onClose: () => void;
 }
 
@@ -259,6 +267,12 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   fontSize,
   onFontSizeChange,
   showFontSize,
+  textBold,
+  onTextBoldChange,
+  textBackground,
+  onTextBackgroundChange,
+  textBackgroundColor,
+  onTextBackgroundColorChange,
   onRotateCCW,
   onRotateCW,
   onFlipH,
@@ -275,6 +289,7 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   onRedo,
   hasSelection,
   onDeleteSelected,
+  onDuplicateSelected,
   onClose,
 }) => {
   if (tool === "crop") {
@@ -387,14 +402,61 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
                   <input
                     type="range"
                     min={12}
-                    max={96}
-                    step={1}
+                    max={240}
+                    step={2}
                     value={fontSize}
                     onChange={(e) => onFontSizeChange(Number(e.target.value))}
                     title="Font size"
                     className="flex-1 accent-blue-500"
                   />
+                  <span className="w-8 shrink-0 text-right tabular-nums">{fontSize}</span>
                 </label>
+              )}
+              {showFontSize && (
+                <button
+                  type="button"
+                  title="Bold"
+                  // A plain click's default action would shift focus onto this button - fine most
+                  // of the time, but while the Text tool's inline editing input is open (a live
+                  // text label being typed), that focus-shift blurs it, which commits/discards
+                  // whatever's been typed so far and, if nothing had been typed yet, leaves the
+                  // *next* keystrokes with nothing focused to receive them - they fall through to
+                  // this editor's own global tool shortcuts instead (same class of bug
+                  // ColorSwatchPicker.tsx already guards its own swatches against).
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => onTextBoldChange(!textBold)}
+                  className={`self-start flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-colors duration-150 ${
+                    textBold
+                      ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                      : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                  }`}
+                >
+                  <MdFormatBold size={15} /> Bold
+                </button>
+              )}
+              {/* The color swatch is always shown (not just once Background is toggled on) - it
+                  was hidden behind that toggle before, and "click Background to reveal the color
+                  picker" turned out not to be discoverable at all. Picking a color here works
+                  regardless of the toggle state; it just has no visible effect until Background
+                  is actually on. */}
+              {showFontSize && (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    title="Background - adds a translucent backdrop behind the text for legibility over busy photos"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => onTextBackgroundChange(!textBackground)}
+                    className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-colors duration-150 ${
+                      textBackground
+                        ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                        : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                    }`}
+                  >
+                    <MdFormatColorFill size={15} /> Background
+                  </button>
+                  <span className="text-xs text-neutral-400 dark:text-neutral-500">Color</span>
+                  <ColorSwatchPicker color={textBackgroundColor} onChange={onTextBackgroundColorChange} size="sm" />
+                </div>
               )}
             </div>
           </Section>
@@ -439,6 +501,9 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
             </IconButton>
             <IconButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={onRedo}>
               <IoArrowRedo size={16} />
+            </IconButton>
+            <IconButton title="Duplicate (Ctrl+D)" disabled={!hasSelection} onClick={onDuplicateSelected}>
+              <IoCopyOutline size={16} />
             </IconButton>
             <IconButton title="Delete selected (Del)" disabled={!hasSelection} onClick={onDeleteSelected}>
               <IoTrashOutline size={16} />
