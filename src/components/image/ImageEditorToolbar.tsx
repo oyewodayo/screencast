@@ -7,7 +7,7 @@
 // or selected, brightness/contrast/saturation, and undo/redo/delete. Zoom and "Save a copy" live
 // in ImageEditor's own persistent header instead - viewing and saving shouldn't depend on this
 // panel being open.
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -80,6 +80,64 @@ export const SaveStatus: React.FC<{ isSaving: boolean; saveError: string | null 
   );
 };
 
+// The percentage readout doubles as a text field - click/tap it to type an exact value instead of
+// nudging with +/-. Edits are staged in local text state (not committed straight to `zoom`) so
+// mid-edit strings ("", "1", "15") aren't immediately clamped/reformatted out from under the
+// user's cursor; the real zoom only updates on blur/Enter. isEditingRef (not React state) tracks
+// whether an edit is in progress, so the sync-from-prop effect below can tell "zoom changed
+// elsewhere, update the field" apart from "zoom changed because *this* field's own edit just
+// committed" without the state update itself retriggering the effect.
+const ZoomPercentInput: React.FC<{
+  zoom: number;
+  onZoomChange: (zoom: number) => void;
+  minZoom: number;
+  maxZoom: number;
+}> = ({ zoom, onZoomChange, minZoom, maxZoom }) => {
+  const [text, setText] = useState<string>(String(Math.round(zoom * 100)));
+  const isEditingRef = useRef(false);
+
+  useEffect(() => {
+    if (!isEditingRef.current) setText(String(Math.round(zoom * 100)));
+  }, [zoom]);
+
+  const commit = (): void => {
+    isEditingRef.current = false;
+    const parsed = parseInt(text, 10);
+    const clampedPercent = Number.isNaN(parsed) ? Math.round(zoom * 100) : Math.max(Math.round(minZoom * 100), Math.min(Math.round(maxZoom * 100), parsed));
+    setText(String(clampedPercent));
+    if (clampedPercent !== Math.round(zoom * 100)) onZoomChange(clampedPercent / 100);
+  };
+
+  return (
+    <span className="flex items-center gap-px w-11 justify-center">
+      <input
+        type="text"
+        inputMode="numeric"
+        title="Zoom - type a value"
+        value={text}
+        onFocus={(e) => {
+          isEditingRef.current = true;
+          e.currentTarget.select();
+        }}
+        onChange={(e) => setText(e.target.value.replace(/[^0-9]/g, ""))}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            e.currentTarget.blur();
+          } else if (e.key === "Escape") {
+            isEditingRef.current = false;
+            setText(String(Math.round(zoom * 100)));
+            e.currentTarget.blur();
+          }
+        }}
+        className="w-7 bg-transparent text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums text-right focus:outline-none"
+      />
+      <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">%</span>
+    </span>
+  );
+};
+
 export const ZoomControl: React.FC<{
   zoom: number;
   onZoomChange: (zoom: number) => void;
@@ -90,7 +148,7 @@ export const ZoomControl: React.FC<{
     <IconButton title="Zoom out (Ctrl+-)" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
       <IoRemove size={16} />
     </IconButton>
-    <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums w-10 text-center">{Math.round(zoom * 100)}%</span>
+    <ZoomPercentInput zoom={zoom} onZoomChange={onZoomChange} minZoom={minZoom} maxZoom={maxZoom} />
     <IconButton title="Zoom in (Ctrl+=)" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
       <IoAdd size={16} />
     </IconButton>

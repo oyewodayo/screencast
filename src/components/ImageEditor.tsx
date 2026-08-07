@@ -12,7 +12,7 @@
 // a second, out-of-sync copy.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
-import { IoDownloadOutline } from "react-icons/io5";
+import { IoBuildOutline, IoDownloadOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";
 import { cropCanvas, makePlacedImageObject, rotateFlipCanvas } from "../handlers/imageEditHandlers";
@@ -54,6 +54,8 @@ const isEditableTarget = (el: Element | null): boolean => {
   return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT";
 };
 
+const clampZoom = (z: number): number => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(z * 100) / 100));
+
 const ImageEditor: React.FC<ImageEditorProps> = ({
   sourcePath,
   title,
@@ -83,6 +85,11 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
   const [geometryError, setGeometryError] = useState<string | null>(null);
 
   const didFitZoomRef = useRef(false);
+  // Read by the pinch-gesture handler below so a touchmove mid-gesture can scale from the zoom
+  // level the pinch *started* at without that handler needing to be torn down/rebound (and thus
+  // lose its in-progress gesture state) every time zoom itself changes.
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
 
   // Reset per-image tool/adjustment UI state when a different image is opened (selection itself
   // is reset by Dashboard.tsx, which owns it) - a fresh doc always starts with nothing selected,
@@ -114,6 +121,55 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
     setZoom(Math.max(MIN_ZOOM, Math.round(fit * 100) / 100));
     didFitZoomRef.current = true;
   }, [store.doc]);
+
+  // Trackpad pinch and two-finger touchscreen pinch both zoom the canvas, same as most image/map
+  // viewers. Browsers (Chrome/Edge/Safari) report a trackpad pinch as a wheel event with ctrlKey
+  // set - that's indistinguishable from an actual held-Ctrl scroll, but a plain scroll wheel never
+  // sets ctrlKey on its own, so gating on it here doesn't swallow normal wheel scrolling/panning.
+  // Real touchscreen pinch has no such synthesized event, so it's handled separately via
+  // touchstart/touchmove distance tracking. touch-action: pan-x pan-y (set below on the container)
+  // stops the browser from also applying its own native pinch-zoom to the page while this runs.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const handleWheel = (e: WheelEvent): void => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      setZoom((z) => clampZoom(z * (1 - e.deltaY * 0.01)));
+    };
+
+    let pinchStartDistance: number | null = null;
+    let pinchStartZoom = 1;
+    const touchDistance = (touches: TouchList): number => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
+
+    const handleTouchStart = (e: TouchEvent): void => {
+      if (e.touches.length !== 2) return;
+      pinchStartDistance = touchDistance(e.touches);
+      pinchStartZoom = zoomRef.current;
+    };
+    const handleTouchMove = (e: TouchEvent): void => {
+      if (e.touches.length !== 2 || pinchStartDistance === null) return;
+      e.preventDefault();
+      setZoom(clampZoom(pinchStartZoom * (touchDistance(e.touches) / pinchStartDistance)));
+    };
+    const handleTouchEnd = (e: TouchEvent): void => {
+      if (e.touches.length < 2) pinchStartDistance = null;
+    };
+
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    el.addEventListener("touchstart", handleTouchStart, { passive: true });
+    el.addEventListener("touchmove", handleTouchMove, { passive: false });
+    el.addEventListener("touchend", handleTouchEnd);
+    el.addEventListener("touchcancel", handleTouchEnd);
+    return () => {
+      el.removeEventListener("wheel", handleWheel);
+      el.removeEventListener("touchstart", handleTouchStart);
+      el.removeEventListener("touchmove", handleTouchMove);
+      el.removeEventListener("touchend", handleTouchEnd);
+      el.removeEventListener("touchcancel", handleTouchEnd);
+    };
+  }, []);
 
   // Drops a selection that no longer exists - geometry ops clear every object, and undo/redo can
   // land on a document where the currently-selected id was never re-added.
@@ -399,16 +455,19 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
       {/* Persistent header - stays visible regardless of the tools panel, so viewing/zooming and
           checking/triggering the autosave never depend on that panel being open. Everything that
           actually edits the image (tools, geometry ops, adjustments, undo/redo) lives in the
-          panel instead, opened from the sidebar's tools button (see Dashboard.tsx). */}
-      <div className="shrink-0 flex items-center justify-between gap-3 px-4 py-2.5 bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-b border-black/[0.04] dark:border-white/[0.08]">
-        {title ? (
-          <span className="text-sm font-medium text-neutral-600 dark:text-neutral-300 truncate" title={title}>
+          panel instead. The tools toggle here mirrors the sidebar's own tools button (Dashboard.tsx)
+          rather than replacing it - collapsing the file-list sidebar hides that one entirely, and
+          this is otherwise the only way back into the panel. */}
+      <div className="shrink-0 flex items-center gap-3 px-4 py-2.5 bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-b border-black/[0.04] dark:border-white/[0.08]">
+        <IconButton title={isToolsPanelOpen ? "Hide image tools" : "Show image tools"} active={isToolsPanelOpen} onClick={() => onToolsPanelOpenChange(!isToolsPanelOpen)}>
+          <IoBuildOutline size={15} />
+        </IconButton>
+        {title && (
+          <span className="text-sm font-medium text-neutral-600 dark:text-neutral-300 truncate min-w-0" title={title}>
             {title}
           </span>
-        ) : (
-          <span />
         )}
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-3 shrink-0 ml-auto">
           <ZoomControl zoom={zoom} onZoomChange={setZoom} minZoom={MIN_ZOOM} maxZoom={MAX_ZOOM} />
           <IconButton title="Save a copy" onClick={handleSaveCopy}>
             <IoDownloadOutline size={16} />
@@ -424,7 +483,11 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
       )}
 
       <div className="flex-1 min-h-0 flex">
-        <div ref={containerRef} className="flex-1 min-w-0 overflow-auto flex items-center justify-center p-6">
+        <div
+          ref={containerRef}
+          className="flex-1 min-w-0 overflow-auto flex items-center justify-center p-6"
+          style={{ touchAction: "pan-x pan-y" }}
+        >
           {store.doc ? (
             <ImageEditorCanvas
               ref={canvasRef}
