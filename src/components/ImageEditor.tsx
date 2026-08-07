@@ -30,6 +30,16 @@ const INSERT_IMAGE_MAX_DIMENSION_PX = 2048;
 const INSERT_IMAGE_MAX_INITIAL_WIDTH_FRACTION = 0.5;
 const INSERT_IMAGE_MAX_INITIAL_HEIGHT_FRACTION = 0.8;
 
+// Pen/arrow/rect/ellipse share one Width range - a fine annotation line/outline rarely needs to
+// get much past this. A highlighter is a different instrument entirely (a broad marker swipe, not
+// a pointer line), so it gets its own much wider range and remembered value below rather than
+// being squeezed into the pen's scale - see the isHighlightWidth/highlightWidth split just below.
+const PEN_MIN_WIDTH = 1;
+const PEN_MAX_WIDTH = 24;
+const HIGHLIGHT_MIN_WIDTH = 8;
+const HIGHLIGHT_MAX_WIDTH = 160;
+const DEFAULT_HIGHLIGHT_WIDTH = 32;
+
 interface ImageEditorProps {
   sourcePath: string; // raw filesystem path, for Save a copy
   title?: string;
@@ -72,6 +82,9 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
   const [tool, setTool] = useState<ImageEditTool>("select");
   const [color, setColor] = useState<string>("#e03131");
   const [strokeWidth, setStrokeWidth] = useState<number>(4);
+  // Remembered separately from `strokeWidth` (pen/arrow/rect/ellipse) so switching tools never
+  // clobbers either one's last-used value - see PEN_MIN_WIDTH/HIGHLIGHT_MIN_WIDTH above.
+  const [highlightWidth, setHighlightWidth] = useState<number>(DEFAULT_HIGHLIGHT_WIDTH);
   const [fontSize, setFontSize] = useState<number>(28);
   const [zoom, setZoom] = useState<number>(1);
   // Live-previewed while a brightness/contrast/saturation slider is being dragged; committed to
@@ -188,7 +201,10 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
   useEffect(() => {
     if (!selectedObject) return;
     if ("color" in selectedObject) setColor(selectedObject.color);
-    if ("width" in selectedObject) setStrokeWidth(selectedObject.width);
+    if ("width" in selectedObject) {
+      if (selectedObject.type === "highlight") setHighlightWidth(selectedObject.width);
+      else setStrokeWidth(selectedObject.width);
+    }
     if (selectedObject.type === "text") setFontSize(selectedObject.fontSize);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedObjectId]);
@@ -200,6 +216,11 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
   const WIDTH_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse"];
   const showColor = COLOR_TOOLS.includes(tool) || (!!selectedObject && "color" in selectedObject);
   const showWidth = WIDTH_TOOLS.includes(tool) || (!!selectedObject && "width" in selectedObject);
+  // Which Width scale is in play right now - the highlighter's own much wider one, or the shared
+  // pen/arrow/rect/ellipse one - covers both "highlighter is armed" and "an existing highlight is
+  // selected via the Select tool", same two cases showWidth itself already accounts for.
+  const isHighlightWidth = tool === "highlighter" || selectedObject?.type === "highlight";
+  const activeWidth = isHighlightWidth ? highlightWidth : strokeWidth;
 
   const handleColorChange = useCallback(
     (next: string) => {
@@ -210,10 +231,11 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
   );
   const handleStrokeWidthChange = useCallback(
     (next: number) => {
-      setStrokeWidth(next);
+      if (isHighlightWidth) setHighlightWidth(next);
+      else setStrokeWidth(next);
       if (selectedObject && "width" in selectedObject) store.editObject(selectedObject, { ...selectedObject, width: next });
     },
-    [selectedObject, store]
+    [selectedObject, store, isHighlightWidth]
   );
 
   // Every geometry op (crop/rotate/flip) follows the same shape: snapshot the canvas exactly as
@@ -429,11 +451,13 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
           break;
         case "[":
           e.preventDefault();
-          setStrokeWidth((w) => Math.max(1, w - 1));
+          if (tool === "highlighter") setHighlightWidth((w) => Math.max(HIGHLIGHT_MIN_WIDTH, w - 4));
+          else setStrokeWidth((w) => Math.max(PEN_MIN_WIDTH, w - 1));
           break;
         case "]":
           e.preventDefault();
-          setStrokeWidth((w) => Math.min(24, w + 1));
+          if (tool === "highlighter") setHighlightWidth((w) => Math.min(HIGHLIGHT_MAX_WIDTH, w + 4));
+          else setStrokeWidth((w) => Math.min(PEN_MAX_WIDTH, w + 1));
           break;
       }
     };
@@ -496,7 +520,7 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
               adjustments={effectiveAdjustments}
               tool={tool}
               color={color}
-              strokeWidth={strokeWidth}
+              strokeWidth={activeWidth}
               fontSize={fontSize}
               zoom={zoom}
               selectedObjectId={selectedObjectId}
@@ -517,7 +541,9 @@ const ImageEditor: React.FC<ImageEditorProps> = ({
             color={color}
             onColorChange={handleColorChange}
             showColor={showColor}
-            strokeWidth={strokeWidth}
+            strokeWidth={activeWidth}
+            widthMin={isHighlightWidth ? HIGHLIGHT_MIN_WIDTH : PEN_MIN_WIDTH}
+            widthMax={isHighlightWidth ? HIGHLIGHT_MAX_WIDTH : PEN_MAX_WIDTH}
             onStrokeWidthChange={handleStrokeWidthChange}
             showWidth={showWidth}
             fontSize={fontSize}

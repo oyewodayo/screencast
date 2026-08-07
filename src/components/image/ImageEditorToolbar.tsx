@@ -215,6 +215,11 @@ interface ImageEditorToolbarProps {
   strokeWidth: number;
   onStrokeWidthChange: (width: number) => void;
   showWidth: boolean;
+  // The Width slider's own range - the caller (ImageEditor.tsx) swaps in a much wider one for the
+  // highlighter than for pen/arrow/rect/ellipse, since a highlighter is a broad marker swipe, not
+  // a fine annotation line. See its own HIGHLIGHT_MIN_WIDTH/HIGHLIGHT_MAX_WIDTH.
+  widthMin: number;
+  widthMax: number;
   fontSize: number;
   onFontSizeChange: (size: number) => void;
   showFontSize: boolean;
@@ -249,6 +254,8 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   strokeWidth,
   onStrokeWidthChange,
   showWidth,
+  widthMin,
+  widthMax,
   fontSize,
   onFontSizeChange,
   showFontSize,
@@ -363,14 +370,15 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
                   <span className="w-12 shrink-0">Width</span>
                   <input
                     type="range"
-                    min={1}
-                    max={24}
+                    min={widthMin}
+                    max={widthMax}
                     step={1}
                     value={strokeWidth}
                     onChange={(e) => onStrokeWidthChange(Number(e.target.value))}
                     title="Stroke width"
                     className="flex-1 accent-blue-500"
                   />
+                  <span className="w-7 shrink-0 text-right tabular-nums">{strokeWidth}</span>
                 </label>
               )}
               {showFontSize && (

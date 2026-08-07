@@ -62,11 +62,16 @@ function pathFromOutline(ctx: CanvasRenderingContext2D, outline: number[][]): vo
   ctx.closePath();
 }
 
-// Highlighter: constant-width, semi-transparent, multiply-blended line - no pressure taper, same
-// as pdfAnnotationHandlers.ts's drawHighlightPath.
+// Highlighter: constant-width (no pressure taper, unlike the pen), semi-transparent,
+// multiply-blended band with flat (butt) caps instead of round ones - a real highlighter's tip is
+// a flat blade, not a point, and a round-capped line just reads as a translucent pen stroke. Width
+// itself comes straight from the caller (ImageEditor.tsx keeps a separate, much wider Width range
+// for this tool - see HIGHLIGHT_MIN_WIDTH/HIGHLIGHT_MAX_WIDTH there - rather than this function
+// scaling a pen-sized value on its own, so the panel's slider position always matches what gets
+// drawn).
 function drawHighlightPath(ctx: CanvasRenderingContext2D, points: { x: number; y: number }[], width: number): void {
   if (points.length === 0) return;
-  ctx.lineCap = "round";
+  ctx.lineCap = "butt";
   ctx.lineJoin = "round";
   ctx.lineWidth = width;
   ctx.beginPath();
