@@ -85,6 +85,7 @@ interface ImageEditorCanvasProps {
   arrowDashed: boolean;
   arrowDoubleHeaded: boolean;
   blurMode: "blur" | "redact";
+  blurRadius: number;
   zoom: number;
   selectedObjectIds: string[];
   onSelectObjects: (ids: string[]) => void;
@@ -125,6 +126,18 @@ interface TextEditorState {
   y: number;
   value: string;
   original?: Extract<ImageAnnotationObject, { type: "text" }>;
+}
+
+// Double-click-to-retype a step badge's number - same "inline input overlaid on the object,
+// commit on blur/Enter" shape as TextEditorState, just simpler (no create mode - a badge always
+// already exists once you can double-click it, and there's nothing else on it to edit).
+interface StepEditorState {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  value: string;
+  original: Extract<ImageAnnotationObject, { type: "step" }>;
 }
 
 interface SnapGuide {
@@ -215,6 +228,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
     arrowDashed,
     arrowDoubleHeaded,
     blurMode,
+    blurRadius,
     zoom,
     selectedObjectIds,
     onSelectObjects,
@@ -242,6 +256,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
   const [marqueeRect, setMarqueeRect] = useState<CropRect | null>(null);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [textEditor, setTextEditor] = useState<TextEditorState | null>(null);
+  const [stepEditor, setStepEditor] = useState<StepEditorState | null>(null);
 
   const { baseWidth, baseHeight, objects } = doc;
 
@@ -293,7 +308,10 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
   // changes on starting/stopping an edit or switching which object - never on every keystroke
   // (textEditor.value changes every keystroke, but isn't read here) - see redraw's own comment for
   // why that distinction matters.
-  const hiddenWhileEditingId = textEditor?.mode === "edit" ? textEditor.original?.id ?? null : null;
+  // Same "hide the committed object while its own live editing chrome covers it" reasoning covers
+  // stepEditor too, which - unlike textEditor - only ever has one mode (retyping an existing
+  // badge's number), so its original id is always the one to hide while it's open.
+  const hiddenWhileEditingId = (textEditor?.mode === "edit" ? textEditor.original?.id : null) ?? stepEditor?.original.id ?? null;
 
   // Excludes hiddenWhileEditingId from the composed canvas while it's being edited - without this,
   // the committed object keeps rendering directly underneath the live editing input for the whole
@@ -402,8 +420,21 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
     setTextEditor({ mode: "edit", x: object.x, y: object.y, value: object.text, original: object });
   };
 
+  const commitStepEditor = (): void => {
+    const state = stepEditor;
+    setStepEditor(null);
+    if (!state) return;
+    const parsed = parseInt(state.value, 10);
+    if (!Number.isFinite(parsed)) return; // cleared or non-numeric - leave the original number as-is
+    if (parsed !== state.original.number) onEditObject(state.original, { ...state.original, number: parsed });
+  };
+
+  const beginEditStepNumber = (object: Extract<ImageAnnotationObject, { type: "step" }>): void => {
+    setStepEditor({ x: object.x, y: object.y, w: object.w, h: object.h, value: String(object.number), original: object });
+  };
+
   const handlePointerDown = (e: React.PointerEvent): void => {
-    if (textEditor) return; // let the inline input's own blur/Enter commit first
+    if (textEditor || stepEditor) return; // let the inline input's own blur/Enter commit first
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const { x, y } = toNaturalPoint(e.clientX, e.clientY);
 
@@ -645,7 +676,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
       } else if (nw > 2 && nh > 2) {
         if (drag.tool === "rect") onAddObject(makeRectObject(nx, ny, nw, nh, color, strokeWidth, shapeFilled));
         else if (drag.tool === "ellipse") onAddObject(makeEllipseObject(nx, ny, nw, nh, color, strokeWidth, shapeFilled));
-        else if (drag.tool === "blur") onAddObject(makeBlurObject(nx, ny, nw, nh, blurMode));
+        else if (drag.tool === "blur") onAddObject(makeBlurObject(nx, ny, nw, nh, blurMode, blurRadius));
         else onAddObject(makeStepObject(nx, ny, nw, nh, nextStepNumber(objects), color));
       }
       return;
@@ -735,13 +766,16 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
           if (hit?.type === "text") {
             onSelectObjects([hit.id]);
             beginEditExistingText(hit);
+          } else if (hit?.type === "step") {
+            onSelectObjects([hit.id]);
+            beginEditStepNumber(hit);
           }
         }}
       >
         {/* Single-selection outline + resize handles - unchanged from before multi-select existed.
             Suppressed once a second object joins the selection (see the multi-select boxes below
             instead), since resize handles only ever act on one object at a time. */}
-        {selectionBounds && tool === "select" && (
+        {selectionBounds && tool === "select" && !stepEditor && (
           <div
             className="absolute border-2 border-dashed border-blue-400 pointer-events-none"
             style={{
@@ -755,6 +789,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
 
         {primaryLive &&
           tool === "select" &&
+          !stepEditor &&
           getHandles(primaryLive).map((h) => (
             <div
               key={h.id}
@@ -790,6 +825,10 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
                 height={display.height * zoom}
                 rotation={display.rotation}
                 src={primarySelectedObject.src}
+                cornerRadius={(display.cornerRadius ?? 0) * zoom}
+                borderWidth={(display.borderWidth ?? 0) * zoom}
+                borderColor={display.borderColor}
+                shadow={display.shadow}
                 onMoveEnd={(newLeft, newTop) => onEditObject(primarySelectedObject, { ...primarySelectedObject, x: newLeft / zoom, y: newTop / zoom })}
                 onResizeEnd={(newWidth, newHeight, newLeft, newTop) =>
                   onEditObject(primarySelectedObject, {
@@ -984,6 +1023,40 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
             color,
             backgroundColor: textBackground ? hexToRgba(textBackgroundColor, TEXT_BACKGROUND_ALPHA) : undefined,
             minWidth: 80,
+            zIndex: 20,
+          }}
+        />
+      )}
+
+      {stepEditor && (
+        <input
+          type="text"
+          inputMode="numeric"
+          autoFocus
+          autoComplete="off"
+          // Selected (not just focused) on mount so typing a replacement digit doesn't require
+          // manually clearing the existing number first - the whole point of double-clicking a
+          // badge that already has one.
+          onFocus={(e) => e.currentTarget.select()}
+          value={stepEditor.value}
+          onChange={(e) => setStepEditor((prev) => (prev ? { ...prev, value: e.target.value.replace(/[^0-9]/g, "") } : prev))}
+          onKeyDown={(e) => {
+            e.stopPropagation(); // same global-shortcut guard the text editor's own input uses
+            if (e.key === "Enter") e.currentTarget.blur();
+            else if (e.key === "Escape") setStepEditor(null);
+          }}
+          onBlur={commitStepEditor}
+          className="absolute outline-none ring-2 ring-blue-500 rounded-full text-center font-bold text-white bg-transparent"
+          style={{
+            left: stepEditor.x * zoom,
+            top: stepEditor.y * zoom,
+            width: stepEditor.w * zoom,
+            height: stepEditor.h * zoom,
+            // Matches renderStepObject's own number size (radius * 1.1, radius = shorter side / 2)
+            // and floored the same way the text editor's own font size is, for the same reason -
+            // otherwise a small badge at low zoom shrinks its retyped digits to unreadable.
+            fontSize: Math.max(14, (Math.min(stepEditor.w, stepEditor.h) / 2) * 1.1 * zoom),
+            fontFamily: TEXT_FONT_FAMILY,
             zIndex: 20,
           }}
         />

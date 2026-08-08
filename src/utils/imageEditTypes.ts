@@ -144,6 +144,14 @@ export interface PlacedImageObject extends BaseObject {
   width: number;
   height: number;
   rotation: number; // radians
+  // Frame styling, all optional (like BlurRegionObject's own `mode`/ArrowObject's `dashed` -
+  // undefined on an image placed before this existed reads as "no frame", not a migration hazard).
+  // `cornerRadius` is natural (unzoomed) px, clamped against the image's own half-width/height at
+  // render time so it can never overshoot into a shape wider than the image itself.
+  cornerRadius?: number;
+  borderWidth?: number;
+  borderColor?: string;
+  shadow?: boolean;
 }
 
 // A numbered callout badge - a filled circle with a bold number centered in it, for "do this,

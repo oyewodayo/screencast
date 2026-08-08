@@ -14,6 +14,18 @@ interface ImageAnnotationEditorProps {
   rotation: number; // radians, fed straight into ctx.rotate()/CSS rotate() — see the sign-convention
   // note on rotatePointAroundCenter in pdfAnnotationHandlers.ts if touching the hit-test math.
   src: string;
+  // Frame styling preview, all optional and all in the same device/CSS px `left`/`top`/etc.
+  // already use (pre-scaled by the caller) - PdfPage.tsx's own images don't have a frame concept
+  // and simply never pass these, leaving the preview exactly as it was before these existed.
+  // Needed because this move-handle's own <img> is a flat DOM duplicate of the underlying
+  // canvas-rendered object (drawn as a plain img so dragging stays smooth without redrawing the
+  // full-res canvas every pointermove - see this component's own doc comment) - without mirroring
+  // the frame styling here too, that duplicate would sit fully opaque on top of the real,
+  // correctly-styled canvas render and hide it completely for as long as the image stays selected.
+  cornerRadius?: number;
+  borderWidth?: number;
+  borderColor?: string;
+  shadow?: boolean;
   onMoveEnd: (newLeft: number, newTop: number) => void;
   onResizeEnd: (newWidth: number, newHeight: number, newLeft: number, newTop: number) => void;
   onRotateEnd: (newRotation: number) => void;
@@ -33,6 +45,10 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
   height,
   rotation,
   src,
+  cornerRadius = 0,
+  borderWidth = 0,
+  borderColor = "#ffffff",
+  shadow = false,
   onMoveEnd,
   onResizeEnd,
   onRotateEnd,
@@ -189,7 +205,17 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       style={{ left, top, width, height, transform: `rotate(${rotation}rad)`, transformOrigin: "center center", zIndex: 20 }}
     >
       <div onPointerDown={handleMovePointerDown} title="Drag to move" className="absolute inset-0 ring-2 ring-blue-500" style={{ cursor: "move" }}>
-        <img src={src} alt="" draggable={false} className="w-full h-full object-fill pointer-events-none select-none" />
+        <img
+          src={src}
+          alt=""
+          draggable={false}
+          className="w-full h-full object-fill pointer-events-none select-none"
+          style={{
+            borderRadius: cornerRadius,
+            border: borderWidth > 0 ? `${borderWidth}px solid ${borderColor}` : undefined,
+            boxShadow: shadow ? "0 4px 16px rgba(0, 0, 0, 0.35)" : undefined,
+          }}
+        />
       </div>
 
       {([[true, true], [false, true], [true, false], [false, false]] as const).map(([cornerLeft, cornerTop]) => (

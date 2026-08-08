@@ -285,19 +285,76 @@ function renderTextObject(ctx: CanvasRenderingContext2D, object: TextObject): vo
   ctx.restore();
 }
 
+// Manual arcTo-based rounded rect rather than the native ctx.roundRect - this runs inside every
+// placed-image render (so every redraw while one exists on canvas, not just at creation), and a
+// hand-rolled path has no engine-support assumptions to make since this file's whole point is
+// working the same regardless of which webview the app is running under.
+function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+  const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr);
+  ctx.arcTo(x, y, x + rr, y, rr);
+  ctx.closePath();
+}
+
 // Draws a second placed-on-top image, rotated around its own center - mirrors
 // pdfAnnotationHandlers.ts's renderImageObject exactly (see PlacedImageObject's own doc comment
 // for the shared x/y/rotation convention). Reads from the shared decoded-image cache
 // (imageObjectCache.ts) rather than decoding inline, same "preload once, render synchronously"
 // split that cache exists for - if the object's src hasn't decoded yet, this is a no-op and the
-// caller's preload effect (ImageEditorCanvas) redraws once it resolves.
+// caller's preload effect (ImageEditorCanvas) redraws once it resolves. Optional frame styling
+// (corner radius / border / drop shadow) layers on in a fixed order: shadow first (a filled,
+// otherwise-invisible copy of the same rounded shape, purely to cast the shadow, since
+// ctx.shadow* would otherwise also shadow the border stroke and double up), then the image itself
+// clipped to the rounded rect, then the border stroked on top so it reads as a frame rather than
+// being half-covered by the photo.
 function renderPlacedImage(ctx: CanvasRenderingContext2D, object: PlacedImageObject): void {
   const img = getCachedImage(object.src);
   if (!img) return;
+  const left = -object.width / 2;
+  const top = -object.height / 2;
+  const radius = object.cornerRadius ?? 0;
+
   ctx.save();
   ctx.translate(object.x + object.width / 2, object.y + object.height / 2);
   ctx.rotate(object.rotation);
-  ctx.drawImage(img, -object.width / 2, -object.height / 2, object.width, object.height);
+
+  if (object.shadow) {
+    ctx.save();
+    ctx.shadowColor = "rgba(0, 0, 0, 0.35)";
+    ctx.shadowBlur = Math.max(8, object.width * 0.03);
+    ctx.shadowOffsetY = Math.max(4, object.height * 0.02);
+    ctx.fillStyle = "#000000";
+    roundedRectPath(ctx, left, top, object.width, object.height, radius);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.save();
+  roundedRectPath(ctx, left, top, object.width, object.height, radius);
+  ctx.clip();
+  ctx.drawImage(img, left, top, object.width, object.height);
+  ctx.restore();
+
+  if (object.borderWidth && object.borderWidth > 0) {
+    ctx.save();
+    ctx.strokeStyle = object.borderColor ?? "#ffffff";
+    ctx.lineWidth = object.borderWidth;
+    // Inset by half the stroke width so the line is drawn *inside* the image's own edge (a stroke
+    // centered exactly on the boundary would otherwise bleed half its width past width/height).
+    const inset = object.borderWidth / 2;
+    roundedRectPath(ctx, left + inset, top + inset, object.width - inset * 2, object.height - inset * 2, Math.max(0, radius - inset));
+    ctx.stroke();
+    ctx.restore();
+  }
+
   ctx.restore();
 }
 
@@ -483,12 +540,29 @@ export function makeTextObject(
 
 export const DEFAULT_BLUR_RADIUS = 16;
 
-export function makeBlurObject(x: number, y: number, w: number, h: number, mode: "blur" | "redact" = "blur"): BlurRegionObject {
-  return { ...baseFields(), type: "blur", x, y, w, h, blurRadius: DEFAULT_BLUR_RADIUS, mode };
+export function makeBlurObject(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  mode: "blur" | "redact" = "blur",
+  blurRadius: number = DEFAULT_BLUR_RADIUS
+): BlurRegionObject {
+  return { ...baseFields(), type: "blur", x, y, w, h, blurRadius, mode };
 }
 
-export function makePlacedImageObject(x: number, y: number, width: number, height: number, src: string): PlacedImageObject {
-  return { ...baseFields(), type: "placed-image", x, y, width, height, rotation: 0, src };
+export function makePlacedImageObject(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  src: string,
+  cornerRadius: number = 0,
+  borderWidth: number = 0,
+  borderColor: string = "#ffffff",
+  shadow: boolean = false
+): PlacedImageObject {
+  return { ...baseFields(), type: "placed-image", x, y, width, height, rotation: 0, src, cornerRadius, borderWidth, borderColor, shadow };
 }
 
 export function makeStepObject(x: number, y: number, w: number, h: number, number: number, color: string): StepObject {

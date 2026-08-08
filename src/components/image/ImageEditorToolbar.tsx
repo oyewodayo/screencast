@@ -27,10 +27,12 @@ import {
   IoCloseOutline,
   IoImageOutline,
   IoClose,
+  IoLockClosed,
+  IoLockOpenOutline,
 } from "react-icons/io5";
 import { AiOutlineSmallDash } from "react-icons/ai";
-import { BsHighlighter, BsCursor, BsArrowUpRight } from "react-icons/bs";
-import { TbArrowLeftRight, TbFlipHorizontal, TbFlipVertical, TbRotate, TbRotateClockwise } from "react-icons/tb";
+import { BsHighlighter, BsCursor, BsArrowUpRight, BsShadows } from "react-icons/bs";
+import { TbArrowLeftRight, TbBorderRadius, TbFlipHorizontal, TbFlipVertical, TbRotate, TbRotateClockwise } from "react-icons/tb";
 import { MdBlurOn, MdFormatBold, MdFormatColorFill, MdLooksOne } from "react-icons/md";
 import { ImageAdjustments, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../../utils/imageEditTypes";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
@@ -243,6 +245,26 @@ interface ImageEditorToolbarProps {
   blurMode: "blur" | "redact";
   onBlurModeChange: (mode: "blur" | "redact") => void;
   showBlurMode: boolean;
+  blurRadius: number;
+  onBlurRadiusChange: (radius: number) => void;
+  imageCornerRadius: number;
+  onImageCornerRadiusChange: (radius: number) => void;
+  imageBorderWidth: number;
+  onImageBorderWidthChange: (width: number) => void;
+  imageBorderColor: string;
+  onImageBorderColorChange: (color: string) => void;
+  imageShadow: boolean;
+  onImageShadowChange: (shadow: boolean) => void;
+  // Natural (unzoomed) px - a numeric fallback for when the drag handles aren't precise enough
+  // (or, at a small on-screen zoom, aren't practical to grab at all) - see onImageWidthChange's
+  // own doc comment (ImageEditor.tsx) for the resize math these drive.
+  imageWidth: number;
+  onImageWidthChange: (width: number) => void;
+  imageHeight: number;
+  onImageHeightChange: (height: number) => void;
+  imageAspectLocked: boolean;
+  onImageAspectLockedChange: (locked: boolean) => void;
+  showImageStyle: boolean;
   onRotateCCW: () => void;
   onRotateCW: () => void;
   onFlipH: () => void;
@@ -297,6 +319,23 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   blurMode,
   onBlurModeChange,
   showBlurMode,
+  blurRadius,
+  onBlurRadiusChange,
+  imageCornerRadius,
+  onImageCornerRadiusChange,
+  imageBorderWidth,
+  onImageBorderWidthChange,
+  imageBorderColor,
+  onImageBorderColorChange,
+  imageShadow,
+  onImageShadowChange,
+  imageWidth,
+  onImageWidthChange,
+  imageHeight,
+  onImageHeightChange,
+  imageAspectLocked,
+  onImageAspectLockedChange,
+  showImageStyle,
   onRotateCCW,
   onRotateCW,
   onFlipH,
@@ -479,6 +518,22 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
                   </button>
                 </div>
               )}
+              {showBlurMode && blurMode === "blur" && (
+                <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                  <span className="w-12 shrink-0">Strength</span>
+                  <input
+                    type="range"
+                    min={2}
+                    max={40}
+                    step={1}
+                    value={blurRadius}
+                    onChange={(e) => onBlurRadiusChange(Number(e.target.value))}
+                    title="Blur strength"
+                    className="flex-1 accent-blue-500"
+                  />
+                  <span className="w-7 shrink-0 text-right tabular-nums">{blurRadius}</span>
+                </label>
+              )}
               {showWidth && (
                 <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                   <span className="w-12 shrink-0">Width</span>
@@ -557,6 +612,106 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
                   <ColorSwatchPicker color={textBackgroundColor} onChange={onTextBackgroundColorChange} size="sm" />
                 </div>
               )}
+            </div>
+          </Section>
+        )}
+
+        {/* Frame styling for a placed (inserted) image - only meaningful once one is actually
+            selected (there's no "armed tool" state for placed-image the way there is for
+            pen/text/etc., since inserting one is a one-shot action - see onInsertImageClick's own
+            doc comment), but the same values also seed the *next* inserted image (ImageEditor.tsx's
+            insertImageFile), so setting a border/shadow once and inserting several images in a row
+            doesn't mean re-applying it each time. */}
+        {showImageStyle && (
+          <Section label="Image">
+            <div className="flex flex-col gap-2.5">
+              {/* Numeric fallback for the drag handles - useful both for an exact size and for
+                  when the handles are hard to grab precisely at a small on-screen zoom. Locked to
+                  the image's own aspect ratio by default, matching what dragging a corner handle
+                  already does (see ImageAnnotationEditor's own doc comment on why its resize is
+                  center-anchored/aspect-locked) - the lock can be turned off here for a
+                  deliberate stretch, which the drag handles themselves don't support at all. */}
+              <div className="flex items-center gap-1.5">
+                <label className="flex items-center gap-1 text-xs text-neutral-500 dark:text-neutral-400">
+                  <span>W</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={Math.round(imageWidth)}
+                    onChange={(e) => onImageWidthChange(Number(e.target.value))}
+                    className="w-16 px-1.5 py-1 rounded-md border border-black/10 dark:border-white/10 bg-transparent text-right tabular-nums"
+                  />
+                </label>
+                <button
+                  type="button"
+                  title={imageAspectLocked ? "Aspect ratio locked - click to resize freely" : "Aspect ratio unlocked - click to lock"}
+                  onClick={() => onImageAspectLockedChange(!imageAspectLocked)}
+                  className={`shrink-0 flex items-center justify-center w-6 h-6 rounded-md transition-colors duration-150 ${
+                    imageAspectLocked
+                      ? "text-blue-600 dark:text-blue-400"
+                      : "text-neutral-400 dark:text-neutral-500 hover:text-neutral-600 dark:hover:text-neutral-300"
+                  }`}
+                >
+                  {imageAspectLocked ? <IoLockClosed size={13} /> : <IoLockOpenOutline size={13} />}
+                </button>
+                <label className="flex items-center gap-1 text-xs text-neutral-500 dark:text-neutral-400">
+                  <span>H</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={Math.round(imageHeight)}
+                    onChange={(e) => onImageHeightChange(Number(e.target.value))}
+                    className="w-16 px-1.5 py-1 rounded-md border border-black/10 dark:border-white/10 bg-transparent text-right tabular-nums"
+                  />
+                </label>
+              </div>
+              <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                <span className="w-12 shrink-0 flex items-center gap-1">
+                  <TbBorderRadius size={14} /> Corners
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={120}
+                  step={2}
+                  value={imageCornerRadius}
+                  onChange={(e) => onImageCornerRadiusChange(Number(e.target.value))}
+                  title="Corner radius"
+                  className="flex-1 accent-blue-500"
+                />
+                <span className="w-7 shrink-0 text-right tabular-nums">{imageCornerRadius}</span>
+              </label>
+              <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                <span className="w-12 shrink-0">Border</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={20}
+                  step={1}
+                  value={imageBorderWidth}
+                  onChange={(e) => onImageBorderWidthChange(Number(e.target.value))}
+                  title="Border width"
+                  className="flex-1 accent-blue-500"
+                />
+                <span className="w-7 shrink-0 text-right tabular-nums">{imageBorderWidth}</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-400 dark:text-neutral-500">Border color</span>
+                <ColorSwatchPicker color={imageBorderColor} onChange={onImageBorderColorChange} size="sm" />
+              </div>
+              <button
+                type="button"
+                title="Shadow - a soft drop shadow behind the image"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => onImageShadowChange(!imageShadow)}
+                className={`self-start flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-colors duration-150 ${
+                  imageShadow
+                    ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                    : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                }`}
+              >
+                <BsShadows size={14} /> Shadow
+              </button>
             </div>
           </Section>
         )}

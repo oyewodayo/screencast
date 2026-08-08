@@ -16,7 +16,7 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { IoBuildOutline, IoCheckmark, IoCopyOutline, IoDownloadOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";
-import { cropCanvas, makePlacedImageObject, rotateFlipCanvas, translateObject } from "../handlers/imageEditHandlers";
+import { DEFAULT_BLUR_RADIUS, cropCanvas, makePlacedImageObject, rotateFlipCanvas, translateObject } from "../handlers/imageEditHandlers";
 import { ImageAdjustments, ImageAnnotationObject, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../utils/imageEditTypes";
 import { fileToDataUrl } from "../utils/imageObjectCache";
 import ImageEditorCanvas, { ImageEditorCanvasHandle } from "./image/ImageEditorCanvas";
@@ -60,6 +60,9 @@ const COPY_STATUS_RESET_MS = 1500;
 const COLOR_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse", "text", "step"];
 const WIDTH_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse"];
 const DEFAULT_BLUR_MODE: "blur" | "redact" = "blur";
+// Floor for the precision Width/Height inputs - matches the drag handles' own MIN_DIAGONAL_DEVICE_PX
+// intent (ImageAnnotationEditor.tsx): stop a typed value from collapsing the image to nothing.
+const MIN_PLACED_IMAGE_SIZE = 8;
 
 interface ImageEditorProps {
   sourcePath: string; // raw filesystem path, for Save a copy
@@ -103,6 +106,22 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
   const [arrowDashed, setArrowDashed] = useState<boolean>(false);
   const [arrowDoubleHeaded, setArrowDoubleHeaded] = useState<boolean>(false);
   const [blurMode, setBlurMode] = useState<"blur" | "redact">(DEFAULT_BLUR_MODE);
+  const [blurRadius, setBlurRadius] = useState<number>(DEFAULT_BLUR_RADIUS);
+  // Placed-image frame styling - there's no "armed tool" for placed-image (see
+  // onInsertImageClick's own doc comment), so these values do double duty: they seed the *next*
+  // inserted image (insertImageFile below) and, once one is selected, edit it directly, same
+  // dual-purpose pattern fontSize/textBold/etc. already use for text.
+  const [imageCornerRadius, setImageCornerRadius] = useState<number>(0);
+  const [imageBorderWidth, setImageBorderWidth] = useState<number>(0);
+  const [imageBorderColor, setImageBorderColor] = useState<string>("#ffffff");
+  const [imageShadow, setImageShadow] = useState<boolean>(false);
+  // Unlike the frame-styling fields above, width/height are read straight off the selected
+  // image itself (handleImageWidthChange/handleImageHeightChange below) rather than mirrored into
+  // their own state - there's no "next inserted image" size to remember the way there is a next
+  // border/shadow, since insertImageFile already computes a sensible auto-fit size on its own.
+  // The lock, though, is a pure UI preference with nothing on the object to read it back from, so
+  // it does need its own state.
+  const [imageAspectLocked, setImageAspectLocked] = useState<boolean>(true);
   const [zoom, setZoom] = useState<number>(1);
   // Which objects are selected - a plain id array (not a Set) since it's small and needs to be a
   // stable, easily-diffed value for props/effect deps. Multi-object: populated by a marquee drag
@@ -241,7 +260,9 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
   useEffect(() => {
     if (!primarySelectedObject) return;
     if ("color" in primarySelectedObject) setColor(primarySelectedObject.color);
-    if ("width" in primarySelectedObject) {
+    // Excludes "placed-image" - see selectedWithWidth's own comment below for why its `width`
+    // field (the image's actual pixel width) must never be read as a stroke width.
+    if ("width" in primarySelectedObject && primarySelectedObject.type !== "placed-image") {
       if (primarySelectedObject.type === "highlight") setHighlightWidth(primarySelectedObject.width);
       else setStrokeWidth(primarySelectedObject.width);
     }
@@ -258,7 +279,16 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
       setArrowDashed(primarySelectedObject.dashed ?? false);
       setArrowDoubleHeaded(primarySelectedObject.doubleHeaded ?? false);
     }
-    if (primarySelectedObject.type === "blur") setBlurMode(primarySelectedObject.mode ?? "blur");
+    if (primarySelectedObject.type === "blur") {
+      setBlurMode(primarySelectedObject.mode ?? "blur");
+      setBlurRadius(primarySelectedObject.blurRadius);
+    }
+    if (primarySelectedObject.type === "placed-image") {
+      setImageCornerRadius(primarySelectedObject.cornerRadius ?? 0);
+      setImageBorderWidth(primarySelectedObject.borderWidth ?? 0);
+      setImageBorderColor(primarySelectedObject.borderColor ?? "#ffffff");
+      setImageShadow(primarySelectedObject.shadow ?? false);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     primarySelectedObject?.id,
@@ -275,12 +305,19 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
   // object that has the field, as one undo step when there's more than one) - same dual-purpose
   // pattern the pre-existing onFontSizeChange below already used for text.
   const selectedWithColor = useMemo(() => selectedObjects.filter((o) => "color" in o), [selectedObjects]);
-  const selectedWithWidth = useMemo(() => selectedObjects.filter((o) => "width" in o), [selectedObjects]);
+  // Excludes "placed-image" even though it technically has a `width` field - that field is the
+  // image's own pixel width (see PlacedImageObject's doc comment), not a stroke/line width, and
+  // sharing the property name with StrokeObject/ArrowObject/RectObject/EllipseObject's actual
+  // stroke width was a real bug: selecting an inserted image lit up the generic Width slider
+  // (ranged for a *stroke*, 1-24px) bound directly to the image's real width, so a small drag
+  // could visibly collapse a 1000+px image down to a sliver with no way back except Undo.
+  const selectedWithWidth = useMemo(() => selectedObjects.filter((o) => "width" in o && o.type !== "placed-image"), [selectedObjects]);
   const showColor = COLOR_TOOLS.includes(tool) || selectedWithColor.length > 0;
   const showWidth = WIDTH_TOOLS.includes(tool) || selectedWithWidth.length > 0;
   const showFill = tool === "rect" || tool === "ellipse" || primarySelectedObject?.type === "rect" || primarySelectedObject?.type === "ellipse";
   const showArrowStyle = tool === "arrow" || primarySelectedObject?.type === "arrow";
   const showBlurMode = tool === "blur" || primarySelectedObject?.type === "blur";
+  const showImageStyle = primarySelectedObject?.type === "placed-image";
   // Which Width scale is in play right now - the highlighter's own much wider one, or the shared
   // pen/arrow/rect/ellipse one - covers both "highlighter is armed" and "an existing highlight is
   // selected via the Select tool", same two cases showWidth itself already accounts for.
@@ -387,6 +424,37 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
     [selectedObjects, store]
   );
 
+  // Precision fallback for the drag handles' own resize (Width/Height number inputs in the
+  // toolbar's Image section) - same center-anchored convention ImageAnnotationEditor's own drag
+  // resize uses (see its doc comment), so typing a value doesn't shift the image's position the
+  // way a top-left-anchored resize would. Locked to the image's current aspect ratio unless
+  // imageAspectLocked has been turned off, in which case the other dimension is left untouched -
+  // the one deliberate way to stretch an image this editor supports (the drag handles don't).
+  const handleImageWidthChange = useCallback(
+    (newWidth: number) => {
+      if (primarySelectedObject?.type !== "placed-image" || !Number.isFinite(newWidth)) return;
+      const obj = primarySelectedObject;
+      const width = Math.max(MIN_PLACED_IMAGE_SIZE, newWidth);
+      const height = imageAspectLocked ? Math.max(MIN_PLACED_IMAGE_SIZE, width * (obj.height / obj.width)) : obj.height;
+      const centerX = obj.x + obj.width / 2;
+      const centerY = obj.y + obj.height / 2;
+      store.editObject(obj, { ...obj, width, height, x: centerX - width / 2, y: centerY - height / 2 });
+    },
+    [primarySelectedObject, imageAspectLocked, store]
+  );
+  const handleImageHeightChange = useCallback(
+    (newHeight: number) => {
+      if (primarySelectedObject?.type !== "placed-image" || !Number.isFinite(newHeight)) return;
+      const obj = primarySelectedObject;
+      const height = Math.max(MIN_PLACED_IMAGE_SIZE, newHeight);
+      const width = imageAspectLocked ? Math.max(MIN_PLACED_IMAGE_SIZE, height * (obj.width / obj.height)) : obj.width;
+      const centerX = obj.x + obj.width / 2;
+      const centerY = obj.y + obj.height / 2;
+      store.editObject(obj, { ...obj, width, height, x: centerX - width / 2, y: centerY - height / 2 });
+    },
+    [primarySelectedObject, imageAspectLocked, store]
+  );
+
   // The "join/collage" building block: reads a picked/pasted file into a downscaled-if-needed
   // data URL (fileToDataUrl - same helper and size cap PdfAnnotator.tsx's own image insertion
   // uses), sizes it to fit within the current photo (capped by both width and height fractions,
@@ -407,7 +475,7 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
         const x = (store.doc.baseWidth - width) / 2;
         const y = (store.doc.baseHeight - height) / 2;
 
-        const object = makePlacedImageObject(x, y, width, height, loaded.dataUrl);
+        const object = makePlacedImageObject(x, y, width, height, loaded.dataUrl, imageCornerRadius, imageBorderWidth, imageBorderColor, imageShadow);
         store.addObject(object);
         setTool("select");
         setSelectedIds([object.id]);
@@ -415,7 +483,7 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
         console.error("Failed to insert image:", err);
       }
     },
-    [store]
+    [store, imageCornerRadius, imageBorderWidth, imageBorderColor, imageShadow]
   );
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -698,6 +766,7 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
               arrowDashed={arrowDashed}
               arrowDoubleHeaded={arrowDoubleHeaded}
               blurMode={blurMode}
+              blurRadius={blurRadius}
               zoom={zoom}
               selectedObjectIds={selectedIds}
               onSelectObjects={setSelectedIds}
@@ -773,6 +842,44 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
               if (primarySelectedObject?.type === "blur") store.editObject(primarySelectedObject, { ...primarySelectedObject, mode });
             }}
             showBlurMode={showBlurMode}
+            blurRadius={blurRadius}
+            onBlurRadiusChange={(radius) => {
+              setBlurRadius(radius);
+              if (primarySelectedObject?.type === "blur") store.editObject(primarySelectedObject, { ...primarySelectedObject, blurRadius: radius });
+            }}
+            imageCornerRadius={imageCornerRadius}
+            onImageCornerRadiusChange={(radius) => {
+              setImageCornerRadius(radius);
+              if (primarySelectedObject?.type === "placed-image") {
+                store.editObject(primarySelectedObject, { ...primarySelectedObject, cornerRadius: radius });
+              }
+            }}
+            imageBorderWidth={imageBorderWidth}
+            onImageBorderWidthChange={(width) => {
+              setImageBorderWidth(width);
+              if (primarySelectedObject?.type === "placed-image") {
+                store.editObject(primarySelectedObject, { ...primarySelectedObject, borderWidth: width });
+              }
+            }}
+            imageBorderColor={imageBorderColor}
+            onImageBorderColorChange={(next) => {
+              setImageBorderColor(next);
+              if (primarySelectedObject?.type === "placed-image") {
+                store.editObject(primarySelectedObject, { ...primarySelectedObject, borderColor: next });
+              }
+            }}
+            imageShadow={imageShadow}
+            onImageShadowChange={(shadow) => {
+              setImageShadow(shadow);
+              if (primarySelectedObject?.type === "placed-image") store.editObject(primarySelectedObject, { ...primarySelectedObject, shadow });
+            }}
+            imageWidth={primarySelectedObject?.type === "placed-image" ? primarySelectedObject.width : 0}
+            onImageWidthChange={handleImageWidthChange}
+            imageHeight={primarySelectedObject?.type === "placed-image" ? primarySelectedObject.height : 0}
+            onImageHeightChange={handleImageHeightChange}
+            imageAspectLocked={imageAspectLocked}
+            onImageAspectLockedChange={setImageAspectLocked}
+            showImageStyle={showImageStyle}
             onRotateCCW={handleRotateCCW}
             onRotateCW={handleRotateCW}
             onFlipH={handleFlipH}
