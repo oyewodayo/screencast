@@ -28,9 +28,10 @@ import {
   IoImageOutline,
   IoClose,
 } from "react-icons/io5";
+import { AiOutlineSmallDash } from "react-icons/ai";
 import { BsHighlighter, BsCursor, BsArrowUpRight } from "react-icons/bs";
-import { TbFlipHorizontal, TbFlipVertical, TbRotate, TbRotateClockwise } from "react-icons/tb";
-import { MdBlurOn, MdFormatBold, MdFormatColorFill } from "react-icons/md";
+import { TbArrowLeftRight, TbFlipHorizontal, TbFlipVertical, TbRotate, TbRotateClockwise } from "react-icons/tb";
+import { MdBlurOn, MdFormatBold, MdFormatColorFill, MdLooksOne } from "react-icons/md";
 import { ImageAdjustments, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../../utils/imageEditTypes";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 
@@ -180,6 +181,7 @@ const TOOL_BUTTONS: { tool: ImageEditTool; label: string; shortcut: string; icon
   { tool: "ellipse", label: "Ellipse", shortcut: "O", icon: <IoEllipseOutline size={16} /> },
   { tool: "text", label: "Text", shortcut: "T", icon: <IoText size={17} /> },
   { tool: "blur", label: "Blur (privacy)", shortcut: "B", icon: <MdBlurOn size={17} /> },
+  { tool: "step", label: "Numbered step", shortcut: "N", icon: <MdLooksOne size={17} /> },
 ];
 
 // A full-width row (icon + label + shortcut) rather than an icon-only square - the panel has the
@@ -230,6 +232,17 @@ interface ImageEditorToolbarProps {
   onTextBackgroundChange: (background: boolean) => void;
   textBackgroundColor: string;
   onTextBackgroundColorChange: (color: string) => void;
+  shapeFilled: boolean;
+  onShapeFilledChange: (filled: boolean) => void;
+  showFill: boolean;
+  arrowDashed: boolean;
+  onArrowDashedChange: (dashed: boolean) => void;
+  arrowDoubleHeaded: boolean;
+  onArrowDoubleHeadedChange: (doubleHeaded: boolean) => void;
+  showArrowStyle: boolean;
+  blurMode: "blur" | "redact";
+  onBlurModeChange: (mode: "blur" | "redact") => void;
+  showBlurMode: boolean;
   onRotateCCW: () => void;
   onRotateCW: () => void;
   onFlipH: () => void;
@@ -273,6 +286,17 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   onTextBackgroundChange,
   textBackgroundColor,
   onTextBackgroundColorChange,
+  shapeFilled,
+  onShapeFilledChange,
+  showFill,
+  arrowDashed,
+  onArrowDashedChange,
+  arrowDoubleHeaded,
+  onArrowDoubleHeadedChange,
+  showArrowStyle,
+  blurMode,
+  onBlurModeChange,
+  showBlurMode,
   onRotateCCW,
   onRotateCW,
   onFlipH,
@@ -376,10 +400,85 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
             or while an existing color/width-bearing object is selected (to edit it directly) -
             showColor/showWidth are computed by the parent, which is the one that knows about both
             the active tool and the current selection. */}
-        {(showColor || showWidth || showFontSize) && (
+        {(showColor || showWidth || showFontSize || showFill || showArrowStyle || showBlurMode) && (
           <Section label="Style">
             <div className="flex flex-col gap-2.5">
               {showColor && <ColorSwatchPicker color={color} onChange={onColorChange} />}
+              {showFill && (
+                <button
+                  type="button"
+                  title="Filled - solid fill instead of just an outline"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => onShapeFilledChange(!shapeFilled)}
+                  className={`self-start flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-colors duration-150 ${
+                    shapeFilled
+                      ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                      : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                  }`}
+                >
+                  <MdFormatColorFill size={15} /> Filled
+                </button>
+              )}
+              {showArrowStyle && (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    title="Dashed line"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => onArrowDashedChange(!arrowDashed)}
+                    className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-colors duration-150 ${
+                      arrowDashed
+                        ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                        : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                    }`}
+                  >
+                    <AiOutlineSmallDash size={15} /> Dashed
+                  </button>
+                  <button
+                    type="button"
+                    title="Double-headed - an arrowhead at both ends"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => onArrowDoubleHeadedChange(!arrowDoubleHeaded)}
+                    className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-colors duration-150 ${
+                      arrowDoubleHeaded
+                        ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                        : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                    }`}
+                  >
+                    <TbArrowLeftRight size={15} /> Both ends
+                  </button>
+                </div>
+              )}
+              {showBlurMode && (
+                <div className="flex items-center gap-1 p-0.5 self-start rounded-lg bg-black/[0.04] dark:bg-white/[0.06]">
+                  <button
+                    type="button"
+                    title="Blur - de-emphasizes the region, not guaranteed irreversible"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => onBlurModeChange("blur")}
+                    className={`px-2.5 py-1 rounded-md text-xs transition-colors duration-150 ${
+                      blurMode === "blur"
+                        ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
+                        : "text-neutral-500 dark:text-neutral-400"
+                    }`}
+                  >
+                    Blur
+                  </button>
+                  <button
+                    type="button"
+                    title="Redact - covers the region with an opaque box, guaranteed irreversible"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => onBlurModeChange("redact")}
+                    className={`px-2.5 py-1 rounded-md text-xs transition-colors duration-150 ${
+                      blurMode === "redact"
+                        ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
+                        : "text-neutral-500 dark:text-neutral-400"
+                    }`}
+                  >
+                    Redact
+                  </button>
+                </div>
+              )}
               {showWidth && (
                 <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                   <span className="w-12 shrink-0">Width</span>

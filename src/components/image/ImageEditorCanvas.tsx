@@ -31,7 +31,9 @@ import {
   Bounds,
   ResizeCorner,
   TEXT_BACKGROUND_ALPHA,
+  TEXT_BACKGROUND_PADDING_RATIO,
   TEXT_FONT_FAMILY,
+  TEXT_LINE_HEIGHT_MULTIPLIER,
   findObjectAt,
   findObjectsInRect,
   getObjectBounds,
@@ -41,8 +43,10 @@ import {
   makeEllipseObject,
   makeHighlightObject,
   makeRectObject,
+  makeStepObject,
   makeStrokeObject,
   makeTextObject,
+  nextStepNumber,
   renderComposedCanvas,
   renderLiveStroke,
   resizeBoxObject,
@@ -77,6 +81,10 @@ interface ImageEditorCanvasProps {
   textBold: boolean;
   textBackground: boolean;
   textBackgroundColor: string;
+  shapeFilled: boolean;
+  arrowDashed: boolean;
+  arrowDoubleHeaded: boolean;
+  blurMode: "blur" | "redact";
   zoom: number;
   selectedObjectIds: string[];
   onSelectObjects: (ids: string[]) => void;
@@ -102,7 +110,7 @@ const SNAP_THRESHOLD_SCREEN_PX = 6;
 
 type DragState =
   | { kind: "freehand"; tool: "pen" | "highlighter"; points: Pt[] }
-  | { kind: "shape"; tool: "arrow" | "rect" | "ellipse" | "blur"; startX: number; startY: number; curX: number; curY: number }
+  | { kind: "shape"; tool: "arrow" | "rect" | "ellipse" | "blur" | "step"; startX: number; startY: number; curX: number; curY: number }
   | { kind: "move"; objects: ImageAnnotationObject[]; startX: number; startY: number; curX: number; curY: number }
   | { kind: "resize"; object: ImageAnnotationObject; corner: ResizeCorner; curX: number; curY: number }
   | { kind: "arrow-endpoint"; object: ImageAnnotationObject; endpoint: "start" | "end"; curX: number; curY: number }
@@ -203,6 +211,10 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
     textBold,
     textBackground,
     textBackgroundColor,
+    shapeFilled,
+    arrowDashed,
+    arrowDoubleHeaded,
+    blurMode,
     zoom,
     selectedObjectIds,
     onSelectObjects,
@@ -410,7 +422,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
       return;
     }
 
-    if (tool === "arrow" || tool === "rect" || tool === "ellipse" || tool === "blur") {
+    if (tool === "arrow" || tool === "rect" || tool === "ellipse" || tool === "blur" || tool === "step") {
       dragRef.current = { kind: "shape", tool, startX: x, startY: y, curX: x, curY: y };
       return;
     }
@@ -489,7 +501,8 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
           ctx.save();
           ctx.strokeStyle = color;
           ctx.lineWidth = strokeWidth;
-          ctx.lineCap = "round";
+          ctx.lineCap = arrowDashed ? "butt" : "round";
+          if (arrowDashed) ctx.setLineDash([strokeWidth * 2.5, strokeWidth * 2]);
           ctx.beginPath();
           ctx.moveTo(drag.startX, drag.startY);
           ctx.lineTo(drag.curX, drag.curY);
@@ -502,15 +515,28 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
           ctx.lineWidth = 2;
           ctx.strokeRect(nx, ny, nw, nh);
           ctx.restore();
+        } else if (drag.tool === "step") {
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.setLineDash([6, 4]);
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.ellipse(nx + nw / 2, ny + nh / 2, nw / 2, nh / 2, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
         } else {
           ctx.save();
           ctx.strokeStyle = color;
+          ctx.fillStyle = color;
           ctx.lineWidth = strokeWidth;
-          if (drag.tool === "rect") ctx.strokeRect(nx, ny, nw, nh);
-          else {
+          if (drag.tool === "rect") {
+            if (shapeFilled) ctx.fillRect(nx, ny, nw, nh);
+            else ctx.strokeRect(nx, ny, nw, nh);
+          } else {
             ctx.beginPath();
             ctx.ellipse(nx + nw / 2, ny + nh / 2, nw / 2, nh / 2, 0, 0, Math.PI * 2);
-            ctx.stroke();
+            if (shapeFilled) ctx.fill();
+            else ctx.stroke();
           }
           ctx.restore();
         }
@@ -575,7 +601,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
       drag.curY = y;
       scheduleLiveRedraw(() => {
         const object = drag.object;
-        if (object.type === "rect" || object.type === "ellipse" || object.type === "blur") {
+        if (object.type === "rect" || object.type === "ellipse" || object.type === "blur" || object.type === "step") {
           setLiveObjects([resizeBoxObject(object, drag.corner, drag.curX, drag.curY)]);
         }
       });
@@ -614,12 +640,13 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
       const nh = Math.abs(drag.curY - drag.startY);
       if (drag.tool === "arrow") {
         if (Math.hypot(drag.curX - drag.startX, drag.curY - drag.startY) > 2) {
-          onAddObject(makeArrowObject(drag.startX, drag.startY, drag.curX, drag.curY, color, strokeWidth));
+          onAddObject(makeArrowObject(drag.startX, drag.startY, drag.curX, drag.curY, color, strokeWidth, arrowDashed, arrowDoubleHeaded));
         }
       } else if (nw > 2 && nh > 2) {
-        if (drag.tool === "rect") onAddObject(makeRectObject(nx, ny, nw, nh, color, strokeWidth));
-        else if (drag.tool === "ellipse") onAddObject(makeEllipseObject(nx, ny, nw, nh, color, strokeWidth));
-        else onAddObject(makeBlurObject(nx, ny, nw, nh));
+        if (drag.tool === "rect") onAddObject(makeRectObject(nx, ny, nw, nh, color, strokeWidth, shapeFilled));
+        else if (drag.tool === "ellipse") onAddObject(makeEllipseObject(nx, ny, nw, nh, color, strokeWidth, shapeFilled));
+        else if (drag.tool === "blur") onAddObject(makeBlurObject(nx, ny, nw, nh, blurMode));
+        else onAddObject(makeStepObject(nx, ny, nw, nh, nextStepNumber(objects), color));
       }
       return;
     }
@@ -651,7 +678,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
     if (drag.kind === "resize") {
       setLiveObjects(null);
       const object = drag.object;
-      if (object.type === "rect" || object.type === "ellipse" || object.type === "blur") {
+      if (object.type === "rect" || object.type === "ellipse" || object.type === "blur" || object.type === "step") {
         onEditObject(object, resizeBoxObject(object, drag.corner, drag.curX, drag.curY));
       }
       return;
@@ -889,11 +916,17 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
       </div>
 
       {textEditor && (
-        <input
-          type="text"
+        <textarea
           autoFocus
           autoComplete="off"
-          placeholder="Type text…"
+          spellCheck={false}
+          // Native textarea line-wrap would silently insert visual line breaks that
+          // renderTextObject (no auto-wrap - see TextObject's own doc comment) never draws,
+          // so what's on screen while typing would stop matching what commits. "off" keeps every
+          // line exactly as typed; overflowX below lets a long line scroll instead of wrapping.
+          wrap="off"
+          rows={Math.max(1, textEditor.value.split("\n").length)}
+          placeholder="Type text… (Shift+Enter for a new line)"
           value={textEditor.value}
           onChange={(e) => setTextEditor((prev) => (prev ? { ...prev, value: e.target.value } : prev))}
           onKeyDown={(e) => {
@@ -903,7 +936,10 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
             // is a second, unconditional guard against the same class of "two listeners on the
             // same keydown" conflict the arrow-key file-navigation bug turned out to be.
             e.stopPropagation();
-            if (e.key === "Enter") {
+            if (e.key === "Enter" && !e.shiftKey) {
+              // Plain Enter commits (matches the old single-line input's behavior); Shift+Enter
+              // falls through to the textarea's own default action and inserts a line break.
+              e.preventDefault();
               e.currentTarget.blur();
             } else if (e.key === "Escape") {
               setTextEditor(null);
@@ -918,12 +954,19 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
           // one, so what's on screen while typing already matches what commits to the canvas -
           // otherwise there was no way to tell the background color setting was doing anything
           // until after committing.
-          className={`absolute outline-none ring-2 ring-blue-500 rounded px-1 shadow-lg ${
-            textBackground ? "" : "bg-white/90 dark:bg-neutral-900/90"
+          className={`absolute outline-none ring-2 ring-blue-500 rounded shadow-lg resize-none overflow-x-auto overflow-y-hidden ${
+            textBackground ? "" : "bg-white/90 dark:bg-neutral-900/90 px-1"
           }`}
           style={{
-            left: textEditor.x * zoom,
-            top: textEditor.y * zoom,
+            // When a background is armed, this input's padding previews textObjectVisualBounds's
+            // own pad (fontSize * TEXT_BACKGROUND_PADDING_RATIO, scaled to screen px) instead of a
+            // fixed CSS value - otherwise the backdrop would visibly jump in size the instant the
+            // edit commits, since the committed box is padded proportionally to fontSize while a
+            // flat px-1 isn't. left/top shift outward by that same pad so the input's padded edge
+            // (not its unpadded one) lands where the committed background's edge will.
+            left: textEditor.x * zoom - (textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : 0),
+            top: textEditor.y * zoom - (textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : 0),
+            padding: textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : undefined,
             // Floored at 14 CSS px regardless of zoom - these are typically 4K screenshots opened
             // fit-to-window at well under 100% zoom, where fontSize*zoom alone shrinks the caret
             // and typed characters down to a couple of CSS pixels: technically present, but
@@ -936,6 +979,8 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
             // about to be drawn to canvas rather than two literals that could silently drift apart.
             fontFamily: TEXT_FONT_FAMILY,
             fontWeight: textBold ? 700 : 400,
+            lineHeight: TEXT_LINE_HEIGHT_MULTIPLIER,
+            whiteSpace: "pre",
             color,
             backgroundColor: textBackground ? hexToRgba(textBackgroundColor, TEXT_BACKGROUND_ALPHA) : undefined,
             minWidth: 80,

@@ -18,6 +18,7 @@ import {
   PlacedImageObject,
   Pt,
   RectObject,
+  StepObject,
   StrokeObject,
   TextObject,
 } from "../utils/imageEditTypes";
@@ -85,7 +86,10 @@ function drawHighlightPath(ctx: CanvasRenderingContext2D, points: { x: number; y
 // ---- Text measurement ---------------------------------------------------------------------------
 
 export const TEXT_FONT_FAMILY = "system-ui, -apple-system, sans-serif";
-const TEXT_LINE_HEIGHT_MULTIPLIER = 1.3;
+// Exported so the live multi-line text-editing textarea (ImageEditorCanvas.tsx) can set the same
+// CSS line-height, keeping each typed line's vertical spacing close to where renderTextObject
+// will actually place it once committed.
+export const TEXT_LINE_HEIGHT_MULTIPLIER = 1.3;
 
 // A detached 1x1 canvas kept around purely for ctx.measureText, same pattern as
 // pdfAnnotationHandlers.ts's getMeasurementContext - text objects here are single-line, but their
@@ -133,14 +137,25 @@ export interface Bounds {
 }
 
 // Proportional to font size (not a fixed px value) so the backdrop reads consistently whether the
-// label is a small callout or a large heading.
-const TEXT_BACKGROUND_PADDING_RATIO = 0.18;
+// label is a small callout or a large heading. Exported so the live text-editing input
+// (ImageEditorCanvas.tsx) can preview the backdrop at this exact padding instead of an
+// unrelated fixed CSS value that would visibly jump in size once the edit commits.
+export const TEXT_BACKGROUND_PADDING_RATIO = 0.18;
+
+// Split out (rather than inlining `object.text.split("\n")` at both call sites) so
+// textObjectBounds and renderTextObject can't drift apart on how a line break is recognized.
+function textObjectLines(text: string): string[] {
+  return text.split("\n");
+}
 
 // `y` is the text's top edge (ctx.textBaseline is set to "top" at render time - see
-// renderTextObject), matching TextObject's own doc comment.
+// renderTextObject), matching TextObject's own doc comment. Width is the widest line (each
+// measured independently, not the whole string with embedded "\n"s, which measureText would
+// otherwise render as stray tofu-glyph width); height grows with the line count.
 export function textObjectBounds(object: TextObject): Bounds {
-  const w = measureTextWidth(object.text, object.fontSize, object.bold);
-  const h = object.fontSize * TEXT_LINE_HEIGHT_MULTIPLIER;
+  const lines = textObjectLines(object.text);
+  const w = Math.max(...lines.map((line) => measureTextWidth(line, object.fontSize, object.bold)));
+  const h = lines.length * object.fontSize * TEXT_LINE_HEIGHT_MULTIPLIER;
   return { x: object.x, y: object.y, w, h };
 }
 
@@ -181,28 +196,40 @@ function renderHighlight(ctx: CanvasRenderingContext2D, object: Extract<ImageAnn
 }
 
 // Arrowhead sized off the line's own stroke width so thicker arrows get proportionally bigger
-// heads, rather than a fixed pixel size that would look spindly on a heavy stroke.
+// heads, rather than a fixed pixel size that would look spindly on a heavy stroke. Shared between
+// the two ends by renderArrow below so a double-headed arrow's second head is pixel-identical to
+// its first, just pointed the other way (angle is the direction the head points *away* from,
+// i.e. the direction of travel into the tip at (tipX, tipY)).
+function drawArrowhead(ctx: CanvasRenderingContext2D, tipX: number, tipY: number, angle: number, width: number): void {
+  const headLength = Math.max(10, width * 3.5);
+  const headAngle = Math.PI / 7;
+  ctx.beginPath();
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(tipX - headLength * Math.cos(angle - headAngle), tipY - headLength * Math.sin(angle - headAngle));
+  ctx.lineTo(tipX - headLength * Math.cos(angle + headAngle), tipY - headLength * Math.sin(angle + headAngle));
+  ctx.closePath();
+  ctx.fill();
+}
+
 function renderArrow(ctx: CanvasRenderingContext2D, object: ArrowObject): void {
   ctx.save();
   ctx.strokeStyle = object.color;
   ctx.fillStyle = object.color;
   ctx.lineWidth = object.width;
-  ctx.lineCap = "round";
+  ctx.lineCap = object.dashed ? "butt" : "round";
+  // Scaled with width like the arrowhead itself - a thin dashed line with a fixed-px dash pattern
+  // reads as barely-dashed once the line gets thick, and vice versa for a thick pattern on a hairline.
+  if (object.dashed) ctx.setLineDash([object.width * 2.5, object.width * 2]);
 
   ctx.beginPath();
   ctx.moveTo(object.x1, object.y1);
   ctx.lineTo(object.x2, object.y2);
   ctx.stroke();
 
-  const headLength = Math.max(10, object.width * 3.5);
   const angle = Math.atan2(object.y2 - object.y1, object.x2 - object.x1);
-  const headAngle = Math.PI / 7;
-  ctx.beginPath();
-  ctx.moveTo(object.x2, object.y2);
-  ctx.lineTo(object.x2 - headLength * Math.cos(angle - headAngle), object.y2 - headLength * Math.sin(angle - headAngle));
-  ctx.lineTo(object.x2 - headLength * Math.cos(angle + headAngle), object.y2 - headLength * Math.sin(angle + headAngle));
-  ctx.closePath();
-  ctx.fill();
+  ctx.setLineDash([]); // arrowheads are always solid, even on a dashed shaft
+  drawArrowhead(ctx, object.x2, object.y2, angle, object.width);
+  if (object.doubleHeaded) drawArrowhead(ctx, object.x1, object.y1, angle + Math.PI, object.width);
   ctx.restore();
 }
 
@@ -253,7 +280,8 @@ function renderTextObject(ctx: CanvasRenderingContext2D, object: TextObject): vo
     ctx.globalAlpha = 1;
   }
   ctx.fillStyle = object.color;
-  ctx.fillText(object.text, object.x, object.y);
+  const lineHeight = object.fontSize * TEXT_LINE_HEIGHT_MULTIPLIER;
+  textObjectLines(object.text).forEach((line, i) => ctx.fillText(line, object.x, object.y + i * lineHeight));
   ctx.restore();
 }
 
@@ -273,16 +301,55 @@ function renderPlacedImage(ctx: CanvasRenderingContext2D, object: PlacedImageObj
   ctx.restore();
 }
 
+// Solid black box - unlike blur below, this is genuinely irreversible (the covered pixels are
+// simply never drawn to the exported image again), so it's the right choice for anything that
+// actually needs to stay hidden rather than just de-emphasized.
+function renderRedactRegion(ctx: CanvasRenderingContext2D, object: BlurRegionObject): void {
+  ctx.save();
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(object.x, object.y, object.w, object.h);
+  ctx.restore();
+}
+
 // Redraws a blurred copy of whatever's *already on the destination canvas* within this region -
 // see renderComposedCanvas's draw-order comment for why this only ever samples the base
 // photo+adjustments layer, never other annotations. `ctx.filter`'s blur is a post-process on the
 // drawImage call itself, so drawing the canvas onto itself with a blur filter set is a cheap,
 // good-enough (not pixel-perfect at the rect's own edges) way to blur just that region - the same
-// technique any canvas-based screenshot tool uses for a redaction/privacy blur.
+// technique any canvas-based screenshot tool uses for a de-emphasis effect. Not a *guaranteed*
+// redaction (a strong enough deconvolution can partially recover blurred text) - see
+// renderRedactRegion above for the actually-irreversible alternative BlurRegionObject's own doc
+// comment calls out.
 function renderBlurRegion(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, object: BlurRegionObject): void {
+  if (object.mode === "redact") {
+    renderRedactRegion(ctx, object);
+    return;
+  }
   ctx.save();
   ctx.filter = `blur(${object.blurRadius}px)`;
   ctx.drawImage(canvas, object.x, object.y, object.w, object.h, object.x, object.y, object.w, object.h);
+  ctx.restore();
+}
+
+// A filled circle (diameter = the shorter of w/h, centered in the box) with a bold white number -
+// deliberately not scaled/positioned via textObjectBounds/measureTextWidth the way TextObject is,
+// since a step badge's number is always short (1-2 digits in practice) and centered by construction
+// rather than measured; canvas's own textAlign/textBaseline "middle" centering is exact here in a
+// way it isn't for TextObject's own left-aligned, top-anchored convention.
+function renderStepObject(ctx: CanvasRenderingContext2D, object: StepObject): void {
+  const cx = object.x + object.w / 2;
+  const cy = object.y + object.h / 2;
+  const radius = Math.min(object.w, object.h) / 2;
+  ctx.save();
+  ctx.fillStyle = object.color;
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = `bold ${Math.max(10, radius * 1.1)}px ${TEXT_FONT_FAMILY}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(object.number), cx, cy);
   ctx.restore();
 }
 
@@ -336,6 +403,9 @@ export function renderComposedCanvas(
       case "placed-image":
         renderPlacedImage(ctx, object);
         break;
+      case "step":
+        renderStepObject(ctx, object);
+        break;
     }
   }
 }
@@ -375,16 +445,25 @@ export function makeHighlightObject(points: Pt[], color: string, width: number):
   return { ...baseFields(), type: "highlight", points, color, width, opacity: 0.35, blend: "multiply" };
 }
 
-export function makeArrowObject(x1: number, y1: number, x2: number, y2: number, color: string, width: number): ArrowObject {
-  return { ...baseFields(), type: "arrow", x1, y1, x2, y2, color, width };
+export function makeArrowObject(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  color: string,
+  width: number,
+  dashed: boolean = false,
+  doubleHeaded: boolean = false
+): ArrowObject {
+  return { ...baseFields(), type: "arrow", x1, y1, x2, y2, color, width, dashed, doubleHeaded };
 }
 
-export function makeRectObject(x: number, y: number, w: number, h: number, color: string, width: number): RectObject {
-  return { ...baseFields(), type: "rect", x, y, w, h, color, width, filled: false };
+export function makeRectObject(x: number, y: number, w: number, h: number, color: string, width: number, filled: boolean = false): RectObject {
+  return { ...baseFields(), type: "rect", x, y, w, h, color, width, filled };
 }
 
-export function makeEllipseObject(x: number, y: number, w: number, h: number, color: string, width: number): EllipseObject {
-  return { ...baseFields(), type: "ellipse", x, y, w, h, color, width, filled: false };
+export function makeEllipseObject(x: number, y: number, w: number, h: number, color: string, width: number, filled: boolean = false): EllipseObject {
+  return { ...baseFields(), type: "ellipse", x, y, w, h, color, width, filled };
 }
 
 export function makeTextObject(
@@ -404,12 +483,24 @@ export function makeTextObject(
 
 export const DEFAULT_BLUR_RADIUS = 16;
 
-export function makeBlurObject(x: number, y: number, w: number, h: number): BlurRegionObject {
-  return { ...baseFields(), type: "blur", x, y, w, h, blurRadius: DEFAULT_BLUR_RADIUS };
+export function makeBlurObject(x: number, y: number, w: number, h: number, mode: "blur" | "redact" = "blur"): BlurRegionObject {
+  return { ...baseFields(), type: "blur", x, y, w, h, blurRadius: DEFAULT_BLUR_RADIUS, mode };
 }
 
 export function makePlacedImageObject(x: number, y: number, width: number, height: number, src: string): PlacedImageObject {
   return { ...baseFields(), type: "placed-image", x, y, width, height, rotation: 0, src };
+}
+
+export function makeStepObject(x: number, y: number, w: number, h: number, number: number, color: string): StepObject {
+  return { ...baseFields(), type: "step", x, y, w, h, number, color };
+}
+
+// The number the *next* placed step badge should show - continues from the highest number
+// already on the canvas rather than counting existing badges, so deleting an earlier one doesn't
+// cause the next new badge to reuse a number still visible elsewhere in the document.
+export function nextStepNumber(objects: ImageAnnotationObject[]): number {
+  const numbers = objects.filter((o): o is StepObject => o.type === "step").map((o) => o.number);
+  return numbers.length === 0 ? 1 : Math.max(...numbers) + 1;
 }
 
 // ---- Move (translate) -----------------------------------------------------------------------------
@@ -491,7 +582,8 @@ export function findObjectAt(objects: ImageAnnotationObject[], x: number, y: num
       }
       case "rect":
       case "ellipse":
-      case "blur": {
+      case "blur":
+      case "step": {
         if (x >= object.x - hitRadius && x <= object.x + object.w + hitRadius && y >= object.y - hitRadius && y <= object.y + object.h + hitRadius) {
           return object;
         }
@@ -523,12 +615,14 @@ export function findObjectAt(objects: ImageAnnotationObject[], x: number, y: num
 // stroke/highlight (no resize handles for freehand ink, see ImageEditorCanvas's own comment on why
 // only bounded-box shapes get resize chrome) and for placed-image/text, which each get their own
 // rotation-aware move/resize/rotate chrome instead (ImageAnnotationEditor.tsx and
-// TextAnnotationEditor.tsx respectively).
+// TextAnnotationEditor.tsx respectively). Step badges are box-shaped like rect/ellipse/blur (see
+// StepObject's own doc comment for why), so they get the same generic corner-drag resize for free.
 export function getObjectBounds(object: ImageAnnotationObject): Bounds | null {
   switch (object.type) {
     case "rect":
     case "ellipse":
     case "blur":
+    case "step":
       return { x: object.x, y: object.y, w: object.w, h: object.h };
     default:
       return null;
@@ -589,10 +683,10 @@ export function findObjectsInRect(objects: ImageAnnotationObject[], rect: Bounds
 
 export type ResizeCorner = "nw" | "ne" | "sw" | "se";
 
-// Resizes a box-shaped object (rect/ellipse/blur only - see ImageEditDocument's own module
+// Resizes a box-shaped object (rect/ellipse/blur/step - see ImageEditDocument's own module
 // comment) by dragging one corner, keeping the *opposite* corner fixed. `minSize` prevents the
 // box collapsing to zero/negative, which would otherwise flip its effective corners underfoot.
-export function resizeBoxObject<T extends RectObject | EllipseObject | BlurRegionObject>(
+export function resizeBoxObject<T extends RectObject | EllipseObject | BlurRegionObject | StepObject>(
   object: T,
   corner: ResizeCorner,
   pointerX: number,

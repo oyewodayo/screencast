@@ -13,7 +13,7 @@
 // to observe or drive it anymore.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
-import { IoBuildOutline, IoDownloadOutline } from "react-icons/io5";
+import { IoBuildOutline, IoCheckmark, IoCopyOutline, IoDownloadOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";
 import { cropCanvas, makePlacedImageObject, rotateFlipCanvas, translateObject } from "../handlers/imageEditHandlers";
@@ -53,11 +53,13 @@ const DUPLICATE_OFFSET = 24;
 // tools use for "small nudge" vs "big nudge".
 const NUDGE_STEP = 1;
 const NUDGE_STEP_SHIFT = 10;
+const COPY_STATUS_RESET_MS = 1500;
 
 // Which tools' next-drawn object takes the armed color/width - module-level (not recreated every
 // render) since these never change; only used via .includes() below.
-const COLOR_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse", "text"];
+const COLOR_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse", "text", "step"];
 const WIDTH_TOOLS: ImageEditTool[] = ["pen", "highlighter", "arrow", "rect", "ellipse"];
+const DEFAULT_BLUR_MODE: "blur" | "redact" = "blur";
 
 interface ImageEditorProps {
   sourcePath: string; // raw filesystem path, for Save a copy
@@ -97,6 +99,10 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
   const [textBold, setTextBold] = useState<boolean>(false);
   const [textBackground, setTextBackground] = useState<boolean>(false);
   const [textBackgroundColor, setTextBackgroundColor] = useState<string>(DEFAULT_TEXT_BACKGROUND_COLOR);
+  const [shapeFilled, setShapeFilled] = useState<boolean>(false);
+  const [arrowDashed, setArrowDashed] = useState<boolean>(false);
+  const [arrowDoubleHeaded, setArrowDoubleHeaded] = useState<boolean>(false);
+  const [blurMode, setBlurMode] = useState<"blur" | "redact">(DEFAULT_BLUR_MODE);
   const [zoom, setZoom] = useState<number>(1);
   // Which objects are selected - a plain id array (not a Set) since it's small and needs to be a
   // stable, easily-diffed value for props/effect deps. Multi-object: populated by a marquee drag
@@ -107,6 +113,11 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
   const [liveAdjustments, setLiveAdjustments] = useState<ImageAdjustments | null>(null);
   const [isSavingCopy, setIsSavingCopy] = useState<boolean>(false);
   const [saveCopyError, setSaveCopyError] = useState<string | null>(null);
+  // Transient feedback for the header's Copy button - "copied"/"error" revert to "idle" on their
+  // own after COPY_STATUS_RESET_MS, same brief-confirmation pattern most copy-to-clipboard buttons
+  // use (there's nothing else to poll: the browser gives no persistent "is this still on the
+  // clipboard" state to reflect).
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
   // Surfaces a failed crop/rotate/flip - these read pixels back off the working canvas
   // (toDataURL), which throws if the canvas is ever tainted (see preloadImage's crossOrigin fix
   // in imageObjectCache.ts for the concrete case that used to break this silently).
@@ -240,6 +251,14 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
       setTextBackground(primarySelectedObject.background);
       setTextBackgroundColor(primarySelectedObject.backgroundColor);
     }
+    if (primarySelectedObject.type === "rect" || primarySelectedObject.type === "ellipse") {
+      setShapeFilled(primarySelectedObject.filled);
+    }
+    if (primarySelectedObject.type === "arrow") {
+      setArrowDashed(primarySelectedObject.dashed ?? false);
+      setArrowDoubleHeaded(primarySelectedObject.doubleHeaded ?? false);
+    }
+    if (primarySelectedObject.type === "blur") setBlurMode(primarySelectedObject.mode ?? "blur");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     primarySelectedObject?.id,
@@ -259,6 +278,9 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
   const selectedWithWidth = useMemo(() => selectedObjects.filter((o) => "width" in o), [selectedObjects]);
   const showColor = COLOR_TOOLS.includes(tool) || selectedWithColor.length > 0;
   const showWidth = WIDTH_TOOLS.includes(tool) || selectedWithWidth.length > 0;
+  const showFill = tool === "rect" || tool === "ellipse" || primarySelectedObject?.type === "rect" || primarySelectedObject?.type === "ellipse";
+  const showArrowStyle = tool === "arrow" || primarySelectedObject?.type === "arrow";
+  const showBlurMode = tool === "blur" || primarySelectedObject?.type === "blur";
   // Which Width scale is in play right now - the highlighter's own much wider one, or the shared
   // pen/arrow/rect/ellipse one - covers both "highlighter is armed" and "an existing highlight is
   // selected via the Select tool", same two cases showWidth itself already accounts for.
@@ -446,6 +468,28 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
     }
   }, [sourcePath, onSaved]);
 
+  // Copies the annotated result straight to the OS clipboard as a PNG - for the common "annotate a
+  // screenshot, then paste it into Slack/an email/a doc" workflow, which otherwise means Save a
+  // copy, then go find the file just to attach it somewhere else. Separate from handleSaveCopy
+  // above since it never touches the filesystem (no invoke, no onSaved) and needs its own
+  // transient success/error feedback rather than the persistent SaveStatus indicator.
+  const handleCopyToClipboard = useCallback(async () => {
+    const canvas = canvasRef.current?.getWorkingCanvas();
+    if (!canvas) return;
+    try {
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Failed to encode image as PNG"))), "image/png");
+      });
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      setCopyStatus("copied");
+    } catch (err) {
+      console.error("Failed to copy image to clipboard:", err);
+      setCopyStatus("error");
+    } finally {
+      setTimeout(() => setCopyStatus("idle"), COPY_STATUS_RESET_MS);
+    }
+  }, []);
+
   // Full shortcut set, mirroring PdfAnnotator.tsx's own keydown handler shape (ignored while
   // focus is in an editable field - most relevantly the inline text-note input this editor's own
   // canvas opens for the Text tool, which needs every one of these keys for itself).
@@ -543,6 +587,10 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
           e.preventDefault();
           setTool("blur");
           break;
+        case "n":
+          e.preventDefault();
+          setTool("step");
+          break;
         case "c":
           e.preventDefault();
           setTool("crop");
@@ -607,6 +655,13 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
         )}
         <div className="flex items-center gap-3 shrink-0 ml-auto">
           <ZoomControl zoom={zoom} onZoomChange={setZoom} minZoom={MIN_ZOOM} maxZoom={MAX_ZOOM} />
+          <IconButton
+            title={copyStatus === "error" ? "Failed to copy - try again" : copyStatus === "copied" ? "Copied!" : "Copy to clipboard"}
+            active={copyStatus === "copied"}
+            onClick={handleCopyToClipboard}
+          >
+            {copyStatus === "copied" ? <IoCheckmark size={16} className="text-emerald-500" /> : <IoCopyOutline size={16} />}
+          </IconButton>
           <IconButton title="Save a copy" onClick={handleSaveCopy}>
             <IoDownloadOutline size={16} />
           </IconButton>
@@ -639,6 +694,10 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
               textBold={textBold}
               textBackground={textBackground}
               textBackgroundColor={textBackgroundColor}
+              shapeFilled={shapeFilled}
+              arrowDashed={arrowDashed}
+              arrowDoubleHeaded={arrowDoubleHeaded}
+              blurMode={blurMode}
               zoom={zoom}
               selectedObjectIds={selectedIds}
               onSelectObjects={setSelectedIds}
@@ -689,6 +748,31 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
               setTextBackgroundColor(next);
               if (primarySelectedObject?.type === "text") store.editObject(primarySelectedObject, { ...primarySelectedObject, backgroundColor: next });
             }}
+            shapeFilled={shapeFilled}
+            onShapeFilledChange={(filled) => {
+              setShapeFilled(filled);
+              if (primarySelectedObject?.type === "rect" || primarySelectedObject?.type === "ellipse") {
+                store.editObject(primarySelectedObject, { ...primarySelectedObject, filled });
+              }
+            }}
+            showFill={showFill}
+            arrowDashed={arrowDashed}
+            onArrowDashedChange={(dashed) => {
+              setArrowDashed(dashed);
+              if (primarySelectedObject?.type === "arrow") store.editObject(primarySelectedObject, { ...primarySelectedObject, dashed });
+            }}
+            arrowDoubleHeaded={arrowDoubleHeaded}
+            onArrowDoubleHeadedChange={(doubleHeaded) => {
+              setArrowDoubleHeaded(doubleHeaded);
+              if (primarySelectedObject?.type === "arrow") store.editObject(primarySelectedObject, { ...primarySelectedObject, doubleHeaded });
+            }}
+            showArrowStyle={showArrowStyle}
+            blurMode={blurMode}
+            onBlurModeChange={(mode) => {
+              setBlurMode(mode);
+              if (primarySelectedObject?.type === "blur") store.editObject(primarySelectedObject, { ...primarySelectedObject, mode });
+            }}
+            showBlurMode={showBlurMode}
             onRotateCCW={handleRotateCCW}
             onRotateCW={handleRotateCW}
             onFlipH={handleFlipH}

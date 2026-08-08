@@ -45,6 +45,13 @@ export interface ArrowObject extends BaseObject {
   y1: number;
   x2: number;
   y2: number;
+  // Optional (not required, like BlurRegionObject's own `mode`) so an arrow saved before this
+  // field existed loads fine and just renders as the plain solid single-headed line it always was
+  // - falsy-checked at render/UI time rather than needing a migration pass over old sidecar JSON.
+  dashed?: boolean;
+  // A second arrowhead at (x1, y1) in addition to the usual one at (x2, y2) - for "these two
+  // things relate to each other" callouts where a single direction would be misleading.
+  doubleHeaded?: boolean;
 }
 
 // Rect/ellipse share the same top-left+size box shape (and therefore the same move/resize math)
@@ -71,11 +78,13 @@ export interface EllipseObject extends BaseObject {
   filled: boolean;
 }
 
-// Single-line label - no PDF-TextObject-style rich formatting (italic/colorRuns) or wrapping.
-// Screenshot annotations ("①", "click here") are short; multi-line rich text isn't worth the
-// added complexity for this editor. Bold and a translucent backdrop ARE supported (unlike the PDF
-// counterpart) since legibility over a busy screenshot - not just over a page background - is the
-// whole point of this tool.
+// No PDF-TextObject-style rich formatting (italic/colorRuns) - one color/size/weight for the
+// whole label. `text` may contain "\n" for explicit line breaks (Shift+Enter while editing - see
+// ImageEditorCanvas.tsx's inline editor); there's no auto-wrap by a fixed box width, since text
+// here has no independently-set width to wrap against (see textObjectBounds's own doc comment in
+// imageEditHandlers.ts - width is always derived from the text). Bold and a translucent backdrop
+// ARE supported (unlike the PDF counterpart) since legibility over a busy screenshot - not just
+// over a page background - is the whole point of this tool.
 export interface TextObject extends BaseObject {
   type: "text";
   x: number;
@@ -101,8 +110,13 @@ export interface TextObject extends BaseObject {
 }
 
 // A rectangular region of the *base* photo (post-adjustments, pre-other-annotations - see
-// renderComposedCanvas's draw-order comment in imageEditHandlers.ts) redrawn blurred - the
-// privacy/redaction tool.
+// renderComposedCanvas's draw-order comment in imageEditHandlers.ts) redrawn blurred, or covered
+// with an opaque solid fill - the privacy/redaction tool. `mode` defaults to (and existing
+// documents without the field are treated as) "blur" for backwards compatibility; `blurRadius` is
+// only read in that mode. "redact" exists alongside blur rather than replacing it because a
+// Gaussian blur is not actually irreversible - genuinely sensitive content (an account number, a
+// face) calls for a guaranteed-opaque box instead, while blur remains useful for "de-emphasize but
+// still hint at what's there."
 export interface BlurRegionObject extends BaseObject {
   type: "blur";
   x: number;
@@ -110,6 +124,7 @@ export interface BlurRegionObject extends BaseObject {
   w: number;
   h: number;
   blurRadius: number;
+  mode?: "blur" | "redact";
 }
 
 // Another image placed on top of the working canvas - the "join/collage" building block: insert
@@ -131,6 +146,22 @@ export interface PlacedImageObject extends BaseObject {
   rotation: number; // radians
 }
 
+// A numbered callout badge - a filled circle with a bold number centered in it, for "do this,
+// then this, then this" tutorial-style screenshots (the alternative today is manually typing
+// unicode circled digits as plain text). Box-shaped (x/y/w/h, diameter = min(w, h)) rather than
+// its own bespoke shape so it can reuse the same generic axis-aligned resize handles/hit-testing
+// rect/ellipse/blur already share (see getObjectBounds/resizeBoxObject in imageEditHandlers.ts) -
+// no rotation, since a number's badge reads the same at any orientation.
+export interface StepObject extends BaseObject {
+  type: "step";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  number: number;
+  color: string;
+}
+
 export type ImageAnnotationObject =
   | StrokeObject
   | HighlightObject
@@ -139,9 +170,10 @@ export type ImageAnnotationObject =
   | EllipseObject
   | TextObject
   | BlurRegionObject
-  | PlacedImageObject;
+  | PlacedImageObject
+  | StepObject;
 
-export type ImageEditTool = "select" | "pen" | "highlighter" | "arrow" | "rect" | "ellipse" | "text" | "blur" | "crop";
+export type ImageEditTool = "select" | "pen" | "highlighter" | "arrow" | "rect" | "ellipse" | "text" | "blur" | "step" | "crop";
 
 // Neutral = 1 for every field, matching the CSS filter functions they map to 1:1
 // (brightness()/contrast()/saturate()) - see imageEditHandlers.ts's cssFilterForAdjustments.
