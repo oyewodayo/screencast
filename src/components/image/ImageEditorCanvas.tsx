@@ -74,6 +74,13 @@ export interface ImageEditorCanvasHandle {
   // flattened into the new bitmap along with it.
   getBaseOnlyCanvas: () => HTMLCanvasElement | null;
   getCropRect: () => CropRect | null;
+  // Starts the per-image crop overlay for whichever placed-image is currently selected (a no-op
+  // otherwise) - triggered from ImageEditorToolbar's Image section, since that panel has no other
+  // way to reach into this component's own local editing state. See the imageCropEditor state and
+  // its rendering block below for the interactive part; unlike the main board's Crop tool (which
+  // needs ImageEditor.tsx to read the result back via getCropRect), this one applies itself
+  // directly through onEditObject, so nothing further needs to be exposed here.
+  beginImageCrop: () => void;
 }
 
 interface ImageEditorCanvasProps {
@@ -149,6 +156,17 @@ interface StepEditorState {
 interface SnapGuide {
   axis: "v" | "h";
   pos: number; // natural-space coordinate the guide line sits at
+}
+
+// Interactive per-image crop, started via beginImageCrop (ImageEditorCanvasHandle) - unlike the
+// main board's Crop tool (a global `tool` mode ImageEditor.tsx drives via getCropRect), this is
+// entirely self-contained here: `rect` lives in the object's own *local* space (0..width,
+// 0..height, before rotation - same convention textObjectBounds/getObjectBounds use for other
+// object types), so the overlay below can rotate as one rigid piece with the image and Apply can
+// commit straight through onEditObject without ImageEditor.tsx needing to know this is happening.
+interface ImageCropEditorState {
+  objectId: string;
+  rect: { x: number; y: number; w: number; h: number };
 }
 
 // Lets the live text-editing input's own CSS background match the translucent alpha
@@ -263,6 +281,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [textEditor, setTextEditor] = useState<TextEditorState | null>(null);
   const [stepEditor, setStepEditor] = useState<StepEditorState | null>(null);
+  const [imageCropEditor, setImageCropEditor] = useState<ImageCropEditorState | null>(null);
 
   const { baseWidth, baseHeight, objects } = doc;
 
@@ -356,14 +375,40 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
         return canvas;
       },
       getCropRect: () => cropRect,
+      beginImageCrop: () => {
+        if (selectedObjectIds.length !== 1) return;
+        const object = objects.find((o) => o.id === selectedObjectIds[0]);
+        if (object?.type !== "placed-image") return;
+        setImageCropEditor({ objectId: object.id, rect: { x: 0, y: 0, w: object.width, h: object.height } });
+      },
     }),
-    [cropRect, baseWidth, baseHeight, adjustments]
+    [cropRect, baseWidth, baseHeight, adjustments, selectedObjectIds, objects]
   );
 
   const toNaturalPoint = (clientX: number, clientY: number): { x: number; y: number } => {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return { x: 0, y: 0 };
     return { x: (clientX - rect.left) / zoom, y: (clientY - rect.top) / zoom };
+  };
+
+  // Converts a pointer's viewport-relative position into the given placed-image's own local space
+  // (0..width, 0..height, before rotation) - same "rotate the query point by -rotation around the
+  // object's center" trick TextAnnotationEditor/ImageAnnotationEditor's own resize handlers use
+  // (see either's doc comment), just done here directly rather than through a child component
+  // since the crop overlay below is plain JSX in this file, not its own component.
+  const clientToImageLocal = (clientX: number, clientY: number, object: Extract<ImageAnnotationObject, { type: "placed-image" }>): { x: number; y: number } => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    const px = clientX - (rect?.left ?? 0);
+    const py = clientY - (rect?.top ?? 0);
+    const centerX = (object.x + object.width / 2) * zoom;
+    const centerY = (object.y + object.height / 2) * zoom;
+    const dx = px - centerX;
+    const dy = py - centerY;
+    const cos = Math.cos(-object.rotation);
+    const sin = Math.sin(-object.rotation);
+    const localDx = dx * cos - dy * sin;
+    const localDy = dx * sin + dy * cos;
+    return { x: localDx / zoom + object.width / 2, y: localDy / zoom + object.height / 2 };
   };
 
   const selectedObjects = objects.filter((o) => selectedObjectIds.includes(o.id));
@@ -447,8 +492,103 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
     setStepEditor({ x: object.x, y: object.y, w: object.w, h: object.h, value: String(object.number), original: object });
   };
 
+  const cancelImageCrop = (): void => setImageCropEditor(null);
+
+  // Commits the crop overlay's current rect: re-samples the cached decoded image into a brand-new,
+  // smaller canvas (scaled from the object's own *display* size back to the underlying bitmap's
+  // real pixel size, in case it's ever different) and re-encodes that as the object's new `src` -
+  // same "rasterize a sub-region into a fresh bitmap" idea the main board's Crop tool uses
+  // (cropCanvas in imageEditHandlers.ts), just producing a new PlacedImageObject instead of a new
+  // base image. Repositions x/y (and, if the image is rotated, does so by rotating the crop
+  // rect's own center-offset by the object's current rotation) so the surviving content stays
+  // exactly where it visually was rather than snapping to the image's original unrotated frame.
+  const applyImageCrop = (): void => {
+    const editor = imageCropEditor;
+    setImageCropEditor(null);
+    if (!editor) return;
+    const object = objects.find((o) => o.id === editor.objectId);
+    if (!object || object.type !== "placed-image") return;
+    const { rect } = editor;
+    if (rect.w < 4 || rect.h < 4) return; // degenerate/no-op selection - leave the image untouched
+
+    const img = getCachedImage(object.src);
+    if (!img) return;
+    const scaleX = img.naturalWidth / object.width;
+    const scaleY = img.naturalHeight / object.height;
+    const sx = rect.x * scaleX;
+    const sy = rect.y * scaleY;
+    const sw = rect.w * scaleX;
+    const sh = rect.h * scaleY;
+
+    const out = document.createElement("canvas");
+    out.width = Math.max(1, Math.round(sw));
+    out.height = Math.max(1, Math.round(sh));
+    const ctx = out.getContext("2d");
+    if (!ctx) return;
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, out.width, out.height);
+
+    const originalCenterX = object.x + object.width / 2;
+    const originalCenterY = object.y + object.height / 2;
+    const localOffsetX = rect.x + rect.w / 2 - object.width / 2;
+    const localOffsetY = rect.y + rect.h / 2 - object.height / 2;
+    const cos = Math.cos(object.rotation);
+    const sin = Math.sin(object.rotation);
+    const newCenterX = originalCenterX + (localOffsetX * cos - localOffsetY * sin);
+    const newCenterY = originalCenterY + (localOffsetX * sin + localOffsetY * cos);
+
+    onEditObject(object, {
+      ...object,
+      src: out.toDataURL("image/png"),
+      x: newCenterX - rect.w / 2,
+      y: newCenterY - rect.h / 2,
+      width: rect.w,
+      height: rect.h,
+    });
+  };
+
+  // Drags one corner of the crop rect, keeping the opposite corner fixed - same shape as
+  // resizeBoxObject's own opposite-corner-anchored math (imageEditHandlers.ts), just operating on
+  // local component state instead of an ImageAnnotationObject since this rect only exists for the
+  // duration of the crop gesture.
+  const handleImageCropCornerPointerDown = (e: React.PointerEvent, corner: "nw" | "ne" | "sw" | "se"): void => {
+    e.stopPropagation();
+    e.preventDefault();
+    const editor = imageCropEditor;
+    if (!editor) return;
+    const object = objects.find((o) => o.id === editor.objectId);
+    if (!object || object.type !== "placed-image") return;
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+    const startRect = editor.rect;
+    const minSize = 8;
+
+    const handleMove = (moveEvent: PointerEvent): void => {
+      const local = clientToImageLocal(moveEvent.clientX, moveEvent.clientY, object);
+      const left = corner === "nw" || corner === "sw" ? local.x : startRect.x;
+      const right = corner === "ne" || corner === "se" ? local.x : startRect.x + startRect.w;
+      const top = corner === "nw" || corner === "ne" ? local.y : startRect.y;
+      const bottom = corner === "sw" || corner === "se" ? local.y : startRect.y + startRect.h;
+      const clampedLeft = Math.max(0, Math.min(left, right - minSize));
+      const clampedTop = Math.max(0, Math.min(top, bottom - minSize));
+      const clampedRight = Math.min(object.width, Math.max(right, clampedLeft + minSize));
+      const clampedBottom = Math.min(object.height, Math.max(bottom, clampedTop + minSize));
+      setImageCropEditor({
+        objectId: editor.objectId,
+        rect: { x: clampedLeft, y: clampedTop, w: clampedRight - clampedLeft, h: clampedBottom - clampedTop },
+      });
+    };
+    const handleUp = (upEvent: PointerEvent): void => {
+      handle.releasePointerCapture(upEvent.pointerId);
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+    };
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+  };
+
   const handlePointerDown = (e: React.PointerEvent): void => {
-    if (textEditor || stepEditor) return; // let the inline input's own blur/Enter commit first
+    if (textEditor || stepEditor || imageCropEditor) return; // let the inline input's own blur/Enter commit first
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const { x, y } = toNaturalPoint(e.clientX, e.clientY);
 
@@ -829,6 +969,7 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
             same reasoning as the resize handles above. */}
         {primarySelectedObject?.type === "placed-image" &&
           tool === "select" &&
+          !imageCropEditor &&
           (() => {
             const display = primaryLive?.type === "placed-image" ? primaryLive : primarySelectedObject;
             return (
@@ -856,6 +997,89 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
                 onRotateEnd={(newRotation) => onEditObject(primarySelectedObject, { ...primarySelectedObject, rotation: newRotation })}
                 onDelete={() => onDeleteObject(primarySelectedObject)}
               />
+            );
+          })()}
+
+        {/* Per-image crop overlay - a dimmed mask outside the selected rect, corner drag handles,
+            and Apply/Cancel, all living inside one wrapper rotated to match the image (same
+            "rigid piece that rotates as one unit" trick ImageAnnotationEditor's own chrome uses)
+            so the rect and handles stay visually aligned with the image at any rotation without
+            this needing its own rotation-aware layout math beyond clientToImageLocal. */}
+        {imageCropEditor &&
+          (() => {
+            const object = objects.find((o) => o.id === imageCropEditor.objectId);
+            if (!object || object.type !== "placed-image") return null;
+            const { rect } = imageCropEditor;
+            return (
+              <div
+                className="absolute"
+                style={{
+                  left: object.x * zoom,
+                  top: object.y * zoom,
+                  width: object.width * zoom,
+                  height: object.height * zoom,
+                  transform: `rotate(${object.rotation}rad)`,
+                  transformOrigin: "center center",
+                  zIndex: 25,
+                }}
+              >
+                <div className="absolute bg-black/60 pointer-events-none" style={{ left: 0, top: 0, right: 0, height: rect.y * zoom }} />
+                <div
+                  className="absolute bg-black/60 pointer-events-none"
+                  style={{ left: 0, top: (rect.y + rect.h) * zoom, right: 0, bottom: 0 }}
+                />
+                <div
+                  className="absolute bg-black/60 pointer-events-none"
+                  style={{ left: 0, top: rect.y * zoom, width: rect.x * zoom, height: rect.h * zoom }}
+                />
+                <div
+                  className="absolute bg-black/60 pointer-events-none"
+                  style={{ left: (rect.x + rect.w) * zoom, top: rect.y * zoom, right: 0, height: rect.h * zoom }}
+                />
+                <div
+                  className="absolute outline outline-2 outline-white"
+                  style={{ left: rect.x * zoom, top: rect.y * zoom, width: rect.w * zoom, height: rect.h * zoom }}
+                />
+
+                {(["nw", "ne", "sw", "se"] as const).map((corner) => (
+                  <div
+                    key={corner}
+                    onPointerDown={(e) => handleImageCropCornerPointerDown(e, corner)}
+                    className="absolute bg-white border-2 border-blue-500 rounded-full shadow-sm"
+                    style={{
+                      left: (corner === "nw" || corner === "sw" ? rect.x : rect.x + rect.w) * zoom - HANDLE_SIZE / 2,
+                      top: (corner === "nw" || corner === "ne" ? rect.y : rect.y + rect.h) * zoom - HANDLE_SIZE / 2,
+                      width: HANDLE_SIZE,
+                      height: HANDLE_SIZE,
+                      cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize",
+                    }}
+                  />
+                ))}
+
+                <div
+                  className="absolute flex items-center gap-1.5"
+                  style={{ left: rect.x * zoom, top: (rect.y + rect.h) * zoom + 8 }}
+                >
+                  <button
+                    type="button"
+                    title="Apply crop"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={applyImageCrop}
+                    className="flex items-center justify-center w-7 h-7 rounded-full bg-blue-600 text-white shadow-sm hover:bg-blue-700"
+                  >
+                    ✓
+                  </button>
+                  <button
+                    type="button"
+                    title="Cancel crop"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={cancelImageCrop}
+                    className="flex items-center justify-center w-7 h-7 rounded-full bg-white border border-black/10 shadow-sm text-neutral-600 hover:text-red-600 hover:border-red-300"
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
             );
           })()}
 

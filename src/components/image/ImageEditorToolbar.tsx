@@ -264,6 +264,7 @@ interface ImageEditorToolbarProps {
   onImageHeightChange: (height: number) => void;
   imageAspectLocked: boolean;
   onImageAspectLockedChange: (locked: boolean) => void;
+  onCropImageClick: () => void;
   showImageStyle: boolean;
   onRotateCCW: () => void;
   onRotateCW: () => void;
@@ -339,6 +340,7 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   onImageHeightChange,
   imageAspectLocked,
   onImageAspectLockedChange,
+  onCropImageClick,
   showImageStyle,
   onRotateCCW,
   onRotateCW,
@@ -669,6 +671,15 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
                   />
                 </label>
               </div>
+              <button
+                type="button"
+                title="Crop this image - cuts it down to a chosen region, independent of the main board's own Crop tool"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={onCropImageClick}
+                className="self-start flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150"
+              >
+                <IoCropOutline size={14} /> Crop image
+              </button>
               <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                 <span className="w-12 shrink-0 flex items-center gap-1">
                   <TbBorderRadius size={14} /> Corners

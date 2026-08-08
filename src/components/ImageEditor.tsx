@@ -963,6 +963,7 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
             onImageHeightChange={handleImageHeightChange}
             imageAspectLocked={imageAspectLocked}
             onImageAspectLockedChange={setImageAspectLocked}
+            onCropImageClick={() => canvasRef.current?.beginImageCrop()}
             showImageStyle={showImageStyle}
             onRotateCCW={handleRotateCCW}
             onRotateCW={handleRotateCW}
