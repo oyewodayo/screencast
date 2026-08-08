@@ -47,6 +47,7 @@ import {
   renderLiveStroke,
   resizeBoxObject,
   textObjectBounds,
+  textObjectVisualBounds,
   translateObject,
 } from "../../handlers/imageEditHandlers";
 import { getCachedImage, preloadImage } from "../../utils/imageObjectCache";
@@ -789,7 +790,9 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
           !textEditor &&
           (() => {
             const display = primaryLive?.type === "text" ? primaryLive : primarySelectedObject;
-            const bounds = textObjectBounds(display);
+            // Visual bounds (includes the background backdrop's padding, when it has one) so the
+            // move/resize/rotate chrome traces the box the user actually sees, not just the glyphs.
+            const bounds = textObjectVisualBounds(display);
             return (
               <TextAnnotationEditor
                 left={bounds.x * zoom}

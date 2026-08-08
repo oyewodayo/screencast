@@ -83,7 +83,14 @@ const TextAnnotationEditor: React.FC<TextAnnotationEditorProps> = ({
       handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
-      onMoveEnd(parseFloat(wrapper.style.left), parseFloat(wrapper.style.top));
+      const newLeft = parseFloat(wrapper.style.left);
+      const newTop = parseFloat(wrapper.style.top);
+      // A double-click's first tap goes through this same move gesture with zero actual
+      // movement (down/up at the same point) - skip the commit entirely rather than dispatching
+      // a no-op edit, which would otherwise push a spurious entry onto the undo stack on every
+      // plain click and every double-click's first half.
+      if (newLeft === startLeft && newTop === startTop) return;
+      onMoveEnd(newLeft, newTop);
     };
 
     window.addEventListener("pointermove", handleMove);
@@ -136,7 +143,9 @@ const TextAnnotationEditor: React.FC<TextAnnotationEditorProps> = ({
       handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
-      onResizeEnd(Math.round(liveFontSize));
+      const newFontSize = Math.round(liveFontSize);
+      if (newFontSize === startFontSize) return;
+      onResizeEnd(newFontSize);
     };
 
     window.addEventListener("pointermove", handleMove);
@@ -170,6 +179,7 @@ const TextAnnotationEditor: React.FC<TextAnnotationEditorProps> = ({
       handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      if (liveRotation === startRotation) return;
       onRotateEnd(liveRotation);
     };
 
@@ -196,7 +206,15 @@ const TextAnnotationEditor: React.FC<TextAnnotationEditorProps> = ({
     >
       <div
         onPointerDown={handleMovePointerDown}
-        onDoubleClick={onDoubleClick}
+        onDoubleClick={(e) => {
+          // Without this, the click also bubbles to ImageEditorCanvas's own onDoubleClick, which
+          // does its own hit-test and calls beginEditExistingText a second time for the same
+          // object - harmless by itself (setTextEditor with an equivalent value), but two
+          // dispatches for one user gesture is exactly the kind of redundant state churn worth
+          // cutting, especially since this overlay is the intended sole handler for this gesture.
+          e.stopPropagation();
+          onDoubleClick();
+        }}
         title="Drag to move (double-click to edit text)"
         className="absolute inset-0 ring-2 ring-blue-500 rounded-sm"
         style={{ cursor: "move" }}
