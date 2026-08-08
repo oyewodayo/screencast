@@ -46,6 +46,7 @@ import {
   makeStepObject,
   makeStrokeObject,
   makeTextObject,
+  measureTextWidth,
   nextStepNumber,
   renderComposedCanvas,
   renderLiveStroke,
@@ -81,6 +82,16 @@ export interface ImageEditorCanvasHandle {
   // needs ImageEditor.tsx to read the result back via getCropRect), this one applies itself
   // directly through onEditObject, so nothing further needs to be exposed here.
   beginImageCrop: () => void;
+  // Re-runs the composed-canvas draw with no data change - purely to nudge the browser into
+  // recompositing this canvas at its current on-screen position. ImageEditor.tsx calls this off a
+  // ResizeObserver on the surrounding pane: the file-list sidebar's open/close is an animated
+  // width transition (not an instant mount/unmount), and Chromium/WebView2 can leave a `<canvas>`
+  // element's rendered layer stuck at its pre-transition screen position for a moment after such a
+  // reflow, even though nothing about the canvas's own box changed - which reads as "the selection
+  // outline and this canvas's own painted pixels have drifted apart" since the outline is a plain
+  // DOM element that *does* track the new layout immediately. A cheap redraw is enough to force a
+  // fresh paint at the right place.
+  forceRepaint: () => void;
 }
 
 interface ImageEditorCanvasProps {
@@ -381,8 +392,9 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
         if (object?.type !== "placed-image") return;
         setImageCropEditor({ objectId: object.id, rect: { x: 0, y: 0, w: object.width, h: object.height } });
       },
+      forceRepaint: () => redraw(),
     }),
-    [cropRect, baseWidth, baseHeight, adjustments, selectedObjectIds, objects]
+    [cropRect, baseWidth, baseHeight, adjustments, selectedObjectIds, objects, redraw]
   );
 
   const toNaturalPoint = (clientX: number, clientY: number): { x: number; y: number } => {
@@ -1192,79 +1204,99 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
         )}
       </div>
 
-      {textEditor && (
-        <textarea
-          autoFocus
-          autoComplete="off"
-          spellCheck={false}
-          // Native textarea line-wrap would silently insert visual line breaks that
-          // renderTextObject (no auto-wrap - see TextObject's own doc comment) never draws,
-          // so what's on screen while typing would stop matching what commits. "off" keeps every
-          // line exactly as typed; overflowX below lets a long line scroll instead of wrapping.
-          wrap="off"
-          rows={Math.max(1, textEditor.value.split("\n").length)}
-          placeholder="Type text… (Shift+Enter for a new line)"
-          value={textEditor.value}
-          onChange={(e) => setTextEditor((prev) => (prev ? { ...prev, value: e.target.value } : prev))}
-          onKeyDown={(e) => {
-            // Stop the keystroke from also reaching ImageEditor.tsx's document-level shortcut
-            // handler - it already bails out via isEditableTarget(document.activeElement), but
-            // that only works once this input has actually taken focus; stopping propagation here
-            // is a second, unconditional guard against the same class of "two listeners on the
-            // same keydown" conflict the arrow-key file-navigation bug turned out to be.
-            e.stopPropagation();
-            if (e.key === "Enter" && !e.shiftKey) {
-              // Plain Enter commits (matches the old single-line input's behavior); Shift+Enter
-              // falls through to the textarea's own default action and inserts a line break.
-              e.preventDefault();
-              e.currentTarget.blur();
-            } else if (e.key === "Escape") {
-              setTextEditor(null);
-            }
-          }}
-          onBlur={commitTextEditor}
-          // A real (if translucent) fill + visible ring, not just a bare transparent box - against
-          // a busy or dark screenshot a transparent input with only a thin ring was easy to miss
-          // entirely, which read as "clicking with the Text tool does nothing". When the
-          // Background style is on, this fill switches to the *actual* configured background
-          // color (at the same alpha renderTextObject draws with) instead of the generic neutral
-          // one, so what's on screen while typing already matches what commits to the canvas -
-          // otherwise there was no way to tell the background color setting was doing anything
-          // until after committing.
-          className={`absolute outline-none ring-2 ring-blue-500 rounded shadow-lg resize-none overflow-x-auto overflow-y-hidden ${
-            textBackground ? "" : "bg-white/90 dark:bg-neutral-900/90 px-1"
-          }`}
-          style={{
-            // When a background is armed, this input's padding previews textObjectVisualBounds's
-            // own pad (fontSize * TEXT_BACKGROUND_PADDING_RATIO, scaled to screen px) instead of a
-            // fixed CSS value - otherwise the backdrop would visibly jump in size the instant the
-            // edit commits, since the committed box is padded proportionally to fontSize while a
-            // flat px-1 isn't. left/top shift outward by that same pad so the input's padded edge
-            // (not its unpadded one) lands where the committed background's edge will.
-            left: textEditor.x * zoom - (textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : 0),
-            top: textEditor.y * zoom - (textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : 0),
-            padding: textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : undefined,
-            // Floored at 14 CSS px regardless of zoom - these are typically 4K screenshots opened
-            // fit-to-window at well under 100% zoom, where fontSize*zoom alone shrinks the caret
-            // and typed characters down to a couple of CSS pixels: technically present, but
-            // unreadable and effectively "the text tool doesn't work". The committed object itself
-            // still uses the real, unfloored fontSize (see commitTextEditor/renderTextObject) -
-            // only this live editing affordance gets the floor.
-            fontSize: Math.max(14, fontSize * zoom),
-            // Same constant renderTextObject uses for the committed object, not a second hardcoded
-            // copy of the string - keeps the live editor's font guaranteed identical to what's
-            // about to be drawn to canvas rather than two literals that could silently drift apart.
-            fontFamily: TEXT_FONT_FAMILY,
-            fontWeight: textBold ? 700 : 400,
-            lineHeight: TEXT_LINE_HEIGHT_MULTIPLIER,
-            whiteSpace: "pre",
-            color,
-            backgroundColor: textBackground ? hexToRgba(textBackgroundColor, TEXT_BACKGROUND_ALPHA) : undefined,
-            minWidth: 80,
-            zIndex: 20,
-          }}
-        />
-      )}
+      {textEditor &&
+        (() => {
+          // Sized from the actual measured content (the same measureTextWidth renderTextObject's
+          // own bounds use) rather than the browser's default ~20-column textarea width, which
+          // read as "the text tool barely has a box" - especially with wrap="off" below, where a
+          // too-narrow box meant even the placeholder scrolled out of view instead of just being
+          // visible. Falls back to a fixed placeholder-sized width while empty, since there's no
+          // typed content yet to measure against.
+          const bgPad = textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO : 0;
+          const contentNaturalWidth = textEditor.value
+            ? Math.max(...textEditor.value.split("\n").map((line) => measureTextWidth(line, fontSize, textBold)))
+            : measureTextWidth("Type text…", fontSize, textBold);
+          const widthPx = Math.max(96, (contentNaturalWidth + bgPad * 2) * zoom + 16);
+          return (
+            <textarea
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              // Native textarea line-wrap would silently insert visual line breaks that
+              // renderTextObject (no auto-wrap - see TextObject's own doc comment) never draws,
+              // so what's on screen while typing would stop matching what commits. "off" keeps
+              // every line exactly as typed - the box is now sized to actually fit it (see
+              // widthPx above) rather than needing this as its only real safety net, but it stays
+              // as a fallback for anything that briefly outgrows that measurement mid-keystroke.
+              wrap="off"
+              rows={Math.max(1, textEditor.value.split("\n").length)}
+              placeholder="Type text… (Shift+Enter for new line)"
+              title="Shift+Enter for a new line"
+              value={textEditor.value}
+              onChange={(e) => setTextEditor((prev) => (prev ? { ...prev, value: e.target.value } : prev))}
+              onKeyDown={(e) => {
+                // Stop the keystroke from also reaching ImageEditor.tsx's document-level shortcut
+                // handler - it already bails out via isEditableTarget(document.activeElement), but
+                // that only works once this input has actually taken focus; stopping propagation
+                // here is a second, unconditional guard against the same class of "two listeners
+                // on the same keydown" conflict the arrow-key file-navigation bug turned out to be.
+                e.stopPropagation();
+                if (e.key === "Enter" && !e.shiftKey) {
+                  // Plain Enter commits (matches the old single-line input's behavior); Shift+Enter
+                  // falls through to the textarea's own default action and inserts a line break.
+                  e.preventDefault();
+                  e.currentTarget.blur();
+                } else if (e.key === "Escape") {
+                  setTextEditor(null);
+                }
+              }}
+              onBlur={commitTextEditor}
+              // A real (if translucent) fill + visible ring, not just a bare transparent box -
+              // against a busy or dark screenshot a transparent input with only a thin ring was
+              // easy to miss entirely, which read as "clicking with the Text tool does nothing".
+              // When the Background style is on, this fill switches to the *actual* configured
+              // background color (at the same alpha renderTextObject draws with) instead of the
+              // generic neutral one, so what's on screen while typing already matches what
+              // commits to the canvas - otherwise there was no way to tell the background color
+              // setting was doing anything until after committing.
+              className={`absolute outline-none ring-2 ring-blue-500 rounded shadow-lg resize-none overflow-x-auto overflow-y-hidden ${
+                textBackground ? "" : "bg-white/90 dark:bg-neutral-900/90 px-1"
+              }`}
+              style={{
+                // When a background is armed, this input's padding previews
+                // textObjectVisualBounds's own pad (fontSize * TEXT_BACKGROUND_PADDING_RATIO,
+                // scaled to screen px) instead of a fixed CSS value - otherwise the backdrop
+                // would visibly jump in size the instant the edit commits, since the committed
+                // box is padded proportionally to fontSize while a flat px-1 isn't. left/top
+                // shift outward by that same pad so the input's padded edge (not its unpadded
+                // one) lands where the committed background's edge will.
+                left: textEditor.x * zoom - (textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : 0),
+                top: textEditor.y * zoom - (textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : 0),
+                padding: textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : undefined,
+                // Floored at 14 CSS px regardless of zoom - these are typically 4K screenshots
+                // opened fit-to-window at well under 100% zoom, where fontSize*zoom alone shrinks
+                // the caret and typed characters down to a couple of CSS pixels: technically
+                // present, but unreadable and effectively "the text tool doesn't work". The
+                // committed object itself still uses the real, unfloored fontSize (see
+                // commitTextEditor/renderTextObject) - only this live editing affordance gets
+                // the floor.
+                fontSize: Math.max(14, fontSize * zoom),
+                // Same constant renderTextObject uses for the committed object, not a second
+                // hardcoded copy of the string - keeps the live editor's font guaranteed
+                // identical to what's about to be drawn to canvas rather than two literals that
+                // could silently drift apart.
+                fontFamily: TEXT_FONT_FAMILY,
+                fontWeight: textBold ? 700 : 400,
+                lineHeight: TEXT_LINE_HEIGHT_MULTIPLIER,
+                whiteSpace: "pre",
+                color,
+                backgroundColor: textBackground ? hexToRgba(textBackgroundColor, TEXT_BACKGROUND_ALPHA) : undefined,
+                width: widthPx,
+                zIndex: 20,
+              }}
+            />
+          );
+        })()}
 
       {stepEditor && (
         <input

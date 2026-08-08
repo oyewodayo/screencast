@@ -595,6 +595,52 @@ export function translateObject(object: ImageAnnotationObject, dx: number, dy: n
   }
 }
 
+// ---- Z-order (front/back/forward/backward) ----------------------------------------------------------
+
+// Array position doubles as z-order (see renderComposedCanvas's own draw-order comment - objects
+// are drawn in array order, so the last one drawn - the end of the array - reads as "on top").
+// None of these four touch any object's own fields, only where it sits in the array, so they're
+// plain array reshuffles rather than per-object edits. Front/back jump the whole selection to one
+// end in a single step, preserving each group's own relative order; forward/backward move it one
+// step at a time instead - each selected object swaps past exactly one *unselected* neighbor (an
+// already-selected neighbor is left alone, so a contiguous multi-selection moves as one block
+// rather than its members leapfrogging each other) - matching the usual "nudge vs. snap-to-edge"
+// split most design tools give these four actions.
+export function moveObjectsToFront(objects: ImageAnnotationObject[], selectedIds: string[]): ImageAnnotationObject[] {
+  const selected = new Set(selectedIds);
+  return [...objects.filter((o) => !selected.has(o.id)), ...objects.filter((o) => selected.has(o.id))];
+}
+
+export function moveObjectsToBack(objects: ImageAnnotationObject[], selectedIds: string[]): ImageAnnotationObject[] {
+  const selected = new Set(selectedIds);
+  return [...objects.filter((o) => selected.has(o.id)), ...objects.filter((o) => !selected.has(o.id))];
+}
+
+// Sweeps from the end backward so a swap never gets re-processed later in the same pass (each
+// selected object moves at most one slot per call).
+export function moveObjectsForward(objects: ImageAnnotationObject[], selectedIds: string[]): ImageAnnotationObject[] {
+  const selected = new Set(selectedIds);
+  const result = [...objects];
+  for (let i = result.length - 2; i >= 0; i--) {
+    if (selected.has(result[i].id) && !selected.has(result[i + 1].id)) {
+      [result[i], result[i + 1]] = [result[i + 1], result[i]];
+    }
+  }
+  return result;
+}
+
+// Mirror of moveObjectsForward, sweeping from the start forward instead.
+export function moveObjectsBackward(objects: ImageAnnotationObject[], selectedIds: string[]): ImageAnnotationObject[] {
+  const selected = new Set(selectedIds);
+  const result = [...objects];
+  for (let i = 1; i < result.length; i++) {
+    if (selected.has(result[i].id) && !selected.has(result[i - 1].id)) {
+      [result[i], result[i - 1]] = [result[i - 1], result[i]];
+    }
+  }
+  return result;
+}
+
 // ---- Hit-testing / selection -----------------------------------------------------------------------
 
 function distanceToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {

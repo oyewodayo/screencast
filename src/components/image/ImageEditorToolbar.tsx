@@ -32,7 +32,18 @@ import {
 } from "react-icons/io5";
 import { AiOutlineSmallDash } from "react-icons/ai";
 import { BsHighlighter, BsCursor, BsArrowUpRight, BsShadows } from "react-icons/bs";
-import { TbArrowLeftRight, TbBorderRadius, TbFlipHorizontal, TbFlipVertical, TbRotate, TbRotateClockwise } from "react-icons/tb";
+import {
+  TbArrowLeftRight,
+  TbBorderRadius,
+  TbChevronDown,
+  TbChevronsDown,
+  TbChevronsUp,
+  TbChevronUp,
+  TbFlipHorizontal,
+  TbFlipVertical,
+  TbRotate,
+  TbRotateClockwise,
+} from "react-icons/tb";
 import { MdBlurOn, MdFormatBold, MdFormatColorFill, MdLooksOne } from "react-icons/md";
 import { ImageAdjustments, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../../utils/imageEditTypes";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
@@ -283,6 +294,10 @@ interface ImageEditorToolbarProps {
   hasSelection: boolean;
   onDeleteSelected: () => void;
   onDuplicateSelected: () => void;
+  onBringToFront: () => void;
+  onSendToBack: () => void;
+  onBringForward: () => void;
+  onSendBackward: () => void;
   onClose: () => void;
 }
 
@@ -290,8 +305,15 @@ interface ImageEditorToolbarProps {
 // itself) once this panel's own content is scrolled to its edge - see ImageEditor.tsx's own
 // canvas-pane container and Dashboard.tsx's sidebar file list for the other two panels that need
 // the same containment so all three scroll independently based on where the cursor actually is.
+// pb-[var(--docker-height,...)] tracks BottomDocker's own real height (published via a
+// ResizeObserver - see player.css's own comment on the same variable, and Dashboard.tsx's sidebar
+// file list for the other panel that already needed this) so this panel's own last section (Edit:
+// Undo/Redo/Duplicate/Delete) can always scroll clear of that fixed bottom-0 overlay instead of
+// rendering underneath it, unclickable - which is exactly what was happening before this padding
+// existed, since nothing here previously reserved room for a bar that isn't part of this layout's
+// own flex flow at all.
 const PANEL_CLASSES =
-  "shrink-0 w-64 h-full flex flex-col bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-l border-black/[0.06] dark:border-white/[0.1] overflow-y-auto overscroll-contain";
+  "shrink-0 w-64 h-full flex flex-col bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-l border-black/[0.06] dark:border-white/[0.1] overflow-y-auto overscroll-contain pb-[var(--docker-height,64px)]";
 
 const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   tool,
@@ -359,6 +381,10 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   hasSelection,
   onDeleteSelected,
   onDuplicateSelected,
+  onBringToFront,
+  onSendToBack,
+  onBringForward,
+  onSendBackward,
   onClose,
 }) => {
   if (tool === "crop") {
@@ -765,6 +791,27 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
             >
               Reset
             </button>
+          </div>
+        </Section>
+
+        {/* Layer order - up = toward the viewer/front, down = toward the back, same convention
+            the chevron direction already implies elsewhere in this panel. Single chevron moves
+            one step past the next object in that direction; double chevron jumps straight to the
+            front/back of the whole stack. */}
+        <Section label="Arrange">
+          <div className="flex items-center gap-1">
+            <IconButton title="Bring to front" disabled={!hasSelection} onClick={onBringToFront}>
+              <TbChevronsUp size={16} />
+            </IconButton>
+            <IconButton title="Bring forward" disabled={!hasSelection} onClick={onBringForward}>
+              <TbChevronUp size={16} />
+            </IconButton>
+            <IconButton title="Send backward" disabled={!hasSelection} onClick={onSendBackward}>
+              <TbChevronDown size={16} />
+            </IconButton>
+            <IconButton title="Send to back" disabled={!hasSelection} onClick={onSendToBack}>
+              <TbChevronsDown size={16} />
+            </IconButton>
           </div>
         </Section>
 

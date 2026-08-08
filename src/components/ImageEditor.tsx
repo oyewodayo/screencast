@@ -21,6 +21,10 @@ import {
   cropCanvas,
   getSelectionBounds,
   makePlacedImageObject,
+  moveObjectsBackward,
+  moveObjectsForward,
+  moveObjectsToBack,
+  moveObjectsToFront,
   rectsIntersect,
   rotateFlipCanvas,
   transformObjectForGeometry,
@@ -189,6 +193,33 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
     setZoom(Math.max(MIN_ZOOM, Math.round(fit * 100) / 100));
     didFitZoomRef.current = true;
   }, [store.doc]);
+
+  // The file-list sidebar (Dashboard.tsx) animates open/closed via a CSS width transition rather
+  // than mounting/unmounting, which continuously reflows this pane's own width for its duration;
+  // the tools panel toggle just below reflows it once, instantly. Either way, the canvas's own CSS
+  // box never changes size (zoom is untouched by either), only its on-screen position does - which
+  // can leave the browser's painted canvas layer visually lagging behind the freshly-repositioned
+  // selection chrome (a plain DOM overlay that reflows immediately) until something forces a fresh
+  // paint. Re-running the canvas draw on every observed size change of this pane is a cheap,
+  // no-op-on-the-data way to force that repaint regardless of what resized it or by how much -
+  // rAF-coalesced since a CSS transition can fire this several times per frame.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    let raf: number | null = null;
+    const observer = new ResizeObserver(() => {
+      if (raf != null) return;
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        canvasRef.current?.forceRepaint();
+      });
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      if (raf != null) cancelAnimationFrame(raf);
+    };
+  }, []);
 
   // Trackpad pinch and two-finger touchscreen pinch both zoom the canvas, same as most image/map
   // viewers. Browsers (Chrome/Edge/Safari) report a trackpad pinch as a wheel event with ctrlKey
@@ -494,6 +525,27 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
     setSelectedIds(clones.map((o) => o.id));
   }, [selectedObjects, store]);
 
+  // Layer order (front/back/forward/backward) - store.reorderObjects already existed (it's what
+  // undo/redo across a drag-to-reorder would use), it just had no UI calling it yet. Guarded on
+  // `store.doc` rather than `selectedObjects.length` alone since these read the *whole* objects
+  // array, not just the selected ones.
+  const handleBringToFront = useCallback(() => {
+    if (!store.doc || selectedIds.length === 0) return;
+    store.reorderObjects(moveObjectsToFront(store.doc.objects, selectedIds));
+  }, [store, selectedIds]);
+  const handleSendToBack = useCallback(() => {
+    if (!store.doc || selectedIds.length === 0) return;
+    store.reorderObjects(moveObjectsToBack(store.doc.objects, selectedIds));
+  }, [store, selectedIds]);
+  const handleBringForward = useCallback(() => {
+    if (!store.doc || selectedIds.length === 0) return;
+    store.reorderObjects(moveObjectsForward(store.doc.objects, selectedIds));
+  }, [store, selectedIds]);
+  const handleSendBackward = useCallback(() => {
+    if (!store.doc || selectedIds.length === 0) return;
+    store.reorderObjects(moveObjectsBackward(store.doc.objects, selectedIds));
+  }, [store, selectedIds]);
+
   // Arrow-key nudge - moves every selected object by NUDGE_STEP (NUDGE_STEP_SHIFT with Shift) as
   // one undo step, the fine-positioning counterpart to dragging with the mouse.
   const handleNudgeSelected = useCallback(
@@ -697,6 +749,14 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
         } else if (key === "0") {
           e.preventDefault();
           setZoom(1);
+        } else if (key === "]") {
+          e.preventDefault();
+          if (e.shiftKey) handleBringToFront();
+          else handleBringForward();
+        } else if (key === "[") {
+          e.preventDefault();
+          if (e.shiftKey) handleSendToBack();
+          else handleSendBackward();
         }
         return;
       }
@@ -775,6 +835,10 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
     handleDeleteSelected,
     handleDuplicateSelected,
     handleNudgeSelected,
+    handleBringToFront,
+    handleSendToBack,
+    handleBringForward,
+    handleSendBackward,
   ]);
 
   if (store.loadError && !store.doc) {
@@ -985,6 +1049,10 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
             hasSelection={selectedObjects.length > 0}
             onDeleteSelected={handleDeleteSelected}
             onDuplicateSelected={handleDuplicateSelected}
+            onBringToFront={handleBringToFront}
+            onSendToBack={handleSendToBack}
+            onBringForward={handleBringForward}
+            onSendBackward={handleSendBackward}
             onClose={() => onToolsPanelOpenChange(false)}
           />
         )}
