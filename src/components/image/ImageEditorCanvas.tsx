@@ -67,6 +67,12 @@ export interface CropRect {
 
 export interface ImageEditorCanvasHandle {
   getWorkingCanvas: () => HTMLCanvasElement | null;
+  // Base photo + adjustments only, no annotation objects - a fresh offscreen canvas, not the live
+  // canvasRef. ImageEditor.tsx's applyGeometry uses this (rather than getWorkingCanvas's fully
+  // composed output) so crop/rotate/flip only rasterizes the *photo*; every annotation object
+  // survives the op as a live, editable object via transformObjectForGeometry instead of being
+  // flattened into the new bitmap along with it.
+  getBaseOnlyCanvas: () => HTMLCanvasElement | null;
   getCropRect: () => CropRect | null;
 }
 
@@ -341,9 +347,17 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
     ref,
     () => ({
       getWorkingCanvas: () => canvasRef.current,
+      getBaseOnlyCanvas: () => {
+        if (!baseImageElRef.current) return null;
+        const canvas = document.createElement("canvas");
+        canvas.width = baseWidth;
+        canvas.height = baseHeight;
+        renderComposedCanvas(canvas, baseImageElRef.current, baseWidth, baseHeight, adjustments, []);
+        return canvas;
+      },
       getCropRect: () => cropRect,
     }),
-    [cropRect]
+    [cropRect, baseWidth, baseHeight, adjustments]
   );
 
   const toNaturalPoint = (clientX: number, clientY: number): { x: number; y: number } => {

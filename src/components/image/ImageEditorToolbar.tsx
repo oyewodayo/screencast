@@ -285,8 +285,12 @@ interface ImageEditorToolbarProps {
   onClose: () => void;
 }
 
+// overscroll-contain keeps scroll momentum from chaining into the canvas pane (or the window
+// itself) once this panel's own content is scrolled to its edge - see ImageEditor.tsx's own
+// canvas-pane container and Dashboard.tsx's sidebar file list for the other two panels that need
+// the same containment so all three scroll independently based on where the cursor actually is.
 const PANEL_CLASSES =
-  "shrink-0 w-64 h-full flex flex-col bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-l border-black/[0.06] dark:border-white/[0.1] overflow-y-auto";
+  "shrink-0 w-64 h-full flex flex-col bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-l border-black/[0.06] dark:border-white/[0.1] overflow-y-auto overscroll-contain";
 
 const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   tool,
@@ -672,28 +676,33 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
                 <input
                   type="range"
                   min={0}
-                  max={120}
+                  // Stops exactly where the image becomes a full pill/circle - the same clamp
+                  // renderPlacedImage/roundedRectPath (imageEditHandlers.ts) apply at render time
+                  // (min(radius, width/2, height/2)), just surfaced as the slider's own ceiling so
+                  // dragging to the end always lands on "fully rounded" instead of a long dead zone
+                  // past it that looks identical.
+                  max={Math.max(1, Math.floor(Math.min(imageWidth, imageHeight) / 2))}
                   step={2}
                   value={imageCornerRadius}
                   onChange={(e) => onImageCornerRadiusChange(Number(e.target.value))}
                   title="Corner radius"
                   className="flex-1 accent-blue-500"
                 />
-                <span className="w-7 shrink-0 text-right tabular-nums">{imageCornerRadius}</span>
+                <span className="w-9 shrink-0 text-right tabular-nums">{imageCornerRadius}</span>
               </label>
               <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                 <span className="w-12 shrink-0">Border</span>
                 <input
                   type="range"
                   min={0}
-                  max={20}
+                  max={100}
                   step={1}
                   value={imageBorderWidth}
                   onChange={(e) => onImageBorderWidthChange(Number(e.target.value))}
                   title="Border width"
                   className="flex-1 accent-blue-500"
                 />
-                <span className="w-7 shrink-0 text-right tabular-nums">{imageBorderWidth}</span>
+                <span className="w-9 shrink-0 text-right tabular-nums">{imageBorderWidth}</span>
               </label>
               <div className="flex items-center gap-2">
                 <span className="text-xs text-neutral-400 dark:text-neutral-500">Border color</span>

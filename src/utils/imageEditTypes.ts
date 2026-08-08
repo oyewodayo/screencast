@@ -195,11 +195,11 @@ export const NEUTRAL_ADJUSTMENTS: ImageAdjustments = { brightness: 1, contrast: 
 
 export const ANNOTATION_SCHEMA_VERSION = 1 as const;
 
-// A geometry op (crop/rotate/flip) rasterizes the *entire* current composition - base image,
-// adjustments, and every annotation object so far - into a new base bitmap, then clears the
-// objects list and resets adjustments to neutral (they're now baked into the new base's pixels).
-// See imageEditHandlers.ts's rasterizeGeometry and this file's own module doc comment for why
-// vector annotation coordinates are never transformed through a rotation/crop instead.
+// A geometry op (crop/rotate/flip) rasterizes the base image + adjustments alone into a new base
+// bitmap (adjustments reset to neutral here since they're now baked into its pixels) - every
+// annotation object survives separately, carried through the same transform via
+// transformObjectForGeometry (imageEditHandlers.ts) rather than being flattened into that bitmap,
+// so Undo/Redo across a geometry op doesn't cost you their editability.
 export interface GeometrySnapshot {
   baseImageOverride: string;
   baseWidth: number;

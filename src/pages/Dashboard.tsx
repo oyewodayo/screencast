@@ -1628,8 +1628,18 @@ const setScreen = () => {
 
   return (
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
-      <div className="p-">
-        <div className="flex justify-between">
+      {/* flex-1 min-h-0 here (and h-full min-h-0 on the row below) is load-bearing, not
+          cosmetic: without a real height bound propagated all the way down, the main content
+          pane (ImageEditor/PdfAnnotator/VideoPlayer) had nothing stopping it from growing taller
+          than the viewport whenever its own content did - at which point the *whole document*
+          became the only thing left to scroll, dragging the sidebar's fixed h-screen column along
+          with it despite the sidebar's own file list having nothing to do with that scroll. That's
+          also why the main content pane's internal overflow-auto panes (ImageEditor.tsx's canvas
+          pane, ImageEditorToolbar's own panel) never had a genuine bounded scroll range of their
+          own to begin with - see those files' own overscroll-contain comments for the other half
+          of making each of the three panels scroll independently. */}
+      <div className="p- flex-1 min-h-0">
+        <div className="flex justify-between h-full min-h-0">
           {/* File list sidebar — force-collapsed in PDF fullscreen/presentation mode,
               regardless of showFileList, so it never reappears over the presented page. */}
           <div
@@ -1864,9 +1874,12 @@ const setScreen = () => {
 
                 {/* pb tracks --docker-height (published by BottomDocker's ResizeObserver, see
                     player.css for the sibling usage) so the last row can always scroll clear of
-                    the fixed bottom icon bar instead of rendering underneath it, unclickable. */}
+                    the fixed bottom icon bar instead of rendering underneath it, unclickable.
+                    overscroll-contain stops scroll momentum at this list's own top/bottom instead
+                    of chaining into whatever's behind it (the main content pane, the tools panel)
+                    once you scroll past its own content - each panel should scroll on its own. */}
                 <div
-                  className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200"
+                  className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto overscroll-contain flex-1 text-neutral-800 dark:text-neutral-200"
                 >
                 {activeFileCategory === "trash" ? (
                   filteredTrashItems.length === 0 ? (
@@ -2217,7 +2230,7 @@ const setScreen = () => {
               }}
             />
           )}
-         <div className="flex-1 min-w-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
+         <div className="flex-1 min-w-0 min-h-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
 
           {boardScreen ? (
             <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />

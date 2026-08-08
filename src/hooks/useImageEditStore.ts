@@ -12,7 +12,6 @@ import {
   ImageAnnotationObject,
   ImageEditCommand,
   ImageEditDocument,
-  NEUTRAL_ADJUSTMENTS,
   createEmptyDocument,
 } from "../utils/imageEditTypes";
 import { applyCommand, invertCommand } from "../handlers/imageEditHandlers";
@@ -42,11 +41,15 @@ export interface UseImageEditStoreResult {
   // Full replacement order for the whole objects array - e.g. drag-to-reorder stacked objects.
   reorderObjects: (newOrder: ImageAnnotationObject[]) => void;
   commitAdjustments: (next: ImageAdjustments) => void;
-  // `beforeImageDataUrl` is a snapshot of the fully composed canvas (base + adjustments + every
-  // object) taken by the caller immediately before applying the rotate/flip/crop transform - see
-  // GeometrySnapshot's own doc comment for why undo needs a concrete bitmap here even though the
-  // *document's* baseImageOverride may still be undefined at this point.
-  commitGeometry: (beforeImageDataUrl: string, afterImageDataUrl: string, afterWidth: number, afterHeight: number) => void;
+  // Both snapshots are built by the caller (ImageEditor.tsx's applyGeometry) - `before` from a
+  // fresh base-only (no-objects) rasterization of the *pre*-transform photo paired with the
+  // document's own current (untouched) objects, `after` from the transformed photo paired with
+  // every object individually carried through the same transform (transformObjectForGeometry) so
+  // they stay live and editable rather than being flattened into the new bitmap. Both snapshots'
+  // `adjustments` are always neutral - each bitmap already has whatever adjustments were live at
+  // the time baked directly into its pixels, so re-applying them as a live filter on top (what
+  // would happen if either snapshot carried the *actual* adjustment values here) would double them.
+  commitGeometry: (before: GeometrySnapshot, after: GeometrySnapshot) => void;
   undo: () => void;
   redo: () => void;
   canUndo: boolean;
@@ -203,25 +206,7 @@ export default function useImageEditStore(sourcePath: string | undefined, assetS
   );
 
   const commitGeometry = useCallback(
-    (beforeImageDataUrl: string, afterImageDataUrl: string, afterWidth: number, afterHeight: number) => {
-      const current = docRef.current;
-      if (!current) return;
-      const before: GeometrySnapshot = {
-        baseImageOverride: beforeImageDataUrl,
-        baseWidth: current.baseWidth,
-        baseHeight: current.baseHeight,
-        adjustments: current.adjustments,
-        objects: current.objects,
-      };
-      const after: GeometrySnapshot = {
-        baseImageOverride: afterImageDataUrl,
-        baseWidth: afterWidth,
-        baseHeight: afterHeight,
-        adjustments: { ...NEUTRAL_ADJUSTMENTS },
-        objects: [],
-      };
-      dispatch({ type: "geometry", before, after });
-    },
+    (before: GeometrySnapshot, after: GeometrySnapshot) => dispatch({ type: "geometry", before, after }),
     [dispatch]
   );
 

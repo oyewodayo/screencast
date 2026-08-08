@@ -744,7 +744,10 @@ export function getSelectionBounds(object: ImageAnnotationObject): Bounds {
   }
 }
 
-function rectsIntersect(a: Bounds, b: Bounds): boolean {
+// Exported for ImageEditor.tsx's own crop handling - see transformObjectForGeometry's doc comment
+// for why crop needs this same "does the transformed object still overlap the new canvas at all"
+// check to decide which objects survive a crop.
+export function rectsIntersect(a: Bounds, b: Bounds): boolean {
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
@@ -781,9 +784,11 @@ export function resizeBoxObject<T extends RectObject | EllipseObject | BlurRegio
 
 // Rotates (in 90 degree steps) and/or flips a canvas, returning a brand-new canvas sized for the
 // result (width/height swap on an odd number of quarter turns). Used by the Rotate/Flip toolbar
-// buttons - the caller is responsible for turning the result into a GeometrySnapshot (see that
-// type's own doc comment for why this bakes in everything drawn so far rather than transforming
-// each annotation object's coordinates).
+// buttons against the *base photo alone* (see ImageEditor.tsx's applyGeometry, which gets that via
+// ImageEditorCanvas's getBaseOnlyCanvas rather than the fully-composed canvas) - annotation
+// objects are carried through separately via transformObjectForGeometry below, using the exact
+// same translate/rotate/scale sequence this function's own ctx calls apply, so an object's
+// coordinates land in the same place on the transformed photo instead of being flattened into it.
 export function rotateFlipCanvas(source: HTMLCanvasElement, quarterTurns: 0 | 1 | 2 | 3, flipH: boolean, flipV: boolean): HTMLCanvasElement {
   const rotated90or270 = quarterTurns % 2 === 1;
   const outWidth = rotated90or270 ? source.height : source.width;
@@ -803,6 +808,121 @@ export function rotateFlipCanvas(source: HTMLCanvasElement, quarterTurns: 0 | 1 
   ctx.restore();
 
   return out;
+}
+
+// Maps one point through the exact same translate/rotate/scale sequence rotateFlipCanvas's own
+// ctx calls apply (in the same order: center on the output, rotate, flip, then offset by the
+// source's own half-size) - see that function's implementation for the canvas-pixel half of this.
+// Kept private; callers go through transformObjectForGeometry below, which applies this per
+// object-type field rather than duplicating the point math at every call site.
+function transformPointForGeometry(
+  x: number,
+  y: number,
+  params: GeometryTransformParams
+): { x: number; y: number } {
+  const { srcWidth, srcHeight, outWidth, outHeight, quarterTurns, flipH, flipV } = params;
+  const localX = x - srcWidth / 2;
+  const localY = y - srcHeight / 2;
+  const flippedX = flipH ? -localX : localX;
+  const flippedY = flipV ? -localY : localY;
+  const theta = (quarterTurns * Math.PI) / 2;
+  const cos = Math.cos(theta);
+  const sin = Math.sin(theta);
+  return {
+    x: flippedX * cos - flippedY * sin + outWidth / 2,
+    y: flippedX * sin + flippedY * cos + outHeight / 2,
+  };
+}
+
+// Carries a stored rotation angle (TextObject.rotation / PlacedImageObject.rotation) through the
+// same rotate/flip transformPointForGeometry uses. A flip alone isn't "add nothing" the way it is
+// for a plain coordinate - it mirrors the *sense* of rotation (a clockwise tilt reads as
+// counterclockwise once the canvas it's sitting on is mirrored), so the flip case negates/reflects
+// the angle before the quarter-turn rotation (if any) is added on top - matching the order
+// rotateFlipCanvas's own ctx calls apply (scale/flip happens before rotate in canvas-transform
+// terms, since it's the transform closest to the drawn content).
+function transformAngleForGeometry(theta: number, params: GeometryTransformParams): number {
+  const { quarterTurns, flipH, flipV } = params;
+  let phi = theta;
+  if (flipH && flipV) phi = theta + Math.PI;
+  else if (flipH) phi = Math.PI - theta;
+  else if (flipV) phi = -theta;
+  return phi + (quarterTurns * Math.PI) / 2;
+}
+
+export interface GeometryTransformParams {
+  srcWidth: number;
+  srcHeight: number;
+  outWidth: number;
+  outHeight: number;
+  quarterTurns: 0 | 1 | 2 | 3;
+  flipH: boolean;
+  flipV: boolean;
+}
+
+// Carries one annotation object's own coordinates (and, where it has one, its own stored
+// rotation) through a rotate/flip op, so Rotate/Flip can keep every object as a live, editable
+// one instead of flattening the whole composition into the new base bitmap the way this editor
+// used to (see ImageEditor.tsx's applyGeometry, which calls this once per object and gets
+// GeometryTransformParams from the actual before/after canvas dimensions).
+//
+// Box-shaped objects (rect/ellipse/blur/step) have no rotation field of their own - only their
+// center moves, and their w/h swap on a 90/270 turn (never on a plain flip). Text and placed-image
+// *reposition and re-tilt* via their own `rotation` field, but their own content isn't
+// mirrored/re-rendered - a flipped text label stays legible rather than reading backwards, and a
+// placed image's own pixels aren't re-flipped, matching how flipping a whole document normally
+// still leaves anything with actual words on it legible.
+export function transformObjectForGeometry(object: ImageAnnotationObject, params: GeometryTransformParams): ImageAnnotationObject {
+  const pt = (x: number, y: number) => transformPointForGeometry(x, y, params);
+  const swapped = params.quarterTurns % 2 === 1;
+  const updatedAt = Date.now();
+
+  switch (object.type) {
+    case "stroke":
+    case "highlight":
+      return { ...object, updatedAt, points: object.points.map((p) => ({ ...p, ...pt(p.x, p.y) })) };
+    case "arrow": {
+      const p1 = pt(object.x1, object.y1);
+      const p2 = pt(object.x2, object.y2);
+      return { ...object, updatedAt, x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y };
+    }
+    case "rect":
+    case "ellipse":
+    case "blur":
+    case "step": {
+      const center = pt(object.x + object.w / 2, object.y + object.h / 2);
+      const w = swapped ? object.h : object.w;
+      const h = swapped ? object.w : object.h;
+      return { ...object, updatedAt, x: center.x - w / 2, y: center.y - h / 2, w, h };
+    }
+    case "text": {
+      const bounds = textObjectBounds(object);
+      const center = pt(bounds.x + bounds.w / 2, bounds.y + bounds.h / 2);
+      return {
+        ...object,
+        updatedAt,
+        x: center.x - bounds.w / 2,
+        y: center.y - bounds.h / 2,
+        rotation: transformAngleForGeometry(object.rotation, params),
+      };
+    }
+    case "placed-image": {
+      const center = pt(object.x + object.width / 2, object.y + object.height / 2);
+      const width = swapped ? object.height : object.width;
+      const height = swapped ? object.width : object.height;
+      return {
+        ...object,
+        updatedAt,
+        x: center.x - width / 2,
+        y: center.y - height / 2,
+        width,
+        height,
+        rotation: transformAngleForGeometry(object.rotation, params),
+      };
+    }
+    default:
+      return object;
+  }
 }
 
 // Crops a canvas to the given rectangle (canvas-pixel space, not fractions - callers on a

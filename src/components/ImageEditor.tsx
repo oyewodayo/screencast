@@ -16,8 +16,17 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { IoBuildOutline, IoCheckmark, IoCopyOutline, IoDownloadOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";
-import { DEFAULT_BLUR_RADIUS, cropCanvas, makePlacedImageObject, rotateFlipCanvas, translateObject } from "../handlers/imageEditHandlers";
-import { ImageAdjustments, ImageAnnotationObject, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../utils/imageEditTypes";
+import {
+  DEFAULT_BLUR_RADIUS,
+  cropCanvas,
+  getSelectionBounds,
+  makePlacedImageObject,
+  rectsIntersect,
+  rotateFlipCanvas,
+  transformObjectForGeometry,
+  translateObject,
+} from "../handlers/imageEditHandlers";
+import { GeometrySnapshot, ImageAdjustments, ImageAnnotationObject, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../utils/imageEditTypes";
 import { fileToDataUrl } from "../utils/imageObjectCache";
 import ImageEditorCanvas, { ImageEditorCanvasHandle } from "./image/ImageEditorCanvas";
 import ImageEditorToolbar, { IconButton, SaveStatus, ZoomControl } from "./image/ImageEditorToolbar";
@@ -352,20 +361,52 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
     [selectedWithWidth, store, isHighlightWidth]
   );
 
-  // Every geometry op (crop/rotate/flip) follows the same shape: snapshot the canvas exactly as
-  // it's currently composed (the "before" undo state), run the pixel transform, then hand both
-  // bitmaps to the store - see GeometrySnapshot's doc comment (imageEditTypes.ts) for why this
-  // flattens rather than transforming each annotation object's coordinates.
+  // Every geometry op (crop/rotate/flip) rasterizes the *base photo alone* (getBaseOnlyCanvas -
+  // no annotation objects baked in) through the given pixel transform, then carries every
+  // annotation object through the matching coordinate transform so each one survives as a live,
+  // editable object instead of being flattened into the new bitmap - see
+  // transformObjectForGeometry's own doc comment (imageEditHandlers.ts) for the per-object-type
+  // details, and GeometryTransformParams for what `transformObject` below receives. Both the
+  // before/after snapshots' `adjustments` are always neutral since each bitmap already has
+  // whatever adjustments were live at the time baked into its own pixels - keeping the real
+  // (possibly non-neutral) values on the `before` snapshot the way this used to work would double
+  // them the instant an Undo restored it.
   const applyGeometry = useCallback(
-    (transform: (canvas: HTMLCanvasElement) => HTMLCanvasElement) => {
-      const canvas = canvasRef.current?.getWorkingCanvas();
-      if (!canvas) return;
+    (
+      pixelTransform: (canvas: HTMLCanvasElement) => HTMLCanvasElement,
+      transformObject: (object: ImageAnnotationObject, srcWidth: number, srcHeight: number, outWidth: number, outHeight: number) => ImageAnnotationObject | null
+    ) => {
+      if (!store.doc) return;
+      const baseCanvas = canvasRef.current?.getBaseOnlyCanvas();
+      if (!baseCanvas) return;
       try {
-        const beforeDataUrl = canvas.toDataURL("image/png");
-        const afterCanvas = transform(canvas);
+        const beforeDataUrl = baseCanvas.toDataURL("image/png");
+        const afterCanvas = pixelTransform(baseCanvas);
         const afterDataUrl = afterCanvas.toDataURL("image/png");
-        store.commitGeometry(beforeDataUrl, afterDataUrl, afterCanvas.width, afterCanvas.height);
-        setSelectedIds([]);
+        const afterObjects = store.doc.objects
+          .map((o) => transformObject(o, baseCanvas.width, baseCanvas.height, afterCanvas.width, afterCanvas.height))
+          .filter((o): o is ImageAnnotationObject => o !== null);
+
+        const before: GeometrySnapshot = {
+          baseImageOverride: beforeDataUrl,
+          baseWidth: baseCanvas.width,
+          baseHeight: baseCanvas.height,
+          adjustments: { ...NEUTRAL_ADJUSTMENTS },
+          objects: store.doc.objects,
+        };
+        const after: GeometrySnapshot = {
+          baseImageOverride: afterDataUrl,
+          baseWidth: afterCanvas.width,
+          baseHeight: afterCanvas.height,
+          adjustments: { ...NEUTRAL_ADJUSTMENTS },
+          objects: afterObjects,
+        };
+        store.commitGeometry(before, after);
+        // Keeps whichever selected objects survived the transform selected (most do - only a crop
+        // that moved an object fully outside the new bounds drops one), rather than unconditionally
+        // clearing selection the way flattening-everything used to require.
+        const survivingIds = new Set(afterObjects.map((o) => o.id));
+        setSelectedIds((ids) => ids.filter((id) => survivingIds.has(id)));
         setGeometryError(null);
       } catch (err) {
         console.error("Failed to apply crop/rotate/flip:", err);
@@ -375,10 +416,42 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
     [store]
   );
 
-  const handleRotateCCW = useCallback(() => applyGeometry((c) => rotateFlipCanvas(c, 3, false, false)), [applyGeometry]);
-  const handleRotateCW = useCallback(() => applyGeometry((c) => rotateFlipCanvas(c, 1, false, false)), [applyGeometry]);
-  const handleFlipH = useCallback(() => applyGeometry((c) => rotateFlipCanvas(c, 0, true, false)), [applyGeometry]);
-  const handleFlipV = useCallback(() => applyGeometry((c) => rotateFlipCanvas(c, 0, false, true)), [applyGeometry]);
+  const handleRotateCCW = useCallback(
+    () =>
+      applyGeometry(
+        (c) => rotateFlipCanvas(c, 3, false, false),
+        (o, srcWidth, srcHeight, outWidth, outHeight) =>
+          transformObjectForGeometry(o, { srcWidth, srcHeight, outWidth, outHeight, quarterTurns: 3, flipH: false, flipV: false })
+      ),
+    [applyGeometry]
+  );
+  const handleRotateCW = useCallback(
+    () =>
+      applyGeometry(
+        (c) => rotateFlipCanvas(c, 1, false, false),
+        (o, srcWidth, srcHeight, outWidth, outHeight) =>
+          transformObjectForGeometry(o, { srcWidth, srcHeight, outWidth, outHeight, quarterTurns: 1, flipH: false, flipV: false })
+      ),
+    [applyGeometry]
+  );
+  const handleFlipH = useCallback(
+    () =>
+      applyGeometry(
+        (c) => rotateFlipCanvas(c, 0, true, false),
+        (o, srcWidth, srcHeight, outWidth, outHeight) =>
+          transformObjectForGeometry(o, { srcWidth, srcHeight, outWidth, outHeight, quarterTurns: 0, flipH: true, flipV: false })
+      ),
+    [applyGeometry]
+  );
+  const handleFlipV = useCallback(
+    () =>
+      applyGeometry(
+        (c) => rotateFlipCanvas(c, 0, false, true),
+        (o, srcWidth, srcHeight, outWidth, outHeight) =>
+          transformObjectForGeometry(o, { srcWidth, srcHeight, outWidth, outHeight, quarterTurns: 0, flipH: false, flipV: true })
+      ),
+    [applyGeometry]
+  );
 
   const handleCropApply = useCallback(() => {
     const rect = canvasRef.current?.getCropRect();
@@ -386,7 +459,15 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
       setTool("select");
       return;
     }
-    applyGeometry((c) => cropCanvas(c, rect.x, rect.y, rect.w, rect.h));
+    applyGeometry(
+      (c) => cropCanvas(c, rect.x, rect.y, rect.w, rect.h),
+      (o, _srcWidth, _srcHeight, outWidth, outHeight) => {
+        const moved = translateObject(o, -rect.x, -rect.y);
+        // Drops anything left with zero overlap against the cropped canvas - keeping it around,
+        // invisible and unreachable outside the new bounds, would just be a silent leak.
+        return rectsIntersect(getSelectionBounds(moved), { x: 0, y: 0, w: outWidth, h: outHeight }) ? moved : null;
+      }
+    );
     setTool("select");
   }, [applyGeometry]);
 
@@ -746,7 +827,10 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
       <div className="flex-1 min-h-0 flex">
         <div
           ref={containerRef}
-          className="flex-1 min-w-0 overflow-auto flex items-center justify-center p-6"
+          // overscroll-contain keeps scroll momentum from chaining into the sidebar/tools panel
+          // (or the window itself) once this pane's own content is scrolled to its edge - each of
+          // the three panels should scroll independently based on where the cursor actually is.
+          className="flex-1 min-w-0 overflow-auto overscroll-contain flex items-center justify-center p-6"
           style={{ touchAction: "pan-x pan-y" }}
         >
           {store.doc ? (
