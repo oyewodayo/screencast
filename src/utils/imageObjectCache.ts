@@ -23,6 +23,13 @@ export function preloadImage(src: string): Promise<HTMLImageElement> {
 
   const promise = new Promise<HTMLImageElement>((resolve, reject) => {
     const img = new Image();
+    // Requested CORS-mode regardless of source: a no-op for the data: URLs this cache was
+    // originally built for (inserted/pasted PDF images), but required for the image editor's
+    // asset://-sourced source photo - without it, drawing the image to a canvas taints that
+    // canvas (even though Tauri's asset protocol answers with a matching
+    // Access-Control-Allow-Origin header), and every later toDataURL()/toBlob() on it - crop,
+    // rotate/flip, Save a copy - throws a SecurityError instead of producing bytes.
+    img.crossOrigin = "anonymous";
     img.onload = () => {
       cache.set(src, img);
       pending.delete(src);

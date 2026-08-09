@@ -1,70 +1,61 @@
-// components/pdf/ImageAnnotationEditor.tsx
+// components/image/TextAnnotationEditor.tsx
+//
+// A selected text object's move/resize/rotate chrome - text's counterpart to
+// ImageAnnotationEditor.tsx (reused as-is for placed images), following the exact same pattern:
+// each gesture is driven by direct style mutation on wrapperRef during pointermove (no React
+// re-render mid-drag), reporting only the final value to the parent on release. The one real
+// difference: an image's resize directly sets width/height, but text has no independent
+// width/height to set - both are derived from fontSize plus the string's own measured width (see
+// textObjectBounds in imageEditHandlers.ts) - so resize here scales fontSize instead, using the
+// same center-anchored, rotation-aware distance-from-center math ImageAnnotationEditor's own
+// resize already uses.
 import React, { useRef } from "react";
 
 const HANDLE_SIZE = 10;
 const ROTATE_HANDLE_OFFSET = 24; // device px above the top edge
-const MIN_DIAGONAL_DEVICE_PX = 24;
+const MIN_FONT_SIZE = 8;
 const ROTATE_SNAP_RADIANS = Math.PI / 12; // 15°, applied while Shift is held
 
-interface ImageAnnotationEditorProps {
-  left: number; // device/CSS px, relative to the page's canvas stack (same convention as TextNoteEditor)
+interface TextAnnotationEditorProps {
+  left: number; // device/CSS px, relative to the canvas stack (same convention as ImageAnnotationEditor)
   top: number;
   width: number;
   height: number;
-  rotation: number; // radians, fed straight into ctx.rotate()/CSS rotate() — see the sign-convention
-  // note on rotatePointAroundCenter in pdfAnnotationHandlers.ts if touching the hit-test math.
-  src: string;
-  // Frame styling preview, all optional and all in the same device/CSS px `left`/`top`/etc.
-  // already use (pre-scaled by the caller) - PdfPage.tsx's own images don't have a frame concept
-  // and simply never pass these, leaving the preview exactly as it was before these existed.
-  // Needed because this move-handle's own <img> is a flat DOM duplicate of the underlying
-  // canvas-rendered object (drawn as a plain img so dragging stays smooth without redrawing the
-  // full-res canvas every pointermove - see this component's own doc comment) - without mirroring
-  // the frame styling here too, that duplicate would sit fully opaque on top of the real,
-  // correctly-styled canvas render and hide it completely for as long as the image stays selected.
-  cornerRadius?: number;
-  borderWidth?: number;
-  borderColor?: string;
-  shadow?: boolean;
+  rotation: number; // radians
+  fontSize: number; // natural (unzoomed) px - the value the resize handles actually scale
   onMoveEnd: (newLeft: number, newTop: number) => void;
-  onResizeEnd: (newWidth: number, newHeight: number, newLeft: number, newTop: number) => void;
+  onResizeEnd: (newFontSize: number) => void;
   onRotateEnd: (newRotation: number) => void;
   onDelete: () => void;
+  // Re-enters inline text editing. Handled directly on the move-handle below rather than relying
+  // on a native dblclick bubbling up to ImageEditorCanvas's own onDoubleClick - this overlay (not
+  // the canvas underneath) is the actual double-click target once an object is selected, and every
+  // click here already goes through setPointerCapture/preventDefault/a full move-gesture setup
+  // (see handleMovePointerDown), any one of which is a plausible way for a double-click to end up
+  // not registering as one in some browser/webview - handling it locally sidesteps that entirely
+  // instead of needing to prove bubbling behaves as expected everywhere this runs.
+  onDoubleClick: () => void;
 }
 
-// A selected image's move/resize/rotate chrome. Follows TextNoteEditor.tsx's pattern exactly:
-// each gesture is driven by direct style mutation on wrapperRef during pointermove (no React
-// re-render mid-drag) and reports only the final value to the parent on release. Unlike text,
-// images support rotation, so resize here is center-anchored and aspect-locked rather than
-// opposite-corner-anchored — that avoids needing to track which screen-space corner a given local
-// corner maps to as the box spins, and matches how most editors handle rotatable image resize.
-const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
+const TextAnnotationEditor: React.FC<TextAnnotationEditorProps> = ({
   left,
   top,
   width,
   height,
   rotation,
-  src,
-  cornerRadius = 0,
-  borderWidth = 0,
-  borderColor = "#ffffff",
-  shadow = false,
+  fontSize,
   onMoveEnd,
   onResizeEnd,
   onRotateEnd,
   onDelete,
+  onDoubleClick,
 }) => {
   const wrapperRef = useRef<HTMLDivElement>(null);
 
-  // `left`/`top`/`width`/`height` (and therefore centerX/centerY below) are in *page-local*
-  // coordinates — relative to the wrapper's positioned ancestor (the page's canvas-stack
-  // container in PdfPage.tsx) — but PointerEvent.clientX/clientY are viewport-relative. Those two
-  // spaces only coincide if that container sits at the browser's top-left corner, which it never
-  // does (toolbar, padding, centered/scrollable layout). Resize/rotate need the *absolute*
-  // pointer position (to measure distance/angle from a fixed center), so — unlike the move
-  // handler above, which only ever diffs two client-space readings and so doesn't care — they
-  // must convert through this on every move (not just once at pointerdown, so a mid-gesture
-  // scroll doesn't throw it off either).
+  // See ImageAnnotationEditor's own doc comment on this exact helper for why resize/rotate need
+  // it (converting viewport-relative pointer coordinates into the same page-local space
+  // left/top/width/height are already in) while move doesn't (it only ever diffs two client-space
+  // readings).
   const clientToLocal = (clientX: number, clientY: number): { x: number; y: number } => {
     const parent = wrapperRef.current?.offsetParent as HTMLElement | null;
     const rect = parent?.getBoundingClientRect();
@@ -92,19 +83,27 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
-      onMoveEnd(parseFloat(wrapper.style.left), parseFloat(wrapper.style.top));
+      const newLeft = parseFloat(wrapper.style.left);
+      const newTop = parseFloat(wrapper.style.top);
+      // A double-click's first tap goes through this same move gesture with zero actual
+      // movement (down/up at the same point) - skip the commit entirely rather than dispatching
+      // a no-op edit, which would otherwise push a spurious entry onto the undo stack on every
+      // plain click and every double-click's first half.
+      if (newLeft === startLeft && newTop === startTop) return;
+      onMoveEnd(newLeft, newTop);
     };
 
     window.addEventListener("pointermove", handleMove);
     window.addEventListener("pointerup", handleUp);
   };
 
-  // Center-anchored, aspect-locked resize: the box's screen-space center stays fixed while
-  // width/height scale together. The pointer's offset from center is rotated by -rotation into
-  // the box's own (unrotated) local axes before measuring distance, so dragging a corner scales
-  // along the box's axes rather than the screen's — this is plain device-space trigonometry (no
-  // PDF-space involved), so the sign is the everyday "undo a +rotation" -rotation, unlike the
-  // hit-test math in pdfAnnotationHandlers.ts which crosses a y-up/y-down boundary.
+  // Center-anchored uniform scale of fontSize - the pointer's offset from center is rotated by
+  // -rotation into the box's own (unrotated) local axes first, so dragging a corner scales along
+  // the text's own axes rather than the screen's, same reasoning as ImageAnnotationEditor's resize.
+  // The live wrapper resize (width/height/left/top) is cosmetic - a growing/shrinking outline box
+  // for feedback during the drag - the actual on-canvas text only re-renders once onResizeEnd
+  // commits the new fontSize, same "DOM chrome moves live, canvas commits on release" split
+  // ImageAnnotationEditor's own resize already uses for images.
   const handleResizePointerDown = (e: React.PointerEvent<HTMLDivElement>): void => {
     e.stopPropagation();
     e.preventDefault();
@@ -117,9 +116,11 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
     const centerY = top + height / 2;
     const startWidth = width;
     const startHeight = height;
-    const startDist = Math.hypot(startWidth / 2, startHeight / 2);
+    const startDist = Math.max(1, Math.hypot(startWidth / 2, startHeight / 2));
+    const startFontSize = fontSize;
     const cos = Math.cos(-rotation);
     const sin = Math.sin(-rotation);
+    let liveFontSize = fontSize;
 
     const handleMove = (moveEvent: PointerEvent): void => {
       const pointerLocal = clientToLocal(moveEvent.clientX, moveEvent.clientY);
@@ -128,8 +129,9 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       const localX = dx * cos - dy * sin;
       const localY = dx * sin + dy * cos;
       const currentDist = Math.hypot(localX, localY);
-      const scale = Math.max(MIN_DIAGONAL_DEVICE_PX / startDist, currentDist / startDist);
+      const scale = Math.max(MIN_FONT_SIZE / startFontSize, currentDist / startDist);
 
+      liveFontSize = startFontSize * scale;
       const newWidth = startWidth * scale;
       const newHeight = startHeight * scale;
       wrapper.style.width = `${newWidth}px`;
@@ -141,12 +143,9 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
-      onResizeEnd(
-        parseFloat(wrapper.style.width),
-        parseFloat(wrapper.style.height),
-        parseFloat(wrapper.style.left),
-        parseFloat(wrapper.style.top)
-      );
+      const newFontSize = Math.round(liveFontSize);
+      if (newFontSize === startFontSize) return;
+      onResizeEnd(newFontSize);
     };
 
     window.addEventListener("pointermove", handleMove);
@@ -180,6 +179,7 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      if (liveRotation === startRotation) return;
       onRotateEnd(liveRotation);
     };
 
@@ -204,25 +204,27 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       className="absolute"
       style={{ left, top, width, height, transform: `rotate(${rotation}rad)`, transformOrigin: "center center", zIndex: 20 }}
     >
-      <div onPointerDown={handleMovePointerDown} title="Drag to move" className="absolute inset-0 ring-2 ring-blue-500" style={{ cursor: "move" }}>
-        <img
-          src={src}
-          alt=""
-          draggable={false}
-          className="w-full h-full object-fill pointer-events-none select-none"
-          style={{
-            borderRadius: cornerRadius,
-            border: borderWidth > 0 ? `${borderWidth}px solid ${borderColor}` : undefined,
-            boxShadow: shadow ? "0 4px 16px rgba(0, 0, 0, 0.35)" : undefined,
-          }}
-        />
-      </div>
+      <div
+        onPointerDown={handleMovePointerDown}
+        onDoubleClick={(e) => {
+          // Without this, the click also bubbles to ImageEditorCanvas's own onDoubleClick, which
+          // does its own hit-test and calls beginEditExistingText a second time for the same
+          // object - harmless by itself (setTextEditor with an equivalent value), but two
+          // dispatches for one user gesture is exactly the kind of redundant state churn worth
+          // cutting, especially since this overlay is the intended sole handler for this gesture.
+          e.stopPropagation();
+          onDoubleClick();
+        }}
+        title="Drag to move (double-click to edit text)"
+        className="absolute inset-0 ring-2 ring-blue-500 rounded-sm"
+        style={{ cursor: "move" }}
+      />
 
       {([[true, true], [false, true], [true, false], [false, false]] as const).map(([cornerLeft, cornerTop]) => (
         <div
           key={`${cornerLeft}-${cornerTop}`}
           onPointerDown={handleResizePointerDown}
-          title="Drag to resize"
+          title="Drag to resize text"
           className="bg-white border-2 border-blue-500 rounded-full shadow-sm"
           style={cornerHandleStyle(cornerLeft, cornerTop)}
         />
@@ -232,7 +234,13 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
         onPointerDown={handleRotatePointerDown}
         title="Drag to rotate (hold Shift to snap to 15°)"
         className="absolute bg-white border-2 border-blue-500 rounded-full shadow-sm"
-        style={{ left: width / 2 - HANDLE_SIZE / 2, top: -ROTATE_HANDLE_OFFSET - HANDLE_SIZE / 2, width: HANDLE_SIZE, height: HANDLE_SIZE, cursor: "grab" }}
+        style={{
+          left: width / 2 - HANDLE_SIZE / 2,
+          top: -ROTATE_HANDLE_OFFSET - HANDLE_SIZE / 2,
+          width: HANDLE_SIZE,
+          height: HANDLE_SIZE,
+          cursor: "grab",
+        }}
       />
       <div
         className="absolute bg-blue-500 pointer-events-none"
@@ -241,7 +249,7 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
 
       <button
         type="button"
-        title="Delete image"
+        title="Delete text"
         onPointerDown={(e) => e.stopPropagation()}
         onClick={onDelete}
         className="absolute -top-3 -left-3 w-6 h-6 flex items-center justify-center rounded-full bg-white border border-black/10 shadow-sm text-neutral-600 hover:text-red-600 hover:border-red-300 text-xs leading-none"
@@ -252,4 +260,4 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
   );
 };
 
-export default ImageAnnotationEditor;
+export default TextAnnotationEditor;

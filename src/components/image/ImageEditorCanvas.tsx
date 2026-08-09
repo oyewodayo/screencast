@@ -1,0 +1,1338 @@
+// components/image/ImageEditorCanvas.tsx
+//
+// The image editor's drawing surface. Two stacked full-resolution canvases (natural image pixels,
+// CSS-scaled to the current zoom% for on-screen display - same "offscreen full-res, CSS-scaled"
+// split ImageOverlayCropPanel.tsx/PdfPage.tsx already use) plus a DOM interaction layer on top:
+//
+// - `canvasRef` always holds exactly renderComposedCanvas's output (base photo + adjustments +
+//   every committed annotation object) and nothing else - this is the canvas getWorkingCanvas()
+//   exposes to the parent for crop/rotate/flip snapshots and the final Save. Selection chrome is
+//   never drawn onto it, so it's always safe to read back as-is.
+// - `previewCanvasRef` is a transparent overlay cleared and redrawn each pointermove with only the
+//   in-progress gesture (a freehand stroke being drawn, a shape's rubber-band drag) - discarded
+//   once the gesture commits (the object then appears on the real canvas via the store round-trip).
+// - Selection outline/resize handles/the crop rect/the marquee/snap guides are plain positioned
+//   DOM elements (mirrors ImageAnnotationEditor.tsx/ImageOverlayCropPanel.tsx's own selection-
+//   chrome convention), not canvas-drawn, so they never risk leaking into an exported frame.
+//
+// Selection is multi-object (`selectedObjectIds`): a marquee drag or shift-click can select more
+// than one at once, and dragging any selected object moves the whole group together as one undo
+// step. Resize handles and the placed-image move/resize/rotate chrome are still single-object only
+// (see the `primarySelectedObject`-gated blocks below) - multi-object resize isn't supported.
+import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import {
+  ImageAdjustments,
+  ImageAnnotationObject,
+  ImageEditDocument,
+  ImageEditTool,
+  Pt,
+} from "../../utils/imageEditTypes";
+import {
+  Bounds,
+  ResizeCorner,
+  TEXT_BACKGROUND_ALPHA,
+  TEXT_BACKGROUND_PADDING_RATIO,
+  TEXT_FONT_FAMILY,
+  TEXT_LINE_HEIGHT_MULTIPLIER,
+  findObjectAt,
+  findObjectsInRect,
+  getObjectBounds,
+  getSelectionBounds,
+  makeArrowObject,
+  makeBlurObject,
+  makeEllipseObject,
+  makeHighlightObject,
+  makeRectObject,
+  makeStepObject,
+  makeStrokeObject,
+  makeTextObject,
+  measureTextWidth,
+  nextStepNumber,
+  renderComposedCanvas,
+  renderLiveStroke,
+  resizeBoxObject,
+  textObjectBounds,
+  textObjectVisualBounds,
+  translateObject,
+} from "../../handlers/imageEditHandlers";
+import { getCachedImage, preloadImage } from "../../utils/imageObjectCache";
+import ImageAnnotationEditor from "../pdf/ImageAnnotationEditor";
+import TextAnnotationEditor from "./TextAnnotationEditor";
+
+export interface CropRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface ImageEditorCanvasHandle {
+  getWorkingCanvas: () => HTMLCanvasElement | null;
+  // Base photo + adjustments only, no annotation objects - a fresh offscreen canvas, not the live
+  // canvasRef. ImageEditor.tsx's applyGeometry uses this (rather than getWorkingCanvas's fully
+  // composed output) so crop/rotate/flip only rasterizes the *photo*; every annotation object
+  // survives the op as a live, editable object via transformObjectForGeometry instead of being
+  // flattened into the new bitmap along with it.
+  getBaseOnlyCanvas: () => HTMLCanvasElement | null;
+  getCropRect: () => CropRect | null;
+  // Starts the per-image crop overlay for whichever placed-image is currently selected (a no-op
+  // otherwise) - triggered from ImageEditorToolbar's Image section, since that panel has no other
+  // way to reach into this component's own local editing state. See the imageCropEditor state and
+  // its rendering block below for the interactive part; unlike the main board's Crop tool (which
+  // needs ImageEditor.tsx to read the result back via getCropRect), this one applies itself
+  // directly through onEditObject, so nothing further needs to be exposed here.
+  beginImageCrop: () => void;
+  // Re-runs the composed-canvas draw with no data change - purely to nudge the browser into
+  // recompositing this canvas at its current on-screen position. ImageEditor.tsx calls this off a
+  // ResizeObserver on the surrounding pane: the file-list sidebar's open/close is an animated
+  // width transition (not an instant mount/unmount), and Chromium/WebView2 can leave a `<canvas>`
+  // element's rendered layer stuck at its pre-transition screen position for a moment after such a
+  // reflow, even though nothing about the canvas's own box changed - which reads as "the selection
+  // outline and this canvas's own painted pixels have drifted apart" since the outline is a plain
+  // DOM element that *does* track the new layout immediately. A cheap redraw is enough to force a
+  // fresh paint at the right place.
+  forceRepaint: () => void;
+}
+
+interface ImageEditorCanvasProps {
+  doc: ImageEditDocument;
+  baseImageSrc: string;
+  adjustments: ImageAdjustments;
+  tool: ImageEditTool;
+  color: string;
+  strokeWidth: number;
+  fontSize: number;
+  textBold: boolean;
+  textBackground: boolean;
+  textBackgroundColor: string;
+  shapeFilled: boolean;
+  arrowDashed: boolean;
+  arrowDoubleHeaded: boolean;
+  blurMode: "blur" | "redact";
+  blurRadius: number;
+  zoom: number;
+  selectedObjectIds: string[];
+  onSelectObjects: (ids: string[]) => void;
+  onAddObject: (object: ImageAnnotationObject) => void;
+  // Fired once a text object is created or an edit to one is committed - unlike every other tool
+  // (pen/shape/etc., where drawing IS the positioning gesture), placing text is click-then-type
+  // with no drag step, so there's no way to land it exactly where you want in one motion. The
+  // caller (ImageEditor.tsx) uses this to drop into the Select tool with the object already
+  // selected, so repositioning it is an immediate drag rather than "switch tools, click it, then
+  // drag".
+  onTextCommitted: (objectId: string) => void;
+  onEditObject: (before: ImageAnnotationObject, after: ImageAnnotationObject) => void;
+  onBatchEditObjects: (before: ImageAnnotationObject[], after: ImageAnnotationObject[]) => void;
+  onDeleteObject: (object: ImageAnnotationObject) => void;
+}
+
+const HANDLE_SIZE = 12; // CSS px, independent of zoom - matches ImageAnnotationEditor's HANDLE_SIZE feel
+const HANDLE_HIT_PADDING = 6;
+// Screen-space (not natural-pixel) threshold so snapping feels the same regardless of zoom level -
+// divided by zoom before comparing against natural-space distances, same convention
+// HANDLE_HIT_PADDING above already uses.
+const SNAP_THRESHOLD_SCREEN_PX = 6;
+
+type DragState =
+  | { kind: "freehand"; tool: "pen" | "highlighter"; points: Pt[] }
+  | { kind: "shape"; tool: "arrow" | "rect" | "ellipse" | "blur" | "step"; startX: number; startY: number; curX: number; curY: number }
+  | { kind: "move"; objects: ImageAnnotationObject[]; startX: number; startY: number; curX: number; curY: number }
+  | { kind: "resize"; object: ImageAnnotationObject; corner: ResizeCorner; curX: number; curY: number }
+  | { kind: "arrow-endpoint"; object: ImageAnnotationObject; endpoint: "start" | "end"; curX: number; curY: number }
+  | { kind: "crop"; startX: number; startY: number; curX: number; curY: number }
+  // Rubber-band select on empty canvas - `additive` (shift held when the drag started) means the
+  // objects it ends up touching are added to whatever was already selected rather than replacing it.
+  | { kind: "marquee"; additive: boolean; startX: number; startY: number; curX: number; curY: number };
+
+interface TextEditorState {
+  mode: "create" | "edit";
+  x: number;
+  y: number;
+  value: string;
+  original?: Extract<ImageAnnotationObject, { type: "text" }>;
+}
+
+// Double-click-to-retype a step badge's number - same "inline input overlaid on the object,
+// commit on blur/Enter" shape as TextEditorState, just simpler (no create mode - a badge always
+// already exists once you can double-click it, and there's nothing else on it to edit).
+interface StepEditorState {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  value: string;
+  original: Extract<ImageAnnotationObject, { type: "step" }>;
+}
+
+interface SnapGuide {
+  axis: "v" | "h";
+  pos: number; // natural-space coordinate the guide line sits at
+}
+
+// Interactive per-image crop, started via beginImageCrop (ImageEditorCanvasHandle) - unlike the
+// main board's Crop tool (a global `tool` mode ImageEditor.tsx drives via getCropRect), this is
+// entirely self-contained here: `rect` lives in the object's own *local* space (0..width,
+// 0..height, before rotation - same convention textObjectBounds/getObjectBounds use for other
+// object types), so the overlay below can rotate as one rigid piece with the image and Apply can
+// commit straight through onEditObject without ImageEditor.tsx needing to know this is happening.
+interface ImageCropEditorState {
+  objectId: string;
+  rect: { x: number; y: number; w: number; h: number };
+}
+
+// Lets the live text-editing input's own CSS background match the translucent alpha
+// renderTextObject draws on the canvas (ctx.globalAlpha there, this here) - a plain hex can't
+// express that on its own, and CSS opacity would fade the typed characters along with it.
+function hexToRgba(hex: string, alpha: number): string {
+  const clean = hex.replace("#", "");
+  const full = clean.length === 3 ? clean.split("").map((c) => c + c).join("") : clean;
+  const int = parseInt(full, 16);
+  const r = (int >> 16) & 255;
+  const g = (int >> 8) & 255;
+  const b = int & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function unionBounds(boxes: Bounds[]): Bounds {
+  const minX = Math.min(...boxes.map((b) => b.x));
+  const minY = Math.min(...boxes.map((b) => b.y));
+  const maxX = Math.max(...boxes.map((b) => b.x + b.w));
+  const maxY = Math.max(...boxes.map((b) => b.y + b.h));
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+// Finds the smallest snap on each axis independently (so a horizontal-only or vertical-only
+// alignment still snaps even if the other axis has nothing nearby) across every edge/center of
+// `movingBounds` against every edge/center of every target box - the same 9-point comparison
+// (left/center/right and top/center/bottom) most design tools' smart guides use.
+function computeSnap(movingBounds: Bounds, targets: Bounds[], threshold: number): { dx: number; dy: number; guides: SnapGuide[] } {
+  const movingXs = [movingBounds.x, movingBounds.x + movingBounds.w / 2, movingBounds.x + movingBounds.w];
+  const movingYs = [movingBounds.y, movingBounds.y + movingBounds.h / 2, movingBounds.y + movingBounds.h];
+
+  let bestDx = 0;
+  let bestDxDist = threshold;
+  let snappedX: number | null = null;
+  let bestDy = 0;
+  let bestDyDist = threshold;
+  let snappedY: number | null = null;
+
+  for (const t of targets) {
+    const targetXs = [t.x, t.x + t.w / 2, t.x + t.w];
+    const targetYs = [t.y, t.y + t.h / 2, t.y + t.h];
+    for (const mx of movingXs) {
+      for (const tx of targetXs) {
+        const dist = Math.abs(mx - tx);
+        if (dist < bestDxDist) {
+          bestDxDist = dist;
+          bestDx = tx - mx;
+          snappedX = tx;
+        }
+      }
+    }
+    for (const my of movingYs) {
+      for (const ty of targetYs) {
+        const dist = Math.abs(my - ty);
+        if (dist < bestDyDist) {
+          bestDyDist = dist;
+          bestDy = ty - my;
+          snappedY = ty;
+        }
+      }
+    }
+  }
+
+  const guides: SnapGuide[] = [];
+  if (snappedX !== null) guides.push({ axis: "v", pos: snappedX });
+  if (snappedY !== null) guides.push({ axis: "h", pos: snappedY });
+  return { dx: snappedX !== null ? bestDx : 0, dy: snappedY !== null ? bestDy : 0, guides };
+}
+
+const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasProps>(function ImageEditorCanvas(
+  {
+    doc,
+    baseImageSrc,
+    adjustments,
+    tool,
+    color,
+    strokeWidth,
+    fontSize,
+    textBold,
+    textBackground,
+    textBackgroundColor,
+    shapeFilled,
+    arrowDashed,
+    arrowDoubleHeaded,
+    blurMode,
+    blurRadius,
+    zoom,
+    selectedObjectIds,
+    onSelectObjects,
+    onAddObject,
+    onTextCommitted,
+    onEditObject,
+    onBatchEditObjects,
+    onDeleteObject,
+  },
+  ref
+) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const baseImageElRef = useRef<HTMLImageElement | null>(null);
+  const dragRef = useRef<DragState | null>(null);
+  const rafRef = useRef<number | null>(null);
+  // The last snap-adjusted (dx, dy) computed during a live "move" drag - handlePointerUp commits
+  // this instead of recomputing straight from curX/curY, so the object doesn't visibly jump away
+  // from a snapped-to guide the instant the pointer is released.
+  const lastMoveDeltaRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
+
+  const [liveObjects, setLiveObjects] = useState<ImageAnnotationObject[] | null>(null);
+  const [cropRect, setCropRect] = useState<CropRect | null>(null);
+  const [marqueeRect, setMarqueeRect] = useState<CropRect | null>(null);
+  const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
+  const [textEditor, setTextEditor] = useState<TextEditorState | null>(null);
+  const [stepEditor, setStepEditor] = useState<StepEditorState | null>(null);
+  const [imageCropEditor, setImageCropEditor] = useState<ImageCropEditorState | null>(null);
+
+  const { baseWidth, baseHeight, objects } = doc;
+
+  // Resets whenever crop mode is (re-)entered, so switching tools away and back always starts
+  // from "the whole image" rather than remembering a stale rect from a cancelled attempt.
+  useEffect(() => {
+    if (tool === "crop") setCropRect({ x: 0, y: 0, w: baseWidth, h: baseHeight });
+    else setCropRect(null);
+  }, [tool, baseWidth, baseHeight]);
+
+  useEffect(() => {
+    let cancelled = false;
+    preloadImage(baseImageSrc).then(
+      (img) => {
+        if (cancelled) return;
+        baseImageElRef.current = img;
+        redraw();
+      },
+      (err) => console.error("Failed to decode image for editing:", err)
+    );
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseImageSrc]);
+
+  // Placed (inserted) images embed their own src directly on the object (see PlacedImageObject's
+  // doc comment) rather than going through baseImageSrc above - decodes any that aren't already in
+  // the shared cache (a freshly-inserted one already is, by the time it's added; this mainly
+  // covers reopening a document - undo/redo, or a fresh load - that already has some) and redraws
+  // once each resolves.
+  useEffect(() => {
+    let cancelled = false;
+    const missing = objects.filter((o): o is Extract<ImageAnnotationObject, { type: "placed-image" }> => o.type === "placed-image" && !getCachedImage(o.src));
+    Promise.all(missing.map((o) => preloadImage(o.src))).then(
+      () => {
+        if (!cancelled && missing.length > 0) redraw();
+      },
+      (err) => console.error("Failed to decode placed image:", err)
+    );
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objects]);
+
+  // The object currently being edited via the inline input (edit mode only - create mode has no
+  // pre-existing object to hide). A plain id/null, not the whole textEditor object, so it only
+  // changes on starting/stopping an edit or switching which object - never on every keystroke
+  // (textEditor.value changes every keystroke, but isn't read here) - see redraw's own comment for
+  // why that distinction matters.
+  // Same "hide the committed object while its own live editing chrome covers it" reasoning covers
+  // stepEditor too, which - unlike textEditor - only ever has one mode (retyping an existing
+  // badge's number), so its original id is always the one to hide while it's open.
+  const hiddenWhileEditingId = (textEditor?.mode === "edit" ? textEditor.original?.id : null) ?? stepEditor?.original.id ?? null;
+
+  // Excludes hiddenWhileEditingId from the composed canvas while it's being edited - without this,
+  // the committed object keeps rendering directly underneath the live editing input for the whole
+  // edit, and since the input's own size/position only approximates the real measured bounds (a
+  // native <input> isn't pixel-identical to canvas-drawn text, more so once background/bold/large
+  // sizes are involved), the two visibly don't line up - it reads as the label being duplicated
+  // rather than as one label being edited.
+  const redraw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const liveById = liveObjects ? new Map(liveObjects.map((o) => [o.id, o])) : null;
+    const displayObjects = objects.filter((o) => o.id !== hiddenWhileEditingId).map((o) => liveById?.get(o.id) ?? o);
+    renderComposedCanvas(canvas, baseImageElRef.current, baseWidth, baseHeight, adjustments, displayObjects);
+  }, [objects, baseWidth, baseHeight, adjustments, liveObjects, hiddenWhileEditingId]);
+
+  useEffect(() => {
+    redraw();
+  }, [redraw]);
+
+  const clearPreview = (): void => {
+    const canvas = previewCanvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+  };
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      getWorkingCanvas: () => canvasRef.current,
+      getBaseOnlyCanvas: () => {
+        if (!baseImageElRef.current) return null;
+        const canvas = document.createElement("canvas");
+        canvas.width = baseWidth;
+        canvas.height = baseHeight;
+        renderComposedCanvas(canvas, baseImageElRef.current, baseWidth, baseHeight, adjustments, []);
+        return canvas;
+      },
+      getCropRect: () => cropRect,
+      beginImageCrop: () => {
+        if (selectedObjectIds.length !== 1) return;
+        const object = objects.find((o) => o.id === selectedObjectIds[0]);
+        if (object?.type !== "placed-image") return;
+        setImageCropEditor({ objectId: object.id, rect: { x: 0, y: 0, w: object.width, h: object.height } });
+      },
+      forceRepaint: () => redraw(),
+    }),
+    [cropRect, baseWidth, baseHeight, adjustments, selectedObjectIds, objects, redraw]
+  );
+
+  const toNaturalPoint = (clientX: number, clientY: number): { x: number; y: number } => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    return { x: (clientX - rect.left) / zoom, y: (clientY - rect.top) / zoom };
+  };
+
+  // Converts a pointer's viewport-relative position into the given placed-image's own local space
+  // (0..width, 0..height, before rotation) - same "rotate the query point by -rotation around the
+  // object's center" trick TextAnnotationEditor/ImageAnnotationEditor's own resize handlers use
+  // (see either's doc comment), just done here directly rather than through a child component
+  // since the crop overlay below is plain JSX in this file, not its own component.
+  const clientToImageLocal = (clientX: number, clientY: number, object: Extract<ImageAnnotationObject, { type: "placed-image" }>): { x: number; y: number } => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    const px = clientX - (rect?.left ?? 0);
+    const py = clientY - (rect?.top ?? 0);
+    const centerX = (object.x + object.width / 2) * zoom;
+    const centerY = (object.y + object.height / 2) * zoom;
+    const dx = px - centerX;
+    const dy = py - centerY;
+    const cos = Math.cos(-object.rotation);
+    const sin = Math.sin(-object.rotation);
+    const localDx = dx * cos - dy * sin;
+    const localDy = dx * sin + dy * cos;
+    return { x: localDx / zoom + object.width / 2, y: localDy / zoom + object.height / 2 };
+  };
+
+  const selectedObjects = objects.filter((o) => selectedObjectIds.includes(o.id));
+  // Resize handles, the placed-image chrome, and the color/width-sync-from-selection effect
+  // (ImageEditor.tsx) only make sense for exactly one selected object - null the moment a second
+  // one joins the selection.
+  const primarySelectedObject = selectedObjectIds.length === 1 ? selectedObjects[0] ?? null : null;
+  const liveById = liveObjects ? new Map(liveObjects.map((o) => [o.id, o])) : null;
+
+  const getHandles = (object: ImageAnnotationObject): { id: string; x: number; y: number; cursor: string }[] => {
+    if (object.type === "arrow") {
+      return [
+        { id: "start", x: object.x1, y: object.y1, cursor: "move" },
+        { id: "end", x: object.x2, y: object.y2, cursor: "move" },
+      ];
+    }
+    // getObjectBounds already returns null for every type with its own dedicated chrome instead
+    // of these generic corner handles (text, placed-image) - see its own doc comment.
+    const bounds = getObjectBounds(object);
+    if (!bounds) return [];
+    const corners: { id: ResizeCorner; cursor: string }[] = [
+      { id: "nw", cursor: "nwse-resize" },
+      { id: "ne", cursor: "nesw-resize" },
+      { id: "sw", cursor: "nesw-resize" },
+      { id: "se", cursor: "nwse-resize" },
+    ];
+    return corners.map((c) => ({
+      id: c.id,
+      cursor: c.cursor,
+      x: c.id.includes("w") ? bounds.x : bounds.x + bounds.w,
+      y: c.id.includes("n") ? bounds.y : bounds.y + bounds.h,
+    }));
+  };
+
+  const scheduleLiveRedraw = (compute: () => void): void => {
+    if (rafRef.current != null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      compute();
+    });
+  };
+
+  useEffect(() => {
+    return () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  const commitTextEditor = (): void => {
+    const state = textEditor;
+    setTextEditor(null);
+    if (!state) return;
+    const text = state.value.trim();
+    if (!text) return;
+    if (state.mode === "create") {
+      const object = makeTextObject(state.x, state.y, text, color, fontSize, textBold, textBackground, textBackgroundColor);
+      onAddObject(object);
+      onTextCommitted(object.id);
+    } else if (state.original) {
+      onEditObject(state.original, { ...state.original, text, updatedAt: Date.now() });
+      onTextCommitted(state.original.id);
+    }
+  };
+
+  const openTextEditorAt = (x: number, y: number): void => setTextEditor({ mode: "create", x, y, value: "" });
+
+  const beginEditExistingText = (object: Extract<ImageAnnotationObject, { type: "text" }>): void => {
+    setTextEditor({ mode: "edit", x: object.x, y: object.y, value: object.text, original: object });
+  };
+
+  const commitStepEditor = (): void => {
+    const state = stepEditor;
+    setStepEditor(null);
+    if (!state) return;
+    const parsed = parseInt(state.value, 10);
+    if (!Number.isFinite(parsed)) return; // cleared or non-numeric - leave the original number as-is
+    if (parsed !== state.original.number) onEditObject(state.original, { ...state.original, number: parsed });
+  };
+
+  const beginEditStepNumber = (object: Extract<ImageAnnotationObject, { type: "step" }>): void => {
+    setStepEditor({ x: object.x, y: object.y, w: object.w, h: object.h, value: String(object.number), original: object });
+  };
+
+  const cancelImageCrop = (): void => setImageCropEditor(null);
+
+  // Commits the crop overlay's current rect: re-samples the cached decoded image into a brand-new,
+  // smaller canvas (scaled from the object's own *display* size back to the underlying bitmap's
+  // real pixel size, in case it's ever different) and re-encodes that as the object's new `src` -
+  // same "rasterize a sub-region into a fresh bitmap" idea the main board's Crop tool uses
+  // (cropCanvas in imageEditHandlers.ts), just producing a new PlacedImageObject instead of a new
+  // base image. Repositions x/y (and, if the image is rotated, does so by rotating the crop
+  // rect's own center-offset by the object's current rotation) so the surviving content stays
+  // exactly where it visually was rather than snapping to the image's original unrotated frame.
+  const applyImageCrop = (): void => {
+    const editor = imageCropEditor;
+    setImageCropEditor(null);
+    if (!editor) return;
+    const object = objects.find((o) => o.id === editor.objectId);
+    if (!object || object.type !== "placed-image") return;
+    const { rect } = editor;
+    if (rect.w < 4 || rect.h < 4) return; // degenerate/no-op selection - leave the image untouched
+
+    const img = getCachedImage(object.src);
+    if (!img) return;
+    const scaleX = img.naturalWidth / object.width;
+    const scaleY = img.naturalHeight / object.height;
+    const sx = rect.x * scaleX;
+    const sy = rect.y * scaleY;
+    const sw = rect.w * scaleX;
+    const sh = rect.h * scaleY;
+
+    const out = document.createElement("canvas");
+    out.width = Math.max(1, Math.round(sw));
+    out.height = Math.max(1, Math.round(sh));
+    const ctx = out.getContext("2d");
+    if (!ctx) return;
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, out.width, out.height);
+
+    const originalCenterX = object.x + object.width / 2;
+    const originalCenterY = object.y + object.height / 2;
+    const localOffsetX = rect.x + rect.w / 2 - object.width / 2;
+    const localOffsetY = rect.y + rect.h / 2 - object.height / 2;
+    const cos = Math.cos(object.rotation);
+    const sin = Math.sin(object.rotation);
+    const newCenterX = originalCenterX + (localOffsetX * cos - localOffsetY * sin);
+    const newCenterY = originalCenterY + (localOffsetX * sin + localOffsetY * cos);
+
+    onEditObject(object, {
+      ...object,
+      src: out.toDataURL("image/png"),
+      x: newCenterX - rect.w / 2,
+      y: newCenterY - rect.h / 2,
+      width: rect.w,
+      height: rect.h,
+    });
+  };
+
+  // Drags one corner of the crop rect, keeping the opposite corner fixed - same shape as
+  // resizeBoxObject's own opposite-corner-anchored math (imageEditHandlers.ts), just operating on
+  // local component state instead of an ImageAnnotationObject since this rect only exists for the
+  // duration of the crop gesture.
+  const handleImageCropCornerPointerDown = (e: React.PointerEvent, corner: "nw" | "ne" | "sw" | "se"): void => {
+    e.stopPropagation();
+    e.preventDefault();
+    const editor = imageCropEditor;
+    if (!editor) return;
+    const object = objects.find((o) => o.id === editor.objectId);
+    if (!object || object.type !== "placed-image") return;
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+    const startRect = editor.rect;
+    const minSize = 8;
+
+    const handleMove = (moveEvent: PointerEvent): void => {
+      const local = clientToImageLocal(moveEvent.clientX, moveEvent.clientY, object);
+      const left = corner === "nw" || corner === "sw" ? local.x : startRect.x;
+      const right = corner === "ne" || corner === "se" ? local.x : startRect.x + startRect.w;
+      const top = corner === "nw" || corner === "ne" ? local.y : startRect.y;
+      const bottom = corner === "sw" || corner === "se" ? local.y : startRect.y + startRect.h;
+      const clampedLeft = Math.max(0, Math.min(left, right - minSize));
+      const clampedTop = Math.max(0, Math.min(top, bottom - minSize));
+      const clampedRight = Math.min(object.width, Math.max(right, clampedLeft + minSize));
+      const clampedBottom = Math.min(object.height, Math.max(bottom, clampedTop + minSize));
+      setImageCropEditor({
+        objectId: editor.objectId,
+        rect: { x: clampedLeft, y: clampedTop, w: clampedRight - clampedLeft, h: clampedBottom - clampedTop },
+      });
+    };
+    const handleUp = (upEvent: PointerEvent): void => {
+      handle.releasePointerCapture(upEvent.pointerId);
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+    };
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+  };
+
+  const handlePointerDown = (e: React.PointerEvent): void => {
+    if (textEditor || stepEditor || imageCropEditor) return; // let the inline input's own blur/Enter commit first
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const { x, y } = toNaturalPoint(e.clientX, e.clientY);
+
+    if (tool === "crop") {
+      dragRef.current = { kind: "crop", startX: x, startY: y, curX: x, curY: y };
+      return;
+    }
+
+    if (tool === "text") {
+      openTextEditorAt(x, y);
+      return;
+    }
+
+    if (tool === "pen" || tool === "highlighter") {
+      dragRef.current = { kind: "freehand", tool, points: [{ x, y, pressure: e.pressure || 0.5 }] };
+      return;
+    }
+
+    if (tool === "arrow" || tool === "rect" || tool === "ellipse" || tool === "blur" || tool === "step") {
+      dragRef.current = { kind: "shape", tool, startX: x, startY: y, curX: x, curY: y };
+      return;
+    }
+
+    // tool === "select"
+    if (primarySelectedObject) {
+      const hitRadius = HANDLE_HIT_PADDING / zoom + HANDLE_SIZE / 2 / zoom;
+      const handle = getHandles(primarySelectedObject).find((h) => Math.hypot(h.x - x, h.y - y) <= hitRadius);
+      if (handle) {
+        dragRef.current =
+          primarySelectedObject.type === "arrow"
+            ? { kind: "arrow-endpoint", object: primarySelectedObject, endpoint: handle.id as "start" | "end", curX: x, curY: y }
+            : { kind: "resize", object: primarySelectedObject, corner: handle.id as ResizeCorner, curX: x, curY: y };
+        return;
+      }
+    }
+
+    const hit = findObjectAt(objects, x, y);
+    if (hit) {
+      // Shift-click toggles membership without starting a drag - same convention as marquee's own
+      // `additive` flag, and matches most design tools' "shift adjusts the set, plain click acts
+      // on it" split.
+      if (e.shiftKey) {
+        onSelectObjects(selectedObjectIds.includes(hit.id) ? selectedObjectIds.filter((id) => id !== hit.id) : [...selectedObjectIds, hit.id]);
+        return;
+      }
+      // Clicking (without shift) on an object that's already part of a multi-selection drags the
+      // whole group; clicking anything else collapses the selection down to just that object first.
+      const alreadyInGroup = selectedObjectIds.length > 1 && selectedObjectIds.includes(hit.id);
+      const groupIds = alreadyInGroup ? selectedObjectIds : [hit.id];
+      if (!alreadyInGroup) onSelectObjects(groupIds);
+      // Reset before the drag starts, not just after it ends - a plain click (select without any
+      // actual movement) never fires a pointermove, so lastMoveDeltaRef would otherwise still hold
+      // whatever delta the *previous* real drag left behind, and handlePointerUp's "move" case
+      // would re-apply that stale offset to the object that was just clicked, snapping or flinging
+      // it despite no drag having happened this time.
+      lastMoveDeltaRef.current = { dx: 0, dy: 0 };
+      dragRef.current = { kind: "move", objects: objects.filter((o) => groupIds.includes(o.id)), startX: x, startY: y, curX: x, curY: y };
+    } else if (e.shiftKey) {
+      dragRef.current = { kind: "marquee", additive: true, startX: x, startY: y, curX: x, curY: y };
+    } else {
+      onSelectObjects([]);
+      dragRef.current = { kind: "marquee", additive: false, startX: x, startY: y, curX: x, curY: y };
+    }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent): void => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const { x, y } = toNaturalPoint(e.clientX, e.clientY);
+
+    if (drag.kind === "freehand") {
+      drag.points.push({ x, y, pressure: e.pressure || 0.5 });
+      const canvas = previewCanvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      if (canvas && ctx) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        renderLiveStroke(ctx, drag.tool, drag.points, color, strokeWidth);
+      }
+      return;
+    }
+
+    if (drag.kind === "shape") {
+      drag.curX = x;
+      drag.curY = y;
+      scheduleLiveRedraw(() => {
+        const canvas = previewCanvasRef.current;
+        const ctx = canvas?.getContext("2d");
+        if (!canvas || !ctx) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const nx = Math.min(drag.startX, drag.curX);
+        const ny = Math.min(drag.startY, drag.curY);
+        const nw = Math.abs(drag.curX - drag.startX);
+        const nh = Math.abs(drag.curY - drag.startY);
+        if (drag.tool === "arrow") {
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = strokeWidth;
+          ctx.lineCap = arrowDashed ? "butt" : "round";
+          if (arrowDashed) ctx.setLineDash([strokeWidth * 2.5, strokeWidth * 2]);
+          ctx.beginPath();
+          ctx.moveTo(drag.startX, drag.startY);
+          ctx.lineTo(drag.curX, drag.curY);
+          ctx.stroke();
+          ctx.restore();
+        } else if (drag.tool === "blur") {
+          ctx.save();
+          ctx.strokeStyle = "rgba(255,255,255,0.9)";
+          ctx.setLineDash([6, 4]);
+          ctx.lineWidth = 2;
+          ctx.strokeRect(nx, ny, nw, nh);
+          ctx.restore();
+        } else if (drag.tool === "step") {
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.setLineDash([6, 4]);
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.ellipse(nx + nw / 2, ny + nh / 2, nw / 2, nh / 2, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        } else {
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.fillStyle = color;
+          ctx.lineWidth = strokeWidth;
+          if (drag.tool === "rect") {
+            if (shapeFilled) ctx.fillRect(nx, ny, nw, nh);
+            else ctx.strokeRect(nx, ny, nw, nh);
+          } else {
+            ctx.beginPath();
+            ctx.ellipse(nx + nw / 2, ny + nh / 2, nw / 2, nh / 2, 0, 0, Math.PI * 2);
+            if (shapeFilled) ctx.fill();
+            else ctx.stroke();
+          }
+          ctx.restore();
+        }
+      });
+      return;
+    }
+
+    if (drag.kind === "crop") {
+      drag.curX = x;
+      drag.curY = y;
+      scheduleLiveRedraw(() => {
+        const nx = Math.max(0, Math.min(baseWidth, Math.min(drag.startX, drag.curX)));
+        const ny = Math.max(0, Math.min(baseHeight, Math.min(drag.startY, drag.curY)));
+        const fx = Math.max(0, Math.min(baseWidth, Math.max(drag.startX, drag.curX)));
+        const fy = Math.max(0, Math.min(baseHeight, Math.max(drag.startY, drag.curY)));
+        setCropRect({ x: nx, y: ny, w: Math.max(1, fx - nx), h: Math.max(1, fy - ny) });
+      });
+      return;
+    }
+
+    if (drag.kind === "marquee") {
+      drag.curX = x;
+      drag.curY = y;
+      scheduleLiveRedraw(() => {
+        setMarqueeRect({
+          x: Math.min(drag.startX, drag.curX),
+          y: Math.min(drag.startY, drag.curY),
+          w: Math.abs(drag.curX - drag.startX),
+          h: Math.abs(drag.curY - drag.startY),
+        });
+      });
+      return;
+    }
+
+    if (drag.kind === "move") {
+      drag.curX = x;
+      drag.curY = y;
+      scheduleLiveRedraw(() => {
+        let dx = drag.curX - drag.startX;
+        let dy = drag.curY - drag.startY;
+        // Hold Shift while dragging to temporarily suspend snapping - the same escape hatch most
+        // design tools give for a move that's deliberately meant to land off-guide.
+        if (!e.shiftKey) {
+          const movedIds = new Set(drag.objects.map((o) => o.id));
+          const targets: Bounds[] = [{ x: 0, y: 0, w: baseWidth, h: baseHeight }, ...objects.filter((o) => !movedIds.has(o.id)).map(getSelectionBounds)];
+          const movingBounds = unionBounds(drag.objects.map((o) => getSelectionBounds(translateObject(o, dx, dy))));
+          const snap = computeSnap(movingBounds, targets, SNAP_THRESHOLD_SCREEN_PX / zoom);
+          dx += snap.dx;
+          dy += snap.dy;
+          setSnapGuides(snap.guides);
+        } else {
+          setSnapGuides([]);
+        }
+        lastMoveDeltaRef.current = { dx, dy };
+        setLiveObjects(drag.objects.map((o) => translateObject(o, dx, dy)));
+      });
+      return;
+    }
+
+    if (drag.kind === "resize") {
+      drag.curX = x;
+      drag.curY = y;
+      scheduleLiveRedraw(() => {
+        const object = drag.object;
+        if (object.type === "rect" || object.type === "ellipse" || object.type === "blur" || object.type === "step") {
+          setLiveObjects([resizeBoxObject(object, drag.corner, drag.curX, drag.curY)]);
+        }
+      });
+      return;
+    }
+
+    if (drag.kind === "arrow-endpoint") {
+      drag.curX = x;
+      drag.curY = y;
+      scheduleLiveRedraw(() => {
+        const object = drag.object;
+        if (object.type !== "arrow") return;
+        setLiveObjects([drag.endpoint === "start" ? { ...object, x1: drag.curX, y1: drag.curY } : { ...object, x2: drag.curX, y2: drag.curY }]);
+      });
+      return;
+    }
+  };
+
+  const handlePointerUp = (): void => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    clearPreview();
+    if (!drag) return;
+
+    if (drag.kind === "freehand") {
+      if (drag.points.length > 1) {
+        onAddObject(drag.tool === "pen" ? makeStrokeObject(drag.points, color, strokeWidth) : makeHighlightObject(drag.points, color, strokeWidth));
+      }
+      return;
+    }
+
+    if (drag.kind === "shape") {
+      const nx = Math.min(drag.startX, drag.curX);
+      const ny = Math.min(drag.startY, drag.curY);
+      const nw = Math.abs(drag.curX - drag.startX);
+      const nh = Math.abs(drag.curY - drag.startY);
+      if (drag.tool === "arrow") {
+        if (Math.hypot(drag.curX - drag.startX, drag.curY - drag.startY) > 2) {
+          onAddObject(makeArrowObject(drag.startX, drag.startY, drag.curX, drag.curY, color, strokeWidth, arrowDashed, arrowDoubleHeaded));
+        }
+      } else if (nw > 2 && nh > 2) {
+        if (drag.tool === "rect") onAddObject(makeRectObject(nx, ny, nw, nh, color, strokeWidth, shapeFilled));
+        else if (drag.tool === "ellipse") onAddObject(makeEllipseObject(nx, ny, nw, nh, color, strokeWidth, shapeFilled));
+        else if (drag.tool === "blur") onAddObject(makeBlurObject(nx, ny, nw, nh, blurMode, blurRadius));
+        else onAddObject(makeStepObject(nx, ny, nw, nh, nextStepNumber(objects), color));
+      }
+      return;
+    }
+
+    if (drag.kind === "marquee") {
+      setMarqueeRect(null);
+      const rect = {
+        x: Math.min(drag.startX, drag.curX),
+        y: Math.min(drag.startY, drag.curY),
+        w: Math.abs(drag.curX - drag.startX),
+        h: Math.abs(drag.curY - drag.startY),
+      };
+      const hitIds = findObjectsInRect(objects, rect).map((o) => o.id);
+      onSelectObjects(drag.additive ? Array.from(new Set([...selectedObjectIds, ...hitIds])) : hitIds);
+      return;
+    }
+
+    if (drag.kind === "move") {
+      setLiveObjects(null);
+      setSnapGuides([]);
+      const { dx, dy } = lastMoveDeltaRef.current;
+      if (dx !== 0 || dy !== 0) {
+        if (drag.objects.length === 1) onEditObject(drag.objects[0], translateObject(drag.objects[0], dx, dy));
+        else onBatchEditObjects(drag.objects, drag.objects.map((o) => translateObject(o, dx, dy)));
+      }
+      return;
+    }
+
+    if (drag.kind === "resize") {
+      setLiveObjects(null);
+      const object = drag.object;
+      if (object.type === "rect" || object.type === "ellipse" || object.type === "blur" || object.type === "step") {
+        onEditObject(object, resizeBoxObject(object, drag.corner, drag.curX, drag.curY));
+      }
+      return;
+    }
+
+    if (drag.kind === "arrow-endpoint") {
+      setLiveObjects(null);
+      const object = drag.object;
+      if (object.type === "arrow") {
+        onEditObject(object, drag.endpoint === "start" ? { ...object, x1: drag.curX, y1: drag.curY } : { ...object, x2: drag.curX, y2: drag.curY });
+      }
+      return;
+    }
+    // "crop" needs no per-gesture commit - cropRect state just stays as the drag left it, read
+    // later by the parent via getCropRect() when the user clicks Apply.
+  };
+
+  const displaySize = { width: baseWidth * zoom, height: baseHeight * zoom };
+  const primaryLive = primarySelectedObject ? liveById?.get(primarySelectedObject.id) ?? primarySelectedObject : null;
+  const selectionBounds: Bounds | null = primaryLive ? getObjectBounds(primaryLive) : null;
+  const cursorForTool: React.CSSProperties["cursor"] =
+    tool === "select" ? "default" : tool === "crop" ? "crosshair" : tool === "text" ? "text" : "crosshair";
+
+  return (
+    <div ref={containerRef} className="relative" style={{ width: displaySize.width, height: displaySize.height }}>
+      <canvas ref={canvasRef} width={baseWidth} height={baseHeight} style={{ width: "100%", height: "100%", position: "absolute", inset: 0 }} />
+      <canvas
+        ref={previewCanvasRef}
+        width={baseWidth}
+        height={baseHeight}
+        style={{ width: "100%", height: "100%", position: "absolute", inset: 0, pointerEvents: "none" }}
+      />
+
+      <div
+        className="absolute inset-0"
+        style={{ cursor: cursorForTool }}
+        // A plain click's default action shifts focus (usually to nothing, since this div isn't
+        // itself focusable) as part of mousedown - same "prevent the browser from stealing focus
+        // out from under an element we're about to focus ourselves" fix ColorSwatchPicker.tsx uses
+        // for its own popover. Without it, the Text tool's autoFocus on the freshly-mounted
+        // editing <input> below wins the race only long enough to register, then this div's own
+        // native mousedown default action blurs it again on the very same click - the input
+        // mounts, focuses, and unmounts within one gesture, which reads as "clicking with the Text
+        // tool does nothing" since a human can't perceive a flash that fast.
+        onMouseDown={(e) => e.preventDefault()}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onDoubleClick={(e) => {
+          if (tool !== "select") return;
+          const { x, y } = toNaturalPoint(e.clientX, e.clientY);
+          const hit = findObjectAt(objects, x, y);
+          if (hit?.type === "text") {
+            onSelectObjects([hit.id]);
+            beginEditExistingText(hit);
+          } else if (hit?.type === "step") {
+            onSelectObjects([hit.id]);
+            beginEditStepNumber(hit);
+          }
+        }}
+      >
+        {/* Single-selection outline + resize handles - unchanged from before multi-select existed.
+            Suppressed once a second object joins the selection (see the multi-select boxes below
+            instead), since resize handles only ever act on one object at a time. */}
+        {selectionBounds && tool === "select" && !stepEditor && (
+          <div
+            className="absolute border-2 border-dashed border-blue-400 pointer-events-none"
+            style={{
+              left: selectionBounds.x * zoom,
+              top: selectionBounds.y * zoom,
+              width: selectionBounds.w * zoom,
+              height: selectionBounds.h * zoom,
+            }}
+          />
+        )}
+
+        {primaryLive &&
+          tool === "select" &&
+          !stepEditor &&
+          getHandles(primaryLive).map((h) => (
+            <div
+              key={h.id}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                handlePointerDown(e);
+              }}
+              className="absolute rounded-full bg-white border-2 border-blue-500 shadow-sm"
+              style={{
+                left: h.x * zoom - HANDLE_SIZE / 2,
+                top: h.y * zoom - HANDLE_SIZE / 2,
+                width: HANDLE_SIZE,
+                height: HANDLE_SIZE,
+                cursor: h.cursor,
+              }}
+            />
+          ))}
+
+        {/* Placed (inserted) images get their own dedicated move/resize/rotate chrome - reused
+            directly from the PDF annotator rather than this canvas's generic axis-aligned
+            handles, since it already supports rotation-aware, center-anchored resize (see
+            PlacedImageObject's own doc comment). Only shown for a single, non-grouped selection -
+            same reasoning as the resize handles above. */}
+        {primarySelectedObject?.type === "placed-image" &&
+          tool === "select" &&
+          !imageCropEditor &&
+          (() => {
+            const display = primaryLive?.type === "placed-image" ? primaryLive : primarySelectedObject;
+            return (
+              <ImageAnnotationEditor
+                left={display.x * zoom}
+                top={display.y * zoom}
+                width={display.width * zoom}
+                height={display.height * zoom}
+                rotation={display.rotation}
+                src={primarySelectedObject.src}
+                cornerRadius={(display.cornerRadius ?? 0) * zoom}
+                borderWidth={(display.borderWidth ?? 0) * zoom}
+                borderColor={display.borderColor}
+                shadow={display.shadow}
+                onMoveEnd={(newLeft, newTop) => onEditObject(primarySelectedObject, { ...primarySelectedObject, x: newLeft / zoom, y: newTop / zoom })}
+                onResizeEnd={(newWidth, newHeight, newLeft, newTop) =>
+                  onEditObject(primarySelectedObject, {
+                    ...primarySelectedObject,
+                    width: newWidth / zoom,
+                    height: newHeight / zoom,
+                    x: newLeft / zoom,
+                    y: newTop / zoom,
+                  })
+                }
+                onRotateEnd={(newRotation) => onEditObject(primarySelectedObject, { ...primarySelectedObject, rotation: newRotation })}
+                onDelete={() => onDeleteObject(primarySelectedObject)}
+              />
+            );
+          })()}
+
+        {/* Per-image crop overlay - a dimmed mask outside the selected rect, corner drag handles,
+            and Apply/Cancel, all living inside one wrapper rotated to match the image (same
+            "rigid piece that rotates as one unit" trick ImageAnnotationEditor's own chrome uses)
+            so the rect and handles stay visually aligned with the image at any rotation without
+            this needing its own rotation-aware layout math beyond clientToImageLocal. */}
+        {imageCropEditor &&
+          (() => {
+            const object = objects.find((o) => o.id === imageCropEditor.objectId);
+            if (!object || object.type !== "placed-image") return null;
+            const { rect } = imageCropEditor;
+            return (
+              <div
+                className="absolute"
+                style={{
+                  left: object.x * zoom,
+                  top: object.y * zoom,
+                  width: object.width * zoom,
+                  height: object.height * zoom,
+                  transform: `rotate(${object.rotation}rad)`,
+                  transformOrigin: "center center",
+                  zIndex: 25,
+                }}
+              >
+                <div className="absolute bg-black/60 pointer-events-none" style={{ left: 0, top: 0, right: 0, height: rect.y * zoom }} />
+                <div
+                  className="absolute bg-black/60 pointer-events-none"
+                  style={{ left: 0, top: (rect.y + rect.h) * zoom, right: 0, bottom: 0 }}
+                />
+                <div
+                  className="absolute bg-black/60 pointer-events-none"
+                  style={{ left: 0, top: rect.y * zoom, width: rect.x * zoom, height: rect.h * zoom }}
+                />
+                <div
+                  className="absolute bg-black/60 pointer-events-none"
+                  style={{ left: (rect.x + rect.w) * zoom, top: rect.y * zoom, right: 0, height: rect.h * zoom }}
+                />
+                <div
+                  className="absolute outline outline-2 outline-white"
+                  style={{ left: rect.x * zoom, top: rect.y * zoom, width: rect.w * zoom, height: rect.h * zoom }}
+                />
+
+                {(["nw", "ne", "sw", "se"] as const).map((corner) => (
+                  <div
+                    key={corner}
+                    onPointerDown={(e) => handleImageCropCornerPointerDown(e, corner)}
+                    className="absolute bg-white border-2 border-blue-500 rounded-full shadow-sm"
+                    style={{
+                      left: (corner === "nw" || corner === "sw" ? rect.x : rect.x + rect.w) * zoom - HANDLE_SIZE / 2,
+                      top: (corner === "nw" || corner === "ne" ? rect.y : rect.y + rect.h) * zoom - HANDLE_SIZE / 2,
+                      width: HANDLE_SIZE,
+                      height: HANDLE_SIZE,
+                      cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize",
+                    }}
+                  />
+                ))}
+
+                <div
+                  className="absolute flex items-center gap-1.5"
+                  style={{ left: rect.x * zoom, top: (rect.y + rect.h) * zoom + 8 }}
+                >
+                  <button
+                    type="button"
+                    title="Apply crop"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={applyImageCrop}
+                    className="flex items-center justify-center w-7 h-7 rounded-full bg-blue-600 text-white shadow-sm hover:bg-blue-700"
+                  >
+                    ✓
+                  </button>
+                  <button
+                    type="button"
+                    title="Cancel crop"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={cancelImageCrop}
+                    className="flex items-center justify-center w-7 h-7 rounded-full bg-white border border-black/10 shadow-sm text-neutral-600 hover:text-red-600 hover:border-red-300"
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+
+        {/* Text gets the same kind of dedicated move/resize/rotate chrome placed images do, for
+            the same reason (rotation-aware resize needs center-anchored math the generic
+            axis-aligned handles above don't do) - "resize" scales fontSize rather than a
+            width/height that doesn't independently exist for text (see TextAnnotationEditor's own
+            doc comment). Hidden while the inline text-editing input is open (!textEditor) so the
+            two pieces of chrome for the same object never show at once. */}
+        {primarySelectedObject?.type === "text" &&
+          tool === "select" &&
+          !textEditor &&
+          (() => {
+            const display = primaryLive?.type === "text" ? primaryLive : primarySelectedObject;
+            // Visual bounds (includes the background backdrop's padding, when it has one) so the
+            // move/resize/rotate chrome traces the box the user actually sees, not just the glyphs.
+            const bounds = textObjectVisualBounds(display);
+            return (
+              <TextAnnotationEditor
+                left={bounds.x * zoom}
+                top={bounds.y * zoom}
+                width={bounds.w * zoom}
+                height={bounds.h * zoom}
+                rotation={display.rotation}
+                fontSize={display.fontSize}
+                onMoveEnd={(newLeft, newTop) => onEditObject(primarySelectedObject, { ...primarySelectedObject, x: newLeft / zoom, y: newTop / zoom })}
+                onResizeEnd={(newFontSize) => {
+                  // The drag itself is center-anchored (TextAnnotationEditor scales its wrapper
+                  // outward from the box's own center), but fontSize alone doesn't determine
+                  // position - x/y is the text's top-left, and a bigger/smaller fontSize means a
+                  // bigger/smaller measured box anchored at that same top-left. Without also
+                  // shifting x/y here to keep the *center* fixed, the commit would visibly jump
+                  // the instant the handle is released, snapping from "grew outward from center"
+                  // (what the drag just showed) to "grew from the old top-left" (what actually
+                  // rendered) - recomputing the new bounds and re-deriving x/y from the same
+                  // center the drag preview used keeps the two in agreement.
+                  const before = textObjectBounds(primarySelectedObject);
+                  const centerX = before.x + before.w / 2;
+                  const centerY = before.y + before.h / 2;
+                  const after = textObjectBounds({ ...primarySelectedObject, fontSize: newFontSize });
+                  onEditObject(primarySelectedObject, {
+                    ...primarySelectedObject,
+                    fontSize: newFontSize,
+                    x: centerX - after.w / 2,
+                    y: centerY - after.h / 2,
+                  });
+                }}
+                onRotateEnd={(newRotation) => onEditObject(primarySelectedObject, { ...primarySelectedObject, rotation: newRotation })}
+                onDelete={() => onDeleteObject(primarySelectedObject)}
+                onDoubleClick={() => beginEditExistingText(primarySelectedObject)}
+              />
+            );
+          })()}
+
+        {/* Multi-selection: a plain dashed box per selected object (via getSelectionBounds, which
+            - unlike getObjectBounds above - covers every object type) tracking live position
+            during a group drag - no resize handles, since multi-object resize isn't supported. */}
+        {tool === "select" &&
+          selectedObjectIds.length > 1 &&
+          selectedObjects.map((o) => {
+            const bounds = getSelectionBounds(liveById?.get(o.id) ?? o);
+            return (
+              <div
+                key={o.id}
+                className="absolute border-2 border-dashed border-blue-400 pointer-events-none"
+                style={{ left: bounds.x * zoom, top: bounds.y * zoom, width: bounds.w * zoom, height: bounds.h * zoom }}
+              />
+            );
+          })}
+
+        {/* Rubber-band marquee - a translucent fill so the drag gesture itself is visible, not
+            just its eventual result. */}
+        {marqueeRect && (
+          <div
+            className="absolute bg-blue-400/10 border border-blue-400 pointer-events-none"
+            style={{ left: marqueeRect.x * zoom, top: marqueeRect.y * zoom, width: marqueeRect.w * zoom, height: marqueeRect.h * zoom }}
+          />
+        )}
+
+        {/* Smart-guide lines - full-canvas-height/width so an alignment against something far from
+            the dragged object is still obviously visible, same convention Figma/PowerPoint use. */}
+        {snapGuides.map((g, i) =>
+          g.axis === "v" ? (
+            <div key={i} className="absolute w-px bg-pink-500 pointer-events-none" style={{ left: g.pos * zoom, top: 0, height: displaySize.height }} />
+          ) : (
+            <div key={i} className="absolute h-px bg-pink-500 pointer-events-none" style={{ top: g.pos * zoom, left: 0, width: displaySize.width }} />
+          )
+        )}
+
+        {tool === "crop" && cropRect && (
+          <>
+            <div className="absolute bg-black/60 pointer-events-none" style={{ left: 0, top: 0, right: 0, height: cropRect.y * zoom }} />
+            <div
+              className="absolute bg-black/60 pointer-events-none"
+              style={{ left: 0, top: (cropRect.y + cropRect.h) * zoom, right: 0, bottom: 0 }}
+            />
+            <div
+              className="absolute bg-black/60 pointer-events-none"
+              style={{ left: 0, top: cropRect.y * zoom, width: cropRect.x * zoom, height: cropRect.h * zoom }}
+            />
+            <div
+              className="absolute bg-black/60 pointer-events-none"
+              style={{ left: (cropRect.x + cropRect.w) * zoom, top: cropRect.y * zoom, right: 0, height: cropRect.h * zoom }}
+            />
+            <div
+              className="absolute outline outline-2 outline-white pointer-events-none"
+              style={{ left: cropRect.x * zoom, top: cropRect.y * zoom, width: cropRect.w * zoom, height: cropRect.h * zoom }}
+            />
+          </>
+        )}
+      </div>
+
+      {textEditor &&
+        (() => {
+          // Sized from the actual measured content (the same measureTextWidth renderTextObject's
+          // own bounds use) rather than the browser's default ~20-column textarea width, which
+          // read as "the text tool barely has a box" - especially with wrap="off" below, where a
+          // too-narrow box meant even the placeholder scrolled out of view instead of just being
+          // visible. Falls back to a fixed placeholder-sized width while empty, since there's no
+          // typed content yet to measure against.
+          const bgPad = textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO : 0;
+          const contentNaturalWidth = textEditor.value
+            ? Math.max(...textEditor.value.split("\n").map((line) => measureTextWidth(line, fontSize, textBold)))
+            : measureTextWidth("Type text…", fontSize, textBold);
+          const widthPx = Math.max(96, (contentNaturalWidth + bgPad * 2) * zoom + 16);
+          return (
+            <textarea
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              // Native textarea line-wrap would silently insert visual line breaks that
+              // renderTextObject (no auto-wrap - see TextObject's own doc comment) never draws,
+              // so what's on screen while typing would stop matching what commits. "off" keeps
+              // every line exactly as typed - the box is now sized to actually fit it (see
+              // widthPx above) rather than needing this as its only real safety net, but it stays
+              // as a fallback for anything that briefly outgrows that measurement mid-keystroke.
+              wrap="off"
+              rows={Math.max(1, textEditor.value.split("\n").length)}
+              placeholder="Type text… (Shift+Enter for new line)"
+              title="Shift+Enter for a new line"
+              value={textEditor.value}
+              onChange={(e) => setTextEditor((prev) => (prev ? { ...prev, value: e.target.value } : prev))}
+              onKeyDown={(e) => {
+                // Stop the keystroke from also reaching ImageEditor.tsx's document-level shortcut
+                // handler - it already bails out via isEditableTarget(document.activeElement), but
+                // that only works once this input has actually taken focus; stopping propagation
+                // here is a second, unconditional guard against the same class of "two listeners
+                // on the same keydown" conflict the arrow-key file-navigation bug turned out to be.
+                e.stopPropagation();
+                if (e.key === "Enter" && !e.shiftKey) {
+                  // Plain Enter commits (matches the old single-line input's behavior); Shift+Enter
+                  // falls through to the textarea's own default action and inserts a line break.
+                  e.preventDefault();
+                  e.currentTarget.blur();
+                } else if (e.key === "Escape") {
+                  setTextEditor(null);
+                }
+              }}
+              onBlur={commitTextEditor}
+              // A real (if translucent) fill + visible ring, not just a bare transparent box -
+              // against a busy or dark screenshot a transparent input with only a thin ring was
+              // easy to miss entirely, which read as "clicking with the Text tool does nothing".
+              // When the Background style is on, this fill switches to the *actual* configured
+              // background color (at the same alpha renderTextObject draws with) instead of the
+              // generic neutral one, so what's on screen while typing already matches what
+              // commits to the canvas - otherwise there was no way to tell the background color
+              // setting was doing anything until after committing.
+              className={`absolute outline-none ring-2 ring-blue-500 rounded shadow-lg resize-none overflow-x-auto overflow-y-hidden ${
+                textBackground ? "" : "bg-white/90 dark:bg-neutral-900/90 px-1"
+              }`}
+              style={{
+                // When a background is armed, this input's padding previews
+                // textObjectVisualBounds's own pad (fontSize * TEXT_BACKGROUND_PADDING_RATIO,
+                // scaled to screen px) instead of a fixed CSS value - otherwise the backdrop
+                // would visibly jump in size the instant the edit commits, since the committed
+                // box is padded proportionally to fontSize while a flat px-1 isn't. left/top
+                // shift outward by that same pad so the input's padded edge (not its unpadded
+                // one) lands where the committed background's edge will.
+                left: textEditor.x * zoom - (textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : 0),
+                top: textEditor.y * zoom - (textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : 0),
+                padding: textBackground ? fontSize * TEXT_BACKGROUND_PADDING_RATIO * zoom : undefined,
+                // Floored at 14 CSS px regardless of zoom - these are typically 4K screenshots
+                // opened fit-to-window at well under 100% zoom, where fontSize*zoom alone shrinks
+                // the caret and typed characters down to a couple of CSS pixels: technically
+                // present, but unreadable and effectively "the text tool doesn't work". The
+                // committed object itself still uses the real, unfloored fontSize (see
+                // commitTextEditor/renderTextObject) - only this live editing affordance gets
+                // the floor.
+                fontSize: Math.max(14, fontSize * zoom),
+                // Same constant renderTextObject uses for the committed object, not a second
+                // hardcoded copy of the string - keeps the live editor's font guaranteed
+                // identical to what's about to be drawn to canvas rather than two literals that
+                // could silently drift apart.
+                fontFamily: TEXT_FONT_FAMILY,
+                fontWeight: textBold ? 700 : 400,
+                lineHeight: TEXT_LINE_HEIGHT_MULTIPLIER,
+                whiteSpace: "pre",
+                color,
+                backgroundColor: textBackground ? hexToRgba(textBackgroundColor, TEXT_BACKGROUND_ALPHA) : undefined,
+                width: widthPx,
+                zIndex: 20,
+              }}
+            />
+          );
+        })()}
+
+      {stepEditor && (
+        <input
+          type="text"
+          inputMode="numeric"
+          autoFocus
+          autoComplete="off"
+          // Selected (not just focused) on mount so typing a replacement digit doesn't require
+          // manually clearing the existing number first - the whole point of double-clicking a
+          // badge that already has one.
+          onFocus={(e) => e.currentTarget.select()}
+          value={stepEditor.value}
+          onChange={(e) => setStepEditor((prev) => (prev ? { ...prev, value: e.target.value.replace(/[^0-9]/g, "") } : prev))}
+          onKeyDown={(e) => {
+            e.stopPropagation(); // same global-shortcut guard the text editor's own input uses
+            if (e.key === "Enter") e.currentTarget.blur();
+            else if (e.key === "Escape") setStepEditor(null);
+          }}
+          onBlur={commitStepEditor}
+          className="absolute outline-none ring-2 ring-blue-500 rounded-full text-center font-bold text-white bg-transparent"
+          style={{
+            left: stepEditor.x * zoom,
+            top: stepEditor.y * zoom,
+            width: stepEditor.w * zoom,
+            height: stepEditor.h * zoom,
+            // Matches renderStepObject's own number size (radius * 1.1, radius = shorter side / 2)
+            // and floored the same way the text editor's own font size is, for the same reason -
+            // otherwise a small badge at low zoom shrinks its retyped digits to unreadable.
+            fontSize: Math.max(14, (Math.min(stepEditor.w, stepEditor.h) / 2) * 1.1 * zoom),
+            fontFamily: TEXT_FONT_FAMILY,
+            zIndex: 20,
+          }}
+        />
+      )}
+    </div>
+  );
+});
+
+export default ImageEditorCanvas;

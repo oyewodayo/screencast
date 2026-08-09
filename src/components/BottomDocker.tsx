@@ -9,6 +9,7 @@ import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
+import { ActiveClipEffects } from "../utils/videoColorFilters";
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -46,6 +47,9 @@ interface Props {
   // Video-only: reports the timeline's current output-timeline position upward, threaded
   // straight through to FileToolsDocker/VideoTimelineDocker.
   onOutputTimeChange?: (outputTime: number) => void;
+  // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
+  // onOutputTimeChange above.
+  onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // FileToolsDocker/VideoTimelineDocker.
   selectedOverlayId?: string | null;
@@ -58,9 +62,20 @@ interface Props {
   onSelectImageOverlay?: (id: string | null) => void;
   isPlacingImage?: boolean;
   onToggleArmPlaceImage?: () => void;
+  // Video-only: blur-overlay selection/placement state, same threading as the text/image-overlay
+  // props above.
+  selectedBlurOverlayId?: string | null;
+  onSelectBlurOverlay?: (id: string | null) => void;
+  isPlacingBlur?: boolean;
+  onToggleArmPlaceBlur?: () => void;
+  // Video-only: on-canvas crop-tool arm state, same threading as the overlay props above.
+  isCroppingClip?: boolean;
+  onToggleCroppingClip?: () => void;
   handleFolderSettings: () => void;
   handleGoHome: () => void;
   isHome: boolean;
+  handleOpenBoard: () => void;
+  isBoard: boolean;
   handleOpenSettings: () => void;
   handleOpenExternalFile: () => void;
   showFileList: boolean;
@@ -128,6 +143,7 @@ const BottomDocker = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  onActiveClipChange,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -136,9 +152,17 @@ const BottomDocker = ({
   onSelectImageOverlay,
   isPlacingImage,
   onToggleArmPlaceImage,
+  selectedBlurOverlayId,
+  onSelectBlurOverlay,
+  isPlacingBlur,
+  onToggleArmPlaceBlur,
+  isCroppingClip,
+  onToggleCroppingClip,
   handleFolderSettings,
   handleGoHome,
   isHome,
+  handleOpenBoard,
+  isBoard,
   handleOpenSettings,
   handleOpenExternalFile,
   showFileList,
@@ -407,6 +431,8 @@ const BottomDocker = ({
             handleFolderSettings={handleFolderSettings}
             handleGoHome={handleGoHome}
             isHome={isHome}
+            handleOpenBoard={handleOpenBoard}
+            isBoard={isBoard}
             handleOpenSettings={handleOpenSettings}
             handleOpenExternalFile={handleOpenExternalFile}
             handleVideoOverlayAction={handleVideoOverlayAction}
@@ -434,6 +460,7 @@ const BottomDocker = ({
             pendingTimelineInsert={pendingTimelineInsert}
             onTimelineInsertHandled={onTimelineInsertHandled}
             onOutputTimeChange={onOutputTimeChange}
+            onActiveClipChange={onActiveClipChange}
             selectedOverlayId={selectedOverlayId}
             onSelectOverlay={onSelectOverlay}
             isPlacingText={isPlacingText}
@@ -442,6 +469,12 @@ const BottomDocker = ({
             onSelectImageOverlay={onSelectImageOverlay}
             isPlacingImage={isPlacingImage}
             onToggleArmPlaceImage={onToggleArmPlaceImage}
+            selectedBlurOverlayId={selectedBlurOverlayId}
+            onSelectBlurOverlay={onSelectBlurOverlay}
+            isPlacingBlur={isPlacingBlur}
+            onToggleArmPlaceBlur={onToggleArmPlaceBlur}
+            isCroppingClip={isCroppingClip}
+            onToggleCroppingClip={onToggleCroppingClip}
           />
         ) : (
           <RecordingDocker

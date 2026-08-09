@@ -10,11 +10,24 @@ interface ColorSwatchPickerProps {
   size?: "sm" | "md";
 }
 
-const PALETTE = ["#1a1a1a", "#e03131", "#f08c00", "#ffd43b", "#2f9e44", "#1971c2", "#9c36b5"];
+// Black and white bookend the palette deliberately - they're the two most-reached-for colors for
+// a *background* swatch specifically (a dark backdrop behind light text, or a light one behind
+// dark text, are by far the two most common combinations), but having both as one-click options
+// benefits every other color picker this same component drives too (pen/highlighter/arrow/shape
+// color), not just backgrounds.
+const PALETTE = ["#1a1a1a", "#ffffff", "#e03131", "#f08c00", "#ffd43b", "#2f9e44", "#1971c2", "#9c36b5"];
 
+// A fixed white ring reads fine as long as this only ever sits on the dark, translucent PDF
+// toolbar it was originally built for - it becomes a real bug anywhere lighter (the image editor's
+// Style panel is a near-white surface in light mode) *and* now that white itself is a selectable
+// swatch (see PALETTE above): a white ring around a white fill on a near-white panel makes the
+// whole trigger disappear, which is exactly what made "I picked white and now I can't tell what
+// color is even selected" possible. A theme-aware neutral ring instead of a color-matched one
+// stays visible against light panels, dark panels, and every swatch color in between.
+const TRIGGER_RING_CLASS = "ring-black/25 dark:ring-white/40";
 const TRIGGER_SIZE_CLASSES: Record<"sm" | "md", string> = {
-  sm: "w-4 h-4 ring-1",
-  md: "w-6 h-6 ring-2",
+  sm: `w-4 h-4 ring-1 ${TRIGGER_RING_CLASS}`,
+  md: `w-6 h-6 ring-2 ${TRIGGER_RING_CLASS}`,
 };
 
 // Positioned via a portal + `position: fixed` computed from the trigger button's own
@@ -58,7 +71,7 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
         // whatever the caller does on blur. click still fires normally afterward.
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => (open ? setOpen(false) : openPicker())}
-        className={`rounded-full ring-white shadow-sm transition-transform duration-150 hover:scale-110 ${TRIGGER_SIZE_CLASSES[size]}`}
+        className={`rounded-full shadow-sm transition-transform duration-150 hover:scale-110 ${TRIGGER_SIZE_CLASSES[size]}`}
         style={{ backgroundColor: color }}
       />
       {open &&
@@ -80,7 +93,12 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
                   setOpen(false);
                 }}
                 className={`w-6 h-6 rounded-full transition-transform duration-150 hover:scale-110 ${
-                  swatch.toLowerCase() === color.toLowerCase() ? "ring-2 ring-blue-500 ring-offset-2 ring-offset-white/90 dark:ring-offset-neutral-800" : "ring-1 ring-black/[0.06] dark:ring-white/20"
+                  swatch.toLowerCase() === color.toLowerCase()
+                    ? "ring-2 ring-blue-500 ring-offset-2 ring-offset-white/90 dark:ring-offset-neutral-800"
+                    // Stronger than before (was ring-black/[0.06], nearly invisible against the
+                    // popover's own near-white background) - needed once white joined the palette
+                    // above, or an unselected white swatch reads as an empty gap rather than a color.
+                    : "ring-1 ring-black/[0.18] dark:ring-white/25"
                 }`}
                 style={{ backgroundColor: swatch }}
               />

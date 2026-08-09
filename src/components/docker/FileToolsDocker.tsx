@@ -14,6 +14,7 @@ import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory
 import { FILE_TOOLS_COPY } from "./fileToolsConfig";
 import VideoTimelineDocker from "./VideoTimelineDocker";
 import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
+import { ActiveClipEffects } from "../../utils/videoColorFilters";
 
 // `path` here is always the real filesystem path (never the asset:// URL used for playback) —
 // every action below (ffprobe, rename, reveal, trash) needs the real path, same convention as
@@ -68,6 +69,9 @@ interface FileToolsDockerProps {
   // Video-only: reports the timeline's current output-timeline position upward, threaded
   // straight through to VideoTimelineDocker - see its own prop doc comment.
   onOutputTimeChange?: (outputTime: number) => void;
+  // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
+  // onOutputTimeChange above.
+  onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // VideoTimelineDocker - see its own prop doc comments.
   selectedOverlayId?: string | null;
@@ -80,6 +84,15 @@ interface FileToolsDockerProps {
   onSelectImageOverlay?: (id: string | null) => void;
   isPlacingImage?: boolean;
   onToggleArmPlaceImage?: () => void;
+  // Video-only: blur-overlay selection/placement state, same threading as the text/image-overlay
+  // props above.
+  selectedBlurOverlayId?: string | null;
+  onSelectBlurOverlay?: (id: string | null) => void;
+  isPlacingBlur?: boolean;
+  onToggleArmPlaceBlur?: () => void;
+  // Video-only: on-canvas crop-tool arm state, same threading as the overlay props above.
+  isCroppingClip?: boolean;
+  onToggleCroppingClip?: () => void;
 }
 
 // The file-type-specific alternative to RecordingDocker (see BottomDocker's dockerMode switch):
@@ -104,6 +117,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  onActiveClipChange,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -112,6 +126,12 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onSelectImageOverlay,
   isPlacingImage,
   onToggleArmPlaceImage,
+  selectedBlurOverlayId,
+  onSelectBlurOverlay,
+  isPlacingBlur,
+  onToggleArmPlaceBlur,
+  isCroppingClip,
+  onToggleCroppingClip,
 }) => {
   const category = getFileCategory(file.name);
   const copy = category ? FILE_TOOLS_COPY[category] : null;
@@ -135,6 +155,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         pendingTimelineInsert={pendingTimelineInsert}
         onTimelineInsertHandled={onTimelineInsertHandled}
         onOutputTimeChange={onOutputTimeChange}
+        onActiveClipChange={onActiveClipChange}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={onSelectOverlay}
         isPlacingText={isPlacingText}
@@ -143,6 +164,12 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onSelectImageOverlay={onSelectImageOverlay}
         isPlacingImage={isPlacingImage}
         onToggleArmPlaceImage={onToggleArmPlaceImage}
+        selectedBlurOverlayId={selectedBlurOverlayId}
+        onSelectBlurOverlay={onSelectBlurOverlay}
+        isPlacingBlur={isPlacingBlur}
+        onToggleArmPlaceBlur={onToggleArmPlaceBlur}
+        isCroppingClip={isCroppingClip}
+        onToggleCroppingClip={onToggleCroppingClip}
       />
     );
   }

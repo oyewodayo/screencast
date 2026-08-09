@@ -12,13 +12,23 @@
 // far cheaper than a full-frame canvas per overlay, and ffmpeg positions it via the returned
 // xPx/yPx either way.
 import { invoke } from "@tauri-apps/api/tauri";
-import { ImageOverlay, TextOverlay, TextOverlayCornerStyle } from "./videoEditTypes";
+import { BlurOverlay, ImageOverlay, TextOverlay, TextOverlayCornerStyle } from "./videoEditTypes";
 import { TEXT_FONT_FAMILY, measureTextBlock } from "../handlers/pdfAnnotationHandlers";
 
 export interface RenderedOverlayPng {
   dataUrl: string;
   xPx: number;
   yPx: number;
+}
+
+// Same shape as RenderedOverlayPng, plus the mask's own bounding-box size - a blur mask (unlike a
+// text/image overlay PNG) needs its width/height told to Rust explicitly, since export_trimmed_video
+// crops that exact region out of the *live video* stream (a completely different ffmpeg input than
+// the mask PNG itself), so it can't just read the crop size off the decoded PNG the way `overlay`
+// implicitly sizes itself off an image input.
+export interface RenderedBlurMaskPng extends RenderedOverlayPng {
+  widthPx: number;
+  heightPx: number;
 }
 
 function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
@@ -270,5 +280,69 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
     dataUrl: canvas.toDataURL("image/png"),
     xPx: Math.round(centerXPx - boundingWidth / 2),
     yPx: Math.round(centerYPx - boundingHeight / 2),
+  };
+}
+
+// A plain axis-aligned rectangle (the common case) needs no mask at all - export_trimmed_video's
+// crop+boxblur+overlay chain already produces exactly that shape on its own. Ellipse, rounded
+// corners, and rotation can't be expressed as ffmpeg filter *parameters* the way a plain crop can,
+// so they share one real solution instead of three: render the shape as a black/white mask
+// (renderBlurMaskToPng below) and apply it via ffmpeg's alphamerge - this predicate is just "does
+// this overlay actually need that".
+export function blurNeedsMask(o: BlurOverlay): boolean {
+  return o.shape === "ellipse" || !!(o.cornerRadius && o.cornerRadius > 0) || !!(o.rotation && o.rotation !== 0);
+}
+
+// Renders a BlurOverlay's shape as a solid-white-on-transparent mask PNG, sized/positioned to just
+// the shape's own (rotation-aware) bounding box (same "canvas per overlay, not per frame" economy
+// as renderTextOverlayToPng/renderImageOverlayToPng) - export_trimmed_video crops that same
+// bounding box out of the live video, blurs it, and uses this mask's luma as its alpha channel
+// (ffmpeg's `alphamerge`) before compositing back, so only the masked-in shape stays blurred and
+// the rest of the crop reverts to the original (unblurred) pixels via the underlying `overlay`.
+// Never called for a plain rectangle (see blurNeedsMask) - only exists to answer "what non-
+// rectangular region, in pixels, does this overlay's current shape actually cover". Same rotation-
+// aware bounding-box + translate/rotate-around-center technique as renderImageOverlayToPng above
+// (see its own comment for why the canvas has to be sized to the *rotated* bounding box, and why
+// xPx/yPx get recentered afterward).
+export function renderBlurMaskToPng(overlay: BlurOverlay, framePixelWidth: number, framePixelHeight: number): RenderedBlurMaskPng | null {
+  const w = overlay.width * framePixelWidth;
+  const h = overlay.height * framePixelHeight;
+  if (w <= 0 || h <= 0) return null;
+
+  const rotationRad = ((overlay.rotation ?? 0) * Math.PI) / 180;
+  const cos = Math.abs(Math.cos(rotationRad));
+  const sin = Math.abs(Math.sin(rotationRad));
+  const boundingWidth = Math.max(1, Math.ceil(w * cos + h * sin));
+  const boundingHeight = Math.max(1, Math.ceil(w * sin + h * cos));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = boundingWidth;
+  canvas.height = boundingHeight;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  ctx.save();
+  ctx.translate(boundingWidth / 2, boundingHeight / 2);
+  ctx.rotate(rotationRad);
+  ctx.fillStyle = "#ffffff";
+  if (overlay.shape === "ellipse") {
+    ctx.beginPath();
+    ctx.ellipse(0, 0, w / 2, h / 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    roundedRectPath(ctx, -w / 2, -h / 2, w, h, (overlay.cornerRadius ?? 0) * framePixelHeight);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  const centerXPx = overlay.x * framePixelWidth + w / 2;
+  const centerYPx = overlay.y * framePixelHeight + h / 2;
+
+  return {
+    dataUrl: canvas.toDataURL("image/png"),
+    xPx: Math.round(centerXPx - boundingWidth / 2),
+    yPx: Math.round(centerYPx - boundingHeight / 2),
+    widthPx: boundingWidth,
+    heightPx: boundingHeight,
   };
 }

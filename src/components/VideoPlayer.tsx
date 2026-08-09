@@ -26,6 +26,8 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
+import { ActiveClipEffects, cropStaticTransform, cssFilterForColorPreset, kenBurnsTransform } from '../utils/videoColorFilters';
+import { ClipCrop } from '../utils/videoEditTypes';
 
 
 
@@ -102,6 +104,12 @@ interface VideoPlayerProps {
   // itself is actually set to.
   trackVolume?: number; // 0..1, defaults to 1
   trackMuted?: boolean;
+  // The currently active clip's own color grade/Ken Burns fields (VideoTimelineDocker's
+  // onActiveClipChange, threaded through by Dashboard) - null/undefined means "no clip tracked
+  // yet or neither effect set", same as trackVolume/trackMuted this component stays fully clip-
+  // unaware otherwise, just applying whatever small descriptor it's handed straight to the
+  // <video> element's own CSS.
+  activeClipEffects?: ActiveClipEffects | null;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -121,11 +129,54 @@ export interface VideoPlayerHandle {
   seek: (time: number) => void;
   togglePlay: () => void;
   loadSource: (src: string, seekTime: number) => void;
+  // Imperatively overrides the crop transform for as long as a crop drag is in progress (pass
+  // null once it ends) - ClipCropOverlay (Dashboard) calls this on every pointer move so the
+  // actual video pixels track the drag in real time instead of only jumping to the new crop once
+  // it round-trips through the store and back down as a new activeClipEffects prop. Deliberately
+  // NOT plumbed through React state/props: at drag-move frequency that would re-render Dashboard's
+  // whole tree every few milliseconds, so this writes video.style.transform directly instead, the
+  // same "bypass React for a hot path" idiom the Ken Burns rAF loop below already uses.
+  previewCropLive: (crop: ClipCrop | null) => void;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, title, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
+  // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
+  // (called both from the effect below AND imperatively from previewCropLive, whose own closure is
+  // frozen at mount - see the comment on the useImperativeHandle factory) always reads the current
+  // value instead of whatever activeClipEffects happened to be at mount time.
+  const activeClipEffectsRef = useRef(activeClipEffects);
+  activeClipEffectsRef.current = activeClipEffects;
+  // Non-null exactly while ClipCropOverlay has an in-progress drag - see previewCropLive below and
+  // VideoPlayerHandle's own doc comment on it.
+  const liveCropOverrideRef = useRef<ClipCrop | null>(null);
+
+  // The one function allowed to write video.style.transform for crop/Ken Burns (see the effect
+  // further down) - factored out so previewCropLive can also call it directly, outside of React's
+  // effect timing, for the drag-move hot path. Reads everything through refs (never a closed-over
+  // prop) so it stays correct no matter which render's closure instance ends up captured by
+  // useImperativeHandle's frozen (deps=[]) factory below - the same reasoning as togglePlay's own
+  // forward-reference comment, just via refs instead of "runs after the render body".
+  const applyCropAndKenBurns = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    const effects = activeClipEffectsRef.current;
+    const crop = liveCropOverrideRef.current ?? effects?.crop;
+    const kb = effects?.kenBurns;
+    if (!crop && !kb) {
+      video.style.transform = '';
+      return;
+    }
+    const cropTransform = crop ? cropStaticTransform(crop) : '';
+    if (!kb) {
+      video.style.transform = cropTransform;
+      return;
+    }
+    const duration = Math.max(0.01, effects!.sourceEnd - effects!.sourceStart);
+    const progress = Math.max(0, Math.min(1, (video.currentTime - effects!.sourceStart) / duration));
+    video.style.transform = `${cropTransform} ${kenBurnsTransform(kb, progress)}`.trim();
+  };
 
   useImperativeHandle(ref, () => ({
     seek: (time: number) => {
@@ -149,6 +200,10 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       video.addEventListener("loadedmetadata", onLoaded);
       video.src = src;
       video.load();
+    },
+    previewCropLive: (crop: ClipCrop | null) => {
+      liveCropOverrideRef.current = crop;
+      applyCropAndKenBurns();
     },
   }), []);
 
@@ -196,8 +251,6 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [showSkipTime, setShowSkipTime] = useState<boolean>(false);
 
-  // File and playlist state
-  const [currentFileTitle, setCurrentFileTitle] = useState<string>("");
 
   // Time and skip state
   const [currentTimeElement, setCurrentTimeElement] = useState<string>("0:00");
@@ -238,15 +291,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   useEffect(() => {
     if (!src) return;
 
-    const type = detectMediaType(src);
-    setMediaType(type);
-
-    if (type === 'image') {
-      setCurrentFileTitle(title || 'Image');
-      setIsPaused(true);
-      setIsPlaying(false);
-    }
-  }, [src, title]);
+    setMediaType(detectMediaType(src));
+  }, [src]);
 
   // Load and play the file once the <video> element for it is actually mounted.
   // (It only mounts for the 'video'/'audio' types, so this can't run in the same
@@ -432,6 +478,48 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   useEffect(() => {
     setVolume(videoRef.current, volume * (trackMuted ? 0 : trackVolume));
   }, [volume, trackVolume, trackMuted]);
+
+  // Live-preview color grade - a direct CSS `filter` write on the <video> element itself, the
+  // export-side counterpart being ffmpeg's eq/colorbalance/vignette chain (conversion.rs). Cleared
+  // (empty string) whenever there's no color filter, or it's explicitly "none", so switching away
+  // from a graded clip doesn't leave a stale filter applied.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const cf = activeClipEffects?.colorFilter;
+    video.style.filter = cf && cf.preset !== 'none' ? cssFilterForColorPreset(cf) : '';
+  }, [activeClipEffects?.colorFilter]);
+
+  // Live-preview crop + Ken Burns, combined into the one thing that's ever allowed to write
+  // video.style.transform (two separate effects each writing it independently would race and
+  // clobber each other) - applyCropAndKenBurns above does the actual writing, reusable here AND
+  // from previewCropLive's own drag-move hot path. Crop is a static "zoom window"
+  // (cropStaticTransform) composed BEFORE Ken Burns' own scale/translate - same order crop_chain
+  // runs before ken_burns_chain on the export side (conversion.rs), so Ken Burns zooms/pans within
+  // the already-cropped window rather than the original uncropped frame. Ken Burns still needs its
+  // own rAF loop reading video.currentTime directly (the 'timeupdate' event fires far too coarsely,
+  // ~4x/sec, for a smooth zoom/pan) - a crop with no Ken Burns is static and just gets written
+  // once, no rAF needed. Safe to transform the <video> element itself: it fills its container at
+  // 100%/100% with object-fit:contain handling the letterboxing, so scaling/translating the element
+  // scales/pans/zooms the picture uniformly around its own center exactly like these effects should.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    applyCropAndKenBurns();
+    const kb = activeClipEffects?.kenBurns;
+    if (!kb) return;
+    let raf: number;
+    const tick = () => {
+      applyCropAndKenBurns();
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      video.style.transform = '';
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);
@@ -800,10 +888,6 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 
 						<div className="duration-container">
-							{/* Was gated on currentFileTitle, internal state that's only ever populated for
-							    the 'image' media type (see the media-type-detection effect) - never set for
-							    ordinary video/audio playback, so this never actually rendered a time display
-							    for the app's main use case. Gating on `src` (a real playing-file signal) instead. */}
 							{src && (
 							<>
 								<div className="current-time">{currentTimeElement}</div>
@@ -908,19 +992,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 			)}
 
 			{
-				mediaType === 'image' ? (
-					<img
-					src={src}
-					alt={currentFileTitle}
-					style={{
-						width: '100%',
-						height: '100%',
-						objectFit: 'contain',
-						backgroundColor: '#000'
-					}}
-					/>
-				) : (
-					<>
+				<>
 					<video
 						ref={videoRef}
 						loop={loop}
@@ -958,8 +1030,22 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							{overlay(frameRect)}
 						</div>
 					)}
+					{activeClipEffects?.colorFilter?.preset === 'vignette' && frameRect && (
+						// No CSS `filter` primitive produces a vignette, unlike every other color preset
+						// above - a radial-gradient div positioned to the exact same frameRect the overlay
+						// render-prop div just above already uses is the simplest equivalent.
+						<div
+							className="absolute pointer-events-none"
+							style={{
+								left: frameRect.left,
+								top: frameRect.top,
+								width: frameRect.width,
+								height: frameRect.height,
+								background: `radial-gradient(ellipse at center, transparent ${40 - 15 * activeClipEffects.colorFilter.intensity}%, rgba(0,0,0,${(0.6 * activeClipEffects.colorFilter.intensity).toFixed(3)}) 100%)`,
+							}}
+						/>
+					)}
 					</>
-				)
 			}
     	</div>
 

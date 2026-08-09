@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdFlip } from "react-icons/md";
+import { MdBlurOn, MdFlip } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -35,12 +35,14 @@ import {
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AudioOverlay, Clip, ImageOverlay, TextOverlay } from "../../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, TextOverlay } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
 import { overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import AudioOverlayPopover from "./AudioOverlayPopover";
+import ClipEffectsPopover from "./ClipEffectsPopover";
+import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 
 const MIN_PX_PER_SEC = 8;
 const MAX_PX_PER_SEC = 200;
@@ -245,6 +247,11 @@ interface VideoTimelineDockerProps {
   // sibling subtree Dashboard owns) can time-gate which overlays are visible without duplicating
   // this component's own tricky SEEK_TOLERANCE_SEC-guarded active-clip tracking.
   onOutputTimeChange?: (outputTime: number) => void;
+  // Reports the ACTIVE clip's own color/Ken Burns effect fields upward, so VideoPlayer (mounted
+  // as a sibling subtree by Dashboard) can drive live CSS filter/transform on the <video> element
+  // without needing to know about clips at all - same "report state this component already tracks
+  // upward for a sibling to consume" reasoning as onOutputTimeChange just above.
+  onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
   // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
@@ -261,6 +268,20 @@ interface VideoTimelineDockerProps {
   onSelectImageOverlay?: (id: string | null) => void;
   isPlacingImage?: boolean;
   onToggleArmPlaceImage?: () => void;
+
+  // Blur-region selection/placement, same threading/reasoning as the text/image-overlay props above.
+  selectedBlurOverlayId?: string | null;
+  onSelectBlurOverlay?: (id: string | null) => void;
+  isPlacingBlur?: boolean;
+  onToggleArmPlaceBlur?: () => void;
+
+  // Whether the on-canvas crop tool (ClipCropOverlay, mounted as a sibling next to VideoPlayer by
+  // Dashboard) is armed - unlike text/image/blur, there's nothing to "place", it just shows/hides
+  // a drag window over whichever clip is currently on screen, so there's no onPlacementConsumed
+  // counterpart here; toggling this button again (or the same toggle inside ClipEffectsPopover) is
+  // what turns it back off.
+  isCroppingClip?: boolean;
+  onToggleCroppingClip?: () => void;
 }
 
 // The video-specific "file tools" docker: a scrubbable timeline (ruler + playhead + reorderable
@@ -286,6 +307,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  onActiveClipChange,
   selectedOverlayId = null,
   onSelectOverlay,
   isPlacingText = false,
@@ -294,6 +316,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onSelectImageOverlay,
   isPlacingImage = false,
   onToggleArmPlaceImage,
+  selectedBlurOverlayId = null,
+  onSelectBlurOverlay,
+  isPlacingBlur = false,
+  onToggleArmPlaceBlur,
+  isCroppingClip = false,
+  onToggleCroppingClip,
 }) => {
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -430,6 +458,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [pxPerSec]);
 
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  // Effects popover (color grade/Ken Burns/transition) for whichever clip is selected - opened
+  // from the toolbar's Effects button, closed the same "outside click" way AudioOverlayPopover
+  // closes itself, plus whenever selection moves to a different clip (below) so it never keeps
+  // pointing at a clip that's no longer selected.
+  const [effectsPopoverAnchor, setEffectsPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
+  const effectsButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    setEffectsPopoverAnchor(null);
+  }, [selectedClipId]);
 
   // Live drag state for resizing a single clip's start/end edge - delta-based (pixels moved since
   // the drag began, converted to a time delta) rather than re-deriving from click position, so it
@@ -677,6 +714,94 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // so only visibly show selection handles) while the playhead is inside their own time range
     // (see activeImageOverlays' overlaysActiveAt filter in VideoOverlayLayer.tsx), so selecting one
     // from the timeline while the playhead is elsewhere needs to bring the playhead along with it.
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
+      seekToOutputTime(liveStartTime);
+    }
+  };
+
+  // ---- Blur-overlay lane drag (move) / resize (retime) - same shape as the image-overlay block
+  // above, just against editStore's blur methods and onSelectBlurOverlay instead. ----------------
+  const [blurOverlayResizeDrag, setBlurOverlayResizeDrag] = useState<null | {
+    id: string;
+    edge: "start" | "end";
+    startClientX: number;
+    startValue: number;
+    oppositeBound: number;
+    liveValue: number;
+  }>(null);
+  const [blurOverlayDrag, setBlurOverlayDrag] = useState<null | {
+    id: string;
+    startClientX: number;
+    startTime: number;
+    duration: number;
+    isDragging: boolean;
+    liveStartTime: number;
+  }>(null);
+
+  const renderBlurOverlays: BlurOverlay[] = editStore.blurOverlays.map((o) => {
+    if (blurOverlayResizeDrag && o.id === blurOverlayResizeDrag.id) {
+      return blurOverlayResizeDrag.edge === "start" ? { ...o, startTime: blurOverlayResizeDrag.liveValue } : { ...o, endTime: blurOverlayResizeDrag.liveValue };
+    }
+    if (blurOverlayDrag && o.id === blurOverlayDrag.id) {
+      return { ...o, startTime: blurOverlayDrag.liveStartTime, endTime: blurOverlayDrag.liveStartTime + blurOverlayDrag.duration };
+    }
+    return o;
+  });
+
+  const beginBlurOverlayResizeDrag = (overlay: BlurOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    onSelectBlurOverlay?.(overlay.id);
+    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
+    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
+    setBlurOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
+  };
+  const handleBlurOverlayResizeDragMove = (e: React.PointerEvent) => {
+    if (!blurOverlayResizeDrag) return;
+    e.stopPropagation();
+    const deltaSec = (e.clientX - blurOverlayResizeDrag.startClientX) / pxPerSec;
+    const raw = blurOverlayResizeDrag.startValue + deltaSec;
+    const clamped =
+      blurOverlayResizeDrag.edge === "start"
+        ? Math.max(0, Math.min(raw, blurOverlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
+        : Math.min(totalOutputDuration, Math.max(raw, blurOverlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
+    setBlurOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
+  };
+  const endBlurOverlayResizeDrag = () => {
+    if (!blurOverlayResizeDrag) return;
+    const { id, edge, liveValue } = blurOverlayResizeDrag;
+    setBlurOverlayResizeDrag(null);
+    editStore.resizeBlurOverlayTime(id, edge, liveValue);
+  };
+
+  const beginBlurOverlayDrag = (overlay: BlurOverlay) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setBlurOverlayDrag({
+      id: overlay.id,
+      startClientX: e.clientX,
+      startTime: overlay.startTime,
+      duration: overlay.endTime - overlay.startTime,
+      isDragging: false,
+      liveStartTime: overlay.startTime,
+    });
+  };
+  const handleBlurOverlayDragMove = (e: React.PointerEvent) => {
+    if (!blurOverlayDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - blurOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    const deltaSec = (e.clientX - blurOverlayDrag.startClientX) / pxPerSec;
+    const liveStartTime = Math.max(0, Math.min(blurOverlayDrag.startTime + deltaSec, totalOutputDuration - blurOverlayDrag.duration));
+    setBlurOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endBlurOverlayDrag = () => {
+    if (!blurOverlayDrag) return;
+    const { id, isDragging, liveStartTime, duration } = blurOverlayDrag;
+    setBlurOverlayDrag(null);
+    if (isDragging) {
+      editStore.moveBlurOverlayTime(id, liveStartTime);
+    }
+    onSelectBlurOverlay?.(id);
     if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
       seekToOutputTime(liveStartTime);
     }
@@ -1023,6 +1148,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onSelectOverlay?.(editStore.duplicateTextOverlay(selectedOverlayId));
         } else if (selectedImageOverlayId) {
           onSelectImageOverlay?.(editStore.duplicateImageOverlay(selectedImageOverlayId));
+        } else if (selectedBlurOverlayId) {
+          onSelectBlurOverlay?.(editStore.duplicateBlurOverlay(selectedBlurOverlayId));
         } else if (selectedAudioOverlayId) {
           setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(selectedAudioOverlayId));
           setAudioPopoverAnchor(null);
@@ -1040,6 +1167,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         e.preventDefault();
         editStore.deleteImageOverlay(selectedImageOverlayId);
         onSelectImageOverlay?.(null);
+      } else if (selectedBlurOverlayId) {
+        e.preventDefault();
+        editStore.deleteBlurOverlay(selectedBlurOverlayId);
+        onSelectBlurOverlay?.(null);
       } else if (selectedAudioOverlayId) {
         e.preventDefault();
         editStore.deleteAudioOverlay(selectedAudioOverlayId);
@@ -1053,7 +1184,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedOverlayId, selectedImageOverlayId, selectedAudioOverlayId, selectedClipId, editStore]);
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAudioOverlayId, selectedClipId, editStore]);
 
   // Pressing Play after the sequence has already played through to the end needs to restart from
   // clip 0 - native <video> never auto-rewinds on .play() once it's reached "ended", it just sits
@@ -1201,6 +1332,20 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOutputTime]);
 
+  // Reports the ACTIVE clip's own color/Ken Burns fields upward - only recomputes when the active
+  // clip's identity or its own effect fields actually change (not every tick, unlike
+  // currentOutputTime above), since color/Ken Burns preview is driven off video.currentTime
+  // directly by VideoPlayer's own rAF loop, not by React state per frame.
+  const activeClip = renderClips[activeIndexForDisplay] as Clip | undefined;
+  useEffect(() => {
+    onActiveClipChange?.(
+      activeClip
+        ? { id: activeClip.id, sourceStart: activeClip.start, sourceEnd: activeClip.end, colorFilter: activeClip.colorFilter, kenBurns: activeClip.kenBurns, crop: activeClip.crop }
+        : null
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop]);
+
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
   // gating text/image overlays already use for visibility), otherwise playing/paused to match
@@ -1290,9 +1435,33 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoTrashOutline size={15} />
           </ActionButton>
           <div className="w-px h-5 bg-neutral-700 mx-1" />
-          <ToolButton title="Crop"><IoCropOutline size={15} /></ToolButton>
+          <ActionButton
+            title={selectedClipId ? (isCroppingClip ? "Stop cropping" : "Crop clip") : "Select a clip to crop"}
+            onClick={() => onToggleCroppingClip?.()}
+            disabled={!selectedClipId}
+          >
+            <IoCropOutline size={15} className={isCroppingClip ? "text-blue-400" : undefined} />
+          </ActionButton>
           <ToolButton title="Mirror"><MdFlip size={15} /></ToolButton>
-          <ToolButton title="Effects"><IoSparklesOutline size={15} /></ToolButton>
+          <button
+            ref={effectsButtonRef}
+            type="button"
+            title={selectedClipId ? "Clip effects" : "Select a clip to edit its effects"}
+            disabled={!selectedClipId}
+            onClick={() => {
+              if (effectsPopoverAnchor) {
+                setEffectsPopoverAnchor(null);
+                return;
+              }
+              const rect = effectsButtonRef.current?.getBoundingClientRect();
+              if (rect) setEffectsPopoverAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+              effectsPopoverAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoSparklesOutline size={15} />
+          </button>
           <ActionButton
             title={isPlacingText ? "Click the video preview to place text" : "Add text overlay"}
             onClick={() => onToggleArmPlaceText?.()}
@@ -1304,6 +1473,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             onClick={() => onToggleArmPlaceImage?.()}
           >
             <IoImageOutline size={15} className={isPlacingImage ? "text-amber-400" : undefined} />
+          </ActionButton>
+          <ActionButton
+            title={isPlacingBlur ? "Click the video preview to place a blur region" : "Add blur region"}
+            onClick={() => onToggleArmPlaceBlur?.()}
+          >
+            <MdBlurOn size={15} className={isPlacingBlur ? "text-sky-400" : undefined} />
           </ActionButton>
           <ActionButton
             title={isPlacingAudio ? "Choosing an audio file…" : "Add audio overlay"}
@@ -1605,6 +1780,27 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 );
               })}
 
+              {/* Transition markers - purely decorative (not interactive; edit the transition
+                  itself via the selected clip's Effects popover), at each boundary where the clip
+                  on the RIGHT has transitionIn set. Communicates the documented preview-vs-export
+                  gap (see ClipTransitionIn's own doc comment): live preview shows a hard cut here
+                  regardless of which transition style is picked - the real transition only
+                  renders in the exported file. */}
+              {renderClips.map((clip, i) => {
+                if (i === 0 || clip.id === "__pending__" || !clip.transitionIn) return null;
+                const left = outputStarts[i] * pxPerSec;
+                return (
+                  <div
+                    key={`transition-${clip.id}`}
+                    title={`${TRANSITION_PRESETS.find((p) => p.value === clip.transitionIn?.type)?.label ?? "Transition"} (preview shows a hard cut; export renders the real transition)`}
+                    className="absolute inset-y-1 w-4 -ml-2 flex items-center justify-center rounded bg-blue-500/80 z-10 pointer-events-none"
+                    style={{ left }}
+                  >
+                    <IoSwapHorizontalOutline size={10} className="text-white" />
+                  </div>
+                );
+              })}
+
               {/* Resize handles - two per real clip (start/end edges), kept as separate overlay
                   elements (not nested inside the draggable clip block above) so interacting with
                   them can't accidentally trigger that block's native drag-to-reorder. */}
@@ -1746,6 +1942,59 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               })}
             </div>
 
+            {/* Blur-overlay lane - same time-based chip/drag/resize pattern as the text/image
+                lanes above, sky-blue instead of purple/amber and with no filename/text to show. */}
+            <div className="h-8 relative border-t border-neutral-800">
+              {renderBlurOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
+                const isSelected = selectedBlurOverlayId === overlay.id;
+                return (
+                  <div
+                    key={overlay.id}
+                    onPointerDown={beginBlurOverlayDrag(overlay)}
+                    onPointerMove={handleBlurOverlayDragMove}
+                    onPointerUp={endBlurOverlayDrag}
+                    onPointerCancel={endBlurOverlayDrag}
+                    title="Blur region"
+                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center gap-1 px-2 text-[11px] text-white truncate cursor-grab active:cursor-grabbing ${
+                      isSelected ? "border-dashed border-white" : "border-sky-400"
+                    }`}
+                    style={{ left, width }}
+                  >
+                    <MdBlurOn size={12} className="shrink-0" />
+                    Blur
+                  </div>
+                );
+              })}
+              {renderBlurOverlays.map((overlay) => {
+                const left = overlay.startTime * pxPerSec;
+                const width = (overlay.endTime - overlay.startTime) * pxPerSec;
+                return (
+                  <React.Fragment key={`blur-overlay-resize-${overlay.id}`}>
+                    <div
+                      onPointerDown={beginBlurOverlayResizeDrag(overlay, "start")}
+                      onPointerMove={handleBlurOverlayResizeDragMove}
+                      onPointerUp={endBlurOverlayResizeDrag}
+                      onPointerCancel={endBlurOverlayResizeDrag}
+                      title="Drag to retime this blur region's start"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-sky-400 hover:bg-sky-300 rounded cursor-ew-resize z-10"
+                      style={{ left }}
+                    />
+                    <div
+                      onPointerDown={beginBlurOverlayResizeDrag(overlay, "end")}
+                      onPointerMove={handleBlurOverlayResizeDragMove}
+                      onPointerUp={endBlurOverlayResizeDrag}
+                      onPointerCancel={endBlurOverlayResizeDrag}
+                      title="Drag to retime this blur region's end"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-sky-400 hover:bg-sky-300 rounded cursor-ew-resize z-10"
+                      style={{ left: left + width }}
+                    />
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
             {/* Audio-overlay lane - same time-based chip pattern as the text/image lanes above,
                 teal instead of purple/amber, with a real waveform instead of an icon+filename and
                 edge handles that trim into the source (resizeAudioOverlayTime) instead of just
@@ -1808,6 +2057,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </div>
         </div>
       </div>
+
+      {selectedClipId &&
+        effectsPopoverAnchor &&
+        (() => {
+          const clipIndex = editStore.clips.findIndex((c) => c.id === selectedClipId);
+          const clip = editStore.clips[clipIndex];
+          if (!clip) return null;
+          return (
+            <ClipEffectsPopover
+              clip={clip}
+              hasPrecedingClip={clipIndex > 0}
+              anchor={effectsPopoverAnchor}
+              onUpdate={(patch) => editStore.updateClipEffects(clip.id, patch)}
+              onClose={() => setEffectsPopoverAnchor(null)}
+              isCropping={isCroppingClip}
+              onToggleCropping={() => onToggleCroppingClip?.()}
+            />
+          );
+        })()}
 
       {selectedAudioOverlayId &&
         audioPopoverAnchor &&

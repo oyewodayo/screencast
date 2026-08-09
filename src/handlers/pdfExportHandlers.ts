@@ -16,7 +16,9 @@ import { preloadImage } from "../utils/imageObjectCache";
 // match any particular display).
 const EXPORT_SCALE = 2;
 
-function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
+// Exported for reuse by the image editor's own "Save a copy" flow (imageEditHandlers.ts /
+// ImageEditor.tsx) - same canvas-to-PNG-bytes encode, no PDF-specific behavior in here.
+export function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (!blob) {

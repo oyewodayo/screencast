@@ -13,6 +13,6 @@ export interface FileToolsCopy {
 export const FILE_TOOLS_COPY: Record<FileCategory, FileToolsCopy> = {
   video: { heading: "Video tools", blurb: "More editing tools (trim, speed, extract audio) are coming here." },
   audio: { heading: "Audio tools", blurb: "More editing tools (trim, fade, normalize) are coming here." },
-  image: { heading: "Image tools", blurb: "More editing tools (crop, rotate, resize) are coming here." },
+  image: { heading: "Image tools", blurb: "Crop, draw, blur, and adjust from the image tools panel (wrench icon, top right)." },
   pdf: { heading: "PDF tools", blurb: "Use the pen, highlighter, text, and outline tools in the toolbar above." },
 };

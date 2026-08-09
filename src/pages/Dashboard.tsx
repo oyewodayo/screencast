@@ -10,13 +10,27 @@ import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortc
 import { formatFileName } from "../utils/Formater";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import useVideoEditStore from "../hooks/useVideoEditStore";
+import useImageEditStore from "../hooks/useImageEditStore";
 import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
+import ClipCropOverlay from "../components/video/ClipCropOverlay";
+import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
+import ImageEditor from "../components/ImageEditor";
+import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, isConvertibleCategory } from "../utils/fileCategory";
+import {
+  MAX_HOME_SCREEN_FILES,
+  getPinnedPaths,
+  getRecentPaths,
+  togglePin,
+  recordFileOpened,
+  repathFile,
+  forgetFile,
+} from "../utils/homeScreenFiles";
 import {
   IoVideocam,
   IoMusicalNotes,
@@ -32,6 +46,10 @@ import {
   IoFolderOutline,
   IoAddCircleOutline,
   IoBuildOutline,
+  IoPin,
+  IoRefresh,
+  IoSearch,
+  IoClose,
 } from "react-icons/io5";
 import { MdCreateNewFolder } from "react-icons/md";
 
@@ -183,7 +201,21 @@ const Dashboard = () => {
   const [files, setFiles] = useState<FileMap>({});
   const [activeFileCategory, setActiveFileCategory] = useState<SidebarTab>("video");
   const [trashItems, setTrashItems] = useState<TrashEntry[]>([]);
+  // Sidebar file-list search - filters the active category's files (and trash) by name, case-
+  // insensitive substring match. Kept as a single query shared across every tab/trash rather than
+  // per-tab state, same as a normal file explorer's search box.
+  const [fileSearchQuery, setFileSearchQuery] = useState<string>("");
   const [openMenu, setOpenMenu] = useState<string | null>(null);
+  // Pinned + recently-opened file paths behind the home screen's "From your library" preview —
+  // see utils/homeScreenFiles.ts. Mirrored into React state (rather than read fresh from
+  // localStorage on every render) so toggling a pin or opening a file re-renders that preview.
+  const [pinnedPaths, setPinnedPaths] = useState<string[]>(() => getPinnedPaths());
+  const [recentPaths, setRecentPaths] = useState<string[]>(() => getRecentPaths());
+  // Which Board screen (if any) is showing in the main content pane - null means Board mode is
+  // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
+  const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
+  // Spins the sidebar's manual refresh icon while a refresh is in flight — see handleRefreshFiles.
+  const [isRefreshingFiles, setIsRefreshingFiles] = useState<boolean>(false);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>("");
   // "Move to ▸" flyout inside a file's 3-dot menu — keyed by file.path, separate from openMenu
@@ -264,14 +296,38 @@ const Dashboard = () => {
   const editStore = useVideoEditStore(
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
+  // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
+  // load_image_edit_state invoke.
+  const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
+  const imageEditStore = useImageEditStore(
+    isImageFileSelected ? selectedFile!.sourcePath : undefined,
+    isImageFileSelected ? selectedFile!.path : undefined
+  );
   // Text-overlay UI state - lifted here (rather than local to either subtree) because it's shared
   // by two siblings: the preview-layer editor mounted next to VideoPlayer below, and the timeline
   // lane's chips inside VideoTimelineDocker (reached via BottomDocker/FileToolsDocker).
   const [currentOutputTime, setCurrentOutputTime] = useState<number>(0);
+  // The active clip's own color grade/Ken Burns fields, reported up by VideoTimelineDocker
+  // (onActiveClipChange) and threaded straight into VideoPlayer (activeClipEffects) - same "held
+  // in Dashboard state, passed to both the timeline docker and the sibling player" shape as
+  // currentOutputTime just above.
+  const [activeClipEffects, setActiveClipEffects] = useState<ActiveClipEffects | null>(null);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [isPlacingText, setIsPlacingText] = useState<boolean>(false);
   const [selectedImageOverlayId, setSelectedImageOverlayId] = useState<string | null>(null);
   const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
+  const [selectedBlurOverlayId, setSelectedBlurOverlayId] = useState<string | null>(null);
+  const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
+  // Arms the on-canvas crop tool (ClipCropOverlay, mounted as a sibling to VideoOverlayLayer just
+  // below) - unlike the placement tools above, there's no "consumed" step, it just shows/hides a
+  // drag window over whichever clip activeClipEffects currently points at. Deliberately NOT reset
+  // when the active CLIP changes within the same file's timeline (playhead crossing a cut, or a
+  // new clip getting selected) - it's meant to follow whichever clip is on screen, per its own
+  // comment above. Only reset when the open FILE itself changes, below.
+  const [isCroppingClip, setIsCroppingClip] = useState<boolean>(false);
+  useEffect(() => {
+    setIsCroppingClip(false);
+  }, [selectedFile?.path]);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
@@ -738,11 +794,27 @@ const setScreen = () => {
 		}
 	};
 
+	// Manual escape hatch for the sidebar's "Files:" refresh button — the backend also watches the
+	// Briefcast folder itself and emits refresh-file-list on external changes (see the
+	// 'refresh-file-list' listener below), but this covers watcher failures/platforms without one,
+	// and just gives an immediate, visible "yes, it's current" action for the user to reach for.
+	const handleRefreshFiles = async () => {
+		setIsRefreshingFiles(true);
+		try {
+			await Promise.all([handleDirectoryFiles(), loadTrash()]);
+		} finally {
+			setIsRefreshingFiles(false);
+		}
+	};
+
 	const handleDeleteFile = async (file: FileEntry) => {
 		try {
 			await invoke("move_to_trash", { path: file.path });
 			if (selectedFile?.sourcePath === file.path) setSelectedFile(null);
 			setOpenMenu(null);
+			const { pinned, recent } = forgetFile(file.path);
+			setPinnedPaths(pinned);
+			setRecentPaths(recent);
 			await handleDirectoryFiles();
 			setMessage(`Moved to trash: ${formatFileName(file.name)}`);
 		} catch (error) {
@@ -813,7 +885,8 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => setSelectedFile(null);
+	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); };
+	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); };
 	const handleOpenSettings = () => setShowSettings(true);
 	const handleCloseSettings = () => setShowSettings(false);
 	// Settings apply immediately to the current session too, not just future ones — otherwise
@@ -980,6 +1053,8 @@ const setScreen = () => {
 		name: fileName,
 		sourcePath: filePath
 		});
+		setBoardScreen(null);
+		setRecentPaths(recordFileOpened(filePath));
 
 		console.log('File selected for playback:', fileName);
 	} catch (error) {
@@ -1003,14 +1078,37 @@ const setScreen = () => {
 		await loadFileForPlayback(newPath, newFileName);
 	};
 
+	// Fired by ImageEditor's "Save a copy" once save_edited_image finishes - same
+	// refresh-list-then-select-the-result shape as handleVideoExported above; the source image is
+	// left untouched, this just adds its edited sibling alongside it.
+	const handleImageSaved = async (newPath: string, newFileName: string) => {
+		await handleDirectoryFiles();
+		setMessage(`Saved edited image: ${formatFileName(newFileName)}`);
+		await loadFileForPlayback(newPath, newFileName);
+	};
+
 	// Small icon shown next to a file name in the home-screen "From your library" preview list.
 	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
 		FILE_CATEGORY_TABS.find((tab) => tab.category === category)?.icon ?? <IoDocumentText size={18} />;
 
-	// A handful of files to surface on the empty home screen so it isn't just a blank void —
-	// not meant to be "recent" (FileEntry carries no timestamp from the backend), just enough
-	// of a taste of the library to invite a click instead of forcing a trip to the sidebar.
-	const libraryPreviewFiles = Object.values(files).flat().slice(0, 6);
+	// What to surface on the empty home screen so it isn't just a blank void. Pinned files (in pin
+	// order — see utils/homeScreenFiles.ts's newest-pin-first toggling) always come first, but they
+	// only ever ADD to the top of the list — they never wholesale replace what's already showing
+	// below. The rest of the slots fill in with recently opened/edited/viewed files (or, absent any
+	// open history, just a taste of the library), skipping anything already pinned so nothing shows
+	// twice.
+	const allLibraryFiles = Object.values(files).flat();
+	const libraryFilesByPath = new Map(allLibraryFiles.map((file) => [file.path, file]));
+	const pinnedLibraryFiles = pinnedPaths
+		.map((path) => libraryFilesByPath.get(path))
+		.filter((file): file is FileEntry => !!file);
+	const recentLibraryFiles = recentPaths
+		.map((path) => libraryFilesByPath.get(path))
+		.filter((file): file is FileEntry => !!file);
+	const fillerFiles = (recentLibraryFiles.length > 0 ? recentLibraryFiles : allLibraryFiles).filter(
+		(file) => !pinnedPaths.includes(file.path)
+	);
+	const libraryPreviewFiles = [...pinnedLibraryFiles, ...fillerFiles].slice(0, MAX_HOME_SCREEN_FILES);
 
 	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
 	// the currently selected file happens to live in, so prev/next still works when a category
@@ -1149,10 +1247,16 @@ const setScreen = () => {
 
 	// Arrow-key navigation — only active while an image or audio file is the currently displayed
 	// one, so it doesn't hijack arrow keys elsewhere (video seeking, PDF page turns, form inputs).
+	// Suppressed for images while the image tools panel is open (dockerMode === "file-tools"):
+	// ImageEditor.tsx binds its own arrow-key handler there to nudge a selected annotation object,
+	// and this listener - being on `document` same as that one, with no relation between the two -
+	// would otherwise ALSO fire for the exact same keypress and flip to the next/previous file out
+	// from under whatever the user was actually trying to nudge.
 	useEffect(() => {
 		if (!selectedFile) return;
 		const category = getFileCategory(selectedFile.name);
 		if (category !== "image" && category !== "audio") return;
+		if (category === "image" && dockerMode === "file-tools") return;
 
 		const handleKeyDown = (e: KeyboardEvent) => {
 			const target = e.target as HTMLElement | null;
@@ -1171,7 +1275,7 @@ const setScreen = () => {
 
 		document.addEventListener("keydown", handleKeyDown);
 		return () => document.removeEventListener("keydown", handleKeyDown);
-	}, [selectedFile, files, audioShuffle]);
+	}, [selectedFile, files, audioShuffle, dockerMode]);
 
 	// Opens a native OS file picker scoped to nowhere in particular — unlike the sidebar (which
 	// only ever lists files under the app's own Briefcast folder), this lets the user view/play
@@ -1284,6 +1388,17 @@ const setScreen = () => {
 			const results = await Promise.allSettled(
 				toMove.map((file) => invoke<string>("move_file", { sourcePath: file.path, destFolderPath: destFolder }))
 			);
+
+			// Keep pin/recent-history pointed at each moved file's new path — repathFile reads then
+			// writes localStorage synchronously, so chaining through fulfilled results in order is safe.
+			results.forEach((result, i) => {
+				if (result.status === "fulfilled") {
+					const { pinned, recent } = repathFile(toMove[i].path, result.value);
+					setPinnedPaths(pinned);
+					setRecentPaths(recent);
+				}
+			});
+
 			await handleDirectoryFiles();
 
 			// The file's playback URL is derived from its old absolute path, so a currently-open
@@ -1438,6 +1553,11 @@ const setScreen = () => {
 		}
 	};
 
+	const handleTogglePin = (file: FileEntry) => {
+		setPinnedPaths(togglePin(file.path));
+		setOpenMenu(null);
+	};
+
 	const startRename = (file: FileEntry) => {
 		const dotIndex = file.name.lastIndexOf('.');
 		setRenameValue(dotIndex > 0 ? file.name.slice(0, dotIndex) : file.name);
@@ -1453,6 +1573,9 @@ const setScreen = () => {
 		if (!newName || newName === file.name) return;
 		try {
 			const newPath = await invoke<string>('rename_file', { oldPath: file.path, newName });
+			const { pinned, recent } = repathFile(file.path, newPath);
+			setPinnedPaths(pinned);
+			setRecentPaths(recent);
 			await handleDirectoryFiles();
 			if (selectedFile?.sourcePath === file.path) {
 				const newFileName = newPath.split(/[\\/]/).pop() ?? newName;
@@ -1478,22 +1601,45 @@ const setScreen = () => {
 	// tab happens to be open. Sorted lexicographically on the relative-path key, which conveniently
 	// also sorts every folder after its own parent ("Workshops" before "Workshops/Papers") and
 	// puts the root ("") first, so this doubles as the hierarchical display order.
+	const normalizedSearchQuery = fileSearchQuery.trim().toLowerCase();
+	const isSearchingFiles = normalizedSearchQuery.length > 0;
 	const filteredEntries = Object.entries(files)
 		.map(([folder, fileList]) => [
 			folder,
-			fileList.filter((file) => getFileCategory(file.name) === activeFileCategory),
+			fileList.filter(
+				(file) => getFileCategory(file.name) === activeFileCategory && (!isSearchingFiles || file.name.toLowerCase().includes(normalizedSearchQuery))
+			),
 		] as [string, FileEntry[]])
+		// A folder with zero matches is only worth hiding while actively searching - normally
+		// every real folder stays visible (even empty ones, per this file's own comment above)
+		// so it's still usable as a create-subfolder/move/drop target.
+		.filter(([, fileList]) => !isSearchingFiles || fileList.length > 0)
 		.sort(([a], [b]) => a.localeCompare(b));
+	const filteredTrashItems = isSearchingFiles
+		? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery))
+		: trashItems;
 	const sidebarHeaderLabel =
 		activeFileCategory === "trash"
 			? "Trash:"
+			: isSearchingFiles
+			? "Search results:"
 			: filteredEntries.length === 1 ? `${folderDisplayName(filteredEntries[0][0])}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
 	const isAudioSelected = selectedFile !== null && getFileCategory(selectedFile.name) === "audio";
 
   return (
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
-      <div className="p-">
-        <div className="flex justify-between">
+      {/* flex-1 min-h-0 here (and h-full min-h-0 on the row below) is load-bearing, not
+          cosmetic: without a real height bound propagated all the way down, the main content
+          pane (ImageEditor/PdfAnnotator/VideoPlayer) had nothing stopping it from growing taller
+          than the viewport whenever its own content did - at which point the *whole document*
+          became the only thing left to scroll, dragging the sidebar's fixed h-screen column along
+          with it despite the sidebar's own file list having nothing to do with that scroll. That's
+          also why the main content pane's internal overflow-auto panes (ImageEditor.tsx's canvas
+          pane, ImageEditorToolbar's own panel) never had a genuine bounded scroll range of their
+          own to begin with - see those files' own overscroll-contain comments for the other half
+          of making each of the three panels scroll independently. */}
+      <div className="p- flex-1 min-h-0">
+        <div className="flex justify-between h-full min-h-0">
           {/* File list sidebar — force-collapsed in PDF fullscreen/presentation mode,
               regardless of showFileList, so it never reappears over the presented page. */}
           <div
@@ -1539,11 +1685,45 @@ const setScreen = () => {
                   </button>
                 </div>
 
+                {/* File search - filters the active tab's files (and trash) by name as you type.
+                    Fixed below the tabs, same as the folder-label bar beneath it. */}
+                <div className="px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
+                  <div className="relative">
+                    <IoSearch size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 dark:text-neutral-500 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={fileSearchQuery}
+                      onChange={(e) => setFileSearchQuery(e.target.value)}
+                      placeholder="Search files"
+                      className="w-full pl-7 pr-7 py-1.5 rounded-md text-xs bg-gray-100 dark:bg-neutral-800 border border-transparent focus:border-blue-400 dark:focus:border-blue-500 outline-none text-neutral-800 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500"
+                    />
+                    {fileSearchQuery && (
+                      <button
+                        type="button"
+                        title="Clear search"
+                        onClick={() => setFileSearchQuery("")}
+                        className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                      >
+                        <IoClose size={13} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
                 {/* Folder label + prev/next/repeat/shuffle/autoplay controls — fixed below the
                     tabs, does not scroll with the file list beneath it. */}
                 <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
                   <h3 className="font-semibold text-gray-700 dark:text-neutral-300 text-sm truncate">{sidebarHeaderLabel}</h3>
                   <div className="flex items-center gap-0.5 shrink-0">
+                    <button
+                      type="button"
+                      title="Refresh files"
+                      onClick={handleRefreshFiles}
+                      disabled={isRefreshingFiles}
+                      className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                    >
+                      <IoRefresh size={15} className={isRefreshingFiles ? "animate-spin" : ""} />
+                    </button>
                     {activeFileCategory !== "trash" && (
                       <button
                         type="button"
@@ -1562,7 +1742,11 @@ const setScreen = () => {
                           !selectedFile
                             ? "Select a file to see its tools"
                             : dockerMode === "file-tools"
-                            ? "Show recording controls"
+                            ? isImageFileSelected
+                              ? "Hide image tools"
+                              : "Show recording controls"
+                            : isImageFileSelected
+                            ? "Show image tools"
                             : "Show tools for this file"
                         }
                         onClick={() => setDockerMode((prev) => (prev === "record" ? "file-tools" : "record"))}
@@ -1690,18 +1874,21 @@ const setScreen = () => {
 
                 {/* pb tracks --docker-height (published by BottomDocker's ResizeObserver, see
                     player.css for the sibling usage) so the last row can always scroll clear of
-                    the fixed bottom icon bar instead of rendering underneath it, unclickable. */}
+                    the fixed bottom icon bar instead of rendering underneath it, unclickable.
+                    overscroll-contain stops scroll momentum at this list's own top/bottom instead
+                    of chaining into whatever's behind it (the main content pane, the tools panel)
+                    once you scroll past its own content - each panel should scroll on its own. */}
                 <div
-                  className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto flex-1 text-neutral-800 dark:text-neutral-200"
+                  className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto overscroll-contain flex-1 text-neutral-800 dark:text-neutral-200"
                 >
                 {activeFileCategory === "trash" ? (
-                  trashItems.length === 0 ? (
-                    <p>Trash is empty</p>
+                  filteredTrashItems.length === 0 ? (
+                    <p>{isSearchingFiles ? "No matching trash items" : "Trash is empty"}</p>
                   ) : (
                     <>
                       <div className="flex items-center justify-between mb-3">
                         <span className="text-xs text-neutral-500 dark:text-neutral-400">
-                          {trashItems.length} item{trashItems.length === 1 ? "" : "s"}
+                          {filteredTrashItems.length} item{filteredTrashItems.length === 1 ? "" : "s"}
                         </span>
                         <button
                           type="button"
@@ -1712,7 +1899,7 @@ const setScreen = () => {
                         </button>
                       </div>
                       <ul className="space-y-0.5">
-                        {trashItems.map((item) => (
+                        {filteredTrashItems.map((item) => (
                           <li
                             key={item.trashed_name}
                             className="flex items-center justify-between gap-2 group px-1 py-1.5 rounded hover:bg-gray-50 dark:hover:bg-neutral-800"
@@ -1745,7 +1932,7 @@ const setScreen = () => {
                     </>
                   )
                 ) : filteredEntries.length === 0 ? (
-                  <p>No {activeFileCategory} files found</p>
+                  <p>{isSearchingFiles ? `No ${activeFileCategory} files match "${fileSearchQuery.trim()}"` : `No ${activeFileCategory} files found`}</p>
                 ) : (
                   filteredEntries.map(([folder, fileList]) => (
                     <div
@@ -1827,7 +2014,7 @@ const setScreen = () => {
                         </div>
                       )}
 
-                      {collapsedFolders.has(folder) ? null : fileList.length === 0 ? (
+                      {collapsedFolders.has(folder) && !isSearchingFiles ? null : fileList.length === 0 ? (
                         <p
                           className="text-[11px] text-neutral-400 dark:text-neutral-500 italic mt-1"
                           style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}
@@ -1890,6 +2077,14 @@ const setScreen = () => {
                                 </div>
                               )}
 
+                              {pinnedPaths.includes(file.path) && (
+                                <IoPin
+                                  size={12}
+                                  className="shrink-0 text-gray-400 dark:text-neutral-500"
+                                  title="Pinned to home"
+                                />
+                              )}
+
                               {/* Three vertical dots menu */}
                               <div className="relative">
                                 <button
@@ -1908,6 +2103,15 @@ const setScreen = () => {
                                 {/* Popup Menu */}
                                 {openMenu === file.path && (
                                   <div className="absolute right-0 top-full mt-1 w-36 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg z-20">
+                                    <button
+                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleTogglePin(file);
+                                      }}
+                                    >
+                                      {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
+                                    </button>
                                     <button
                                       className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
                                       onClick={(e) => {
@@ -2019,15 +2223,18 @@ const setScreen = () => {
                     name: newFileName,
                     sourcePath: newPath
                   });
+                  setBoardScreen(null);
                 } catch (error) {
                   console.error('Error loading converted file:', error);
                 }
               }}
             />
           )}
-         <div className="flex-1 min-w-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
+         <div className="flex-1 min-w-0 min-h-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
 
-          {selectedFile ? (
+          {boardScreen ? (
+            <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
+          ) : selectedFile ? (
             getFileCategory(selectedFile.name) === "pdf" ? (
               <PdfAnnotator
                 key={selectedFile.path}
@@ -2036,6 +2243,16 @@ const setScreen = () => {
                 title={selectedFile.name}
                 isFullscreen={isPdfFullscreen}
                 onToggleFullscreen={handleTogglePdfFullscreen}
+              />
+            ) : getFileCategory(selectedFile.name) === "image" ? (
+              <ImageEditor
+                key={selectedFile.path}
+                sourcePath={selectedFile.sourcePath}
+                title={selectedFile.name}
+                onSaved={handleImageSaved}
+                store={imageEditStore}
+                isToolsPanelOpen={dockerMode === "file-tools"}
+                onToolsPanelOpenChange={(open) => setDockerMode(open ? "file-tools" : "record")}
               />
             ) : (
               <VideoPlayer
@@ -2060,7 +2277,8 @@ const setScreen = () => {
                 overlay={
                   getFileCategory(selectedFile.name) === "video"
                     ? (frameRect) => (
-                        <VideoOverlayLayer
+                        <>
+                          <VideoOverlayLayer
                           frameRect={frameRect}
                           overlays={editStore.textOverlays}
                           imageOverlays={editStore.imageOverlays}
@@ -2085,13 +2303,40 @@ const setScreen = () => {
                           onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
                           onBringImageOverlayToFront={editStore.bringImageOverlayToFront}
                           onSendImageOverlayToBack={editStore.sendImageOverlayToBack}
+                          blurOverlays={editStore.blurOverlays}
+                          selectedBlurOverlayId={selectedBlurOverlayId}
+                          onSelectBlurOverlay={setSelectedBlurOverlayId}
+                          isPlacingBlur={isPlacingBlur}
+                          onPlacementBlurConsumed={() => setIsPlacingBlur(false)}
+                          onAddBlurOverlay={editStore.addBlurOverlay}
+                          onUpdateBlurOverlayContent={editStore.updateBlurOverlayContent}
+                          onDeleteBlurOverlay={editStore.deleteBlurOverlay}
+                          onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
                           totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
                         />
+                        {isCroppingClip && activeClipEffects && (
+                          // Keyed on the active clip's own id so a clip change mid-drag (playback
+                          // crossing a cut while the user is still holding a handle down - rare,
+                          // but possible) unmounts/remounts this instead of silently committing
+                          // the in-progress drag to whatever clip happens to be active at release:
+                          // onChange closes over `activeClipEffects.id` fresh every render, so
+                          // without this key a mid-drag identity change would let the commit land
+                          // on the wrong clip using frame geometry computed against the OLD one.
+                          <ClipCropOverlay
+                            key={activeClipEffects.id}
+                            frameRect={frameRect}
+                            crop={activeClipEffects.crop}
+                            onChange={(crop) => editStore.updateClipEffects(activeClipEffects.id, { crop })}
+                            onLivePreview={(crop) => videoPlayerRef.current?.previewCropLive(crop)}
+                          />
+                        )}
+                      </>
                       )
                     : undefined
                 }
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted}
+                activeClipEffects={activeClipEffects}
               />
             )
           ) : (
@@ -2168,6 +2413,9 @@ const setScreen = () => {
                         <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
                           {formatFileName(file.name)}
                         </span>
+                        {pinnedPaths.includes(file.path) && (
+                          <IoPin size={13} className="ml-auto text-gray-400 dark:text-neutral-500 shrink-0" />
+                        )}
                       </button>
                     ))}
                   </div>
@@ -2201,6 +2449,7 @@ const setScreen = () => {
         pendingTimelineInsert={pendingTimelineInsert}
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         onOutputTimeChange={setCurrentOutputTime}
+        onActiveClipChange={setActiveClipEffects}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={setSelectedOverlayId}
         isPlacingText={isPlacingText}
@@ -2209,6 +2458,12 @@ const setScreen = () => {
         onSelectImageOverlay={setSelectedImageOverlayId}
         isPlacingImage={isPlacingImage}
         onToggleArmPlaceImage={() => setIsPlacingImage((v) => !v)}
+        selectedBlurOverlayId={selectedBlurOverlayId}
+        onSelectBlurOverlay={setSelectedBlurOverlayId}
+        isPlacingBlur={isPlacingBlur}
+        onToggleArmPlaceBlur={() => setIsPlacingBlur((v) => !v)}
+        isCroppingClip={isCroppingClip}
+        onToggleCroppingClip={() => setIsCroppingClip((v) => !v)}
         selectScreen={selectScreen}
         setScreen={setScreen}
         unSetScreen={unSetScreen}
@@ -2244,7 +2499,9 @@ const setScreen = () => {
         setAudioDevice={setAudioDevice}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
-        isHome={selectedFile === null}
+        isHome={selectedFile === null && boardScreen === null}
+        handleOpenBoard={handleOpenBoard}
+        isBoard={boardScreen !== null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}
