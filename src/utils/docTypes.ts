@@ -8,4 +8,12 @@ export interface DocSummary {
   title: string;
   created_at: string;
   updated_at: string;
+  linked_to: string | null;
+}
+
+// Structurally identical to Dashboard.tsx's own (unexported) FileEntry - defined here instead of
+// imported from a page component so Docs' components don't reverse-depend on Dashboard.tsx.
+export interface LibraryFileEntry {
+  name: string;
+  path: string;
 }

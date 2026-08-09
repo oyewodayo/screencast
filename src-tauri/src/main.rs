@@ -212,6 +212,11 @@ fn main() {
             services::docs::save_doc,
             services::docs::load_doc,
             services::docs::delete_doc,
+            services::docs::link_doc_to_file,
+            services::docs::unlink_doc,
+            services::docs::find_docs_linked_to,
+            services::docs::relink_doc_path,
+            services::docs::export_doc,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

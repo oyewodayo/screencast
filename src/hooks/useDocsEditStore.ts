@@ -20,6 +20,11 @@ interface LoadedDoc {
   title: string;
   created_at: string;
   updated_at: string;
+  linked_to: string | null;
+}
+
+interface DocSummaryResult {
+  linked_to: string | null;
 }
 
 export interface UseDocsEditStoreResult {
@@ -33,6 +38,12 @@ export interface UseDocsEditStoreResult {
   // Forces any pending debounced save to write immediately - DocsEditor calls this before
   // navigating back to Docs Home, same reasoning as BoardEditor's own flushSave call.
   flushSave: () => void;
+  // The recording/file this doc is "notes for", if any - see services/docs.rs's link_doc_to_file.
+  // Written straight through to Rust, not routed through the debounced save_doc path, since it's a
+  // meta-only field independent of the Yjs byte snapshot.
+  linkedTo: string | null;
+  linkDoc: (filePath: string) => Promise<void>;
+  unlinkDoc: () => Promise<void>;
 }
 
 export default function useDocsEditStore(docId: string | undefined): UseDocsEditStoreResult {
@@ -42,6 +53,7 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [linkedTo, setLinkedTo] = useState<string | null>(null);
 
   const ydocRef = useRef<Y.Doc | null>(null);
   const titleRef = useRef<string>("");
@@ -103,6 +115,7 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
         doc.on("update", scheduleAutosave);
         ydocRef.current = doc;
         setTitleState(result.title);
+        setLinkedTo(result.linked_to);
         setYdoc(doc);
       } catch (err) {
         console.error("Failed to load document:", err);
@@ -138,5 +151,19 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
     [scheduleAutosave]
   );
 
-  return { ydoc, title, setTitle, loading, loadError, isSaving, saveError, flushSave };
+  const linkDoc = useCallback(async (filePath: string) => {
+    const id = docIdRef.current;
+    if (!id) return;
+    const result = await invoke<DocSummaryResult>("link_doc_to_file", { id, filePath });
+    setLinkedTo(result.linked_to);
+  }, []);
+
+  const unlinkDoc = useCallback(async () => {
+    const id = docIdRef.current;
+    if (!id) return;
+    const result = await invoke<DocSummaryResult>("unlink_doc", { id });
+    setLinkedTo(result.linked_to);
+  }, []);
+
+  return { ydoc, title, setTitle, loading, loadError, isSaving, saveError, flushSave, linkedTo, linkDoc, unlinkDoc };
 }

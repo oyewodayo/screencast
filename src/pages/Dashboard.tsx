@@ -1,5 +1,6 @@
 // Dashboard.tsx
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import * as Y from "yjs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
 import BottomDocker from "../components/BottomDocker";
@@ -19,6 +20,7 @@ import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
+import { DocSummary } from "../utils/docTypes";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings } from "../utils/appSettings";
@@ -52,7 +54,7 @@ import {
   IoSearch,
   IoClose,
 } from "react-icons/io5";
-import { MdCreateNewFolder } from "react-icons/md";
+import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 
 type RAMInfo = [number, number];
 
@@ -218,6 +220,13 @@ const Dashboard = () => {
   // Which Docs screen (if any) is showing in the main content pane - same null-means-off pattern
   // as boardScreen. See handleOpenDocs.
   const [docsScreen, setDocsScreen] = useState<DocsScreen | null>(null);
+  // Every doc's summary (id/title/linked_to/etc.), refreshed via refreshDocsIndex - backs both the
+  // "Link to recording" picker's libraryFiles-independent state and the per-file "has linked
+  // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
+  const [docsIndex, setDocsIndex] = useState<DocSummary[]>([]);
+  // "Link notes" flyout inside a file's 3-dot menu when 2+ docs are already linked to it - same
+  // expand-in-place pattern as moveMenuOpenFor.
+  const [linkDocsMenuOpenFor, setLinkDocsMenuOpenFor] = useState<string | null>(null);
   // Spins the sidebar's manual refresh icon while a refresh is in flight — see handleRefreshFiles.
   const [isRefreshingFiles, setIsRefreshingFiles] = useState<boolean>(false);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
@@ -798,6 +807,63 @@ const setScreen = () => {
 		}
 	};
 
+	// Backs the sidebar's per-file "has linked notes" badge/menu (see linkedDocsByPath below) from
+	// one list_docs call rather than a find_docs_linked_to round trip per visible row.
+	const refreshDocsIndex = useCallback(async () => {
+		try {
+			setDocsIndex(await invoke<DocSummary[]>("list_docs"));
+		} catch (error) {
+			console.error("Failed to load docs index:", error);
+		}
+	}, []);
+
+	useEffect(() => {
+		refreshDocsIndex();
+	}, [refreshDocsIndex]);
+
+	// file.path -> every doc linked to it, derived once per docsIndex change rather than filtered
+	// per row on every render.
+	const linkedDocsByPath = useMemo(() => {
+		const map = new Map<string, DocSummary[]>();
+		for (const doc of docsIndex) {
+			if (!doc.linked_to) continue;
+			const existing = map.get(doc.linked_to);
+			if (existing) existing.push(doc);
+			else map.set(doc.linked_to, [doc]);
+		}
+		return map;
+	}, [docsIndex]);
+
+	// One-step "notes for this file" action from a file's 3-dot menu: create-and-link if nothing's
+	// linked yet, jump straight in if exactly one doc is, or open the flyout (linkDocsMenuOpenFor)
+	// if there's more than one - handled inline at the call site since the 2+ case needs UI state.
+	const handleLinkNotes = async (file: FileEntry) => {
+		setOpenMenu(null);
+		const existing = linkedDocsByPath.get(file.path) ?? [];
+		if (existing.length === 1) {
+			setSelectedFile(null);
+			setDocsScreen({ mode: "editor", docId: existing[0].id });
+			return;
+		}
+		if (existing.length >= 2) {
+			setLinkDocsMenuOpenFor(file.path);
+			return;
+		}
+		try {
+			const id = crypto.randomUUID();
+			const title = `Notes for ${file.name}`;
+			const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
+			await invoke("create_doc", { id, title, bytes });
+			await invoke("link_doc_to_file", { id, filePath: file.path });
+			await refreshDocsIndex();
+			setSelectedFile(null);
+			setDocsScreen({ mode: "editor", docId: id });
+		} catch (error) {
+			console.error("Failed to create linked notes:", error);
+			setError(`Failed to create linked notes: ${error}`);
+		}
+	};
+
 	// Manual escape hatch for the sidebar's "Files:" refresh button — the backend also watches the
 	// Briefcast folder itself and emits refresh-file-list on external changes (see the
 	// 'refresh-file-list' listener below), but this covers watcher failures/platforms without one,
@@ -805,7 +871,7 @@ const setScreen = () => {
 	const handleRefreshFiles = async () => {
 		setIsRefreshingFiles(true);
 		try {
-			await Promise.all([handleDirectoryFiles(), loadTrash()]);
+			await Promise.all([handleDirectoryFiles(), loadTrash(), refreshDocsIndex()]);
 		} finally {
 			setIsRefreshingFiles(false);
 		}
@@ -1405,6 +1471,15 @@ const setScreen = () => {
 				}
 			});
 
+			// Same repair for any doc's linked_to pointing at a moved file - one refresh after the
+			// loop rather than per-file, to avoid redundant list_docs calls during a bulk move.
+			const relinkResults = await Promise.allSettled(
+				results
+					.map((result, i) => (result.status === "fulfilled" ? invoke("relink_doc_path", { oldPath: toMove[i].path, newPath: result.value }) : null))
+					.filter((p): p is Promise<unknown> => p !== null)
+			);
+			if (relinkResults.length > 0) await refreshDocsIndex();
+
 			await handleDirectoryFiles();
 
 			// The file's playback URL is derived from its old absolute path, so a currently-open
@@ -1582,6 +1657,12 @@ const setScreen = () => {
 			const { pinned, recent } = repathFile(file.path, newPath);
 			setPinnedPaths(pinned);
 			setRecentPaths(recent);
+			try {
+				await invoke("relink_doc_path", { oldPath: file.path, newPath });
+				await refreshDocsIndex();
+			} catch (error) {
+				console.error("Failed to repair doc links after rename:", error);
+			}
 			await handleDirectoryFiles();
 			if (selectedFile?.sourcePath === file.path) {
 				const newFileName = newPath.split(/[\\/]/).pop() ?? newName;
@@ -2091,6 +2172,14 @@ const setScreen = () => {
                                 />
                               )}
 
+                              {linkedDocsByPath.has(file.path) && (
+                                <MdOutlineDescription
+                                  size={13}
+                                  className="shrink-0 text-gray-400 dark:text-neutral-500"
+                                  title={`${linkedDocsByPath.get(file.path)!.length} linked note(s)`}
+                                />
+                              )}
+
                               {/* Three vertical dots menu */}
                               <div className="relative">
                                 <button
@@ -2099,6 +2188,7 @@ const setScreen = () => {
                                     e.stopPropagation();
                                     setOpenMenu(openMenu === file.path ? null : file.path);
                                     setMoveMenuOpenFor(null);
+                                    setLinkDocsMenuOpenFor(null);
                                   }}
                                 >
                                   <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
@@ -2118,6 +2208,65 @@ const setScreen = () => {
                                     >
                                       {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
                                     </button>
+                                    <button
+                                      className="w-full flex items-center justify-between px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        void handleLinkNotes(file);
+                                      }}
+                                    >
+                                      Link notes
+                                      {linkedDocsByPath.has(file.path) && (linkedDocsByPath.get(file.path)!.length >= 2) && (
+                                        <IoChevronForward
+                                          size={12}
+                                          className={`transition-transform ${linkDocsMenuOpenFor === file.path ? 'rotate-90' : ''}`}
+                                        />
+                                      )}
+                                    </button>
+                                    {linkDocsMenuOpenFor === file.path && (
+                                      <div className="border-t border-gray-200 dark:border-neutral-700 max-h-40 overflow-y-auto py-0.5">
+                                        {(linkedDocsByPath.get(file.path) ?? []).map((doc) => (
+                                          <button
+                                            key={doc.id}
+                                            className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setOpenMenu(null);
+                                              setLinkDocsMenuOpenFor(null);
+                                              setSelectedFile(null);
+                                              setDocsScreen({ mode: "editor", docId: doc.id });
+                                            }}
+                                          >
+                                            {doc.title || "Untitled document"}
+                                          </button>
+                                        ))}
+                                        <button
+                                          className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setLinkDocsMenuOpenFor(null);
+                                            void (async () => {
+                                              try {
+                                                const id = crypto.randomUUID();
+                                                const title = `Notes for ${file.name}`;
+                                                const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
+                                                await invoke("create_doc", { id, title, bytes });
+                                                await invoke("link_doc_to_file", { id, filePath: file.path });
+                                                await refreshDocsIndex();
+                                                setOpenMenu(null);
+                                                setSelectedFile(null);
+                                                setDocsScreen({ mode: "editor", docId: id });
+                                              } catch (error) {
+                                                console.error("Failed to create linked notes:", error);
+                                                setError(`Failed to create linked notes: ${error}`);
+                                              }
+                                            })();
+                                          }}
+                                        >
+                                          + New linked doc
+                                        </button>
+                                      </div>
+                                    )}
                                     <button
                                       className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
                                       onClick={(e) => {
@@ -2242,7 +2391,15 @@ const setScreen = () => {
           {boardScreen ? (
             <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
           ) : docsScreen ? (
-            <DocsWorkspace screen={docsScreen} onScreenChange={setDocsScreen} />
+            <DocsWorkspace
+              screen={docsScreen}
+              onScreenChange={setDocsScreen}
+              libraryFiles={allLibraryFiles}
+              onOpenLinkedFile={(path, name) => {
+                setDocsScreen(null);
+                void loadFileForPlayback(path, name);
+              }}
+            />
           ) : selectedFile ? (
             getFileCategory(selectedFile.name) === "pdf" ? (
               <PdfAnnotator
