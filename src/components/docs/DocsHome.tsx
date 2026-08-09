@@ -21,6 +21,26 @@ function formatUpdatedAt(iso: string): string {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
+// Y.XmlFragment/Y.XmlElement's own .toString() embeds tag and formatting-attribute names in the
+// output (e.g. "<paragraph><bold>Hello world</bold></paragraph>" - verified directly against the
+// installed yjs version), so using it for search would make every document that happens to use
+// bold/a table/a link etc. false-positive match a search for "bold"/"table"/"link" regardless of
+// its actual text. Walk the tree and concatenate only Y.XmlText nodes' real inserted text (via
+// .toDelta(), which separates the plain string from its formatting attributes) instead.
+function extractPlainText(node: Y.XmlFragment | Y.XmlElement): string {
+  let text = "";
+  for (const child of node.toArray()) {
+    if (child instanceof Y.XmlText) {
+      for (const op of child.toDelta()) {
+        if (typeof op.insert === "string") text += op.insert;
+      }
+    } else if (child instanceof Y.XmlElement) {
+      text += extractPlainText(child) + " ";
+    }
+  }
+  return text;
+}
+
 const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   const [docs, setDocs] = useState<DocSummary[] | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -75,7 +95,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
           const result = await invoke<{ bytes: number[] }>("load_doc", { id: doc.id });
           const ydoc = new Y.Doc();
           Y.applyUpdate(ydoc, new Uint8Array(result.bytes));
-          const text = ydoc.getXmlFragment("default").toString().toLowerCase();
+          const text = extractPlainText(ydoc.getXmlFragment("default")).toLowerCase();
           ydoc.destroy();
           return [doc.id, text] as const;
         } catch (err) {

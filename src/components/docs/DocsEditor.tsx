@@ -98,10 +98,14 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       // lets you start typing immediately instead of requiring a click into the editor first.
       autofocus: "start",
       // Auto-fills the title from the first line typed/pasted, but only while the title is still
-      // the untouched "Untitled document N" default - self-limiting, since setTitle moves it off
-      // that pattern and the guard below then no-ops on every later keystroke.
+      // an untouched default - self-limiting, since setTitle moves it off that pattern and the
+      // guard below then no-ops on every later keystroke. Also treats a blank/whitespace-only
+      // title as "still default", not just the exact "Untitled document N" string - a doc can end
+      // up with an empty title (e.g. from an older create path, or a title cleared by hand), and
+      // without this the regex-only check leaves auto-fill permanently disabled for that doc.
       onUpdate: ({ editor: e }) => {
-        if (!/^Untitled document \d+$/.test(store.title)) return;
+        const isDefaultTitle = store.title.trim() === "" || /^Untitled document \d+$/.test(store.title);
+        if (!isDefaultTitle) return;
         const firstLine = e.getText({ blockSeparator: "\n" }).split("\n")[0]?.trim() ?? "";
         if (!firstLine) return;
         store.setTitle(firstLine.length > 80 ? firstLine.slice(0, 80) : firstLine);
@@ -214,12 +218,25 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         // exact "editor.can(...).undo is not a function" crash. Optional-chaining the call (not
         // just gating the surrounding render on `loading`) is what actually closes this gap.
         <div className="shrink-0 flex items-center gap-1 px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/95 dark:bg-neutral-900/95 shadow-[0_1px_2px_rgba(0,0,0,0.04)] flex-wrap print:hidden">
-          <button type="button" title="Undo" disabled={!editor.can().undo?.()} onClick={() => editor.can().undo?.() && editor.chain().focus().undo().run()} className={toolbarButtonClass(false, !editor.can().undo?.())}>
-            <MdUndo size={18} />
-          </button>
-          <button type="button" title="Redo" disabled={!editor.can().redo?.()} onClick={() => editor.can().redo?.() && editor.chain().focus().redo().run()} className={toolbarButtonClass(false, !editor.can().redo?.())}>
-            <MdRedo size={18} />
-          </button>
+          {/* editor.can()/isActive() checks that a button needs more than once (disabled state +
+              className + onClick guard, or className + icon choice) are hoisted to a local const
+              rather than re-invoked per usage - this toolbar re-renders on every editor
+              transaction (every keystroke), so repeating the same check 2-3x per button in each
+              render was pure waste. */}
+          {(() => {
+            const canUndo = editor.can().undo?.() ?? false;
+            const canRedo = editor.can().redo?.() ?? false;
+            return (
+              <>
+                <button type="button" title="Undo" disabled={!canUndo} onClick={() => canUndo && editor.chain().focus().undo().run()} className={toolbarButtonClass(false, !canUndo)}>
+                  <MdUndo size={18} />
+                </button>
+                <button type="button" title="Redo" disabled={!canRedo} onClick={() => canRedo && editor.chain().focus().redo().run()} className={toolbarButtonClass(false, !canRedo)}>
+                  <MdRedo size={18} />
+                </button>
+              </>
+            );
+          })()}
 
           {toolbarDivider}
 
@@ -274,9 +291,14 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           {toolbarDivider}
 
           <div className="relative">
-            <button type="button" title={editor.isActive("link") ? "Remove link" : "Add link"} onClick={toggleLink} className={toolbarButtonClass(editor.isActive("link"))}>
-              {editor.isActive("link") ? <MdLinkOff size={18} /> : <MdLink size={18} />}
-            </button>
+            {(() => {
+              const isLinkActive = editor.isActive("link");
+              return (
+                <button type="button" title={isLinkActive ? "Remove link" : "Add link"} onClick={toggleLink} className={toolbarButtonClass(isLinkActive)}>
+                  {isLinkActive ? <MdLinkOff size={18} /> : <MdLink size={18} />}
+                </button>
+              );
+            })()}
             {/* The Tauri dialog allowlist only exposes "message"/"open" - no native text-prompt
                 dialog - so the URL has to come from an inline popover instead of window.prompt. */}
             {showLinkInput && (

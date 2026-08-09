@@ -11,16 +11,23 @@ import { Plugin } from "@tiptap/pm/state";
 import type { EditorView } from "@tiptap/pm/view";
 import { invoke, convertFileSrc } from "@tauri-apps/api/tauri";
 
+// Kept in sync with docs.rs's save_doc_image ALLOWED whitelist - "image/jpg" is a non-standard
+// MIME some tools still emit for a JPEG, mapped alongside the standard "image/jpeg".
 const EXTENSION_BY_MIME: Record<string, string> = {
   "image/png": "png",
   "image/jpeg": "jpg",
+  "image/jpg": "jpg",
   "image/gif": "gif",
   "image/webp": "webp",
 };
 
-async function uploadImage(docId: string, file: File): Promise<string | null> {
+async function uploadImage(docId: string, file: File): Promise<string> {
   const extension = EXTENSION_BY_MIME[file.type];
-  if (!extension) return null;
+  // Throwing (rather than returning null) means an unsupported type - e.g. BMP/TIFF/SVG, or any
+  // MIME this app's backend doesn't whitelist - surfaces through the existing .catch() logging in
+  // handlePaste/handleDrop below instead of the paste silently doing nothing with no diagnostic
+  // trail at all.
+  if (!extension) throw new Error(`Unsupported image type for paste: "${file.type || "unknown"}"`);
   const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
   const path = await invoke<string>("save_doc_image", { id: docId, assetId: crypto.randomUUID(), extension, bytes });
   return convertFileSrc(path);
@@ -61,7 +68,7 @@ export function createDocImagePasteExtension(docId: string) {
               event.preventDefault();
               const pos = view.state.selection.from;
               uploadImage(docId, file)
-                .then((src) => src && insertImageAt(view, pos, src))
+                .then((src) => insertImageAt(view, pos, src))
                 .catch((err) => console.error("Failed to paste image:", err));
               return true;
             },
@@ -73,7 +80,7 @@ export function createDocImagePasteExtension(docId: string) {
               const coords = view.posAtCoords({ left: event.clientX, top: event.clientY });
               const pos = coords?.pos ?? view.state.selection.from;
               uploadImage(docId, file)
-                .then((src) => src && insertImageAt(view, pos, src))
+                .then((src) => insertImageAt(view, pos, src))
                 .catch((err) => console.error("Failed to drop image:", err));
               return true;
             },
