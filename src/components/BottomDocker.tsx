@@ -426,7 +426,7 @@ const BottomDocker = ({
       onStartRecording={onStartRecording} 
       setOpen={setModalOpenScreen}
     />
-    <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col">
+    <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
      
         <ActiveRecordingState
             isRecording={isRecording}

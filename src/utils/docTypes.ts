@@ -9,6 +9,8 @@ export interface DocSummary {
   created_at: string;
   updated_at: string;
   linked_to: string | null;
+  // Set only on a doc returned by list_trashed_docs - null for every doc in the normal list.
+  deleted_at: string | null;
 }
 
 // Structurally identical to Dashboard.tsx's own (unexported) FileEntry - defined here instead of

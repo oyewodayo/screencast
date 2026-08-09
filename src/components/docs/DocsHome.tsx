@@ -33,6 +33,12 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [pinnedIds, setPinnedIds] = useState<string[]>(() => getPinnedDocIds());
   const [searchQuery, setSearchQuery] = useState("");
+  // Trash: deleting a doc is a soft-delete now (services/docs.rs's delete_doc moves the folder
+  // into Docs/.trash/ instead of removing it), matching the rest of the app's recoverable-delete
+  // convention instead of Docs being the one place an accidental click was unrecoverable.
+  const [showTrash, setShowTrash] = useState(false);
+  const [trashedDocs, setTrashedDocs] = useState<DocSummary[] | null>(null);
+  const [confirmPermanentDeleteId, setConfirmPermanentDeleteId] = useState<string | null>(null);
   // Body-text cache for search, keyed by doc id - list_docs only ever reads meta.json (title/dates),
   // never doc.bin, so searching body text means decoding each doc's Yjs bytes client-side once and
   // caching the result. This is a deliberate full-corpus decode on every DocsHome visit, not a
@@ -53,34 +59,47 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     refresh();
   }, [refresh]);
 
+  // Deferred until the user actually types into search (not eagerly on every DocsHome mount) -
+  // indexing means one load_doc round trip + a Yjs decode per doc, a real cost not worth paying
+  // just for landing on this screen, especially as the doc count grows. Once triggered, the
+  // missing docs are indexed in parallel rather than one invoke at a time.
   useEffect(() => {
-    if (!docs || docs.length === 0) return;
+    if (searchQuery.trim().length === 0 || !docs || docs.length === 0) return;
     const missing = docs.filter((d) => !(d.id in bodyCache));
     if (missing.length === 0) return;
     let cancelled = false;
 
-    (async () => {
-      for (const doc of missing) {
-        if (cancelled) return;
+    Promise.all(
+      missing.map(async (doc) => {
         try {
           const result = await invoke<{ bytes: number[] }>("load_doc", { id: doc.id });
           const ydoc = new Y.Doc();
           Y.applyUpdate(ydoc, new Uint8Array(result.bytes));
           const text = ydoc.getXmlFragment("default").toString().toLowerCase();
           ydoc.destroy();
-          if (!cancelled) setBodyCache((prev) => ({ ...prev, [doc.id]: text }));
+          return [doc.id, text] as const;
         } catch (err) {
           // One doc failing to decode shouldn't block indexing the rest - same fail-soft posture
           // as list_docs skipping a corrupt folder.
           console.error(`Failed to index document ${doc.id} for search:`, err);
+          return null;
         }
-      }
-    })();
+      })
+    ).then((results) => {
+      if (cancelled) return;
+      const decoded = results.filter((r): r is readonly [string, string] => r !== null);
+      if (decoded.length === 0) return;
+      setBodyCache((prev) => {
+        const next = { ...prev };
+        for (const [id, text] of decoded) next[id] = text;
+        return next;
+      });
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [docs, bodyCache]);
+  }, [searchQuery, docs, bodyCache]);
 
   // Closes an open card menu (and drops any pending delete confirmation) on any click outside it -
   // must be "click", not "mousedown", for the same ordering reason documented in BoardHome.tsx:
@@ -99,6 +118,8 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
 
   const handleDeleteDoc = useCallback(async (id: string): Promise<void> => {
     try {
+      // Soft delete - services/docs.rs moves the folder into Docs/.trash/ rather than removing
+      // it, so this just needs to drop the doc out of the normal list, same as before.
       await invoke("delete_doc", { id });
       setOpenMenuId(null);
       setConfirmDeleteId(null);
@@ -106,6 +127,45 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
       setPinnedIds(forgetDocPin(id));
     } catch (err) {
       console.error("Failed to delete document:", err);
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  const refreshTrash = useCallback(() => {
+    invoke<DocSummary[]>("list_trashed_docs")
+      .then(setTrashedDocs)
+      .catch((err) => {
+        console.error("Failed to list trashed documents:", err);
+        setError(err instanceof Error ? err.message : String(err));
+        setTrashedDocs([]);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (showTrash) refreshTrash();
+  }, [showTrash, refreshTrash]);
+
+  const handleRestoreDoc = useCallback(
+    async (id: string): Promise<void> => {
+      try {
+        await invoke("restore_doc", { id });
+        setTrashedDocs((prev) => prev?.filter((d) => d.id !== id) ?? prev);
+        refresh();
+      } catch (err) {
+        console.error("Failed to restore document:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [refresh]
+  );
+
+  const handleDeleteForever = useCallback(async (id: string): Promise<void> => {
+    try {
+      await invoke("delete_doc_permanently", { id });
+      setTrashedDocs((prev) => prev?.filter((d) => d.id !== id) ?? prev);
+      setConfirmPermanentDeleteId(null);
+    } catch (err) {
+      console.error("Failed to permanently delete document:", err);
       setError(err instanceof Error ? err.message : String(err));
     }
   }, []);
@@ -232,10 +292,65 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
         >
           <IoAdd size={16} /> New document
         </button>
+        <button
+          type="button"
+          onClick={() => setShowTrash((v) => !v)}
+          className="text-xs text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:underline"
+        >
+          {showTrash ? "Back to documents" : "Trash"}
+        </button>
         {error && <p className="text-red-500 dark:text-red-400 text-xs">{error}</p>}
       </div>
 
-      {docs && docs.length > 0 && (
+      {showTrash && (
+        <div className="relative w-full max-w-3xl">
+          <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
+            Trash - deleted documents are kept here until permanently deleted
+          </p>
+          {trashedDocs === null ? (
+            <p className="text-center text-sm text-gray-400 dark:text-neutral-500">Loading…</p>
+          ) : trashedDocs.length === 0 ? (
+            <p className="text-center text-sm text-gray-400 dark:text-neutral-500">Trash is empty</p>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+              {trashedDocs.map((doc) => (
+                <div
+                  key={doc.id}
+                  className="flex flex-col rounded-md bg-white/90 dark:bg-neutral-900/90 border border-gray-200 dark:border-neutral-800"
+                >
+                  <div className="aspect-video rounded-t-md overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center">
+                    <IoDocumentTextOutline size={22} className="text-gray-300 dark:text-neutral-600" />
+                  </div>
+                  <div className="px-2.5 py-2">
+                    <p className="text-sm text-gray-700 dark:text-neutral-200 truncate">{doc.title || "Untitled document"}</p>
+                    <p className="text-xs text-gray-400 dark:text-neutral-500">Deleted {formatUpdatedAt(doc.deleted_at ?? doc.updated_at)}</p>
+                  </div>
+                  <div className="flex border-t border-gray-100 dark:border-neutral-800">
+                    <button
+                      type="button"
+                      onClick={() => void handleRestoreDoc(doc.id)}
+                      className="flex-1 px-2 py-1.5 text-xs text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-500/10"
+                    >
+                      Restore
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        confirmPermanentDeleteId === doc.id ? void handleDeleteForever(doc.id) : setConfirmPermanentDeleteId(doc.id)
+                      }
+                      className="flex-1 px-2 py-1.5 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 border-l border-gray-100 dark:border-neutral-800"
+                    >
+                      {confirmPermanentDeleteId === doc.id ? "Confirm?" : "Delete forever"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {!showTrash && docs && docs.length > 0 && (
         <div className="relative w-full max-w-3xl">
           <div className="relative mb-4">
             <IoSearch size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 dark:text-neutral-500 pointer-events-none" />

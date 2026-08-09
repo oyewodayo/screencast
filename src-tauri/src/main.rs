@@ -217,6 +217,10 @@ fn main() {
             services::docs::find_docs_linked_to,
             services::docs::relink_doc_path,
             services::docs::export_doc,
+            services::docs::save_doc_image,
+            services::docs::list_trashed_docs,
+            services::docs::restore_doc,
+            services::docs::delete_doc_permanently,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

@@ -77,7 +77,31 @@ function renderBlock(node: JSONContent): string {
       const text = (node.content ?? []).map((c) => c.text ?? "").join("");
       return `\`\`\`${language}\n${text}\n\`\`\``;
     }
+    case "image": {
+      const alt = (node.attrs?.alt as string) ?? "";
+      const src = (node.attrs?.src as string) ?? "";
+      return `![${alt}](${src})`;
+    }
+    // tableRow/tableCell/tableHeader are only ever children of "table" - handled inline below
+    // rather than as their own switch cases, since a bare row/cell has no meaningful standalone
+    // Markdown rendering outside a table's header+separator structure.
+    case "table": {
+      const rows = node.content ?? [];
+      if (rows.length === 0) return "";
+      const renderRow = (row: JSONContent): string[] =>
+        (row.content ?? []).map((cell) => renderBlocks(cell.content ?? []).replace(/\n/g, " "));
+      const firstRowIsHeader = (rows[0].content ?? []).every((c) => c.type === "tableHeader");
+      const headerCells = firstRowIsHeader ? renderRow(rows[0]) : (rows[0].content ?? []).map(() => "");
+      const bodyRows = firstRowIsHeader ? rows.slice(1) : rows;
+      const headerLine = `| ${headerCells.join(" | ")} |`;
+      const separatorLine = `| ${headerCells.map(() => "---").join(" | ")} |`;
+      const bodyLines = bodyRows.map((row) => `| ${renderRow(row).join(" | ")} |`);
+      return [headerLine, separatorLine, ...bodyLines].join("\n");
+    }
     default:
+      // Text alignment (node.attrs.textAlign) and color (a "textStyle"/"color" mark, handled in
+      // applyMarks) have no CommonMark representation - intentionally not special-cased anywhere
+      // in this file, so they're silently dropped rather than forcing non-standard syntax.
       return renderInline(node.content);
   }
 }

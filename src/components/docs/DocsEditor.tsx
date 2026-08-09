@@ -11,6 +11,15 @@ import StarterKit from "@tiptap/starter-kit";
 import Collaboration from "@tiptap/extension-collaboration";
 import Underline from "@tiptap/extension-underline";
 import Link from "@tiptap/extension-link";
+import Image from "@tiptap/extension-image";
+import Table from "@tiptap/extension-table";
+import TableRow from "@tiptap/extension-table-row";
+import TableHeader from "@tiptap/extension-table-header";
+import TableCell from "@tiptap/extension-table-cell";
+import TextAlign from "@tiptap/extension-text-align";
+import TextStyle from "@tiptap/extension-text-style";
+import Color from "@tiptap/extension-color";
+import Placeholder from "@tiptap/extension-placeholder";
 import { IoArrowBack, IoClose } from "react-icons/io5";
 import {
   MdFormatBold,
@@ -28,10 +37,16 @@ import {
   MdRedo,
   MdFileDownload,
   MdInsertLink,
+  MdFormatAlignLeft,
+  MdFormatAlignCenter,
+  MdFormatAlignRight,
+  MdFormatAlignJustify,
+  MdMoreHoriz,
 } from "react-icons/md";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
 import { LibraryFileEntry } from "../../utils/docTypes";
+import { createDocImagePasteExtension } from "../../utils/docImagePaste";
 
 interface DocsEditorProps {
   docId: string;
@@ -55,6 +70,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [fileFilter, setFileFilter] = useState("");
+  const [showMoreFormatting, setShowMoreFormatting] = useState(false);
 
   const editor = useEditor(
     {
@@ -66,16 +82,56 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
         Underline,
         Link.configure({ openOnClick: false, autolink: false }),
+        Image.configure({ inline: false }),
+        createDocImagePasteExtension(docId),
+        Table.configure({ resizable: false }),
+        TableRow,
+        TableHeader,
+        TableCell,
+        TextAlign.configure({ types: ["heading", "paragraph"] }),
+        TextStyle,
+        Color,
+        Placeholder.configure({ placeholder: "Start writing…" }),
       ],
       editable: !store.loading,
+      // Focuses the content area as soon as the doc is ready, so opening a doc (new or existing)
+      // lets you start typing immediately instead of requiring a click into the editor first.
+      autofocus: "start",
+      // Auto-fills the title from the first line typed/pasted, but only while the title is still
+      // the untouched "Untitled document N" default - self-limiting, since setTitle moves it off
+      // that pattern and the guard below then no-ops on every later keystroke.
+      onUpdate: ({ editor: e }) => {
+        if (!/^Untitled document \d+$/.test(store.title)) return;
+        const firstLine = e.getText({ blockSeparator: "\n" }).split("\n")[0]?.trim() ?? "";
+        if (!firstLine) return;
+        store.setTitle(firstLine.length > 80 ? firstLine.slice(0, 80) : firstLine);
+      },
     },
     [store.ydoc]
   );
 
   const handleBack = useCallback(() => {
-    store.flushSave();
+    store.flushSave().catch((err) => console.error("Failed to save before navigating back:", err));
     onBack();
   }, [store, onBack]);
+
+  const handlePrint = useCallback(() => {
+    setShowExportMenu(false);
+    // Chrome/Edge's print dialog derives both its default "Save as PDF" filename and the printed
+    // page's header text from document.title - which is otherwise a static app-wide value
+    // (index.html's <title>), not this document's title. Swap it in just for the print dialog,
+    // then restore it once the dialog closes (afterprint fires whether printed or cancelled) so
+    // the app's own window/tab title isn't left showing a stale document name.
+    const previousTitle = document.title;
+    const safeTitle = store.title.replace(/[\\/:*?"<>|]/g, "_").trim();
+    document.title = safeTitle || previousTitle;
+    const restore = () => {
+      document.title = previousTitle;
+      window.removeEventListener("afterprint", restore);
+    };
+    window.addEventListener("afterprint", restore);
+    window.print();
+  }, [store.title]);
 
   const toggleLink = useCallback(() => {
     if (!editor) return;
@@ -121,8 +177,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   }, [libraryFiles, fileFilter]);
 
   return (
-    <div className="w-full h-full flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950">
-      <div className="shrink-0 flex items-center gap-2 px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/80 dark:bg-neutral-900/80 backdrop-blur-sm">
+    <div className="w-full h-full flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950 print:bg-white print:h-auto print:block">
+      <div className="shrink-0 flex items-center gap-2 px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/80 dark:bg-neutral-900/80 backdrop-blur-sm print:hidden">
         <button
           type="button"
           onClick={handleBack}
@@ -157,7 +213,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         // entire render tree - confirmed via a headless React+StrictMode repro reproducing the
         // exact "editor.can(...).undo is not a function" crash. Optional-chaining the call (not
         // just gating the surrounding render on `loading`) is what actually closes this gap.
-        <div className="shrink-0 flex items-center gap-1 px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/95 dark:bg-neutral-900/95 shadow-[0_1px_2px_rgba(0,0,0,0.04)] flex-wrap">
+        <div className="shrink-0 flex items-center gap-1 px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/95 dark:bg-neutral-900/95 shadow-[0_1px_2px_rgba(0,0,0,0.04)] flex-wrap print:hidden">
           <button type="button" title="Undo" disabled={!editor.can().undo?.()} onClick={() => editor.can().undo?.() && editor.chain().focus().undo().run()} className={toolbarButtonClass(false, !editor.can().undo?.())}>
             <MdUndo size={18} />
           </button>
@@ -244,6 +300,100 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           </div>
 
           <div className="ml-auto flex items-center gap-1">
+            <div className="relative">
+              <button type="button" title="More formatting" onClick={() => setShowMoreFormatting((v) => !v)} className={toolbarButtonClass(showMoreFormatting)}>
+                <MdMoreHoriz size={18} />
+              </button>
+              {showMoreFormatting && (
+                <div className="absolute right-0 top-full mt-1 z-10 w-64 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-2 space-y-2">
+                  <div>
+                    <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Align</p>
+                    <div className="flex items-center gap-1">
+                      {(
+                        [
+                          ["left", MdFormatAlignLeft, "Align left"],
+                          ["center", MdFormatAlignCenter, "Align center"],
+                          ["right", MdFormatAlignRight, "Align right"],
+                          ["justify", MdFormatAlignJustify, "Justify"],
+                        ] as const
+                      ).map(([align, Icon, label]) => (
+                        <button
+                          key={align}
+                          type="button"
+                          title={label}
+                          onClick={() => editor.chain().focus().setTextAlign(align).run()}
+                          className={toolbarButtonClass(editor.isActive({ textAlign: align }))}
+                        >
+                          <Icon size={18} />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="border-t border-neutral-100 dark:border-neutral-700 pt-2">
+                    <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Color</p>
+                    <div className="flex items-center gap-2 px-1">
+                      <input
+                        type="color"
+                        title="Text color"
+                        onChange={(e) => editor.chain().focus().setColor(e.target.value).run()}
+                        className="w-7 h-7 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => editor.chain().focus().unsetColor().run()}
+                        className="text-xs text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:underline"
+                      >
+                        Clear color
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="border-t border-neutral-100 dark:border-neutral-700 pt-2">
+                    <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Table</p>
+                    <div className="flex flex-wrap gap-1 px-1">
+                      <button
+                        type="button"
+                        onClick={() => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()}
+                        className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+                      >
+                        Insert table
+                      </button>
+                      {editor.isActive("table") && (
+                        <>
+                          <button type="button" onClick={() => editor.chain().focus().addRowBefore().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                            + Row above
+                          </button>
+                          <button type="button" onClick={() => editor.chain().focus().addRowAfter().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                            + Row below
+                          </button>
+                          <button type="button" onClick={() => editor.chain().focus().deleteRow().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                            Delete row
+                          </button>
+                          <button type="button" onClick={() => editor.chain().focus().addColumnBefore().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                            + Col left
+                          </button>
+                          <button type="button" onClick={() => editor.chain().focus().addColumnAfter().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                            + Col right
+                          </button>
+                          <button type="button" onClick={() => editor.chain().focus().deleteColumn().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                            Delete col
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => editor.chain().focus().deleteTable().run()}
+                            className="px-2 py-1 text-xs rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
+                          >
+                            Delete table
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {store.linkedTo ? (
               <div className="flex items-center gap-1 pl-2 pr-1 py-1 rounded-md bg-neutral-100 dark:bg-neutral-800 text-xs text-neutral-600 dark:text-neutral-300">
                 <MdInsertLink size={14} />
@@ -328,6 +478,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                   >
                     Plain text (.txt)
                   </button>
+                  <button
+                    type="button"
+                    onClick={handlePrint}
+                    className="w-full text-left px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700 border-t border-neutral-100 dark:border-neutral-700"
+                  >
+                    Print / Save as PDF
+                  </button>
                 </div>
               )}
             </div>
@@ -335,7 +492,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         </div>
       )}
 
-      <div className="flex-1 min-h-0 overflow-y-auto px-8 py-10">
+      {/* print:overflow-visible/h-auto/block - without these, this flex/overflow-auto box (built
+          for on-screen scrolling) clips the document to whatever fits in the viewport instead of
+          flowing across printed pages, since overflow:auto content doesn't reflow for print the
+          way normal block content does. */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-8 py-10 print:flex-none print:h-auto print:overflow-visible print:block print:p-0">
         {store.loading || !editor ? (
           <div className="flex items-center justify-center h-full text-neutral-400 dark:text-neutral-500 text-sm">Loading…</div>
         ) : store.loadError ? (
@@ -344,7 +505,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           // The "page": a bounded card on the surrounding gray backdrop, rather than content
           // floating directly on the app background - gives the document a distinct identity the
           // way Docs/Notion-style editors do, instead of blending into the chrome around it.
-          <div className="max-w-3xl mx-auto bg-white dark:bg-neutral-900 rounded-xl ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-sm px-14 py-14 min-h-[75vh]">
+          <div className="max-w-3xl mx-auto bg-white dark:bg-neutral-900 rounded-xl ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-sm px-14 py-14 min-h-[75vh] print:shadow-none print:ring-0 print:rounded-none print:px-0 print:py-0 print:max-w-none print:min-h-0">
             <EditorContent
               editor={editor}
               className={[
@@ -364,6 +525,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                 // Blockquote: a soft tint behind the existing left-border-and-italic Typography
                 // default, so it reads as its own block rather than just indented italic text.
                 "[&_.ProseMirror_blockquote]:bg-neutral-50 dark:[&_.ProseMirror_blockquote]:bg-neutral-800/40 [&_.ProseMirror_blockquote]:rounded-r-md [&_.ProseMirror_blockquote]:py-1",
+                // Empty-doc placeholder ("Start writing…") - @tiptap/extension-placeholder decorates
+                // the empty paragraph with `is-editor-empty` + a data-placeholder attribute rather
+                // than rendering real text, so this is what actually makes it visible.
+                "[&_.ProseMirror_p.is-editor-empty::before]:content-[attr(data-placeholder)] [&_.ProseMirror_p.is-editor-empty::before]:float-left",
+                "[&_.ProseMirror_p.is-editor-empty::before]:h-0 [&_.ProseMirror_p.is-editor-empty::before]:pointer-events-none",
+                "[&_.ProseMirror_p.is-editor-empty::before]:text-neutral-400 dark:[&_.ProseMirror_p.is-editor-empty::before]:text-neutral-500",
               ].join(" ")}
             />
           </div>

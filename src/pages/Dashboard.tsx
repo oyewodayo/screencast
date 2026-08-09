@@ -21,6 +21,7 @@ import ImageEditor from "../components/ImageEditor";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { DocSummary } from "../utils/docTypes";
+import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings } from "../utils/appSettings";
@@ -2391,15 +2392,21 @@ const setScreen = () => {
           {boardScreen ? (
             <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
           ) : docsScreen ? (
-            <DocsWorkspace
-              screen={docsScreen}
-              onScreenChange={setDocsScreen}
-              libraryFiles={allLibraryFiles}
-              onOpenLinkedFile={(path, name) => {
-                setDocsScreen(null);
-                void loadFileForPlayback(path, name);
-              }}
-            />
+            <ErrorBoundary
+              key={docsScreen.mode === "editor" ? `editor-${docsScreen.docId}` : "home"}
+              fallbackTitle="This document ran into a problem"
+              onReset={() => setDocsScreen({ mode: "home" })}
+            >
+              <DocsWorkspace
+                screen={docsScreen}
+                onScreenChange={setDocsScreen}
+                libraryFiles={allLibraryFiles}
+                onOpenLinkedFile={(path, name) => {
+                  setDocsScreen(null);
+                  void loadFileForPlayback(path, name);
+                }}
+              />
+            </ErrorBoundary>
           ) : selectedFile ? (
             getFileCategory(selectedFile.name) === "pdf" ? (
               <PdfAnnotator
