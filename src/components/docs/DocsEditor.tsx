@@ -41,9 +41,11 @@ interface DocsEditorProps {
 }
 
 const toolbarButtonClass = (active: boolean, disabled = false): string =>
-  `p-2 rounded-md text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
-    active ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400" : ""
+  `p-2 rounded-md text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors ${
+    active ? "bg-blue-100 dark:bg-blue-500/25 text-blue-600 dark:text-blue-300 ring-1 ring-inset ring-blue-200 dark:ring-blue-500/40" : ""
   } ${disabled ? "opacity-40 cursor-not-allowed hover:bg-transparent dark:hover:bg-transparent" : ""}`;
+
+const toolbarDivider = <div className="w-px h-6 bg-neutral-300 dark:bg-neutral-600 mx-2" />;
 
 const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, onOpenLinkedFile }) => {
   const store = useDocsEditStore(docId);
@@ -155,7 +157,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         // entire render tree - confirmed via a headless React+StrictMode repro reproducing the
         // exact "editor.can(...).undo is not a function" crash. Optional-chaining the call (not
         // just gating the surrounding render on `loading`) is what actually closes this gap.
-        <div className="shrink-0 flex items-center gap-1 px-3 py-1.5 border-b border-neutral-200 dark:border-neutral-800 bg-white/60 dark:bg-neutral-900/60 flex-wrap">
+        <div className="shrink-0 flex items-center gap-1 px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/95 dark:bg-neutral-900/95 shadow-[0_1px_2px_rgba(0,0,0,0.04)] flex-wrap">
           <button type="button" title="Undo" disabled={!editor.can().undo?.()} onClick={() => editor.can().undo?.() && editor.chain().focus().undo().run()} className={toolbarButtonClass(false, !editor.can().undo?.())}>
             <MdUndo size={18} />
           </button>
@@ -163,7 +165,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             <MdRedo size={18} />
           </button>
 
-          <div className="w-px h-5 bg-neutral-200 dark:bg-neutral-700 mx-1" />
+          {toolbarDivider}
 
           <button type="button" title="Bold" onClick={() => editor.chain().focus().toggleBold().run()} className={toolbarButtonClass(editor.isActive("bold"))}>
             <MdFormatBold size={18} />
@@ -181,7 +183,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             <MdCode size={18} />
           </button>
 
-          <div className="w-px h-5 bg-neutral-200 dark:bg-neutral-700 mx-1" />
+          {toolbarDivider}
 
           {([1, 2, 3] as const).map((level) => (
             <button
@@ -195,7 +197,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             </button>
           ))}
 
-          <div className="w-px h-5 bg-neutral-200 dark:bg-neutral-700 mx-1" />
+          {toolbarDivider}
 
           <button type="button" title="Blockquote" onClick={() => editor.chain().focus().toggleBlockquote().run()} className={toolbarButtonClass(editor.isActive("blockquote"))}>
             <MdFormatQuote size={18} />
@@ -204,7 +206,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             <MdDataObject size={18} />
           </button>
 
-          <div className="w-px h-5 bg-neutral-200 dark:bg-neutral-700 mx-1" />
+          {toolbarDivider}
 
           <button type="button" title="Bullet list" onClick={() => editor.chain().focus().toggleBulletList().run()} className={toolbarButtonClass(editor.isActive("bulletList"))}>
             <MdFormatListBulleted size={18} />
@@ -213,7 +215,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             <MdFormatListNumbered size={18} />
           </button>
 
-          <div className="w-px h-5 bg-neutral-200 dark:bg-neutral-700 mx-1" />
+          {toolbarDivider}
 
           <div className="relative">
             <button type="button" title={editor.isActive("link") ? "Remove link" : "Add link"} onClick={toggleLink} className={toolbarButtonClass(editor.isActive("link"))}>
@@ -333,16 +335,38 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         </div>
       )}
 
-      <div className="flex-1 min-h-0 overflow-y-auto px-8 py-6">
+      <div className="flex-1 min-h-0 overflow-y-auto px-8 py-10">
         {store.loading || !editor ? (
           <div className="flex items-center justify-center h-full text-neutral-400 dark:text-neutral-500 text-sm">Loading…</div>
         ) : store.loadError ? (
           <div className="flex items-center justify-center h-full text-red-500 dark:text-red-400 text-sm">{store.loadError}</div>
         ) : (
-          <EditorContent
-            editor={editor}
-            className="max-w-3xl mx-auto prose prose-sm dark:prose-invert prose-neutral [&_.ProseMirror]:outline-none [&_.ProseMirror]:min-h-[60vh]"
-          />
+          // The "page": a bounded card on the surrounding gray backdrop, rather than content
+          // floating directly on the app background - gives the document a distinct identity the
+          // way Docs/Notion-style editors do, instead of blending into the chrome around it.
+          <div className="max-w-3xl mx-auto bg-white dark:bg-neutral-900 rounded-xl ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-sm px-14 py-14 min-h-[75vh]">
+            <EditorContent
+              editor={editor}
+              className={[
+                "prose prose-sm dark:prose-invert prose-neutral max-w-none",
+                "[&_.ProseMirror]:outline-none [&_.ProseMirror]:min-h-[50vh]",
+                // Uniform rhythm between every top-level block (paragraph/heading/list/quote/code)
+                // instead of Typography's own per-element-type spacing scale, which is what made
+                // the gaps between block types look inconsistent.
+                "[&_.ProseMirror>*]:my-0 [&_.ProseMirror>*+*]:mt-4",
+                // Code blocks: full card width (not sized to content), a real monospace stack, and
+                // a small static "Code" label so it reads as a distinct block at a glance - no
+                // per-language syntax highlighting yet, that's a separate feature.
+                "[&_.ProseMirror_pre]:w-full [&_.ProseMirror_pre]:box-border [&_.ProseMirror_pre]:font-mono [&_.ProseMirror_pre]:text-[13px] [&_.ProseMirror_pre]:leading-relaxed",
+                "[&_.ProseMirror_pre]:relative [&_.ProseMirror_pre]:rounded-lg [&_.ProseMirror_pre]:pt-7",
+                "[&_.ProseMirror_pre::before]:content-['Code'] [&_.ProseMirror_pre::before]:absolute [&_.ProseMirror_pre::before]:top-2 [&_.ProseMirror_pre::before]:right-3",
+                "[&_.ProseMirror_pre::before]:text-[10px] [&_.ProseMirror_pre::before]:uppercase [&_.ProseMirror_pre::before]:tracking-wide [&_.ProseMirror_pre::before]:text-neutral-400",
+                // Blockquote: a soft tint behind the existing left-border-and-italic Typography
+                // default, so it reads as its own block rather than just indented italic text.
+                "[&_.ProseMirror_blockquote]:bg-neutral-50 dark:[&_.ProseMirror_blockquote]:bg-neutral-800/40 [&_.ProseMirror_blockquote]:rounded-r-md [&_.ProseMirror_blockquote]:py-1",
+              ].join(" ")}
+            />
+          </div>
         )}
       </div>
     </div>
