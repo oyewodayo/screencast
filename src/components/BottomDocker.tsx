@@ -76,6 +76,8 @@ interface Props {
   isHome: boolean;
   handleOpenBoard: () => void;
   isBoard: boolean;
+  handleOpenDocs: () => void;
+  isDocs: boolean;
   handleOpenSettings: () => void;
   handleOpenExternalFile: () => void;
   showFileList: boolean;
@@ -163,6 +165,8 @@ const BottomDocker = ({
   isHome,
   handleOpenBoard,
   isBoard,
+  handleOpenDocs,
+  isDocs,
   handleOpenSettings,
   handleOpenExternalFile,
   showFileList,
@@ -433,6 +437,8 @@ const BottomDocker = ({
             isHome={isHome}
             handleOpenBoard={handleOpenBoard}
             isBoard={isBoard}
+            handleOpenDocs={handleOpenDocs}
+            isDocs={isDocs}
             handleOpenSettings={handleOpenSettings}
             handleOpenExternalFile={handleOpenExternalFile}
             handleVideoOverlayAction={handleVideoOverlayAction}

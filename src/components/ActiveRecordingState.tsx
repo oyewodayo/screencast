@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoClose, IoMicCircle, IoOpenSharp, IoScanSharp, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline } from 'react-icons/io5'
+import { IoClose, IoMicCircle, IoOpenSharp, IoScanSharp, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline } from 'react-icons/io5'
 
 interface Props {
     recordType: string;
@@ -11,6 +11,8 @@ interface Props {
     isHome:boolean;
     handleOpenBoard:()=>void;
     isBoard:boolean;
+    handleOpenDocs:()=>void;
+    isDocs:boolean;
     handleOpenSettings:()=>void;
     handleOpenExternalFile:()=>void;
     handleVideoOverlayAction: ()=>void;
@@ -21,7 +23,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenSettings,handleOpenExternalFile, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenSettings,handleOpenExternalFile, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -121,6 +123,18 @@ const ActiveRecordingState = (
                     title="Board"
                     >
                       <IoImagesOutline />
+                    </button>
+                    <button
+                    type="button"
+                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
+                      isDocs
+                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
+                        : "hover:bg-black/40 active:bg-black/60"
+                    }`}
+                    onClick={() => handleOpenDocs()}
+                    title="Docs"
+                    >
+                      <IoDocumentTextOutline />
                     </button>
                     <button
                     type="button"

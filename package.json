@@ -12,15 +12,24 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^1.5",
+    "@tiptap/core": "^2.27.2",
+    "@tiptap/extension-collaboration": "^2.27.2",
+    "@tiptap/extension-link": "^2.27.2",
+    "@tiptap/extension-underline": "^2.27.2",
+    "@tiptap/pm": "^2.27.2",
+    "@tiptap/react": "^2.27.2",
+    "@tiptap/starter-kit": "^2.27.2",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "6.1.200",
     "perfect-freehand": "1.2.3",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-icons": "^5.2.1",
-    "react-router-dom": "^6.25.0"
+    "react-router-dom": "^6.25.0",
+    "yjs": "^13.6.32"
   },
   "devDependencies": {
+    "@tailwindcss/typography": "^0.5.20",
     "@tauri-apps/cli": "^1.5",
     "@types/react": "^18.2.15",
     "@types/react-dom": "^18.2.7",

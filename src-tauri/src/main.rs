@@ -24,6 +24,7 @@ mod services {
     pub mod trash;
     pub mod file_watcher;
     pub mod boards;
+    pub mod docs;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
@@ -206,6 +207,11 @@ fn main() {
             services::boards::import_board_image,
             services::boards::save_board_thumbnail,
             services::boards::export_board_png,
+            services::docs::list_docs,
+            services::docs::create_doc,
+            services::docs::save_doc,
+            services::docs::load_doc,
+            services::docs::delete_doc,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

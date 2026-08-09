@@ -18,6 +18,7 @@ import ConversionDialog from "../components/ConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
+import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings } from "../utils/appSettings";
@@ -214,6 +215,9 @@ const Dashboard = () => {
   // Which Board screen (if any) is showing in the main content pane - null means Board mode is
   // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
   const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
+  // Which Docs screen (if any) is showing in the main content pane - same null-means-off pattern
+  // as boardScreen. See handleOpenDocs.
+  const [docsScreen, setDocsScreen] = useState<DocsScreen | null>(null);
   // Spins the sidebar's manual refresh icon while a refresh is in flight — see handleRefreshFiles.
   const [isRefreshingFiles, setIsRefreshingFiles] = useState<boolean>(false);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
@@ -885,8 +889,9 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); };
-	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); };
+	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); };
+	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); };
+	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); };
 	const handleOpenSettings = () => setShowSettings(true);
 	const handleCloseSettings = () => setShowSettings(false);
 	// Settings apply immediately to the current session too, not just future ones — otherwise
@@ -1054,6 +1059,7 @@ const setScreen = () => {
 		sourcePath: filePath
 		});
 		setBoardScreen(null);
+		setDocsScreen(null);
 		setRecentPaths(recordFileOpened(filePath));
 
 		console.log('File selected for playback:', fileName);
@@ -2224,6 +2230,7 @@ const setScreen = () => {
                     sourcePath: newPath
                   });
                   setBoardScreen(null);
+                  setDocsScreen(null);
                 } catch (error) {
                   console.error('Error loading converted file:', error);
                 }
@@ -2234,6 +2241,8 @@ const setScreen = () => {
 
           {boardScreen ? (
             <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
+          ) : docsScreen ? (
+            <DocsWorkspace screen={docsScreen} onScreenChange={setDocsScreen} />
           ) : selectedFile ? (
             getFileCategory(selectedFile.name) === "pdf" ? (
               <PdfAnnotator
@@ -2499,9 +2508,11 @@ const setScreen = () => {
         setAudioDevice={setAudioDevice}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
-        isHome={selectedFile === null && boardScreen === null}
+        isHome={selectedFile === null && boardScreen === null && docsScreen === null}
         handleOpenBoard={handleOpenBoard}
         isBoard={boardScreen !== null}
+        handleOpenDocs={handleOpenDocs}
+        isDocs={docsScreen !== null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}
