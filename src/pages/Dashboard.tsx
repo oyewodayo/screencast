@@ -64,6 +64,7 @@ const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.R
   { category: "audio", label: "Audio", icon: <IoMusicalNotes size={18} /> },
   { category: "image", label: "Image", icon: <IoImage size={18} /> },
   { category: "pdf", label: "Pdf", icon: <IoDocumentText size={18} /> },
+  { category: "document", label: "Documents", icon: <MdOutlineDescription size={18} /> },
 ];
 
 // The sidebar's active tab is either a real file category or the Trash view — the latter isn't
@@ -93,6 +94,7 @@ const OPEN_FILE_DIALOG_FILTERS = [
   { name: "Audio", extensions: FILE_CATEGORY_EXTENSIONS.audio },
   { name: "Image", extensions: FILE_CATEGORY_EXTENSIONS.image },
   { name: "PDF", extensions: FILE_CATEGORY_EXTENSIONS.pdf },
+  { name: "Document", extensions: FILE_CATEGORY_EXTENSIONS.document },
 ];
 
 // Toggles the recording-overlay window's visibility. Registered as an OS-level hotkey via
@@ -1361,7 +1363,7 @@ const setScreen = () => {
 
 			const name = selected.split(/[\\/]/).pop() ?? selected;
 			if (!getFileCategory(name)) {
-				await showMessageDialog(`"${name}" isn't a supported file type (video, audio, image, or PDF).`, {
+				await showMessageDialog(`"${name}" isn't a supported file type (video, audio, image, PDF, or document).`, {
 					title: 'Unsupported file',
 					type: 'warning',
 				});
@@ -2427,6 +2429,22 @@ const setScreen = () => {
                 isToolsPanelOpen={dockerMode === "file-tools"}
                 onToolsPanelOpenChange={(open) => setDockerMode(open ? "file-tools" : "record")}
               />
+            ) : getFileCategory(selectedFile.name) === "document" ? (
+              // .docx/.md/.txt (e.g. Docs' own Export menu output) have no in-app renderer, unlike
+              // pdf/image/video above - hand off to the OS's own default app rather than pretending
+              // to preview them.
+              <div key={selectedFile.path} className="w-full h-full flex flex-col items-center justify-center gap-3 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-300">
+                <MdOutlineDescription size={48} className="text-neutral-300 dark:text-neutral-600" />
+                <p className="text-sm font-medium max-w-md truncate px-4">{selectedFile.name}</p>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500">This file type can't be previewed inside Briefcast.</p>
+                <button
+                  type="button"
+                  onClick={() => invoke("open_file_with_default_app", { filepath: selectedFile.sourcePath }).catch((err) => setError(`Failed to open file: ${err}`))}
+                  className="mt-1 px-4 py-2 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700"
+                >
+                  Open with default app
+                </button>
+              </div>
             ) : (
               <VideoPlayer
                 ref={videoPlayerRef}

@@ -6,13 +6,17 @@
 // dialog previously only checked "is this an image", and treated literally everything else
 // (audio, PDF) as video, offering MP4/MOV/MKV/AVI/WebM output for files that aren't video at all.
 
-export type FileCategory = "video" | "audio" | "image" | "pdf";
+export type FileCategory = "video" | "audio" | "image" | "pdf" | "document";
 
 export const FILE_CATEGORY_EXTENSIONS: Record<FileCategory, string[]> = {
   video: ["mp4", "mov", "avi", "mkv", "webm", "wmv"],
   audio: ["mp3", "wav", "aac", "flac", "ogg", "m4a"],
   image: ["jpg", "jpeg", "png", "gif", "bmp", "tiff"],
   pdf: ["pdf"],
+  // What Docs' export feature (DocsEditor.tsx's Export menu) writes into the Briefcast root -
+  // docx/md/txt have no inline previewer (unlike pdf/image/video), so Dashboard.tsx falls back to
+  // an "open with default app" panel for this category instead of rendering one.
+  document: ["docx", "md", "txt"],
 };
 
 export const getFileExtension = (fileName: string): string => fileName.split(".").pop()?.toLowerCase() ?? "";

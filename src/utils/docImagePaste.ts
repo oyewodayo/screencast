@@ -35,6 +35,24 @@ async function uploadImage(docId: string, file: File): Promise<string> {
   return convertFileSrc(path);
 }
 
+// save_doc_image's own whitelist (docs.rs) - kept as a separate list rather than reusing
+// EXTENSION_BY_MIME's values, since that map's keys are MIME types, not file extensions.
+const ALLOWED_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
+
+// Toolbar-driven "Insert image" counterpart to uploadImage() above - there the source is an
+// in-memory File from a paste/drop event; here it's a path already on disk, picked via a native
+// file dialog, so the extension comes straight from the filename instead of being derived from a
+// MIME type.
+export async function uploadImageFromPath(docId: string, path: string): Promise<string> {
+  const extension = path.split(".").pop()?.toLowerCase() ?? "";
+  if (!ALLOWED_IMAGE_EXTENSIONS.includes(extension)) {
+    throw new Error(`Unsupported image type: "${extension || "unknown"}"`);
+  }
+  const bytes = await invoke<number[]>("read_file_bytes", { path });
+  const savedPath = await invoke<string>("save_doc_image", { id: docId, assetId: crypto.randomUUID(), extension, bytes });
+  return convertFileSrc(savedPath);
+}
+
 // Position captured synchronously before the async upload starts, so a cursor move (or further
 // typing) while the upload is in flight doesn't insert the image in the wrong place - but the
 // document itself can also change size in the meantime (more typing, a deletion, even navigating

@@ -180,6 +180,7 @@ fn main() {
             commands::annotation::ensure_annotation_overlay,
 
             services::utility::open_file_from_directory,
+            services::utility::open_file_with_default_app,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
             services::utility::get_cursor_position_in_window,
@@ -218,6 +219,7 @@ fn main() {
             services::docs::find_docs_linked_to,
             services::docs::relink_doc_path,
             services::docs::export_doc,
+            services::docs::export_doc_binary,
             services::docs::save_doc_image,
             services::docs::list_trashed_docs,
             services::docs::restore_doc,

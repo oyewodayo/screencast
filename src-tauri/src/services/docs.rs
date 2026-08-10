@@ -324,12 +324,9 @@ pub fn relink_doc_path(old_path: String, new_path: String) -> Result<u32, String
 // Writes a Markdown/plain-text export directly into the Briefcast root (no Save dialog exists in
 // this app's Tauri allowlist) with a timestamp-suffixed filename, so it shows up in the sidebar's
 // file list immediately via the existing file watcher - same convention as export_board_png.
-#[command]
-pub fn export_doc(doc_title: String, extension: String, content: String) -> Result<String, String> {
-    if extension != "md" && extension != "txt" {
-        return Err(format!("Unsupported export extension: {}", extension));
-    }
-
+// Shared by export_doc and export_doc_binary so the sanitized-name + timestamp filename
+// convention can't drift between the text and binary export paths.
+fn build_export_path(doc_title: &str, extension: &str) -> Result<PathBuf, String> {
     let root = briefcast_dir()?;
     fs::create_dir_all(&root).map_err(|e| format!("Failed to create Briefcast folder: {}", e))?;
 
@@ -339,11 +336,33 @@ pub fn export_doc(doc_title: String, extension: String, content: String) -> Resu
         .collect();
     let safe_name = if safe_name.trim().is_empty() { "Document".to_string() } else { safe_name };
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
-    let output = root.join(format!("{} {}.{}", safe_name, stamp, extension));
+    Ok(root.join(format!("{} {}.{}", safe_name, stamp, extension)))
+}
 
+#[command]
+pub fn export_doc(doc_title: String, extension: String, content: String) -> Result<String, String> {
+    if extension != "md" && extension != "txt" {
+        return Err(format!("Unsupported export extension: {}", extension));
+    }
+
+    let output = build_export_path(&doc_title, &extension)?;
     let tmp_file_name = format!("{}.tmp", output.file_name().unwrap().to_string_lossy());
     let tmp = output.with_file_name(tmp_file_name);
     fs::write(&tmp, content.as_bytes()).map_err(|e| format!("Failed to write export: {}", e))?;
+    fs::rename(&tmp, &output).map_err(|e| format!("Failed to save export: {}", e))?;
+    Ok(output.to_string_lossy().to_string())
+}
+
+#[command]
+pub fn export_doc_binary(doc_title: String, extension: String, bytes: Vec<u8>) -> Result<String, String> {
+    if extension != "docx" {
+        return Err(format!("Unsupported export extension: {}", extension));
+    }
+
+    let output = build_export_path(&doc_title, &extension)?;
+    let tmp_file_name = format!("{}.tmp", output.file_name().unwrap().to_string_lossy());
+    let tmp = output.with_file_name(tmp_file_name);
+    fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write export: {}", e))?;
     fs::rename(&tmp, &output).map_err(|e| format!("Failed to save export: {}", e))?;
     Ok(output.to_string_lossy().to_string())
 }

@@ -15,4 +15,5 @@ export const FILE_TOOLS_COPY: Record<FileCategory, FileToolsCopy> = {
   audio: { heading: "Audio tools", blurb: "More editing tools (trim, fade, normalize) are coming here." },
   image: { heading: "Image tools", blurb: "Crop, draw, blur, and adjust from the image tools panel (wrench icon, top right)." },
   pdf: { heading: "PDF tools", blurb: "Use the pen, highlighter, text, and outline tools in the toolbar above." },
+  document: { heading: "Document", blurb: "This file opens in your system's default app - use \"Open with default app\" in the preview." },
 };

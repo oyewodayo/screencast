@@ -28,6 +28,7 @@
     "@tiptap/pm": "^2.27.2",
     "@tiptap/react": "^2.27.2",
     "@tiptap/starter-kit": "^2.27.2",
+    "docx": "^9.7.1",
     "mammoth": "^1.12.1",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "6.1.200",

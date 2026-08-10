@@ -585,7 +585,11 @@ fn is_media_file(ext: &str)->bool{
         "jpg" | "jpeg" | "png" | "gif"  | "bmp" | "tiff" |
         "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" |
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv" |
-        "pdf"
+        "pdf" |
+        // docx/md/txt: what Docs' export feature (services/docs.rs's export_doc/
+        // export_doc_binary) writes into briefcast_dir() - without these here they'd be filtered
+        // out of scan_directory below and never reach the frontend's file list at all.
+        "docx" | "md" | "txt"
     )
 }
 
@@ -625,6 +629,42 @@ pub async fn open_file_from_directory(filepath: String) -> Result<(), String> {
     Ok(())
 }
 
+// Launches filepath in whatever app the OS has associated with its extension - used by the
+// Documents tab's preview panel for docx/md/txt, which have no in-app renderer. Deliberately a
+// dedicated OS-spawn command rather than @tauri-apps/api/shell's open() - that API's default
+// validation regex only accepts http(s)/mailto/tel targets and rejects local file paths outright,
+// and Tauri v1's allowlist has no way to widen it to permit arbitrary local paths without opening
+// the same hole up for URLs too.
+#[command]
+pub async fn open_file_with_default_app(filepath: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Passing a file path (not a directory) launches its associated default app - the same
+        // trick open_file_from_directory uses with /select, just without that flag.
+        Command::new("explorer")
+            .arg(&filepath)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&filepath)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(&filepath)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    Ok(())
+}
 
 #[command]
 pub fn rename_file(old_path: String, new_name: String) -> Result<String, String> {

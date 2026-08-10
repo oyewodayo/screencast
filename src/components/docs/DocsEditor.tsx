@@ -6,6 +6,7 @@
 // - just a title field, a formatting toolbar, and the editable content area.
 import React, { useCallback, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
+import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { useEditor, EditorContent } from "@tiptap/react";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -31,11 +32,13 @@ import {
   MdFormatAlignRight,
   MdFormatAlignJustify,
   MdMoreHoriz,
+  MdImage,
 } from "react-icons/md";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
+import { buildDocxBytes } from "../../utils/docDocx";
 import { LibraryFileEntry } from "../../utils/docTypes";
-import { createDocImagePasteExtension } from "../../utils/docImagePaste";
+import { createDocImagePasteExtension, uploadImageFromPath } from "../../utils/docImagePaste";
 import { getDocContentExtensions } from "../../utils/docSchemaExtensions";
 
 interface DocsEditorProps {
@@ -138,6 +141,24 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     setLinkUrl("");
   }, [editor, linkUrl]);
 
+  // Toolbar-driven counterpart to docImagePaste.ts's paste/drop handling - the only other way to
+  // get an image into a doc up to now, which meant there was no clean way to insert one without
+  // already having it on the clipboard or in an open OS window to drag from.
+  const handleInsertImage = useCallback(async () => {
+    if (!editor) return;
+    try {
+      const selected = await openFileDialog({
+        multiple: false,
+        filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
+      });
+      if (!selected || Array.isArray(selected)) return; // cancelled
+      const src = await uploadImageFromPath(docId, selected);
+      editor.chain().focus().setImage({ src }).run();
+    } catch (err) {
+      console.error("Failed to insert image:", err);
+    }
+  }, [editor, docId]);
+
   const handleExport = useCallback(
     async (extension: "md" | "txt") => {
       if (!editor) return;
@@ -155,6 +176,22 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     },
     [editor, store.title]
   );
+
+  const handleExportDocx = useCallback(async () => {
+    if (!editor) return;
+    setShowExportMenu(false);
+    setExportStatus("Exporting…");
+    try {
+      const bytes = await buildDocxBytes(editor.getJSON(), store.title);
+      await invoke("export_doc_binary", { docTitle: store.title, extension: "docx", bytes: Array.from(bytes) });
+      setExportStatus("Exported");
+    } catch (err) {
+      console.error("Failed to export document as .docx:", err);
+      setExportStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTimeout(() => setExportStatus(null), 3000);
+    }
+  }, [editor, store.title]);
 
   const linkedFile = useMemo(() => libraryFiles.find((f) => f.path === store.linkedTo), [libraryFiles, store.linkedTo]);
   const filteredLibraryFiles = useMemo(() => {
@@ -269,6 +306,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           </button>
           <button type="button" title="Numbered list" onClick={() => editor.chain().focus().toggleOrderedList().run()} className={toolbarButtonClass(editor.isActive("orderedList"))}>
             <MdFormatListNumbered size={18} />
+          </button>
+
+          {toolbarDivider}
+
+          <button type="button" title="Insert image" onClick={() => void handleInsertImage()} className={toolbarButtonClass(false)}>
+            <MdImage size={18} />
           </button>
 
           {toolbarDivider}
@@ -485,6 +528,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                   </button>
                   <button
                     type="button"
+                    onClick={() => void handleExportDocx()}
+                    className="w-full text-left px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+                  >
+                    Word Document (.docx)
+                  </button>
+                  <button
+                    type="button"
                     onClick={handlePrint}
                     className="w-full text-left px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700 border-t border-neutral-100 dark:border-neutral-700"
                   >
@@ -536,6 +586,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                 "[&_.ProseMirror_p.is-editor-empty::before]:content-[attr(data-placeholder)] [&_.ProseMirror_p.is-editor-empty::before]:float-left",
                 "[&_.ProseMirror_p.is-editor-empty::before]:h-0 [&_.ProseMirror_p.is-editor-empty::before]:pointer-events-none",
                 "[&_.ProseMirror_p.is-editor-empty::before]:text-neutral-400 dark:[&_.ProseMirror_p.is-editor-empty::before]:text-neutral-500",
+                // Images: clicking one gives it a ProseMirror NodeSelection (the schema never sets
+                // selectable:false), but with no styling for that state a click looked like it did
+                // nothing - this is what actually shows the selection, so Backspace/Delete on a
+                // selected image reads as a real "select then remove" action instead of a dead click.
+                "[&_.ProseMirror_img]:rounded-md [&_.ProseMirror_img]:cursor-pointer [&_.ProseMirror_img]:max-w-full",
+                "[&_.ProseMirror_img.ProseMirror-selectednode]:outline [&_.ProseMirror_img.ProseMirror-selectednode]:outline-2 [&_.ProseMirror_img.ProseMirror-selectednode]:outline-blue-500 [&_.ProseMirror_img.ProseMirror-selectednode]:outline-offset-2",
               ].join(" ")}
             />
           </div>
