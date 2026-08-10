@@ -11,15 +11,67 @@
 import * as mammoth from "mammoth";
 import * as Y from "yjs";
 import { getSchema } from "@tiptap/core";
-import { DOMParser as ProseMirrorDOMParser } from "@tiptap/pm/model";
+import { DOMParser as ProseMirrorDOMParser, Fragment, type Node as ProseMirrorNode, type MarkType } from "@tiptap/pm/model";
 import { prosemirrorToYDoc } from "y-prosemirror";
 import { invoke, convertFileSrc } from "@tauri-apps/api/tauri";
 import { getDocContentExtensions } from "./docSchemaExtensions";
 import { EXTENSION_BY_MIME } from "./docImagePaste";
+import { resolveDocxParagraphStyles, type ParagraphStyle } from "./docxStyleResolver";
 
 export interface ImportedDoc {
   id: string;
   title: string;
+}
+
+// Overlays docxStyleResolver's per-paragraph color/font/size (recovered by reading the .docx's raw
+// OOXML directly - see that module's own header comment for why mammoth's HTML output alone can't
+// carry this) onto mammoth's own structural ProseMirror output. Correlated purely by encounter
+// order: both this walk and the resolver's own XML walk visit every paragraph/heading in a
+// recursive depth-first, document-order traversal (top-level, inside a list item, inside a table
+// cell - wherever it is), so the Nth paragraph/heading node this recursion reaches is assumed to
+// be the Nth entry the resolver produced. True for the common case; an unusual paragraph type
+// mammoth drops or restructures differently than a literal walk could misalign the two lists -
+// best-effort fidelity improvement over having no styling at all, not a correctness guarantee.
+function applyParagraphStyles(doc: ProseMirrorNode, markType: MarkType | undefined, paragraphStyles: ParagraphStyle[]): ProseMirrorNode {
+  if (!markType || paragraphStyles.length === 0) return doc;
+  const definiteMarkType = markType;
+  let index = 0;
+
+  function walk(node: ProseMirrorNode): ProseMirrorNode {
+    if (node.type.name === "paragraph" || node.type.name === "heading") {
+      const style = paragraphStyles[index];
+      index++;
+      return style ? applyStyleToTextRuns(node, definiteMarkType, style) : node;
+    }
+    if (node.content.childCount === 0) return node;
+    const children: ProseMirrorNode[] = [];
+    node.forEach((child) => children.push(walk(child)));
+    return node.copy(Fragment.fromArray(children));
+  }
+
+  return walk(doc);
+}
+
+function applyStyleToTextRuns(node: ProseMirrorNode, markType: MarkType, style: ParagraphStyle): ProseMirrorNode {
+  const attrs: Record<string, unknown> = {};
+  if (style.color) attrs.color = style.color;
+  if (style.fontFamily) attrs.fontFamily = style.fontFamily;
+  if (style.fontSizePt) attrs.fontSize = style.fontSizePt;
+  if (Object.keys(attrs).length === 0) return node;
+  const mark = markType.create(attrs);
+
+  const children: ProseMirrorNode[] = [];
+  node.forEach((child) => {
+    // Only text runs get the style - other inline content (e.g. an inline image) passes through
+    // untouched, since "paragraph color/font" has no meaning for it.
+    if (child.isText) {
+      const otherMarks = child.marks.filter((m) => m.type !== markType);
+      children.push(child.mark([...otherMarks, mark]));
+    } else {
+      children.push(child);
+    }
+  });
+  return node.copy(Fragment.fromArray(children));
 }
 
 // mammoth's own Image descriptor exposes contentType (a MIME string) and several read methods -
@@ -62,7 +114,12 @@ export async function importDocxFile(path: string, fileName: string): Promise<Im
 
     const schema = getSchema(getDocContentExtensions());
     const dom = new DOMParser().parseFromString(result.value, "text/html");
-    const node = ProseMirrorDOMParser.fromSchema(schema).parse(dom.body);
+    const parsedNode = ProseMirrorDOMParser.fromSchema(schema).parse(dom.body);
+
+    // Recovers color/font/size mammoth's own HTML conversion can't (see docxStyleResolver.ts) by
+    // reading the .docx's raw OOXML directly, then overlaying it onto mammoth's structural output.
+    const paragraphStyles = await resolveDocxParagraphStyles(new Uint8Array(fileBytes));
+    const node = applyParagraphStyles(parsedNode, schema.marks.textStyle, paragraphStyles);
 
     // "default" matches @tiptap/extension-collaboration's own default field name (DocsEditor.tsx
     // never overrides it) - getting this wrong would silently put the imported content in a

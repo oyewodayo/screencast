@@ -23,6 +23,21 @@ export const EXTENSION_BY_MIME: Record<string, string> = {
   "image/webp": "webp",
 };
 
+// save_doc_image's own whitelist (docs.rs) - kept as a separate list rather than reusing
+// EXTENSION_BY_MIME's values, since that map's keys are MIME types, not file extensions.
+const ALLOWED_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
+
+// Shared by every doc-image write path (clipboard paste, drag-drop, toolbar file-insert, and the
+// crop tool's re-save-as-new-asset step) - always a fresh crypto.randomUUID() assetId, matching
+// this app's "never overwrite, always version as a new file" convention for doc assets.
+export async function saveImageBytes(docId: string, bytes: number[], extension: string): Promise<string> {
+  if (!ALLOWED_IMAGE_EXTENSIONS.includes(extension)) {
+    throw new Error(`Unsupported image type: "${extension || "unknown"}"`);
+  }
+  const path = await invoke<string>("save_doc_image", { id: docId, assetId: crypto.randomUUID(), extension, bytes });
+  return convertFileSrc(path);
+}
+
 async function uploadImage(docId: string, file: File): Promise<string> {
   const extension = EXTENSION_BY_MIME[file.type];
   // Throwing (rather than returning null) means an unsupported type - e.g. BMP/TIFF/SVG, or any
@@ -31,13 +46,8 @@ async function uploadImage(docId: string, file: File): Promise<string> {
   // trail at all.
   if (!extension) throw new Error(`Unsupported image type for paste: "${file.type || "unknown"}"`);
   const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-  const path = await invoke<string>("save_doc_image", { id: docId, assetId: crypto.randomUUID(), extension, bytes });
-  return convertFileSrc(path);
+  return saveImageBytes(docId, bytes, extension);
 }
-
-// save_doc_image's own whitelist (docs.rs) - kept as a separate list rather than reusing
-// EXTENSION_BY_MIME's values, since that map's keys are MIME types, not file extensions.
-const ALLOWED_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
 
 // Toolbar-driven "Insert image" counterpart to uploadImage() above - there the source is an
 // in-memory File from a paste/drop event; here it's a path already on disk, picked via a native
@@ -45,12 +55,8 @@ const ALLOWED_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
 // MIME type.
 export async function uploadImageFromPath(docId: string, path: string): Promise<string> {
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
-  if (!ALLOWED_IMAGE_EXTENSIONS.includes(extension)) {
-    throw new Error(`Unsupported image type: "${extension || "unknown"}"`);
-  }
   const bytes = await invoke<number[]>("read_file_bytes", { path });
-  const savedPath = await invoke<string>("save_doc_image", { id: docId, assetId: crypto.randomUUID(), extension, bytes });
-  return convertFileSrc(savedPath);
+  return saveImageBytes(docId, bytes, extension);
 }
 
 // Position captured synchronously before the async upload starts, so a cursor move (or further

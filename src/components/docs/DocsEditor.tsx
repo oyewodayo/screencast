@@ -55,6 +55,11 @@ const toolbarButtonClass = (active: boolean, disabled = false): string =>
 
 const toolbarDivider = <div className="w-px h-6 bg-neutral-300 dark:bg-neutral-600 mx-2" />;
 
+// Common web-safe fonts - matches the ones .docx documents (and Word itself) most commonly use,
+// since the main reason to pick a font here is either matching an imported document or preparing
+// one for export, not general-purpose web typography.
+const FONT_FAMILIES = ["Arial", "Calibri", "Cambria", "Courier New", "Georgia", "Helvetica", "Times New Roman", "Verdana"];
+
 const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, onOpenLinkedFile }) => {
   const store = useDocsEditStore(docId);
   const [showLinkInput, setShowLinkInput] = useState(false);
@@ -71,7 +76,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         // Schema-contributing extensions (StarterKit, Underline, Link, Image, Table+*, TextAlign,
         // TextStyle, Color) live in getDocContentExtensions() - shared with docxImport.ts's
         // headless schema builder so the live editor and the importer can never drift apart.
-        ...getDocContentExtensions(),
+        ...getDocContentExtensions(docId),
         // Collaboration's own history (Yjs UndoManager) replaces StarterKit's plain history -
         // undo/redo need to walk CRDT operations, not a linear command stack, once this doc can
         // eventually receive remote updates too.
@@ -398,6 +403,43 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                   </div>
 
                   <div className="border-t border-neutral-100 dark:border-neutral-700 pt-2">
+                    <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Font</p>
+                    <div className="flex items-center gap-1.5 px-1">
+                      <select
+                        title="Font family"
+                        value={editor.getAttributes("textStyle").fontFamily ?? ""}
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          if (value) editor.chain().focus().setFontFamily(value).run();
+                          else editor.chain().focus().unsetFontFamily().run();
+                        }}
+                        className="min-w-0 flex-1 px-1.5 py-1 text-xs rounded border border-neutral-200 dark:border-neutral-700 bg-transparent text-neutral-700 dark:text-neutral-200 outline-none"
+                      >
+                        <option value="">Default</option>
+                        {FONT_FAMILIES.map((font) => (
+                          <option key={font} value={font}>
+                            {font}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="number"
+                        title="Font size (pt)"
+                        min={1}
+                        max={200}
+                        value={editor.getAttributes("textStyle").fontSize ?? ""}
+                        placeholder="pt"
+                        onChange={(e) => {
+                          const value = parseFloat(e.target.value);
+                          if (e.target.value && !Number.isNaN(value)) editor.chain().focus().setFontSize(value).run();
+                          else editor.chain().focus().unsetFontSize().run();
+                        }}
+                        className="w-14 px-1.5 py-1 text-xs rounded border border-neutral-200 dark:border-neutral-700 bg-transparent text-neutral-700 dark:text-neutral-200 outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="border-t border-neutral-100 dark:border-neutral-700 pt-2">
                     <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Table</p>
                     <div className="flex flex-wrap gap-1 px-1">
                       <button
@@ -586,12 +628,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                 "[&_.ProseMirror_p.is-editor-empty::before]:content-[attr(data-placeholder)] [&_.ProseMirror_p.is-editor-empty::before]:float-left",
                 "[&_.ProseMirror_p.is-editor-empty::before]:h-0 [&_.ProseMirror_p.is-editor-empty::before]:pointer-events-none",
                 "[&_.ProseMirror_p.is-editor-empty::before]:text-neutral-400 dark:[&_.ProseMirror_p.is-editor-empty::before]:text-neutral-500",
-                // Images: clicking one gives it a ProseMirror NodeSelection (the schema never sets
-                // selectable:false), but with no styling for that state a click looked like it did
-                // nothing - this is what actually shows the selection, so Backspace/Delete on a
-                // selected image reads as a real "select then remove" action instead of a dead click.
-                "[&_.ProseMirror_img]:rounded-md [&_.ProseMirror_img]:cursor-pointer [&_.ProseMirror_img]:max-w-full",
-                "[&_.ProseMirror_img.ProseMirror-selectednode]:outline [&_.ProseMirror_img.ProseMirror-selectednode]:outline-2 [&_.ProseMirror_img.ProseMirror-selectednode]:outline-blue-500 [&_.ProseMirror_img.ProseMirror-selectednode]:outline-offset-2",
+                // Image selection/resize/crop/reorder styling lives entirely inside
+                // DocImageView.tsx (a custom NodeView), driven by the `selected` prop Tiptap passes
+                // it directly - not global CSS, since ProseMirror-selectednode lands on the
+                // NodeView's own wrapper element rather than the raw <img> once a NodeView owns it.
               ].join(" ")}
             />
           </div>

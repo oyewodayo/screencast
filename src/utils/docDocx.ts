@@ -68,13 +68,14 @@ function resolveImagePath(src: string): string | null {
   }
 }
 
-// No natural-dimension tracking exists anywhere in this app at paste/import time, so embedded
-// images use a fixed reasonable default rather than a guessed/incorrect size - a known v1
-// limitation, not a silent approximation.
+// Fallback for images with no explicit width/height (DocImageView.tsx's resize handles, added
+// after this default was introduced, now set node.attrs.width/height for any image the user has
+// resized - this stays the fallback for images that were never resized, e.g. from before that
+// feature shipped, or freshly cropped/inserted).
 const DEFAULT_IMAGE_WIDTH = 400;
 const DEFAULT_IMAGE_HEIGHT = 300;
 
-async function buildImageRun(src: string): Promise<ImageRun | null> {
+async function buildImageRun(src: string, width?: number | null, height?: number | null): Promise<ImageRun | null> {
   const path = resolveImagePath(src);
   if (!path) return null;
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
@@ -88,7 +89,7 @@ async function buildImageRun(src: string): Promise<ImageRun | null> {
     return new ImageRun({
       type,
       data: new Uint8Array(bytes),
-      transformation: { width: DEFAULT_IMAGE_WIDTH, height: DEFAULT_IMAGE_HEIGHT },
+      transformation: { width: width ?? DEFAULT_IMAGE_WIDTH, height: height ?? DEFAULT_IMAGE_HEIGHT },
     });
   } catch (err) {
     console.error("Failed to embed image in docx export:", err);
@@ -101,14 +102,22 @@ async function buildImageRun(src: string): Promise<ImageRun | null> {
 // table-header cells (docx has no distinct header-cell type, unlike tableHeader in the schema).
 function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
   const has = (type: string) => marks?.some((m) => m.type === type) ?? false;
-  const color = marks?.find((m) => m.type === "textStyle")?.attrs?.color as string | undefined;
+  const textStyle = marks?.find((m) => m.type === "textStyle");
+  const color = textStyle?.attrs?.color as string | undefined;
+  const fontFamily = textStyle?.attrs?.fontFamily as string | undefined;
+  const fontSizePt = textStyle?.attrs?.fontSize as number | undefined;
   return {
     bold: has("bold") || forceBold || undefined,
     italics: has("italic") || undefined,
     strike: has("strike") || undefined,
     ...(has("underline") ? { underline: { type: UnderlineType.SINGLE } } : {}),
     ...(color ? { color: color.replace("#", "") } : {}),
+    ...(fontFamily ? { font: fontFamily } : {}),
+    // docx's own run size is in half-points (OOXML convention), not points.
+    ...(fontSizePt ? { size: fontSizePt * 2 } : {}),
     // No first-class inline-code concept in docx - approximated as monospace + light shading.
+    // Placed last so it wins over any fontFamily above - showing code in the surrounding prose
+    // font would look wrong regardless of what the paragraph's own font is set to.
     ...(has("code") ? { font: "Consolas", shading: { fill: "F0F0F0" } } : {}),
   };
 }
@@ -134,7 +143,7 @@ async function renderInline(content: JSONContent[] | undefined, forceBold = fals
       runs.push(new TextRun({ text: "", break: 1 }));
     } else if (node.type === "image") {
       const src = (node.attrs?.src as string) ?? "";
-      const image = await buildImageRun(src);
+      const image = await buildImageRun(src, node.attrs?.width, node.attrs?.height);
       if (image) runs.push(image);
     }
   }
@@ -263,7 +272,23 @@ class DocxBuilder {
       for (const cell of row.content ?? []) cells.push(await this.renderTableCell(cell));
       tableRows.push(new TableRow({ children: cells }));
     }
-    return new Table({ rows: tableRows, width: { size: 100, type: WidthType.PERCENTAGE } });
+    return new Table({
+      rows: tableRows,
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      // Matches the live editor's own table style (Tailwind Typography's default: no outer/vertical
+      // borders, only a thin line between rows - see @tailwindcss/typography's styles.js, `thead`/
+      // `tbody tr` get border-bottom only) - docx's own Table default is a full black grid, which
+      // doesn't reflect what the table actually looks like in Docs, so it's overridden explicitly
+      // rather than left at that default.
+      borders: {
+        top: { style: BorderStyle.NONE, size: 0, color: "auto" },
+        bottom: { style: BorderStyle.NONE, size: 0, color: "auto" },
+        left: { style: BorderStyle.NONE, size: 0, color: "auto" },
+        right: { style: BorderStyle.NONE, size: 0, color: "auto" },
+        insideVertical: { style: BorderStyle.NONE, size: 0, color: "auto" },
+        insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: "D1D5DB" },
+      },
+    });
   }
 
   // extraParagraphProps carries context a container passes down into any Paragraph it produces -
@@ -328,7 +353,7 @@ class DocxBuilder {
       }
       case "image": {
         const src = (node.attrs?.src as string) ?? "";
-        const image = await buildImageRun(src);
+        const image = await buildImageRun(src, node.attrs?.width, node.attrs?.height);
         return image ? [new Paragraph({ children: [image] })] : [];
       }
       case "table": {

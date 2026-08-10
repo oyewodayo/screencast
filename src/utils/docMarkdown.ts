@@ -23,12 +23,22 @@ function applyMarks(text: string, marks: JSONContent["marks"]): string {
   return result;
 }
 
+function imageMarkdown(node: JSONContent): string {
+  const alt = (node.attrs?.alt as string) ?? "";
+  const src = (node.attrs?.src as string) ?? "";
+  return `![${alt}](${src})`;
+}
+
 function renderInline(content: JSONContent[] | undefined): string {
   if (!content) return "";
   return content
     .map((node) => {
       if (node.type === "text") return applyMarks(node.text ?? "", node.marks);
       if (node.type === "hardBreak") return "\n";
+      // Images are an inline node (docSchemaExtensions.ts's DocImage.configure({ inline: true,
+      // ... })) - one can appear anywhere inside a paragraph/heading/list item's own content array,
+      // not just as its own top-level block (see renderBlock's "image" case below for that path).
+      if (node.type === "image") return imageMarkdown(node);
       return "";
     })
     .join("");
@@ -77,11 +87,8 @@ function renderBlock(node: JSONContent): string {
       const text = (node.content ?? []).map((c) => c.text ?? "").join("");
       return `\`\`\`${language}\n${text}\n\`\`\``;
     }
-    case "image": {
-      const alt = (node.attrs?.alt as string) ?? "";
-      const src = (node.attrs?.src as string) ?? "";
-      return `![${alt}](${src})`;
-    }
+    case "image":
+      return imageMarkdown(node);
     // tableRow/tableCell/tableHeader are only ever children of "table" - handled inline below
     // rather than as their own switch cases, since a bare row/cell has no meaningful standalone
     // Markdown rendering outside a table's header+separator structure.
