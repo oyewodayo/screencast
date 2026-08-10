@@ -12,8 +12,10 @@ import type { EditorView } from "@tiptap/pm/view";
 import { invoke, convertFileSrc } from "@tauri-apps/api/tauri";
 
 // Kept in sync with docs.rs's save_doc_image ALLOWED whitelist - "image/jpg" is a non-standard
-// MIME some tools still emit for a JPEG, mapped alongside the standard "image/jpeg".
-const EXTENSION_BY_MIME: Record<string, string> = {
+// MIME some tools still emit for a JPEG, mapped alongside the standard "image/jpeg". Exported so
+// docxImport.ts's own image-extraction step (docx embeds images the same way clipboard paste
+// does - a MIME type + raw bytes) reuses this instead of keeping a second copy.
+export const EXTENSION_BY_MIME: Record<string, string> = {
   "image/png": "png",
   "image/jpeg": "jpg",
   "image/jpg": "jpg",

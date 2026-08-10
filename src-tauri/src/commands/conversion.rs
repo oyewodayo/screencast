@@ -1415,6 +1415,16 @@ pub async fn read_image_data_url(path: String) -> Result<String, String> {
     Ok(format!("data:{};base64,{}", mime, BASE64.encode(&bytes)))
 }
 
+// Generic "read an arbitrary externally-picked file's raw bytes" - same rationale as
+// read_image_data_url just above (sidesteps the frontend fs allowlist scope, unrestricted Rust-
+// side fs access), but returning raw bytes rather than a base64 data URL since the caller (docx
+// import, see src/utils/docxImport.ts) needs an ArrayBuffer to hand to a JS parsing library, not
+// something to drop into an <img src>.
+#[tauri::command]
+pub fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
+    std::fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))
+}
+
 // Get file information before conversion
 #[tauri::command]
 pub async fn get_conversion_info(

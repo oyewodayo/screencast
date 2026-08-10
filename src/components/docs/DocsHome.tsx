@@ -6,10 +6,13 @@
 // briefcast_dir(), just with a Y.Doc instead of a canvas as the content.
 import React, { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
+import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
 import { IoAdd, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoPin, IoSearch, IoTrashOutline } from "react-icons/io5";
+import { MdFileUpload } from "react-icons/md";
 import * as Y from "yjs";
 import { DocSummary } from "../../utils/docTypes";
 import { getPinnedDocIds, toggleDocPin, forgetDocPin } from "../../utils/docLibraryHistory";
+import { importDocxFile } from "../../utils/docxImport";
 
 interface DocsHomeProps {
   onOpenDoc: (id: string) => void;
@@ -44,6 +47,7 @@ function extractPlainText(node: Y.XmlFragment | Y.XmlElement): string {
 const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   const [docs, setDocs] = useState<DocSummary[] | null>(null);
   const [isCreating, setIsCreating] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Which card's 3-dot menu is open, if any - and, within that menu, whether "Delete" has already
   // been clicked once (turning it into "Confirm delete?"). Same two-step-confirm-in-menu UX as
@@ -208,6 +212,37 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     }
   }, [docs, onOpenDoc]);
 
+  const handleImportDocx = useCallback(async () => {
+    setError(null);
+    // Both extensions listed so a .doc file is actually pickable - hiding it from the dialog
+    // entirely would just look like a bug ("why can't I even select my file?"), whereas showing a
+    // clear message once it's picked explains the real limitation (no import path exists for the
+    // legacy binary format - see utils/docxImport.ts's own header comment for why mammoth.js,
+    // which does the actual .docx -> HTML conversion, only supports the modern OOXML format).
+    const selected = await openFileDialog({ multiple: false, filters: [{ name: "Word Document", extensions: ["docx", "doc"] }] });
+    if (!selected || Array.isArray(selected)) return;
+    const name = selected.split(/[\\/]/).pop() ?? selected;
+
+    if (!/\.docx$/i.test(name)) {
+      await showMessageDialog(
+        "This looks like an older .doc file. Please save it as .docx (in Word, Google Docs, or LibreOffice) and import again.",
+        { title: "Unsupported file", type: "warning" }
+      );
+      return;
+    }
+
+    setIsImporting(true);
+    try {
+      const { id } = await importDocxFile(selected, name);
+      onOpenDoc(id);
+    } catch (err) {
+      console.error("Failed to import document:", err);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsImporting(false);
+    }
+  }, [onOpenDoc]);
+
   const normalizedQuery = searchQuery.trim().toLowerCase();
   const isSearching = normalizedQuery.length > 0;
   const filteredDocs = docs?.filter(
@@ -311,6 +346,14 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
           className="mt-1 flex items-center gap-1.5 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
         >
           <IoAdd size={16} /> New document
+        </button>
+        <button
+          type="button"
+          onClick={() => void handleImportDocx()}
+          disabled={isImporting}
+          className="flex items-center gap-1.5 px-4 py-2 rounded-md border border-gray-300 dark:border-neutral-700 text-gray-700 dark:text-neutral-200 text-sm font-medium hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors disabled:opacity-50"
+        >
+          <MdFileUpload size={16} /> {isImporting ? "Importing…" : "Import .docx"}
         </button>
         <button
           type="button"

@@ -7,18 +7,7 @@
 import React, { useCallback, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { useEditor, EditorContent } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
 import Collaboration from "@tiptap/extension-collaboration";
-import Underline from "@tiptap/extension-underline";
-import Link from "@tiptap/extension-link";
-import Image from "@tiptap/extension-image";
-import Table from "@tiptap/extension-table";
-import TableRow from "@tiptap/extension-table-row";
-import TableHeader from "@tiptap/extension-table-header";
-import TableCell from "@tiptap/extension-table-cell";
-import TextAlign from "@tiptap/extension-text-align";
-import TextStyle from "@tiptap/extension-text-style";
-import Color from "@tiptap/extension-color";
 import Placeholder from "@tiptap/extension-placeholder";
 import { IoArrowBack, IoClose } from "react-icons/io5";
 import {
@@ -47,6 +36,7 @@ import useDocsEditStore from "../../hooks/useDocsEditStore";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
 import { LibraryFileEntry } from "../../utils/docTypes";
 import { createDocImagePasteExtension } from "../../utils/docImagePaste";
+import { getDocContentExtensions } from "../../utils/docSchemaExtensions";
 
 interface DocsEditorProps {
   docId: string;
@@ -75,22 +65,15 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const editor = useEditor(
     {
       extensions: [
+        // Schema-contributing extensions (StarterKit, Underline, Link, Image, Table+*, TextAlign,
+        // TextStyle, Color) live in getDocContentExtensions() - shared with docxImport.ts's
+        // headless schema builder so the live editor and the importer can never drift apart.
+        ...getDocContentExtensions(),
         // Collaboration's own history (Yjs UndoManager) replaces StarterKit's plain history -
         // undo/redo need to walk CRDT operations, not a linear command stack, once this doc can
         // eventually receive remote updates too.
-        StarterKit.configure({ history: false }),
         ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
-        Underline,
-        Link.configure({ openOnClick: false, autolink: false }),
-        Image.configure({ inline: false }),
         createDocImagePasteExtension(docId),
-        Table.configure({ resizable: false }),
-        TableRow,
-        TableHeader,
-        TableCell,
-        TextAlign.configure({ types: ["heading", "paragraph"] }),
-        TextStyle,
-        Color,
         Placeholder.configure({ placeholder: "Start writing…" }),
       ],
       editable: !store.loading,
