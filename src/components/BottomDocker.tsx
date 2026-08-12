@@ -4,12 +4,13 @@ import OsInfo from "./OsInfo";
 
 import { message } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
-import ActiveRecordingState from "./ActiveRecordingState";
+import ActiveRecordingState, { RecordSource, SOURCE_FLAGS } from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
+import { loadSettings } from "../utils/appSettings";
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -125,6 +126,10 @@ interface Props {
   setAudioDevice: React.Dispatch<React.SetStateAction<string>>;
   videoDevices: string[];
   setVideoDevices: React.Dispatch<React.SetStateAction<string[]>>;
+  // Whether RecordingDocker (Save file as/Type/Recording options/Audio+video devices/Screenshot/
+  // Start Recording) still renders in the collapsible panel - its fields now live in Settings as
+  // defaults regardless, this just controls whether the panel itself is also still shown here.
+  showRecordingDocker: boolean;
 }
 
 type ConnectedDevice = string[];
@@ -202,7 +207,8 @@ const BottomDocker = ({
   audioDevice,
   setAudioDevice,
   videoDevices,
-  setVideoDevices
+  setVideoDevices,
+  showRecordingDocker
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -263,11 +269,16 @@ const BottomDocker = ({
   // }, []);
 
   const loadDevices = () => {
+    const settings = loadSettings();
+
     invoke<ConnectedDevice>("get_connected_audios")
       .then((devices) => {
         setConnectedAudioDevices(devices);
         if (devices.length > 0) {
-          setAudioDevice(devices[0]); // Set default audio device
+          // Prefer whatever's configured as the default in Settings, so long as it's actually
+          // still plugged in - otherwise fall back to the first detected device like before.
+          const preferred = settings.defaultAudioDevice;
+          setAudioDevice(preferred && devices.includes(preferred) ? preferred : devices[0]);
         }
       })
       .catch(console.error);
@@ -276,7 +287,8 @@ const BottomDocker = ({
       .then((devices) => {
         setConnectedCameraDevices(devices);
         if (devices.length > 0) {
-          setVideoDevices([devices[0]]); // Default to the first detected camera
+          const preferred = settings.defaultVideoDevices.filter((d) => devices.includes(d));
+          setVideoDevices(preferred.length > 0 ? preferred : [devices[0]]); // Default to the first detected camera
         }
       })
       .catch(console.error);
@@ -327,6 +339,30 @@ const BottomDocker = ({
     setVideoDevices((prev) =>
       prev.includes(device) ? prev.filter((d) => d !== device) : [...prev, device]
     );
+  };
+
+  // Drives the shortcut icons in ActiveRecordingState (scan/videocam/mic) when the full
+  // RecordingDocker panel is hidden - each icon toggles whether its source is armed, and the
+  // resulting combination is mapped back onto recordType, the same field RecordingDocker's own
+  // "Recording options" dropdown drives.
+  const toggleRecordSource = (source: RecordSource) => {
+    const current = SOURCE_FLAGS[recordType] ?? { screen: false, video: false, audio: false };
+    const next = { ...current, [source]: !current[source] };
+
+    // "screen + video without audio" has no backend record_type ("sv" isn't one of the values
+    // start_recording matches on) - resolve the ambiguity toward whichever toggle the user just
+    // pressed rather than landing on an unsupported combination.
+    if (next.screen && next.video && !next.audio) {
+      if (source === "audio") next.video = false;
+      else next.audio = true;
+    }
+
+    const match = Object.entries(SOURCE_FLAGS).find(
+      ([, flags]) => flags.screen === next.screen && flags.video === next.video && flags.audio === next.audio
+    );
+    // No match means every source just got toggled off - refuse the change rather than leaving
+    // recordType pointing at nothing, same as never having any capture source selected.
+    if (match) setRecordType(match[0]);
   };
 
   // EnhancedScreenOptions passes the resolved target directly when it has one (e.g. clicking a
@@ -445,9 +481,12 @@ const BottomDocker = ({
             handleStopRecording={handleStopRecording}
             showDocker={showDocker}
             setShowDocker={setShowDocker}
-            showFileList={showFileList} 
+            showFileList={showFileList}
+            onToggleRecordSource={toggleRecordSource}
+            onStartRecordingClick={() => openModalScreen()}
+            onScreenshotClick={handleScreenshotClick}
         />
-      
+
       {showDocker && (<div className="docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
         {dockerMode === "file-tools" && activeFile ? (
           <FileToolsDocker
@@ -482,7 +521,7 @@ const BottomDocker = ({
             isCroppingClip={isCroppingClip}
             onToggleCroppingClip={onToggleCroppingClip}
           />
-        ) : (
+        ) : showRecordingDocker ? (
           <RecordingDocker
             fileName={fileName}
             onFileNameChange={handleFileNameChange}
@@ -505,7 +544,7 @@ const BottomDocker = ({
             onStartRecordingClick={() => openModalScreen()}
             onStopRecordingClick={handleStopRecording}
           />
-        )}
+        ) : null}
 
         <div className="w-full grid grid-cols-1 grid-flow-col text-xs">
           <div>

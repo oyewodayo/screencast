@@ -18,6 +18,12 @@ function applyMarks(text: string, marks: JSONContent["marks"]): string {
   // renderers already tolerate.
   if (has("underline")) result = `<u>${result}</u>`;
   if (has("strike")) result = `~~${result}~~`;
+  // Not just a convenient-looking choice - this is literally the same syntax
+  // @tiptap/extension-highlight's own input/paste rules use to *detect* a highlight while typing,
+  // so re-importing this Markdown elsewhere round-trips correctly. Carries no color information
+  // (no CommonMark/this-convention way to express *which* color) - same "drop what can't be
+  // represented" posture already used for text color below via applyMarks never touching it.
+  if (has("highlight")) result = `==${result}==`;
   const link = marks?.find((m) => m.type === "link");
   if (link) result = `[${result}](${(link.attrs?.href as string) ?? ""})`;
   return result;

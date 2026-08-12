@@ -106,6 +106,11 @@ function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
   const color = textStyle?.attrs?.color as string | undefined;
   const fontFamily = textStyle?.attrs?.fontFamily as string | undefined;
   const fontSizePt = textStyle?.attrs?.fontSize as number | undefined;
+  // A separate mark, not a textStyle attribute (see @tiptap/extension-highlight's own source -
+  // it's its own Mark rendering <mark>, unlike Color/FontFamily/FontSize which all bolt onto
+  // textStyle) - docx has no first-class "highlight" concept either, approximated the same way
+  // table-cell/code shading already is: a background fill on the run.
+  const highlightColor = marks?.find((m) => m.type === "highlight")?.attrs?.color as string | undefined;
   return {
     bold: has("bold") || forceBold || undefined,
     italics: has("italic") || undefined,
@@ -115,9 +120,10 @@ function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
     ...(fontFamily ? { font: fontFamily } : {}),
     // docx's own run size is in half-points (OOXML convention), not points.
     ...(fontSizePt ? { size: fontSizePt * 2 } : {}),
+    ...(highlightColor ? { shading: { fill: highlightColor.replace("#", "") } } : {}),
     // No first-class inline-code concept in docx - approximated as monospace + light shading.
-    // Placed last so it wins over any fontFamily above - showing code in the surrounding prose
-    // font would look wrong regardless of what the paragraph's own font is set to.
+    // Placed last so it wins over any fontFamily/highlight above - code's own monospace+shading
+    // look would win regardless of what the paragraph's own font/highlight is set to.
     ...(has("code") ? { font: "Consolas", shading: { fill: "F0F0F0" } } : {}),
   };
 }

@@ -5,6 +5,7 @@ import { FiMonitor } from "react-icons/fi";
 import { MdMonitor } from "react-icons/md";
 import { WindowInfo, MonitorInfo } from "../Types";
 import CameraOverlayPreview from "./CameraOverlayPreview";
+import { RECORD_TYPE_LABELS } from "./ActiveRecordingState";
 
 interface ScreenOptionsProps {
     recordType: string;
@@ -485,6 +486,9 @@ const EnhancedScreenOptions = ({
                     <div className="flex items-center gap-2">
                         <IoDesktop className="text-xl" />
                         <h2 className="text-lg font-semibold">Screen Options</h2>
+                        <span className="text-xs font-medium px-2 py-1 rounded-full bg-green-100 dark:bg-green-500/20 text-green-700 dark:text-green-300">
+                            {RECORD_TYPE_LABELS[recordType] ?? recordType}
+                        </span>
                     </div>
                     <button onClick={closeModal} className="p-1 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded">
                         <IoClose className="text-2xl" />

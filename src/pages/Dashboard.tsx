@@ -157,6 +157,7 @@ const Dashboard = () => {
   const [fileExt, setFileExt] = useState(() => loadSettings().defaultFileExt);
   const [recordType, setRecordType] = useState(() => loadSettings().defaultRecordType);
   const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [showRecordingDocker, setShowRecordingDocker] = useState<boolean>(() => loadSettings().showRecordingDocker);
 
   // The main window is created hidden (tauri.conf.json's "visible": false on the main window
   // entry) specifically so this can show it only once there's real, already-painted UI behind it
@@ -200,7 +201,7 @@ const Dashboard = () => {
   // can't capture system audio on a machine with no Stereo Mix-equivalent device). Only
   // meaningful for the screen-capture record types (sva/sa/s); RecordingDocker only shows the
   // toggle for those.
-  const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(false);
+  const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(() => loadSettings().defaultIncludeSystemAudio);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
@@ -970,6 +971,10 @@ const setScreen = () => {
 		setRecordType(settings.defaultRecordType);
 		setAnnotationEnabled(settings.enableAnnotationTool);
 		setHomeBackgroundStyle(settings.homeBackgroundStyle);
+		setShowRecordingDocker(settings.showRecordingDocker);
+		setIncludeSystemAudio(settings.defaultIncludeSystemAudio);
+		if (settings.defaultAudioDevice) setAudioDevice(settings.defaultAudioDevice);
+		if (settings.defaultVideoDevices.length > 0) setVideoDevices(settings.defaultVideoDevices);
 	};
 	// After the Briefcast folder itself has been relocated (see SettingsModal's Storage section):
 	// re-list from the new location, and drop whatever's currently open - its sourcePath was inside
@@ -2688,6 +2693,7 @@ const setScreen = () => {
         videoDevices={videoDevices}
         setVideoDevices={setVideoDevices}
         setAudioDevice={setAudioDevice}
+        showRecordingDocker={showRecordingDocker}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
         isHome={selectedFile === null && boardScreen === null && docsScreen === null}

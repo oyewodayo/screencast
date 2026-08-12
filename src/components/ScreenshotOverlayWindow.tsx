@@ -112,15 +112,22 @@ const ScreenshotOverlayWindow = () => {
           <IoClose size={16} />
         </button>
       </div>
-      <div className="flex-1 flex flex-col justify-center gap-2 px-3 py-2">
-        <p className="text-xs text-neutral-600 dark:text-neutral-300 leading-snug">
+      <div className="flex-1 flex flex-col justify-center gap-2 px-3 py-2 min-h-0">
+        {/* line-clamp caps this at 2 lines regardless of how long the target window's title is
+            (e.g. a document title bar) - without it, a long enough title wraps past this
+            overlay's fixed 120px height and pushes the Capture/Esc buttons below the visible,
+            clickable window entirely (silently clipped by the outer overflow-hidden). */}
+        <p
+          className="text-xs text-neutral-600 dark:text-neutral-300 leading-snug line-clamp-2"
+          title={title || undefined}
+        >
           {typeof formData?.screen_size === 'string' && formData.screen_size.startsWith('window:') ? (
             <>Click on <strong className="font-semibold">{title || 'the target window'}</strong> to bring it forward, then capture.</>
           ) : (
             <>Get <strong className="font-semibold">{title || 'the screen'}</strong> ready, then capture.</>
           )}
         </p>
-        <div className="flex gap-2">
+        <div className="flex gap-2 shrink-0">
           <button
             onClick={capture}
             disabled={capturing || !formData}

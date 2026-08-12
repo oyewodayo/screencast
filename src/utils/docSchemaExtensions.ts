@@ -21,6 +21,7 @@ import TextAlign from "@tiptap/extension-text-align";
 import TextStyle from "@tiptap/extension-text-style";
 import Color from "@tiptap/extension-color";
 import FontFamily from "@tiptap/extension-font-family";
+import Highlight from "@tiptap/extension-highlight";
 import DocImageView from "../components/docs/DocImageView";
 import FontSize from "./docFontSizeExtension";
 
@@ -91,5 +92,8 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     Color,
     FontFamily,
     FontSize,
+    // multicolor: true - without it, Highlight has no `color` attribute at all (a single fixed
+    // highlight color, not a picker) - see @tiptap/extension-highlight's own addAttributes().
+    Highlight.configure({ multicolor: true }),
   ];
 }

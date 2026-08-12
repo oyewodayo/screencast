@@ -31,7 +31,10 @@ import {
   MdFormatAlignCenter,
   MdFormatAlignRight,
   MdFormatAlignJustify,
-  MdMoreHoriz,
+  MdFormatColorText,
+  MdFormatColorFill,
+  MdTableChart,
+  MdTableRows,
   MdImage,
 } from "react-icons/md";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
@@ -68,7 +71,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [fileFilter, setFileFilter] = useState("");
-  const [showMoreFormatting, setShowMoreFormatting] = useState(false);
+  const [showTextColorPicker, setShowTextColorPicker] = useState(false);
+  const [showHighlightPicker, setShowHighlightPicker] = useState(false);
+  const [showAlignMenu, setShowAlignMenu] = useState(false);
+  const [showTableOptions, setShowTableOptions] = useState(false);
 
   const editor = useEditor(
     {
@@ -265,6 +271,58 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
           {toolbarDivider}
 
+          {([1, 2, 3] as const).map((level) => (
+            <button
+              key={level}
+              type="button"
+              title={`Heading ${level}`}
+              onClick={() => editor.chain().focus().toggleHeading({ level }).run()}
+              className={`${toolbarButtonClass(editor.isActive("heading", { level }))} text-sm font-semibold`}
+            >
+              H{level}
+            </button>
+          ))}
+
+          {toolbarDivider}
+
+          {/* Font family/size are frequent, everyday operations (matching an imported document's
+              own font, or setting one before exporting) - kept directly on the bar rather than
+              behind a click, same reasoning Google Docs' own toolbar uses for keeping them always
+              visible instead of in an overflow menu. */}
+          <select
+            title="Font family"
+            value={editor.getAttributes("textStyle").fontFamily ?? ""}
+            onChange={(e) => {
+              const value = e.target.value;
+              if (value) editor.chain().focus().setFontFamily(value).run();
+              else editor.chain().focus().unsetFontFamily().run();
+            }}
+            className="w-28 px-1.5 py-1.5 text-xs rounded-md border border-neutral-200 dark:border-neutral-700 bg-transparent text-neutral-700 dark:text-neutral-200 outline-none"
+          >
+            <option value="">Font</option>
+            {FONT_FAMILIES.map((font) => (
+              <option key={font} value={font}>
+                {font}
+              </option>
+            ))}
+          </select>
+          <input
+            type="number"
+            title="Font size (pt)"
+            min={1}
+            max={200}
+            value={editor.getAttributes("textStyle").fontSize ?? ""}
+            placeholder="pt"
+            onChange={(e) => {
+              const value = parseFloat(e.target.value);
+              if (e.target.value && !Number.isNaN(value)) editor.chain().focus().setFontSize(value).run();
+              else editor.chain().focus().unsetFontSize().run();
+            }}
+            className="w-14 px-1.5 py-1.5 text-xs rounded-md border border-neutral-200 dark:border-neutral-700 bg-transparent text-neutral-700 dark:text-neutral-200 outline-none"
+          />
+
+          {toolbarDivider}
+
           <button type="button" title="Bold" onClick={() => editor.chain().focus().toggleBold().run()} className={toolbarButtonClass(editor.isActive("bold"))}>
             <MdFormatBold size={18} />
           </button>
@@ -283,17 +341,108 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
           {toolbarDivider}
 
-          {([1, 2, 3] as const).map((level) => (
-            <button
-              key={level}
-              type="button"
-              title={`Heading ${level}`}
-              onClick={() => editor.chain().focus().toggleHeading({ level }).run()}
-              className={`${toolbarButtonClass(editor.isActive("heading", { level }))} text-sm font-semibold`}
-            >
-              H{level}
+          <div className="relative">
+            <button type="button" title="Text color" onClick={() => setShowTextColorPicker((v) => !v)} className={toolbarButtonClass(showTextColorPicker)}>
+              <span className="flex flex-col items-center">
+                <MdFormatColorText size={18} />
+                <span
+                  className="block w-4 h-1 rounded-sm mt-0.5"
+                  style={{ backgroundColor: (editor.getAttributes("textStyle").color as string | undefined) ?? "currentColor" }}
+                />
+              </span>
             </button>
-          ))}
+            {showTextColorPicker && (
+              <div className="absolute left-0 top-full mt-1 z-10 flex items-center gap-2 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-2">
+                <input
+                  type="color"
+                  title="Text color"
+                  onChange={(e) => editor.chain().focus().setColor(e.target.value).run()}
+                  className="w-7 h-7 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    editor.chain().focus().unsetColor().run();
+                    setShowTextColorPicker(false);
+                  }}
+                  className="text-xs text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:underline whitespace-nowrap"
+                >
+                  Clear color
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="relative">
+            <button type="button" title="Highlight color" onClick={() => setShowHighlightPicker((v) => !v)} className={toolbarButtonClass(showHighlightPicker)}>
+              <span className="flex flex-col items-center">
+                <MdFormatColorFill size={18} />
+                <span
+                  className="block w-4 h-1 rounded-sm mt-0.5"
+                  style={{ backgroundColor: (editor.getAttributes("highlight").color as string | undefined) ?? "transparent", outline: "1px solid currentColor" }}
+                />
+              </span>
+            </button>
+            {showHighlightPicker && (
+              <div className="absolute left-0 top-full mt-1 z-10 flex items-center gap-2 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-2">
+                <input
+                  type="color"
+                  title="Highlight color"
+                  onChange={(e) => editor.chain().focus().setHighlight({ color: e.target.value }).run()}
+                  className="w-7 h-7 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    editor.chain().focus().unsetHighlight().run();
+                    setShowHighlightPicker(false);
+                  }}
+                  className="text-xs text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:underline whitespace-nowrap"
+                >
+                  Clear highlight
+                </button>
+              </div>
+            )}
+          </div>
+
+          {toolbarDivider}
+
+          <div className="relative">
+            {(() => {
+              const activeAlign = (["left", "center", "right", "justify"] as const).find((align) => editor.isActive({ textAlign: align })) ?? "left";
+              const AlignIcon = { left: MdFormatAlignLeft, center: MdFormatAlignCenter, right: MdFormatAlignRight, justify: MdFormatAlignJustify }[activeAlign];
+              return (
+                <button type="button" title="Align" onClick={() => setShowAlignMenu((v) => !v)} className={toolbarButtonClass(showAlignMenu)}>
+                  <AlignIcon size={18} />
+                </button>
+              );
+            })()}
+            {showAlignMenu && (
+              <div className="absolute left-0 top-full mt-1 z-10 flex items-center gap-1 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-1.5">
+                {(
+                  [
+                    ["left", MdFormatAlignLeft, "Align left"],
+                    ["center", MdFormatAlignCenter, "Align center"],
+                    ["right", MdFormatAlignRight, "Align right"],
+                    ["justify", MdFormatAlignJustify, "Justify"],
+                  ] as const
+                ).map(([align, Icon, label]) => (
+                  <button
+                    key={align}
+                    type="button"
+                    title={label}
+                    onClick={() => {
+                      editor.chain().focus().setTextAlign(align).run();
+                      setShowAlignMenu(false);
+                    }}
+                    className={toolbarButtonClass(editor.isActive({ textAlign: align }))}
+                  >
+                    <Icon size={18} />
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
 
           {toolbarDivider}
 
@@ -318,8 +467,6 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           <button type="button" title="Insert image" onClick={() => void handleInsertImage()} className={toolbarButtonClass(false)}>
             <MdImage size={18} />
           </button>
-
-          {toolbarDivider}
 
           <div className="relative">
             {(() => {
@@ -352,138 +499,53 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             )}
           </div>
 
-          <div className="ml-auto flex items-center gap-1">
+          <button
+            type="button"
+            title="Insert table"
+            onClick={() => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()}
+            className={toolbarButtonClass(false)}
+          >
+            <MdTableChart size={18} />
+          </button>
+
+          {editor.isActive("table") && (
             <div className="relative">
-              <button type="button" title="More formatting" onClick={() => setShowMoreFormatting((v) => !v)} className={toolbarButtonClass(showMoreFormatting)}>
-                <MdMoreHoriz size={18} />
+              <button type="button" title="Table options" onClick={() => setShowTableOptions((v) => !v)} className={toolbarButtonClass(showTableOptions)}>
+                <MdTableRows size={18} />
               </button>
-              {showMoreFormatting && (
-                <div className="absolute right-0 top-full mt-1 z-10 w-64 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-2 space-y-2">
-                  <div>
-                    <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Align</p>
-                    <div className="flex items-center gap-1">
-                      {(
-                        [
-                          ["left", MdFormatAlignLeft, "Align left"],
-                          ["center", MdFormatAlignCenter, "Align center"],
-                          ["right", MdFormatAlignRight, "Align right"],
-                          ["justify", MdFormatAlignJustify, "Justify"],
-                        ] as const
-                      ).map(([align, Icon, label]) => (
-                        <button
-                          key={align}
-                          type="button"
-                          title={label}
-                          onClick={() => editor.chain().focus().setTextAlign(align).run()}
-                          className={toolbarButtonClass(editor.isActive({ textAlign: align }))}
-                        >
-                          <Icon size={18} />
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="border-t border-neutral-100 dark:border-neutral-700 pt-2">
-                    <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Color</p>
-                    <div className="flex items-center gap-2 px-1">
-                      <input
-                        type="color"
-                        title="Text color"
-                        onChange={(e) => editor.chain().focus().setColor(e.target.value).run()}
-                        className="w-7 h-7 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => editor.chain().focus().unsetColor().run()}
-                        className="text-xs text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:underline"
-                      >
-                        Clear color
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="border-t border-neutral-100 dark:border-neutral-700 pt-2">
-                    <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Font</p>
-                    <div className="flex items-center gap-1.5 px-1">
-                      <select
-                        title="Font family"
-                        value={editor.getAttributes("textStyle").fontFamily ?? ""}
-                        onChange={(e) => {
-                          const value = e.target.value;
-                          if (value) editor.chain().focus().setFontFamily(value).run();
-                          else editor.chain().focus().unsetFontFamily().run();
-                        }}
-                        className="min-w-0 flex-1 px-1.5 py-1 text-xs rounded border border-neutral-200 dark:border-neutral-700 bg-transparent text-neutral-700 dark:text-neutral-200 outline-none"
-                      >
-                        <option value="">Default</option>
-                        {FONT_FAMILIES.map((font) => (
-                          <option key={font} value={font}>
-                            {font}
-                          </option>
-                        ))}
-                      </select>
-                      <input
-                        type="number"
-                        title="Font size (pt)"
-                        min={1}
-                        max={200}
-                        value={editor.getAttributes("textStyle").fontSize ?? ""}
-                        placeholder="pt"
-                        onChange={(e) => {
-                          const value = parseFloat(e.target.value);
-                          if (e.target.value && !Number.isNaN(value)) editor.chain().focus().setFontSize(value).run();
-                          else editor.chain().focus().unsetFontSize().run();
-                        }}
-                        className="w-14 px-1.5 py-1 text-xs rounded border border-neutral-200 dark:border-neutral-700 bg-transparent text-neutral-700 dark:text-neutral-200 outline-none"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="border-t border-neutral-100 dark:border-neutral-700 pt-2">
-                    <p className="px-1 pb-1 text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Table</p>
-                    <div className="flex flex-wrap gap-1 px-1">
-                      <button
-                        type="button"
-                        onClick={() => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()}
-                        className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700"
-                      >
-                        Insert table
-                      </button>
-                      {editor.isActive("table") && (
-                        <>
-                          <button type="button" onClick={() => editor.chain().focus().addRowBefore().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                            + Row above
-                          </button>
-                          <button type="button" onClick={() => editor.chain().focus().addRowAfter().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                            + Row below
-                          </button>
-                          <button type="button" onClick={() => editor.chain().focus().deleteRow().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                            Delete row
-                          </button>
-                          <button type="button" onClick={() => editor.chain().focus().addColumnBefore().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                            + Col left
-                          </button>
-                          <button type="button" onClick={() => editor.chain().focus().addColumnAfter().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                            + Col right
-                          </button>
-                          <button type="button" onClick={() => editor.chain().focus().deleteColumn().run()} className="px-2 py-1 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                            Delete col
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => editor.chain().focus().deleteTable().run()}
-                            className="px-2 py-1 text-xs rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
-                          >
-                            Delete table
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </div>
+              {showTableOptions && (
+                <div className="absolute left-0 top-full mt-1 z-10 w-48 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-1.5 space-y-0.5">
+                  <button type="button" onClick={() => editor.chain().focus().addRowBefore().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                    + Row above
+                  </button>
+                  <button type="button" onClick={() => editor.chain().focus().addRowAfter().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                    + Row below
+                  </button>
+                  <button type="button" onClick={() => editor.chain().focus().deleteRow().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                    Delete row
+                  </button>
+                  <button type="button" onClick={() => editor.chain().focus().addColumnBefore().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                    + Column left
+                  </button>
+                  <button type="button" onClick={() => editor.chain().focus().addColumnAfter().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                    + Column right
+                  </button>
+                  <button type="button" onClick={() => editor.chain().focus().deleteColumn().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+                    Delete column
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => editor.chain().focus().deleteTable().run()}
+                    className="w-full text-left px-2 py-1.5 text-xs rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 border-t border-neutral-100 dark:border-neutral-700 mt-0.5 pt-1.5"
+                  >
+                    Delete table
+                  </button>
                 </div>
               )}
             </div>
+          )}
 
+          <div className="ml-auto flex items-center gap-1">
             {store.linkedTo ? (
               <div className="flex items-center gap-1 pl-2 pr-1 py-1 rounded-md bg-neutral-100 dark:bg-neutral-800 text-xs text-neutral-600 dark:text-neutral-300">
                 <MdInsertLink size={14} />

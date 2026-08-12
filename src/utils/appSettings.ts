@@ -26,6 +26,15 @@ export interface AppSettings {
   // AnnotationOverlayWindow.tsx) — when false, Dashboard never creates the overlay window or
   // registers its hotkey at all.
   enableAnnotationTool: boolean;
+  // Whether the full recording setup panel (file name/type/recording options/audio+video
+  // device pickers/Screenshot/Start Recording) still appears in the bottom docker. Its fields
+  // now live here in Settings as defaults regardless of this - turning it off just also stops
+  // showing the panel itself, leaving the ActiveRecordingState shortcut icons as the only way
+  // to start a recording from the docker.
+  showRecordingDocker: boolean;
+  defaultAudioDevice: string;
+  defaultVideoDevices: string[];
+  defaultIncludeSystemAudio: boolean;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -52,6 +61,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // window can't block input no matter what, which is what makes it safe to default to on rather
   // than requiring an opt-in visit to Settings.
   enableAnnotationTool: true,
+  // Off by default - the bottom-right shortcut icons (see ActiveRecordingState.tsx) are the
+  // primary way to start a recording now; the full panel is an opt-in for anyone who wants it.
+  showRecordingDocker: false,
+  defaultAudioDevice: "",
+  defaultVideoDevices: [],
+  defaultIncludeSystemAudio: false,
 };
 
 export function loadSettings(): AppSettings {
