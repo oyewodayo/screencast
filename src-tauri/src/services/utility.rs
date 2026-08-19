@@ -582,7 +582,7 @@ pub fn import_file(source_path: String, dest_folder_path: String) -> Result<Stri
 fn is_media_file(ext: &str)->bool{
     matches!(
         ext,
-        "jpg" | "jpeg" | "png" | "gif"  | "bmp" | "tiff" |
+        "jpg" | "jpeg" | "png" | "gif"  | "bmp" | "tiff" | "heic" | "heif" |
         "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" |
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv" |
         "pdf" |

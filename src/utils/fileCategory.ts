@@ -11,7 +11,10 @@ export type FileCategory = "video" | "audio" | "image" | "pdf" | "document";
 export const FILE_CATEGORY_EXTENSIONS: Record<FileCategory, string[]> = {
   video: ["mp4", "mov", "avi", "mkv", "webm", "wmv"],
   audio: ["mp3", "wav", "aac", "flac", "ogg", "m4a"],
-  image: ["jpg", "jpeg", "png", "gif", "bmp", "tiff"],
+  // heic/heif are iPhone's default photo format - Chromium (WebView2) has no built-in decoder for
+  // them, so Dashboard.tsx special-cases these two extensions to show a "Convert to view" prompt
+  // (via the same ffmpeg-backed convert_image path below) instead of handing them to ImageEditor.
+  image: ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "heic", "heif"],
   pdf: ["pdf"],
   // What Docs' export feature (DocsEditor.tsx's Export menu) writes into the Briefcast root -
   // docx/md/txt have no inline previewer (unlike pdf/image/video), so Dashboard.tsx falls back to

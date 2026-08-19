@@ -421,6 +421,18 @@ pub async fn convert_image(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
+    // HEIC/HEIF inputs skip ffmpeg entirely on Windows - see heic_windows.rs's module doc for why
+    // (the bundled ffmpeg build mis-decodes modern iPhone Portrait-mode/multi-image HEIC files as
+    // a black frame). Not gated on the *output* format because the bug is in reading the HEIC
+    // source, not in what ffmpeg would have encoded it to.
+    #[cfg(windows)]
+    {
+        let input_ext = input.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+        if matches!(input_ext.as_deref(), Some("heic") | Some("heif")) {
+            return convert_heic_windows(&app_handle, &window, &state, &input, output, &output_format, preserve_original).await;
+        }
+    }
+
     let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
 
     if !preserve_original {
@@ -428,6 +440,117 @@ pub async fn convert_image(
     }
 
     Ok(result)
+}
+
+// HEIC/HEIF path for convert_image, above - always decodes through Windows' own HEIF codec to a
+// full-resolution PNG first (see heic_windows::decode_to_png), then - unless PNG is what was
+// actually asked for - hands that PNG to the same ffmpeg image2 pipeline every other image format
+// already uses to reach jpeg/webp/bmp. ffmpeg is perfectly reliable at that second step; the only
+// thing it couldn't be trusted with was reading the HEIC file in the first place.
+#[cfg(windows)]
+async fn convert_heic_windows(
+    app_handle: &AppHandle,
+    window: &Window,
+    state: &State<'_, ConversionState>,
+    input: &PathBuf,
+    output: PathBuf,
+    output_format: &str,
+    preserve_original: bool,
+) -> Result<String, String> {
+    let _ = window.emit("conversion-progress", ConversionProgress {
+        input_path: input.to_string_lossy().to_string(),
+        output_path: output.to_string_lossy().to_string(),
+        progress: 0.0,
+        status: ConversionStatus::Starting,
+        message: "Decoding HEIC photo...".to_string(),
+    });
+
+    let format = output_format.to_lowercase();
+    let final_output = unique_output_path(output);
+
+    let native_result: Result<String, String> = async {
+        if format == "png" {
+            crate::services::heic_windows::decode_to_png(input.clone(), final_output.clone()).await?;
+            Ok(final_output.to_string_lossy().to_string())
+        } else {
+            let temp_png = final_output.with_extension("heic_tmp.png");
+            crate::services::heic_windows::decode_to_png(input.clone(), temp_png.clone()).await?;
+            let transcode = run_conversion(
+                app_handle,
+                window,
+                state,
+                &[InputSpec::plain(temp_png.to_string_lossy().to_string())],
+                &input.to_string_lossy(),
+                final_output.clone(),
+                &[],
+            )
+            .await;
+            let _ = std::fs::remove_file(&temp_png);
+            transcode
+        }
+    }
+    .await;
+
+    // Windows' own HEIC decoder needs the HEVC Video Extensions codec package installed (separate
+    // from HEIF Image Extensions, which just handles the container/metadata) - plenty of machines
+    // only have the latter. Rather than fail outright when that codec is missing, fall back to the
+    // bundled ffmpeg's own HEVC decoder directly on the HEIC file. ffmpeg's automatic stream
+    // selection is what produced the original black-image bug for multi-image (Portrait mode/Deep
+    // Fusion) photos - `-map 0:0` pins it to the primary/default-flagged image instead. For a
+    // simple single-image HEIC file (no stream groups) this is a no-op, same stream ffmpeg's
+    // default selection would have picked anyway; for a complex one it trades resolution (ffmpeg's
+    // HEIF tile-grid reconstruction in this build tops out well below the photo's real size) for
+    // at least getting the correct photo instead of a black frame.
+    let result = match native_result {
+        Ok(path) => Ok(path),
+        Err(native_err) => {
+            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to ffmpeg", input.display());
+            let codec_args: Vec<&str> = match format.as_str() {
+                "png" | "jpeg" | "jpg" | "webp" | "bmp" => vec!["-map", "0:0"],
+                _ => return Err(format!("Unsupported output format: {}", output_format)),
+            };
+            let fallback = run_conversion(
+                app_handle,
+                window,
+                state,
+                &[InputSpec::plain(input.to_string_lossy().to_string())],
+                &input.to_string_lossy(),
+                final_output,
+                &codec_args,
+            )
+            .await;
+            if let Err(ffmpeg_err) = &fallback {
+                log::error!("HEIC ffmpeg fallback also failed for {}: {ffmpeg_err}", input.display());
+            }
+            fallback.map_err(|ffmpeg_err| format!("{native_err}; fallback conversion also failed: {ffmpeg_err}"))
+        }
+    };
+
+    match &result {
+        Ok(path) => {
+            let _ = window.emit("conversion-progress", ConversionProgress {
+                input_path: input.to_string_lossy().to_string(),
+                output_path: path.clone(),
+                progress: 100.0,
+                status: ConversionStatus::Completed,
+                message: "Conversion completed".to_string(),
+            });
+            if !preserve_original {
+                let _ = std::fs::remove_file(input);
+            }
+        }
+        Err(err) => {
+            let _ = window.emit("conversion-progress", ConversionProgress {
+                input_path: input.to_string_lossy().to_string(),
+                output_path: String::new(),
+                progress: 0.0,
+                status: ConversionStatus::Failed,
+                message: err.clone(),
+            });
+        }
+    }
+
+    result
 }
 
 // Convert an audio file between mp3/wav/aac/flac/ogg/m4a. -vn drops any video stream before

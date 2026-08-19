@@ -16,6 +16,7 @@ import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
 import ClipCropOverlay from "../components/video/ClipCropOverlay";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
+import BulkConversionDialog, { BulkConversionSummary } from "../components/BulkConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
@@ -25,7 +26,7 @@ import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings } from "../utils/appSettings";
-import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, isConvertibleCategory } from "../utils/fileCategory";
+import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
 import {
   MAX_HOME_SCREEN_FILES,
   getPinnedPaths,
@@ -314,8 +315,13 @@ const Dashboard = () => {
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
-  // load_image_edit_state invoke.
-  const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
+  // load_image_edit_state invoke. HEIC/HEIF are excluded too - they render as a "Convert to
+  // view" prompt instead of ImageEditor (see the main content pane below), so loading edit state
+  // for them would just be a wasted invoke that's also doomed to fail decoding the source photo.
+  const isImageFileSelected =
+    !!selectedFile &&
+    getFileCategory(selectedFile.name) === "image" &&
+    !["heic", "heif"].includes(getFileExtension(selectedFile.name));
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
@@ -346,6 +352,7 @@ const Dashboard = () => {
     setIsCroppingClip(false);
   }, [selectedFile?.path]);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
+const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
   // Toggled from the sidebar header's tools icon (next to "new folder"); falls back to "record"
@@ -1956,6 +1963,15 @@ const setScreen = () => {
                           </div>
                         )}
                       </div>
+                      {isConvertibleCategory(activeFileCategory) && (
+                        <button
+                          type="button"
+                          onClick={() => setBulkConversionFiles(getSelectedFileEntries())}
+                          className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                        >
+                          Convert
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => setSelectedFilePaths(new Set())}
@@ -2394,6 +2410,24 @@ const setScreen = () => {
               }}
             />
           )}
+
+          {/* Bulk Conversion Dialog */}
+          {bulkConversionFiles && (
+            <BulkConversionDialog
+              files={bulkConversionFiles}
+              onClose={() => setBulkConversionFiles(null)}
+              onDone={async (summary: BulkConversionSummary) => {
+                setBulkConversionFiles(null);
+                setSelectedFilePaths(new Set());
+                await handleDirectoryFiles();
+                setMessage(
+                  summary.failedCount > 0
+                    ? `Converted ${summary.converted.length} file${summary.converted.length === 1 ? "" : "s"}, ${summary.failedCount} failed`
+                    : `Converted ${summary.converted.length} file${summary.converted.length === 1 ? "" : "s"}`
+                );
+              }}
+            />
+          )}
          <div className="flex-1 min-w-0 min-h-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
 
           {boardScreen ? (
@@ -2424,6 +2458,26 @@ const setScreen = () => {
                 isFullscreen={isPdfFullscreen}
                 onToggleFullscreen={handleTogglePdfFullscreen}
               />
+            ) : getFileCategory(selectedFile.name) === "image" &&
+              ["heic", "heif"].includes(getFileExtension(selectedFile.name)) ? (
+              // HEIC/HEIF (iPhone's default photo format) has no Chromium/WebView2 decoder, so
+              // handing it to ImageEditor would just fail to decode - route straight to the
+              // existing ffmpeg-backed Convert flow instead (it already turns HEIC into a
+              // previewable jpg/png fine; see convert_image).
+              <div key={selectedFile.path} className="w-full h-full flex flex-col items-center justify-center gap-3 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-300">
+                <IoImage size={48} className="text-neutral-300 dark:text-neutral-600" />
+                <p className="text-sm font-medium max-w-md truncate px-4">{selectedFile.name}</p>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 max-w-sm text-center px-4">
+                  This is an iPhone HEIC photo - Briefcast can't preview it directly. Convert it to JPEG or PNG to view and edit it.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setConversionFile({ path: selectedFile.sourcePath, name: selectedFile.name })}
+                  className="mt-1 px-4 py-2 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700"
+                >
+                  Convert to view
+                </button>
+              </div>
             ) : getFileCategory(selectedFile.name) === "image" ? (
               <ImageEditor
                 key={selectedFile.path}

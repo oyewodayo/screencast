@@ -160,7 +160,7 @@ export const useMediaConversion = () => {
   };
 };
 
-interface FormatOption {
+export interface FormatOption {
   value: string;
   label: string;
 }
@@ -189,7 +189,7 @@ const IMAGE_FORMATS: FormatOption[] = [
   { value: 'bmp', label: 'BMP' },
 ];
 
-interface ConversionProfile {
+export interface ConversionProfile {
   dialogTitle: string;
   formats: FormatOption[];
   defaultFormat: string;
@@ -197,8 +197,9 @@ interface ConversionProfile {
 
 // The one place that decides what "Convert" offers for a given file category. Adding support for
 // converting a new category (or changing a format list) only ever means editing this object —
-// nothing else in the component branches on category directly.
-const CONVERSION_PROFILES: Record<'video' | 'audio' | 'image', ConversionProfile> = {
+// nothing else in the component branches on category directly. Shared with BulkConversionDialog.tsx
+// so the single- and multi-file convert flows can never offer different formats for the same category.
+export const CONVERSION_PROFILES: Record<'video' | 'audio' | 'image', ConversionProfile> = {
   video: { dialogTitle: 'Convert Video', formats: VIDEO_FORMATS, defaultFormat: 'mp4' },
   audio: { dialogTitle: 'Convert Audio', formats: AUDIO_FORMATS, defaultFormat: 'mp3' },
   image: { dialogTitle: 'Convert Image', formats: IMAGE_FORMATS, defaultFormat: 'png' },
