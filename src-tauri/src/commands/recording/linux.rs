@@ -378,3 +378,24 @@ pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form
     .await
     .map_err(|e| format!("Screenshot task panicked: {}", e))?
 }
+
+// Pauses/resumes every thread in the ffmpeg process at once via the standard POSIX job-control
+// signals - the direct Linux/macOS equivalent of win.rs's per-thread SuspendThread/ResumeThread
+// loop (Windows has no single "pause a process" signal, so it has to approximate this by hand;
+// SIGSTOP/SIGCONT already do exactly this natively). Shelling out to `kill` rather than adding a
+// libc dependency just for two syscalls this codebase otherwise has no other use for.
+pub(crate) fn suspend_process(pid: u32) -> Result<(), String> {
+    Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("Failed to pause recording: {}", e))
+        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to pause recording: kill -STOP exited with an error".to_string()))
+}
+
+pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
+    Command::new("kill")
+        .args(["-CONT", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("Failed to resume recording: {}", e))
+        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to resume recording: kill -CONT exited with an error".to_string()))
+}

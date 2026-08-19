@@ -115,6 +115,13 @@ interface Props {
   handleStopRecording: () => void;
   isRecording: boolean;
   recordingStartTime: number | null;
+  // Pause/resume timing model - see Dashboard.tsx's own doc comment on these three fields for the
+  // elapsed-time formula they feed into.
+  isPaused: boolean;
+  pauseStartedAt: number | null;
+  pausedAccumulatedMs: number;
+  handlePauseRecording: () => void;
+  handleResumeRecording: () => void;
   ramInfo: [number, number] | null;
   fileName: string;
   setFileName: React.Dispatch<React.SetStateAction<string>>;
@@ -196,6 +203,11 @@ const BottomDocker = ({
   setIncludeSystemAudio,
   handleStartRecording,
   handleStopRecording,
+  isPaused,
+  pauseStartedAt,
+  pausedAccumulatedMs,
+  handlePauseRecording,
+  handleResumeRecording,
   isMonitoring,
   setIsMonitoring,
   windowTitles,
@@ -493,6 +505,11 @@ const BottomDocker = ({
             handleOpenSettings={handleOpenSettings}
             handleOpenExternalFile={handleOpenExternalFile}
             handleStopRecording={handleStopRecording}
+            isPaused={isPaused}
+            pauseStartedAt={pauseStartedAt}
+            pausedAccumulatedMs={pausedAccumulatedMs}
+            handlePauseRecording={handlePauseRecording}
+            handleResumeRecording={handleResumeRecording}
             showDocker={showDocker}
             setShowDocker={setShowDocker}
             showFileList={showFileList}
@@ -556,9 +573,12 @@ const BottomDocker = ({
             onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
             isSystemAudioSupported={isSystemAudioSupported}
             isRecording={isRecording}
+            isPaused={isPaused}
             onScreenshotClick={handleScreenshotClick}
             onStartRecordingClick={() => openModalScreen()}
             onStopRecordingClick={handleStopRecording}
+            onPauseRecordingClick={handlePauseRecording}
+            onResumeRecordingClick={handleResumeRecording}
           />
         ) : null}
 

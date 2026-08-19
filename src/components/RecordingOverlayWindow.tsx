@@ -1,7 +1,7 @@
 // RecordingOverlayWindow.tsx - This should be a separate component/page
 import { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoMicCircle, IoScanSharp, IoStopSharp, IoVideocam } from 'react-icons/io5'
+import { IoMicCircle, IoPauseCircle, IoPlayCircle, IoScanSharp, IoStopSharp, IoVideocam } from 'react-icons/io5'
 import { appWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/tauri';
@@ -13,6 +13,14 @@ const RecordingOverlayWindow = () => {
     const [recordType, setRecordType] = useState<string>("sva");
     const [isRecording, setIsRecording] = useState<boolean>(false);
     const [startTime, setStartTime] = useState<number | null>(null);
+    // Pause/resume timing model - see Dashboard.tsx's own doc comment on these three fields for
+    // the elapsed-time formula they feed into below. Kept in sync with the main window in both
+    // directions: 'recording-state-update' carries it here whenever the main window's own pause
+    // button changes it, and this window's own pause button below emits 'recording-pause-changed'
+    // for the main window to pick back up, mirroring how stop already works both ways.
+    const [isPaused, setIsPaused] = useState<boolean>(false);
+    const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
+    const [pausedAccumulatedMs, setPausedAccumulatedMs] = useState<number>(0);
 
     const formatTime = (seconds: number): string => {
         const mins = Math.floor(seconds / 60);
@@ -42,6 +50,36 @@ const RecordingOverlayWindow = () => {
         await appWindow.hide();
     };
 
+    const handlePauseRecording = async () => {
+        try {
+            await invoke("pause_recording");
+            const now = Date.now();
+            setIsPaused(true);
+            setPauseStartedAt(now);
+            const { emit } = await import('@tauri-apps/api/event');
+            await emit('recording-pause-changed', { isPaused: true, pauseStartedAt: now, pausedAccumulatedMs });
+        } catch (error) {
+            console.error("Error pausing recording:", error);
+            await message(String(error), { title: 'Failed to pause recording', type: 'error' });
+        }
+    };
+
+    const handleResumeRecording = async () => {
+        try {
+            await invoke("resume_recording");
+            const addedMs = pauseStartedAt ? Date.now() - pauseStartedAt : 0;
+            const newAccumulatedMs = pausedAccumulatedMs + addedMs;
+            setIsPaused(false);
+            setPauseStartedAt(null);
+            setPausedAccumulatedMs(newAccumulatedMs);
+            const { emit } = await import('@tauri-apps/api/event');
+            await emit('recording-pause-changed', { isPaused: false, pauseStartedAt: null, pausedAccumulatedMs: newAccumulatedMs });
+        } catch (error) {
+            console.error("Error resuming recording:", error);
+            await message(String(error), { title: 'Failed to resume recording', type: 'error' });
+        }
+    };
+
     // Listen for recording updates from main window
     useEffect(() => {
         const setupListeners = async () => {
@@ -50,10 +88,16 @@ const RecordingOverlayWindow = () => {
                 isRecording: boolean;
                 recordType: string;
                 startTime: number;
+                isPaused?: boolean;
+                pauseStartedAt?: number | null;
+                pausedAccumulatedMs?: number;
             }>('recording-state-update', (event) => {
                 setIsRecording(event.payload.isRecording);
                 setRecordType(event.payload.recordType);
                 setStartTime(event.payload.startTime);
+                setIsPaused(event.payload.isPaused ?? false);
+                setPauseStartedAt(event.payload.pauseStartedAt ?? null);
+                setPausedAccumulatedMs(event.payload.pausedAccumulatedMs ?? 0);
             });
 
             return () => {
@@ -72,18 +116,24 @@ const RecordingOverlayWindow = () => {
     }, []);
 
     // Derive elapsed time from the shared start timestamp (see Dashboard.tsx /
-    // ActiveRecordingState.tsx) so this window's timer can't drift apart from the main window's.
+    // ActiveRecordingState.tsx) so this window's timer can't drift apart from the main window's -
+    // same pause-aware formula as ActiveRecordingState.tsx's own copy (see its doc comment).
     useEffect(() => {
         let interval: number | undefined;
         if (isRecording && startTime) {
-            const tick = () => setElapsedTime(Math.floor((Date.now() - startTime) / 1000));
+            const tick = () => {
+                const effectiveNow = isPaused && pauseStartedAt ? pauseStartedAt : Date.now();
+                setElapsedTime(Math.floor((effectiveNow - startTime - pausedAccumulatedMs) / 1000));
+            };
             tick();
-            interval = window.setInterval(tick, 1000);
+            if (!isPaused) {
+                interval = window.setInterval(tick, 1000);
+            }
         } else {
             setElapsedTime(0);
         }
         return () => clearInterval(interval);
-    }, [isRecording, startTime]);
+    }, [isRecording, startTime, isPaused, pauseStartedAt, pausedAccumulatedMs]);
 
     // Render minimized version
     if (isMinimized) {
@@ -115,7 +165,7 @@ const RecordingOverlayWindow = () => {
                         {recordType === "a" && <IoMicCircle className="text-green-500 text-base" />}
                         {recordType === "c" && <IoScanSharp className="text-green-500 text-base" />}
                         
-                        <span className="text-xs font-mono">{formatTime(elapsedTime)}</span>
+                        <span className={`text-xs font-mono ${isPaused ? "text-amber-400" : ""}`}>{formatTime(elapsedTime)}</span>
                     </div>
                     <button 
                         onClick={toggleMinimize}
@@ -154,15 +204,24 @@ const RecordingOverlayWindow = () => {
             <div className="flex-1 p-3 flex flex-col justify-center">
                 {isRecording && (
                     <div className="bg-black rounded-lg text-white text-xs py-2 px-3 flex items-center justify-between gap-2">              
-                        <div className="flex gap-2">
+                        <div className="flex gap-2 items-center">
                             <button
-                                className="flex items-center gap-1 hover:text-gray-300" 
+                                className="flex items-center gap-1 hover:text-gray-300"
                                 onClick={handleStopRecording}
                                 title="Stop recording"
                             >
-                                <IoStopSharp className="text-lg" /> 
+                                <IoStopSharp className="text-lg" />
                             </button>
-                            <div className='font-mono text-sm ml-2'>{formatTime(elapsedTime)}</div>
+                            <button
+                                className="flex items-center gap-1 hover:text-gray-300"
+                                onClick={isPaused ? handleResumeRecording : handlePauseRecording}
+                                title={isPaused ? "Resume recording" : "Pause recording"}
+                            >
+                                {isPaused ? <IoPlayCircle className="text-lg" /> : <IoPauseCircle className="text-lg" />}
+                            </button>
+                            <div className={`font-mono text-sm ml-1 ${isPaused ? "text-amber-400" : ""}`}>
+                                {formatTime(elapsedTime)}{isPaused ? " (paused)" : ""}
+                            </div>
                         </div>
 
                         <div className='flex items-center gap-2 pl-2 border-l border-gray-600'>

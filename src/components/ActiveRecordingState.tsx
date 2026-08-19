@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoMicCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline } from 'react-icons/io5'
+import { IoCameraOutline, IoMicCircle, IoPauseCircle, IoPlayCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline } from 'react-icons/io5'
 
 export type RecordSource = "screen" | "video" | "audio";
 
@@ -47,6 +47,13 @@ interface Props {
     handleOpenSettings:()=>void;
     handleOpenExternalFile:()=>void;
     handleStopRecording: () => void;
+    // Pause/resume timing model - see Dashboard.tsx's own doc comment on these three fields for
+    // the elapsed-time formula they feed into below.
+    isPaused: boolean;
+    pauseStartedAt: number | null;
+    pausedAccumulatedMs: number;
+    handlePauseRecording: () => void;
+    handleResumeRecording: () => void;
     showDocker:boolean;
     setShowDocker:React.Dispatch<React.SetStateAction<boolean>>;
     showFileList?: boolean;
@@ -67,7 +74,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenSettings,handleOpenExternalFile,handleStopRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -89,18 +96,27 @@ const ActiveRecordingState = (
         setShowDocker(true)
      }
     // Derive elapsed time from the shared start timestamp (rather than accumulating +1 per
-    // tick) so this window's timer can't drift apart from the recording-overlay window's.
+    // tick) so this window's timer can't drift apart from the recording-overlay window's. While
+    // paused, "now" is pinned to the moment the pause began (pauseStartedAt) instead of the real
+    // clock, and pausedAccumulatedMs subtracts out every millisecond already spent paused before
+    // that - together these freeze the display during a pause and pick up again, uninterrupted,
+    // wherever it left off on resume, rather than counting the paused span as part of the video.
     useEffect(() => {
         let interval: number | undefined;
         if (isRecording && recordingStartTime) {
-        const tick = () => setElapsedTime(Math.floor((Date.now() - recordingStartTime) / 1000));
+        const tick = () => {
+            const effectiveNow = isPaused && pauseStartedAt ? pauseStartedAt : Date.now();
+            setElapsedTime(Math.floor((effectiveNow - recordingStartTime - pausedAccumulatedMs) / 1000));
+        };
         tick();
-        interval = window.setInterval(tick, 1000);
+        if (!isPaused) {
+            interval = window.setInterval(tick, 1000);
+        }
         } else {
         setElapsedTime(0);
         }
         return () => clearInterval(interval);
-    }, [isRecording, recordingStartTime]);
+    }, [isRecording, recordingStartTime, isPaused, pauseStartedAt, pausedAccumulatedMs]);
 
 
     return (
@@ -256,14 +272,30 @@ const ActiveRecordingState = (
                             );
                         })()}
                         {isRecording && (
-                            <div className="ml-1 text-white text-xs font-mono">{formatTime(elapsedTime)}</div>
+                            <div className={`ml-1 text-xs font-mono ${isPaused ? "text-amber-400" : "text-white"}`}>
+                                {formatTime(elapsedTime)}{isPaused ? " (paused)" : ""}
+                            </div>
+                        )}
+                        {isRecording && (
+                            <button
+                                type="button"
+                                title={isPaused ? "Resume recording" : "Pause recording"}
+                                onClick={isPaused ? handleResumeRecording : handlePauseRecording}
+                                className="cursor-pointer ml-1 p-2 rounded-md text-xl text-white/70 hover:text-white hover:bg-black/40 active:scale-90 transition-all duration-150 outline-none"
+                            >
+                                {isPaused ? <IoPlayCircle /> : <IoPauseCircle />}
+                            </button>
                         )}
                         <button
                             type="button"
                             title={isRecording ? "Stop recording" : "Start recording"}
                             onClick={isRecording ? handleStopRecording : onStartRecordingClick}
                             className={`cursor-pointer ml-1 p-2 rounded-full text-white active:scale-90 transition-all duration-150 outline-none ${
-                                isRecording ? "bg-green-500 hover:bg-green-400 animate-pulse" : "bg-red-500 hover:bg-red-400"
+                                !isRecording
+                                    ? "bg-red-500 hover:bg-red-400"
+                                    : isPaused
+                                    ? "bg-amber-500 hover:bg-amber-400"
+                                    : "bg-green-500 hover:bg-green-400 animate-pulse"
                             }`}
                         >
                             <IoRadioButtonOn />

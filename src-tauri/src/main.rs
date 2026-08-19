@@ -154,6 +154,8 @@ fn main() {
             commands::recording::get_connected_devices,
             commands::recording::start_recording,
             commands::recording::stop_recording,
+            commands::recording::pause_recording,
+            commands::recording::resume_recording,
             commands::recording::take_screenshot,
             commands::window_capture::start_monitoring_windows,
             commands::window_capture::stop_monitoring_windows,

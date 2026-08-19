@@ -125,6 +125,14 @@ const ANNOTATION_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+D';
 // app's own window, without opening Settings mid-presentation. Registered once on mount, unlike
 // the two shortcuts above: there's no window to create/tear down, just a boolean to flip.
 const PANEL_BUTTONS_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+B';
+
+// Starts a full-screen recording with whatever settings are currently configured (record type,
+// file name/ext, audio/video devices, overlay options) when not recording, or stops the
+// in-progress one when pressed again - a single toggle rather than two separate bindings, same
+// convention as OVERLAY_TOGGLE_SHORTCUT/PANEL_BUTTONS_TOGGLE_SHORTCUT above. Deliberately skips
+// EnhancedScreenOptions' target picker (screen_size is hardcoded to "fullscreen") since the whole
+// point of a global hotkey is starting a recording without switching to this window first.
+const RECORDING_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+R';
 // Hard kill switch, independent of the Settings checkbox/localStorage. Confirmed on 2026-07-21:
 // flipping this to false reliably hangs the whole app (Briefcast.exe stops responding, verified via
 // Get-Process -> Responding: False) on first launch, right as ensure_annotation_overlay
@@ -156,6 +164,14 @@ const Dashboard = () => {
   const [message, setMessage] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
+  // Pause/resume timing model: elapsed time is (now or, while paused, the moment it paused) minus
+  // recordingStartTime minus every millisecond already spent paused so far. pausedAccumulatedMs
+  // only changes at a pause->resume transition (not every tick), so unlike recordingStartTime this
+  // is cheap to keep as ordinary state - ActiveRecordingState/RecordingOverlayWindow both need it
+  // as a prop/event field to compute their own ticking display, since each runs its own timer.
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
+  const [pausedAccumulatedMs, setPausedAccumulatedMs] = useState<number>(0);
   const [error, setError] = useState<string>("");
   const [ramInfo, setRamInfo] = useState<RAMInfo | null>(null);
   const [fileName, setFileName] = useState(
@@ -480,8 +496,11 @@ useEffect(() => {
       // Update main window state
       setIsRecording(false);
       setRecordingStartTime(null);
+      setIsPaused(false);
+      setPauseStartedAt(null);
+      setPausedAccumulatedMs(0);
       setMessage("Recording stopped");
-      
+
       // Stop monitoring if active
       if (isMonitoring) {
         try {
@@ -516,7 +535,25 @@ useEffect(() => {
       unlistenFn();
     }
   };
-}, [isMonitoring]); 
+}, [isMonitoring]);
+
+  // Mirrors the recording-overlay window's own pause/resume buttons back into this window's state
+  // - same "whichever window acted, sync the other one" idea as the recording-stopped listener
+  // above, just for pause instead of stop.
+  useEffect(() => {
+    const unlistenPromise = listen<{ isPaused: boolean; pauseStartedAt: number | null; pausedAccumulatedMs: number }>(
+      'recording-pause-changed',
+      (event) => {
+        setIsPaused(event.payload.isPaused);
+        setPauseStartedAt(event.payload.pauseStartedAt);
+        setPausedAccumulatedMs(event.payload.pausedAccumulatedMs);
+        setMessage(event.payload.isPaused ? "Recording paused" : "Recording resumed");
+      }
+    );
+    return () => {
+      unlistenPromise.then((fn) => fn());
+    };
+  }, []);
 
   // Get RAM info
   useEffect(() => {
@@ -698,6 +735,9 @@ const setScreen = () => {
         const startTime = Date.now();
         setIsRecording(true);
         setRecordingStartTime(startTime);
+        setIsPaused(false);
+        setPauseStartedAt(null);
+        setPausedAccumulatedMs(0);
         setError("");
 
         // Create the overlay window, but don't show it - it stays hidden until the user
@@ -728,7 +768,10 @@ const setScreen = () => {
         overlayWindow.emit('recording-state-update', {
           isRecording: true,
           recordType: formData.record_type,
-          startTime
+          startTime,
+          isPaused: false,
+          pauseStartedAt: null,
+          pausedAccumulatedMs: 0,
         });
 
         if (!(await isRegistered(OVERLAY_TOGGLE_SHORTCUT))) {
@@ -745,33 +788,97 @@ const setScreen = () => {
 
   
   let handleStopRecording = async () => {
+    setError("");
     try {
-      setError("");
       const response = await invoke<string>("stop_recording");
-      
       const audio = new Audio("/sounds/option-3.mp3");
       audio.play().catch(err => console.error("Error playing audio:", err));
-      
       setMessage(response);
-      setIsRecording(false);
-      setRecordingStartTime(null);
-	  // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
-		const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
-		if (overlayWindow) {
-		await overlayWindow.hide();
-		}
-		if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
-		await unregister(OVERLAY_TOGGLE_SHORTCUT);
-		}
-
-      if (isMonitoring) {
-        await invoke("stop_monitoring_windows");
-        setIsMonitoring(false);
-        console.log("Monitoring stopped");
-      }
     } catch (error) {
       console.error("Error stopping recording:", error);
       setError(`Failed to stop recording: ${error}`);
+    }
+
+    // ffmpeg has already been asked to stop and torn down on the backend by the time
+    // stop_recording rejects (e.g. the capture device disappeared mid-recording and no output
+    // file was produced), so this window's own state still needs resetting either way - same
+    // reasoning as RecordingOverlayWindow.tsx's own handleStopRecording.
+    setIsRecording(false);
+    setRecordingStartTime(null);
+    setIsPaused(false);
+    setPauseStartedAt(null);
+    setPausedAccumulatedMs(0);
+
+    // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
+    const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+    if (overlayWindow) {
+      await overlayWindow.hide();
+    }
+    if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
+      await unregister(OVERLAY_TOGGLE_SHORTCUT);
+    }
+
+    if (isMonitoring) {
+      try {
+        await invoke("stop_monitoring_windows");
+        setIsMonitoring(false);
+        console.log("Monitoring stopped");
+      } catch (error) {
+        console.error("Error stopping monitoring:", error);
+      }
+    }
+  };
+
+  // Pauses the in-progress recording - suspends ffmpeg (and, on Windows, the WASAPI loopback
+  // capture if system audio is on) at the backend level, and freezes this window's own elapsed
+  // timer at the moment of pause by recording when it happened rather than resetting it.
+  const handlePauseRecording = async () => {
+    try {
+      await invoke("pause_recording");
+      const now = Date.now();
+      setIsPaused(true);
+      setPauseStartedAt(now);
+      setMessage("Recording paused");
+
+      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      overlayWindow?.emit('recording-state-update', {
+        isRecording: true,
+        recordType,
+        startTime: recordingStartTime,
+        isPaused: true,
+        pauseStartedAt: now,
+        pausedAccumulatedMs,
+      });
+    } catch (error) {
+      console.error("Error pausing recording:", error);
+      setError(`Failed to pause recording: ${error}`);
+    }
+  };
+
+  const handleResumeRecording = async () => {
+    try {
+      await invoke("resume_recording");
+      // Folds the just-finished pause into the running total before clearing pauseStartedAt -
+      // this is the one moment pausedAccumulatedMs actually changes (see its own doc comment).
+      const addedMs = pauseStartedAt ? Date.now() - pauseStartedAt : 0;
+      const newAccumulatedMs = pausedAccumulatedMs + addedMs;
+      setIsPaused(false);
+      setPauseStartedAt(null);
+      setPausedAccumulatedMs(newAccumulatedMs);
+      setMessage("Recording resumed");
+
+      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      overlayWindow?.emit('recording-state-update', {
+        isRecording: true,
+        recordType,
+        startTime: recordingStartTime,
+        isPaused: false,
+        pauseStartedAt: null,
+        pausedAccumulatedMs: newAccumulatedMs,
+      });
+    } catch (error) {
+      console.error("Error resuming recording:", error);
+      setError(`Failed to resume recording: ${error}`);
     }
   };
 
@@ -1152,6 +1259,73 @@ const setScreen = () => {
 			});
 		};
 	}, [toggleRecordingPanelButtons]);
+
+	// handleStartRecording/handleStopRecording (and every recording-setup field below) are
+	// recreated or reassigned on every render, so a stable (empty-deps) hotkey callback can't
+	// reference them directly without capturing a stale first-render snapshot forever - this ref
+	// is refreshed after every render instead (same pattern as selectedFileRef above) so the
+	// hotkey handler, registered once, always acts on the latest values.
+	const recordingHotkeyRef = useRef({
+		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
+		fileName, fileExt, recordType, audioDevice, videoDevices,
+		overlayShape, overlayPosition, overlaySize, includeSystemAudio,
+	});
+	useEffect(() => {
+		recordingHotkeyRef.current = {
+			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
+			fileName, fileExt, recordType, audioDevice, videoDevices,
+			overlayShape, overlayPosition, overlaySize, includeSystemAudio,
+		};
+	});
+
+	const handleRecordingToggleHotkey = useCallback(() => {
+		const s = recordingHotkeyRef.current;
+		if (s.isRecording) {
+			void s.stopRecording();
+			return;
+		}
+		void s.startRecording({
+			file_name: s.fileName,
+			file_ext: s.fileExt,
+			record_type: s.recordType,
+			audio_device: s.audioDevice,
+			// Deliberately skips EnhancedScreenOptions' target picker - see RECORDING_TOGGLE_SHORTCUT's
+			// own doc comment for why.
+			screen_size: 'fullscreen',
+			video_devices: s.videoDevices,
+			overlay_shape: s.overlayShape,
+			overlay_position: s.overlayPosition,
+			overlay_size: s.overlaySize,
+			window_title: '',
+			include_system_audio: s.includeSystemAudio,
+		});
+	}, []);
+
+	// Registered once for the life of the window, same reasoning as the panel-buttons shortcut
+	// above - starting/stopping is meaningful any time the app is running, not just mid-recording.
+	useEffect(() => {
+		let cancelled = false;
+
+		(async () => {
+			try {
+				if (!(await isRegistered(RECORDING_TOGGLE_SHORTCUT)) && !cancelled) {
+					await register(RECORDING_TOGGLE_SHORTCUT, () => {
+						handleRecordingToggleHotkey();
+					});
+				}
+			} catch (err) {
+				console.error('Failed to register recording-toggle hotkey:', err);
+				setError(`Couldn't register the start/stop recording shortcut (${RECORDING_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+			isRegistered(RECORDING_TOGGLE_SHORTCUT).then((registered) => {
+				if (registered) void unregister(RECORDING_TOGGLE_SHORTCUT);
+			});
+		};
+	}, [handleRecordingToggleHotkey]);
 
 	const handleTogglePdfFullscreen = async () => {
 		const next = !isPdfFullscreen;
@@ -2782,6 +2956,11 @@ const setScreen = () => {
         recordingStartTime={recordingStartTime}
         handleStartRecording={handleStartRecording}
         handleStopRecording={handleStopRecording}
+        isPaused={isPaused}
+        pauseStartedAt={pauseStartedAt}
+        pausedAccumulatedMs={pausedAccumulatedMs}
+        handlePauseRecording={handlePauseRecording}
+        handleResumeRecording={handleResumeRecording}
         ramInfo={ramInfo}
         fileName={fileName}
         setFileName={setFileName}

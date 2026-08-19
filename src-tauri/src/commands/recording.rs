@@ -44,6 +44,12 @@ use linux as platform;
 pub struct AppState {
     output_path: Arc<Mutex<Option<PathBuf>>>,
     ffmpeg_process: Arc<Mutex<Option<Child>>>, // NEW: Store the process
+    // Whether the in-progress recording is currently paused (see pause_recording/resume_recording
+    // below). Kept separately from ffmpeg_process's mere presence since "a process is running" and
+    // "that process is actively capturing" are different questions once pausing exists - stop_
+    // recording checks this to resume a paused process before asking it to shut down gracefully,
+    // since a suspended process can't act on the 'q' written to its stdin either.
+    paused: Arc<Mutex<bool>>,
     // System-audio (WASAPI loopback) capture session for the recording currently in progress, if
     // one was requested - Windows-only, see services/loopback_audio.rs's doc comment for why this
     // exists at all (ffmpeg/dshow alone can't capture "what you hear" on a machine with no Stereo
@@ -603,6 +609,26 @@ pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -
         }
     };
 
+    // A suspended process can't act on the graceful 'q' written to its stdin below - resume it
+    // first (same as resume_recording would) so the shutdown below can actually finish cleanly
+    // instead of timing out and force-killing, which for containers that only finalize on exit
+    // (mp4/mov - see codec_args_for_ext's own note on this) means a corrupt, unplayable file.
+    {
+        let mut paused = state.paused.lock().await;
+        if *paused {
+            if let Some(process) = state.ffmpeg_process.lock().await.as_ref() {
+                if let Err(e) = platform::resume_process(process.id()) {
+                    warn!("Failed to resume paused recording before stopping: {}", e);
+                }
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(capture) = state.loopback_capture.lock().await.as_ref() {
+                capture.resume();
+            }
+            *paused = false;
+        }
+    }
+
     // Try graceful shutdown first: send 'q' to ffmpeg's stdin (every platform's ffmpeg treats
     // this as "finalize the file and exit cleanly"), then poll off the async runtime's worker
     // threads instead of blocking them with a fixed sleep. `Child::kill()` is cross-platform on
@@ -690,6 +716,61 @@ pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -
     }
 
     Ok(output_str.to_string())
+}
+
+// Pauses the in-progress recording: suspends every thread of the ffmpeg process (see each
+// platform module's suspend_process - Windows approximates POSIX's SIGSTOP by hand since it has
+// no direct equivalent) so no frames/samples are captured or encoded while paused, and - Windows
+// only - pauses the WASAPI loopback capture the same way if system audio was requested, so its
+// WAV file's timeline stays aligned with the paused video instead of drifting ahead of it. Screen/
+// camera/mic capture and system-audio capture are otherwise two independent pipelines (see
+// AppState's own doc comments) that would fall out of sync with each other if only one paused.
+#[tauri::command]
+pub async fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
+    let mut paused = state.paused.lock().await;
+    if *paused {
+        return Err("Recording is already paused".to_string());
+    }
+
+    let pid = {
+        let process_state = state.ffmpeg_process.lock().await;
+        process_state.as_ref().map(|p| p.id()).ok_or_else(|| "No recording in progress".to_string())?
+    };
+
+    platform::suspend_process(pid)?;
+
+    #[cfg(target_os = "windows")]
+    if let Some(capture) = state.loopback_capture.lock().await.as_ref() {
+        capture.pause();
+    }
+
+    *paused = true;
+    info!("Recording paused");
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn resume_recording(state: State<'_, AppState>) -> Result<(), String> {
+    let mut paused = state.paused.lock().await;
+    if !*paused {
+        return Err("Recording is not paused".to_string());
+    }
+
+    let pid = {
+        let process_state = state.ffmpeg_process.lock().await;
+        process_state.as_ref().map(|p| p.id()).ok_or_else(|| "No recording in progress".to_string())?
+    };
+
+    platform::resume_process(pid)?;
+
+    #[cfg(target_os = "windows")]
+    if let Some(capture) = state.loopback_capture.lock().await.as_ref() {
+        capture.resume();
+    }
+
+    *paused = false;
+    info!("Recording resumed");
+    Ok(())
 }
 
 // Combines the just-recorded system-audio WAV into `video_path`, replacing it in place. When the

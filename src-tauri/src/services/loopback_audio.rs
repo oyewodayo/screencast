@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 use wasapi::{deinitialize, initialize_mta, Direction, DeviceEnumerator, SampleType, StreamMode, WaveFormat};
@@ -31,6 +32,10 @@ const BITS_PER_SAMPLE: usize = 16;
 
 pub struct LoopbackCapture {
     stop_flag: Arc<AtomicBool>,
+    // Mirrors a paused screen/mic recording: while set, the capture thread stops the WASAPI
+    // stream and writes nothing, so the WAV's own timeline stays aligned with the (also paused)
+    // video instead of drifting by however long the pause lasted.
+    pause_flag: Arc<AtomicBool>,
     handle: JoinHandle<Result<(), String>>,
     pub wav_path: PathBuf,
 }
@@ -46,6 +51,14 @@ impl LoopbackCapture {
             Err(_) => Err("Loopback capture thread panicked".to_string()),
         }
     }
+
+    pub fn pause(&self) {
+        self.pause_flag.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.pause_flag.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Starts capturing whatever's currently playing through the default output device on a
@@ -54,27 +67,29 @@ impl LoopbackCapture {
 /// until `LoopbackCapture::stop()` is called.
 pub fn start(wav_path: PathBuf) -> Result<LoopbackCapture, String> {
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let pause_flag = Arc::new(AtomicBool::new(false));
     let thread_stop_flag = stop_flag.clone();
+    let thread_pause_flag = pause_flag.clone();
     let thread_wav_path = wav_path.clone();
 
     let handle = std::thread::Builder::new()
         .name("loopback-audio-capture".to_string())
-        .spawn(move || capture_loop(thread_wav_path, thread_stop_flag))
+        .spawn(move || capture_loop(thread_wav_path, thread_stop_flag, thread_pause_flag))
         .map_err(|e| format!("Failed to start system-audio capture thread: {}", e))?;
 
-    Ok(LoopbackCapture { stop_flag, handle, wav_path })
+    Ok(LoopbackCapture { stop_flag, pause_flag, handle, wav_path })
 }
 
-fn capture_loop(wav_path: PathBuf, stop_flag: Arc<AtomicBool>) -> Result<(), String> {
+fn capture_loop(wav_path: PathBuf, stop_flag: Arc<AtomicBool>, pause_flag: Arc<AtomicBool>) -> Result<(), String> {
     // COM apartment state is per-thread and must be torn down on the same thread that set it up
     // - this whole function runs on the dedicated thread spawn() above created for exactly that.
     let _ = initialize_mta();
-    let result = run_capture(&wav_path, &stop_flag);
+    let result = run_capture(&wav_path, &stop_flag, &pause_flag);
     deinitialize();
     result
 }
 
-fn run_capture(wav_path: &Path, stop_flag: &Arc<AtomicBool>) -> Result<(), String> {
+fn run_capture(wav_path: &Path, stop_flag: &Arc<AtomicBool>, pause_flag: &Arc<AtomicBool>) -> Result<(), String> {
     let enumerator = DeviceEnumerator::new().map_err(|e| format!("Failed to enumerate audio devices: {}", e))?;
 
     // The trick: open the default *render* (playback) device, but initialize its AudioClient for
@@ -125,7 +140,30 @@ fn run_capture(wav_path: &Path, stop_flag: &Arc<AtomicBool>) -> Result<(), Strin
         .start_stream()
         .map_err(|e| format!("Failed to start the loopback capture stream: {}", e))?;
 
+    // Tracks whether the *stream itself* is currently stopped for a pause, separately from
+    // pause_flag (the request) - so the Stop()/Start() transition only ever fires once per
+    // pause/resume rather than every loop iteration.
+    let mut stream_paused = false;
+
     while !stop_flag.load(Ordering::SeqCst) {
+        if pause_flag.load(Ordering::SeqCst) {
+            if !stream_paused {
+                // IAudioClient::Stop (unlike Reset) doesn't discard buffered device state, so
+                // Start()ing it again below picks capture back up cleanly - this is the standard
+                // WASAPI pause pattern. Nothing is read or written while stopped, which is what
+                // keeps the WAV's own duration in sync with the (also paused) video instead of
+                // silently growing to cover the paused wall-clock time too.
+                let _ = audio_client.stop_stream();
+                stream_paused = true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        if stream_paused {
+            let _ = audio_client.start_stream();
+            stream_paused = false;
+        }
+
         capture_client
             .read_from_device_to_deque(&mut sample_queue)
             .map_err(|e| format!("Loopback capture read failed: {}", e))?;
