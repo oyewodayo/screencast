@@ -5,6 +5,7 @@ import { IoMicCircle, IoScanSharp, IoStopSharp, IoVideocam } from 'react-icons/i
 import { appWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/tauri';
+import { message } from '@tauri-apps/api/dialog';
 
 const RecordingOverlayWindow = () => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -24,18 +25,21 @@ const RecordingOverlayWindow = () => {
     };
 
     const handleStopRecording = async () => {
+        // ffmpeg has already been asked to stop and torn down on the backend by the time
+        // stop_recording rejects (e.g. the capture device disappeared mid-recording and no
+        // output file was produced) - so the main window's state still needs resetting and
+        // this overlay still needs to go away even on failure. Only the "tell the user what
+        // happened" step differs between the two branches below.
         try {
             await invoke("stop_recording");
-            
-            // Emit event to main window to update its state
-            const { emit } = await import('@tauri-apps/api/event');
-            await emit('recording-stopped');
-            
-            // Hide this overlay window after stopping
-            await appWindow.hide();
         } catch (error) {
             console.error("Error stopping recording:", error);
+            await message(String(error), { title: 'Recording failed', type: 'error' });
         }
+
+        const { emit } = await import('@tauri-apps/api/event');
+        await emit('recording-stopped');
+        await appWindow.hide();
     };
 
     // Listen for recording updates from main window

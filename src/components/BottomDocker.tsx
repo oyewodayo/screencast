@@ -130,6 +130,10 @@ interface Props {
   // Start Recording) still renders in the collapsible panel - its fields now live in Settings as
   // defaults regardless, this just controls whether the panel itself is also still shown here.
   showRecordingDocker: boolean;
+  // Whether the screenshot/screen-webcam-mic/record-button cluster (ActiveRecordingState's own
+  // bottom-right buttons, distinct from RecordingDocker above) is visible - see
+  // appSettings.ts's showRecordingPanelButtons doc comment for why this exists.
+  showRecordingPanelButtons: boolean;
 }
 
 type ConnectedDevice = string[];
@@ -208,7 +212,8 @@ const BottomDocker = ({
   setAudioDevice,
   videoDevices,
   setVideoDevices,
-  showRecordingDocker
+  showRecordingDocker,
+  showRecordingPanelButtons
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -431,9 +436,6 @@ const BottomDocker = ({
     openModalScreen();
   }
 
-  const handleVideoOverlayAction = async() =>{
-    return await message("Video recording is going on as overlay to screen recoring", "Video recording");
-  }
   const videoFormatInfo = async() =>{
     return await message("Avi or Mkv format is highly rocommended to record video. However, you can remuxe or convert to other format when you are done recording.", { title: 'Video format', type: 'info' });
   }
@@ -477,7 +479,6 @@ const BottomDocker = ({
             isDocs={isDocs}
             handleOpenSettings={handleOpenSettings}
             handleOpenExternalFile={handleOpenExternalFile}
-            handleVideoOverlayAction={handleVideoOverlayAction}
             handleStopRecording={handleStopRecording}
             showDocker={showDocker}
             setShowDocker={setShowDocker}
@@ -485,6 +486,7 @@ const BottomDocker = ({
             onToggleRecordSource={toggleRecordSource}
             onStartRecordingClick={() => openModalScreen()}
             onScreenshotClick={handleScreenshotClick}
+            showRecordingPanelButtons={showRecordingPanelButtons}
         />
 
       {showDocker && (<div className="docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">

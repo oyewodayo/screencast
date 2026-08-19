@@ -631,6 +631,14 @@ pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -
     }
     drop(process_state);
 
+    // The path is now stale regardless of what happens below - clearing it here (rather than
+    // only on the success path) stops a failed recording's path from lingering in state and
+    // being mistaken for an in-progress one by anything that checks it later.
+    {
+        let mut app_state = state.output_path.lock().await;
+        *app_state = None;
+    }
+
     info!("Recording stopped");
 
     // Stop the system-audio capture (if this recording had one running) and mux it into the
@@ -650,6 +658,24 @@ pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -
                 }
                 Err(e) => warn!("System-audio capture ended with an error, recording will have no system audio: {}", e),
             }
+        }
+    }
+
+    // ffmpeg's Command::spawn() only fails if the executable itself can't launch - a bad
+    // device name, a closed capture window, or a permission error all still let spawn()
+    // succeed, then exit ffmpeg almost immediately with nothing ever written to output_path.
+    // stdout/stderr are nulled (see recording_with_output_sva's comment on why), so that
+    // failure is otherwise silent: the caller would get back an apparent success and the
+    // completed-recording popup would open pointing at a file that was never created. Checking
+    // for a real, non-empty file here is what turns that into a visible error instead.
+    match fs::metadata(&output_path) {
+        Ok(meta) if meta.len() > 0 => {}
+        Ok(_) => {
+            let _ = fs::remove_file(&output_path);
+            return Err("Recording failed: no video/audio was captured, so the output file is empty. The selected screen, camera, or microphone may have become unavailable during recording.".to_string());
+        }
+        Err(_) => {
+            return Err("Recording failed: no output file was created. The selected screen, camera, or microphone may be unavailable, or recording may have been stopped before it could start.".to_string());
         }
     }
 

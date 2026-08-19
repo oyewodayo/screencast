@@ -32,6 +32,12 @@ export interface AppSettings {
   // showing the panel itself, leaving the ActiveRecordingState shortcut icons as the only way
   // to start a recording from the docker.
   showRecordingDocker: boolean;
+  // Whether the screenshot/screen-webcam-mic/record-button cluster at the bottom-right of
+  // ActiveRecordingState is visible - unlike showRecordingDocker above, this is meant to be
+  // flipped mid-session (Ctrl+Shift+B, see Dashboard.tsx's PANEL_BUTTONS_TOGGLE_SHORTCUT) so
+  // it can be hidden right before presenting/recording a screen that includes this app's own
+  // window, without those controls ending up baked into the video.
+  showRecordingPanelButtons: boolean;
   defaultAudioDevice: string;
   defaultVideoDevices: string[];
   defaultIncludeSystemAudio: boolean;
@@ -64,6 +70,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // Off by default - the bottom-right shortcut icons (see ActiveRecordingState.tsx) are the
   // primary way to start a recording now; the full panel is an opt-in for anyone who wants it.
   showRecordingDocker: false,
+  showRecordingPanelButtons: true,
   defaultAudioDevice: "",
   defaultVideoDevices: [],
   defaultIncludeSystemAudio: false,

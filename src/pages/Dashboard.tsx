@@ -25,7 +25,7 @@ import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
-import { AppSettings, loadSettings } from "../utils/appSettings";
+import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
 import {
   MAX_HOME_SCREEN_FILES,
@@ -119,6 +119,12 @@ const toggleOverlayVisibility = async () => {
 // registered/unregistered purely based on the enableAnnotationTool setting (see the effect that
 // watches annotationEnabled below), not recording state.
 const ANNOTATION_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+D';
+
+// Toggles visibility of the bottom-right recording-panel buttons (screenshot/screen-webcam-mic/
+// record) - meant for hiding them right before presenting/recording a screen that includes this
+// app's own window, without opening Settings mid-presentation. Registered once on mount, unlike
+// the two shortcuts above: there's no window to create/tear down, just a boolean to flip.
+const PANEL_BUTTONS_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+B';
 // Hard kill switch, independent of the Settings checkbox/localStorage. Confirmed on 2026-07-21:
 // flipping this to false reliably hangs the whole app (Briefcast.exe stops responding, verified via
 // Get-Process -> Responding: False) on first launch, right as ensure_annotation_overlay
@@ -159,6 +165,7 @@ const Dashboard = () => {
   const [recordType, setRecordType] = useState(() => loadSettings().defaultRecordType);
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [showRecordingDocker, setShowRecordingDocker] = useState<boolean>(() => loadSettings().showRecordingDocker);
+  const [showRecordingPanelButtons, setShowRecordingPanelButtons] = useState<boolean>(() => loadSettings().showRecordingPanelButtons);
 
   // The main window is created hidden (tauri.conf.json's "visible": false on the main window
   // entry) specifically so this can show it only once there's real, already-painted UI behind it
@@ -979,6 +986,7 @@ const setScreen = () => {
 		setAnnotationEnabled(settings.enableAnnotationTool);
 		setHomeBackgroundStyle(settings.homeBackgroundStyle);
 		setShowRecordingDocker(settings.showRecordingDocker);
+		setShowRecordingPanelButtons(settings.showRecordingPanelButtons);
 		setIncludeSystemAudio(settings.defaultIncludeSystemAudio);
 		if (settings.defaultAudioDevice) setAudioDevice(settings.defaultAudioDevice);
 		if (settings.defaultVideoDevices.length > 0) setVideoDevices(settings.defaultVideoDevices);
@@ -1106,6 +1114,44 @@ const setScreen = () => {
 			});
 		};
 	}, []);
+
+	// Flips the panel-buttons visibility and persists it directly - bypassing the Settings modal's
+	// "must click Save" flow is the whole point here, so the next time Settings is opened it should
+	// still show the state this shortcut/checkbox last left it in, not silently revert on save.
+	const toggleRecordingPanelButtons = useCallback(() => {
+		setShowRecordingPanelButtons((prev) => {
+			const next = !prev;
+			saveSettings({ ...loadSettings(), showRecordingPanelButtons: next });
+			return next;
+		});
+	}, []);
+
+	// Registered once for the life of the window, unlike OVERLAY_TOGGLE_SHORTCUT (tied to an
+	// in-progress recording) or ANNOTATION_TOGGLE_SHORTCUT (tied to a Settings toggle) - this
+	// panel is visible any time the app is, so the shortcut to hide it should be too.
+	useEffect(() => {
+		let cancelled = false;
+
+		(async () => {
+			try {
+				if (!(await isRegistered(PANEL_BUTTONS_TOGGLE_SHORTCUT)) && !cancelled) {
+					await register(PANEL_BUTTONS_TOGGLE_SHORTCUT, () => {
+						void toggleRecordingPanelButtons();
+					});
+				}
+			} catch (err) {
+				console.error('Failed to register panel-buttons hotkey:', err);
+				setError(`Couldn't register the panel-buttons shortcut (${PANEL_BUTTONS_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+			isRegistered(PANEL_BUTTONS_TOGGLE_SHORTCUT).then((registered) => {
+				if (registered) void unregister(PANEL_BUTTONS_TOGGLE_SHORTCUT);
+			});
+		};
+	}, [toggleRecordingPanelButtons]);
 
 	const handleTogglePdfFullscreen = async () => {
 		const next = !isPdfFullscreen;
@@ -2748,6 +2794,7 @@ const setScreen = () => {
         setVideoDevices={setVideoDevices}
         setAudioDevice={setAudioDevice}
         showRecordingDocker={showRecordingDocker}
+        showRecordingPanelButtons={showRecordingPanelButtons}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
         isHome={selectedFile === null && boardScreen === null && docsScreen === null}

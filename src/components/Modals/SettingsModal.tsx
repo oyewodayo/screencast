@@ -311,6 +311,21 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   screen/webcam/mic shortcut icons at the bottom-right of the app to start a recording instead.
                 </p>
 
+                <Field label="Show recording panel buttons">
+                  <input
+                    type="checkbox"
+                    checked={settings.showRecordingPanelButtons}
+                    onChange={(e) => update("showRecordingPanelButtons", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  The screenshot/screen-webcam-mic/record-button cluster itself, distinct from the panel above.
+                  Press Ctrl+Shift+B (Cmd+Shift+B on Mac) any time to hide or show it instantly - handy right
+                  before presenting or recording a screen that includes this window, so it doesn't end up in
+                  the video.
+                </p>
+
                 <Field label="Recording type">
                   <select className={fieldInputClass} value={settings.defaultRecordType} onChange={(e) => handleRecordTypeChange(e.target.value)}>
                     {RECORD_TYPE_OPTIONS.map((o) => (

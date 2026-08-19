@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoClose, IoMicCircle, IoOpenSharp, IoRadioButtonOn, IoScanSharp, IoStopSharp, IoVideocam, IoVideocamSharp, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline } from 'react-icons/io5'
+import { IoCameraOutline, IoMicCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline } from 'react-icons/io5'
 
 export type RecordSource = "screen" | "video" | "audio";
 
@@ -46,7 +46,6 @@ interface Props {
     isDocs:boolean;
     handleOpenSettings:()=>void;
     handleOpenExternalFile:()=>void;
-    handleVideoOverlayAction: ()=>void;
     handleStopRecording: () => void;
     showDocker:boolean;
     setShowDocker:React.Dispatch<React.SetStateAction<boolean>>;
@@ -60,10 +59,15 @@ interface Props {
     // Same idea as onStartRecordingClick, but for RecordingDocker's other button - a screenshot
     // is a standalone one-shot action, not part of the screen/webcam/mic toggle combo above.
     onScreenshotClick?: () => void;
+    // Hides the screenshot/screen-webcam-mic/record-button cluster entirely (Ctrl+Shift+B, see
+    // Dashboard.tsx's PANEL_BUTTONS_TOGGLE_SHORTCUT) - for hiding Briefcast's own controls right
+    // before presenting/recording a screen that includes this window, so they don't end up baked
+    // into the video.
+    showRecordingPanelButtons: boolean;
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenSettings,handleOpenExternalFile, handleVideoOverlayAction,handleStopRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenSettings,handleOpenExternalFile,handleStopRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -187,150 +191,84 @@ const ActiveRecordingState = (
                 </div>
                 <div className='flex items-center'>
 
-                    {/* { !showDocker && <button className='bg-black rounded p-0.5'><IoPlay title='Start recording' className='text-white' /></button>} */}
-
-                    {isRecording? (
-                    <div className="bg-black rounded text-[#F5F7FA] text-ms py-2 px-3 flex justify-between align-middle">
-                        <div className="flex ">
-                            <button className="flex" onClick={handleStopRecording}><IoStopSharp className="rounded-md text-2xl cursor-pointer" /> Stop &nbsp;&nbsp; </button>
-                            <div className='mr-3'> {formatTime(elapsedTime)}</div>
-                        </div>
-
-                        <div className='flex align-middle items-center pl-4'>
-                         
-                            {recordType == "sva" && (
-                            <div className="w-full flex flex-row gap-3 text-right">
-                                <IoScanSharp                                         
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer ` : ``
-                                }
-                                />
-                                <IoVideocam
-                                onClick={handleVideoOverlayAction}    
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                                <IoMicCircle className={isRecording ? `text-green-500 cursor-pointer` : ``} />
-                            </div>
-                            )}
-                            {recordType == "sa" && (
-                            <div className="w-full flex flex-row gap-3 text-right">
-                                <IoScanSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                                <IoMicCircle className={isRecording ? `text-green` : ``} />
-                            </div>
-                            )}
-                            {recordType == "va" && (
-                            <div className="w-full flex flex-row gap-3 text-right">
-                                <IoVideocamSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                                <IoMicCircle className={isRecording ? `text-green-500` : ``} />
-                            </div>
-                            )}
-                            {recordType == "s" && (
-                            <div className="w-full flex flex-row gap-3 text-right">
-                                <IoScanSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                            </div>
-                            )}
-                            {recordType == "v" && (
-                            <div className="w-full flex flex-row gap-3 text-right">
-                                <IoVideocamSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                            </div>
-                            )}
-                            {recordType == "a" && (
-                            <div className="w-full flex flex-row gap-3 text-right">
-                                <IoMicCircle
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                            </div>
-                            )}
-                            {recordType == "c" && (
-                            <div className="w-full flex flex-row gap-3 text-right">
-                                <IoScanSharp
-                                className={
-                                    isRecording ? `text-green-500 cursor-pointer` : ``
-                                }
-                                />
-                            </div>
-                            )}
-                         
-                            {isRecording ?<IoOpenSharp className=" text-2xl"/>:<IoClose className=" text-2xl"/>}
-                        </div>
+                    {/* The recording-in-progress case used to swap this whole panel out for a
+                        separate "Stop / elapsed time / active-source icons" panel - now redundant
+                        with the draggable overlay window (RecordingOverlayWindow.tsx), which
+                        already shows the timer and a Stop button. So this panel stays exactly as
+                        it is during recording (sources shown but not toggleable, since recordType
+                        can't change mid-recording) and only the record button itself changes: red
+                        "start" -> pulsing green "recording, click to stop". Hideable on its own
+                        (Ctrl+Shift+B) for presenting/recording a screen that includes this
+                        window - see appSettings.ts's showRecordingPanelButtons doc comment. */}
+                    {showRecordingPanelButtons && (
+                    <div className="px-2 flex items-center gap-1">
+                        <button
+                            type="button"
+                            title="Take a screenshot"
+                            onClick={() => onScreenshotClick?.()}
+                            disabled={isRecording}
+                            className={`p-2 rounded-md text-xl transition-all duration-150 active:scale-90 outline-none ${
+                                isRecording
+                                    ? "text-white/30 cursor-not-allowed"
+                                    : "cursor-pointer text-white/70 hover:text-white hover:bg-black/40"
+                            }`}
+                        >
+                            <IoCameraOutline />
+                        </button>
+                        <div className="w-px self-stretch my-1 bg-white/20" />
+                        {(() => {
+                            const flags = SOURCE_FLAGS[recordType] ?? { screen: false, video: false, audio: false };
+                            const sourceButtonClass = (active: boolean) =>
+                                `p-2 rounded-md text-xl transition-all duration-150 outline-none ${
+                                    isRecording ? "cursor-default" : "cursor-pointer active:scale-90"
+                                } ${
+                                    active
+                                        ? "text-green-400 bg-green-400/10 hover:bg-green-400/20"
+                                        : "text-white/70 hover:text-white hover:bg-black/40"
+                                }`;
+                            return (
+                                <>
+                                    <button
+                                        type="button"
+                                        title="Toggle screen capture"
+                                        onClick={() => !isRecording && onToggleRecordSource?.("screen")}
+                                        className={sourceButtonClass(flags.screen)}
+                                    >
+                                        <IoScanSharp />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        title="Toggle webcam"
+                                        onClick={() => !isRecording && onToggleRecordSource?.("video")}
+                                        className={sourceButtonClass(flags.video)}
+                                    >
+                                        <IoVideocam />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        title="Toggle microphone"
+                                        onClick={() => !isRecording && onToggleRecordSource?.("audio")}
+                                        className={sourceButtonClass(flags.audio)}
+                                    >
+                                        <IoMicCircle />
+                                    </button>
+                                </>
+                            );
+                        })()}
+                        {isRecording && (
+                            <div className="ml-1 text-white text-xs font-mono">{formatTime(elapsedTime)}</div>
+                        )}
+                        <button
+                            type="button"
+                            title={isRecording ? "Stop recording" : "Start recording"}
+                            onClick={isRecording ? handleStopRecording : onStartRecordingClick}
+                            className={`cursor-pointer ml-1 p-2 rounded-full text-white active:scale-90 transition-all duration-150 outline-none ${
+                                isRecording ? "bg-green-500 hover:bg-green-400 animate-pulse" : "bg-red-500 hover:bg-red-400"
+                            }`}
+                        >
+                            <IoRadioButtonOn />
+                        </button>
                     </div>
-                    ):(
-                        <div className="px-2 flex items-center gap-1">
-                            <button
-                                type="button"
-                                title="Take a screenshot"
-                                onClick={() => onScreenshotClick?.()}
-                                className="cursor-pointer p-2 rounded-md text-xl text-white/70 hover:text-white hover:bg-black/40 active:scale-90 transition-all duration-150 outline-none"
-                            >
-                                <IoCameraOutline />
-                            </button>
-                            <div className="w-px self-stretch my-1 bg-white/20" />
-                            {(() => {
-                                const flags = SOURCE_FLAGS[recordType] ?? { screen: false, video: false, audio: false };
-                                const sourceButtonClass = (active: boolean) =>
-                                    `cursor-pointer p-2 rounded-md text-xl transition-all duration-150 active:scale-90 outline-none ${
-                                        active
-                                            ? "text-green-400 bg-green-400/10 hover:bg-green-400/20"
-                                            : "text-white/70 hover:text-white hover:bg-black/40"
-                                    }`;
-                                return (
-                                    <>
-                                        <button
-                                            type="button"
-                                            title="Toggle screen capture"
-                                            onClick={() => onToggleRecordSource?.("screen")}
-                                            className={sourceButtonClass(flags.screen)}
-                                        >
-                                            <IoScanSharp />
-                                        </button>
-                                        <button
-                                            type="button"
-                                            title="Toggle webcam"
-                                            onClick={() => onToggleRecordSource?.("video")}
-                                            className={sourceButtonClass(flags.video)}
-                                        >
-                                            <IoVideocam />
-                                        </button>
-                                        <button
-                                            type="button"
-                                            title="Toggle microphone"
-                                            onClick={() => onToggleRecordSource?.("audio")}
-                                            className={sourceButtonClass(flags.audio)}
-                                        >
-                                            <IoMicCircle />
-                                        </button>
-                                    </>
-                                );
-                            })()}
-                            <button
-                                type="button"
-                                title="Start recording"
-                                onClick={onStartRecordingClick}
-                                className="cursor-pointer ml-1 p-2 rounded-full text-white bg-red-500 hover:bg-red-400 active:scale-90 transition-all duration-150 outline-none"
-                            >
-                                <IoRadioButtonOn />
-                            </button>
-                        </div>
                     )}
 
                     <div className='flex justify-end pl-2'>

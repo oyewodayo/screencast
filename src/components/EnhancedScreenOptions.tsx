@@ -211,7 +211,7 @@ const EnhancedScreenOptions = ({
     };
 
     const renderMainOptions = () => (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 p-6">
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 p-6">
             <button
                 onClick={() => {
                     setSelectedMonitor('');
@@ -258,15 +258,6 @@ const EnhancedScreenOptions = ({
                     <span className="text-xs text-gray-500 dark:text-neutral-400">Not on macOS</span>
                 </button>
             )}
-
-            <button
-                className="flex flex-col items-center gap-2 p-4 rounded-lg border-2 border-gray-200 dark:border-neutral-700 opacity-50 cursor-not-allowed"
-                disabled
-            >
-                <IoDesktop className="text-5xl text-gray-700 dark:text-neutral-300" />
-                <span className="text-sm font-medium">Region</span>
-                <span className="text-xs text-gray-500 dark:text-neutral-400">Coming soon</span>
-            </button>
         </div>
     );
 
