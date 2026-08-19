@@ -1,6 +1,6 @@
 // components/Modals/SettingsModal.tsx
 import React, { useEffect, useState } from "react";
-import { IoClose, IoSettingsOutline, IoSunny, IoMoon, IoContrast } from "react-icons/io5";
+import { IoClose, IoSettingsOutline, IoSunny, IoMoon, IoContrast, IoRefresh } from "react-icons/io5";
 import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
 import { AppSettings, DEFAULT_SETTINGS, loadSettings, saveSettings } from "../../utils/appSettings";
@@ -94,6 +94,27 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
   const [storageBusy, setStorageBusy] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
 
+  // Audio/video device lists for the "Default audio device"/"Default video device(s)" pickers
+  // below - the same devices RecordingDocker itself lists, fetched the same way (BottomDocker.tsx
+  // does an identical pair of invokes for its own copies of these pickers).
+  const [connectedAudioDevices, setConnectedAudioDevices] = useState<string[] | null>(null);
+  const [connectedCameraDevices, setConnectedCameraDevices] = useState<string[] | null>(null);
+
+  // WASAPI loopback ("system audio") is Windows-only - see BottomDocker.tsx's identical check
+  // for why the equivalent checkbox in the recording panel is gated the same way. Without this,
+  // the default here could be turned on for a macOS/Linux install and never do anything.
+  const [isSystemAudioSupported, setIsSystemAudioSupported] = useState(true);
+  useEffect(() => {
+    invoke<string>('get_platform')
+      .then((platform) => setIsSystemAudioSupported(platform === 'windows'))
+      .catch((err) => console.error('Failed to detect platform:', err));
+  }, []);
+
+  const loadDevices = (): void => {
+    invoke<string[]>("get_connected_audios").then(setConnectedAudioDevices).catch(console.error);
+    invoke<string[]>("get_connected_cameras").then(setConnectedCameraDevices).catch(console.error);
+  };
+
   useEffect(() => {
     (async () => {
       try {
@@ -104,7 +125,17 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
         console.error("Failed to load the current storage location:", err);
       }
     })();
+    loadDevices();
   }, []);
+
+  const toggleDefaultVideoDevice = (device: string): void => {
+    setSettings((prev) => ({
+      ...prev,
+      defaultVideoDevices: prev.defaultVideoDevices.includes(device)
+        ? prev.defaultVideoDevices.filter((d) => d !== device)
+        : [...prev.defaultVideoDevices, device],
+    }));
+  };
 
   const recordCategory = RECORD_TYPE_OPTIONS.find((o) => o.value === settings.defaultRecordType)?.category ?? "video";
 
@@ -277,6 +308,34 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
 
             {activeSection === "recording" && (
               <Section title="Recording defaults">
+                <Field label="Show recording panel in bottom bar">
+                  <input
+                    type="checkbox"
+                    checked={settings.showRecordingDocker}
+                    onChange={(e) => update("showRecordingDocker", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  When off, the fields below still apply as defaults, but the panel itself is hidden - use the
+                  screen/webcam/mic shortcut icons at the bottom-right of the app to start a recording instead.
+                </p>
+
+                <Field label="Show recording panel buttons">
+                  <input
+                    type="checkbox"
+                    checked={settings.showRecordingPanelButtons}
+                    onChange={(e) => update("showRecordingPanelButtons", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  The screenshot/screen-webcam-mic/record-button cluster itself, distinct from the panel above.
+                  Press Ctrl+Shift+B (Cmd+Shift+B on Mac) any time to hide or show it instantly - handy right
+                  before presenting or recording a screen that includes this window, so it doesn't end up in
+                  the video.
+                </p>
+
                 <Field label="Recording type">
                   <select className={fieldInputClass} value={settings.defaultRecordType} onChange={(e) => handleRecordTypeChange(e.target.value)}>
                     {RECORD_TYPE_OPTIONS.map((o) => (
@@ -304,6 +363,66 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     placeholder="Recording"
                   />
                 </Field>
+                <Field label="Audio device">
+                  <select
+                    className={fieldInputClass}
+                    value={settings.defaultAudioDevice}
+                    onChange={(e) => update("defaultAudioDevice", e.target.value)}
+                  >
+                    <option value="">First detected device</option>
+                    {connectedAudioDevices?.map((device) => (
+                      <option key={device} value={device}>
+                        {device}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                {(settings.defaultRecordType === "sva" || settings.defaultRecordType === "sa" || settings.defaultRecordType === "s") && (
+                  <Field label="Include system audio">
+                    <input
+                      type="checkbox"
+                      checked={settings.defaultIncludeSystemAudio && isSystemAudioSupported}
+                      disabled={!isSystemAudioSupported}
+                      title={isSystemAudioSupported ? undefined : "System audio capture is Windows-only for now - not available on this platform."}
+                      onChange={(e) => update("defaultIncludeSystemAudio", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
+                    />
+                  </Field>
+                )}
+                {(settings.defaultRecordType === "sva" || settings.defaultRecordType === "sa" || settings.defaultRecordType === "s") && !isSystemAudioSupported && (
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                    System audio capture (WASAPI loopback) isn't available on this platform yet.
+                  </p>
+                )}
+                <div className="flex items-start justify-between gap-4">
+                  <span className="text-sm text-neutral-700 dark:text-neutral-300 pt-1.5">Video device(s)</span>
+                  <div className="flex items-center gap-1.5">
+                    <div className="p-2 rounded-lg text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 max-h-28 overflow-y-auto min-w-[200px]">
+                      {connectedCameraDevices && connectedCameraDevices.length > 0 ? (
+                        connectedCameraDevices.map((device) => (
+                          <label key={device} className="flex items-center gap-2 py-0.5 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={settings.defaultVideoDevices.includes(device)}
+                              onChange={() => toggleDefaultVideoDevice(device)}
+                            />
+                            <span className="truncate">{device}</span>
+                          </label>
+                        ))
+                      ) : (
+                        <span className="text-neutral-500">No video cameras detected</span>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={loadDevices}
+                      title="Refresh device list"
+                      className="p-2 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+                    >
+                      <IoRefresh />
+                    </button>
+                  </div>
+                </div>
               </Section>
             )}
 

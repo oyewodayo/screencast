@@ -1,5 +1,6 @@
 // Dashboard.tsx
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import * as Y from "yjs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
 import BottomDocker from "../components/BottomDocker";
@@ -15,13 +16,17 @@ import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
 import ClipCropOverlay from "../components/video/ClipCropOverlay";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
+import BulkConversionDialog, { BulkConversionSummary } from "../components/BulkConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
+import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
+import { DocSummary } from "../utils/docTypes";
+import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import Toast from "../components/custom/Toast";
-import { AppSettings, loadSettings } from "../utils/appSettings";
-import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, isConvertibleCategory } from "../utils/fileCategory";
+import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
+import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
 import {
   MAX_HOME_SCREEN_FILES,
   getPinnedPaths,
@@ -51,7 +56,7 @@ import {
   IoSearch,
   IoClose,
 } from "react-icons/io5";
-import { MdCreateNewFolder } from "react-icons/md";
+import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 
 type RAMInfo = [number, number];
 
@@ -60,6 +65,7 @@ const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.R
   { category: "audio", label: "Audio", icon: <IoMusicalNotes size={18} /> },
   { category: "image", label: "Image", icon: <IoImage size={18} /> },
   { category: "pdf", label: "Pdf", icon: <IoDocumentText size={18} /> },
+  { category: "document", label: "Documents", icon: <MdOutlineDescription size={18} /> },
 ];
 
 // The sidebar's active tab is either a real file category or the Trash view — the latter isn't
@@ -89,6 +95,7 @@ const OPEN_FILE_DIALOG_FILTERS = [
   { name: "Audio", extensions: FILE_CATEGORY_EXTENSIONS.audio },
   { name: "Image", extensions: FILE_CATEGORY_EXTENSIONS.image },
   { name: "PDF", extensions: FILE_CATEGORY_EXTENSIONS.pdf },
+  { name: "Document", extensions: FILE_CATEGORY_EXTENSIONS.document },
 ];
 
 // Toggles the recording-overlay window's visibility. Registered as an OS-level hotkey via
@@ -112,6 +119,20 @@ const toggleOverlayVisibility = async () => {
 // registered/unregistered purely based on the enableAnnotationTool setting (see the effect that
 // watches annotationEnabled below), not recording state.
 const ANNOTATION_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+D';
+
+// Toggles visibility of the bottom-right recording-panel buttons (screenshot/screen-webcam-mic/
+// record) - meant for hiding them right before presenting/recording a screen that includes this
+// app's own window, without opening Settings mid-presentation. Registered once on mount, unlike
+// the two shortcuts above: there's no window to create/tear down, just a boolean to flip.
+const PANEL_BUTTONS_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+B';
+
+// Starts a full-screen recording with whatever settings are currently configured (record type,
+// file name/ext, audio/video devices, overlay options) when not recording, or stops the
+// in-progress one when pressed again - a single toggle rather than two separate bindings, same
+// convention as OVERLAY_TOGGLE_SHORTCUT/PANEL_BUTTONS_TOGGLE_SHORTCUT above. Deliberately skips
+// EnhancedScreenOptions' target picker (screen_size is hardcoded to "fullscreen") since the whole
+// point of a global hotkey is starting a recording without switching to this window first.
+const RECORDING_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+R';
 // Hard kill switch, independent of the Settings checkbox/localStorage. Confirmed on 2026-07-21:
 // flipping this to false reliably hangs the whole app (Briefcast.exe stops responding, verified via
 // Get-Process -> Responding: False) on first launch, right as ensure_annotation_overlay
@@ -143,6 +164,14 @@ const Dashboard = () => {
   const [message, setMessage] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
+  // Pause/resume timing model: elapsed time is (now or, while paused, the moment it paused) minus
+  // recordingStartTime minus every millisecond already spent paused so far. pausedAccumulatedMs
+  // only changes at a pause->resume transition (not every tick), so unlike recordingStartTime this
+  // is cheap to keep as ordinary state - ActiveRecordingState/RecordingOverlayWindow both need it
+  // as a prop/event field to compute their own ticking display, since each runs its own timer.
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
+  const [pausedAccumulatedMs, setPausedAccumulatedMs] = useState<number>(0);
   const [error, setError] = useState<string>("");
   const [ramInfo, setRamInfo] = useState<RAMInfo | null>(null);
   const [fileName, setFileName] = useState(
@@ -151,6 +180,8 @@ const Dashboard = () => {
   const [fileExt, setFileExt] = useState(() => loadSettings().defaultFileExt);
   const [recordType, setRecordType] = useState(() => loadSettings().defaultRecordType);
   const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [showRecordingDocker, setShowRecordingDocker] = useState<boolean>(() => loadSettings().showRecordingDocker);
+  const [showRecordingPanelButtons, setShowRecordingPanelButtons] = useState<boolean>(() => loadSettings().showRecordingPanelButtons);
 
   // The main window is created hidden (tauri.conf.json's "visible": false on the main window
   // entry) specifically so this can show it only once there's real, already-painted UI behind it
@@ -194,7 +225,7 @@ const Dashboard = () => {
   // can't capture system audio on a machine with no Stereo Mix-equivalent device). Only
   // meaningful for the screen-capture record types (sva/sa/s); RecordingDocker only shows the
   // toggle for those.
-  const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(false);
+  const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(() => loadSettings().defaultIncludeSystemAudio);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
@@ -214,6 +245,16 @@ const Dashboard = () => {
   // Which Board screen (if any) is showing in the main content pane - null means Board mode is
   // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
   const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
+  // Which Docs screen (if any) is showing in the main content pane - same null-means-off pattern
+  // as boardScreen. See handleOpenDocs.
+  const [docsScreen, setDocsScreen] = useState<DocsScreen | null>(null);
+  // Every doc's summary (id/title/linked_to/etc.), refreshed via refreshDocsIndex - backs both the
+  // "Link to recording" picker's libraryFiles-independent state and the per-file "has linked
+  // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
+  const [docsIndex, setDocsIndex] = useState<DocSummary[]>([]);
+  // "Link notes" flyout inside a file's 3-dot menu when 2+ docs are already linked to it - same
+  // expand-in-place pattern as moveMenuOpenFor.
+  const [linkDocsMenuOpenFor, setLinkDocsMenuOpenFor] = useState<string | null>(null);
   // Spins the sidebar's manual refresh icon while a refresh is in flight — see handleRefreshFiles.
   const [isRefreshingFiles, setIsRefreshingFiles] = useState<boolean>(false);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
@@ -297,8 +338,13 @@ const Dashboard = () => {
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
-  // load_image_edit_state invoke.
-  const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
+  // load_image_edit_state invoke. HEIC/HEIF are excluded too - they render as a "Convert to
+  // view" prompt instead of ImageEditor (see the main content pane below), so loading edit state
+  // for them would just be a wasted invoke that's also doomed to fail decoding the source photo.
+  const isImageFileSelected =
+    !!selectedFile &&
+    getFileCategory(selectedFile.name) === "image" &&
+    !["heic", "heif"].includes(getFileExtension(selectedFile.name));
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
@@ -329,6 +375,7 @@ const Dashboard = () => {
     setIsCroppingClip(false);
   }, [selectedFile?.path]);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
+const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
   // Toggled from the sidebar header's tools icon (next to "new folder"); falls back to "record"
@@ -449,8 +496,11 @@ useEffect(() => {
       // Update main window state
       setIsRecording(false);
       setRecordingStartTime(null);
+      setIsPaused(false);
+      setPauseStartedAt(null);
+      setPausedAccumulatedMs(0);
       setMessage("Recording stopped");
-      
+
       // Stop monitoring if active
       if (isMonitoring) {
         try {
@@ -485,7 +535,25 @@ useEffect(() => {
       unlistenFn();
     }
   };
-}, [isMonitoring]); 
+}, [isMonitoring]);
+
+  // Mirrors the recording-overlay window's own pause/resume buttons back into this window's state
+  // - same "whichever window acted, sync the other one" idea as the recording-stopped listener
+  // above, just for pause instead of stop.
+  useEffect(() => {
+    const unlistenPromise = listen<{ isPaused: boolean; pauseStartedAt: number | null; pausedAccumulatedMs: number }>(
+      'recording-pause-changed',
+      (event) => {
+        setIsPaused(event.payload.isPaused);
+        setPauseStartedAt(event.payload.pauseStartedAt);
+        setPausedAccumulatedMs(event.payload.pausedAccumulatedMs);
+        setMessage(event.payload.isPaused ? "Recording paused" : "Recording resumed");
+      }
+    );
+    return () => {
+      unlistenPromise.then((fn) => fn());
+    };
+  }, []);
 
   // Get RAM info
   useEffect(() => {
@@ -667,6 +735,9 @@ const setScreen = () => {
         const startTime = Date.now();
         setIsRecording(true);
         setRecordingStartTime(startTime);
+        setIsPaused(false);
+        setPauseStartedAt(null);
+        setPausedAccumulatedMs(0);
         setError("");
 
         // Create the overlay window, but don't show it - it stays hidden until the user
@@ -697,7 +768,10 @@ const setScreen = () => {
         overlayWindow.emit('recording-state-update', {
           isRecording: true,
           recordType: formData.record_type,
-          startTime
+          startTime,
+          isPaused: false,
+          pauseStartedAt: null,
+          pausedAccumulatedMs: 0,
         });
 
         if (!(await isRegistered(OVERLAY_TOGGLE_SHORTCUT))) {
@@ -714,33 +788,97 @@ const setScreen = () => {
 
   
   let handleStopRecording = async () => {
+    setError("");
     try {
-      setError("");
       const response = await invoke<string>("stop_recording");
-      
       const audio = new Audio("/sounds/option-3.mp3");
       audio.play().catch(err => console.error("Error playing audio:", err));
-      
       setMessage(response);
-      setIsRecording(false);
-      setRecordingStartTime(null);
-	  // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
-		const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
-		if (overlayWindow) {
-		await overlayWindow.hide();
-		}
-		if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
-		await unregister(OVERLAY_TOGGLE_SHORTCUT);
-		}
-
-      if (isMonitoring) {
-        await invoke("stop_monitoring_windows");
-        setIsMonitoring(false);
-        console.log("Monitoring stopped");
-      }
     } catch (error) {
       console.error("Error stopping recording:", error);
       setError(`Failed to stop recording: ${error}`);
+    }
+
+    // ffmpeg has already been asked to stop and torn down on the backend by the time
+    // stop_recording rejects (e.g. the capture device disappeared mid-recording and no output
+    // file was produced), so this window's own state still needs resetting either way - same
+    // reasoning as RecordingOverlayWindow.tsx's own handleStopRecording.
+    setIsRecording(false);
+    setRecordingStartTime(null);
+    setIsPaused(false);
+    setPauseStartedAt(null);
+    setPausedAccumulatedMs(0);
+
+    // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
+    const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+    if (overlayWindow) {
+      await overlayWindow.hide();
+    }
+    if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
+      await unregister(OVERLAY_TOGGLE_SHORTCUT);
+    }
+
+    if (isMonitoring) {
+      try {
+        await invoke("stop_monitoring_windows");
+        setIsMonitoring(false);
+        console.log("Monitoring stopped");
+      } catch (error) {
+        console.error("Error stopping monitoring:", error);
+      }
+    }
+  };
+
+  // Pauses the in-progress recording - suspends ffmpeg (and, on Windows, the WASAPI loopback
+  // capture if system audio is on) at the backend level, and freezes this window's own elapsed
+  // timer at the moment of pause by recording when it happened rather than resetting it.
+  const handlePauseRecording = async () => {
+    try {
+      await invoke("pause_recording");
+      const now = Date.now();
+      setIsPaused(true);
+      setPauseStartedAt(now);
+      setMessage("Recording paused");
+
+      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      overlayWindow?.emit('recording-state-update', {
+        isRecording: true,
+        recordType,
+        startTime: recordingStartTime,
+        isPaused: true,
+        pauseStartedAt: now,
+        pausedAccumulatedMs,
+      });
+    } catch (error) {
+      console.error("Error pausing recording:", error);
+      setError(`Failed to pause recording: ${error}`);
+    }
+  };
+
+  const handleResumeRecording = async () => {
+    try {
+      await invoke("resume_recording");
+      // Folds the just-finished pause into the running total before clearing pauseStartedAt -
+      // this is the one moment pausedAccumulatedMs actually changes (see its own doc comment).
+      const addedMs = pauseStartedAt ? Date.now() - pauseStartedAt : 0;
+      const newAccumulatedMs = pausedAccumulatedMs + addedMs;
+      setIsPaused(false);
+      setPauseStartedAt(null);
+      setPausedAccumulatedMs(newAccumulatedMs);
+      setMessage("Recording resumed");
+
+      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      overlayWindow?.emit('recording-state-update', {
+        isRecording: true,
+        recordType,
+        startTime: recordingStartTime,
+        isPaused: false,
+        pauseStartedAt: null,
+        pausedAccumulatedMs: newAccumulatedMs,
+      });
+    } catch (error) {
+      console.error("Error resuming recording:", error);
+      setError(`Failed to resume recording: ${error}`);
     }
   };
 
@@ -794,6 +932,63 @@ const setScreen = () => {
 		}
 	};
 
+	// Backs the sidebar's per-file "has linked notes" badge/menu (see linkedDocsByPath below) from
+	// one list_docs call rather than a find_docs_linked_to round trip per visible row.
+	const refreshDocsIndex = useCallback(async () => {
+		try {
+			setDocsIndex(await invoke<DocSummary[]>("list_docs"));
+		} catch (error) {
+			console.error("Failed to load docs index:", error);
+		}
+	}, []);
+
+	useEffect(() => {
+		refreshDocsIndex();
+	}, [refreshDocsIndex]);
+
+	// file.path -> every doc linked to it, derived once per docsIndex change rather than filtered
+	// per row on every render.
+	const linkedDocsByPath = useMemo(() => {
+		const map = new Map<string, DocSummary[]>();
+		for (const doc of docsIndex) {
+			if (!doc.linked_to) continue;
+			const existing = map.get(doc.linked_to);
+			if (existing) existing.push(doc);
+			else map.set(doc.linked_to, [doc]);
+		}
+		return map;
+	}, [docsIndex]);
+
+	// One-step "notes for this file" action from a file's 3-dot menu: create-and-link if nothing's
+	// linked yet, jump straight in if exactly one doc is, or open the flyout (linkDocsMenuOpenFor)
+	// if there's more than one - handled inline at the call site since the 2+ case needs UI state.
+	const handleLinkNotes = async (file: FileEntry) => {
+		setOpenMenu(null);
+		const existing = linkedDocsByPath.get(file.path) ?? [];
+		if (existing.length === 1) {
+			setSelectedFile(null);
+			setDocsScreen({ mode: "editor", docId: existing[0].id });
+			return;
+		}
+		if (existing.length >= 2) {
+			setLinkDocsMenuOpenFor(file.path);
+			return;
+		}
+		try {
+			const id = crypto.randomUUID();
+			const title = `Notes for ${file.name}`;
+			const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
+			await invoke("create_doc", { id, title, bytes });
+			await invoke("link_doc_to_file", { id, filePath: file.path });
+			await refreshDocsIndex();
+			setSelectedFile(null);
+			setDocsScreen({ mode: "editor", docId: id });
+		} catch (error) {
+			console.error("Failed to create linked notes:", error);
+			setError(`Failed to create linked notes: ${error}`);
+		}
+	};
+
 	// Manual escape hatch for the sidebar's "Files:" refresh button — the backend also watches the
 	// Briefcast folder itself and emits refresh-file-list on external changes (see the
 	// 'refresh-file-list' listener below), but this covers watcher failures/platforms without one,
@@ -801,7 +996,7 @@ const setScreen = () => {
 	const handleRefreshFiles = async () => {
 		setIsRefreshingFiles(true);
 		try {
-			await Promise.all([handleDirectoryFiles(), loadTrash()]);
+			await Promise.all([handleDirectoryFiles(), loadTrash(), refreshDocsIndex()]);
 		} finally {
 			setIsRefreshingFiles(false);
 		}
@@ -885,8 +1080,9 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); };
-	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); };
+	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); };
+	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); };
+	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); };
 	const handleOpenSettings = () => setShowSettings(true);
 	const handleCloseSettings = () => setShowSettings(false);
 	// Settings apply immediately to the current session too, not just future ones — otherwise
@@ -896,6 +1092,11 @@ const setScreen = () => {
 		setRecordType(settings.defaultRecordType);
 		setAnnotationEnabled(settings.enableAnnotationTool);
 		setHomeBackgroundStyle(settings.homeBackgroundStyle);
+		setShowRecordingDocker(settings.showRecordingDocker);
+		setShowRecordingPanelButtons(settings.showRecordingPanelButtons);
+		setIncludeSystemAudio(settings.defaultIncludeSystemAudio);
+		if (settings.defaultAudioDevice) setAudioDevice(settings.defaultAudioDevice);
+		if (settings.defaultVideoDevices.length > 0) setVideoDevices(settings.defaultVideoDevices);
 	};
 	// After the Briefcast folder itself has been relocated (see SettingsModal's Storage section):
 	// re-list from the new location, and drop whatever's currently open - its sourcePath was inside
@@ -1021,6 +1222,111 @@ const setScreen = () => {
 		};
 	}, []);
 
+	// Flips the panel-buttons visibility and persists it directly - bypassing the Settings modal's
+	// "must click Save" flow is the whole point here, so the next time Settings is opened it should
+	// still show the state this shortcut/checkbox last left it in, not silently revert on save.
+	const toggleRecordingPanelButtons = useCallback(() => {
+		setShowRecordingPanelButtons((prev) => {
+			const next = !prev;
+			saveSettings({ ...loadSettings(), showRecordingPanelButtons: next });
+			return next;
+		});
+	}, []);
+
+	// Registered once for the life of the window, unlike OVERLAY_TOGGLE_SHORTCUT (tied to an
+	// in-progress recording) or ANNOTATION_TOGGLE_SHORTCUT (tied to a Settings toggle) - this
+	// panel is visible any time the app is, so the shortcut to hide it should be too.
+	useEffect(() => {
+		let cancelled = false;
+
+		(async () => {
+			try {
+				if (!(await isRegistered(PANEL_BUTTONS_TOGGLE_SHORTCUT)) && !cancelled) {
+					await register(PANEL_BUTTONS_TOGGLE_SHORTCUT, () => {
+						void toggleRecordingPanelButtons();
+					});
+				}
+			} catch (err) {
+				console.error('Failed to register panel-buttons hotkey:', err);
+				setError(`Couldn't register the panel-buttons shortcut (${PANEL_BUTTONS_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+			isRegistered(PANEL_BUTTONS_TOGGLE_SHORTCUT).then((registered) => {
+				if (registered) void unregister(PANEL_BUTTONS_TOGGLE_SHORTCUT);
+			});
+		};
+	}, [toggleRecordingPanelButtons]);
+
+	// handleStartRecording/handleStopRecording (and every recording-setup field below) are
+	// recreated or reassigned on every render, so a stable (empty-deps) hotkey callback can't
+	// reference them directly without capturing a stale first-render snapshot forever - this ref
+	// is refreshed after every render instead (same pattern as selectedFileRef above) so the
+	// hotkey handler, registered once, always acts on the latest values.
+	const recordingHotkeyRef = useRef({
+		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
+		fileName, fileExt, recordType, audioDevice, videoDevices,
+		overlayShape, overlayPosition, overlaySize, includeSystemAudio,
+	});
+	useEffect(() => {
+		recordingHotkeyRef.current = {
+			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
+			fileName, fileExt, recordType, audioDevice, videoDevices,
+			overlayShape, overlayPosition, overlaySize, includeSystemAudio,
+		};
+	});
+
+	const handleRecordingToggleHotkey = useCallback(() => {
+		const s = recordingHotkeyRef.current;
+		if (s.isRecording) {
+			void s.stopRecording();
+			return;
+		}
+		void s.startRecording({
+			file_name: s.fileName,
+			file_ext: s.fileExt,
+			record_type: s.recordType,
+			audio_device: s.audioDevice,
+			// Deliberately skips EnhancedScreenOptions' target picker - see RECORDING_TOGGLE_SHORTCUT's
+			// own doc comment for why.
+			screen_size: 'fullscreen',
+			video_devices: s.videoDevices,
+			overlay_shape: s.overlayShape,
+			overlay_position: s.overlayPosition,
+			overlay_size: s.overlaySize,
+			window_title: '',
+			include_system_audio: s.includeSystemAudio,
+		});
+	}, []);
+
+	// Registered once for the life of the window, same reasoning as the panel-buttons shortcut
+	// above - starting/stopping is meaningful any time the app is running, not just mid-recording.
+	useEffect(() => {
+		let cancelled = false;
+
+		(async () => {
+			try {
+				if (!(await isRegistered(RECORDING_TOGGLE_SHORTCUT)) && !cancelled) {
+					await register(RECORDING_TOGGLE_SHORTCUT, () => {
+						handleRecordingToggleHotkey();
+					});
+				}
+			} catch (err) {
+				console.error('Failed to register recording-toggle hotkey:', err);
+				setError(`Couldn't register the start/stop recording shortcut (${RECORDING_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+			isRegistered(RECORDING_TOGGLE_SHORTCUT).then((registered) => {
+				if (registered) void unregister(RECORDING_TOGGLE_SHORTCUT);
+			});
+		};
+	}, [handleRecordingToggleHotkey]);
+
 	const handleTogglePdfFullscreen = async () => {
 		const next = !isPdfFullscreen;
 		setIsPdfFullscreen(next);
@@ -1054,6 +1360,7 @@ const setScreen = () => {
 		sourcePath: filePath
 		});
 		setBoardScreen(null);
+		setDocsScreen(null);
 		setRecentPaths(recordFileOpened(filePath));
 
 		console.log('File selected for playback:', fileName);
@@ -1288,7 +1595,7 @@ const setScreen = () => {
 
 			const name = selected.split(/[\\/]/).pop() ?? selected;
 			if (!getFileCategory(name)) {
-				await showMessageDialog(`"${name}" isn't a supported file type (video, audio, image, or PDF).`, {
+				await showMessageDialog(`"${name}" isn't a supported file type (video, audio, image, PDF, or document).`, {
 					title: 'Unsupported file',
 					type: 'warning',
 				});
@@ -1398,6 +1705,15 @@ const setScreen = () => {
 					setRecentPaths(recent);
 				}
 			});
+
+			// Same repair for any doc's linked_to pointing at a moved file - one refresh after the
+			// loop rather than per-file, to avoid redundant list_docs calls during a bulk move.
+			const relinkResults = await Promise.allSettled(
+				results
+					.map((result, i) => (result.status === "fulfilled" ? invoke("relink_doc_path", { oldPath: toMove[i].path, newPath: result.value }) : null))
+					.filter((p): p is Promise<unknown> => p !== null)
+			);
+			if (relinkResults.length > 0) await refreshDocsIndex();
 
 			await handleDirectoryFiles();
 
@@ -1576,6 +1892,12 @@ const setScreen = () => {
 			const { pinned, recent } = repathFile(file.path, newPath);
 			setPinnedPaths(pinned);
 			setRecentPaths(recent);
+			try {
+				await invoke("relink_doc_path", { oldPath: file.path, newPath });
+				await refreshDocsIndex();
+			} catch (error) {
+				console.error("Failed to repair doc links after rename:", error);
+			}
 			await handleDirectoryFiles();
 			if (selectedFile?.sourcePath === file.path) {
 				const newFileName = newPath.split(/[\\/]/).pop() ?? newName;
@@ -1861,6 +2183,15 @@ const setScreen = () => {
                           </div>
                         )}
                       </div>
+                      {isConvertibleCategory(activeFileCategory) && (
+                        <button
+                          type="button"
+                          onClick={() => setBulkConversionFiles(getSelectedFileEntries())}
+                          className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                        >
+                          Convert
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => setSelectedFilePaths(new Set())}
@@ -2085,6 +2416,14 @@ const setScreen = () => {
                                 />
                               )}
 
+                              {linkedDocsByPath.has(file.path) && (
+                                <MdOutlineDescription
+                                  size={13}
+                                  className="shrink-0 text-gray-400 dark:text-neutral-500"
+                                  title={`${linkedDocsByPath.get(file.path)!.length} linked note(s)`}
+                                />
+                              )}
+
                               {/* Three vertical dots menu */}
                               <div className="relative">
                                 <button
@@ -2093,6 +2432,7 @@ const setScreen = () => {
                                     e.stopPropagation();
                                     setOpenMenu(openMenu === file.path ? null : file.path);
                                     setMoveMenuOpenFor(null);
+                                    setLinkDocsMenuOpenFor(null);
                                   }}
                                 >
                                   <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
@@ -2112,6 +2452,65 @@ const setScreen = () => {
                                     >
                                       {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
                                     </button>
+                                    <button
+                                      className="w-full flex items-center justify-between px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        void handleLinkNotes(file);
+                                      }}
+                                    >
+                                      Link notes
+                                      {linkedDocsByPath.has(file.path) && (linkedDocsByPath.get(file.path)!.length >= 2) && (
+                                        <IoChevronForward
+                                          size={12}
+                                          className={`transition-transform ${linkDocsMenuOpenFor === file.path ? 'rotate-90' : ''}`}
+                                        />
+                                      )}
+                                    </button>
+                                    {linkDocsMenuOpenFor === file.path && (
+                                      <div className="border-t border-gray-200 dark:border-neutral-700 max-h-40 overflow-y-auto py-0.5">
+                                        {(linkedDocsByPath.get(file.path) ?? []).map((doc) => (
+                                          <button
+                                            key={doc.id}
+                                            className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setOpenMenu(null);
+                                              setLinkDocsMenuOpenFor(null);
+                                              setSelectedFile(null);
+                                              setDocsScreen({ mode: "editor", docId: doc.id });
+                                            }}
+                                          >
+                                            {doc.title || "Untitled document"}
+                                          </button>
+                                        ))}
+                                        <button
+                                          className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setLinkDocsMenuOpenFor(null);
+                                            void (async () => {
+                                              try {
+                                                const id = crypto.randomUUID();
+                                                const title = `Notes for ${file.name}`;
+                                                const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
+                                                await invoke("create_doc", { id, title, bytes });
+                                                await invoke("link_doc_to_file", { id, filePath: file.path });
+                                                await refreshDocsIndex();
+                                                setOpenMenu(null);
+                                                setSelectedFile(null);
+                                                setDocsScreen({ mode: "editor", docId: id });
+                                              } catch (error) {
+                                                console.error("Failed to create linked notes:", error);
+                                                setError(`Failed to create linked notes: ${error}`);
+                                              }
+                                            })();
+                                          }}
+                                        >
+                                          + New linked doc
+                                        </button>
+                                      </div>
+                                    )}
                                     <button
                                       className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
                                       onClick={(e) => {
@@ -2224,9 +2623,28 @@ const setScreen = () => {
                     sourcePath: newPath
                   });
                   setBoardScreen(null);
+                  setDocsScreen(null);
                 } catch (error) {
                   console.error('Error loading converted file:', error);
                 }
+              }}
+            />
+          )}
+
+          {/* Bulk Conversion Dialog */}
+          {bulkConversionFiles && (
+            <BulkConversionDialog
+              files={bulkConversionFiles}
+              onClose={() => setBulkConversionFiles(null)}
+              onDone={async (summary: BulkConversionSummary) => {
+                setBulkConversionFiles(null);
+                setSelectedFilePaths(new Set());
+                await handleDirectoryFiles();
+                setMessage(
+                  summary.failedCount > 0
+                    ? `Converted ${summary.converted.length} file${summary.converted.length === 1 ? "" : "s"}, ${summary.failedCount} failed`
+                    : `Converted ${summary.converted.length} file${summary.converted.length === 1 ? "" : "s"}`
+                );
               }}
             />
           )}
@@ -2234,6 +2652,22 @@ const setScreen = () => {
 
           {boardScreen ? (
             <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
+          ) : docsScreen ? (
+            <ErrorBoundary
+              key={docsScreen.mode === "editor" ? `editor-${docsScreen.docId}` : "home"}
+              fallbackTitle="This document ran into a problem"
+              onReset={() => setDocsScreen({ mode: "home" })}
+            >
+              <DocsWorkspace
+                screen={docsScreen}
+                onScreenChange={setDocsScreen}
+                libraryFiles={allLibraryFiles}
+                onOpenLinkedFile={(path, name) => {
+                  setDocsScreen(null);
+                  void loadFileForPlayback(path, name);
+                }}
+              />
+            </ErrorBoundary>
           ) : selectedFile ? (
             getFileCategory(selectedFile.name) === "pdf" ? (
               <PdfAnnotator
@@ -2244,6 +2678,26 @@ const setScreen = () => {
                 isFullscreen={isPdfFullscreen}
                 onToggleFullscreen={handleTogglePdfFullscreen}
               />
+            ) : getFileCategory(selectedFile.name) === "image" &&
+              ["heic", "heif"].includes(getFileExtension(selectedFile.name)) ? (
+              // HEIC/HEIF (iPhone's default photo format) has no Chromium/WebView2 decoder, so
+              // handing it to ImageEditor would just fail to decode - route straight to the
+              // existing ffmpeg-backed Convert flow instead (it already turns HEIC into a
+              // previewable jpg/png fine; see convert_image).
+              <div key={selectedFile.path} className="w-full h-full flex flex-col items-center justify-center gap-3 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-300">
+                <IoImage size={48} className="text-neutral-300 dark:text-neutral-600" />
+                <p className="text-sm font-medium max-w-md truncate px-4">{selectedFile.name}</p>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 max-w-sm text-center px-4">
+                  This is an iPhone HEIC photo - Briefcast can't preview it directly. Convert it to JPEG or PNG to view and edit it.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setConversionFile({ path: selectedFile.sourcePath, name: selectedFile.name })}
+                  className="mt-1 px-4 py-2 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700"
+                >
+                  Convert to view
+                </button>
+              </div>
             ) : getFileCategory(selectedFile.name) === "image" ? (
               <ImageEditor
                 key={selectedFile.path}
@@ -2254,6 +2708,22 @@ const setScreen = () => {
                 isToolsPanelOpen={dockerMode === "file-tools"}
                 onToolsPanelOpenChange={(open) => setDockerMode(open ? "file-tools" : "record")}
               />
+            ) : getFileCategory(selectedFile.name) === "document" ? (
+              // .docx/.md/.txt (e.g. Docs' own Export menu output) have no in-app renderer, unlike
+              // pdf/image/video above - hand off to the OS's own default app rather than pretending
+              // to preview them.
+              <div key={selectedFile.path} className="w-full h-full flex flex-col items-center justify-center gap-3 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-300">
+                <MdOutlineDescription size={48} className="text-neutral-300 dark:text-neutral-600" />
+                <p className="text-sm font-medium max-w-md truncate px-4">{selectedFile.name}</p>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500">This file type can't be previewed inside Briefcast.</p>
+                <button
+                  type="button"
+                  onClick={() => invoke("open_file_with_default_app", { filepath: selectedFile.sourcePath }).catch((err) => setError(`Failed to open file: ${err}`))}
+                  className="mt-1 px-4 py-2 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700"
+                >
+                  Open with default app
+                </button>
+              </div>
             ) : (
               <VideoPlayer
                 ref={videoPlayerRef}
@@ -2486,6 +2956,11 @@ const setScreen = () => {
         recordingStartTime={recordingStartTime}
         handleStartRecording={handleStartRecording}
         handleStopRecording={handleStopRecording}
+        isPaused={isPaused}
+        pauseStartedAt={pauseStartedAt}
+        pausedAccumulatedMs={pausedAccumulatedMs}
+        handlePauseRecording={handlePauseRecording}
+        handleResumeRecording={handleResumeRecording}
         ramInfo={ramInfo}
         fileName={fileName}
         setFileName={setFileName}
@@ -2497,11 +2972,15 @@ const setScreen = () => {
         videoDevices={videoDevices}
         setVideoDevices={setVideoDevices}
         setAudioDevice={setAudioDevice}
+        showRecordingDocker={showRecordingDocker}
+        showRecordingPanelButtons={showRecordingPanelButtons}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
-        isHome={selectedFile === null && boardScreen === null}
+        isHome={selectedFile === null && boardScreen === null && docsScreen === null}
         handleOpenBoard={handleOpenBoard}
         isBoard={boardScreen !== null}
+        handleOpenDocs={handleOpenDocs}
+        isDocs={docsScreen !== null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}

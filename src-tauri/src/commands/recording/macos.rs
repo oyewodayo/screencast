@@ -18,7 +18,7 @@ use std::process::Command;
 
 use tauri::{AppHandle, State};
 
-use super::{codec_args_for_ext, extract_ffmpeg_error, get_overlay_position, get_overlay_shape, map_overlay_size, spawn_recording, AppState, FormData};
+use super::{build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error, map_overlay_size, spawn_recording, AppState, FormData};
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
 #[derive(Debug, Clone)]
@@ -113,20 +113,37 @@ fn av_input_spec(video_index: Option<u32>, audio_index: Option<u32>) -> String {
     )
 }
 
-// Mirrors win.rs's add_overlay_args: the camera input carries both its video AND its paired
-// microphone audio combined in one avfoundation input (just like dshow's "video=X:audio=Y") —
-// so when this is used, ffmpeg auto-selects that as the sole audio stream (the screen input has
-// none), no explicit -map needed.
-fn add_camera_overlay_args(args: &mut Vec<String>, form_data: &FormData, camera_index: u32, audio_index: Option<u32>) {
+// Adds one video-only avfoundation input per selected camera - mirrors win.rs's add_overlay_args
+// for dshow, including deliberately NOT bundling mic audio into any of these inputs the way
+// av_input_spec normally would (that only ever made sense for exactly one camera): with N cameras
+// each occupying its own video-only input, build_camera_overlay_filter_complex's [1:v]..[N:v]
+// indexing lines up regardless of camera count, and callers add mic audio as its own separate
+// input afterward.
+fn add_camera_overlay_args(
+    args: &mut Vec<String>,
+    form_data: &FormData,
+    video_devices: &[AvDevice],
+) -> Result<(), String> {
     let overlay_size = map_overlay_size(&form_data.overlay_size);
-    args.extend(vec![
-        "-f".to_string(), "avfoundation".to_string(),
-        "-video_size".to_string(), overlay_size,
-        "-i".to_string(), av_input_spec(Some(camera_index), audio_index),
-    ]);
-    let overlay_filter = get_overlay_position(form_data.overlay_position.to_string());
-    let filter_complex = get_overlay_shape(&form_data.overlay_shape, overlay_filter);
+
+    for device in &form_data.video_devices {
+        let index = find_index(video_devices, device)
+            .ok_or_else(|| format!("Camera '{}' not found", device))?;
+        args.extend(vec![
+            "-f".to_string(), "avfoundation".to_string(),
+            "-video_size".to_string(), overlay_size.clone(),
+            "-i".to_string(), av_input_spec(Some(index), None),
+        ]);
+    }
+
+    let filter_complex = build_camera_overlay_filter_complex(
+        &form_data.overlay_shape,
+        &form_data.overlay_position,
+        &form_data.overlay_size,
+        form_data.video_devices.len(),
+    );
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
+    Ok(())
 }
 
 fn require_screen_index(video_devices: &[AvDevice]) -> Result<u32, String> {
@@ -177,19 +194,27 @@ pub async fn recording_with_output_sva(
     let screen_index = resolve_screen_target(&video_devices, form_data)?;
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
 
-    let has_overlay = !form_data.overlay_shape.is_empty();
+    let has_camera_overlay = !form_data.video_devices.is_empty();
     let mut args: Vec<String> = vec![
         "-f".to_string(), "avfoundation".to_string(),
         "-capture_cursor".to_string(), "1".to_string(),
         "-framerate".to_string(), "30".to_string(),
-        "-i".to_string(), av_input_spec(Some(screen_index), if has_overlay { None } else { audio_index }),
+        "-i".to_string(), av_input_spec(Some(screen_index), if has_camera_overlay { None } else { audio_index }),
     ];
 
-    if has_overlay {
-        log::debug!("overlay is present");
-        let camera_index = find_index(&video_devices, &form_data.video_device)
-            .ok_or_else(|| format!("Camera '{}' not found", form_data.video_device))?;
-        add_camera_overlay_args(&mut args, form_data, camera_index, audio_index);
+    if has_camera_overlay {
+        log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
+        add_camera_overlay_args(&mut args, form_data, &video_devices)?;
+        // The screen input above was left audio-less (its side of av_input_spec was None) so the
+        // mic gets its own dedicated input instead - same reasoning as win.rs's sva mode keeping
+        // camera and audio as separate dshow inputs rather than trying to bundle mic audio onto
+        // whichever camera happens to be first.
+        if let Some(index) = audio_index {
+            args.extend(vec![
+                "-f".to_string(), "avfoundation".to_string(),
+                "-i".to_string(), av_input_spec(None, Some(index)),
+            ]);
+        }
     }
 
     args.extend(codec_args_for_ext(&form_data.file_ext));
@@ -217,10 +242,8 @@ pub async fn recording_with_output_sv(
         "-i".to_string(), av_input_spec(Some(screen_index), None),
     ];
 
-    if !form_data.overlay_shape.is_empty() {
-        let camera_index = find_index(&video_devices, &form_data.video_device)
-            .ok_or_else(|| format!("Camera '{}' not found", form_data.video_device))?;
-        add_camera_overlay_args(&mut args, form_data, camera_index, None);
+    if !form_data.video_devices.is_empty() {
+        add_camera_overlay_args(&mut args, form_data, &video_devices)?;
     }
 
     args.extend(vec!["-c:v".to_string(), "mpeg4".to_string()]);
@@ -262,8 +285,11 @@ pub async fn recording_with_output_v(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
-    let camera_index = find_index(&video_devices, &form_data.video_device)
-        .ok_or_else(|| format!("Camera '{}' not found", form_data.video_device))?;
+    // Standalone video recording (no screen) only ever uses one camera, same as win.rs's own
+    // recording_with_output_v - multi-camera only applies to the overlay-onto-screen modes above.
+    let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
+    let camera_index = find_index(&video_devices, &video_device)
+        .ok_or_else(|| format!("Camera '{}' not found", video_device))?;
 
     let args: Vec<String> = vec![
         "-f".to_string(), "avfoundation".to_string(),
@@ -307,8 +333,10 @@ pub async fn recording_with_output_va(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, audio_devices) = list_avfoundation_devices(app_handle)?;
-    let camera_index = find_index(&video_devices, &form_data.video_device)
-        .ok_or_else(|| format!("Camera '{}' not found", form_data.video_device))?;
+    // Same single-camera restriction as recording_with_output_v above.
+    let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
+    let camera_index = find_index(&video_devices, &video_device)
+        .ok_or_else(|| format!("Camera '{}' not found", video_device))?;
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
 
     let args: Vec<String> = vec![
@@ -380,4 +408,25 @@ pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form
     })
     .await
     .map_err(|e| format!("Screenshot task panicked: {}", e))?
+}
+
+// Pauses/resumes every thread in the ffmpeg process at once via the standard POSIX job-control
+// signals - the direct macOS/Linux equivalent of win.rs's per-thread SuspendThread/ResumeThread
+// loop (Windows has no single "pause a process" signal, so it has to approximate this by hand;
+// SIGSTOP/SIGCONT already do exactly this natively). Shelling out to `kill` rather than adding a
+// libc dependency just for two syscalls this codebase otherwise has no other use for.
+pub(crate) fn suspend_process(pid: u32) -> Result<(), String> {
+    Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("Failed to pause recording: {}", e))
+        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to pause recording: kill -STOP exited with an error".to_string()))
+}
+
+pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
+    Command::new("kill")
+        .args(["-CONT", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("Failed to resume recording: {}", e))
+        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to resume recording: kill -CONT exited with an error".to_string()))
 }

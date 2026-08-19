@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { IoVideocamOffOutline } from "react-icons/io5";
 
 interface CameraOverlayPreviewProps {
     videoDevices: string[];
@@ -226,8 +227,23 @@ const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, ove
                                     }}
                                 />
                             ) : (
-                                <div className="w-full h-full flex items-center justify-center text-white text-[10px] text-center p-1">
-                                    {errors[label] || "Loading..."}
+                                // A missing/denied browser preview doesn't mean the recording itself will
+                                // fail - ffmpeg captures this device directly via dshow, independent of
+                                // Chromium's own camera access. So this stays a calm, muted placeholder
+                                // rather than reusing the alarming red/black "error" treatment, except for
+                                // "permission denied", which the user actually can fix from here.
+                                <div
+                                    className="w-full h-full flex flex-col items-center justify-center gap-1 bg-neutral-700/80 text-white/80 text-center p-1"
+                                    title={errors[label]}
+                                >
+                                    <IoVideocamOffOutline className="text-base opacity-80" />
+                                    <span className="text-[9px] leading-tight">
+                                        {!errors[label]
+                                            ? "Loading…"
+                                            : errors[label] === "Camera permission was denied"
+                                            ? "Permission needed"
+                                            : "Preview unavailable"}
+                                    </span>
                                 </div>
                             )}
                         </div>

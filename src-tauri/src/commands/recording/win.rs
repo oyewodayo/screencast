@@ -9,6 +9,11 @@ use std::process::{Command, Stdio};
 
 use tauri::regex::Regex;
 use tauri::{AppHandle, State};
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+};
+use windows::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME};
 
 use super::{audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error, map_overlay_size, resolve_capture_target, silent_command, AppState, CaptureTarget, FormData, AUDIO_ENHANCE_FILTER, MAX_RECORDING_WIDTH};
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
@@ -485,4 +490,55 @@ pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form
     })
     .await
     .map_err(|e| format!("Screenshot task panicked: {}", e))?
+}
+
+// Runs `f` once per thread currently owned by `pid` - the enumeration primitive shared by
+// suspend_process/resume_process below. Windows has no single "list this process's threads" call
+// that doesn't also require walking every thread on the system: CreateToolhelp32Snapshot always
+// snapshots system-wide, so the th32OwnerProcessID filter has to happen in the walk itself.
+fn for_each_process_thread(pid: u32, mut f: impl FnMut(u32)) -> Result<(), String> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+            .map_err(|e| format!("Failed to snapshot system threads: {}", e))?;
+
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+
+        let mut has_entry = Thread32First(snapshot, &mut entry).is_ok();
+        while has_entry {
+            if entry.th32OwnerProcessID == pid {
+                f(entry.th32ThreadID);
+            }
+            has_entry = Thread32Next(snapshot, &mut entry).is_ok();
+        }
+
+        let _ = CloseHandle(snapshot);
+    }
+    Ok(())
+}
+
+// Windows has no single "pause a process" API the way POSIX has SIGSTOP - this is the standard
+// approximation: suspend every thread the process owns individually. ffmpeg's screen/mic capture
+// and encoding all happen on threads of this one process, so once every thread is suspended
+// nothing in it can run at all until resume_process undoes this. Threads that exit between the
+// snapshot and OpenThread (ffmpeg spinning up/down a worker thread at exactly the wrong moment)
+// just fail OpenThread and are skipped - not a real failure, nothing to suspend there anymore.
+pub(crate) fn suspend_process(pid: u32) -> Result<(), String> {
+    for_each_process_thread(pid, |tid| unsafe {
+        if let Ok(handle) = OpenThread(THREAD_SUSPEND_RESUME, false, tid) {
+            SuspendThread(handle);
+            let _ = CloseHandle(handle);
+        }
+    })
+}
+
+pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
+    for_each_process_thread(pid, |tid| unsafe {
+        if let Ok(handle) = OpenThread(THREAD_SUSPEND_RESUME, false, tid) {
+            ResumeThread(handle);
+            let _ = CloseHandle(handle);
+        }
+    })
 }

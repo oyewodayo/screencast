@@ -4,12 +4,13 @@ import OsInfo from "./OsInfo";
 
 import { message } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
-import ActiveRecordingState from "./ActiveRecordingState";
+import ActiveRecordingState, { RecordSource, SOURCE_FLAGS } from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
+import { loadSettings } from "../utils/appSettings";
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -76,6 +77,8 @@ interface Props {
   isHome: boolean;
   handleOpenBoard: () => void;
   isBoard: boolean;
+  handleOpenDocs: () => void;
+  isDocs: boolean;
   handleOpenSettings: () => void;
   handleOpenExternalFile: () => void;
   showFileList: boolean;
@@ -112,6 +115,13 @@ interface Props {
   handleStopRecording: () => void;
   isRecording: boolean;
   recordingStartTime: number | null;
+  // Pause/resume timing model - see Dashboard.tsx's own doc comment on these three fields for the
+  // elapsed-time formula they feed into.
+  isPaused: boolean;
+  pauseStartedAt: number | null;
+  pausedAccumulatedMs: number;
+  handlePauseRecording: () => void;
+  handleResumeRecording: () => void;
   ramInfo: [number, number] | null;
   fileName: string;
   setFileName: React.Dispatch<React.SetStateAction<string>>;
@@ -123,6 +133,14 @@ interface Props {
   setAudioDevice: React.Dispatch<React.SetStateAction<string>>;
   videoDevices: string[];
   setVideoDevices: React.Dispatch<React.SetStateAction<string[]>>;
+  // Whether RecordingDocker (Save file as/Type/Recording options/Audio+video devices/Screenshot/
+  // Start Recording) still renders in the collapsible panel - its fields now live in Settings as
+  // defaults regardless, this just controls whether the panel itself is also still shown here.
+  showRecordingDocker: boolean;
+  // Whether the screenshot/screen-webcam-mic/record-button cluster (ActiveRecordingState's own
+  // bottom-right buttons, distinct from RecordingDocker above) is visible - see
+  // appSettings.ts's showRecordingPanelButtons doc comment for why this exists.
+  showRecordingPanelButtons: boolean;
 }
 
 type ConnectedDevice = string[];
@@ -163,6 +181,8 @@ const BottomDocker = ({
   isHome,
   handleOpenBoard,
   isBoard,
+  handleOpenDocs,
+  isDocs,
   handleOpenSettings,
   handleOpenExternalFile,
   showFileList,
@@ -183,6 +203,11 @@ const BottomDocker = ({
   setIncludeSystemAudio,
   handleStartRecording,
   handleStopRecording,
+  isPaused,
+  pauseStartedAt,
+  pausedAccumulatedMs,
+  handlePauseRecording,
+  handleResumeRecording,
   isMonitoring,
   setIsMonitoring,
   windowTitles,
@@ -198,7 +223,9 @@ const BottomDocker = ({
   audioDevice,
   setAudioDevice,
   videoDevices,
-  setVideoDevices
+  setVideoDevices,
+  showRecordingDocker,
+  showRecordingPanelButtons
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -208,6 +235,19 @@ const BottomDocker = ({
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
   const [showDocker, setShowDocker] = useState(true);
+  // System audio ("what you hear") capture is WASAPI loopback, Windows-only (see
+  // start_recording's #[cfg(target_os = "windows")] block in recording.rs and
+  // services/loopback_audio.rs) - the "Include system audio" checkbox below used to render
+  // unconditionally everywhere, so a macOS/Linux user could check it and have it silently do
+  // nothing, no different from every other option they could see actually taking effect. Same
+  // get_platform check EnhancedScreenOptions.tsx already uses to hide the "Window" capture tile
+  // on macOS.
+  const [isSystemAudioSupported, setIsSystemAudioSupported] = useState(true);
+  useEffect(() => {
+    invoke<string>('get_platform')
+      .then((platform) => setIsSystemAudioSupported(platform === 'windows'))
+      .catch((err) => console.error('Failed to detect platform:', err));
+  }, []);
   // This whole docker is `fixed bottom-0`, sitting on top of the video player rather than
   // participating in its flex layout - so the player's own control bar (see .video-controls-
   // container in player.css) has no natural way to know how tall it is and previously assumed a
@@ -259,11 +299,16 @@ const BottomDocker = ({
   // }, []);
 
   const loadDevices = () => {
+    const settings = loadSettings();
+
     invoke<ConnectedDevice>("get_connected_audios")
       .then((devices) => {
         setConnectedAudioDevices(devices);
         if (devices.length > 0) {
-          setAudioDevice(devices[0]); // Set default audio device
+          // Prefer whatever's configured as the default in Settings, so long as it's actually
+          // still plugged in - otherwise fall back to the first detected device like before.
+          const preferred = settings.defaultAudioDevice;
+          setAudioDevice(preferred && devices.includes(preferred) ? preferred : devices[0]);
         }
       })
       .catch(console.error);
@@ -272,7 +317,8 @@ const BottomDocker = ({
       .then((devices) => {
         setConnectedCameraDevices(devices);
         if (devices.length > 0) {
-          setVideoDevices([devices[0]]); // Default to the first detected camera
+          const preferred = settings.defaultVideoDevices.filter((d) => devices.includes(d));
+          setVideoDevices(preferred.length > 0 ? preferred : [devices[0]]); // Default to the first detected camera
         }
       })
       .catch(console.error);
@@ -323,6 +369,30 @@ const BottomDocker = ({
     setVideoDevices((prev) =>
       prev.includes(device) ? prev.filter((d) => d !== device) : [...prev, device]
     );
+  };
+
+  // Drives the shortcut icons in ActiveRecordingState (scan/videocam/mic) when the full
+  // RecordingDocker panel is hidden - each icon toggles whether its source is armed, and the
+  // resulting combination is mapped back onto recordType, the same field RecordingDocker's own
+  // "Recording options" dropdown drives.
+  const toggleRecordSource = (source: RecordSource) => {
+    const current = SOURCE_FLAGS[recordType] ?? { screen: false, video: false, audio: false };
+    const next = { ...current, [source]: !current[source] };
+
+    // "screen + video without audio" has no backend record_type ("sv" isn't one of the values
+    // start_recording matches on) - resolve the ambiguity toward whichever toggle the user just
+    // pressed rather than landing on an unsupported combination.
+    if (next.screen && next.video && !next.audio) {
+      if (source === "audio") next.video = false;
+      else next.audio = true;
+    }
+
+    const match = Object.entries(SOURCE_FLAGS).find(
+      ([, flags]) => flags.screen === next.screen && flags.video === next.video && flags.audio === next.audio
+    );
+    // No match means every source just got toggled off - refuse the change rather than leaving
+    // recordType pointing at nothing, same as never having any capture source selected.
+    if (match) setRecordType(match[0]);
   };
 
   // EnhancedScreenOptions passes the resolved target directly when it has one (e.g. clicking a
@@ -391,9 +461,6 @@ const BottomDocker = ({
     openModalScreen();
   }
 
-  const handleVideoOverlayAction = async() =>{
-    return await message("Video recording is going on as overlay to screen recoring", "Video recording");
-  }
   const videoFormatInfo = async() =>{
     return await message("Avi or Mkv format is highly rocommended to record video. However, you can remuxe or convert to other format when you are done recording.", { title: 'Video format', type: 'info' });
   }
@@ -422,7 +489,7 @@ const BottomDocker = ({
       onStartRecording={onStartRecording} 
       setOpen={setModalOpenScreen}
     />
-    <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col">
+    <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
      
         <ActiveRecordingState
             isRecording={isRecording}
@@ -433,15 +500,25 @@ const BottomDocker = ({
             isHome={isHome}
             handleOpenBoard={handleOpenBoard}
             isBoard={isBoard}
+            handleOpenDocs={handleOpenDocs}
+            isDocs={isDocs}
             handleOpenSettings={handleOpenSettings}
             handleOpenExternalFile={handleOpenExternalFile}
-            handleVideoOverlayAction={handleVideoOverlayAction}
             handleStopRecording={handleStopRecording}
+            isPaused={isPaused}
+            pauseStartedAt={pauseStartedAt}
+            pausedAccumulatedMs={pausedAccumulatedMs}
+            handlePauseRecording={handlePauseRecording}
+            handleResumeRecording={handleResumeRecording}
             showDocker={showDocker}
             setShowDocker={setShowDocker}
-            showFileList={showFileList} 
+            showFileList={showFileList}
+            onToggleRecordSource={toggleRecordSource}
+            onStartRecordingClick={() => openModalScreen()}
+            onScreenshotClick={handleScreenshotClick}
+            showRecordingPanelButtons={showRecordingPanelButtons}
         />
-      
+
       {showDocker && (<div className="docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
         {dockerMode === "file-tools" && activeFile ? (
           <FileToolsDocker
@@ -476,7 +553,7 @@ const BottomDocker = ({
             isCroppingClip={isCroppingClip}
             onToggleCroppingClip={onToggleCroppingClip}
           />
-        ) : (
+        ) : showRecordingDocker ? (
           <RecordingDocker
             fileName={fileName}
             onFileNameChange={handleFileNameChange}
@@ -494,12 +571,16 @@ const BottomDocker = ({
             onRefreshDevices={loadDevices}
             includeSystemAudio={includeSystemAudio}
             onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
+            isSystemAudioSupported={isSystemAudioSupported}
             isRecording={isRecording}
+            isPaused={isPaused}
             onScreenshotClick={handleScreenshotClick}
             onStartRecordingClick={() => openModalScreen()}
             onStopRecordingClick={handleStopRecording}
+            onPauseRecordingClick={handlePauseRecording}
+            onResumeRecordingClick={handleResumeRecording}
           />
-        )}
+        ) : null}
 
         <div className="w-full grid grid-cols-1 grid-flow-col text-xs">
           <div>

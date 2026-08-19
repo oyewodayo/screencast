@@ -5,6 +5,7 @@ import { FiMonitor } from "react-icons/fi";
 import { MdMonitor } from "react-icons/md";
 import { WindowInfo, MonitorInfo } from "../Types";
 import CameraOverlayPreview from "./CameraOverlayPreview";
+import { RECORD_TYPE_LABELS } from "./ActiveRecordingState";
 
 interface ScreenOptionsProps {
     recordType: string;
@@ -210,7 +211,7 @@ const EnhancedScreenOptions = ({
     };
 
     const renderMainOptions = () => (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 p-6">
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 p-6">
             <button
                 onClick={() => {
                     setSelectedMonitor('');
@@ -257,15 +258,6 @@ const EnhancedScreenOptions = ({
                     <span className="text-xs text-gray-500 dark:text-neutral-400">Not on macOS</span>
                 </button>
             )}
-
-            <button
-                className="flex flex-col items-center gap-2 p-4 rounded-lg border-2 border-gray-200 dark:border-neutral-700 opacity-50 cursor-not-allowed"
-                disabled
-            >
-                <IoDesktop className="text-5xl text-gray-700 dark:text-neutral-300" />
-                <span className="text-sm font-medium">Region</span>
-                <span className="text-xs text-gray-500 dark:text-neutral-400">Coming soon</span>
-            </button>
         </div>
     );
 
@@ -485,6 +477,9 @@ const EnhancedScreenOptions = ({
                     <div className="flex items-center gap-2">
                         <IoDesktop className="text-xl" />
                         <h2 className="text-lg font-semibold">Screen Options</h2>
+                        <span className="text-xs font-medium px-2 py-1 rounded-full bg-green-100 dark:bg-green-500/20 text-green-700 dark:text-green-300">
+                            {RECORD_TYPE_LABELS[recordType] ?? recordType}
+                        </span>
                     </div>
                     <button onClick={closeModal} className="p-1 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded">
                         <IoClose className="text-2xl" />

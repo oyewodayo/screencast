@@ -24,11 +24,19 @@ mod services {
     pub mod trash;
     pub mod file_watcher;
     pub mod boards;
+    pub mod docs;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
     #[cfg(target_os = "windows")]
     pub mod loopback_audio;
+    // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
+    // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
+    // ffmpeg build mis-decodes multi-image HEIC files (Portrait mode, Deep Fusion, etc.) as a
+    // black frame instead of the actual photo. macOS's WebKit-based webview decodes HEIC directly
+    // in <img> tags, so this problem - and this module - is Windows-only.
+    #[cfg(target_os = "windows")]
+    pub mod heic_windows;
 }
 use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMode, ConfigBuilder};
 
@@ -146,6 +154,8 @@ fn main() {
             commands::recording::get_connected_devices,
             commands::recording::start_recording,
             commands::recording::stop_recording,
+            commands::recording::pause_recording,
+            commands::recording::resume_recording,
             commands::recording::take_screenshot,
             commands::window_capture::start_monitoring_windows,
             commands::window_capture::stop_monitoring_windows,
@@ -168,6 +178,7 @@ fn main() {
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
             commands::conversion::read_image_data_url,
+            commands::conversion::read_file_bytes,
 
             commands::native_playback::start_native_playback,
             commands::native_playback::get_next_video_frame,
@@ -178,6 +189,7 @@ fn main() {
             commands::annotation::ensure_annotation_overlay,
 
             services::utility::open_file_from_directory,
+            services::utility::open_file_with_default_app,
             services::utility::list_briefcast_files,
             services::utility::convert_file_path_to_url,
             services::utility::get_cursor_position_in_window,
@@ -206,6 +218,21 @@ fn main() {
             services::boards::import_board_image,
             services::boards::save_board_thumbnail,
             services::boards::export_board_png,
+            services::docs::list_docs,
+            services::docs::create_doc,
+            services::docs::save_doc,
+            services::docs::load_doc,
+            services::docs::delete_doc,
+            services::docs::link_doc_to_file,
+            services::docs::unlink_doc,
+            services::docs::find_docs_linked_to,
+            services::docs::relink_doc_path,
+            services::docs::export_doc,
+            services::docs::export_doc_binary,
+            services::docs::save_doc_image,
+            services::docs::list_trashed_docs,
+            services::docs::restore_doc,
+            services::docs::delete_doc_permanently,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

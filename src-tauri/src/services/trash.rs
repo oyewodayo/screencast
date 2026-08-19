@@ -88,7 +88,18 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
     let trashed_name = unique_trashed_name(&original_name);
     let destination = trash_dir()?.join(&trashed_name);
 
-    fs::rename(&source, &destination).map_err(|e| format!("Failed to move file to trash: {}", e))?;
+    fs::rename(&source, &destination).map_err(|e| {
+        // Windows ERROR_SHARING_VIOLATION (32) - another process (Word, Excel, a preview pane,
+        // etc.) has the file open and locked. fs::rename's own io::Error message just echoes the
+        // raw OS text ("The process cannot access the file because it is being used by another
+        // process."), which reads as an unexplained internal failure rather than something the
+        // user can actually act on - naming the likely cause here is worth the extra branch.
+        if e.raw_os_error() == Some(32) {
+            format!("\"{}\" is open in another program - close it and try again.", original_name)
+        } else {
+            format!("Failed to move file to trash: {}", e)
+        }
+    })?;
 
     let mut records = read_manifest()?;
     records.push(TrashRecord {

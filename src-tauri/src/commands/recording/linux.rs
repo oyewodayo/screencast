@@ -25,7 +25,7 @@ use std::process::Command;
 use tauri::{AppHandle, State};
 
 use super::{
-    codec_args_for_ext, extract_ffmpeg_error, get_overlay_position, get_overlay_shape,
+    build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error,
     map_overlay_size, resolve_capture_target, spawn_recording, AppState, CaptureTarget, FormData,
 };
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
@@ -126,19 +126,29 @@ fn require_v4l2_path(name: &str) -> Result<String, String> {
     find_v4l2_path(&devices, name).ok_or_else(|| format!("Camera '{}' not found", name))
 }
 
-// Screen (x11grab) + optional camera overlay (v4l2), composited exactly like win.rs's
-// add_overlay_args — same shared filter-graph builders, just fed x11grab/v4l2 inputs instead of
-// gdigrab/dshow ones.
-fn add_camera_overlay_args(args: &mut Vec<String>, form_data: &FormData, camera_path: &str) {
+// Adds one video-only v4l2 input per selected camera, then a -filter_complex chaining an overlay
+// stage per camera onto the screen capture — mirrors win.rs's add_overlay_args for dshow, using
+// the same shared, camera-count-aware filter-graph builder rather than a single-camera one.
+fn add_camera_overlay_args(args: &mut Vec<String>, form_data: &FormData) -> Result<(), String> {
     let overlay_size = map_overlay_size(&form_data.overlay_size);
-    args.extend(vec![
-        "-f".to_string(), "v4l2".to_string(),
-        "-video_size".to_string(), overlay_size,
-        "-i".to_string(), camera_path.to_string(),
-    ]);
-    let overlay_filter = get_overlay_position(form_data.overlay_position.to_string());
-    let filter_complex = get_overlay_shape(&form_data.overlay_shape, overlay_filter);
+
+    for device in &form_data.video_devices {
+        let camera_path = require_v4l2_path(device)?;
+        args.extend(vec![
+            "-f".to_string(), "v4l2".to_string(),
+            "-video_size".to_string(), overlay_size.clone(),
+            "-i".to_string(), camera_path,
+        ]);
+    }
+
+    let filter_complex = build_camera_overlay_filter_complex(
+        &form_data.overlay_shape,
+        &form_data.overlay_position,
+        &form_data.overlay_size,
+        form_data.video_devices.len(),
+    );
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
+    Ok(())
 }
 
 //Screen, optional camera overlay, and audio
@@ -156,25 +166,28 @@ pub async fn recording_with_output_sva(
     ];
     args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
 
-    let has_overlay = !form_data.overlay_shape.is_empty();
-    if has_overlay {
-        log::debug!("overlay is present");
-        let camera_path = require_v4l2_path(&form_data.video_device)?;
-        add_camera_overlay_args(&mut args, form_data, &camera_path);
+    let has_camera_overlay = !form_data.video_devices.is_empty();
+    if has_camera_overlay {
+        log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
+        add_camera_overlay_args(&mut args, form_data)?;
         // Pulse can't be bundled into the screen or camera input the way avfoundation/dshow
         // combine video+audio in one -i — it's always its own input on Linux. With
         // filter_complex already in play for the video composite, the output stream selection
         // is made explicit here (rather than relying on ffmpeg's default auto-selection, which
-        // is a needless ambiguity to leave in place once there are two video-capable inputs)
-        // by labeling the filtergraph's output and mapping both it and the audio input in.
+        // is a needless ambiguity to leave in place once there's more than one video-capable
+        // input) by labeling the filtergraph's output and mapping both it and the audio input
+        // in. The audio input lands right after the screen input (index 0) and however many
+        // camera inputs add_camera_overlay_args just added, so its index has to be computed
+        // rather than the single-camera-only hardcoded "2:a" this used to be.
         if let Some(filter_complex_value) = args.last_mut() {
             filter_complex_value.push_str("[vout]");
         }
+        let audio_input_index = 1 + form_data.video_devices.len();
         args.extend(vec![
             "-f".to_string(), "pulse".to_string(),
             "-i".to_string(), form_data.audio_device.clone(),
             "-map".to_string(), "[vout]".to_string(),
-            "-map".to_string(), "2:a".to_string(),
+            "-map".to_string(), format!("{}:a", audio_input_index),
         ]);
     } else {
         args.extend(vec![
@@ -206,9 +219,8 @@ pub async fn recording_with_output_sv(
     ];
     args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
 
-    if !form_data.overlay_shape.is_empty() {
-        let camera_path = require_v4l2_path(&form_data.video_device)?;
-        add_camera_overlay_args(&mut args, form_data, &camera_path);
+    if !form_data.video_devices.is_empty() {
+        add_camera_overlay_args(&mut args, form_data)?;
     }
 
     args.extend(vec!["-c:v".to_string(), "mpeg4".to_string()]);
@@ -249,7 +261,10 @@ pub async fn recording_with_output_v(
     form_data: &FormData,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-    let camera_path = require_v4l2_path(&form_data.video_device)?;
+    // Standalone video recording (no screen) only ever uses one camera, same as win.rs's own
+    // recording_with_output_v - multi-camera only applies to the overlay-onto-screen modes above.
+    let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
+    let camera_path = require_v4l2_path(&video_device)?;
 
     let args: Vec<String> = vec![
         "-f".to_string(), "v4l2".to_string(),
@@ -289,7 +304,9 @@ pub async fn recording_with_output_va(
     form_data: &FormData,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-    let camera_path = require_v4l2_path(&form_data.video_device)?;
+    // Same single-camera restriction as recording_with_output_v above.
+    let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
+    let camera_path = require_v4l2_path(&video_device)?;
 
     // v4l2 and pulse can't be combined into one -i (unlike dshow/avfoundation) — two separate
     // inputs, one video-only stream and one audio-only stream, which ffmpeg's default stream
@@ -360,4 +377,25 @@ pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form
     })
     .await
     .map_err(|e| format!("Screenshot task panicked: {}", e))?
+}
+
+// Pauses/resumes every thread in the ffmpeg process at once via the standard POSIX job-control
+// signals - the direct Linux/macOS equivalent of win.rs's per-thread SuspendThread/ResumeThread
+// loop (Windows has no single "pause a process" signal, so it has to approximate this by hand;
+// SIGSTOP/SIGCONT already do exactly this natively). Shelling out to `kill` rather than adding a
+// libc dependency just for two syscalls this codebase otherwise has no other use for.
+pub(crate) fn suspend_process(pid: u32) -> Result<(), String> {
+    Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("Failed to pause recording: {}", e))
+        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to pause recording: kill -STOP exited with an error".to_string()))
+}
+
+pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
+    Command::new("kill")
+        .args(["-CONT", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("Failed to resume recording: {}", e))
+        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to resume recording: kill -CONT exited with an error".to_string()))
 }

@@ -22,10 +22,15 @@ interface RecordingDockerProps {
   // start_recording's handling of FormData.include_system_audio on the backend.
   includeSystemAudio: boolean;
   onToggleIncludeSystemAudio: () => void;
+  // WASAPI loopback is Windows-only - see BottomDocker.tsx's own doc comment on this same prop.
+  isSystemAudioSupported: boolean;
   isRecording: boolean;
+  isPaused: boolean;
   onScreenshotClick: () => void;
   onStartRecordingClick: () => void;
   onStopRecordingClick: () => void;
+  onPauseRecordingClick: () => void;
+  onResumeRecordingClick: () => void;
 }
 
 // The default docker content: screen/video/audio recording setup. This is exactly what used to
@@ -49,10 +54,14 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   onRefreshDevices,
   includeSystemAudio,
   onToggleIncludeSystemAudio,
+  isSystemAudioSupported,
   isRecording,
+  isPaused,
   onScreenshotClick,
   onStartRecordingClick,
   onStopRecordingClick,
+  onPauseRecordingClick,
+  onResumeRecordingClick,
 }) => {
   return (
     <div className="docker-panel w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
@@ -154,10 +163,23 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
           <div>
             <div className="docker-field-label p-1 text-sm">&nbsp;</div>
             <label
-              title="Captures whatever's playing through your speakers (e.g. a video open in another app) via WASAPI loopback, alongside the screen capture. Windows only."
-              className="docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 cursor-pointer"
+              title={
+                isSystemAudioSupported
+                  ? "Captures whatever's playing through your speakers (e.g. a video open in another app) via WASAPI loopback, alongside the screen capture."
+                  : "System audio capture is Windows-only for now - not available on this platform."
+              }
+              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
+                isSystemAudioSupported
+                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
+                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
+              }`}
             >
-              <input type="checkbox" checked={includeSystemAudio} onChange={onToggleIncludeSystemAudio} />
+              <input
+                type="checkbox"
+                checked={includeSystemAudio && isSystemAudioSupported}
+                disabled={!isSystemAudioSupported}
+                onChange={onToggleIncludeSystemAudio}
+              />
               System audio
             </label>
           </div>
@@ -211,12 +233,20 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             Start Recording
           </button>
         ) : (
-          <button
-            onClick={onStopRecordingClick}
-            className="p-2.5 rounded-md text-sm bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white"
-          >
-            Stop Recording
-          </button>
+          <>
+            <button
+              onClick={isPaused ? onResumeRecordingClick : onPauseRecordingClick}
+              className="p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
+            >
+              {isPaused ? "Resume" : "Pause"}
+            </button>
+            <button
+              onClick={onStopRecordingClick}
+              className="p-2.5 rounded-md text-sm bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white"
+            >
+              Stop Recording
+            </button>
+          </>
         )}
       </div>
     </div>
