@@ -223,6 +223,19 @@ const BottomDocker = ({
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
   const [showDocker, setShowDocker] = useState(true);
+  // System audio ("what you hear") capture is WASAPI loopback, Windows-only (see
+  // start_recording's #[cfg(target_os = "windows")] block in recording.rs and
+  // services/loopback_audio.rs) - the "Include system audio" checkbox below used to render
+  // unconditionally everywhere, so a macOS/Linux user could check it and have it silently do
+  // nothing, no different from every other option they could see actually taking effect. Same
+  // get_platform check EnhancedScreenOptions.tsx already uses to hide the "Window" capture tile
+  // on macOS.
+  const [isSystemAudioSupported, setIsSystemAudioSupported] = useState(true);
+  useEffect(() => {
+    invoke<string>('get_platform')
+      .then((platform) => setIsSystemAudioSupported(platform === 'windows'))
+      .catch((err) => console.error('Failed to detect platform:', err));
+  }, []);
   // This whole docker is `fixed bottom-0`, sitting on top of the video player rather than
   // participating in its flex layout - so the player's own control bar (see .video-controls-
   // container in player.css) has no natural way to know how tall it is and previously assumed a
@@ -541,6 +554,7 @@ const BottomDocker = ({
             onRefreshDevices={loadDevices}
             includeSystemAudio={includeSystemAudio}
             onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
+            isSystemAudioSupported={isSystemAudioSupported}
             isRecording={isRecording}
             onScreenshotClick={handleScreenshotClick}
             onStartRecordingClick={() => openModalScreen()}

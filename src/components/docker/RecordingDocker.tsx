@@ -22,6 +22,8 @@ interface RecordingDockerProps {
   // start_recording's handling of FormData.include_system_audio on the backend.
   includeSystemAudio: boolean;
   onToggleIncludeSystemAudio: () => void;
+  // WASAPI loopback is Windows-only - see BottomDocker.tsx's own doc comment on this same prop.
+  isSystemAudioSupported: boolean;
   isRecording: boolean;
   onScreenshotClick: () => void;
   onStartRecordingClick: () => void;
@@ -49,6 +51,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   onRefreshDevices,
   includeSystemAudio,
   onToggleIncludeSystemAudio,
+  isSystemAudioSupported,
   isRecording,
   onScreenshotClick,
   onStartRecordingClick,
@@ -154,10 +157,23 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
           <div>
             <div className="docker-field-label p-1 text-sm">&nbsp;</div>
             <label
-              title="Captures whatever's playing through your speakers (e.g. a video open in another app) via WASAPI loopback, alongside the screen capture. Windows only."
-              className="docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 cursor-pointer"
+              title={
+                isSystemAudioSupported
+                  ? "Captures whatever's playing through your speakers (e.g. a video open in another app) via WASAPI loopback, alongside the screen capture."
+                  : "System audio capture is Windows-only for now - not available on this platform."
+              }
+              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
+                isSystemAudioSupported
+                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
+                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
+              }`}
             >
-              <input type="checkbox" checked={includeSystemAudio} onChange={onToggleIncludeSystemAudio} />
+              <input
+                type="checkbox"
+                checked={includeSystemAudio && isSystemAudioSupported}
+                disabled={!isSystemAudioSupported}
+                onChange={onToggleIncludeSystemAudio}
+              />
               System audio
             </label>
           </div>

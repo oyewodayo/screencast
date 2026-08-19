@@ -100,6 +100,16 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<string[] | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<string[] | null>(null);
 
+  // WASAPI loopback ("system audio") is Windows-only - see BottomDocker.tsx's identical check
+  // for why the equivalent checkbox in the recording panel is gated the same way. Without this,
+  // the default here could be turned on for a macOS/Linux install and never do anything.
+  const [isSystemAudioSupported, setIsSystemAudioSupported] = useState(true);
+  useEffect(() => {
+    invoke<string>('get_platform')
+      .then((platform) => setIsSystemAudioSupported(platform === 'windows'))
+      .catch((err) => console.error('Failed to detect platform:', err));
+  }, []);
+
   const loadDevices = (): void => {
     invoke<string[]>("get_connected_audios").then(setConnectedAudioDevices).catch(console.error);
     invoke<string[]>("get_connected_cameras").then(setConnectedCameraDevices).catch(console.error);
@@ -371,11 +381,18 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   <Field label="Include system audio">
                     <input
                       type="checkbox"
-                      checked={settings.defaultIncludeSystemAudio}
+                      checked={settings.defaultIncludeSystemAudio && isSystemAudioSupported}
+                      disabled={!isSystemAudioSupported}
+                      title={isSystemAudioSupported ? undefined : "System audio capture is Windows-only for now - not available on this platform."}
                       onChange={(e) => update("defaultIncludeSystemAudio", e.target.checked)}
-                      className="w-4 h-4 accent-blue-500 cursor-pointer"
+                      className="w-4 h-4 accent-blue-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
                     />
                   </Field>
+                )}
+                {(settings.defaultRecordType === "sva" || settings.defaultRecordType === "sa" || settings.defaultRecordType === "s") && !isSystemAudioSupported && (
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                    System audio capture (WASAPI loopback) isn't available on this platform yet.
+                  </p>
                 )}
                 <div className="flex items-start justify-between gap-4">
                   <span className="text-sm text-neutral-700 dark:text-neutral-300 pt-1.5">Video device(s)</span>
