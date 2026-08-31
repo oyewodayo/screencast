@@ -33,6 +33,7 @@ import {
   IoShareOutline,
 } from "react-icons/io5";
 import {
+  TbAspectRatio,
   TbBlur,
   TbCircleDashed,
   TbColumns,
@@ -72,6 +73,7 @@ import {
   resolveBoardPadding,
 } from "../../handlers/boardHandlers";
 import { boardAssetPath, preloadBoardImage } from "../../utils/boardImageCache";
+import { BOARD_SIZE_PRESET_GROUPS, BOARD_SIZE_PRESETS } from "../../utils/boardCanvasSizes";
 import BoardCanvas from "./BoardCanvas";
 import BoardLayerPanel from "./BoardLayerPanel";
 import BoardStylePanel from "./BoardStylePanel";
@@ -716,6 +718,25 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     [store]
   );
 
+  // Free (not just one-step) reorder, driven by BoardLayerPanel's drag-and-drop rows - moves
+  // draggedId out of the array and re-inserts it at targetId's current position, shifting whatever
+  // was between them by one. One reorderImages call, one undo step, regardless of how far the drag
+  // moved the item.
+  const handleReorderLayer = useCallback(
+    (draggedId: string, targetId: string) => {
+      if (!store.doc || draggedId === targetId) return;
+      const images = store.doc.images;
+      const from = images.findIndex((img) => img.id === draggedId);
+      const to = images.findIndex((img) => img.id === targetId);
+      if (from === -1 || to === -1) return;
+      const next = [...images];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      store.reorderImages(next);
+    },
+    [store]
+  );
+
   // Applies any of the "Arrange" auto-layouts below AND resizes the canvas (both dimensions - it
   // recomputes every image, so unlike handleAddImages's grow-only batch append, it's safe to
   // shrink-to-fit too, removing any dead space the previous canvas size left unused) to what that
@@ -730,6 +751,23 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       store.batchEditImages(before, result.images);
       store.setCanvasSize(width, height);
       fitToSize(width, height, resolveBoardPadding(store.doc));
+    },
+    [store, fitToSize]
+  );
+
+  // Manual/preset canvas resize (the toolbar's "Size" menu) - unlike applyAutoLayout above, this
+  // never touches item positions, only the canvas dimensions themselves: a settable size is meant
+  // to define the *frame* the user is composing into (e.g. "I need this to end up 1080x1920 for an
+  // Instagram Story"), not to reflow whatever's already been placed. Re-fits the view afterward
+  // since a preset can flip the aspect ratio entirely (a 1600x1000 board going to a 1080x1920 story
+  // would otherwise stay at whatever zoom the old, much wider canvas happened to be at).
+  const handleApplyCanvasSize = useCallback(
+    (width: number, height: number) => {
+      if (!store.doc) return;
+      const w = Math.max(200, Math.round(width));
+      const h = Math.max(200, Math.round(height));
+      store.setCanvasSize(w, h);
+      fitToSize(w, h, resolveBoardPadding(store.doc));
     },
     [store, fitToSize]
   );
@@ -798,6 +836,24 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
   }, [isAlignMenuOpen]);
+
+  // Same anchor/portal pattern again for the toolbar's "Size" menu (canvas-size presets + a manual
+  // width/height field) - see arrangeMenuAnchor's own doc comment for why a portal over a plain
+  // absolute child. `sizeDraft` is the menu's own local width/height text state for the manual
+  // fields, reseeded from the board's actual current size every time the menu opens (see its
+  // onClick below) rather than staying live-bound to store.doc, so mid-typing an edit isn't
+  // clobbered by whatever the canvas size happens to be at that instant.
+  const [sizeMenuAnchor, setSizeMenuAnchor] = useState<{ top: number; left: number } | null>(null);
+  const isSizeMenuOpen = sizeMenuAnchor !== null;
+  const sizeButtonRef = useRef<HTMLButtonElement>(null);
+  const [sizeDraft, setSizeDraft] = useState<{ width: string; height: string }>({ width: "", height: "" });
+
+  useEffect(() => {
+    if (!isSizeMenuOpen) return;
+    const close = () => setSizeMenuAnchor(null);
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [isSizeMenuOpen]);
 
   // Defensively defaulted the same way every other doc field with a "didn't exist on old boards"
   // story is (resolveBoardPadding, resolveBackgroundMode/resolveBoardGrid themselves) - read once
@@ -1068,6 +1124,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setBackgroundMenuAnchor(null);
               setShareMenuAnchor(null);
               setAlignMenuAnchor(null);
+              setSizeMenuAnchor(null);
               const rect = arrangeButtonRef.current?.getBoundingClientRect();
               if (rect) setArrangeMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
@@ -1123,6 +1180,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setArrangeMenuAnchor(null);
               setBackgroundMenuAnchor(null);
               setShareMenuAnchor(null);
+              setSizeMenuAnchor(null);
               const rect = alignButtonRef.current?.getBoundingClientRect();
               if (rect) setAlignMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
@@ -1198,6 +1256,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setArrangeMenuAnchor(null);
               setShareMenuAnchor(null);
               setAlignMenuAnchor(null);
+              setSizeMenuAnchor(null);
               const rect = backgroundButtonRef.current?.getBoundingClientRect();
               if (rect) setBackgroundMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
@@ -1331,6 +1390,105 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
                   </div>
                 </div>
               )}
+            </div>,
+            document.body
+          )}
+        {/* "Size" - the canvas's own pixel dimensions (not padding, not zoom): named social-platform
+            presets (see boardCanvasSizes.ts) plus a manual width/height field for anything else.
+            Never touches item positions, only canvasWidth/Height - see handleApplyCanvasSize's own
+            comment for why. Same portal-dropdown pattern as Arrange/Align/Background above. */}
+        <button
+          ref={sizeButtonRef}
+          type="button"
+          title="Canvas size - social-media presets or a custom width/height"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (isSizeMenuOpen) {
+              setSizeMenuAnchor(null);
+            } else {
+              setArrangeMenuAnchor(null);
+              setBackgroundMenuAnchor(null);
+              setShareMenuAnchor(null);
+              setAlignMenuAnchor(null);
+              setSizeDraft({ width: String(store.doc?.canvasWidth ?? ""), height: String(store.doc?.canvasHeight ?? "") });
+              const rect = sizeButtonRef.current?.getBoundingClientRect();
+              if (rect) setSizeMenuAnchor({ top: rect.bottom + 6, left: rect.left });
+            }
+          }}
+          disabled={!store.doc}
+          className={isSizeMenuOpen ? TOOLBAR_CHIP_ACTIVE : TOOLBAR_CHIP}
+        >
+          <TbAspectRatio size={15} />
+          Size
+          <IoChevronDown size={12} className={`transition-transform ${isSizeMenuOpen ? "rotate-180" : ""}`} />
+        </button>
+        {sizeMenuAnchor &&
+          store.doc &&
+          createPortal(
+            <div
+              onPointerDown={(e) => e.stopPropagation()}
+              style={{ position: "fixed", top: sizeMenuAnchor.top, left: sizeMenuAnchor.left }}
+              className="w-64 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 z-[9999] p-3 max-h-[70vh] overflow-y-auto"
+            >
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500 mb-1.5">Custom size</div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="number"
+                  min={200}
+                  value={sizeDraft.width}
+                  onChange={(e) => setSizeDraft((d) => ({ ...d, width: e.target.value }))}
+                  className="w-full min-w-0 h-8 px-2 rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-100 text-xs tabular-nums outline-none focus:border-blue-400 dark:focus:border-blue-500"
+                />
+                <span className="text-neutral-400 text-xs shrink-0">×</span>
+                <input
+                  type="number"
+                  min={200}
+                  value={sizeDraft.height}
+                  onChange={(e) => setSizeDraft((d) => ({ ...d, height: e.target.value }))}
+                  className="w-full min-w-0 h-8 px-2 rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-100 text-xs tabular-nums outline-none focus:border-blue-400 dark:focus:border-blue-500"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const w = Number(sizeDraft.width);
+                    const h = Number(sizeDraft.height);
+                    if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) handleApplyCanvasSize(w, h);
+                    setSizeMenuAnchor(null);
+                  }}
+                  className="shrink-0 px-2.5 h-8 rounded-md text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                >
+                  Apply
+                </button>
+              </div>
+
+              {BOARD_SIZE_PRESET_GROUPS.map((group) => (
+                <div key={group} className="mt-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500 mb-1">{group}</div>
+                  {BOARD_SIZE_PRESETS.filter((preset) => preset.group === group).map((preset) => {
+                    const isCurrent = store.doc?.canvasWidth === preset.width && store.doc?.canvasHeight === preset.height;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => {
+                          handleApplyCanvasSize(preset.width, preset.height);
+                          setSizeMenuAnchor(null);
+                        }}
+                        className={`w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded-md text-left transition-colors ${
+                          isCurrent
+                            ? "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300"
+                            : "text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70"
+                        }`}
+                      >
+                        <span className="text-sm">{preset.label}</span>
+                        <span className="text-[11px] tabular-nums text-neutral-400 dark:text-neutral-500 shrink-0">
+                          {preset.width}×{preset.height}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
             </div>,
             document.body
           )}
@@ -1471,6 +1629,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setArrangeMenuAnchor(null);
               setBackgroundMenuAnchor(null);
               setAlignMenuAnchor(null);
+              setSizeMenuAnchor(null);
               const rect = shareButtonRef.current?.getBoundingClientRect();
               if (rect) setShareMenuAnchor({ top: rect.bottom + 6, left: rect.right - 224 });
             }
@@ -1629,6 +1788,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             selectedIds={selectedIds}
             onSelect={setSelectedIds}
             onStepReorder={handleStepReorder}
+            onReorder={handleReorderLayer}
             onClose={() => setShowLayerPanel(false)}
           />
         )}

@@ -6,9 +6,9 @@
 // see and manage stacking order without relying on "click the exact overlapping tile" on the canvas,
 // and click a row to select that item directly - handy once several items overlap and picking the
 // right one by clicking the canvas gets fiddly.
-import React from "react";
+import React, { useState } from "react";
 import { IoChevronDown, IoChevronUp, IoCloseOutline, IoImageOutline, IoText } from "react-icons/io5";
-import { TbBlur } from "react-icons/tb";
+import { TbBlur, TbGripVertical } from "react-icons/tb";
 import { BoardItem } from "../../utils/boardTypes";
 
 interface BoardLayerPanelProps {
@@ -19,6 +19,9 @@ interface BoardLayerPanelProps {
   // neighbor currently sits there - see BoardEditor.tsx's handleStepReorder. A no-op at either end
   // of the stack; the row's own chevron buttons disable themselves in that case.
   onStepReorder: (id: string, direction: "forward" | "backward") => void;
+  // Free (not just one-step) reorder via dragging a row onto another - see BoardEditor.tsx's
+  // handleReorderLayer. Drops the dragged item into the target's current stacking position.
+  onReorder: (draggedId: string, targetId: string) => void;
   onClose: () => void;
 }
 
@@ -34,10 +37,17 @@ function layerLabel(item: BoardItem): string {
   return "Image";
 }
 
-const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, onSelect, onStepReorder, onClose }) => {
+const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, onSelect, onStepReorder, onReorder, onClose }) => {
   // Front-to-back for display; each row still knows its own true index in `items` (the array
   // BoardEditor.tsx and onStepReorder both work in) via `items.length - 1 - displayIndex`.
   const frontToBack = [...items].reverse();
+
+  // Drag-and-drop reorder state - `draggingId` is the row currently being dragged (dimmed while in
+  // flight), `dragOverId` is whichever row the pointer is currently over (gets a highlight so the
+  // drop target is obvious before release). Both cleared on drop AND on dragend, so a drag cancelled
+  // by Escape/dropping outside the list never leaves a stuck highlight.
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
 
   return (
     <div className="w-64 shrink-0 flex flex-col border-l border-neutral-200/80 dark:border-neutral-800 bg-white dark:bg-neutral-900">
@@ -58,9 +68,34 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
         {frontToBack.map((item, displayIndex) => {
           const trueIndex = items.length - 1 - displayIndex;
           const isSelected = selectedIds.has(item.id);
+          const isDragOver = dragOverId === item.id && draggingId !== null && draggingId !== item.id;
           return (
             <div
               key={item.id}
+              draggable
+              onDragStart={(e) => {
+                e.dataTransfer.effectAllowed = "move";
+                setDraggingId(item.id);
+              }}
+              onDragEnd={() => {
+                setDraggingId(null);
+                setDragOverId(null);
+              }}
+              onDragOver={(e) => {
+                if (!draggingId || draggingId === item.id) return;
+                e.preventDefault();
+                if (dragOverId !== item.id) setDragOverId(item.id);
+              }}
+              onDragLeave={(e) => {
+                if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+                if (dragOverId === item.id) setDragOverId(null);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                if (draggingId && draggingId !== item.id) onReorder(draggingId, item.id);
+                setDraggingId(null);
+                setDragOverId(null);
+              }}
               onClick={(e) => {
                 if (e.shiftKey) {
                   const next = new Set(selectedIds);
@@ -71,12 +106,17 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
                   onSelect(new Set([item.id]));
                 }
               }}
-              className={`group flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer transition-colors ${
-                isSelected
-                  ? "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300"
-                  : "text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              className={`group flex items-center gap-1 px-2 py-1.5 rounded-lg cursor-pointer transition-colors border-t-2 ${
+                isDragOver ? "border-t-blue-500" : "border-t-transparent"
+              } ${
+                draggingId === item.id
+                  ? "opacity-40"
+                  : isSelected
+                    ? "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300"
+                    : "text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
               }`}
             >
+              <TbGripVertical size={13} className="shrink-0 text-neutral-300 dark:text-neutral-600 cursor-grab" />
               <span className={`shrink-0 ${isSelected ? "text-blue-500" : "text-neutral-400 dark:text-neutral-500"}`}>{KIND_ICON[item.kind]}</span>
               <span className="min-w-0 flex-1 truncate text-sm">{layerLabel(item)}</span>
               <div className="shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">

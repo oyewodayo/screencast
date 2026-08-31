@@ -441,7 +441,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
         drag.startImages.filter((img) => drag.ids.has(img.id)),
         drag.groupCenter.x,
         drag.groupCenter.y,
-        currentAngle - drag.startAngle
+        snapAngle(currentAngle - drag.startAngle)
       );
       const byId = new Map(transformed.map((item) => [item.id, item]));
       setLiveImages(drag.startImages.map((item) => byId.get(item.id) ?? item));
@@ -468,12 +468,56 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
       return;
     }
 
+    if (drag.mode === "resize" && drag.corner) {
+      // Single-item resize snap: the dragged corner's raw (x, y) is snapped independently on each
+      // axis to the nearest edge/center of every OTHER item plus the canvas's own edges/center,
+      // same target set computeSnapTargets/move-snap already use. Only when the item itself isn't
+      // rotated - applyResize below works in the item's own LOCAL (unrotated) frame, so a raw
+      // canvas-space snap only lines up with what's visibly on screen when local space and canvas
+      // space are the same thing; a rotated item just resizes without snap assistance instead of
+      // snapping to the wrong axis.
+      const corner = drag.corner;
+      const target = drag.startImages.find((image) => drag.ids.has(image.id));
+      let snappedX = x;
+      let snappedY = y;
+      let guideX: number | null = null;
+      let guideY: number | null = null;
+      if (target && Math.abs(target.rotation) < 0.001) {
+        const others = doc.images.filter((image) => !drag.ids.has(image.id));
+        const targets = computeSnapTargets(others, doc.canvasWidth, doc.canvasHeight);
+        const threshold = SNAP_THRESHOLD / zoom;
+        let bestDistX = threshold;
+        for (const tx of targets.x) {
+          const dist = Math.abs(x - tx);
+          if (dist < bestDistX) {
+            bestDistX = dist;
+            snappedX = tx;
+            guideX = tx;
+          }
+        }
+        let bestDistY = threshold;
+        for (const ty of targets.y) {
+          const dist = Math.abs(y - ty);
+          if (dist < bestDistY) {
+            bestDistY = dist;
+            snappedY = ty;
+            guideY = ty;
+          }
+        }
+      }
+      setSnapGuides({ vertical: guideX !== null ? [guideX] : [], horizontal: guideY !== null ? [guideY] : [] });
+      setLiveImages(drag.startImages.map((image) => (drag.ids.has(image.id) ? applyResize(image, corner, snappedX, snappedY) : image)));
+      return;
+    }
+
     if (snapGuides.vertical.length > 0 || snapGuides.horizontal.length > 0) setSnapGuides({ vertical: [], horizontal: [] });
     setLiveImages(
       drag.startImages.map((image) => {
         if (!drag.ids.has(image.id)) return image;
-        if (drag.mode === "resize" && drag.corner) return applyResize(image, drag.corner, x, y);
-        if (drag.mode === "rotate") return applyRotate(image, x, y);
+        if (drag.mode === "rotate") {
+          const rotated = applyRotate(image, x, y);
+          return { ...rotated, rotation: snapAngle(rotated.rotation) };
+        }
         return image;
       })
     );
@@ -851,6 +895,18 @@ function snapMoveDelta(
   }
 
   return { dx, dy, guideX, guideY };
+}
+
+// Rotation-angle snapping (radians) - separate from the edge/center position snapping above, but
+// the same idea applied to angle instead of x/y: rounds to the nearest 15deg increment whenever
+// the raw angle is already close, so "make this level" or "make this exactly 45deg" doesn't need
+// pixel-perfect pointer precision. Used by both single-item rotate (applyRotate's own absolute
+// pointer-angle result) and group rotate (the delta angle applyGroupRotate orbits every item by).
+const ROTATION_SNAP_INCREMENT = Math.PI / 12; // 15deg
+const ROTATION_SNAP_THRESHOLD = (3 * Math.PI) / 180; // ~3deg
+function snapAngle(angle: number): number {
+  const nearest = Math.round(angle / ROTATION_SNAP_INCREMENT) * ROTATION_SNAP_INCREMENT;
+  return Math.abs(angle - nearest) <= ROTATION_SNAP_THRESHOLD ? nearest : angle;
 }
 
 export default BoardCanvas;

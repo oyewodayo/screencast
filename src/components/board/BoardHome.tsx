@@ -8,8 +8,9 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { IoAdd, IoChevronDown, IoCopyOutline, IoEllipsisVertical, IoImagesOutline, IoTrashOutline } from "react-icons/io5";
-import { BoardSummary, createEmptyBoardDocument } from "../../utils/boardTypes";
+import { BoardSummary, createEmptyBoardDocument, DEFAULT_BOARD_HEIGHT, DEFAULT_BOARD_WIDTH } from "../../utils/boardTypes";
 import { applyBoardTemplate, BOARD_TEMPLATES, BoardTemplate } from "../../utils/boardTemplates";
+import { BOARD_SIZE_PRESET_GROUPS, BOARD_SIZE_PRESETS, BoardSizePreset } from "../../utils/boardCanvasSizes";
 
 // Small CSS-only preview swatch for a template card - no need for a real canvas render just to
 // preview a background choice, since a template only ever sets background/padding fields.
@@ -129,6 +130,11 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
   // Which card's 3-dot menu is open reuses the click-outside pattern above; the template picker
   // below is its own toggle since it's a completely separate popover off a different button.
   const [showTemplates, setShowTemplates] = useState(false);
+  // Paired with the style template below, not a replacement for it - this picks the new board's
+  // starting canvasWidth/Height (see boardCanvasSizes.ts), the style template picks its background/
+  // padding; a click on a style tile creates the board using whichever size is selected here. null =
+  // createEmptyBoardDocument's own default size (1600x1000), same as if this row never existed.
+  const [selectedSize, setSelectedSize] = useState<BoardSizePreset | null>(null);
 
   useEffect(() => {
     if (!showTemplates) return;
@@ -145,7 +151,8 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
       try {
         const id = crypto.randomUUID();
         const existingCount = boards?.length ?? 0;
-        const doc = applyBoardTemplate(createEmptyBoardDocument(id, `Board ${existingCount + 1}`), template);
+        let doc = applyBoardTemplate(createEmptyBoardDocument(id, `Board ${existingCount + 1}`), template);
+        if (selectedSize) doc = { ...doc, canvasWidth: selectedSize.width, canvasHeight: selectedSize.height };
         await invoke("create_board", { id, name: doc.name, json: JSON.stringify(doc) });
         onOpenBoard(id);
       } catch (err) {
@@ -193,6 +200,32 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
               onClick={(e) => e.stopPropagation()}
               className="absolute left-1/2 -translate-x-1/2 top-full mt-2 w-80 rounded-xl bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 shadow-xl p-3 z-20"
             >
+              {/* Paired with the style template grid below (see selectedSize's own doc comment) -
+                  picks the new board's starting canvas size, most usefully one of the named
+                  social-platform presets (Instagram Post/Story, etc. - see boardCanvasSizes.ts) so
+                  a board meant for a specific platform starts at that platform's exact pixel
+                  dimensions instead of needing a resize later. */}
+              <label className="flex items-center justify-between gap-2 mb-3 px-1">
+                <span className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500">Size</span>
+                <select
+                  value={selectedSize?.id ?? "default"}
+                  onChange={(e) => setSelectedSize(BOARD_SIZE_PRESETS.find((p) => p.id === e.target.value) ?? null)}
+                  className="flex-1 max-w-[190px] h-7 px-1.5 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-gray-700 dark:text-neutral-200 text-xs outline-none"
+                >
+                  <option value="default">
+                    Default ({DEFAULT_BOARD_WIDTH}×{DEFAULT_BOARD_HEIGHT})
+                  </option>
+                  {BOARD_SIZE_PRESET_GROUPS.map((group) => (
+                    <optgroup key={group} label={group}>
+                      {BOARD_SIZE_PRESETS.filter((preset) => preset.group === group).map((preset) => (
+                        <option key={preset.id} value={preset.id}>
+                          {preset.label} ({preset.width}×{preset.height})
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+              </label>
               <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 px-1">Start from a template</p>
               <div className="grid grid-cols-3 gap-2">
                 {BOARD_TEMPLATES.map((template) => (
