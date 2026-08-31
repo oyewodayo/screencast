@@ -94,6 +94,43 @@ pub fn create_board(id: String, name: String, json: String) -> Result<BoardSumma
         .map(|mut s| { s.name = name; s })
 }
 
+// Recursive plain-file copy (board.json, assets/, thumbnail.png) - std::fs has no built-in
+// directory copy, so this is the manual equivalent of `cp -r`. Used only by duplicate_board below.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("Failed to create folder: {}", e))?;
+    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read folder: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read folder entry: {}", e))?;
+        let file_type = entry.file_type().map_err(|e| format!("Failed to read entry type: {}", e))?;
+        let dest_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            fs::copy(entry.path(), &dest_path).map_err(|e| format!("Failed to copy file: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+// Copies an existing board's whole project folder (board.json, assets/, thumbnail.png) verbatim
+// into a new id - deliberately does NOT touch board.json's id/name/timestamps fields itself. Same
+// "this file only ever peeks at a few top-level fields, the document shape is FE-owned" philosophy
+// as the rest of this module (see its own top comment): the frontend calls load_board/save_board
+// right after this to patch those fields in with its own JS Date().toISOString() convention,
+// rather than this file learning to parse and rewrite JSON it doesn't otherwise need to understand.
+// `new_id` is frontend-generated (crypto.randomUUID()), same convention create_board's `id` uses.
+#[command]
+pub fn duplicate_board(source_id: String, new_id: String) -> Result<(), String> {
+    let source_dir = board_dir(&source_id)?;
+    if !source_dir.is_dir() {
+        return Err("Source board does not exist".to_string());
+    }
+    let dest_dir = board_dir(&new_id)?;
+    if dest_dir.exists() {
+        return Err("A board with that id already exists".to_string());
+    }
+    copy_dir_recursive(&source_dir, &dest_dir)
+}
+
 #[command]
 pub fn save_board(id: String, json: String) -> Result<(), String> {
     let dir = board_dir(&id)?;

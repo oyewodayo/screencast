@@ -26,6 +26,7 @@ import {
   IoChevronUp,
   IoColorFillOutline,
   IoContrastOutline,
+  IoCopyOutline,
   IoImageOutline,
   IoOptionsOutline,
   IoSwapHorizontalOutline,
@@ -39,6 +40,10 @@ interface BoardStylePanelProps {
   items: BoardItem[]; // the full selected set - fields showing a mixed value across them just show the first one's
   onChange: (before: BoardItem[], after: BoardItem[]) => void;
   onDelete: (ids: Set<string>) => void;
+  // Copies every selected item (offset slightly, selects the copies) - see BoardEditor.tsx's
+  // handleDuplicateSelected. Also reachable via Ctrl+D and BoardCanvas.tsx's own right-click menu;
+  // all three just call this same handler.
+  onDuplicate: (ids: Set<string>) => void;
   onBringToFront: (ids: Set<string>) => void;
   onSendToBack: (ids: Set<string>) => void;
   // "Apply this image's/text's style to every other image/text on the board" - copies everything
@@ -174,6 +179,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   items,
   onChange,
   onDelete,
+  onDuplicate,
   onBringToFront,
   onSendToBack,
   onApplyStyleToAllImages,
@@ -465,6 +471,10 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         <SectionHeader icon={<IoContrastOutline size={12} />} label="Appearance" />
         <SliderField label="Opacity" display={`${Math.round(primary.opacity * 100)}%`} min={0.1} max={1} step={0.05} value={primary.opacity} onChange={setOpacity} />
       </div>
+
+      <button type="button" onClick={() => onDuplicate(ids)} className={`flex items-center justify-center gap-1.5 ${GHOST_BUTTON}`}>
+        <IoCopyOutline size={14} /> Duplicate {items.length > 1 ? "items" : allText ? "text" : allBlur ? "blur" : "image"}
+      </button>
 
       <div className="flex gap-2">
         <button type="button" onClick={() => onSendToBack(ids)} className={`flex-1 ${GHOST_BUTTON}`}>

@@ -32,7 +32,21 @@ import {
   IoSaveOutline,
   IoShareOutline,
 } from "react-icons/io5";
-import { TbBlur, TbCircleDashed, TbColumns, TbSpiral, TbStairsUp } from "react-icons/tb";
+import {
+  TbBlur,
+  TbCircleDashed,
+  TbColumns,
+  TbLayoutAlignBottom,
+  TbLayoutAlignCenter,
+  TbLayoutAlignLeft,
+  TbLayoutAlignMiddle,
+  TbLayoutAlignRight,
+  TbLayoutAlignTop,
+  TbLayoutDistributeHorizontal,
+  TbLayoutDistributeVertical,
+  TbSpiral,
+  TbStairsUp,
+} from "react-icons/tb";
 import useBoardStore from "../../hooks/useBoardStore";
 import { BoardBackgroundMode, BoardBlur, BoardImage, BoardItem, BoardText, createDefaultBoardBlur, createDefaultBoardImage, createDefaultBoardText } from "../../utils/boardTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
@@ -41,6 +55,7 @@ import {
   applyMove,
   AutoLayoutResult,
   DEFAULT_BOARD_GRID,
+  groupBoundingBox,
   layoutImagesInCascade,
   layoutImagesInCircle,
   layoutImagesInCircleWithCenter,
@@ -58,11 +73,32 @@ import {
 } from "../../handlers/boardHandlers";
 import { boardAssetPath, preloadBoardImage } from "../../utils/boardImageCache";
 import BoardCanvas from "./BoardCanvas";
+import BoardLayerPanel from "./BoardLayerPanel";
 import BoardStylePanel from "./BoardStylePanel";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
+
+// The toolbar's "Align" menu - edge/center alignment (needs 2+ selected items) plus even
+// distribution (needs 3+, since "distribute" is meaningless for a pair). Both act on each
+// selected item's own rotated bounding box (groupBoundingBox([item]), the same helper the group
+// resize/rotate gizmo in BoardCanvas.tsx uses) rather than raw x/y, so a rotated item aligns by
+// what's actually visible on screen, not its unrotated origin.
+type AlignEdge = "left" | "hcenter" | "right" | "top" | "vcenter" | "bottom";
+const ALIGN_ACTIONS: { key: AlignEdge; label: string; icon: ReactNode }[] = [
+  { key: "left", label: "Align left", icon: <TbLayoutAlignLeft size={16} /> },
+  { key: "hcenter", label: "Align center", icon: <TbLayoutAlignCenter size={16} /> },
+  { key: "right", label: "Align right", icon: <TbLayoutAlignRight size={16} /> },
+  { key: "top", label: "Align top", icon: <TbLayoutAlignTop size={16} /> },
+  { key: "vcenter", label: "Align middle", icon: <TbLayoutAlignMiddle size={16} /> },
+  { key: "bottom", label: "Align bottom", icon: <TbLayoutAlignBottom size={16} /> },
+];
+type DistributeAxis = "horizontal" | "vertical";
+const DISTRIBUTE_ACTIONS: { key: DistributeAxis; label: string; icon: ReactNode }[] = [
+  { key: "horizontal", label: "Distribute horizontally", icon: <TbLayoutDistributeHorizontal size={16} /> },
+  { key: "vertical", label: "Distribute vertically", icon: <TbLayoutDistributeVertical size={16} /> },
+];
 
 // The toolbar's "Arrange" preset menu - one entry per boardHandlers.ts auto-layout function. Order
 // here is the order they appear in the dropdown.
@@ -158,6 +194,9 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
   const store = useBoardStore(boardId);
   const [briefcastDir, setBriefcastDir] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Toggled by the toolbar's "Layers" chip - see BoardLayerPanel.tsx. Off by default so it doesn't
+  // eat into canvas space for boards nobody needs a layer list for.
+  const [showLayerPanel, setShowLayerPanel] = useState(false);
   const [imageBitmaps, setImageBitmaps] = useState<Map<string, HTMLImageElement>>(new Map());
   const [isImporting, setIsImporting] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -507,10 +546,42 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
   const handleDeleteSelected = useCallback(
     (ids: Set<string>) => {
       if (!store.doc) return;
-      for (const image of store.doc.images) {
-        if (ids.has(image.id)) store.deleteImage(image);
-      }
+      const targets = store.doc.images.filter((item) => ids.has(item.id));
+      // One deleteItems call, not one deleteImage per item - the latter (this function's own
+      // previous implementation) created one undo step per deleted item, so undoing a 5-item
+      // delete took 5 separate Ctrl+Z presses instead of one.
+      store.deleteItems(targets);
       setSelectedIds(new Set());
+    },
+    [store]
+  );
+
+  // Copies every selected item, offset slightly down-right so the duplicates are visibly distinct
+  // from their originals rather than sitting exactly on top of them, and selects the copies (not
+  // the originals) so the very next drag moves the new ones - the same "duplicate lands ready to
+  // reposition" convention Figma/Canva/etc. use. One addItems call for one undo step regardless of
+  // how many items were selected. Images/blurs reuse the SAME assetFileName as their original
+  // rather than copying the underlying file on disk - nothing about rendering or deletion requires
+  // per-BoardImage-uniqueness (imageBitmaps is keyed by assetFileName, and deleting one duplicate
+  // was already never wired to delete the shared asset file either), so a physical copy would only
+  // add disk I/O for no behavioral benefit.
+  const DUPLICATE_OFFSET = 24;
+  const handleDuplicateSelected = useCallback(
+    (ids: Set<string>) => {
+      if (!store.doc || ids.size === 0) return;
+      const originals = store.doc.images.filter((item) => ids.has(item.id));
+      if (originals.length === 0) return;
+      const now = Date.now();
+      const copies = originals.map((item) => ({
+        ...item,
+        id: crypto.randomUUID(),
+        x: item.x + DUPLICATE_OFFSET,
+        y: item.y + DUPLICATE_OFFSET,
+        createdAt: now,
+        updatedAt: now,
+      }));
+      store.addItems(copies);
+      setSelectedIds(new Set(copies.map((c) => c.id)));
     },
     [store]
   );
@@ -533,6 +604,78 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     [store, selectedIds]
   );
 
+  // Aligns every selected item to a shared edge/center line, computed from the group's own
+  // rotated bounding boxes (min/max of each item's groupBoundingBox, not raw x/y) so the result
+  // matches what's visually flush on screen even when items are rotated. One batch-edit, one undo
+  // step, regardless of how many items are selected.
+  const handleAlignSelected = useCallback(
+    (edge: AlignEdge) => {
+      if (!store.doc || selectedIds.size < 2) return;
+      const targets = store.doc.images.filter((img) => selectedIds.has(img.id));
+      if (targets.length < 2) return;
+      const boxed = targets.map((item) => ({ item, box: groupBoundingBox([item]) }));
+      let reference: number;
+      if (edge === "left") reference = Math.min(...boxed.map((b) => b.box.x));
+      else if (edge === "right") reference = Math.max(...boxed.map((b) => b.box.x + b.box.width));
+      else if (edge === "hcenter") {
+        const minX = Math.min(...boxed.map((b) => b.box.x));
+        const maxX = Math.max(...boxed.map((b) => b.box.x + b.box.width));
+        reference = (minX + maxX) / 2;
+      } else if (edge === "top") reference = Math.min(...boxed.map((b) => b.box.y));
+      else if (edge === "bottom") reference = Math.max(...boxed.map((b) => b.box.y + b.box.height));
+      else {
+        const minY = Math.min(...boxed.map((b) => b.box.y));
+        const maxY = Math.max(...boxed.map((b) => b.box.y + b.box.height));
+        reference = (minY + maxY) / 2;
+      }
+      const moved = boxed.map(({ item, box }) => {
+        let dx = 0;
+        let dy = 0;
+        if (edge === "left") dx = reference - box.x;
+        else if (edge === "right") dx = reference - (box.x + box.width);
+        else if (edge === "hcenter") dx = reference - (box.x + box.width / 2);
+        else if (edge === "top") dy = reference - box.y;
+        else if (edge === "bottom") dy = reference - (box.y + box.height);
+        else dy = reference - (box.y + box.height / 2);
+        return applyMove(item, dx, dy);
+      });
+      store.batchEditImages(targets, moved);
+    },
+    [store, selectedIds]
+  );
+
+  // Spreads 3+ selected items with equal gaps between them along one axis, keeping the two
+  // outermost items fixed in place (the natural "distribute" convention - only what's between the
+  // ends moves). Sorted by current position along that axis first, so the visual left-to-right (or
+  // top-to-bottom) order is preserved rather than shuffled.
+  const handleDistributeSelected = useCallback(
+    (axis: DistributeAxis) => {
+      if (!store.doc || selectedIds.size < 3) return;
+      const targets = store.doc.images.filter((img) => selectedIds.has(img.id));
+      if (targets.length < 3) return;
+      const boxed = targets.map((item) => ({ item, box: groupBoundingBox([item]) }));
+      const sizeKey = axis === "horizontal" ? "width" : "height";
+      const posKey = axis === "horizontal" ? "x" : "y";
+      boxed.sort((a, b) => a.box[posKey] - b.box[posKey]);
+      const first = boxed[0].box;
+      const last = boxed[boxed.length - 1].box;
+      const span = last[posKey] + last[sizeKey] - first[posKey];
+      const totalSize = boxed.reduce((sum, b) => sum + b.box[sizeKey], 0);
+      const gap = (span - totalSize) / (boxed.length - 1);
+      let cursor = first[posKey];
+      const orderedTargets: BoardItem[] = [];
+      const moved: BoardItem[] = [];
+      for (const { item, box } of boxed) {
+        const delta = cursor - box[posKey];
+        moved.push(applyMove(item, axis === "horizontal" ? delta : 0, axis === "horizontal" ? 0 : delta));
+        orderedTargets.push(item);
+        cursor += box[sizeKey] + gap;
+      }
+      store.batchEditImages(orderedTargets, moved);
+    },
+    [store, selectedIds]
+  );
+
   const handleBringToFront = useCallback(
     (ids: Set<string>) => {
       if (!store.doc) return;
@@ -549,6 +692,26 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       const rest = store.doc.images.filter((img) => !ids.has(img.id));
       const moved = store.doc.images.filter((img) => ids.has(img.id));
       store.reorderImages([...moved, ...rest]);
+    },
+    [store]
+  );
+
+  // "Move one step" counterpart to handleBringToFront/handleSendToBack above - swaps the item with
+  // whichever single neighbor currently sits one step toward the front (higher index - drawn later,
+  // on top) or back (lower index). Used only by BoardLayerPanel's per-row chevrons; the panel itself
+  // disables a button once its item is already at that end of the stack, so the bounds check here is
+  // just a defensive no-op rather than something a user can normally trigger.
+  const handleStepReorder = useCallback(
+    (id: string, direction: "forward" | "backward") => {
+      if (!store.doc) return;
+      const images = store.doc.images;
+      const index = images.findIndex((img) => img.id === id);
+      if (index === -1) return;
+      const swapWith = direction === "forward" ? index + 1 : index - 1;
+      if (swapWith < 0 || swapWith >= images.length) return;
+      const next = [...images];
+      [next[index], next[swapWith]] = [next[swapWith], next[index]];
+      store.reorderImages(next);
     },
     [store]
   );
@@ -621,6 +784,20 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
   }, [isShareMenuOpen]);
+
+  // Same anchor/portal pattern again for the toolbar's "Align" menu (align edges/centers,
+  // distribute) - see arrangeMenuAnchor's own doc comment for why a portal over a plain absolute
+  // child.
+  const [alignMenuAnchor, setAlignMenuAnchor] = useState<{ top: number; left: number } | null>(null);
+  const isAlignMenuOpen = alignMenuAnchor !== null;
+  const alignButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!isAlignMenuOpen) return;
+    const close = () => setAlignMenuAnchor(null);
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [isAlignMenuOpen]);
 
   // Defensively defaulted the same way every other doc field with a "didn't exist on old boards"
   // story is (resolveBoardPadding, resolveBackgroundMode/resolveBoardGrid themselves) - read once
@@ -814,12 +991,17 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
         } else if (key === "a") {
           e.preventDefault();
           if (store.doc) setSelectedIds(new Set(store.doc.images.map((img) => img.id)));
+        } else if (key === "d" && selectedIds.size > 0) {
+          // preventDefault here is load-bearing, not just tidy - Ctrl+D is the browser's own
+          // "bookmark this page" shortcut, which would otherwise fire alongside the duplicate.
+          e.preventDefault();
+          handleDuplicateSelected(selectedIds);
         }
       }
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [selectedIds, handleDeleteSelected, handleNudge, store]);
+  }, [selectedIds, handleDeleteSelected, handleDuplicateSelected, handleNudge, store]);
 
   const nameInputRef = useRef<HTMLInputElement>(null);
 
@@ -857,6 +1039,16 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           <TbBlur size={15} /> Blur
         </button>
 
+        <button
+          type="button"
+          title="Show every item on the board in stacking order, front to back"
+          onClick={() => setShowLayerPanel((v) => !v)}
+          disabled={!store.doc}
+          className={showLayerPanel ? TOOLBAR_CHIP_ACTIVE : TOOLBAR_CHIP}
+        >
+          <IoLayersOutline size={15} /> Layers
+        </button>
+
         <div className="w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
 
         {/* "Arrange" and "Background" - each a self-contained bordered "chip" trigger (not a
@@ -875,6 +1067,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             } else {
               setBackgroundMenuAnchor(null);
               setShareMenuAnchor(null);
+              setAlignMenuAnchor(null);
               const rect = arrangeButtonRef.current?.getBoundingClientRect();
               if (rect) setArrangeMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
@@ -914,6 +1107,80 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             </div>,
             document.body
           )}
+        {/* "Align" - edge/center alignment and even distribution across the current selection.
+            Only meaningful for 2+ selected items (distribute needs 3+, disabled per-row below
+            rather than hiding the whole menu, so it's discoverable before there's enough selected
+            to use it). Same portal-dropdown pattern as Arrange/Background above. */}
+        <button
+          ref={alignButtonRef}
+          type="button"
+          title="Align or distribute the selected items"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (isAlignMenuOpen) {
+              setAlignMenuAnchor(null);
+            } else {
+              setArrangeMenuAnchor(null);
+              setBackgroundMenuAnchor(null);
+              setShareMenuAnchor(null);
+              const rect = alignButtonRef.current?.getBoundingClientRect();
+              if (rect) setAlignMenuAnchor({ top: rect.bottom + 6, left: rect.left });
+            }
+          }}
+          disabled={!store.doc || selectedIds.size < 2}
+          className={isAlignMenuOpen ? TOOLBAR_CHIP_ACTIVE : TOOLBAR_CHIP}
+        >
+          <TbLayoutAlignLeft size={15} />
+          Align
+          <IoChevronDown size={12} className={`transition-transform ${isAlignMenuOpen ? "rotate-180" : ""}`} />
+        </button>
+        {alignMenuAnchor &&
+          createPortal(
+            <div
+              onPointerDown={(e) => e.stopPropagation()}
+              style={{ position: "fixed", top: alignMenuAnchor.top, left: alignMenuAnchor.left }}
+              className="w-52 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 overflow-hidden z-[9999] py-1"
+            >
+              <div className="px-3 pt-1.5 pb-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                Align
+              </div>
+              {ALIGN_ACTIONS.map((action) => (
+                <button
+                  key={action.key}
+                  type="button"
+                  onClick={() => {
+                    handleAlignSelected(action.key);
+                    setAlignMenuAnchor(null);
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                >
+                  {action.icon}
+                  {action.label}
+                </button>
+              ))}
+              <div className="h-px bg-neutral-200/80 dark:bg-neutral-700/80 my-1" />
+              <div className="px-3 pt-1 pb-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                Distribute
+              </div>
+              {DISTRIBUTE_ACTIONS.map((action) => (
+                <button
+                  key={action.key}
+                  type="button"
+                  disabled={selectedIds.size < 3}
+                  onClick={() => {
+                    handleDistributeSelected(action.key);
+                    setAlignMenuAnchor(null);
+                  }}
+                  title={selectedIds.size < 3 ? "Select at least 3 items to distribute" : undefined}
+                  className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+                >
+                  {action.icon}
+                  {action.label}
+                </button>
+              ))}
+            </div>,
+            document.body
+          )}
         {/* "Background" mode picker - Color (the original control, now one of three modes) / Grid
             (gridlines, optionally over a base fill) / Image (a full-bleed photo). Same portal
             pattern and chip styling as "Arrange" above - see arrangeMenuAnchor's doc comment for
@@ -930,6 +1197,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             } else {
               setArrangeMenuAnchor(null);
               setShareMenuAnchor(null);
+              setAlignMenuAnchor(null);
               const rect = backgroundButtonRef.current?.getBoundingClientRect();
               if (rect) setBackgroundMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
@@ -1202,6 +1470,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             } else {
               setArrangeMenuAnchor(null);
               setBackgroundMenuAnchor(null);
+              setAlignMenuAnchor(null);
               const rect = shareButtonRef.current?.getBoundingClientRect();
               if (rect) setShareMenuAnchor({ top: rect.bottom + 6, left: rect.right - 224 });
             }
@@ -1344,6 +1613,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               onReplaceImage={(image) => void handleReplaceImage(image)}
               onBringToFront={handleBringToFront}
               onSendToBack={handleSendToBack}
+              onDuplicateItem={(item) => handleDuplicateSelected(new Set([item.id]))}
               onDeleteItem={(item) => handleDeleteSelected(new Set([item.id]))}
             />
           ) : store.loadError ? (
@@ -1353,11 +1623,22 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           )}
         </div>
 
+        {showLayerPanel && store.doc && (
+          <BoardLayerPanel
+            items={store.doc.images}
+            selectedIds={selectedIds}
+            onSelect={setSelectedIds}
+            onStepReorder={handleStepReorder}
+            onClose={() => setShowLayerPanel(false)}
+          />
+        )}
+
         {selectedImages.length > 0 && (
           <BoardStylePanel
             items={selectedImages}
             onChange={handleStyleChange}
             onDelete={handleDeleteSelected}
+            onDuplicate={handleDuplicateSelected}
             onBringToFront={handleBringToFront}
             onSendToBack={handleSendToBack}
             onApplyStyleToAllImages={handleApplyImageStyleToAll}

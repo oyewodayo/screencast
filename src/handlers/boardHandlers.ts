@@ -431,6 +431,70 @@ export function applyRotate<T extends BoardItem>(image: T, pointerX: number, poi
   return { ...image, rotation, updatedAt: Date.now() };
 }
 
+// ---- Group resize/rotate (multi-selection) ---------------------------------------------------
+//
+// Single-item resize/rotate above (applyResize/applyRotate) reshape that one item's own box. A
+// multi-selection needs a different operation entirely - resizing/rotating the SELECTION as one
+// shape, the same convention every design tool with a multi-select uses. These three are what
+// BoardCanvas.tsx's group drag branch (selectedIds.size > 1) calls instead of the single-item ones.
+
+export interface GroupBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// Axis-aligned bounding box of the WHOLE selection, computed from each item's own ROTATED corners
+// (resizeHandlePoints already does the rotation math) rather than its raw x/y/width/height - a
+// tilted item's true on-screen footprint is bigger than its unrotated box, and the group's handles
+// need to actually enclose what's visibly selected.
+export function groupBoundingBox(items: BoardItem[]): GroupBounds {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const item of items) {
+    for (const corner of Object.values(resizeHandlePoints(item))) {
+      minX = Math.min(minX, corner.x);
+      minY = Math.min(minY, corner.y);
+      maxX = Math.max(maxX, corner.x);
+      maxY = Math.max(maxY, corner.y);
+    }
+  }
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+// Scales every item's position AND size around a fixed anchor (the bounding-box corner OPPOSITE
+// whichever handle is being dragged) by the same factor on each axis - each item's own `rotation`
+// is left untouched, only its box moves/resizes. A fully rotation-aware group resize (re-deriving
+// each rotated child's true footprint under the new scale) is a substantially harder affine-
+// transform problem for comparatively little practical gain over this simpler, still-correct-for-
+// the-common-case version.
+export function applyGroupResize(items: BoardItem[], anchorX: number, anchorY: number, scaleX: number, scaleY: number): BoardItem[] {
+  const now = Date.now();
+  return items.map((item) => ({
+    ...item,
+    x: anchorX + (item.x - anchorX) * scaleX,
+    y: anchorY + (item.y - anchorY) * scaleY,
+    width: Math.max(8, item.width * Math.abs(scaleX)),
+    height: Math.max(8, item.height * Math.abs(scaleY)),
+    updatedAt: now,
+  }));
+}
+
+// Rotates the WHOLE selection as one rigid body around a shared center: every item's own rotation
+// increases by the same `deltaAngle`, AND every item's position orbits that same center by the same
+// angle. Without the orbit this would just spin each item in place independently - "rotate" for a
+// multi-selection means swinging the group around together, the same convention Figma/etc. use.
+export function applyGroupRotate(items: BoardItem[], centerX: number, centerY: number, deltaAngle: number): BoardItem[] {
+  const now = Date.now();
+  return items.map((item) => {
+    const center = rotatePoint(item.x + item.width / 2, item.y + item.height / 2, centerX, centerY, deltaAngle);
+    return { ...item, x: center.x - item.width / 2, y: center.y - item.height / 2, rotation: item.rotation + deltaAngle, updatedAt: now };
+  });
+}
+
 // ---- Auto-layout ("arrange side by side") ---------------------------------------------------
 //
 // A one-shot toolbar action, not continuous/live layout - free drag/resize is the default
@@ -841,6 +905,12 @@ export function applyCommand(doc: BoardDocument, command: BoardCommand): BoardDo
       const afterById = new Map(command.after.map((img) => [img.id, img]));
       return { ...doc, images: doc.images.map((img) => afterById.get(img.id) ?? img), updatedAt };
     }
+    case "add-batch":
+      return { ...doc, images: [...doc.images, ...command.items], updatedAt };
+    case "delete-batch": {
+      const removedIds = new Set(command.items.map((item) => item.id));
+      return { ...doc, images: doc.images.filter((img) => !removedIds.has(img.id)), updatedAt };
+    }
     case "reorder":
       return { ...doc, images: command.after, updatedAt };
     case "background":
@@ -868,6 +938,10 @@ export function invertCommand(command: BoardCommand): BoardCommand {
       return { type: "edit", before: command.after, after: command.before };
     case "batch-edit":
       return { type: "batch-edit", before: command.after, after: command.before };
+    case "add-batch":
+      return { type: "delete-batch", items: command.items };
+    case "delete-batch":
+      return { type: "add-batch", items: command.items };
     case "reorder":
       return { type: "reorder", before: command.after, after: command.before };
     case "background":

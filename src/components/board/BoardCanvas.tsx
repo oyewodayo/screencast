@@ -13,17 +13,21 @@
 // keeps a whole drag gesture to exactly one undo step.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
+import { IoCopyOutline, IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
 import { TbStackBack, TbStackFront } from "react-icons/tb";
 import { BoardDocument, BoardImage, BoardItem, BoardText } from "../../utils/boardTypes";
 import {
-  ResizeCorner,
+  applyGroupResize,
+  applyGroupRotate,
   applyMove,
   applyResize,
   applyRotate,
+  GroupBounds,
+  groupBoundingBox,
   hitTestBoardItem,
   paddedCanvasSize,
   renderBoardToCanvas,
+  ResizeCorner,
   resizeHandlePoints,
   rotateHandlePoint,
 } from "../../handlers/boardHandlers";
@@ -40,6 +44,13 @@ import {
 const HANDLE_HIT_RADIUS = 14;
 const HANDLE_DRAW_RADIUS = 7;
 const ROTATE_HANDLE_OFFSET = 32;
+// How close (CSS px, divided by zoom at its one use site below, same convention as the three
+// constants above) a dragged item's edge/center has to come to another item's edge/center - or the
+// canvas's own edges/center - before handlePointerMove's "move" branch snaps it flush and shows a
+// guide line. Deliberately smaller than HANDLE_HIT_RADIUS - a hit-test radius wants to be forgiving
+// about where you click, but a snap threshold that's too generous makes items feel like they're
+// fighting the pointer instead of just landing where you put them.
+const SNAP_THRESHOLD = 6;
 
 type DragMode = "move" | "resize" | "rotate";
 
@@ -50,6 +61,13 @@ interface DragState {
   startX: number;
   startY: number;
   startImages: BoardItem[]; // full doc.images snapshot at drag start
+  // Set ONLY when this resize/rotate started on the multi-selection's own GROUP bounding-box
+  // handles (ids.size > 1) rather than a single item's own handles - see handlePointerDown's
+  // group-vs-single branch. handlePointerMove checks these to know which transform to apply.
+  groupBounds?: GroupBounds; // resize: the bbox as it was at drag start
+  groupAnchor?: { x: number; y: number }; // resize: the bbox corner OPPOSITE the one being dragged
+  groupCenter?: { x: number; y: number }; // rotate: bbox center to orbit every item around
+  startAngle?: number; // rotate: pointer's angle relative to groupCenter when the drag began
 }
 
 interface BoardCanvasProps {
@@ -67,12 +85,13 @@ interface BoardCanvasProps {
   onBatchEditImages: (before: BoardItem[], after: BoardItem[]) => void;
   // Right-click menu on a single item tile (see the contextMenu state below) - "Replace image"
   // only ever offered for an image (text has no source photo to swap); the rest apply to either
-  // kind. All four are the exact same actions BoardStylePanel's own buttons already call; this is
+  // kind. All five are the exact same actions BoardStylePanel's own buttons already call; this is
   // just a faster, no-side-panel-required path to them, and also what stops WebView2's native
   // "Save image as / Copy image / Inspect" context menu from appearing over board tiles at all.
   onReplaceImage: (image: BoardImage) => void;
   onBringToFront: (ids: Set<string>) => void;
   onSendToBack: (ids: Set<string>) => void;
+  onDuplicateItem: (item: BoardItem) => void;
   onDeleteItem: (item: BoardItem) => void;
 }
 
@@ -87,12 +106,31 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
   onReplaceImage,
   onBringToFront,
   onSendToBack,
+  onDuplicateItem,
   onDeleteItem,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [liveImages, setLiveImages] = useState<BoardItem[] | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const [contextMenu, setContextMenu] = useState<{ item: BoardItem; x: number; y: number } | null>(null);
+
+  // Marquee (rubber-band) select - starts whenever a plain pointerdown misses every item (see
+  // handlePointerDown's final fallback below). `marqueeRef` holds the gesture's fixed start info
+  // (not React state - nothing here needs to trigger a render on its own, only marqueeRect below
+  // does); `marqueeRect` is the live rectangle, read by both draw() (to render the rubber band) and
+  // handlePointerMove (to recompute which items are enclosed on every move). Shift+drag is additive
+  // - `baseSelection` is a snapshot of whatever was already selected when the drag started, and the
+  // live selection sent to onSelect is always baseSelection plus whatever's newly enclosed, so
+  // releasing the drag never loses a selection that existed before it began.
+  const marqueeRef = useRef<{ baseSelection: Set<string>; startX: number; startY: number } | null>(null);
+  const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+
+  // Snap guide lines shown while a plain "move" drag (single or multi-item) is in progress - see
+  // handlePointerMove's "move" branch, the only place this is ever set to anything non-empty.
+  // `vertical`/`horizontal` are canvas-buffer-space (unpadded doc space) line positions, at most one
+  // of each since a drag only ever snaps to its single closest target per axis. Cleared on every
+  // pointer move that isn't a snapped "move" drag, and always on drag end (see endDrag).
+  const [snapGuides, setSnapGuides] = useState<{ vertical: number[]; horizontal: number[] }>({ vertical: [], horizontal: [] });
 
   // Double-click-to-edit text - see BoardText's own doc comment in boardTypes.ts for why this is a
   // transparent textarea overlay (visible caret/selection only - color: transparent, see the style
@@ -148,12 +186,50 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
     // top of the images they belong to regardless of the board's current padding.
     ctx.save();
     ctx.translate(padding, padding);
+    const selectedItems: BoardItem[] = [];
     for (const image of displayImages) {
       if (!selectedIds.has(image.id)) continue;
+      selectedItems.push(image);
       drawSelectionChrome(ctx, image, selectedIds.size === 1, zoom);
     }
+    // A second, dashed bounding box around the WHOLE selection once there's more than one item -
+    // this is what resize/rotate actually grab for a multi-selection (see handlePointerDown's
+    // group branch), so it needs its own visible outline/handles distinct from each item's own
+    // (solid, handle-less) box above. Recomputed from `displayImages` (not `doc.images`) so it
+    // tracks a live group drag in progress, same as the individual outlines already do.
+    if (selectedItems.length > 1) {
+      drawGroupSelectionChrome(ctx, groupBoundingBox(selectedItems), zoom);
+    }
+    if (marqueeRect) {
+      ctx.save();
+      ctx.fillStyle = "rgba(59, 130, 246, 0.1)";
+      ctx.strokeStyle = "#3b82f6";
+      ctx.lineWidth = 1 / zoom;
+      ctx.fillRect(marqueeRect.x, marqueeRect.y, marqueeRect.width, marqueeRect.height);
+      ctx.strokeRect(marqueeRect.x, marqueeRect.y, marqueeRect.width, marqueeRect.height);
+      ctx.restore();
+    }
+    if (snapGuides.vertical.length > 0 || snapGuides.horizontal.length > 0) {
+      ctx.save();
+      ctx.strokeStyle = "#ec4899";
+      ctx.lineWidth = 1 / zoom;
+      ctx.setLineDash([4 / zoom, 4 / zoom]);
+      for (const vx of snapGuides.vertical) {
+        ctx.beginPath();
+        ctx.moveTo(vx, 0);
+        ctx.lineTo(vx, doc.canvasHeight);
+        ctx.stroke();
+      }
+      for (const hy of snapGuides.horizontal) {
+        ctx.beginPath();
+        ctx.moveTo(0, hy);
+        ctx.lineTo(doc.canvasWidth, hy);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
     ctx.restore();
-  }, [doc, displayImages, imageBitmaps, selectedIds, zoom]);
+  }, [doc, displayImages, imageBitmaps, selectedIds, zoom, marqueeRect, snapGuides]);
 
   useEffect(() => {
     draw();
@@ -207,14 +283,14 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>): void => {
     const { x, y } = pointerToCanvasSpace(e);
+    // /zoom converts the CSS-pixel constants above back into buffer space - see their own doc
+    // comment. Matches exactly what drawSelectionChrome/drawGroupSelectionChrome render, so the
+    // clickable area always lines up with what's actually drawn on screen.
+    const hitRadius = HANDLE_HIT_RADIUS / zoom;
 
     if (selectedIds.size === 1) {
       const image = doc.images.find((img) => selectedIds.has(img.id));
       if (image) {
-        // /zoom converts the CSS-pixel constants above back into buffer space - see their own doc
-        // comment. Matches exactly what drawSelectionChrome renders below, so the clickable area
-        // always lines up with what's actually drawn on screen.
-        const hitRadius = HANDLE_HIT_RADIUS / zoom;
         const handles = resizeHandlePoints(image);
         for (const corner of Object.keys(handles) as ResizeCorner[]) {
           if (Math.hypot(x - handles[corner].x, y - handles[corner].y) <= hitRadius) {
@@ -230,10 +306,65 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
           return;
         }
       }
+    } else if (selectedIds.size > 1) {
+      // Group resize/rotate - grabs the WHOLE selection's bounding-box handles (see
+      // drawGroupSelectionChrome) instead of any one item's own. Resize scales every selected
+      // item's position and size around the anchor corner (see applyGroupResize's own doc
+      // comment); rotate orbits every item around the shared bbox center (applyGroupRotate).
+      const selectedItems = doc.images.filter((img) => selectedIds.has(img.id));
+      if (selectedItems.length > 1) {
+        const bounds = groupBoundingBox(selectedItems);
+        const cornerPoints: Record<ResizeCorner, { x: number; y: number }> = {
+          nw: { x: bounds.x, y: bounds.y },
+          ne: { x: bounds.x + bounds.width, y: bounds.y },
+          sw: { x: bounds.x, y: bounds.y + bounds.height },
+          se: { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
+        };
+        const opposite: Record<ResizeCorner, ResizeCorner> = { nw: "se", ne: "sw", sw: "ne", se: "nw" };
+        for (const corner of Object.keys(cornerPoints) as ResizeCorner[]) {
+          if (Math.hypot(x - cornerPoints[corner].x, y - cornerPoints[corner].y) <= hitRadius) {
+            e.currentTarget.setPointerCapture(e.pointerId);
+            dragRef.current = {
+              mode: "resize",
+              ids: selectedIds,
+              corner,
+              startX: x,
+              startY: y,
+              startImages: doc.images,
+              groupBounds: bounds,
+              groupAnchor: cornerPoints[opposite[corner]],
+            };
+            return;
+          }
+        }
+        const groupCenter = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+        const rotateHandlePos = { x: groupCenter.x, y: bounds.y - ROTATE_HANDLE_OFFSET / zoom };
+        if (Math.hypot(x - rotateHandlePos.x, y - rotateHandlePos.y) <= hitRadius) {
+          e.currentTarget.setPointerCapture(e.pointerId);
+          dragRef.current = {
+            mode: "rotate",
+            ids: selectedIds,
+            startX: x,
+            startY: y,
+            startImages: doc.images,
+            groupCenter,
+            startAngle: Math.atan2(y - groupCenter.y, x - groupCenter.x),
+          };
+          return;
+        }
+      }
     }
 
     const hit = hitTestBoardItem(doc.images, x, y);
     if (!hit) {
+      // Missed every item - start a marquee (rubber-band) drag instead of just clearing the
+      // selection outright. Shift+drag is additive: baseSelection snapshots whatever was already
+      // selected so handlePointerMove can union it with whatever the rectangle newly encloses,
+      // and a plain click-and-release with no movement still behaves like the old "click empty
+      // space to deselect" (handlePointerMove never having enlarged marqueeRect off zero size).
+      e.currentTarget.setPointerCapture(e.pointerId);
+      marqueeRef.current = { baseSelection: e.shiftKey ? new Set(selectedIds) : new Set(), startX: x, startY: y };
+      setMarqueeRect({ x, y, width: 0, height: 0 });
       if (!e.shiftKey) onSelect(new Set());
       return;
     }
@@ -255,16 +386,92 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>): void => {
+    const marquee = marqueeRef.current;
+    if (marquee) {
+      const { x, y } = pointerToCanvasSpace(e);
+      const rect = {
+        x: Math.min(marquee.startX, x),
+        y: Math.min(marquee.startY, y),
+        width: Math.abs(x - marquee.startX),
+        height: Math.abs(y - marquee.startY),
+      };
+      setMarqueeRect(rect);
+      const enclosed = doc.images.filter((item) => rectsIntersect(groupBoundingBox([item]), rect));
+      const next = new Set(marquee.baseSelection);
+      for (const item of enclosed) next.add(item.id);
+      onSelect(next);
+      return;
+    }
+
     const drag = dragRef.current;
     if (!drag) return;
     const { x, y } = pointerToCanvasSpace(e);
     const dx = x - drag.startX;
     const dy = y - drag.startY;
 
+    // Group resize/rotate (see handlePointerDown's group branch, which is the only place that ever
+    // sets groupBounds/groupAnchor/groupCenter) - transform just the selected items via
+    // applyGroupResize/applyGroupRotate, then merge back into the full item list the same way the
+    // plain single-item branch below already does.
+    if (drag.mode === "resize" && drag.corner && drag.groupBounds && drag.groupAnchor) {
+      if (snapGuides.vertical.length > 0 || snapGuides.horizontal.length > 0) setSnapGuides({ vertical: [], horizontal: [] });
+      const b = drag.groupBounds;
+      const anchor = drag.groupAnchor;
+      const startCorner = {
+        x: drag.corner === "nw" || drag.corner === "sw" ? b.x : b.x + b.width,
+        y: drag.corner === "nw" || drag.corner === "ne" ? b.y : b.y + b.height,
+      };
+      const scaleX = groupResizeScale(startCorner.x, anchor.x, x);
+      const scaleY = groupResizeScale(startCorner.y, anchor.y, y);
+      const transformed = applyGroupResize(
+        drag.startImages.filter((img) => drag.ids.has(img.id)),
+        anchor.x,
+        anchor.y,
+        scaleX,
+        scaleY
+      );
+      const byId = new Map(transformed.map((item) => [item.id, item]));
+      setLiveImages(drag.startImages.map((item) => byId.get(item.id) ?? item));
+      return;
+    }
+    if (drag.mode === "rotate" && drag.groupCenter && drag.startAngle !== undefined) {
+      if (snapGuides.vertical.length > 0 || snapGuides.horizontal.length > 0) setSnapGuides({ vertical: [], horizontal: [] });
+      const currentAngle = Math.atan2(y - drag.groupCenter.y, x - drag.groupCenter.x);
+      const transformed = applyGroupRotate(
+        drag.startImages.filter((img) => drag.ids.has(img.id)),
+        drag.groupCenter.x,
+        drag.groupCenter.y,
+        currentAngle - drag.startAngle
+      );
+      const byId = new Map(transformed.map((item) => [item.id, item]));
+      setLiveImages(drag.startImages.map((item) => byId.get(item.id) ?? item));
+      return;
+    }
+
+    if (drag.mode === "move") {
+      // Snap the whole dragged selection's group bounding box (not each item separately - a
+      // multi-item drag should snap as one rigid block, same as it moves as one) to the nearest
+      // edge/center of every OTHER item plus the canvas's own edges/center, within SNAP_THRESHOLD.
+      // computeSnapTargets/snapMoveDelta do the actual nearest-target search; this just wires their
+      // result into the raw pointer delta and remembers where to draw the guide line(s).
+      const movedSelected = drag.startImages
+        .filter((image) => drag.ids.has(image.id))
+        .map((image) => applyMove(image, dx, dy));
+      const draggedBox = groupBoundingBox(movedSelected);
+      const others = doc.images.filter((image) => !drag.ids.has(image.id));
+      const targets = computeSnapTargets(others, doc.canvasWidth, doc.canvasHeight);
+      const snap = snapMoveDelta(draggedBox, targets, SNAP_THRESHOLD / zoom);
+      setSnapGuides({ vertical: snap.guideX !== null ? [snap.guideX] : [], horizontal: snap.guideY !== null ? [snap.guideY] : [] });
+      const finalDx = dx + snap.dx;
+      const finalDy = dy + snap.dy;
+      setLiveImages(drag.startImages.map((image) => (drag.ids.has(image.id) ? applyMove(image, finalDx, finalDy) : image)));
+      return;
+    }
+
+    if (snapGuides.vertical.length > 0 || snapGuides.horizontal.length > 0) setSnapGuides({ vertical: [], horizontal: [] });
     setLiveImages(
       drag.startImages.map((image) => {
         if (!drag.ids.has(image.id)) return image;
-        if (drag.mode === "move") return applyMove(image, dx, dy);
         if (drag.mode === "resize" && drag.corner) return applyResize(image, drag.corner, x, y);
         if (drag.mode === "rotate") return applyRotate(image, x, y);
         return image;
@@ -273,6 +480,14 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
   };
 
   const endDrag = (): void => {
+    if (marqueeRef.current) {
+      marqueeRef.current = null;
+      setMarqueeRect(null);
+      return;
+    }
+
+    if (snapGuides.vertical.length > 0 || snapGuides.horizontal.length > 0) setSnapGuides({ vertical: [], horizontal: [] });
+
     const drag = dragRef.current;
     dragRef.current = null;
     if (!drag || !liveImages) {
@@ -406,6 +621,17 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
             <button
               type="button"
               onClick={() => {
+                onDuplicateItem(contextMenu.item);
+                setContextMenu(null);
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
+            >
+              <IoCopyOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+              Duplicate
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 onBringToFront(new Set([contextMenu.item.id]));
                 setContextMenu(null);
               }}
@@ -498,6 +724,133 @@ function drawSelectionChrome(ctx: CanvasRenderingContext2D, image: BoardItem, sh
   }
 
   ctx.restore();
+}
+
+// Draws the group bounding box + its own resize/rotate handles - what handlePointerDown's group
+// branch actually grabs when 2+ items are selected, so it needs a visibly distinct (dashed) outline
+// from each item's own solid one, drawn once around the whole selection rather than per item.
+function drawGroupSelectionChrome(ctx: CanvasRenderingContext2D, bounds: GroupBounds, zoom: number): void {
+  ctx.save();
+  const lineWidth = 2 / zoom;
+  const handleRadius = HANDLE_DRAW_RADIUS / zoom;
+  const rotateOffset = ROTATE_HANDLE_OFFSET / zoom;
+
+  ctx.strokeStyle = "#3b82f6";
+  ctx.lineWidth = lineWidth;
+  ctx.setLineDash([4 / zoom, 4 / zoom]);
+  ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
+  ctx.setLineDash([]);
+
+  const drawHandle = (hx: number, hy: number): void => {
+    ctx.beginPath();
+    ctx.arc(hx, hy, handleRadius, 0, Math.PI * 2);
+    ctx.fillStyle = "#3b82f6";
+    ctx.fill();
+    ctx.lineWidth = lineWidth;
+    ctx.strokeStyle = "#ffffff";
+    ctx.stroke();
+  };
+
+  for (const [hx, hy] of [
+    [bounds.x, bounds.y],
+    [bounds.x + bounds.width, bounds.y],
+    [bounds.x, bounds.y + bounds.height],
+    [bounds.x + bounds.width, bounds.y + bounds.height],
+  ]) {
+    drawHandle(hx, hy);
+  }
+
+  const cx = bounds.x + bounds.width / 2;
+  ctx.beginPath();
+  ctx.moveTo(cx, bounds.y);
+  ctx.lineTo(cx, bounds.y - rotateOffset);
+  ctx.strokeStyle = "#3b82f6";
+  ctx.lineWidth = lineWidth;
+  ctx.stroke();
+  drawHandle(cx, bounds.y - rotateOffset);
+
+  ctx.restore();
+}
+
+// Converts a group-resize pointer position into a scale factor: how far the dragged corner has
+// moved from the anchor, relative to how far it started - used identically for both axes (see
+// handlePointerMove's two calls). Floors the magnitude (not the sign - dragging back past the
+// anchor is allowed to flip the group) so a bbox with near-zero width/height at drag start, or a
+// drag pulled almost onto the anchor point, can't collapse the whole selection to nothing.
+const MIN_GROUP_SCALE = 0.05;
+function groupResizeScale(startCornerCoord: number, anchorCoord: number, currentCoord: number): number {
+  const startDist = startCornerCoord - anchorCoord;
+  if (Math.abs(startDist) < 1) return 1;
+  const scale = (currentCoord - anchorCoord) / startDist;
+  return (scale < 0 ? -1 : 1) * Math.max(MIN_GROUP_SCALE, Math.abs(scale));
+}
+
+// Plain AABB overlap test - used by the marquee-select move handler to decide which items' own
+// (rotated) bounding boxes fall inside the drag rectangle. Both rects are already axis-aligned in
+// canvas-buffer space (an item's rect comes from groupBoundingBox([item]), which already accounts
+// for rotation), so a simple separating-axis check is all this needs.
+function rectsIntersect(a: GroupBounds, b: GroupBounds): boolean {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+}
+
+// Collects every snap-worthy line for a move drag: each non-dragged item's own left/center/right
+// (x) and top/center/bottom (y) edges, plus the canvas's own left/center/right and top/center/
+// bottom - so a dragged item can snap flush with either another item or the board itself. Used by
+// handlePointerMove's "move" branch, recomputed fresh every pointer move (cheap - board item counts
+// are small, and only "other" items are considered, not the dragged selection itself).
+function computeSnapTargets(others: BoardItem[], canvasWidth: number, canvasHeight: number): { x: number[]; y: number[] } {
+  const x: number[] = [0, canvasWidth / 2, canvasWidth];
+  const y: number[] = [0, canvasHeight / 2, canvasHeight];
+  for (const item of others) {
+    const box = groupBoundingBox([item]);
+    x.push(box.x, box.x + box.width / 2, box.x + box.width);
+    y.push(box.y, box.y + box.height / 2, box.y + box.height);
+  }
+  return { x, y };
+}
+
+// Finds the single closest snap target per axis (if any is within `threshold`) for a dragged
+// group's bounding box, checking its own left/center/right against every x target and its top/
+// center/bottom against every y target. Returns the extra (dx, dy) to add on top of the raw pointer
+// delta to land exactly on that target, plus the target's own position for drawing a guide line -
+// null on an axis with nothing close enough to snap to.
+function snapMoveDelta(
+  draggedBox: GroupBounds,
+  targets: { x: number[]; y: number[] },
+  threshold: number
+): { dx: number; dy: number; guideX: number | null; guideY: number | null } {
+  const candidatesX = [draggedBox.x, draggedBox.x + draggedBox.width / 2, draggedBox.x + draggedBox.width];
+  const candidatesY = [draggedBox.y, draggedBox.y + draggedBox.height / 2, draggedBox.y + draggedBox.height];
+
+  let dx = 0;
+  let bestDistX = threshold;
+  let guideX: number | null = null;
+  for (const cx of candidatesX) {
+    for (const tx of targets.x) {
+      const dist = Math.abs(cx - tx);
+      if (dist < bestDistX) {
+        bestDistX = dist;
+        dx = tx - cx;
+        guideX = tx;
+      }
+    }
+  }
+
+  let dy = 0;
+  let bestDistY = threshold;
+  let guideY: number | null = null;
+  for (const cy of candidatesY) {
+    for (const ty of targets.y) {
+      const dist = Math.abs(cy - ty);
+      if (dist < bestDistY) {
+        bestDistY = dist;
+        dy = ty - cy;
+        guideY = ty;
+      }
+    }
+  }
+
+  return { dx, dy, guideX, guideY };
 }
 
 export default BoardCanvas;

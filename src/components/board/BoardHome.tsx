@@ -7,7 +7,7 @@
 // the user wants.
 import React, { useCallback, useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { IoAdd, IoChevronDown, IoEllipsisVertical, IoImagesOutline, IoTrashOutline } from "react-icons/io5";
+import { IoAdd, IoChevronDown, IoCopyOutline, IoEllipsisVertical, IoImagesOutline, IoTrashOutline } from "react-icons/io5";
 import { BoardSummary, createEmptyBoardDocument } from "../../utils/boardTypes";
 import { applyBoardTemplate, BOARD_TEMPLATES, BoardTemplate } from "../../utils/boardTemplates";
 
@@ -93,6 +93,38 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, []);
+
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
+
+  const handleDuplicateBoard = useCallback(
+    async (board: BoardSummary): Promise<void> => {
+      setDuplicatingId(board.id);
+      setOpenMenuId(null);
+      setConfirmDeleteId(null);
+      try {
+        const newId = crypto.randomUUID();
+        // duplicate_board (Rust) only copies files verbatim - see its own doc comment for why.
+        // Load the copy back and patch id/name/timestamps ourselves here, same "frontend owns the
+        // document shape" division of labor every other board command already follows.
+        await invoke("duplicate_board", { sourceId: board.id, newId });
+        const json = await invoke<string>("load_board", { id: newId });
+        const doc = JSON.parse(json);
+        doc.id = newId;
+        doc.name = `${board.name || "Untitled board"} copy`;
+        const now = new Date().toISOString();
+        doc.createdAt = now;
+        doc.updatedAt = now;
+        await invoke("save_board", { id: newId, json: JSON.stringify(doc) });
+        refresh();
+      } catch (err) {
+        console.error("Failed to duplicate board:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setDuplicatingId(null);
+      }
+    },
+    [refresh]
+  );
 
   // Which card's 3-dot menu is open reuses the click-outside pattern above; the template picker
   // below is its own toggle since it's a completely separate popover off a different button.
@@ -230,6 +262,16 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                       onClick={(e) => e.stopPropagation()}
                       className="absolute right-0 top-full mt-1 w-40 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg overflow-hidden"
                     >
+                      <button
+                        type="button"
+                        onClick={() => void handleDuplicateBoard(board)}
+                        disabled={duplicatingId === board.id}
+                        className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+                      >
+                        <IoCopyOutline size={14} />
+                        {duplicatingId === board.id ? "Duplicating…" : "Duplicate board"}
+                      </button>
+                      <div className="border-t border-gray-100 dark:border-neutral-700/70" />
                       <button
                         type="button"
                         onClick={() => (confirmDeleteId === board.id ? void handleDeleteBoard(board.id) : setConfirmDeleteId(board.id))}

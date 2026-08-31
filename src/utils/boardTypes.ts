@@ -116,6 +116,12 @@ export type BoardCommand =
   // row" (images only - see BoardEditor.tsx's handleArrange). Same before/after-pair shape as
   // 'edit', just over an array. Matched by id.
   | { type: "batch-edit"; before: BoardItem[]; after: BoardItem[] }
+  // Several items added/removed at once as ONE undo step - "Duplicate" on a multi-selection, and
+  // bulk delete (see BoardEditor.tsx's handleDuplicateSelected/handleDeleteSelected). Kept distinct
+  // from plain 'add'/'delete' (rather than dispatching one of those per item) specifically so
+  // undoing a 5-item duplicate or delete takes one Ctrl+Z, not five.
+  | { type: "add-batch"; items: BoardItem[] }
+  | { type: "delete-batch"; items: BoardItem[] }
   // Full replacement order for the whole images array - order is the document's only concept of
   // z-order/stacking (last = topmost), same convention imageEditTypes.ts's objects array uses.
   | { type: "reorder"; before: BoardItem[]; after: BoardItem[] }

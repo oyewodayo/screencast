@@ -261,6 +261,7 @@ fn main() {
             services::image_annotations::save_edited_image,
             services::boards::list_boards,
             services::boards::create_board,
+            services::boards::duplicate_board,
             services::boards::save_board,
             services::boards::load_board,
             services::boards::delete_board,

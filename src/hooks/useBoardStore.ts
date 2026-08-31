@@ -25,6 +25,11 @@ export interface UseBoardStoreResult {
   // Replaces several items at once as a single undo step - multi-selection drag, "Arrange in a
   // row". `before`/`after` must be the same items (matched by id) before/after the batch op.
   batchEditImages: (before: BoardItem[], after: BoardItem[]) => void;
+  // Adds/removes several items at once as ONE undo step - "Duplicate" on a multi-selection, and
+  // bulk delete. Distinct from calling addImage/deleteImage in a loop, which would create one undo
+  // step per item.
+  addItems: (items: BoardItem[]) => void;
+  deleteItems: (items: BoardItem[]) => void;
   // Full replacement order for the whole images array - drag-to-reorder in the layers list.
   reorderImages: (newOrder: BoardItem[]) => void;
   // `null` = transparent - see BoardDocument's own doc comment.
@@ -168,6 +173,22 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     [dispatch]
   );
 
+  const addItems = useCallback(
+    (items: BoardItem[]) => {
+      if (items.length === 0) return;
+      dispatch({ type: "add-batch", items });
+    },
+    [dispatch]
+  );
+
+  const deleteItems = useCallback(
+    (items: BoardItem[]) => {
+      if (items.length === 0) return;
+      dispatch({ type: "delete-batch", items });
+    },
+    [dispatch]
+  );
+
   const reorderImages = useCallback(
     (newOrder: BoardItem[]) => {
       const current = docRef.current;
@@ -274,6 +295,8 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     editImage,
     deleteImage,
     batchEditImages,
+    addItems,
+    deleteItems,
     reorderImages,
     setBackgroundColor,
     setBackgroundMode,
