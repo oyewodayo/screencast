@@ -22,6 +22,7 @@ import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
 import ImageFolderGallery from "../components/ImageFolderGallery";
 import VideoFolderGallery from "../components/VideoFolderGallery";
+import PdfFolderGallery from "../components/PdfFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { DocSummary } from "../utils/docTypes";
@@ -79,6 +80,12 @@ const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.R
 // a FileCategory (getFileCategory never returns it; it's a distinct data source, not an
 // extension-based filter over `files`), so it gets its own type rather than being folded in.
 type SidebarTab = FileCategory | "trash";
+
+// Categories with a folder-click grid view (ImageFolderGallery/VideoFolderGallery/
+// PdfFolderGallery) - audio and document don't have one yet. Centralized so adding a category's
+// gallery later is a one-line change here instead of hunting down every activeFileCategory === "x"
+// || activeFileCategory === "y" check this gates.
+const GALLERY_CATEGORIES: readonly SidebarTab[] = ["image", "video", "pdf"];
 
 interface TrashEntry {
   trashed_name: string;
@@ -1743,8 +1750,12 @@ const setScreen = () => {
 		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "video") : []),
 		[files, selectedFolder]
 	);
-	// Not category-specific despite living alongside the two memos above - every folder in the
-	// library, for either gallery's "Move to" list.
+	const selectedFolderPdfs = useMemo(
+		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "pdf") : []),
+		[files, selectedFolder]
+	);
+	// Not category-specific despite living alongside the memos above - every folder in the
+	// library, for any gallery's "Move to" list.
 	const folderOptions = useMemo(
 		() => Object.keys(files).sort((a, b) => a.localeCompare(b)).map((key) => ({ key, label: folderDisplayName(key) })),
 		[files]
@@ -2543,18 +2554,19 @@ const setScreen = () => {
                       >
                         <h4
                           className={`text-xs font-semibold flex items-center gap-1 min-w-0 truncate cursor-pointer ${
-                            (activeFileCategory === "image" || activeFileCategory === "video") && selectedFolder === folder
+                            GALLERY_CATEGORIES.includes(activeFileCategory) && selectedFolder === folder
                               ? "text-blue-600 dark:text-blue-400"
                               : "text-gray-500 dark:text-neutral-400"
                           }`}
                           title={collapsedFolders.has(folder) ? `Expand ${folderDisplayName(folder)}` : `Collapse ${folderDisplayName(folder)}`}
                           onClick={() => {
                             toggleFolderCollapsed(folder);
-                            // Image and Video tabs only: clicking a folder also loads its files as
-                            // a thumbnail grid in the main board (see selectedFolder above) - the
-                            // other tabs (audio/pdf/etc.) don't have a gallery view yet, so this is
-                            // a no-op for them beyond the existing expand/collapse.
-                            if (activeFileCategory === "image" || activeFileCategory === "video") {
+                            // Gallery categories only (see GALLERY_CATEGORIES): clicking a folder
+                            // also loads its files as a thumbnail grid in the main board (see
+                            // selectedFolder above) - other tabs (audio/document) don't have a
+                            // gallery view yet, so this is a no-op for them beyond the existing
+                            // expand/collapse.
+                            if (GALLERY_CATEGORIES.includes(activeFileCategory)) {
                               setSelectedFolder(folder);
                               setSelectedFile(null);
                               setBoardScreen(null);
@@ -3147,6 +3159,29 @@ const setScreen = () => {
               onOpenVideo={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
               onConvertFile={(file) => setConversionFile(file)}
+              renamingFile={renamingFile}
+              renameValue={renameValue}
+              onRenameValueChange={setRenameValue}
+              onStartRename={startRename}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenamingFile(null)}
+              selectedFilePaths={selectedFilePaths}
+              onToggleFileSelected={toggleFileSelected}
+              onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
+              onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
+              onClearSelection={() => setSelectedFilePaths(new Set())}
+              folderOptions={folderOptions}
+              currentFolder={selectedFolder}
+              onMoveFiles={handleMoveFiles}
+              onBulkDelete={handleBulkDeleteFiles}
+            />
+          ) : selectedFolder !== null && activeFileCategory === "pdf" ? (
+            <PdfFolderGallery
+              files={selectedFolderPdfs}
+              folderLabel={folderDisplayName(selectedFolder)}
+              resolveAssetUrl={resolvePreviewAssetUrl}
+              onOpenPdf={(file) => loadFileForPlayback(file.path, file.name)}
+              onDeleteFile={handleDeleteFile}
               renamingFile={renamingFile}
               renameValue={renameValue}
               onRenameValueChange={setRenameValue}
