@@ -321,11 +321,18 @@ pub async fn convert_to_mp4(
     Ok(result)
 }
 
-// Deterministic, content-addressed cache location for the "just play, no prompts" preview
-// fallback (see get_playable_preview below) - keyed by the source path plus its modification
-// time, so a file replaced at the same path invalidates and regenerates automatically instead
-// of ever silently reusing a stale preview.
-fn preview_cache_path(input: &PathBuf) -> Result<PathBuf, String> {
+// Deterministic, content-addressed cache location for a "just display/play it, no prompts"
+// preview (see get_playable_preview and get_heic_preview below) - keyed by the source path plus
+// its modification time, so a file replaced at the same path invalidates and regenerates
+// automatically instead of ever silently reusing a stale preview. `namespace` is a subdirectory,
+// not just decoration - it's what lets a *decoder* change (not just a source file change) bust
+// old cached output too: get_heic_preview used to fall back to ffmpeg, whose HEIF tile-grid
+// reconstruction badly under-reconstructed these photos (a cropped fragment, not just lower
+// quality) - every photo previewed before that got fixed left a wrong-but-permanently-cached PNG
+// sitting here under the *same* path+mtime key the corrected decoder would also produce, so nothing
+// short of a namespace change would ever have invalidated it. Bump the namespace's suffix (e.g.
+// "heic_v3") again if a future decoder change needs the same guarantee.
+fn preview_cache_path(input: &PathBuf, namespace: &str, output_ext: &str) -> Result<PathBuf, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -342,7 +349,7 @@ fn preview_cache_path(input: &PathBuf) -> Result<PathBuf, String> {
     modified_secs.hash(&mut hasher);
     let key = hasher.finish();
 
-    Ok(std::env::temp_dir().join("briefcast_preview_cache").join(format!("{:x}.mp4", key)))
+    Ok(std::env::temp_dir().join("briefcast_preview_cache").join(namespace).join(format!("{:x}.{}", key, output_ext)))
 }
 
 // Silent, no-prompt fallback for a file the in-app player can't decode natively - most notably
@@ -372,7 +379,7 @@ pub async fn get_playable_preview(
     input_path: String,
 ) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
-    let cache_path = preview_cache_path(&input)?;
+    let cache_path = preview_cache_path(&input, "video", "mp4")?;
 
     // Already converted (fully, from a previous open) - just hand back the finished file, no
     // need to ever re-run ffmpeg for the same source.
@@ -493,36 +500,42 @@ async fn convert_heic_windows(
 
     // Windows' own HEIC decoder needs the HEVC Video Extensions codec package installed (separate
     // from HEIF Image Extensions, which just handles the container/metadata) - plenty of machines
-    // only have the latter. Rather than fail outright when that codec is missing, fall back to the
-    // bundled ffmpeg's own HEVC decoder directly on the HEIC file. ffmpeg's automatic stream
-    // selection is what produced the original black-image bug for multi-image (Portrait mode/Deep
-    // Fusion) photos - `-map 0:0` pins it to the primary/default-flagged image instead. For a
-    // simple single-image HEIC file (no stream groups) this is a no-op, same stream ffmpeg's
-    // default selection would have picked anyway; for a complex one it trades resolution (ffmpeg's
-    // HEIF tile-grid reconstruction in this build tops out well below the photo's real size) for
-    // at least getting the correct photo instead of a black frame.
+    // only have the latter. Rather than fail outright when that codec is missing, fall back to a
+    // bundled libheif build (services/heif_tool.rs) instead of the app's own ffmpeg - ffmpeg's
+    // HEIF tile-grid reconstruction badly under-reconstructs the tiled grid modern iPhone photos
+    // are stored as (a small, blown-up fragment of the real photo, not just lower resolution -
+    // confirmed against real user photos), where libheif is the reference implementation and gets
+    // it right.
     let result = match native_result {
         Ok(path) => Ok(path),
         Err(native_err) => {
-            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to ffmpeg", input.display());
-            let codec_args: Vec<&str> = match format.as_str() {
-                "png" | "jpeg" | "jpg" | "webp" | "bmp" => vec!["-map", "0:0"],
-                _ => return Err(format!("Unsupported output format: {}", output_format)),
-            };
-            let fallback = run_conversion(
-                app_handle,
-                window,
-                state,
-                &[InputSpec::plain(input.to_string_lossy().to_string())],
-                &input.to_string_lossy(),
-                final_output,
-                &codec_args,
-            )
-            .await;
-            if let Err(ffmpeg_err) = &fallback {
-                log::error!("HEIC ffmpeg fallback also failed for {}: {ffmpeg_err}", input.display());
+            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to bundled libheif", input.display());
+            let fallback: Result<String, String> = async {
+                if format == "png" {
+                    crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), final_output.clone()).await?;
+                    Ok(final_output.to_string_lossy().to_string())
+                } else {
+                    let temp_png = final_output.with_extension("heic_tmp.png");
+                    crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), temp_png.clone()).await?;
+                    let transcode = run_conversion(
+                        app_handle,
+                        window,
+                        state,
+                        &[InputSpec::plain(temp_png.to_string_lossy().to_string())],
+                        &input.to_string_lossy(),
+                        final_output.clone(),
+                        &[],
+                    )
+                    .await;
+                    let _ = std::fs::remove_file(&temp_png);
+                    transcode
+                }
             }
-            fallback.map_err(|ffmpeg_err| format!("{native_err}; fallback conversion also failed: {ffmpeg_err}"))
+            .await;
+            if let Err(heif_err) = &fallback {
+                log::error!("HEIC libheif fallback also failed for {}: {heif_err}", input.display());
+            }
+            fallback.map_err(|heif_err| format!("{native_err}; fallback conversion also failed: {heif_err}"))
         }
     };
 
@@ -551,6 +564,127 @@ async fn convert_heic_windows(
     }
 
     result
+}
+
+// Silent, cached HEIC/HEIF -> PNG preview for on-screen display only, at full resolution - the
+// single-image viewer's counterpart to get_playable_preview above but for photos instead of
+// video (get_image_thumbnail below is the gallery-grid counterpart - deliberately a *different*
+// command, since a grid tile only ever needs a few hundred pixels and paying this function's full
+// decode cost per thumbnail was exactly what made opening a large HEIC folder painfully slow).
+// WebView2 has no HEIC decoder at all, so a plain <img src> just fails to load one. Unlike
+// convert_image/convert_heic_windows (an explicit, user-triggered "Convert" that writes a
+// permanent sibling file into the library), this never touches the source file and never adds
+// anything to the library - it only ever writes into the same content-addressed temp cache
+// get_playable_preview uses, so viewing the same photo again is instant and nothing shows up next
+// to the original in the file list. Frontend calls this once per HEIC/HEIF file (see
+// Dashboard.tsx's resolveImageDisplayUrl) and feeds the returned path through the same
+// convert_file_path_to_url + convertFileSrc round-trip every other preview already uses.
+#[tauri::command]
+pub async fn get_heic_preview(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    input_path: String,
+) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "heic_v2", "png")?;
+
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = (&window, &state); // only used by the non-Windows branch below
+        if let Err(native_err) = crate::services::heic_windows::decode_to_png(input.clone(), cache_path.clone()).await {
+            // Windows' own HEIC decoder needs the HEVC Video Extensions codec package installed
+            // (separate from HEIF Image Extensions) - plenty of machines only have the latter. Same
+            // bundled-libheif fallback as convert_heic_windows above; see its comment for why that
+            // replaced an ffmpeg fallback here.
+            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to bundled libheif", input.display());
+            if let Err(heif_err) = crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), cache_path.clone()).await {
+                log::error!("HEIC libheif fallback also failed for {}: {heif_err}", input.display());
+                return Err(format!("{native_err}; fallback conversion also failed: {heif_err}"));
+            }
+        }
+        path_to_str(&cache_path).map(|s| s.to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, cache_path, &[]).await
+    }
+}
+
+// Long edge, in pixels, of a gallery-grid thumbnail - generous headroom over the CSS tile size
+// (ImageFolderGallery.tsx renders these well under 300px) for high-DPI displays, while staying
+// small enough that decoding one in the browser is cheap and 100+ of them fit comfortably in the
+// renderer's image cache at once (the full-resolution originals didn't - see get_image_thumbnail
+// below).
+const GALLERY_THUMBNAIL_MAX_DIMENSION: u32 = 480;
+
+// Silent, cached, small preview for an image gallery grid tile - counterpart to get_heic_preview
+// above, but deliberately NOT that function at a smaller size: ImageFolderGallery.tsx used to
+// point every grid tile straight at the full-resolution decode (get_heic_preview, or the plain
+// original file for non-HEIC), which is correct for a single enlarged view but wrong for a grid
+// of 100+ tiles - each one is a multi-megapixel decoded bitmap the browser's image cache can't
+// hold all of at once, so scrolling away and back forced a re-decode of whatever got evicted
+// (observed directly: images visibly "reloading" on scroll-up, and the initial load being far
+// slower than it needed to be). This produces something actually sized for a thumbnail instead.
+//
+// HEIC/HEIF goes through the bundled heif-thumbnailer (services/heif_tool.rs) - it renders the
+// small embedded preview HEIC containers already carry (or a fast downscale of the primary image
+// if there isn't one) rather than doing heif-dec's full tile-grid reconstruction, which measured
+// roughly 20x faster per photo in practice. Every other format is decoded and downscaled directly
+// via the `image` crate, in-process - no bundled binary needed for those, and cheaper than
+// shelling out to ffmpeg for something this small.
+#[tauri::command]
+pub async fn get_image_thumbnail(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "thumb_v1", "jpg")?;
+
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+    }
+
+    let ext = input.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+    #[cfg(windows)]
+    if matches!(ext.as_deref(), Some("heic") | Some("heif")) {
+        if let Err(err) = crate::services::heif_tool::extract_thumbnail(app_handle, input.clone(), cache_path.clone(), GALLERY_THUMBNAIL_MAX_DIMENSION).await {
+            log::error!("HEIC thumbnail failed for {}: {err}", input.display());
+            return Err(err);
+        }
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    #[cfg(not(windows))]
+    let _ = &ext; // HEIC thumbnails aren't specially handled outside Windows yet (see heif_tool.rs)
+
+    let input_for_blocking = input.clone();
+    let cache_for_blocking = cache_path.clone();
+    tauri::async_runtime::spawn_blocking(move || generate_plain_thumbnail(&input_for_blocking, &cache_for_blocking))
+        .await
+        .map_err(|e| format!("Thumbnail task panicked: {e}"))?
+        .map_err(|err| {
+            log::error!("Image thumbnail failed for {}: {err}", input.display());
+            err
+        })?;
+
+    path_to_str(&cache_path).map(|s| s.to_string())
+}
+
+fn generate_plain_thumbnail(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+    let img = image::open(input).map_err(|e| format!("Failed to open image: {e}"))?;
+    img.thumbnail(GALLERY_THUMBNAIL_MAX_DIMENSION, GALLERY_THUMBNAIL_MAX_DIMENSION)
+        .save(output)
+        .map_err(|e| format!("Failed to save thumbnail: {e}"))
 }
 
 // Convert an audio file between mp3/wav/aac/flac/ogg/m4a. -vn drops any video stream before

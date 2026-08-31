@@ -19,6 +19,7 @@ import ConversionDialog from "../components/ConversionDialog";
 import BulkConversionDialog, { BulkConversionSummary } from "../components/BulkConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
+import ImageFolderGallery from "../components/ImageFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { DocSummary } from "../utils/docTypes";
@@ -329,6 +330,12 @@ const Dashboard = () => {
   const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(new Set());
   const [bulkMoveMenuOpen, setBulkMoveMenuOpen] = useState<boolean>(false);
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
+  // Folder relative-path whose images are shown as a thumbnail grid in the main board - set by
+  // clicking an Image-tab folder header in the sidebar (see the folder header onClick below), and
+  // cleared whenever the active category tab changes so a stale gallery can't linger into another
+  // tab's empty state. Independent of selectedFile: opening a thumbnail sets selectedFile without
+  // clearing this, so the board's "Back to <folder>" button (below) can return to the grid.
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   // Lifted here (single call site - useVideoEditStore is a stateful hook, unsafe to call from
   // more than one component) so both the video-tools timeline (via BottomDocker/FileToolsDocker/
   // VideoTimelineDocker) and the text-overlay preview layer mounted alongside VideoPlayer below
@@ -338,13 +345,10 @@ const Dashboard = () => {
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
-  // load_image_edit_state invoke. HEIC/HEIF are excluded too - they render as a "Convert to
-  // view" prompt instead of ImageEditor (see the main content pane below), so loading edit state
-  // for them would just be a wasted invoke that's also doomed to fail decoding the source photo.
-  const isImageFileSelected =
-    !!selectedFile &&
-    getFileCategory(selectedFile.name) === "image" &&
-    !["heic", "heif"].includes(getFileExtension(selectedFile.name));
+  // load_image_edit_state invoke. HEIC/HEIF included - selectedFile.path is already a decoded
+  // PNG for them by the time this reads it (see resolveImageDisplayUrl/loadFileForPlayback), so
+  // there's nothing left to fail decoding.
+  const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
@@ -414,14 +418,52 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // point it at a different file entirely without touching selectedFile itself.
   const previewSourcePathRef = useRef<string | null>(null);
 
-  const resolvePreviewAssetUrl = async (sourcePath: string): Promise<string> => {
+  // useCallback'd (stable identity across renders, not just a stable cache Map) because these
+  // three resolvers are passed as props into ImageFolderGallery, whose own thumbnail-resolving
+  // effect depends on resolveThumbnailUrl's identity (see that file). Without this, every
+  // Dashboard re-render - including one triggered by nothing more than a gallery selection click,
+  // since selectedFilePaths lives here - handed the gallery a brand-new function reference, which
+  // re-triggered that effect and re-resolved every already-cached thumbnail on every click. That
+  // was the actual "selection is lagging/hanging" bug: not the selection logic itself, but a full
+  // thumbnail-resolution storm firing on every click as a side effect of it.
+  const resolvePreviewAssetUrl = useCallback(async (sourcePath: string): Promise<string> => {
     const cached = previewAssetUrlCacheRef.current.get(sourcePath);
     if (cached) return cached;
     const absolutePath = await invoke<string>("convert_file_path_to_url", { filepath: sourcePath });
     const url = convertFileSrc(absolutePath);
     previewAssetUrlCacheRef.current.set(sourcePath, url);
     return url;
-  };
+  }, []);
+
+  // Full-resolution display URL for an image file - the single-image viewer's resolver (also used
+  // by the gallery's "Copy image" action, which should copy full quality, not a thumbnail). Same
+  // as resolvePreviewAssetUrl above except HEIC/HEIF (WebView2 has no decoder for it at all) first
+  // gets silently decoded to a cached PNG on the backend (get_heic_preview, content-addressed by
+  // path+mtime - see conversion.rs) so it just displays with no "Convert" step and nothing added
+  // to the library. get_heic_preview itself is nearly free on a cache hit (a single file-exists
+  // check), so it's fine to call on every resolve rather than adding a second JS-side cache here.
+  //
+  // Deliberately NOT what the gallery grid (ImageFolderGallery.tsx) uses for its tiles - see
+  // resolveImageThumbnailUrl below for why a full decode per grid tile turned out to be a real
+  // problem, not just a slower one.
+  const resolveImageDisplayUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
+    if (!["heic", "heif"].includes(getFileExtension(file.name))) return resolvePreviewAssetUrl(file.path);
+    const previewPath = await invoke<string>("get_heic_preview", { inputPath: file.path });
+    return resolvePreviewAssetUrl(previewPath);
+  }, [resolvePreviewAssetUrl]);
+
+  // Small (~480px) display URL for an image gallery grid tile - get_image_thumbnail generates and
+  // caches a properly downscaled preview on the backend (HEIC/HEIF via the bundled
+  // heif-thumbnailer, everything else via the `image` crate) instead of handing the tile a
+  // full-resolution decode. The grid used to just call resolveImageDisplayUrl above for every
+  // tile: fine for one image, but a folder of 100+ multi-megapixel photos meant the browser's
+  // image cache couldn't hold every decoded bitmap at once, so scrolling away and back forced a
+  // re-decode of whatever got evicted - visible as thumbnails "reloading" while scrolling, on top
+  // of the initial load already being far slower than a grid of small tiles should be.
+  const resolveImageThumbnailUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
+    const thumbPath = await invoke<string>("get_image_thumbnail", { inputPath: file.path });
+    return resolvePreviewAssetUrl(thumbPath);
+  }, [resolvePreviewAssetUrl]);
 
   // The video-tools timeline's own seek, extended to know *which file* it's seeking within -
   // once a clip can be dragged in from a different file than the one currently open, "seek to
@@ -1341,15 +1383,12 @@ const setScreen = () => {
   // anywhere" picker below — both just need a raw filesystem path turned into a playable URL.
 	const loadFileForPlayback = async (filePath: string, fileName: string) => {
 	try {
-		// Get the absolute file path from Rust
-		const absolutePath = await invoke<string>("convert_file_path_to_url", {
-		filepath: filePath
-		});
-
-		console.log('Absolute file path:', absolutePath);
-
-		// Convert to asset protocol URL using Tauri's helper
-		const fileUrl = convertFileSrc(absolutePath);
+		// Images (including HEIC/HEIF, auto-decoded to a cached PNG - see resolveImageDisplayUrl)
+		// resolve through their own path; everything else is the plain convert_file_path_to_url +
+		// convertFileSrc round-trip.
+		const fileUrl = getFileCategory(fileName) === "image"
+			? await resolveImageDisplayUrl({ name: fileName, path: filePath })
+			: convertFileSrc(await invoke<string>("convert_file_path_to_url", { filepath: filePath }));
 
 		console.log('Converted file URL:', fileUrl);
 
@@ -1614,6 +1653,21 @@ const setScreen = () => {
 	const folderDisplayName = (folder: string): string => (folder === "" ? "Briefcast" : folder.split("/").pop()!);
 	const folderDepth = (folder: string): number => (folder === "" ? 0 : folder.split("/").length);
 
+	// Memoized for the same reason resolvePreviewAssetUrl etc. are useCallback'd above: passed as
+	// the `files`/`folderOptions` props into ImageFolderGallery, which uses `files`'s identity as a
+	// dependency of its own thumbnail-resolving effect. Recomputing a fresh array here on every
+	// Dashboard render (as this used to do inline in the JSX below) handed the gallery a new array
+	// reference on every render regardless of whether the underlying file list had actually
+	// changed - including on every selection click - which re-triggered that effect needlessly.
+	const selectedFolderImages = useMemo(
+		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "image") : []),
+		[files, selectedFolder]
+	);
+	const imageFolderOptions = useMemo(
+		() => Object.keys(files).sort((a, b) => a.localeCompare(b)).map((key) => ({ key, label: folderDisplayName(key) })),
+		[files]
+	);
+
 	const findFileFolder = (path: string): string | null => {
 		for (const [folder, list] of Object.entries(files)) {
 			if (list.some((f) => f.path === path)) return folder;
@@ -1738,6 +1792,38 @@ const setScreen = () => {
 		} catch (error) {
 			console.error("Error moving files:", error);
 			setError(`Failed to move files: ${error}`);
+		}
+	};
+
+	// Bulk counterpart to handleDeleteFile above - same move_to_trash-per-file/Promise.allSettled/
+	// combined-message shape handleMoveFiles uses for a bulk move. Shared by the sidebar's own
+	// bulk action bar and the image gallery's selection panel (ImageFolderGallery.tsx).
+	const handleBulkDeleteFiles = async (fileList: FileEntry[]) => {
+		if (fileList.length === 0) return;
+		try {
+			const results = await Promise.allSettled(fileList.map((file) => invoke("move_to_trash", { path: file.path })));
+			results.forEach((result, i) => {
+				if (result.status === "fulfilled") {
+					if (selectedFile?.sourcePath === fileList[i].path) setSelectedFile(null);
+					const { pinned, recent } = forgetFile(fileList[i].path);
+					setPinnedPaths(pinned);
+					setRecentPaths(recent);
+				}
+			});
+			await handleDirectoryFiles();
+			setSelectedFilePaths(new Set());
+			const failedCount = results.filter((r) => r.status === "rejected").length;
+			if (failedCount > 0) {
+				const firstError = results.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason;
+				setError(`Moved ${fileList.length - failedCount} of ${fileList.length} file(s) to trash — ${failedCount} failed: ${firstError}`);
+			} else if (fileList.length === 1) {
+				setMessage(`Moved to trash: ${formatFileName(fileList[0].name)}`);
+			} else {
+				setMessage(`Moved ${fileList.length} files to trash`);
+			}
+		} catch (error) {
+			console.error("Error deleting files:", error);
+			setError(`Failed to delete files: ${error}`);
 		}
 	};
 
@@ -1981,6 +2067,7 @@ const setScreen = () => {
                       onClick={() => {
                         setActiveFileCategory(category);
                         setSelectedFilePaths(new Set());
+                        setSelectedFolder(null);
                       }}
                       className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
                         activeFileCategory === category
@@ -2194,6 +2281,13 @@ const setScreen = () => {
                       )}
                       <button
                         type="button"
+                        onClick={() => handleBulkDeleteFiles(getSelectedFileEntries())}
+                        className="text-xs font-medium text-red-600 dark:text-red-400 hover:underline"
+                      >
+                        Delete
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => setSelectedFilePaths(new Set())}
                         className="text-xs text-neutral-500 dark:text-neutral-400 hover:underline"
                       >
@@ -2297,9 +2391,25 @@ const setScreen = () => {
                         style={{ paddingLeft: 4 + folderDepth(folder) * 10 }}
                       >
                         <h4
-                          className="text-xs font-semibold text-gray-500 dark:text-neutral-400 flex items-center gap-1 min-w-0 truncate cursor-pointer"
+                          className={`text-xs font-semibold flex items-center gap-1 min-w-0 truncate cursor-pointer ${
+                            activeFileCategory === "image" && selectedFolder === folder
+                              ? "text-blue-600 dark:text-blue-400"
+                              : "text-gray-500 dark:text-neutral-400"
+                          }`}
                           title={collapsedFolders.has(folder) ? `Expand ${folderDisplayName(folder)}` : `Collapse ${folderDisplayName(folder)}`}
-                          onClick={() => toggleFolderCollapsed(folder)}
+                          onClick={() => {
+                            toggleFolderCollapsed(folder);
+                            // Image tab only: clicking a folder also loads its images as a
+                            // thumbnail grid in the main board (see selectedFolder above) - the
+                            // other tabs (video/audio/pdf/etc.) don't have a gallery view yet, so
+                            // this is a no-op for them beyond the existing expand/collapse.
+                            if (activeFileCategory === "image") {
+                              setSelectedFolder(folder);
+                              setSelectedFile(null);
+                              setBoardScreen(null);
+                              setDocsScreen(null);
+                            }
+                          }}
                         >
                           <IoChevronForward size={10} className={`shrink-0 transition-transform ${collapsedFolders.has(folder) ? "" : "rotate-90"}`} />
                           <IoFolderOutline size={12} className="shrink-0" />
@@ -2648,7 +2758,18 @@ const setScreen = () => {
               }}
             />
           )}
-         <div className="flex-1 min-w-0 min-h-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
+         <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
+
+          {selectedFolder && selectedFile && !boardScreen && !docsScreen && (
+            <button
+              type="button"
+              onClick={() => setSelectedFile(null)}
+              className="absolute top-3 left-3 z-10 flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
+            >
+              <IoChevronBack size={14} />
+              Back to {folderDisplayName(selectedFolder)}
+            </button>
+          )}
 
           {boardScreen ? (
             <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
@@ -2678,27 +2799,11 @@ const setScreen = () => {
                 isFullscreen={isPdfFullscreen}
                 onToggleFullscreen={handleTogglePdfFullscreen}
               />
-            ) : getFileCategory(selectedFile.name) === "image" &&
-              ["heic", "heif"].includes(getFileExtension(selectedFile.name)) ? (
-              // HEIC/HEIF (iPhone's default photo format) has no Chromium/WebView2 decoder, so
-              // handing it to ImageEditor would just fail to decode - route straight to the
-              // existing ffmpeg-backed Convert flow instead (it already turns HEIC into a
-              // previewable jpg/png fine; see convert_image).
-              <div key={selectedFile.path} className="w-full h-full flex flex-col items-center justify-center gap-3 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-300">
-                <IoImage size={48} className="text-neutral-300 dark:text-neutral-600" />
-                <p className="text-sm font-medium max-w-md truncate px-4">{selectedFile.name}</p>
-                <p className="text-xs text-neutral-400 dark:text-neutral-500 max-w-sm text-center px-4">
-                  This is an iPhone HEIC photo - Briefcast can't preview it directly. Convert it to JPEG or PNG to view and edit it.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setConversionFile({ path: selectedFile.sourcePath, name: selectedFile.name })}
-                  className="mt-1 px-4 py-2 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700"
-                >
-                  Convert to view
-                </button>
-              </div>
             ) : getFileCategory(selectedFile.name) === "image" ? (
+              // HEIC/HEIF (iPhone's default photo format) has no Chromium/WebView2 decoder, but
+              // selectedFile.path is already a silently-decoded, cached PNG for those by the time
+              // it gets here (see resolveImageDisplayUrl/loadFileForPlayback) - ImageEditor never
+              // has to know the source was HEIC at all.
               <ImageEditor
                 key={selectedFile.path}
                 sourcePath={selectedFile.sourcePath}
@@ -2809,6 +2914,31 @@ const setScreen = () => {
                 activeClipEffects={activeClipEffects}
               />
             )
+          ) : selectedFolder ? (
+            <ImageFolderGallery
+              files={selectedFolderImages}
+              folderLabel={folderDisplayName(selectedFolder)}
+              resolveThumbnailUrl={resolveImageThumbnailUrl}
+              resolveFullUrl={resolveImageDisplayUrl}
+              onOpenImage={(file) => loadFileForPlayback(file.path, file.name)}
+              onDeleteFile={handleDeleteFile}
+              onConvertFile={(file) => setConversionFile(file)}
+              renamingFile={renamingFile}
+              renameValue={renameValue}
+              onRenameValueChange={setRenameValue}
+              onStartRename={startRename}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenamingFile(null)}
+              selectedFilePaths={selectedFilePaths}
+              onToggleFileSelected={toggleFileSelected}
+              onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
+              onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
+              onClearSelection={() => setSelectedFilePaths(new Set())}
+              folderOptions={imageFolderOptions}
+              currentFolder={selectedFolder}
+              onMoveFiles={handleMoveFiles}
+              onBulkDelete={handleBulkDeleteFiles}
+            />
           ) : (
             <div className="relative flex flex-col items-center justify-center h-full w-full gap-6 px-8 overflow-hidden">
               {/* Purely decorative - a soft color glow plus a faint graph-paper line grid, sat

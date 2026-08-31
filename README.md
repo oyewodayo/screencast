@@ -184,7 +184,9 @@ bundled.
 Briefcast shells out to `ffmpeg.exe`/`ffprobe.exe`/`ffplay.exe` at
 `src-tauri/binaries/ffmpeg/` rather than requiring a system-wide install — but those
 binaries are gitignored (not committed to this repo, not even via Git LFS), so you need
-to place them yourself before the app can record, convert, or probe anything.
+to place them yourself before the app can record, convert, or probe anything. HEIC/HEIF
+photo preview needs two more bundled binaries at `src-tauri/binaries/heif/` — same
+gitignored-and-place-yourself deal (see below).
 
 ## Getting started
 
@@ -198,6 +200,24 @@ npm install
 Then download a Windows FFmpeg build (e.g. from
 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)) and copy `ffmpeg.exe`, `ffprobe.exe`,
 and `ffplay.exe` into `src-tauri/binaries/ffmpeg/`.
+
+HEIC/HEIF (iPhone photo) preview also needs two bundled binaries at
+`src-tauri/binaries/heif/` — `heif-dec.exe` (full-resolution decode, for the single-image
+viewer and "Convert") and `heif-thumbnailer.exe` (fast small preview, for the image
+gallery grid) — alongside every DLL they depend on. Windows' own HEIC decoder (used
+first) needs OS codec packages that aren't reliably present on every machine, and the
+ffmpeg build above doesn't reconstruct these photos' tiled internal format correctly, so
+this app bundles [libheif](https://github.com/strukturag/libheif) — the reference HEIF
+implementation — as its fallback decoder instead. The simplest way to get a matching
+build: install [MSYS2](https://www.msys2.org/), then from an MSYS2 shell:
+
+```bash
+pacman -S mingw-w64-x86_64-libheif
+```
+
+and copy `heif-dec.exe`, `heif-thumbnailer.exe`, and every DLL `ldd heif-dec.exe` (run
+from `/mingw64/bin`) lists under `/mingw64/bin` into `src-tauri/binaries/heif/` (the two
+tools share the same DLLs, so one `ldd` pass covers both).
 
 ```bash
 npm run tauri dev
@@ -270,6 +290,7 @@ screencast/
 │   │   │   └── loopback_audio.rs    # WASAPI loopback (system audio) capture
 │   │   └── views/                   # Standalone window (recording-completed popup)
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
+│   ├── binaries/heif/               # Bundled libheif (heif-dec.exe + DLLs) - HEIC/HEIF fallback decode
 │   └── tauri.conf.json              # Tauri app/window/permissions configuration
 └── public/                          # Static assets (icons, notification sounds)
 ```
@@ -290,6 +311,13 @@ screencast/
 The FFmpeg binaries are gitignored and not part of a fresh clone — confirm
 `src-tauri/binaries/ffmpeg/ffmpeg.exe` and `ffprobe.exe` actually exist on disk (see
 [Getting started](#getting-started)).
+
+**"Failed to resolve heif-dec at ..." when opening a HEIC/HEIF photo**
+Same as above but for `src-tauri/binaries/heif/heif-dec.exe` — see
+[Getting started](#getting-started) for how to obtain it. This path only gets hit as a
+fallback (when Windows' own HEIC decoder fails), so most HEIC photos will still preview
+fine without it on a machine that already has the OS codec packages installed; only
+photos that need the fallback will error until it's in place.
 
 **No audio/video devices listed**
 Briefcast enumerates DirectShow devices via `ffmpeg -f dshow -list_devices`. Make sure
