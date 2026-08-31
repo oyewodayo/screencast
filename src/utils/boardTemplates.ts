@@ -40,6 +40,23 @@ export const BOARD_TEMPLATES: BoardTemplate[] = [
     backgroundGrid: { spacing: 32, lineColor: "#333333", baseColor: "#0a0a0a" },
     padding: 24,
   },
+  {
+    id: "blueprint",
+    name: "Blueprint",
+    backgroundMode: "grid",
+    backgroundColor: "#0b2545",
+    backgroundGrid: { spacing: 36, lineColor: "#4f83bf", baseColor: "#0b2545" },
+    padding: 24,
+  },
+  { id: "kraft-paper", name: "Kraft Paper", backgroundMode: "color", backgroundColor: "#c9a876", backgroundGrid: null, padding: 36 },
+  {
+    id: "charcoal-portfolio",
+    name: "Charcoal Portfolio",
+    backgroundMode: "grid",
+    backgroundColor: "#242424",
+    backgroundGrid: { spacing: 48, lineColor: "#3a3a3a", baseColor: "#242424" },
+    padding: 28,
+  },
 ];
 
 export function applyBoardTemplate(doc: BoardDocument, template: BoardTemplate): BoardDocument {

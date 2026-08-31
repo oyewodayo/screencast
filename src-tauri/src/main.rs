@@ -267,6 +267,7 @@ fn main() {
             services::boards::import_board_image,
             services::boards::save_board_thumbnail,
             services::boards::export_board_png,
+            services::boards::export_board_png_to_path,
             services::docs::list_docs,
             services::docs::create_doc,
             services::docs::save_doc,

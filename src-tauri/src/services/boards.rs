@@ -152,13 +152,18 @@ pub fn save_board_thumbnail(board_id: String, bytes: Vec<u8>) -> Result<(), Stri
     fs::rename(&tmp, &target).map_err(|e| format!("Failed to save thumbnail: {}", e))
 }
 
-// Writes a flattened export directly into the Briefcast root (not a source-file's sibling - a
-// board has no single source file) so it shows up in the sidebar's Image tab immediately via the
-// existing file watcher. Timestamp-suffixed so repeat exports of the same board never collide.
+// Writes a flattened export into a "Board" subfolder of the Briefcast root (not a source-file's
+// sibling - a board has no single source file, and not the root itself - that quickly buried
+// exports among every other loose image once someone exported a few boards) so every board export
+// lands in one place, easy to find, and still shows up in the sidebar's Image tab immediately via
+// the existing file watcher. Singular "Board", not "Boards" (BOARDS_DIR_NAME) - the latter is this
+// module's own internal project storage, excluded from the sidebar entirely (see its own doc
+// comment); this is a normal, browsable library folder, just like any the user creates themselves.
+// Timestamp-suffixed so repeat exports of the same board never collide.
 #[command]
 pub fn export_board_png(board_name: String, bytes: Vec<u8>) -> Result<String, String> {
-    let root = briefcast_dir()?;
-    fs::create_dir_all(&root).map_err(|e| format!("Failed to create Briefcast folder: {}", e))?;
+    let root = briefcast_dir()?.join("Board");
+    fs::create_dir_all(&root).map_err(|e| format!("Failed to create Board folder: {}", e))?;
 
     let safe_name: String = board_name
         .chars()
@@ -173,4 +178,23 @@ pub fn export_board_png(board_name: String, bytes: Vec<u8>) -> Result<String, St
     fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write export: {}", e))?;
     fs::rename(&tmp, &output).map_err(|e| format!("Failed to save export: {}", e))?;
     Ok(output.to_string_lossy().to_string())
+}
+
+// "Save As" counterpart to export_board_png above - writes to an EXACT destination path the
+// frontend already resolved via its own native save-file dialog (@tauri-apps/api/dialog's `save`),
+// rather than always landing in briefcast_dir()/Board/. Deliberately doesn't touch briefcast_dir()
+// at all: the whole point of Save As is picking a location outside (or inside, if the user chooses)
+// the library, so nothing here should assume one. Same write-then-rename crash-safety convention as
+// every other save in this file.
+#[command]
+pub fn export_board_png_to_path(dest_path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let dest = PathBuf::from(&dest_path);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create destination folder: {}", e))?;
+    }
+    let file_name = dest.file_name().ok_or("Invalid destination path")?.to_string_lossy();
+    let tmp = dest.with_file_name(format!("{}.tmp", file_name));
+    fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write export: {}", e))?;
+    fs::rename(&tmp, &dest).map_err(|e| format!("Failed to save export: {}", e))?;
+    Ok(())
 }

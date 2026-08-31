@@ -614,6 +614,165 @@ export function layoutImagesInFan(images: BoardImage[], gap: number): AutoLayout
   return { images: placed, canvasWidth, canvasHeight };
 }
 
+// Pinterest-style column layout: unlike every other auto-layout above, this one does NOT normalize
+// every image to a common square footprint - it keeps each photo's own aspect ratio (same
+// commonFootprint-free approach layoutImagesInRow uses, just packed into columns instead of one
+// row) and lets column heights differ. Columns = ceil(sqrt(n)), matching layoutImagesInGrid's own
+// column-count choice, so switching between Grid and Masonry on the same board doesn't jump
+// between wildly different densities. Column WIDTH still comes from commonFootprint (a shared
+// target width every image is scaled to, aspect preserved) - only height varies per image.
+export function layoutImagesInMasonry(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const colWidth = commonFootprint(images);
+  const columns = Math.max(1, Math.ceil(Math.sqrt(images.length)));
+  // Running bottom edge of each column, in board space (already includes the leading gap) - the
+  // classic masonry/Pinterest packing rule: each new tile goes into whichever column is currently
+  // shortest, so the columns fill up roughly evenly regardless of how tall any individual photo is.
+  const columnBottoms = new Array(columns).fill(g);
+  const now = Date.now();
+
+  const placed = images.map((image) => {
+    const aspect = image.height / Math.max(1, image.width);
+    const height = colWidth * aspect;
+    let col = 0;
+    for (let c = 1; c < columns; c++) {
+      if (columnBottoms[c] < columnBottoms[col]) col = c;
+    }
+    const x = g + col * (colWidth + g);
+    const y = columnBottoms[col];
+    columnBottoms[col] = y + height + g;
+    return { ...image, x, y, width: colWidth, height, rotation: 0, updatedAt: now };
+  });
+
+  return { images: placed, canvasWidth: columns * colWidth + (columns + 1) * g, canvasHeight: Math.max(...columnBottoms) };
+}
+
+// A structured, orderly stepped overlap along a diagonal - the "tidy" counterpart to Fan's loose
+// scatter: same uniform square footprint per tile (commonFootprint, no forced cornerRadius - this
+// one stays rectangular, not round), but no rotation and no per-slot offset pattern, just a
+// constant step down and to the right. Later tiles sit on top, reading as a stack of photos nudged
+// into a staircase rather than dropped.
+const CASCADE_OVERLAP_FACTOR = 0.35;
+
+export function layoutImagesInCascade(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const step = cell * CASCADE_OVERLAP_FACTOR;
+  const now = Date.now();
+
+  const placed = images.map((image, i) => ({ ...image, x: g + i * step, y: g + i * step, width: cell, height: cell, rotation: 0, updatedAt: now }));
+
+  const span = g * 2 + (images.length - 1) * step + cell;
+  return { images: placed, canvasWidth: span, canvasHeight: span };
+}
+
+// Sunflower/phyllotaxis spiral (Vogel's model): r(i) = c*sqrt(i), theta(i) = i*GOLDEN_ANGLE. Unlike
+// a naive spiral (constant angle step per ring, which visibly bands into arms), the golden-angle
+// increment is famously the one value that keeps every point's neighbors evenly spaced all the way
+// from center to edge - the same packing nature uses for sunflower seeds and pinecone scales. Each
+// tile gets the same "true circle" cornerRadius treatment as layoutImagesInCircle - a spiral of
+// square photos would read as a grid gone crooked; round tiles read as the deliberate bubbles this
+// is going for.
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5)); // ≈137.5°, radians
+
+export function layoutImagesInSpiral(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const n = images.length;
+  // In Vogel's model each point "owns" an average area of pi*c^2 (the disc packing is uniform-
+  // density by construction), so the average nearest-neighbor spacing works out to c*sqrt(pi) -
+  // solved here for c so that spacing matches (cell + gap) regardless of how many images there are,
+  // the same reasoning ringRadius uses for layoutImagesInCircle's own sizing.
+  const c = (cell + g) / Math.sqrt(Math.PI);
+  const maxRadius = c * Math.sqrt(n);
+  const canvasSize = maxRadius * 2 + cell + g * 2;
+  const center = canvasSize / 2;
+  const now = Date.now();
+
+  const placed = images.map((image, i) => {
+    // i+1, not i: keeps the very first tile off dead-center (r=0), so it reads as the spiral's
+    // innermost coil rather than a stray photo someone forgot to place.
+    const r = c * Math.sqrt(i + 1);
+    const angle = i * GOLDEN_ANGLE;
+    const cx = center + r * Math.cos(angle);
+    const cy = center + r * Math.sin(angle);
+    return { ...image, x: cx - cell / 2, y: cy - cell / 2, width: cell, height: cell, cornerRadius: cell / 2, rotation: 0, updatedAt: now };
+  });
+
+  return { images: placed, canvasWidth: canvasSize, canvasHeight: canvasSize };
+}
+
+// Parametric heart curve (x=16sin^3 t, y=13cos t - 5cos 2t - 2cos 3t - cos 4t is the textbook
+// formula; y is negated here since it's derived assuming math's y-up convention and this file's
+// document space is y-down - without the flip the cusp would land at the top, an upside-down
+// heart). HEART_GEOMETRY is this curve's own bounding box and total arc length, sampled once at
+// module load (a fixed, images-independent property of the curve itself) so layoutImagesInHeart
+// below can normalize any image count onto it without re-deriving the curve's shape every call.
+function rawHeartPoint(t: number): { x: number; y: number } {
+  const x = 16 * Math.sin(t) ** 3;
+  const y = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+  return { x, y };
+}
+
+const HEART_SAMPLE_COUNT = 720;
+
+function computeHeartGeometry(): { minX: number; maxX: number; minY: number; maxY: number; perimeter: number } {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let perimeter = 0;
+  let prev = rawHeartPoint(0);
+  for (let i = 1; i <= HEART_SAMPLE_COUNT; i++) {
+    const point = rawHeartPoint((i / HEART_SAMPLE_COUNT) * Math.PI * 2);
+    minX = Math.min(minX, point.x);
+    maxX = Math.max(maxX, point.x);
+    minY = Math.min(minY, point.y);
+    maxY = Math.max(maxY, point.y);
+    perimeter += Math.hypot(point.x - prev.x, point.y - prev.y);
+    prev = point;
+  }
+  return { minX, maxX, minY, maxY, perimeter };
+}
+
+const HEART_GEOMETRY = computeHeartGeometry();
+
+export function layoutImagesInHeart(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const heartWidth = HEART_GEOMETRY.maxX - HEART_GEOMETRY.minX;
+  // Scale so `images.length` cells (plus a gap between each) fill the curve's own perimeter - same
+  // "size the shape to the batch, not the other way round" approach ringRadius uses for Circle.
+  // Floored at a minimum width (4 cells across) so 2-3 images still land on a recognizably
+  // heart-shaped path with visible gaps between them, rather than collapsing the whole curve down
+  // to a tiny cluster - the same reasoning MIN_RADIUS_FACTOR protects Circle's small-n case with.
+  const minScale = (4 * cell) / heartWidth;
+  const scale = Math.max(minScale, (images.length * (cell + g)) / HEART_GEOMETRY.perimeter);
+  const offsetX = g + cell / 2 - HEART_GEOMETRY.minX * scale;
+  const offsetY = g + cell / 2 - HEART_GEOMETRY.minY * scale;
+  const now = Date.now();
+
+  const placed = images.map((image, i) => {
+    // Evenly spaced by curve PARAMETER t, not by arc length - the heart's parametrization isn't
+    // uniform-speed, so tiles land slightly denser near the bottom cusp and sparser at the top
+    // lobes. A true arc-length resampling would fix that, but the parameter-uniform version is
+    // already unmistakably heart-shaped and far simpler - not worth the extra math for this.
+    const t = (i / images.length) * Math.PI * 2;
+    const raw = rawHeartPoint(t);
+    const cx = raw.x * scale + offsetX;
+    const cy = raw.y * scale + offsetY;
+    return { ...image, x: cx - cell / 2, y: cy - cell / 2, width: cell, height: cell, cornerRadius: cell / 2, rotation: 0, updatedAt: now };
+  });
+
+  const canvasWidth = heartWidth * scale + cell + g * 2;
+  const canvasHeight = (HEART_GEOMETRY.maxY - HEART_GEOMETRY.minY) * scale + cell + g * 2;
+  return { images: placed, canvasWidth, canvasHeight };
+}
+
 // ---- Document mutation (pure) --------------------------------------------------------------------
 
 export function applyCommand(doc: BoardDocument, command: BoardCommand): BoardDocument {
