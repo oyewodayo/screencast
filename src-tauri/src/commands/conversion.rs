@@ -687,6 +687,80 @@ fn generate_plain_thumbnail(input: &PathBuf, output: &PathBuf) -> Result<(), Str
         .map_err(|e| format!("Failed to save thumbnail: {e}"))
 }
 
+// Silent, cached poster-frame thumbnail for a video gallery grid tile - the video counterpart to
+// get_image_thumbnail above. Extracts a single downscaled frame via the bundled ffmpeg, 1 second
+// in rather than frame 0 (a screen recording's very first frame is very often solid black/blank
+// before anything's actually happened on screen) - with a fallback to frame 0 if that seek fails,
+// which happens for clips shorter than a second. Cached the same way every other gallery
+// thumbnail is (content-addressed by path+mtime - see preview_cache_path), so revisiting a video
+// folder is instant after the first pass.
+#[tauri::command]
+pub async fn get_video_thumbnail(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "video_thumb_v1", "jpg")?;
+
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+    }
+
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    if let Err(err) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:01").await {
+        log::warn!("Video thumbnail seek to 1s failed for {}: {err}; retrying at frame 0", input.display());
+        if let Err(err2) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:00").await {
+            let combined = format!("{err}; retry at frame 0 also failed: {err2}");
+            log::error!("Video thumbnail failed for {}: {combined}", input.display());
+            return Err(combined);
+        }
+    }
+
+    path_to_str(&cache_path).map(|s| s.to_string())
+}
+
+// -ss before -i is ffmpeg's fast (keyframe-seeking, not frame-accurate) seek - plenty precise for
+// a thumbnail and far quicker than decoding from the start, which matters here since this runs
+// once per video in a folder that can hold hundreds of them (bounded by the same shared
+// thumbnailLimiter the frontend routes every gallery/sidebar thumbnail request through).
+async fn extract_video_frame(ffmpeg_path: &PathBuf, input: &PathBuf, output: &PathBuf, seek: &str) -> Result<(), String> {
+    let ffmpeg_path = ffmpeg_path.clone();
+    let input = input.clone();
+    let output = output.clone();
+    let seek = seek.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.args(["-y", "-ss", &seek]);
+        cmd.arg("-i").arg(path_to_str(&input)?);
+        cmd.args(["-frames:v", "1", "-update", "1", "-vf", "scale=480:-1", "-q:v", "4"]);
+        cmd.arg(path_to_str(&output)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            // ffmpeg's stderr always opens with its full version/build-config banner before
+            // anything about THIS run - keeping only the last few non-empty lines is what
+            // actually explains the failure (e.g. "Invalid data found when processing input"),
+            // instead of a wall of --enable-* flags every single error gets buried under.
+            let tail: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).rev().take(3).collect();
+            let reason: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+            return Err(format!("ffmpeg frame extraction failed: {}", if reason.is_empty() { "unknown error".to_string() } else { reason }));
+        }
+        if !output.exists() {
+            return Err("ffmpeg exited successfully but produced no output file".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Video thumbnail task panicked: {e}"))?
+}
+
 // Convert an audio file between mp3/wav/aac/flac/ogg/m4a. -vn drops any video stream before
 // encoding - many mp3/m4a files carry embedded cover art as an attached-picture "video" stream,
 // which would otherwise get passed through (or rejected outright by formats like wav/flac that

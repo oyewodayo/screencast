@@ -8,7 +8,8 @@ import { listen } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
 import { WebviewWindow, appWindow } from '@tauri-apps/api/window';
 import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
-import { formatFileName } from "../utils/Formater";
+import { formatFileName, truncateFileName } from "../utils/Formater";
+import SidebarFileIcon from "../components/SidebarFileIcon";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import useVideoEditStore from "../hooks/useVideoEditStore";
 import useImageEditStore from "../hooks/useImageEditStore";
@@ -20,6 +21,7 @@ import BulkConversionDialog, { BulkConversionSummary } from "../components/BulkC
 import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
 import ImageFolderGallery from "../components/ImageFolderGallery";
+import VideoFolderGallery from "../components/VideoFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { DocSummary } from "../utils/docTypes";
@@ -53,6 +55,9 @@ import {
   IoAddCircleOutline,
   IoBuildOutline,
   IoPin,
+  IoPinOutline,
+  IoCreateOutline,
+  IoSwapHorizontalOutline,
   IoLocateOutline,
   IoRefresh,
   IoSearch,
@@ -463,6 +468,16 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // of the initial load already being far slower than a grid of small tiles should be.
   const resolveImageThumbnailUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
     const thumbPath = await invoke<string>("get_image_thumbnail", { inputPath: file.path });
+    return resolvePreviewAssetUrl(thumbPath);
+  }, [resolvePreviewAssetUrl]);
+
+  // Poster-frame thumbnail for a video gallery grid tile (VideoFolderGallery.tsx) - the video
+  // counterpart to resolveImageThumbnailUrl above, backed by get_video_thumbnail's own
+  // content-addressed cache on the Rust side (a single ffmpeg frame extraction, ~1s into the
+  // clip). Routed through the same shared thumbnailLimiter as every other gallery/sidebar
+  // thumbnail request by the callers of this function, not here - this just resolves one URL.
+  const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
+    const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: file.path });
     return resolvePreviewAssetUrl(thumbPath);
   }, [resolvePreviewAssetUrl]);
 
@@ -1434,9 +1449,23 @@ const setScreen = () => {
 		await loadFileForPlayback(newPath, newFileName);
 	};
 
-	// Small icon shown next to a file name in the home-screen "From your library" preview list.
+	// Small icon shown next to a file name in the home-screen "From your library" preview list, the
+	// sidebar file list, and the "Now open" banner.
 	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
 		FILE_CATEGORY_TABS.find((tab) => tab.category === category)?.icon ?? <IoDocumentText size={18} />;
+
+	// A distinct color per category, matching categoryIcon 1:1 - gives the sidebar's otherwise
+	// text-only file rows a quick, scannable visual cue for "what kind of file is this" at a
+	// glance, the same job the old per-row emoji (formatFileName's icon) used to do less legibly.
+	const CATEGORY_ICON_COLOR: Record<FileCategory, string> = {
+		video: "text-violet-500 dark:text-violet-400",
+		audio: "text-pink-500 dark:text-pink-400",
+		image: "text-emerald-500 dark:text-emerald-400",
+		pdf: "text-red-500 dark:text-red-400",
+		document: "text-blue-500 dark:text-blue-400",
+	};
+	const categoryIconColorClassName = (category: FileCategory | null): string =>
+		category ? CATEGORY_ICON_COLOR[category] : "text-neutral-400 dark:text-neutral-500";
 
 	// What to surface on the empty home screen so it isn't just a blank void. Pinned files (in pin
 	// order — see utils/homeScreenFiles.ts's newest-pin-first toggling) always come first, but they
@@ -1644,6 +1673,31 @@ const setScreen = () => {
 		return () => document.removeEventListener("keydown", handleEscape);
 	}, [selectedFilePaths.size]);
 
+	// Closes a file row's 3-dot menu (and its Move-to/Link-notes submenus) on a click anywhere
+	// else, or on Escape - previously it only closed via its own toggle button or by picking an
+	// action, so clicking away (or even just wanting out without picking anything) left it stuck
+	// open. pointerdown, not click, so a press that's opening a *different* row's menu doesn't get
+	// eaten by this one closing first (same reasoning as ImageFolderGallery.tsx's own outside-click
+	// handler for its context menu) - and it never fires for the toggle button's own click in the
+	// first place, since that handler already calls stopPropagation.
+	useEffect(() => {
+		if (!openMenu) return;
+
+		const close = (e: Event) => {
+			if (e instanceof KeyboardEvent && e.key !== "Escape") return;
+			setOpenMenu(null);
+			setMoveMenuOpenFor(null);
+			setLinkDocsMenuOpenFor(null);
+		};
+
+		document.addEventListener("pointerdown", close);
+		document.addEventListener("keydown", close);
+		return () => {
+			document.removeEventListener("pointerdown", close);
+			document.removeEventListener("keydown", close);
+		};
+	}, [openMenu]);
+
 	// Opens a native OS file picker scoped to nowhere in particular — unlike the sidebar (which
 	// only ever lists files under the app's own Briefcast folder), this lets the user view/play
 	// any video, audio, image, or PDF already sitting anywhere else on their system. Selecting
@@ -1675,16 +1729,23 @@ const setScreen = () => {
 	const folderDepth = (folder: string): number => (folder === "" ? 0 : folder.split("/").length);
 
 	// Memoized for the same reason resolvePreviewAssetUrl etc. are useCallback'd above: passed as
-	// the `files`/`folderOptions` props into ImageFolderGallery, which uses `files`'s identity as a
-	// dependency of its own thumbnail-resolving effect. Recomputing a fresh array here on every
-	// Dashboard render (as this used to do inline in the JSX below) handed the gallery a new array
-	// reference on every render regardless of whether the underlying file list had actually
-	// changed - including on every selection click - which re-triggered that effect needlessly.
+	// the `files`/`folderOptions` props into ImageFolderGallery/VideoFolderGallery, which use
+	// `files`'s identity as a dependency of their own thumbnail-resolving effect. Recomputing a
+	// fresh array here on every Dashboard render (as this used to do inline in the JSX below)
+	// handed the gallery a new array reference on every render regardless of whether the underlying
+	// file list had actually changed - including on every selection click - which re-triggered that
+	// effect needlessly.
 	const selectedFolderImages = useMemo(
 		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "image") : []),
 		[files, selectedFolder]
 	);
-	const imageFolderOptions = useMemo(
+	const selectedFolderVideos = useMemo(
+		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "video") : []),
+		[files, selectedFolder]
+	);
+	// Not category-specific despite living alongside the two memos above - every folder in the
+	// library, for either gallery's "Move to" list.
+	const folderOptions = useMemo(
 		() => Object.keys(files).sort((a, b) => a.localeCompare(b)).map((key) => ({ key, label: folderDisplayName(key) })),
 		[files]
 	);
@@ -2390,7 +2451,7 @@ const setScreen = () => {
                         Now open
                       </span>
                       <span className="block truncate text-xs font-medium leading-tight text-blue-700 dark:text-blue-300">
-                        {formatFileName(selectedFile.name)}
+                        {truncateFileName(selectedFile.name)}
                       </span>
                     </span>
                     <IoLocateOutline size={14} className="shrink-0 text-blue-400 dark:text-blue-500" />
@@ -2482,18 +2543,18 @@ const setScreen = () => {
                       >
                         <h4
                           className={`text-xs font-semibold flex items-center gap-1 min-w-0 truncate cursor-pointer ${
-                            activeFileCategory === "image" && selectedFolder === folder
+                            (activeFileCategory === "image" || activeFileCategory === "video") && selectedFolder === folder
                               ? "text-blue-600 dark:text-blue-400"
                               : "text-gray-500 dark:text-neutral-400"
                           }`}
                           title={collapsedFolders.has(folder) ? `Expand ${folderDisplayName(folder)}` : `Collapse ${folderDisplayName(folder)}`}
                           onClick={() => {
                             toggleFolderCollapsed(folder);
-                            // Image tab only: clicking a folder also loads its images as a
-                            // thumbnail grid in the main board (see selectedFolder above) - the
-                            // other tabs (video/audio/pdf/etc.) don't have a gallery view yet, so
-                            // this is a no-op for them beyond the existing expand/collapse.
-                            if (activeFileCategory === "image") {
+                            // Image and Video tabs only: clicking a folder also loads its files as
+                            // a thumbnail grid in the main board (see selectedFolder above) - the
+                            // other tabs (audio/pdf/etc.) don't have a gallery view yet, so this is
+                            // a no-op for them beyond the existing expand/collapse.
+                            if (activeFileCategory === "image" || activeFileCategory === "video") {
                               setSelectedFolder(folder);
                               setSelectedFile(null);
                               setBoardScreen(null);
@@ -2553,7 +2614,7 @@ const setScreen = () => {
                           No {activeFileCategory} files
                         </p>
                       ) : (
-                        <ul className="mt-1" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
+                        <ul className="mt-1 space-y-0.5" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
                           {fileList.map((file) => (
                             <li
                               key={file.path}
@@ -2567,7 +2628,7 @@ const setScreen = () => {
                                 setDraggingFiles(null);
                                 setDragOverFolder(null);
                               }}
-                              className={`flex items-center justify-between gap-1 min-w-0 group cursor-pointer hover:bg-gray-50 dark:hover:bg-neutral-800 ${
+                              className={`flex items-center gap-1.5 min-w-0 group cursor-pointer -mx-1 px-1 py-1 rounded-md hover:bg-gray-50 dark:hover:bg-neutral-800 ${
                                 selectedFile?.sourcePath === file.path ? 'bg-blue-50 dark:bg-blue-500/10' : ''
                               } ${draggingFiles?.some((f) => f.path === file.path) ? 'opacity-40' : ''}`}
                             >
@@ -2577,9 +2638,17 @@ const setScreen = () => {
                                 onClick={(e) => e.stopPropagation()}
                                 onChange={() => toggleFileSelected(file.path)}
                                 title="Select for bulk move"
-                                className={`shrink-0 mr-1.5 accent-blue-500 transition-opacity ${
+                                className={`shrink-0 accent-blue-500 transition-opacity ${
                                   selectedFilePaths.size > 0 || selectedFilePaths.has(file.path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
                                 }`}
+                              />
+                              <SidebarFileIcon
+                                name={file.name}
+                                path={file.path}
+                                isImage={getFileCategory(file.name) === "image"}
+                                resolveThumbnailUrl={resolveImageThumbnailUrl}
+                                fallbackIcon={categoryIcon(getFileCategory(file.name))}
+                                fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
                               />
                               {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
                               {renamingFile === file.path ? (
@@ -2605,7 +2674,7 @@ const setScreen = () => {
                                   onPointerMove={handleSidebarFilePointerMove}
                                   onPointerUp={handleSidebarFilePointerUp(file)}
                                 >
-                                  {formatFileName(file.name)}
+                                  {truncateFileName(file.name)}
                                 </div>
                               )}
 
@@ -2628,7 +2697,11 @@ const setScreen = () => {
                               {/* Three vertical dots menu */}
                               <div className="relative">
                                 <button
-                                  className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-200 dark:hover:bg-neutral-700 transition-opacity"
+                                  className={`p-1 rounded-md transition-colors ${
+                                    openMenu === file.path
+                                      ? 'opacity-100 bg-gray-200 dark:bg-neutral-700'
+                                      : 'opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-neutral-700'
+                                  }`}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     setOpenMenu(openMenu === file.path ? null : file.path);
@@ -2641,149 +2714,180 @@ const setScreen = () => {
                                   </svg>
                                 </button>
 
-                                {/* Popup Menu */}
+                                {/* Popup Menu - see the "Closes a file row's 3-dot menu" effect
+                                    above for outside-click/Escape handling. onPointerDown here
+                                    stops that same document-level listener from treating a click
+                                    *inside* this menu (e.g. expanding "Move to") as a click
+                                    outside it - mirrors ImageFolderGallery.tsx's own context menu. */}
                                 {openMenu === file.path && (
-                                  <div className="absolute right-0 top-full mt-1 w-36 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg z-20">
-                                    <button
-                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleTogglePin(file);
-                                      }}
+                                  <>
+                                    <style>{`
+                                      @keyframes sidebarFileMenuIn {
+                                        from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+                                        to { opacity: 1; transform: translateY(0) scale(1); }
+                                      }
+                                    `}</style>
+                                    <div
+                                      onPointerDown={(e) => e.stopPropagation()}
+                                      style={{ animation: "sidebarFileMenuIn 140ms cubic-bezier(0.16, 1, 0.3, 1)" }}
+                                      className="absolute right-0 top-full mt-1.5 w-48 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 overflow-hidden z-20 py-1"
                                     >
-                                      {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
-                                    </button>
-                                    <button
-                                      className="w-full flex items-center justify-between px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        void handleLinkNotes(file);
-                                      }}
-                                    >
-                                      Link notes
-                                      {linkedDocsByPath.has(file.path) && (linkedDocsByPath.get(file.path)!.length >= 2) && (
-                                        <IoChevronForward
-                                          size={12}
-                                          className={`transition-transform ${linkDocsMenuOpenFor === file.path ? 'rotate-90' : ''}`}
-                                        />
-                                      )}
-                                    </button>
-                                    {linkDocsMenuOpenFor === file.path && (
-                                      <div className="border-t border-gray-200 dark:border-neutral-700 max-h-40 overflow-y-auto py-0.5">
-                                        {(linkedDocsByPath.get(file.path) ?? []).map((doc) => (
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleTogglePin(file);
+                                        }}
+                                      >
+                                        {pinnedPaths.includes(file.path) ? (
+                                          <IoPin size={15} className="shrink-0 text-blue-500 dark:text-blue-400" />
+                                        ) : (
+                                          <IoPinOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        )}
+                                        <span className="flex-1 text-left">
+                                          {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
+                                        </span>
+                                      </button>
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          void handleLinkNotes(file);
+                                        }}
+                                      >
+                                        <MdOutlineDescription size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">Link notes</span>
+                                        {linkedDocsByPath.has(file.path) && (linkedDocsByPath.get(file.path)!.length >= 2) && (
+                                          <IoChevronForward
+                                            size={12}
+                                            className={`shrink-0 text-neutral-400 dark:text-neutral-500 transition-transform ${linkDocsMenuOpenFor === file.path ? 'rotate-90' : ''}`}
+                                          />
+                                        )}
+                                      </button>
+                                      {linkDocsMenuOpenFor === file.path && (
+                                        <div className="mx-1.5 mb-1 max-h-40 overflow-y-auto rounded-lg bg-gray-50 dark:bg-neutral-900/60 py-0.5">
+                                          {(linkedDocsByPath.get(file.path) ?? []).map((doc) => (
+                                            <button
+                                              key={doc.id}
+                                              className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                setOpenMenu(null);
+                                                setLinkDocsMenuOpenFor(null);
+                                                setSelectedFile(null);
+                                                setDocsScreen({ mode: "editor", docId: doc.id });
+                                              }}
+                                            >
+                                              {doc.title || "Untitled document"}
+                                            </button>
+                                          ))}
                                           <button
-                                            key={doc.id}
                                             className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
                                             onClick={(e) => {
                                               e.stopPropagation();
-                                              setOpenMenu(null);
                                               setLinkDocsMenuOpenFor(null);
-                                              setSelectedFile(null);
-                                              setDocsScreen({ mode: "editor", docId: doc.id });
+                                              void (async () => {
+                                                try {
+                                                  const id = crypto.randomUUID();
+                                                  const title = `Notes for ${file.name}`;
+                                                  const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
+                                                  await invoke("create_doc", { id, title, bytes });
+                                                  await invoke("link_doc_to_file", { id, filePath: file.path });
+                                                  await refreshDocsIndex();
+                                                  setOpenMenu(null);
+                                                  setSelectedFile(null);
+                                                  setDocsScreen({ mode: "editor", docId: id });
+                                                } catch (error) {
+                                                  console.error("Failed to create linked notes:", error);
+                                                  setError(`Failed to create linked notes: ${error}`);
+                                                }
+                                              })();
                                             }}
                                           >
-                                            {doc.title || "Untitled document"}
+                                            + New linked doc
                                           </button>
-                                        ))}
-                                        <button
-                                          className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setLinkDocsMenuOpenFor(null);
-                                            void (async () => {
-                                              try {
-                                                const id = crypto.randomUUID();
-                                                const title = `Notes for ${file.name}`;
-                                                const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
-                                                await invoke("create_doc", { id, title, bytes });
-                                                await invoke("link_doc_to_file", { id, filePath: file.path });
-                                                await refreshDocsIndex();
-                                                setOpenMenu(null);
-                                                setSelectedFile(null);
-                                                setDocsScreen({ mode: "editor", docId: id });
-                                              } catch (error) {
-                                                console.error("Failed to create linked notes:", error);
-                                                setError(`Failed to create linked notes: ${error}`);
-                                              }
-                                            })();
-                                          }}
-                                        >
-                                          + New linked doc
-                                        </button>
-                                      </div>
-                                    )}
-                                    <button
-                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        startRename(file);
-                                      }}
-                                    >
-                                      Rename
-                                    </button>
-                                     {isConvertibleCategory(getFileCategory(file.name)) && (
-                                       <button
-                                          className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setConversionFile(file);
-                                            setOpenMenu(null);
-                                          }}
-                                        >
-                                        Convert
-                                      </button>
-                                     )}
-
-                                    {/* "Move to ▸" — expands in place into the folder list rather
-                                        than as a hover flyout, so it works the same on touch/
-                                        trackpad as a click, with no hover-timing to get wrong. */}
-                                    <button
-                                      className="w-full flex items-center justify-between px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setMoveMenuOpenFor((prev) => (prev === file.path ? null : file.path));
-                                      }}
-                                    >
-                                      {filesToActOn(file).length > 1 ? `Move ${filesToActOn(file).length} items to` : "Move to"}
-                                      <IoChevronForward
-                                        size={12}
-                                        className={`transition-transform ${moveMenuOpenFor === file.path ? 'rotate-90' : ''}`}
-                                      />
-                                    </button>
-                                    {moveMenuOpenFor === file.path && (
-                                      <div className="border-t border-gray-200 dark:border-neutral-700 max-h-40 overflow-y-auto py-0.5">
-                                        {Object.keys(files)
-                                          .sort((a, b) => a.localeCompare(b))
-                                          .map((destFolder) => (
-                                            <button
-                                              key={destFolder || "__root__"}
-                                              disabled={destFolder === folder}
-                                              className={`w-full text-left pl-6 pr-3 py-1.5 text-xs truncate ${
-                                                destFolder === folder
-                                                  ? "text-neutral-300 dark:text-neutral-600 cursor-default"
-                                                  : "hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                              }`}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                if (destFolder !== folder) handleMoveFiles(filesToActOn(file), destFolder);
-                                              }}
-                                            >
-                                              {folderDisplayName(destFolder)}
-                                            </button>
-                                          ))}
-                                      </div>
-                                    )}
-
-                                    <button
-                                        className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm text-red-600 dark:text-red-400"
+                                        </div>
+                                      )}
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
                                         onClick={(e) => {
                                           e.stopPropagation();
-                                          handleDeleteFile(file);
+                                          startRename(file);
                                         }}
                                       >
-                                      Delete
-                                    </button>
-                                  </div>
+                                        <IoCreateOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">Rename</span>
+                                      </button>
+                                       {isConvertibleCategory(getFileCategory(file.name)) && (
+                                         <button
+                                            className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setConversionFile(file);
+                                              setOpenMenu(null);
+                                            }}
+                                          >
+                                          <IoSwapHorizontalOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                          <span className="flex-1 text-left">Convert</span>
+                                        </button>
+                                       )}
+
+                                      {/* "Move to ▸" — expands in place into the folder list rather
+                                          than as a hover flyout, so it works the same on touch/
+                                          trackpad as a click, with no hover-timing to get wrong. */}
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setMoveMenuOpenFor((prev) => (prev === file.path ? null : file.path));
+                                        }}
+                                      >
+                                        <IoFolderOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">
+                                          {filesToActOn(file).length > 1 ? `Move ${filesToActOn(file).length} items to` : "Move to"}
+                                        </span>
+                                        <IoChevronForward
+                                          size={12}
+                                          className={`shrink-0 text-neutral-400 dark:text-neutral-500 transition-transform ${moveMenuOpenFor === file.path ? 'rotate-90' : ''}`}
+                                        />
+                                      </button>
+                                      {moveMenuOpenFor === file.path && (
+                                        <div className="mx-1.5 mb-1 max-h-40 overflow-y-auto rounded-lg bg-gray-50 dark:bg-neutral-900/60 py-0.5">
+                                          {Object.keys(files)
+                                            .sort((a, b) => a.localeCompare(b))
+                                            .map((destFolder) => (
+                                              <button
+                                                key={destFolder || "__root__"}
+                                                disabled={destFolder === folder}
+                                                className={`w-full text-left pl-6 pr-3 py-1.5 text-xs truncate ${
+                                                  destFolder === folder
+                                                    ? "text-neutral-300 dark:text-neutral-600 cursor-default"
+                                                    : "hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                                }`}
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  if (destFolder !== folder) handleMoveFiles(filesToActOn(file), destFolder);
+                                                }}
+                                              >
+                                                {folderDisplayName(destFolder)}
+                                              </button>
+                                            ))}
+                                        </div>
+                                      )}
+
+                                      <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
+                                      <button
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleDeleteFile(file);
+                                          }}
+                                        >
+                                        <IoTrashOutline size={15} className="shrink-0" />
+                                        <span className="flex-1 text-left">Delete</span>
+                                      </button>
+                                    </div>
+                                  </>
                                 )}
                               </div>
                             </li>
@@ -2851,7 +2955,12 @@ const setScreen = () => {
           )}
          <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
 
-          {selectedFolder && selectedFile && !boardScreen && !docsScreen && (
+          {/* selectedFolder !== null, not a truthy check - the root ("Briefcast") folder's key is
+              "", which is falsy in JS even though it's a perfectly valid, currently-selected
+              folder. A truthy check here silently treated selecting the root folder as "nothing
+              selected" (observed directly: clicking it fell through to the empty state instead of
+              showing a gallery). Same fix applies to the two ternary branches below. */}
+          {selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
             <button
               type="button"
               onClick={() => setSelectedFile(null)}
@@ -3005,7 +3114,7 @@ const setScreen = () => {
                 activeClipEffects={activeClipEffects}
               />
             )
-          ) : selectedFolder ? (
+          ) : selectedFolder !== null && activeFileCategory === "image" ? (
             <ImageFolderGallery
               files={selectedFolderImages}
               folderLabel={folderDisplayName(selectedFolder)}
@@ -3025,7 +3134,31 @@ const setScreen = () => {
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
               onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
               onClearSelection={() => setSelectedFilePaths(new Set())}
-              folderOptions={imageFolderOptions}
+              folderOptions={folderOptions}
+              currentFolder={selectedFolder}
+              onMoveFiles={handleMoveFiles}
+              onBulkDelete={handleBulkDeleteFiles}
+            />
+          ) : selectedFolder !== null && activeFileCategory === "video" ? (
+            <VideoFolderGallery
+              files={selectedFolderVideos}
+              folderLabel={folderDisplayName(selectedFolder)}
+              resolveThumbnailUrl={resolveVideoThumbnailUrl}
+              onOpenVideo={(file) => loadFileForPlayback(file.path, file.name)}
+              onDeleteFile={handleDeleteFile}
+              onConvertFile={(file) => setConversionFile(file)}
+              renamingFile={renamingFile}
+              renameValue={renameValue}
+              onRenameValueChange={setRenameValue}
+              onStartRename={startRename}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenamingFile(null)}
+              selectedFilePaths={selectedFilePaths}
+              onToggleFileSelected={toggleFileSelected}
+              onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
+              onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
+              onClearSelection={() => setSelectedFilePaths(new Set())}
+              folderOptions={folderOptions}
               currentFolder={selectedFolder}
               onMoveFiles={handleMoveFiles}
               onBulkDelete={handleBulkDeleteFiles}
@@ -3102,7 +3235,7 @@ const setScreen = () => {
                           {categoryIcon(getFileCategory(file.name))}
                         </span>
                         <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
-                          {formatFileName(file.name)}
+                          {truncateFileName(file.name)}
                         </span>
                         {pinnedPaths.includes(file.path) && (
                           <IoPin size={13} className="ml-auto text-gray-400 dark:text-neutral-500 shrink-0" />

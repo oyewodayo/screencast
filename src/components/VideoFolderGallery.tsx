@@ -1,11 +1,15 @@
-// components/ImageFolderGallery.tsx
+// components/VideoFolderGallery.tsx
 //
-// Thumbnail grid shown in the main board when an Image folder is selected in the sidebar
-// (rather than a single file) - lets the user see every image in the folder at a glance and
-// double-click one to open it full-size in ImageEditor (see Dashboard.tsx's selectedFolder
-// state). Right-click (or the hover kebab button) opens a per-image context menu - copy path/
-// image, rename, convert, delete - the same actions the sidebar's own 3-dot menu already offers,
-// wired to the same Dashboard.tsx handlers so both stay in sync automatically.
+// Thumbnail grid shown in the main board when a Video folder is selected in the sidebar (rather
+// than a single file) - the video counterpart to ImageFolderGallery.tsx, and deliberately built
+// as a close mirror of it rather than a shared generic component: the two differ enough in tile
+// content (a poster-frame video needs a play-icon overlay and a 16:9 crop instead of a photo's
+// square one, no "Copy image" - there's no OS convention for copying video to the clipboard) and
+// forcing them through one shared abstraction felt more likely to destabilize the
+// already-working, already-tuned image gallery than to save real code. If a third media type ever
+// needs this same shape, that's the point to actually extract the shared selection/menu/panel
+// logic into a hook - see this file's own selection/context-menu/bulk-panel code, which is
+// otherwise identical to ImageFolderGallery.tsx's.
 //
 // Multi-select follows the same Explorer-standard conventions the sidebar's own checkbox
 // multi-select doesn't (it has no keyboard-modifier support) - plain click selects only that
@@ -15,9 +19,8 @@
 // selection are one and the same thing, not two parallel selection models.
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoImageOutline, IoTrashOutline } from "react-icons/io5";
+import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoPlay, IoTrashOutline, IoVideocam } from "react-icons/io5";
 import { truncateFileName } from "../utils/Formater";
-import { preloadImage } from "../utils/imageObjectCache";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
 
 interface GalleryFile {
@@ -25,19 +28,13 @@ interface GalleryFile {
   path: string;
 }
 
-interface ImageFolderGalleryProps {
+interface VideoFolderGalleryProps {
   files: GalleryFile[];
   folderLabel: string;
-  // Small (~480px) preview for a grid tile - see Dashboard.tsx's resolveImageThumbnailUrl. NOT
-  // the same as resolveFullUrl below: pointing every tile at a full-resolution decode is what
-  // used to make a large folder slow to load and re-decode on every scroll (see that resolver's
-  // own doc comment for the full story).
+  // Poster-frame preview for a grid tile - see Dashboard.tsx's resolveVideoThumbnailUrl (a single
+  // ffmpeg frame extraction, cached on the backend by get_video_thumbnail).
   resolveThumbnailUrl: (file: GalleryFile) => Promise<string>;
-  // Full-resolution asset URL - used by "Copy image" (which should copy full quality, not a
-  // thumbnail) and nothing else here; opening a file is handled by onOpenImage below instead,
-  // via Dashboard.tsx's own loadFileForPlayback.
-  resolveFullUrl: (file: GalleryFile) => Promise<string>;
-  onOpenImage: (file: GalleryFile) => void;
+  onOpenVideo: (file: GalleryFile) => void;
   onDeleteFile: (file: GalleryFile) => void;
   onConvertFile: (file: GalleryFile) => void;
   // Rename is inline (matches the sidebar's own inline rename), so its state is lifted to
@@ -67,12 +64,11 @@ interface ImageFolderGalleryProps {
 
 const STATUS_RESET_MS = 1500;
 
-const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
+const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
   files,
   folderLabel,
   resolveThumbnailUrl,
-  resolveFullUrl,
-  onOpenImage,
+  onOpenVideo,
   onDeleteFile,
   onConvertFile,
   renamingFile,
@@ -105,14 +101,11 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
     let cancelled = false;
     const pending = files.filter((file) => !thumbUrls[file.path]);
 
-    // Routed through the shared thumbnailLimiter (concurrencyLimiter.ts) instead of a
-    // gallery-local worker pool - a backend thumbnail request (invoke, plus for HEIC/HEIF a
-    // bundled heif-thumbnailer process spawn - see resolveImageThumbnailUrl in Dashboard.tsx) is
-    // real CPU/memory work, and this same cap has to hold across the gallery AND the sidebar's own
-    // lazy thumbnails (SidebarFileIcon.tsx) at once - two independent caps of 4 each could still
-    // add up to 8 concurrent full-image decodes if both are loading at the same time, which is
-    // exactly the kind of burst that froze the app ("Not Responding", fan noise, multi-GB RAM
-    // growth - observed directly) before this was a single shared limiter.
+    // Routed through the shared thumbnailLimiter (concurrencyLimiter.ts), the same one
+    // ImageFolderGallery/SidebarFileIcon use - a poster-frame extraction is a real ffmpeg process
+    // spawn, and this cap has to hold across every source of thumbnail requests at once, not just
+    // within this one gallery (see that module's own doc comment for the "Not Responding" history
+    // that made this necessary).
     pending.forEach((file) => {
       thumbnailLimiter(() => resolveThumbnailUrl(file))
         .then((url) => {
@@ -160,31 +153,6 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
     }
   };
 
-  // Draws the resolved image into an offscreen canvas and copies that as a PNG - same approach
-  // ImageEditor.tsx's own "Copy to clipboard" uses. preloadImage sets crossOrigin="anonymous" on
-  // the asset:// source, which is what keeps the canvas untainted (a plain <img> would throw a
-  // SecurityError on toBlob) - see imageObjectCache.ts's doc comment for the concrete history.
-  const handleCopyImage = async (file: GalleryFile) => {
-    try {
-      const url = await resolveFullUrl(file);
-      const img = await preloadImage(url);
-      const canvas = document.createElement("canvas");
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Canvas is not supported");
-      ctx.drawImage(img, 0, 0);
-      const blob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Failed to encode image as PNG"))), "image/png");
-      });
-      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-      flashStatus("Image copied");
-    } catch (err) {
-      console.error("Failed to copy image to clipboard:", err);
-      flashStatus("Copy failed");
-    }
-  };
-
   const openMenuFor = (file: GalleryFile, x: number, y: number) => {
     setContextMenu({ file, x, y });
   };
@@ -194,8 +162,8 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
   if (files.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full w-full gap-3 text-gray-500 dark:text-neutral-400">
-        <IoImageOutline size={40} className="text-gray-300 dark:text-neutral-700" />
-        <p className="text-sm">No images in {folderLabel}</p>
+        <IoVideocam size={40} className="text-gray-300 dark:text-neutral-700" />
+        <p className="text-sm">No videos in {folderLabel}</p>
       </div>
     );
   }
@@ -208,10 +176,10 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
         </div>
       )}
       <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-3">
-        {folderLabel} — {files.length} image{files.length === 1 ? "" : "s"}
+        {folderLabel} — {files.length} video{files.length === 1 ? "" : "s"}
       </p>
       <div
-        className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-3"
+        className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3"
         onClick={(e) => {
           // Clicking empty grid space (not a tile - tile clicks are handled and don't bubble
           // here unhandled) clears the selection, matching a normal file manager's background
@@ -237,9 +205,9 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
                 lastClickedIndexRef.current = index;
               }
             }}
-            onDoubleClick={() => onOpenImage(file)}
+            onDoubleClick={() => onOpenVideo(file)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") onOpenImage(file);
+              if (e.key === "Enter") onOpenVideo(file);
             }}
             onContextMenu={(e) => {
               e.preventDefault();
@@ -264,7 +232,10 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
             >
               <IoEllipsisVertical size={13} />
             </button>
-            <div className="aspect-square w-full bg-gray-100 dark:bg-neutral-800 flex items-center justify-center overflow-hidden">
+            {/* aspect-video (16:9), not the image gallery's aspect-square - video source material
+                is almost always widescreen, and cropping a poster frame to a square would cut off
+                real content in a way it wouldn't for a typically-portrait or already-square photo. */}
+            <div className="aspect-video w-full bg-gray-100 dark:bg-neutral-800 flex items-center justify-center overflow-hidden relative">
               {thumbUrls[file.path] ? (
                 <img
                   src={thumbUrls[file.path]}
@@ -274,8 +245,13 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
                   className="w-full h-full object-cover"
                 />
               ) : (
-                <IoImageOutline size={22} className="text-gray-300 dark:text-neutral-700" />
+                <IoVideocam size={22} className="text-gray-300 dark:text-neutral-700" />
               )}
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <div className="w-8 h-8 rounded-full bg-black/50 flex items-center justify-center opacity-80 group-hover:opacity-100 group-hover:scale-110 transition-all">
+                  <IoPlay size={14} className="text-white translate-x-[1px]" />
+                </div>
+              </div>
             </div>
             {renamingFile === file.path ? (
               <input
@@ -301,15 +277,12 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
       </div>
 
       {/* Selection panel - fixed (not just sticky-within-scroll) so it stays in view regardless
-          of scroll position, per the user's own "sticky option at the right" ask. Only for a real
-          multi-selection (2+) - a single selected tile already has its own highlighted ring and
-          per-tile kebab/context menu, so a panel for exactly one would just be visual noise
-          duplicating what's already on screen. Bulk convert deliberately isn't offered here
-          (unlike the sidebar's own bulk bar, which does have it for video/audio) - a folder-sized
-          image selection can run into the dozens/hundreds, and queuing that many ffmpeg
-          conversions at once doesn't scale the way a single-file Convert (still in the per-image
-          context menu) does; Move and Delete are the operations that actually benefit from being
-          batched. */}
+          of scroll position. Only for a real multi-selection (2+) - a single selected tile
+          already has its own highlighted ring and per-tile kebab/context menu. Bulk convert
+          deliberately isn't offered here (unlike the sidebar's own bulk bar) - a folder-sized
+          video selection can run into the dozens, and queuing that many ffmpeg conversions at
+          once doesn't scale the way a single-file Convert (still in the per-video context menu)
+          does; Move and Delete are the operations that actually benefit from being batched. */}
       {selectedInFolder.length > 1 && (
         <>
           <style>{`
@@ -414,7 +387,7 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
               type="button"
               className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
               onClick={() => {
-                onOpenImage(contextMenu.file);
+                onOpenVideo(contextMenu.file);
                 setContextMenu(null);
               }}
             >
@@ -429,16 +402,6 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
               }}
             >
               Copy path
-            </button>
-            <button
-              type="button"
-              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
-              onClick={() => {
-                void handleCopyImage(contextMenu.file);
-                setContextMenu(null);
-              }}
-            >
-              Copy image
             </button>
             <button
               type="button"
@@ -477,4 +440,4 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
   );
 };
 
-export default ImageFolderGallery;
+export default VideoFolderGallery;

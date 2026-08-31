@@ -223,6 +223,7 @@ fn main() {
             commands::conversion::convert_image,
             commands::conversion::get_heic_preview,
             commands::conversion::get_image_thumbnail,
+            commands::conversion::get_video_thumbnail,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
             commands::conversion::read_image_data_url,
