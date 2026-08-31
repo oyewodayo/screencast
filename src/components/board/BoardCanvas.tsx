@@ -197,9 +197,13 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({ doc, zoom, imageBitmaps, sele
         width: bufferWidth * zoom,
         height: bufferHeight * zoom,
         // Always-on checkerboard sitting behind the canvas's own pixels - invisible wherever the
-        // board has an opaque background/image, but shows through cleanly wherever
-        // doc.backgroundColor is null (transparent) or an image's opacity is under 100%, the same
-        // "see-through" convention every other image editor uses.
+        // board has an opaque background (a color, a grid with a base fill, or a chosen image), but
+        // shows through cleanly wherever that background is transparent - color mode's
+        // backgroundColor null, grid mode's baseColor null, or image mode with nothing chosen yet -
+        // or an image's own opacity is under 100%, the same "see-through" convention every other
+        // image editor uses. See boardHandlers.ts's renderBoardToCanvas for which of the three
+        // background modes is actually responsible for what gets drawn into the pixels this sits
+        // behind.
         backgroundImage:
           "repeating-conic-gradient(#0000000f 0% 25%, transparent 0% 50%), repeating-conic-gradient(#0000000f 0% 25%, transparent 0% 50%)",
         backgroundSize: "20px 20px",

@@ -45,6 +45,21 @@ export interface BoardImage {
   updatedAt: number;
 }
 
+// Which of the three background renderers is active - see boardHandlers.ts's renderBoardToCanvas
+// for how each one actually paints. Old boards saved before this existed simply lack the field on
+// disk; every reader treats an absent backgroundMode as "color", so those boards keep rendering
+// exactly as they did before this feature - no migration step needed.
+export type BoardBackgroundMode = "color" | "grid" | "image";
+
+export interface BoardGridBackground {
+  spacing: number; // px between lines, in the board's own (unscaled) document space
+  lineColor: string;
+  // Fill color under the grid lines - same "null = transparent" convention as BoardDocument's own
+  // backgroundColor, so a grid can sit on a transparent board (visible in an exported PNG's alpha)
+  // exactly like a plain color background can.
+  baseColor: string | null;
+}
+
 export type BoardCommand =
   | { type: "add"; image: BoardImage }
   | { type: "delete"; image: BoardImage }
@@ -56,7 +71,16 @@ export type BoardCommand =
   // z-order/stacking (last = topmost), same convention imageEditTypes.ts's objects array uses.
   | { type: "reorder"; before: BoardImage[]; after: BoardImage[] }
   // `null` = no fill, the canvas stays transparent there (visible in the exported PNG's alpha).
+  // Only actually painted when backgroundMode is "color" (or absent, for an old board) - see
+  // BoardBackgroundMode above - but kept as its own field/command rather than folded into a
+  // discriminated union so switching *to* grid/image and back to color never loses whatever color
+  // was last chosen.
   | { type: "background"; before: string | null; after: string | null }
+  | { type: "background-mode"; before: BoardBackgroundMode; after: BoardBackgroundMode }
+  | { type: "background-grid"; before: BoardGridBackground; after: BoardGridBackground }
+  // Asset filename (this board's own assets/ folder, same convention as BoardImage.assetFileName)
+  // or null for "no image chosen yet" - only actually painted when backgroundMode is "image".
+  | { type: "background-image"; before: string | null; after: string | null }
   | { type: "canvas-size"; before: { width: number; height: number }; after: { width: number; height: number } }
   | { type: "padding"; before: number; after: number };
 
@@ -69,8 +93,14 @@ export interface BoardDocument {
   canvasWidth: number;
   canvasHeight: number;
   // `null` = transparent - see renderBoardToCanvas (boardHandlers.ts), which simply skips the
-  // background fill in that case rather than treating null as "some particular color."
+  // background fill in that case rather than treating null as "some particular color." Only
+  // actually painted while backgroundMode below is "color" (or absent).
   backgroundColor: string | null;
+  // All three optional/absent on an old board (or a new one that's never touched the background
+  // mode picker) - see BoardBackgroundMode's own doc comment for why absent always means "color."
+  backgroundMode?: BoardBackgroundMode;
+  backgroundGrid?: BoardGridBackground;
+  backgroundImage?: string | null;
   // Blank margin (px) added around the *outside* of canvasWidth/canvasHeight at render/export
   // time - a mat/frame border around the whole composed board, like a photo frame. Purely a
   // rendering-time inset: no BoardImage's x/y ever changes because of it, which is what makes it

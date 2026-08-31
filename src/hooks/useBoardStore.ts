@@ -7,8 +7,8 @@
 // id that's already guaranteed to exist.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
-import { BoardCommand, BoardDocument, BoardImage } from "../utils/boardTypes";
-import { applyCommand, invertCommand } from "../handlers/boardHandlers";
+import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGridBackground, BoardImage } from "../utils/boardTypes";
+import { applyCommand, invertCommand, resolveBackgroundMode, resolveBoardGrid } from "../handlers/boardHandlers";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
@@ -26,6 +26,15 @@ export interface UseBoardStoreResult {
   reorderImages: (newOrder: BoardImage[]) => void;
   // `null` = transparent - see BoardDocument's own doc comment.
   setBackgroundColor: (color: string | null) => void;
+  // Which of the three background renderers is active - see BoardBackgroundMode's own doc comment.
+  // Switching modes never touches backgroundColor/backgroundGrid/backgroundImage - each is
+  // remembered independently so flipping back to a previously-used mode restores it as last left.
+  setBackgroundMode: (mode: BoardBackgroundMode) => void;
+  setBackgroundGrid: (grid: BoardGridBackground) => void;
+  // Asset filename already imported into this board's assets/ folder (see BoardEditor.tsx's
+  // handleChooseBackgroundImage), or null to clear it - this setter doesn't do any importing
+  // itself, same division of responsibility as addImage/BoardEditor's own handleAddImages.
+  setBackgroundImage: (assetFileName: string | null) => void;
   setCanvasSize: (width: number, height: number) => void;
   // Mat/frame border around the whole board - see BoardDocument's own doc comment. Purely a
   // rendering-time inset (boardHandlers.ts's paddedCanvasSize), so this alone is enough to update
@@ -166,6 +175,33 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     [dispatch]
   );
 
+  const setBackgroundMode = useCallback(
+    (mode: BoardBackgroundMode) => {
+      const current = docRef.current;
+      if (!current || resolveBackgroundMode(current) === mode) return;
+      dispatch({ type: "background-mode", before: resolveBackgroundMode(current), after: mode });
+    },
+    [dispatch]
+  );
+
+  const setBackgroundGrid = useCallback(
+    (grid: BoardGridBackground) => {
+      const current = docRef.current;
+      if (!current) return;
+      dispatch({ type: "background-grid", before: resolveBoardGrid(current), after: grid });
+    },
+    [dispatch]
+  );
+
+  const setBackgroundImage = useCallback(
+    (assetFileName: string | null) => {
+      const current = docRef.current;
+      if (!current || (current.backgroundImage ?? null) === assetFileName) return;
+      dispatch({ type: "background-image", before: current.backgroundImage ?? null, after: assetFileName });
+    },
+    [dispatch]
+  );
+
   // Applied after "Arrange in a row" so the canvas grows or shrinks to fit whatever that layout
   // actually needed - see boardHandlers.ts's AutoLayoutResult.
   const setCanvasSize = useCallback(
@@ -229,6 +265,9 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     batchEditImages,
     reorderImages,
     setBackgroundColor,
+    setBackgroundMode,
+    setBackgroundGrid,
+    setBackgroundImage,
     setCanvasSize,
     setPadding,
     renameBoard,

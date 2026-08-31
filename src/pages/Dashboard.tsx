@@ -23,7 +23,9 @@ import ImageEditor from "../components/ImageEditor";
 import ImageFolderGallery from "../components/ImageFolderGallery";
 import VideoFolderGallery from "../components/VideoFolderGallery";
 import PdfFolderGallery from "../components/PdfFolderGallery";
+import DocumentFolderGallery from "../components/DocumentFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
+import { BoardEditorHandle } from "../components/board/BoardEditor";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
@@ -63,6 +65,9 @@ import {
   IoRefresh,
   IoSearch,
   IoClose,
+  IoSwapVerticalOutline,
+  IoEyeOffOutline,
+  IoEyeOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 
@@ -82,10 +87,10 @@ const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.R
 type SidebarTab = FileCategory | "trash";
 
 // Categories with a folder-click grid view (ImageFolderGallery/VideoFolderGallery/
-// PdfFolderGallery) - audio and document don't have one yet. Centralized so adding a category's
-// gallery later is a one-line change here instead of hunting down every activeFileCategory === "x"
-// || activeFileCategory === "y" check this gates.
-const GALLERY_CATEGORIES: readonly SidebarTab[] = ["image", "video", "pdf"];
+// PdfFolderGallery/DocumentFolderGallery) - audio doesn't have one yet. Centralized so adding a
+// category's gallery later is a one-line change here instead of hunting down every
+// activeFileCategory === "x" || activeFileCategory === "y" check this gates.
+const GALLERY_CATEGORIES: readonly SidebarTab[] = ["image", "video", "pdf", "document"];
 
 interface TrashEntry {
   trashed_name: string;
@@ -259,6 +264,12 @@ const Dashboard = () => {
   // Which Board screen (if any) is showing in the main content pane - null means Board mode is
   // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
   const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
+  // Imperative handle onto whichever BoardEditor is currently mounted (see BoardEditorHandle) -
+  // lets the sidebar's "Add to board" menu item and bulk action bar reach into it and reuse its
+  // image-import pipeline, the same way videoPlayerRef lets the sidebar reach into VideoPlayer.
+  // null whenever boardScreen isn't in "editor" mode (BoardWorkspace renders BoardHome instead,
+  // which never attaches anything to this ref).
+  const boardEditorRef = useRef<BoardEditorHandle>(null);
   // Which Docs screen (if any) is showing in the main content pane - same null-means-off pattern
   // as boardScreen. See handleOpenDocs.
   const [docsScreen, setDocsScreen] = useState<DocsScreen | null>(null);
@@ -291,6 +302,25 @@ const Dashboard = () => {
       else next.add(folder);
       return next;
     });
+  };
+  // Sidebar declutter/ordering controls for the active category's file list - both in-memory
+  // only, same lifetime as collapsedFolders above. Hiding empty folders only affects folders with
+  // zero files in the *active* category (the "No {category} files" ones) — it never hides a
+  // folder while searching (isFolderEmpty-style filtering already takes over then) and the root
+  // is never eligible to be hidden.
+  const [hideEmptyFolders, setHideEmptyFolders] = useState<boolean>(false);
+  const [fileSortMode, setFileSortMode] = useState<"name-asc" | "name-desc" | "type">("name-asc");
+  const sortFileList = (fileList: FileEntry[]): FileEntry[] => {
+    const sorted = [...fileList];
+    if (fileSortMode === "name-desc") sorted.sort((a, b) => b.name.localeCompare(a.name));
+    else if (fileSortMode === "type") {
+      sorted.sort((a, b) => {
+        const extA = a.name.split(".").pop()?.toLowerCase() ?? "";
+        const extB = b.name.split(".").pop()?.toLowerCase() ?? "";
+        return extA.localeCompare(extB) || a.name.localeCompare(b.name);
+      });
+    } else sorted.sort((a, b) => a.name.localeCompare(b.name));
+    return sorted;
   };
   // Drag-and-drop move: the file(s) currently being dragged (more than one if the dragged file
   // was part of the active multi-selection below), and whichever folder header the pointer is
@@ -1754,6 +1784,10 @@ const setScreen = () => {
 		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "pdf") : []),
 		[files, selectedFolder]
 	);
+	const selectedFolderDocuments = useMemo(
+		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "document") : []),
+		[files, selectedFolder]
+	);
 	// Not category-specific despite living alongside the memos above - every folder in the
 	// library, for any gallery's "Move to" list.
 	const folderOptions = useMemo(
@@ -1856,10 +1890,20 @@ const setScreen = () => {
 		const name = newFolderValue.trim();
 		setCreatingFolderIn(null);
 		if (parent === null || !name) return;
+		// The backend only rejects a duplicate name within the same parent directory - nothing stops
+		// two folders sharing a name elsewhere in the tree (e.g. "MSC Research" under two different
+		// parents), and since the sidebar only ever shows a folder's last path segment, that pair
+		// would otherwise render identically with no indication anything's ambiguous. Non-blocking:
+		// this only warns after creation succeeds, it never prevents it.
+		const collidesElsewhere = Object.keys(files).some((existingFolder) => folderDisplayName(existingFolder) === name && existingFolder !== `${parent}/${name}` && existingFolder !== name);
 		try {
 			await invoke<string>("create_folder", { parentPath: parent, name });
 			await handleDirectoryFiles();
-			setMessage(`Created folder: ${name}`);
+			setMessage(
+				collidesElsewhere
+					? `Created folder: ${name} (note: another folder is already named "${name}" elsewhere - hover a folder to see its full path)`
+					: `Created folder: ${name}`
+			);
 		} catch (error) {
 			console.error("Error creating folder:", error);
 			setError(`Failed to create folder: ${error}`);
@@ -1925,6 +1969,20 @@ const setScreen = () => {
 			console.error("Error moving files:", error);
 			setError(`Failed to move files: ${error}`);
 		}
+	};
+
+	// Routes a batch of already-in-the-library files (a sidebar row's "Add to board" menu item, the
+	// bulk action bar's own button, or - separately - a sidebar drag onto the canvas, which
+	// BoardEditor handles itself via the libraryDraggingFiles prop rather than this function) into
+	// whichever board is currently open, via boardEditorRef's imperative handle. Silently drops any
+	// non-image file rather than erroring - both call sites already only show the option for image
+	// files/the image tab, so this filter is a safety net, not the primary gate.
+	const handleAddFilesToBoard = async (fileList: FileEntry[]): Promise<void> => {
+		setOpenMenu(null);
+		const imagePaths = fileList.filter((file) => getFileCategory(file.name) === "image").map((file) => file.path);
+		if (imagePaths.length === 0 || !boardEditorRef.current) return;
+		await boardEditorRef.current.addImagesFromPaths(imagePaths);
+		setSelectedFilePaths(new Set());
 	};
 
 	// Bulk counterpart to handleDeleteFile above - same move_to_trash-per-file/Promise.allSettled/
@@ -2146,14 +2204,19 @@ const setScreen = () => {
 	const filteredEntries = Object.entries(files)
 		.map(([folder, fileList]) => [
 			folder,
-			fileList.filter(
-				(file) => getFileCategory(file.name) === activeFileCategory && (!isSearchingFiles || file.name.toLowerCase().includes(normalizedSearchQuery))
+			sortFileList(
+				fileList.filter(
+					(file) => getFileCategory(file.name) === activeFileCategory && (!isSearchingFiles || file.name.toLowerCase().includes(normalizedSearchQuery))
+				)
 			),
 		] as [string, FileEntry[]])
 		// A folder with zero matches is only worth hiding while actively searching - normally
 		// every real folder stays visible (even empty ones, per this file's own comment above)
-		// so it's still usable as a create-subfolder/move/drop target.
+		// so it's still usable as a create-subfolder/move/drop target. hideEmptyFolders is the
+		// opt-in exception: user has explicitly asked to declutter, so folders with nothing in
+		// the active category are dropped too (root exempted - it's never hidden).
 		.filter(([, fileList]) => !isSearchingFiles || fileList.length > 0)
+		.filter(([folder, fileList]) => !hideEmptyFolders || fileList.length > 0 || folder === "")
 		.sort(([a], [b]) => a.localeCompare(b));
 	const filteredTrashItems = isSearchingFiles
 		? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery))
@@ -2278,6 +2341,32 @@ const setScreen = () => {
                     {activeFileCategory !== "trash" && (
                       <button
                         type="button"
+                        title={`Sort: ${fileSortMode === "name-asc" ? "Name (A-Z)" : fileSortMode === "name-desc" ? "Name (Z-A)" : "Type"} - click to cycle`}
+                        onClick={() =>
+                          setFileSortMode((prev) => (prev === "name-asc" ? "name-desc" : prev === "name-desc" ? "type" : "name-asc"))
+                        }
+                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                      >
+                        <IoSwapVerticalOutline size={15} />
+                      </button>
+                    )}
+                    {activeFileCategory !== "trash" && (
+                      <button
+                        type="button"
+                        title={hideEmptyFolders ? `Show folders with no ${activeFileCategory} files` : `Hide folders with no ${activeFileCategory} files`}
+                        onClick={() => setHideEmptyFolders((prev) => !prev)}
+                        className={`p-1 rounded transition-colors ${
+                          hideEmptyFolders
+                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        }`}
+                      >
+                        {hideEmptyFolders ? <IoEyeOffOutline size={15} /> : <IoEyeOutline size={15} />}
+                      </button>
+                    )}
+                    {activeFileCategory !== "trash" && (
+                      <button
+                        type="button"
                         disabled={!selectedFile}
                         title={
                           !selectedFile
@@ -2393,6 +2482,7 @@ const setScreen = () => {
                               .map((destFolder) => (
                                 <button
                                   key={destFolder || "__root__"}
+                                  title={destFolder || "Briefcast"}
                                   className="w-full text-left px-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
                                   onClick={() => handleMoveFiles(getSelectedFileEntries(), destFolder)}
                                 >
@@ -2409,6 +2499,18 @@ const setScreen = () => {
                           className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
                         >
                           Convert
+                        </button>
+                      )}
+                      {/* Only when a board is actually open - see BoardEditorHandle/boardEditorRef.
+                          Image tab only, matching FILE_CATEGORY_EXTENSIONS.image being the only
+                          thing Board can place on its canvas. */}
+                      {boardScreen?.mode === "editor" && activeFileCategory === "image" && (
+                        <button
+                          type="button"
+                          onClick={() => void handleAddFilesToBoard(getSelectedFileEntries())}
+                          className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                        >
+                          Add to board
                         </button>
                       )}
                       <button
@@ -2558,13 +2660,17 @@ const setScreen = () => {
                               ? "text-blue-600 dark:text-blue-400"
                               : "text-gray-500 dark:text-neutral-400"
                           }`}
-                          title={collapsedFolders.has(folder) ? `Expand ${folderDisplayName(folder)}` : `Collapse ${folderDisplayName(folder)}`}
+                          // Full relative path here (not just folderDisplayName's leaf segment) so
+                          // two folders sharing a name at different nesting depths - e.g. two
+                          // "MSC Research" folders - are distinguishable on hover instead of both
+                          // showing an identical tooltip.
+                          title={`${collapsedFolders.has(folder) ? "Expand" : "Collapse"} "${folder || "Briefcast"}"`}
                           onClick={() => {
                             toggleFolderCollapsed(folder);
                             // Gallery categories only (see GALLERY_CATEGORIES): clicking a folder
                             // also loads its files as a thumbnail grid in the main board (see
-                            // selectedFolder above) - other tabs (audio/document) don't have a
-                            // gallery view yet, so this is a no-op for them beyond the existing
+                            // selectedFolder above) - the audio tab doesn't have a gallery view yet,
+                            // so this is a no-op for it beyond the existing
                             // expand/collapse.
                             if (GALLERY_CATEGORIES.includes(activeFileCategory)) {
                               setSelectedFolder(folder);
@@ -2844,6 +2950,23 @@ const setScreen = () => {
                                         </button>
                                        )}
 
+                                      {/* Only when a board is actually open (boardEditorRef) and
+                                          this is an image - see handleAddFilesToBoard. */}
+                                      {boardScreen?.mode === "editor" && getFileCategory(file.name) === "image" && (
+                                        <button
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void handleAddFilesToBoard(filesToActOn(file));
+                                          }}
+                                        >
+                                          <IoAddCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                          <span className="flex-1 text-left">
+                                            {filesToActOn(file).length > 1 ? `Add ${filesToActOn(file).length} to board` : "Add to board"}
+                                          </span>
+                                        </button>
+                                      )}
+
                                       {/* "Move to ▸" — expands in place into the folder list rather
                                           than as a hover flyout, so it works the same on touch/
                                           trackpad as a click, with no hover-timing to get wrong. */}
@@ -2870,6 +2993,7 @@ const setScreen = () => {
                                             .map((destFolder) => (
                                               <button
                                                 key={destFolder || "__root__"}
+                                                title={destFolder || "Briefcast"}
                                                 disabled={destFolder === folder}
                                                 className={`w-full text-left pl-6 pr-3 py-1.5 text-xs truncate ${
                                                   destFolder === folder
@@ -2984,7 +3108,7 @@ const setScreen = () => {
           )}
 
           {boardScreen ? (
-            <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
+            <BoardWorkspace ref={boardEditorRef} screen={boardScreen} onScreenChange={setBoardScreen} libraryDraggingFiles={draggingFiles} />
           ) : docsScreen ? (
             <ErrorBoundary
               key={docsScreen.mode === "editor" ? `editor-${docsScreen.docId}` : "home"}
@@ -3181,6 +3305,28 @@ const setScreen = () => {
               folderLabel={folderDisplayName(selectedFolder)}
               resolveAssetUrl={resolvePreviewAssetUrl}
               onOpenPdf={(file) => loadFileForPlayback(file.path, file.name)}
+              onDeleteFile={handleDeleteFile}
+              renamingFile={renamingFile}
+              renameValue={renameValue}
+              onRenameValueChange={setRenameValue}
+              onStartRename={startRename}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenamingFile(null)}
+              selectedFilePaths={selectedFilePaths}
+              onToggleFileSelected={toggleFileSelected}
+              onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
+              onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
+              onClearSelection={() => setSelectedFilePaths(new Set())}
+              folderOptions={folderOptions}
+              currentFolder={selectedFolder}
+              onMoveFiles={handleMoveFiles}
+              onBulkDelete={handleBulkDeleteFiles}
+            />
+          ) : selectedFolder !== null && activeFileCategory === "document" ? (
+            <DocumentFolderGallery
+              files={selectedFolderDocuments}
+              folderLabel={folderDisplayName(selectedFolder)}
+              onOpenDocument={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
               renamingFile={renamingFile}
               renameValue={renameValue}
