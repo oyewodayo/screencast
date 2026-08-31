@@ -7,8 +7,26 @@
 // the user wants.
 import React, { useCallback, useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { IoAdd, IoEllipsisVertical, IoImagesOutline, IoTrashOutline } from "react-icons/io5";
+import { IoAdd, IoChevronDown, IoEllipsisVertical, IoImagesOutline, IoTrashOutline } from "react-icons/io5";
 import { BoardSummary, createEmptyBoardDocument } from "../../utils/boardTypes";
+import { applyBoardTemplate, BOARD_TEMPLATES, BoardTemplate } from "../../utils/boardTemplates";
+
+// Small CSS-only preview swatch for a template card - no need for a real canvas render just to
+// preview a background choice, since a template only ever sets background/padding fields.
+function templatePreviewStyle(template: BoardTemplate): React.CSSProperties {
+  if (template.backgroundMode === "grid" && template.backgroundGrid) {
+    const { spacing, lineColor, baseColor } = template.backgroundGrid;
+    // Scaled down from the board's own (much larger) spacing to something that reads as a grid
+    // inside a small card rather than a handful of stray lines.
+    const previewSpacing = Math.max(8, Math.round(spacing / 3));
+    return {
+      backgroundColor: baseColor ?? "transparent",
+      backgroundImage: `linear-gradient(${lineColor} 1px, transparent 1px), linear-gradient(90deg, ${lineColor} 1px, transparent 1px)`,
+      backgroundSize: `${previewSpacing}px ${previewSpacing}px`,
+    };
+  }
+  return { backgroundColor: template.backgroundColor ?? "transparent" };
+}
 
 interface BoardHomeProps {
   onOpenBoard: (id: string) => void;
@@ -76,22 +94,37 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
     }
   }, []);
 
-  const handleCreate = useCallback(async () => {
-    setIsCreating(true);
-    setError(null);
-    try {
-      const id = crypto.randomUUID();
-      const existingCount = boards?.length ?? 0;
-      const doc = createEmptyBoardDocument(id, `Board ${existingCount + 1}`);
-      await invoke("create_board", { id, name: doc.name, json: JSON.stringify(doc) });
-      onOpenBoard(id);
-    } catch (err) {
-      console.error("Failed to create board:", err);
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setIsCreating(false);
-    }
-  }, [boards, onOpenBoard]);
+  // Which card's 3-dot menu is open reuses the click-outside pattern above; the template picker
+  // below is its own toggle since it's a completely separate popover off a different button.
+  const [showTemplates, setShowTemplates] = useState(false);
+
+  useEffect(() => {
+    if (!showTemplates) return;
+    const close = () => setShowTemplates(false);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [showTemplates]);
+
+  const handleCreate = useCallback(
+    async (template: BoardTemplate) => {
+      setIsCreating(true);
+      setShowTemplates(false);
+      setError(null);
+      try {
+        const id = crypto.randomUUID();
+        const existingCount = boards?.length ?? 0;
+        const doc = applyBoardTemplate(createEmptyBoardDocument(id, `Board ${existingCount + 1}`), template);
+        await invoke("create_board", { id, name: doc.name, json: JSON.stringify(doc) });
+        onOpenBoard(id);
+      } catch (err) {
+        console.error("Failed to create board:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsCreating(false);
+      }
+    },
+    [boards, onOpenBoard]
+  );
 
   return (
     <div className="relative flex flex-col items-center justify-start h-full w-full gap-6 px-8 py-10 overflow-y-auto">
@@ -105,14 +138,50 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
             Arrange several images into one composed layout, then export it as a new image.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => void handleCreate()}
-          disabled={isCreating}
-          className="mt-1 flex items-center gap-1.5 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
-        >
-          <IoAdd size={16} /> New board
-        </button>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowTemplates((prev) => !prev);
+            }}
+            disabled={isCreating}
+            className="mt-1 flex items-center gap-1.5 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+          >
+            <IoAdd size={16} /> New board
+            <IoChevronDown size={14} className={`transition-transform ${showTemplates ? "rotate-180" : ""}`} />
+          </button>
+
+          {/* Template picker - a starting background/padding preset, not a locked-in choice (see
+              boardTemplates.ts's own doc comment: every field it sets stays freely editable
+              afterward). No portal needed here (unlike BoardEditor.tsx's own dropdowns) - nothing
+              in this tree uses a stacking-context-creating filter/backdrop-blur. */}
+          {showTemplates && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="absolute left-1/2 -translate-x-1/2 top-full mt-2 w-80 rounded-xl bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 shadow-xl p-3 z-20"
+            >
+              <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 px-1">Start from a template</p>
+              <div className="grid grid-cols-3 gap-2">
+                {BOARD_TEMPLATES.map((template) => (
+                  <button
+                    key={template.id}
+                    type="button"
+                    onClick={() => void handleCreate(template)}
+                    disabled={isCreating}
+                    className="group flex flex-col gap-1.5 rounded-lg text-left disabled:opacity-50"
+                  >
+                    <div
+                      style={templatePreviewStyle(template)}
+                      className="aspect-square rounded-md border border-gray-200 dark:border-neutral-700 group-hover:border-blue-400 dark:group-hover:border-blue-500 transition-colors"
+                    />
+                    <span className="text-[11px] text-gray-600 dark:text-neutral-300 truncate px-0.5">{template.name}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
         {error && <p className="text-red-500 dark:text-red-400 text-xs">{error}</p>}
       </div>
 

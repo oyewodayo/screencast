@@ -12,13 +12,13 @@
 // as a single edit/batch-edit on pointer release - a "stage locally, commit once" discipline that
 // keeps a whole drag gesture to exactly one undo step.
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { BoardDocument, BoardImage } from "../../utils/boardTypes";
+import { BoardDocument, BoardItem } from "../../utils/boardTypes";
 import {
   ResizeCorner,
   applyMove,
   applyResize,
   applyRotate,
-  hitTestBoardImage,
+  hitTestBoardItem,
   paddedCanvasSize,
   renderBoardToCanvas,
   resizeHandlePoints,
@@ -36,7 +36,7 @@ interface DragState {
   corner?: ResizeCorner;
   startX: number;
   startY: number;
-  startImages: BoardImage[]; // full doc.images snapshot at drag start
+  startImages: BoardItem[]; // full doc.images snapshot at drag start
 }
 
 interface BoardCanvasProps {
@@ -50,13 +50,13 @@ interface BoardCanvasProps {
   imageBitmaps: Map<string, HTMLImageElement>;
   selectedIds: Set<string>;
   onSelect: (ids: Set<string>) => void;
-  onEditImage: (before: BoardImage, after: BoardImage) => void;
-  onBatchEditImages: (before: BoardImage[], after: BoardImage[]) => void;
+  onEditImage: (before: BoardItem, after: BoardItem) => void;
+  onBatchEditImages: (before: BoardItem[], after: BoardItem[]) => void;
 }
 
 const BoardCanvas: React.FC<BoardCanvasProps> = ({ doc, zoom, imageBitmaps, selectedIds, onSelect, onEditImage, onBatchEditImages }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [liveImages, setLiveImages] = useState<BoardImage[] | null>(null);
+  const [liveImages, setLiveImages] = useState<BoardItem[] | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
   const displayImages = liveImages ?? doc.images;
@@ -72,8 +72,8 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({ doc, zoom, imageBitmaps, sele
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    // Selection chrome is drawn in the same unpadded document space image.x/y already are
-    // (matching hitTestBoardImage/applyMove etc.) - offset by the same padding
+    // Selection chrome is drawn in the same unpadded document space item.x/y already are
+    // (matching hitTestBoardItem/applyMove etc.) - offset by the same padding
     // renderBoardToCanvas insets its own image drawing by, so the outline/handles land exactly on
     // top of the images they belong to regardless of the board's current padding.
     ctx.save();
@@ -90,7 +90,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({ doc, zoom, imageBitmaps, sele
   }, [draw]);
 
   // Converts a pointer event into the board's own unpadded document space - the same space
-  // image.x/y, hitTestBoardImage, applyMove/Resize/Rotate, and resizeHandlePoints all work in.
+  // item.x/y, hitTestBoardItem, applyMove/Resize/Rotate, and resizeHandlePoints all work in.
   // canvas.width/rect.width first undoes any zoom (CSS size vs. buffer size), then padding is
   // subtracted back out since the buffer itself is padding pixels bigger than the document on
   // every side (see paddedCanvasSize).
@@ -127,7 +127,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({ doc, zoom, imageBitmaps, sele
       }
     }
 
-    const hit = hitTestBoardImage(doc.images, x, y);
+    const hit = hitTestBoardItem(doc.images, x, y);
     if (!hit) {
       if (!e.shiftKey) onSelect(new Set());
       return;
@@ -177,8 +177,8 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({ doc, zoom, imageBitmaps, sele
 
     const beforeById = new Map(drag.startImages.map((img) => [img.id, img]));
     const afterById = new Map(liveImages.map((img) => [img.id, img]));
-    const before = [...drag.ids].map((id) => beforeById.get(id)).filter((img): img is BoardImage => !!img);
-    const after = [...drag.ids].map((id) => afterById.get(id)).filter((img): img is BoardImage => !!img);
+    const before = [...drag.ids].map((id) => beforeById.get(id)).filter((img): img is BoardItem => !!img);
+    const after = [...drag.ids].map((id) => afterById.get(id)).filter((img): img is BoardItem => !!img);
 
     setLiveImages(null);
     if (before.length === 0 || after.length === 0) return;
@@ -218,7 +218,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({ doc, zoom, imageBitmaps, sele
   );
 };
 
-function drawSelectionChrome(ctx: CanvasRenderingContext2D, image: BoardImage, showHandles: boolean): void {
+function drawSelectionChrome(ctx: CanvasRenderingContext2D, image: BoardItem, showHandles: boolean): void {
   ctx.save();
   const cx = image.x + image.width / 2;
   const cy = image.y + image.height / 2;

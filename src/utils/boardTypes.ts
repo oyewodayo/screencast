@@ -14,13 +14,28 @@ export interface BoardShadow {
   color: string;
 }
 
-// Border-box model: x/y/width/height describe the *outer* edge of the image's frame (background +
-// border), pre-rotation - rotation is applied around the box's own center at render time, same
-// convention imageEditTypes.ts's PlacedImageObject uses for the same reason (move/resize math
-// never has to account for rotation). The actual photo is drawn inset from this box by
-// `borderWidth + padding` on every side.
-export interface BoardImage {
+// Fields every board item - image or text - shares: geometry (the same border-box model
+// imageEditTypes.ts's PlacedImageObject uses - x/y/width/height describe the outer edge
+// pre-rotation, rotation applied around the box's own center at render time, so move/resize math
+// never has to account for rotation), stacking-independent style (opacity), and bookkeeping.
+// boardHandlers.ts's geometry helpers (applyMove/applyResize/applyRotate/hitTestBoardItem/
+// resizeHandlePoints/rotateHandlePoint) are written generically against exactly this shape, which
+// is what lets a text item get full move/resize/rotate/select parity with an image for free.
+interface BoardItemBase {
   id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotation: number; // radians, around the box's own center
+  opacity: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// The actual photo is drawn inset from the border-box by `borderWidth + padding` on every side.
+export interface BoardImage extends BoardItemBase {
+  kind: "image";
   // Filename only, relative to this board's own Boards/<boardId>/assets/ folder - never an
   // absolute path or the original source file's path. Images are copied in at import time (see
   // import_board_image) so the board keeps working even if the source is later moved, renamed, or
@@ -28,22 +43,40 @@ export interface BoardImage {
   assetFileName: string;
   naturalWidth: number;
   naturalHeight: number;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  rotation: number; // radians, around the box's own center
   // Gap between the border and the photo itself - the background color shows through here.
   padding: number;
   borderWidth: number;
   borderColor: string;
   cornerRadius: number;
   backgroundColor: string;
-  opacity: number;
   shadow?: BoardShadow;
-  createdAt: number;
-  updatedAt: number;
 }
+
+// A free-floating text box - the Board feature's second item kind alongside BoardImage (see
+// BoardItem below). Deliberately edited through BoardStylePanel's own text section rather than an
+// in-canvas contentEditable overlay: the whole board is one <canvas> element, not per-item DOM
+// nodes, so there's nothing to make contentEditable without building a second, rotation-aware
+// overlay system - the side panel already IS this app's one property-editing surface for every
+// other per-item field (image padding/border/corner radius included), so text content joins it
+// instead of inventing a second interaction model just for itself.
+export interface BoardText extends BoardItemBase {
+  kind: "text";
+  text: string;
+  fontFamily: string;
+  fontSize: number;
+  fontWeight: "normal" | "bold";
+  fontStyle: "normal" | "italic";
+  textAlign: "left" | "center" | "right";
+  color: string;
+  // Fill behind the text, inset by `padding` from the text itself - null = no box, just the text
+  // floating directly on whatever's behind it. Same "null = transparent" convention as
+  // BoardDocument.backgroundColor/BoardGridBackground.baseColor.
+  backgroundColor: string | null;
+  cornerRadius: number; // rounds the background box, when backgroundColor isn't null
+  padding: number;
+}
+
+export type BoardItem = BoardImage | BoardText;
 
 // Which of the three background renderers is active - see boardHandlers.ts's renderBoardToCanvas
 // for how each one actually paints. Old boards saved before this existed simply lack the field on
@@ -61,15 +94,16 @@ export interface BoardGridBackground {
 }
 
 export type BoardCommand =
-  | { type: "add"; image: BoardImage }
-  | { type: "delete"; image: BoardImage }
-  | { type: "edit"; before: BoardImage; after: BoardImage }
-  // Multiple images replaced at once as a single undo step - multi-selection drag, "Arrange in a
-  // row" - same before/after-pair shape as 'edit', just over an array. Matched by id.
-  | { type: "batch-edit"; before: BoardImage[]; after: BoardImage[] }
+  | { type: "add"; item: BoardItem }
+  | { type: "delete"; item: BoardItem }
+  | { type: "edit"; before: BoardItem; after: BoardItem }
+  // Multiple items replaced at once as a single undo step - multi-selection drag, "Arrange in a
+  // row" (images only - see BoardEditor.tsx's handleArrange). Same before/after-pair shape as
+  // 'edit', just over an array. Matched by id.
+  | { type: "batch-edit"; before: BoardItem[]; after: BoardItem[] }
   // Full replacement order for the whole images array - order is the document's only concept of
   // z-order/stacking (last = topmost), same convention imageEditTypes.ts's objects array uses.
-  | { type: "reorder"; before: BoardImage[]; after: BoardImage[] }
+  | { type: "reorder"; before: BoardItem[]; after: BoardItem[] }
   // `null` = no fill, the canvas stays transparent there (visible in the exported PNG's alpha).
   // Only actually painted when backgroundMode is "color" (or absent, for an old board) - see
   // BoardBackgroundMode above - but kept as its own field/command rather than folded into a
@@ -107,7 +141,12 @@ export interface BoardDocument {
   // safe to update live (see boardHandlers.ts's paddedCanvasSize) with no re-arrange step needed,
   // unlike the old per-arrangement gridline gap this replaced conceptually but not in code.
   padding: number;
-  images: BoardImage[]; // array order = z-order, last = topmost
+  // array order = z-order, last = topmost. Still named "images" despite now holding BoardText
+  // items too - kept for on-disk compatibility (renaming the JSON key would silently orphan every
+  // image already saved on an existing board) rather than for accuracy; every reader/writer in
+  // this codebase treats it as BoardItem[]. An entry with no `kind` field at all is an image saved
+  // before BoardText existed - see useBoardStore.ts's load effect for where that gets normalized.
+  images: BoardItem[];
   createdAt: string;
   updatedAt: string;
 }
@@ -158,6 +197,7 @@ export function createDefaultBoardImage(
   const scale = Math.min(1, DEFAULT_IMAGE_MAX_DIMENSION / longestSide);
   const now = Date.now();
   return {
+    kind: "image",
     id,
     assetFileName,
     naturalWidth,
@@ -172,6 +212,35 @@ export function createDefaultBoardImage(
     borderColor: "#000000",
     cornerRadius: 0,
     backgroundColor: "#ffffff",
+    opacity: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+const DEFAULT_TEXT_WIDTH = 260;
+const DEFAULT_TEXT_HEIGHT = 90;
+
+export function createDefaultBoardText(id: string, x: number, y: number): BoardText {
+  const now = Date.now();
+  return {
+    kind: "text",
+    id,
+    text: "Your text here",
+    x,
+    y,
+    width: DEFAULT_TEXT_WIDTH,
+    height: DEFAULT_TEXT_HEIGHT,
+    rotation: 0,
+    fontFamily: "system-ui, sans-serif",
+    fontSize: 28,
+    fontWeight: "normal",
+    fontStyle: "normal",
+    textAlign: "left",
+    color: "#111111",
+    backgroundColor: null,
+    cornerRadius: 0,
+    padding: 8,
     opacity: 1,
     createdAt: now,
     updatedAt: now,

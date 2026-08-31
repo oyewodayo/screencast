@@ -6,7 +6,7 @@
 // no shared code, per the Board feature's "build from scratch" requirement (the single-image
 // editor's tools don't fit this feature's per-image padding/border/margin/radius needs).
 
-import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGridBackground, BoardImage } from "../utils/boardTypes";
+import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGridBackground, BoardImage, BoardItem, BoardText } from "../utils/boardTypes";
 
 // ---- Geometry helpers -----------------------------------------------------------------------
 
@@ -114,6 +114,77 @@ function renderBoardImage(ctx: CanvasRenderingContext2D, image: BoardImage, img:
   ctx.restore();
 }
 
+// Greedy word-wrap: splits on explicit newlines first (a deliberate paragraph break the user
+// typed), then wraps each paragraph's words to fit `maxWidth`, measured against whatever font is
+// already set on `ctx` - callers must set ctx.font before calling this. A single word wider than
+// maxWidth is still placed on its own line rather than split mid-word (this is a text box, not a
+// terminal - breaking a word is worse than letting one line overflow slightly).
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    const words = paragraph.split(" ");
+    let current = "";
+    for (const word of words) {
+      const candidate = current ? `${current} ${word}` : word;
+      if (maxWidth > 0 && current && ctx.measureText(candidate).width > maxWidth) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = candidate;
+      }
+    }
+    lines.push(current);
+  }
+  return lines;
+}
+
+// Draws one text item's background box (if any) and its word-wrapped content, clipped to the box
+// so an overflowing paragraph is cropped rather than spilling onto whatever's next to it - the
+// text-editing UI (BoardStylePanel) has no live "does this fit" preview, so silently cropping is
+// safer than an unreadable overlap. `padding` insets the text from the box on every side, same
+// convention renderBoardImage's own borderWidth+padding inset uses for the photo inside its frame.
+function renderBoardText(ctx: CanvasRenderingContext2D, item: BoardText): void {
+  ctx.save();
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
+  ctx.translate(cx, cy);
+  ctx.rotate(item.rotation);
+  ctx.translate(-cx, -cy);
+  ctx.globalAlpha = item.opacity;
+
+  if (item.backgroundColor) {
+    roundedRectPath(ctx, item.x, item.y, item.width, item.height, item.cornerRadius);
+    ctx.fillStyle = item.backgroundColor;
+    ctx.fill();
+  }
+
+  const contentX = item.x + item.padding;
+  const contentY = item.y + item.padding;
+  const contentWidth = Math.max(0, item.width - item.padding * 2);
+  const contentHeight = Math.max(0, item.height - item.padding * 2);
+
+  if (contentWidth > 0 && contentHeight > 0 && item.text) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(contentX, contentY, contentWidth, contentHeight);
+    ctx.clip();
+
+    ctx.fillStyle = item.color;
+    ctx.font = `${item.fontStyle} ${item.fontWeight} ${item.fontSize}px ${item.fontFamily}`;
+    ctx.textBaseline = "top";
+    ctx.textAlign = item.textAlign;
+
+    const anchorX = item.textAlign === "center" ? contentX + contentWidth / 2 : item.textAlign === "right" ? contentX + contentWidth : contentX;
+    const lineHeight = item.fontSize * 1.25;
+    wrapText(ctx, item.text, contentWidth).forEach((line, i) => {
+      ctx.fillText(line, anchorX, contentY + i * lineHeight);
+    });
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+
 // Resolves doc.padding defensively (Number.isFinite guard - same reasoning safeGap used to have
 // for the old gridlineWidth field: a board saved before `padding` existed loads it as `undefined`,
 // which must never reach arithmetic as NaN - this exact bug already slipped through once, into the
@@ -184,9 +255,10 @@ function drawGridBackground(ctx: CanvasRenderingContext2D, width: number, height
   ctx.restore();
 }
 
-// Renders the full board: background (see the three-renderer comment above), then every image in
-// array order (last = topmost), inset by paddedCanvasSize's padding so image coordinates stay in
-// the document's own unpadded space throughout (BoardImage.x/y never account for padding - callers
+// Renders the full board: background (see the three-renderer comment above), then every item
+// (image or text) in array order (last = topmost), inset by paddedCanvasSize's padding so item
+// coordinates stay in the document's own unpadded space throughout (BoardItem.x/y never account
+// for padding - callers
 // doing hit-testing/pointer math against the same buffer must subtract padding back out, see
 // BoardCanvas.tsx's pointerToCanvasSpace). `canvas` must already be sized to
 // `paddedCanvasSize(doc).width * scale` / `.height * scale` by the caller (same split of
@@ -220,23 +292,26 @@ export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocumen
 
   ctx.save();
   ctx.translate(padding, padding);
-  for (const image of doc.images) {
-    renderBoardImage(ctx, image, imageBitmaps.get(image.assetFileName) ?? null);
+  for (const item of doc.images) {
+    if (item.kind === "text") renderBoardText(ctx, item);
+    else renderBoardImage(ctx, item, imageBitmaps.get(item.assetFileName) ?? null);
   }
   ctx.restore();
 }
 
 // ---- Hit-testing / interaction -----------------------------------------------------------------
 
-// Click-to-select hit test, topmost (last-drawn) image first.
-export function hitTestBoardImage(images: BoardImage[], x: number, y: number): BoardImage | null {
-  for (let i = images.length - 1; i >= 0; i--) {
-    const image = images[i];
-    const cx = image.x + image.width / 2;
-    const cy = image.y + image.height / 2;
-    const local = unrotatePoint(x, y, cx, cy, image.rotation);
-    if (local.x >= image.x && local.x <= image.x + image.width && local.y >= image.y && local.y <= image.y + image.height) {
-      return image;
+// Click-to-select hit test, topmost (last-drawn) item first - works identically for an image or a
+// text item since both are BoardItem's shared border-box geometry (see BoardItemBase's own doc
+// comment in boardTypes.ts).
+export function hitTestBoardItem(items: BoardItem[], x: number, y: number): BoardItem | null {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    const cx = item.x + item.width / 2;
+    const cy = item.y + item.height / 2;
+    const local = unrotatePoint(x, y, cx, cy, item.rotation);
+    if (local.x >= item.x && local.x <= item.x + item.width && local.y >= item.y && local.y <= item.y + item.height) {
+      return item;
     }
   }
   return null;
@@ -244,41 +319,44 @@ export function hitTestBoardImage(images: BoardImage[], x: number, y: number): B
 
 export type ResizeCorner = "nw" | "ne" | "sw" | "se";
 
-// On-screen (canvas-space) positions of an image's four resize-handle corners, accounting for its
+// On-screen (canvas-space) positions of an item's four resize-handle corners, accounting for its
 // current rotation - what BoardCanvas draws handle chrome at and hit-tests drag starts against.
-export function resizeHandlePoints(image: BoardImage): Record<ResizeCorner, { x: number; y: number }> {
-  const cx = image.x + image.width / 2;
-  const cy = image.y + image.height / 2;
+export function resizeHandlePoints(item: BoardItem): Record<ResizeCorner, { x: number; y: number }> {
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
   const local: Record<ResizeCorner, { x: number; y: number }> = {
-    nw: { x: image.x, y: image.y },
-    ne: { x: image.x + image.width, y: image.y },
-    sw: { x: image.x, y: image.y + image.height },
-    se: { x: image.x + image.width, y: image.y + image.height },
+    nw: { x: item.x, y: item.y },
+    ne: { x: item.x + item.width, y: item.y },
+    sw: { x: item.x, y: item.y + item.height },
+    se: { x: item.x + item.width, y: item.y + item.height },
   };
   return {
-    nw: rotatePoint(local.nw.x, local.nw.y, cx, cy, image.rotation),
-    ne: rotatePoint(local.ne.x, local.ne.y, cx, cy, image.rotation),
-    sw: rotatePoint(local.sw.x, local.sw.y, cx, cy, image.rotation),
-    se: rotatePoint(local.se.x, local.se.y, cx, cy, image.rotation),
+    nw: rotatePoint(local.nw.x, local.nw.y, cx, cy, item.rotation),
+    ne: rotatePoint(local.ne.x, local.ne.y, cx, cy, item.rotation),
+    sw: rotatePoint(local.sw.x, local.sw.y, cx, cy, item.rotation),
+    se: rotatePoint(local.se.x, local.se.y, cx, cy, item.rotation),
   };
 }
 
 // Canvas-space position of the rotate handle - a fixed offset above the box's local top edge,
 // rotated along with the box, so it always sits just outside whichever edge is currently "up".
-export function rotateHandlePoint(image: BoardImage, offset = 28): { x: number; y: number } {
-  const cx = image.x + image.width / 2;
-  const cy = image.y + image.height / 2;
-  return rotatePoint(cx, image.y - offset, cx, cy, image.rotation);
+export function rotateHandlePoint(item: BoardItem, offset = 28): { x: number; y: number } {
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
+  return rotatePoint(cx, item.y - offset, cx, cy, item.rotation);
 }
 
-export function applyMove(image: BoardImage, dx: number, dy: number): BoardImage {
-  return { ...image, x: image.x + dx, y: image.y + dy, updatedAt: Date.now() };
+// Generic over T so a BoardImage stays a BoardImage and a BoardText stays a BoardText through the
+// operation (a plain BoardItem param/return would collapse the result back to the union, forcing
+// every caller to re-narrow by `.kind` even when they already know which one they started with).
+export function applyMove<T extends BoardItem>(item: T, dx: number, dy: number): T {
+  return { ...item, x: item.x + dx, y: item.y + dy, updatedAt: Date.now() };
 }
 
 // Resizes by dragging one corner, keeping the *opposite* corner fixed - pointer coordinates are
 // first brought into the box's own local (unrotated) frame so this works the same regardless of
 // the box's current rotation. `minSize` prevents the box collapsing to zero/negative.
-export function applyResize(image: BoardImage, corner: ResizeCorner, pointerX: number, pointerY: number, minSize = 24): BoardImage {
+export function applyResize<T extends BoardItem>(image: T, corner: ResizeCorner, pointerX: number, pointerY: number, minSize = 24): T {
   const cx = image.x + image.width / 2;
   const cy = image.y + image.height / 2;
   const local = unrotatePoint(pointerX, pointerY, cx, cy, image.rotation);
@@ -293,7 +371,7 @@ export function applyResize(image: BoardImage, corner: ResizeCorner, pointerX: n
   return { ...image, x, y, width: Math.max(minSize, right - x), height: Math.max(minSize, bottom - y), updatedAt: Date.now() };
 }
 
-export function applyRotate(image: BoardImage, pointerX: number, pointerY: number): BoardImage {
+export function applyRotate<T extends BoardItem>(image: T, pointerX: number, pointerY: number): T {
   const cx = image.x + image.width / 2;
   const cy = image.y + image.height / 2;
   const rotation = Math.atan2(pointerY - cy, pointerX - cx) + Math.PI / 2;
@@ -542,9 +620,9 @@ export function applyCommand(doc: BoardDocument, command: BoardCommand): BoardDo
   const updatedAt = new Date().toISOString();
   switch (command.type) {
     case "add":
-      return { ...doc, images: [...doc.images, command.image], updatedAt };
+      return { ...doc, images: [...doc.images, command.item], updatedAt };
     case "delete":
-      return { ...doc, images: doc.images.filter((img) => img.id !== command.image.id), updatedAt };
+      return { ...doc, images: doc.images.filter((img) => img.id !== command.item.id), updatedAt };
     case "edit":
       return { ...doc, images: doc.images.map((img) => (img.id === command.after.id ? command.after : img)), updatedAt };
     case "batch-edit": {
@@ -571,9 +649,9 @@ export function applyCommand(doc: BoardDocument, command: BoardCommand): BoardDo
 export function invertCommand(command: BoardCommand): BoardCommand {
   switch (command.type) {
     case "add":
-      return { type: "delete", image: command.image };
+      return { type: "delete", item: command.item };
     case "delete":
-      return { type: "add", image: command.image };
+      return { type: "add", item: command.item };
     case "edit":
       return { type: "edit", before: command.after, after: command.before };
     case "batch-edit":

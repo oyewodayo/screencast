@@ -7,7 +7,7 @@
 // id that's already guaranteed to exist.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
-import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGridBackground, BoardImage } from "../utils/boardTypes";
+import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGridBackground, BoardItem } from "../utils/boardTypes";
 import { applyCommand, invertCommand, resolveBackgroundMode, resolveBoardGrid } from "../handlers/boardHandlers";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
@@ -16,14 +16,17 @@ export interface UseBoardStoreResult {
   doc: BoardDocument | null;
   loading: boolean;
   loadError: string | null;
-  addImage: (image: BoardImage) => void;
-  editImage: (before: BoardImage, after: BoardImage) => void;
-  deleteImage: (image: BoardImage) => void;
-  // Replaces several images at once as a single undo step - multi-selection drag, "Arrange in a
-  // row". `before`/`after` must be the same images (matched by id) before/after the batch op.
-  batchEditImages: (before: BoardImage[], after: BoardImage[]) => void;
+  // Named after images for historical reasons (images came first) but generic over BoardItem -
+  // works identically for a BoardText item, same as boardHandlers.ts's own geometry helpers these
+  // ultimately dispatch to.
+  addImage: (item: BoardItem) => void;
+  editImage: (before: BoardItem, after: BoardItem) => void;
+  deleteImage: (item: BoardItem) => void;
+  // Replaces several items at once as a single undo step - multi-selection drag, "Arrange in a
+  // row". `before`/`after` must be the same items (matched by id) before/after the batch op.
+  batchEditImages: (before: BoardItem[], after: BoardItem[]) => void;
   // Full replacement order for the whole images array - drag-to-reorder in the layers list.
-  reorderImages: (newOrder: BoardImage[]) => void;
+  reorderImages: (newOrder: BoardItem[]) => void;
   // `null` = transparent - see BoardDocument's own doc comment.
   setBackgroundColor: (color: string | null) => void;
   // Which of the three background renderers is active - see BoardBackgroundMode's own doc comment.
@@ -86,7 +89,15 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
         // (not instead of) every consumer's own defensive guard (e.g. boardHandlers.ts's
         // resolveBoardPadding) - a missing `padding` already reached the zoom-percentage readout
         // as NaN once because only *some* consumers guarded it; belt and suspenders now.
-        setDoc({ padding: 0, ...JSON.parse(json) });
+        const parsed = JSON.parse(json);
+        // BoardText didn't exist when older boards were saved, so every entry in their `images`
+        // array is an image with no `kind` field at all - normalized to "image" here, once, so
+        // every other reader in the app can treat `kind` as always present rather than re-deriving
+        // "no kind = image" itself. A `kind: "text"` entry (impossible before this feature existed)
+        // passes through unchanged. `parsed`/`item` are untyped (JSON.parse's own `any`) precisely
+        // because this is the one place on-disk data may not yet match BoardItem's shape.
+        const images: BoardItem[] = (parsed.images ?? []).map((item: any) => (item.kind ? item : { ...item, kind: "image" as const }));
+        setDoc({ padding: 0, ...parsed, images });
       } catch (err) {
         console.error("Failed to load board:", err);
         if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
@@ -139,10 +150,10 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     [scheduleAutosave]
   );
 
-  const addImage = useCallback((image: BoardImage) => dispatch({ type: "add", image }), [dispatch]);
-  const deleteImage = useCallback((image: BoardImage) => dispatch({ type: "delete", image }), [dispatch]);
+  const addImage = useCallback((item: BoardItem) => dispatch({ type: "add", item }), [dispatch]);
+  const deleteImage = useCallback((item: BoardItem) => dispatch({ type: "delete", item }), [dispatch]);
   const editImage = useCallback(
-    (before: BoardImage, after: BoardImage) => {
+    (before: BoardItem, after: BoardItem) => {
       if (before.id !== after.id) return;
       dispatch({ type: "edit", before, after });
     },
@@ -150,7 +161,7 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
   );
 
   const batchEditImages = useCallback(
-    (before: BoardImage[], after: BoardImage[]) => {
+    (before: BoardItem[], after: BoardItem[]) => {
       if (before.length === 0 || after.length === 0) return;
       dispatch({ type: "batch-edit", before, after });
     },
@@ -158,7 +169,7 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
   );
 
   const reorderImages = useCallback(
-    (newOrder: BoardImage[]) => {
+    (newOrder: BoardItem[]) => {
       const current = docRef.current;
       if (!current) return;
       dispatch({ type: "reorder", before: current.images, after: newOrder });

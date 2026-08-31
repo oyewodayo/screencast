@@ -12,6 +12,7 @@ import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import {
   IoAdd,
   IoAppsOutline,
+  IoText,
   IoArrowBack,
   IoArrowRedo,
   IoArrowUndo,
@@ -28,7 +29,7 @@ import {
 } from "react-icons/io5";
 import { TbCircleDashed } from "react-icons/tb";
 import useBoardStore from "../../hooks/useBoardStore";
-import { BoardBackgroundMode, BoardImage, createDefaultBoardImage } from "../../utils/boardTypes";
+import { BoardBackgroundMode, BoardImage, BoardItem, createDefaultBoardImage, createDefaultBoardText } from "../../utils/boardTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import {
@@ -182,7 +183,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     if (!briefcastDir || !store.doc) return;
     let cancelled = false;
     const missingAssetFileNames = [
-      ...store.doc.images.map((img) => img.assetFileName),
+      ...store.doc.images.filter((item): item is BoardImage => item.kind === "image").map((img) => img.assetFileName),
       ...(store.doc.backgroundImage ? [store.doc.backgroundImage] : []),
     ].filter((assetFileName) => !imageBitmaps.has(assetFileName));
     if (missingAssetFileNames.length === 0) return;
@@ -315,6 +316,22 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     }
   }, [boardId, store]);
 
+  // Drops a new text box centered on the board's current canvas (not the viewport - the canvas can
+  // be scrolled/zoomed, but its own center is always a well-defined, board-relative spot) and
+  // immediately selects it, so BoardStylePanel's text section (the one place its content gets
+  // edited - see BoardText's own doc comment) is right there ready to type into. No layout/import
+  // step needed the way images have (importAndPlaceImages) - a text item has no source file, so
+  // it's just one addImage call.
+  const handleAddText = useCallback((): void => {
+    if (!store.doc) return;
+    const id = crypto.randomUUID();
+    const x = store.doc.canvasWidth / 2 - 130;
+    const y = store.doc.canvasHeight / 2 - 45;
+    const text = createDefaultBoardText(id, x, y);
+    store.addImage(text);
+    setSelectedIds(new Set([id]));
+  }, [store]);
+
   // Drop target for a sidebar image drag (see libraryDraggingFiles prop doc comment) - accepts the
   // drop only while the dragged batch actually contains at least one image, so dropping e.g. a
   // dragged PDF here shows the browser's native "not droppable" cursor instead of silently doing
@@ -330,7 +347,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
   const selectedImages = useMemo(() => (store.doc ? store.doc.images.filter((img) => selectedIds.has(img.id)) : []), [store.doc, selectedIds]);
 
   const handleStyleChange = useCallback(
-    (before: BoardImage[], after: BoardImage[]) => {
+    (before: BoardItem[], after: BoardItem[]) => {
       if (before.length === 1) store.editImage(before[0], after[0]);
       else store.batchEditImages(before, after);
     },
@@ -428,6 +445,9 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
   // here rather than re-deriving inline at each of the panel's three per-mode branches below.
   const currentBackgroundMode: BoardBackgroundMode = store.doc ? resolveBackgroundMode(store.doc) : "color";
   const currentGrid = store.doc ? resolveBoardGrid(store.doc) : DEFAULT_BOARD_GRID;
+  // "Arrange"/"Apply" are only ever meaningful across 2+ images - see handleArrange's own comment
+  // for why text items don't count here.
+  const arrangeableImageCount = store.doc ? store.doc.images.filter((item) => item.kind === "image").length : 0;
 
   // "Circle (center focus)" needs to know which image is the hero - a single selected image is a
   // deliberate choice ("make THIS one the centerpiece"), so it wins whenever exactly one image is
@@ -436,19 +456,25 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
 
   const handleArrange = useCallback(
     (style: ArrangeStyle) => {
-      if (!store.doc || store.doc.images.length < 2) return;
+      if (!store.doc) return;
+      // Text items sit outside every auto-layout (see layoutImagesIn*'s own BoardImage[] param
+      // types) - forcing a text box into a uniform image-sized cell would badly distort its
+      // readable dimensions, so "Arrange" only ever touches images, leaving any text exactly
+      // where it was.
+      const imageItems = store.doc.images.filter((item): item is BoardImage => item.kind === "image");
+      if (imageItems.length < 2) return;
       const gap = resolveBoardPadding(store.doc);
       const result =
         style === "row"
-          ? layoutImagesInRow(store.doc.images, store.doc.canvasWidth, gap)
+          ? layoutImagesInRow(imageItems, store.doc.canvasWidth, gap)
           : style === "grid"
-          ? layoutImagesInGrid(store.doc.images, gap)
+          ? layoutImagesInGrid(imageItems, gap)
           : style === "circle"
-          ? layoutImagesInCircle(store.doc.images, gap)
+          ? layoutImagesInCircle(imageItems, gap)
           : style === "circleCenter"
-          ? layoutImagesInCircleWithCenter(store.doc.images, gap, singleSelectedImageId)
-          : layoutImagesInFan(store.doc.images, gap);
-      applyAutoLayout(result, store.doc.images);
+          ? layoutImagesInCircleWithCenter(imageItems, gap, singleSelectedImageId)
+          : layoutImagesInFan(imageItems, gap);
+      applyAutoLayout(result, imageItems);
       setArrangeStyle(style);
       setArrangeMenuAnchor(null);
     },
@@ -573,6 +599,16 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           <IoAdd size={16} /> Add images
         </button>
 
+        <button
+          type="button"
+          title="Add text"
+          onClick={handleAddText}
+          disabled={!store.doc}
+          className="p-2 rounded-md text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-40"
+        >
+          <IoText size={18} />
+        </button>
+
         <div className="w-px h-6 bg-neutral-200 dark:bg-neutral-700 mx-1" />
 
         {/* "Arrange" preset menu - see ARRANGE_STYLES/handleArrange above. Portaled to document.body
@@ -593,7 +629,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               if (rect) setArrangeMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
           }}
-          disabled={!store.doc || store.doc.images.length < 2}
+          disabled={!store.doc || arrangeableImageCount < 2}
           className={`flex items-center gap-1 p-2 rounded-md disabled:opacity-40 ${
             isArrangeMenuOpen
               ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
@@ -808,7 +844,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           type="button"
           title={`Re-apply "${ARRANGE_STYLES.find((s) => s.key === arrangeStyle)?.label}" using the current padding value`}
           onClick={() => handleArrange(arrangeStyle)}
-          disabled={!store.doc || store.doc.images.length < 2}
+          disabled={!store.doc || arrangeableImageCount < 2}
           className="px-2 py-1 rounded-md text-xs font-medium text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-40"
         >
           Apply
@@ -966,7 +1002,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
 
         {selectedImages.length > 0 && (
           <BoardStylePanel
-            images={selectedImages}
+            items={selectedImages}
             onChange={handleStyleChange}
             onDelete={handleDeleteSelected}
             onBringToFront={handleBringToFront}
