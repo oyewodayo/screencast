@@ -6,7 +6,7 @@
 // no shared code, per the Board feature's "build from scratch" requirement (the single-image
 // editor's tools don't fit this feature's per-image padding/border/margin/radius needs).
 
-import { BoardBackgroundMode, BoardBlur, BoardCommand, BoardDocument, BoardGradientBackground, BoardGridBackground, BoardImage, BoardItem, BoardText } from "../utils/boardTypes";
+import { BoardBackgroundMode, BoardBlur, BoardCommand, BoardDocument, BoardGradientBackground, BoardGridBackground, BoardImage, BoardItem, BoardShape, BoardText } from "../utils/boardTypes";
 
 // ---- Geometry helpers -----------------------------------------------------------------------
 
@@ -138,6 +138,45 @@ function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number)
   return lines;
 }
 
+// Lazily-created, module-level scratch canvas used only for text measurement (never drawn to the
+// screen or attached to the DOM) - measureBoardTextContentHeight below needs a 2D context to call
+// ctx.measureText/wrapText against, and creating a fresh <canvas> per measurement would be wasteful
+// given this runs on every keystroke while editing (see BoardCanvas.tsx's text-edit overlay).
+let measureCanvas: HTMLCanvasElement | null = null;
+function getMeasureContext(): CanvasRenderingContext2D | null {
+  if (typeof document === "undefined") return null;
+  if (!measureCanvas) measureCanvas = document.createElement("canvas");
+  return measureCanvas.getContext("2d");
+}
+
+// The height a text item's content actually needs at its CURRENT width - same wrapText/lineHeight
+// math renderBoardText itself uses (font set identically, contentWidth computed identically), so
+// what this predicts always matches what actually gets drawn. Returns item.height unchanged if a
+// measurement context isn't available (SSR/non-browser) or the item has no usable content width -
+// never smaller than a single line, so an empty text box still gets a sane minimum.
+export function measureBoardTextContentHeight(item: BoardText): number {
+  const ctx = getMeasureContext();
+  const lineHeight = item.fontSize * 1.25;
+  if (!ctx) return item.height;
+  const contentWidth = Math.max(0, item.width - item.padding * 2);
+  if (contentWidth <= 0) return item.height;
+  ctx.font = `${item.fontStyle} ${item.fontWeight} ${item.fontSize}px ${item.fontFamily}`;
+  const lineCount = Math.max(1, wrapText(ctx, item.text, contentWidth).length);
+  return Math.ceil(lineCount * lineHeight + item.padding * 2);
+}
+
+// Grows (never shrinks) a text item's height to fit its own content - called after every edit that
+// could make wrapped content taller (typing, a bigger font size, a font/weight/style change, more
+// padding, a narrower width from a resize). Grow-only, not a true auto-fit both ways, so a user who
+// deliberately made a box taller than its content (for breathing room, or because they're about to
+// type more) never has that undone by an unrelated style tweak - see BoardStylePanel.tsx's
+// setTextField and BoardCanvas.tsx's text-edit overlay, the two places content/style actually
+// change, for where this gets applied.
+export function growTextItemToFitContent(item: BoardText): BoardText {
+  const needed = measureBoardTextContentHeight(item);
+  return needed > item.height ? { ...item, height: needed } : item;
+}
+
 // Draws one text item's background box (if any) and its word-wrapped content, clipped to the box
 // so an overflowing paragraph is cropped rather than spilling onto whatever's next to it - the
 // text-editing UI (BoardStylePanel) has no live "does this fit" preview, so silently cropping is
@@ -180,6 +219,144 @@ function renderBoardText(ctx: CanvasRenderingContext2D, item: BoardText): void {
       ctx.fillText(line, anchorX, contentY + i * lineHeight);
     });
     ctx.restore();
+  }
+
+  ctx.restore();
+}
+
+// Traces a regular N-sided polygon's path, first vertex pointing straight up (the natural
+// "sitting flat on its base" orientation for an odd `sides` like a triangle/pentagon - rotate the
+// item itself to point it elsewhere, same convention line/arrow already use). `rx`/`ry` are
+// independent per axis rather than one shared radius, so a non-square box STRETCHES the polygon to
+// fill it - same "fills its box, doesn't just inscribe a fixed-aspect shape and leave dead space
+// on the wider axis" reasoning ctx.ellipse's own two radii already give BoardBlur/the "ellipse"
+// shapeType for free.
+function regularPolygonPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, rx: number, ry: number, sides: number): void {
+  const n = Math.max(3, Math.round(sides));
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const angle = -Math.PI / 2 + (i * 2 * Math.PI) / n;
+    const x = cx + Math.cos(angle) * rx;
+    const y = cy + Math.sin(angle) * ry;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+// Traces an N-pointed star's path - alternates an outer vertex (full rx/ry) with an inner vertex
+// (rx/ry scaled by `innerRatio`) every half-step, same up-pointing/box-filling reasoning as
+// regularPolygonPath above.
+function starPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, rx: number, ry: number, points: number, innerRatio: number): void {
+  const n = Math.max(3, Math.round(points));
+  const ratio = Math.min(0.95, Math.max(0.05, innerRatio));
+  ctx.beginPath();
+  for (let i = 0; i < n * 2; i++) {
+    const angle = -Math.PI / 2 + (i * Math.PI) / n;
+    const r = i % 2 === 0 ? 1 : ratio;
+    const x = cx + Math.cos(angle) * rx * r;
+    const y = cy + Math.sin(angle) * ry * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+// Traces a classic 7-point block-arrow polygon (a shaft rectangle plus a triangular head) filling
+// the item's box left-to-right, in LOCAL space - points elsewhere once the item itself is rotated,
+// same convention as every other directional shape here.
+function blockArrowPath(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number): void {
+  const midY = y + height / 2;
+  const shaftTop = midY - height * 0.25;
+  const shaftBottom = midY + height * 0.25;
+  const headX = x + width * 0.6;
+  ctx.beginPath();
+  ctx.moveTo(x, shaftTop);
+  ctx.lineTo(headX, shaftTop);
+  ctx.lineTo(headX, y);
+  ctx.lineTo(x + width, midY);
+  ctx.lineTo(headX, y + height);
+  ctx.lineTo(headX, shaftBottom);
+  ctx.lineTo(x, shaftBottom);
+  ctx.closePath();
+}
+
+// Sets (or clears) the dash pattern for a shape's stroke - shared by every shapeType's stroke, not
+// just line/arrow, so a dashed/dotted outline works equally on a rectangle, a star, anything with a
+// stroke at all. Pattern lengths scale with strokeWidth (a heavier stroke wants proportionally
+// longer dashes/gaps to still read as dashes rather than a blur), floored so a hairline stroke still
+// gets a visible pattern instead of collapsing to a solid-looking line. Dotted relies on
+// renderBoardShape's own lineCap: "round" (set once, for every shapeType) to turn each near-zero-
+// length dash into an actual round dot rather than a tiny square.
+function applyShapeStrokeDash(ctx: CanvasRenderingContext2D, strokeStyle: BoardShape["strokeStyle"], strokeWidth: number): void {
+  if (strokeStyle === "dashed") ctx.setLineDash([Math.max(6, strokeWidth * 3), Math.max(4, strokeWidth * 2)]);
+  else if (strokeStyle === "dotted") ctx.setLineDash([0.01, Math.max(6, strokeWidth * 2.2)]);
+  else ctx.setLineDash([]);
+}
+
+// Draws one shape item - see BoardShape's own doc comment in boardTypes.ts for why "line"/"arrow"
+// reuse the exact same rotatable border-box every other kind does (a straight horizontal segment
+// along the box's own local midline) rather than a dedicated two-point model, and why every other
+// shapeType inscribes/stretches into that same box rather than each having its own geometry model.
+function renderBoardShape(ctx: CanvasRenderingContext2D, item: BoardShape): void {
+  ctx.save();
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
+  ctx.translate(cx, cy);
+  ctx.rotate(item.rotation);
+  ctx.translate(-cx, -cy);
+  ctx.globalAlpha = item.opacity;
+  ctx.strokeStyle = item.strokeColor;
+  ctx.lineWidth = item.strokeWidth;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  applyShapeStrokeDash(ctx, item.strokeStyle, item.strokeWidth);
+
+  if (item.shapeType === "line" || item.shapeType === "arrow") {
+    // A single straight segment along the box's own vertical center, left edge to right edge - see
+    // this function's own doc comment above.
+    const midY = item.y + item.height / 2;
+    const startX = item.x;
+    const endX = item.x + item.width;
+    ctx.beginPath();
+    ctx.moveTo(startX, midY);
+    ctx.lineTo(endX, midY);
+    if (item.strokeWidth > 0) ctx.stroke();
+
+    if (item.shapeType === "arrow") {
+      // Arrowhead size scales with stroke width (a thicker line reads a proportionally bigger
+      // head) but is floored so a hairline stroke still gets a legible triangle, and capped so a
+      // very heavy stroke on a short line doesn't grow a head wider than the line itself. Filled,
+      // not stroked, so the dash pattern above never touches it even when the line itself is
+      // dashed/dotted.
+      const headLength = Math.max(10, Math.min(item.width * 0.4, item.strokeWidth * 3.5));
+      const headWidth = headLength * 0.7;
+      ctx.beginPath();
+      ctx.moveTo(endX, midY);
+      ctx.lineTo(endX - headLength, midY - headWidth / 2);
+      ctx.lineTo(endX - headLength, midY + headWidth / 2);
+      ctx.closePath();
+      ctx.fillStyle = item.strokeColor;
+      ctx.fill();
+    }
+  } else {
+    if (item.shapeType === "ellipse") {
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, item.width / 2, item.height / 2, 0, 0, Math.PI * 2);
+    } else if (item.shapeType === "polygon") {
+      regularPolygonPath(ctx, cx, cy, item.width / 2, item.height / 2, item.sides ?? 5);
+    } else if (item.shapeType === "star") {
+      starPath(ctx, cx, cy, item.width / 2, item.height / 2, item.points ?? 5, item.innerRadiusRatio ?? 0.45);
+    } else if (item.shapeType === "block-arrow") {
+      blockArrowPath(ctx, item.x, item.y, item.width, item.height);
+    } else {
+      roundedRectPath(ctx, item.x, item.y, item.width, item.height, item.cornerRadius);
+    }
+    if (item.fillColor) {
+      ctx.fillStyle = item.fillColor;
+      ctx.fill();
+    }
+    if (item.strokeWidth > 0) ctx.stroke();
   }
 
   ctx.restore();
@@ -400,6 +577,7 @@ export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocumen
   for (const item of doc.images) {
     if (item.kind === "text") renderBoardText(ctx, item);
     else if (item.kind === "blur") renderBoardBlur(ctx, canvas, item);
+    else if (item.kind === "shape") renderBoardShape(ctx, item);
     else renderBoardImage(ctx, item, imageBitmaps.get(item.assetFileName) ?? null);
   }
   ctx.restore();

@@ -7,9 +7,9 @@
 // and click a row to select that item directly - handy once several items overlap and picking the
 // right one by clicking the canvas gets fiddly.
 import React, { useState } from "react";
-import { IoChevronDown, IoChevronUp, IoCloseOutline, IoImageOutline, IoLockClosed, IoLockOpenOutline, IoText } from "react-icons/io5";
+import { IoChevronDown, IoChevronUp, IoCloseOutline, IoImageOutline, IoLockClosed, IoLockOpenOutline, IoShapesOutline, IoText } from "react-icons/io5";
 import { TbBlur, TbGripVertical } from "react-icons/tb";
-import { BoardItem } from "../../utils/boardTypes";
+import { BoardItem, BoardShape } from "../../utils/boardTypes";
 
 interface BoardLayerPanelProps {
   items: BoardItem[]; // doc.images, in paint order (back to front)
@@ -33,11 +33,27 @@ const KIND_ICON: Record<BoardItem["kind"], React.ReactNode> = {
   image: <IoImageOutline size={14} />,
   text: <IoText size={14} />,
   blur: <TbBlur size={14} />,
+  shape: <IoShapesOutline size={14} />,
 };
+
+// "polygon"/"star" show their own sides/points count (matching what the style panel's shape-type
+// grid actually named it - a "polygon" with sides:3 IS a triangle, not a generic "Polygon") rather
+// than the raw shapeType string, which would otherwise be the one kind whose layer-list label
+// doesn't match what the user actually picked.
+function shapeLayerLabel(item: BoardShape): string {
+  if (item.shapeType === "polygon") {
+    const sides = item.sides ?? 5;
+    return sides === 3 ? "Triangle" : sides === 5 ? "Pentagon" : sides === 6 ? "Hexagon" : sides === 8 ? "Octagon" : `${sides}-gon`;
+  }
+  if (item.shapeType === "star") return "Star";
+  if (item.shapeType === "block-arrow") return "Block arrow";
+  return item.shapeType[0].toUpperCase() + item.shapeType.slice(1);
+}
 
 function layerLabel(item: BoardItem): string {
   if (item.kind === "text") return item.text.trim() || "Text";
   if (item.kind === "blur") return "Blur";
+  if (item.kind === "shape") return shapeLayerLabel(item);
   return "Image";
 }
 

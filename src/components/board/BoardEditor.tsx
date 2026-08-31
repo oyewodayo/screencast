@@ -9,6 +9,10 @@ import { forwardRef, ReactNode, useCallback, useEffect, useImperativeHandle, use
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/api/dialog";
+// Self-hosted @font-face rules for BoardText's "Modern" font group - see this file's own doc
+// comment for why bundled rather than relying on the host OS. A plain side-effect import: nothing
+// here references its exports, it just needs to be loaded once wherever the Board feature mounts.
+import "./boardFonts.css";
 import {
   IoAdd,
   IoAppsOutline,
@@ -22,6 +26,7 @@ import {
   IoColorFilterOutline,
   IoColorPaletteOutline,
   IoCopyOutline,
+  IoEllipseOutline,
   IoExpandOutline,
   IoGridOutline,
   IoHeartOutline,
@@ -31,13 +36,18 @@ import {
   IoRemove,
   IoReorderThreeOutline,
   IoSaveOutline,
+  IoShapesOutline,
   IoShareOutline,
+  IoSquareOutline,
 } from "react-icons/io5";
 import {
+  TbArrowBigRight,
+  TbArrowUpRight,
   TbAspectRatio,
   TbBlur,
   TbCircleDashed,
   TbColumns,
+  TbHexagon,
   TbLayoutAlignBottom,
   TbLayoutAlignCenter,
   TbLayoutAlignLeft,
@@ -46,11 +56,27 @@ import {
   TbLayoutAlignTop,
   TbLayoutDistributeHorizontal,
   TbLayoutDistributeVertical,
+  TbLine,
+  TbOctagon,
+  TbPentagon,
   TbSpiral,
   TbStairsUp,
+  TbStar,
+  TbTriangle,
 } from "react-icons/tb";
 import useBoardStore from "../../hooks/useBoardStore";
-import { BoardBackgroundMode, BoardBlur, BoardImage, BoardItem, BoardText, createDefaultBoardBlur, createDefaultBoardImage, createDefaultBoardText } from "../../utils/boardTypes";
+import {
+  BoardBackgroundMode,
+  BoardBlur,
+  BoardImage,
+  BoardItem,
+  BoardShape,
+  BoardText,
+  createDefaultBoardBlur,
+  createDefaultBoardImage,
+  createDefaultBoardShape,
+  createDefaultBoardText,
+} from "../../utils/boardTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import {
@@ -84,6 +110,36 @@ import BoardStylePanel from "./BoardStylePanel";
 const THUMBNAIL_MAX_DIMENSION = 480;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
+
+// The toolbar's "Shape" menu - one entry per named quick-add. Several share the same underlying
+// shapeType ("polygon" for Triangle/Pentagon/Hexagon/Octagon, just at a different `sides` - see
+// BoardShape's own doc comment in boardTypes.ts for why that's one parameterized shapeType rather
+// than four separate ones) rather than each being its own distinct type; createDefaultBoardShape's
+// `overrides` param is what lets this one preset list drive all of them through a single factory.
+// Grouped into sections (Basic/Polygons/Stars/Lines) purely for the dropdown's own layout below.
+interface ShapeAddPreset {
+  id: string;
+  label: string;
+  icon: ReactNode;
+  shapeType: BoardShape["shapeType"];
+  sides?: number;
+  points?: number;
+  group: "Basic" | "Polygons" | "Stars" | "Lines";
+}
+const SHAPE_ADD_PRESETS: ShapeAddPreset[] = [
+  { id: "rectangle", label: "Rectangle", icon: <IoSquareOutline size={16} />, shapeType: "rectangle", group: "Basic" },
+  { id: "ellipse", label: "Ellipse", icon: <IoEllipseOutline size={16} />, shapeType: "ellipse", group: "Basic" },
+  { id: "triangle", label: "Triangle", icon: <TbTriangle size={16} />, shapeType: "polygon", sides: 3, group: "Basic" },
+  { id: "pentagon", label: "Pentagon", icon: <TbPentagon size={16} />, shapeType: "polygon", sides: 5, group: "Polygons" },
+  { id: "hexagon", label: "Hexagon", icon: <TbHexagon size={16} />, shapeType: "polygon", sides: 6, group: "Polygons" },
+  { id: "octagon", label: "Octagon", icon: <TbOctagon size={16} />, shapeType: "polygon", sides: 8, group: "Polygons" },
+  { id: "star", label: "Star", icon: <TbStar size={16} />, shapeType: "star", points: 5, group: "Stars" },
+  { id: "starburst", label: "Starburst", icon: <TbStar size={16} />, shapeType: "star", points: 8, group: "Stars" },
+  { id: "line", label: "Line", icon: <TbLine size={16} />, shapeType: "line", group: "Lines" },
+  { id: "arrow", label: "Arrow", icon: <TbArrowUpRight size={16} />, shapeType: "arrow", group: "Lines" },
+  { id: "block-arrow", label: "Block arrow", icon: <TbArrowBigRight size={16} />, shapeType: "block-arrow", group: "Lines" },
+];
+const SHAPE_ADD_GROUPS: ShapeAddPreset["group"][] = ["Basic", "Polygons", "Stars", "Lines"];
 
 // The toolbar's "Align" menu - edge/center alignment (needs 2+ selected items) plus even
 // distribution (needs 3+, since "distribute" is meaningless for a pair). Both act on each
@@ -139,12 +195,17 @@ const BACKGROUND_MODE_META: Record<BoardBackgroundMode, { label: string; icon: R
 // Undo/Redo and Zoom intentionally do NOT use these - they're rendered as bordered segmented
 // controls instead (see their own comments below), the standard convention for a tightly coupled
 // pair/group rather than a menu trigger.
+// shrink-0 + whitespace-nowrap on all three: this row has grown past what a narrow window fits
+// (see the container's own overflow-x-auto below), and a plain flex child shrinks by default -
+// without these, the row didn't wrap or scroll, it silently squeezed each chip's own box down
+// until its label text wrapped internally instead ("Add images" broke into two lines). shrink-0
+// forces every chip to keep its natural width and let the CONTAINER scroll instead.
 const TOOLBAR_ICON_BTN =
-  "w-9 h-9 flex items-center justify-center rounded-lg text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-40 disabled:pointer-events-none";
+  "shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-40 disabled:pointer-events-none";
 const TOOLBAR_CHIP =
-  "flex items-center gap-1.5 h-9 px-3 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-700 dark:text-neutral-200 text-sm font-medium hover:border-neutral-300 dark:hover:border-neutral-600 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-colors disabled:opacity-40 disabled:pointer-events-none";
+  "shrink-0 flex items-center gap-1.5 h-9 px-3 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-700 dark:text-neutral-200 text-sm font-medium whitespace-nowrap hover:border-neutral-300 dark:hover:border-neutral-600 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-colors disabled:opacity-40 disabled:pointer-events-none";
 const TOOLBAR_CHIP_ACTIVE =
-  "flex items-center gap-1.5 h-9 px-3 rounded-lg border border-blue-300 dark:border-blue-500/40 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 text-sm font-medium transition-colors";
+  "shrink-0 flex items-center gap-1.5 h-9 px-3 rounded-lg border border-blue-300 dark:border-blue-500/40 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 text-sm font-medium whitespace-nowrap transition-colors";
 
 interface BoardEditorProps {
   boardId: string;
@@ -453,6 +514,22 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     setSelectedIds(new Set([id]));
   }, [store]);
 
+  // Same "drop centered, select immediately" pattern as handleAddText/handleAddBlur above - see
+  // createDefaultBoardShape's per-shapeType defaults (boardTypes.ts) for each preset's starting
+  // size, and SHAPE_ADD_PRESETS' own doc comment for why several presets share one shapeType.
+  const handleAddShape = useCallback(
+    (preset: ShapeAddPreset): void => {
+      if (!store.doc) return;
+      const id = crypto.randomUUID();
+      const shape = createDefaultBoardShape(id, preset.shapeType, 0, 0, { sides: preset.sides, points: preset.points });
+      const x = store.doc.canvasWidth / 2 - shape.width / 2;
+      const y = store.doc.canvasHeight / 2 - shape.height / 2;
+      store.addImage({ ...shape, x, y });
+      setSelectedIds(new Set([id]));
+    },
+    [store]
+  );
+
   // Drop target for a sidebar image drag (see libraryDraggingFiles prop doc comment) - accepts the
   // drop only while the dragged batch actually contains at least one image, so dropping e.g. a
   // dragged PDF here shows the browser's native "not droppable" cursor instead of silently doing
@@ -539,8 +616,31 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       const styled = targets.map((b) => ({
         ...b,
         shape: source.shape,
+        mode: source.mode,
         cornerRadius: source.cornerRadius,
         strength: source.strength,
+        opacity: source.opacity,
+        updatedAt: Date.now(),
+      }));
+      store.batchEditImages(targets, styled);
+    },
+    [store]
+  );
+
+  // Shape counterpart to the three above - fill/stroke/corner radius/opacity copy across; shapeType
+  // itself stays put (turning every rectangle on the board into an arrow because one of them
+  // changed its own type would be a bigger, unrequested change than "apply this one's style").
+  const handleApplyShapeStyleToAll = useCallback(
+    (source: BoardShape) => {
+      if (!store.doc) return;
+      const targets = store.doc.images.filter((item): item is BoardShape => item.kind === "shape" && item.id !== source.id);
+      if (targets.length === 0) return;
+      const styled = targets.map((s) => ({
+        ...s,
+        fillColor: source.fillColor,
+        strokeColor: source.strokeColor,
+        strokeWidth: source.strokeWidth,
+        cornerRadius: source.cornerRadius,
         opacity: source.opacity,
         updatedAt: Date.now(),
       }));
@@ -815,6 +915,19 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     return () => document.removeEventListener("pointerdown", close);
   }, [isArrangeMenuOpen]);
 
+  // Same anchor/portal pattern again for the toolbar's "Shape" menu (Rectangle/Ellipse/Line/Arrow) -
+  // see arrangeMenuAnchor's own doc comment for why a portal over a plain absolute child.
+  const [shapeMenuAnchor, setShapeMenuAnchor] = useState<{ top: number; left: number } | null>(null);
+  const isShapeMenuOpen = shapeMenuAnchor !== null;
+  const shapeButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!isShapeMenuOpen) return;
+    const close = () => setShapeMenuAnchor(null);
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [isShapeMenuOpen]);
+
   // Same anchor/portal pattern as arrangeMenuAnchor above (see its own doc comment for why a plain
   // absolute child doesn't work under the toolbar's backdrop-blur-sm) for the "Background" mode
   // picker further down the toolbar.
@@ -1087,7 +1200,11 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
 
   return (
     <div className="w-full h-full flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950">
-      <div className="shrink-0 flex items-center gap-1.5 px-4 py-2.5 border-b border-neutral-200/80 dark:border-neutral-800/80 bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl">
+      {/* overflow-x-auto is the real fix for a chip running out of room (see TOOLBAR_CHIP's own
+          comment) - once every chip refuses to shrink, something has to give when the window is
+          narrow, and a horizontal scroll on the bar itself beats any chip silently wrapping its
+          own label. shrink-0 on the back button/divider too, for the same reason. */}
+      <div className="shrink-0 flex items-center gap-1.5 px-4 py-2.5 border-b border-neutral-200/80 dark:border-neutral-800/80 bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl overflow-x-auto">
         <button type="button" onClick={handleBack} title="Back to boards" className={TOOLBAR_ICON_BTN}>
           <IoArrowBack size={17} />
         </button>
@@ -1097,16 +1214,16 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           value={store.doc?.name ?? ""}
           onChange={(e) => store.renameBoard(e.target.value)}
           placeholder="Untitled board"
-          className="min-w-0 flex-1 max-w-[180px] px-2.5 py-1.5 rounded-lg text-sm font-semibold bg-transparent border border-transparent hover:bg-neutral-100 dark:hover:bg-neutral-800 focus:bg-white dark:focus:bg-neutral-900 focus:border-blue-400 dark:focus:border-blue-500 focus:ring-2 focus:ring-blue-500/10 outline-none text-neutral-900 dark:text-neutral-100 transition-colors"
+          className="min-w-[80px] shrink w-[180px] px-2.5 py-1.5 rounded-lg text-sm font-semibold bg-transparent border border-transparent hover:bg-neutral-100 dark:hover:bg-neutral-800 focus:bg-white dark:focus:bg-neutral-900 focus:border-blue-400 dark:focus:border-blue-500 focus:ring-2 focus:ring-blue-500/10 outline-none text-neutral-900 dark:text-neutral-100 transition-colors"
         />
 
-        <div className="w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
 
         <button
           type="button"
           onClick={() => void handleAddImages()}
           disabled={isImporting || !store.doc}
-          className="flex items-center gap-1.5 h-9 px-3.5 rounded-lg text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] active:shadow-none transition-all disabled:opacity-50 disabled:shadow-none"
+          className="shrink-0 flex items-center gap-1.5 h-9 px-3 rounded-lg text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] active:shadow-none transition-all disabled:opacity-50 disabled:shadow-none whitespace-nowrap"
         >
           <IoAdd size={16} /> Add images
         </button>
@@ -1119,6 +1236,69 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           <TbBlur size={15} /> Blur
         </button>
 
+        {/* "Shape" - each preset in SHAPE_ADD_PRESETS is just createDefaultBoardShape dropped
+            centered on the canvas (same "center and select" pattern as Text/Blur above) - see
+            BoardShape's own doc comment in boardTypes.ts for why Line/Arrow (and several of these
+            presets sharing one "polygon"/"star" shapeType) reuse the exact same rotatable box every
+            other kind does. Same portal-dropdown pattern as Arrange/Align above, grouped the same
+            way Align's own menu groups Align vs. Distribute. */}
+        <button
+          ref={shapeButtonRef}
+          type="button"
+          title="Add a shape"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (isShapeMenuOpen) {
+              setShapeMenuAnchor(null);
+            } else {
+              setArrangeMenuAnchor(null);
+              setBackgroundMenuAnchor(null);
+              setShareMenuAnchor(null);
+              setAlignMenuAnchor(null);
+              setSizeMenuAnchor(null);
+              const rect = shapeButtonRef.current?.getBoundingClientRect();
+              if (rect) setShapeMenuAnchor({ top: rect.bottom + 6, left: rect.left });
+            }
+          }}
+          disabled={!store.doc}
+          className={isShapeMenuOpen ? TOOLBAR_CHIP_ACTIVE : TOOLBAR_CHIP}
+        >
+          <IoShapesOutline size={15} /> Shape
+          <IoChevronDown size={12} className={`transition-transform ${isShapeMenuOpen ? "rotate-180" : ""}`} />
+        </button>
+        {shapeMenuAnchor &&
+          createPortal(
+            <div
+              onPointerDown={(e) => e.stopPropagation()}
+              style={{ position: "fixed", top: shapeMenuAnchor.top, left: shapeMenuAnchor.left }}
+              className="w-56 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 overflow-hidden z-[9999] py-1 max-h-[70vh] overflow-y-auto"
+            >
+              {SHAPE_ADD_GROUPS.map((group) => (
+                <div key={group}>
+                  <div className="px-3 pt-1.5 pb-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500">{group}</div>
+                  <div className="grid grid-cols-4 gap-0.5 px-1.5 pb-1.5">
+                    {SHAPE_ADD_PRESETS.filter((preset) => preset.group === group).map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        title={preset.label}
+                        onClick={() => {
+                          handleAddShape(preset);
+                          setShapeMenuAnchor(null);
+                        }}
+                        className="flex flex-col items-center gap-1 py-2 rounded-lg text-neutral-600 dark:text-neutral-300 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                      >
+                        {preset.icon}
+                        <span className="text-[10px] leading-none truncate max-w-full px-0.5">{preset.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>,
+            document.body
+          )}
+
         <button
           type="button"
           title="Show every item on the board in stacking order, front to back"
@@ -1129,7 +1309,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           <IoLayersOutline size={15} /> Layers
         </button>
 
-        <div className="w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
 
         {/* "Arrange" and "Background" - each a self-contained bordered "chip" trigger (not a
             shared grey pill) that opens its own portaled dropdown (see arrangeMenuAnchor's own doc
@@ -1149,6 +1329,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setShareMenuAnchor(null);
               setAlignMenuAnchor(null);
               setSizeMenuAnchor(null);
+              setShapeMenuAnchor(null);
               const rect = arrangeButtonRef.current?.getBoundingClientRect();
               if (rect) setArrangeMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
@@ -1205,6 +1386,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setBackgroundMenuAnchor(null);
               setShareMenuAnchor(null);
               setSizeMenuAnchor(null);
+              setShapeMenuAnchor(null);
               const rect = alignButtonRef.current?.getBoundingClientRect();
               if (rect) setAlignMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
@@ -1281,6 +1463,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setShareMenuAnchor(null);
               setAlignMenuAnchor(null);
               setSizeMenuAnchor(null);
+              setShapeMenuAnchor(null);
               const rect = backgroundButtonRef.current?.getBoundingClientRect();
               if (rect) setBackgroundMenuAnchor({ top: rect.bottom + 6, left: rect.left });
             }
@@ -1474,6 +1657,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setBackgroundMenuAnchor(null);
               setShareMenuAnchor(null);
               setAlignMenuAnchor(null);
+              setShapeMenuAnchor(null);
               setSizeDraft({ width: String(store.doc?.canvasWidth ?? ""), height: String(store.doc?.canvasHeight ?? "") });
               const rect = sizeButtonRef.current?.getBoundingClientRect();
               if (rect) setSizeMenuAnchor({ top: rect.bottom + 6, left: rect.left });
@@ -1557,7 +1741,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             document.body
           )}
 
-        <div className="w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
 
         {/* Mat/frame border around the whole board - a pure rendering-time inset (see
             paddedCanvasSize), so this just updates live on every keystroke/spinner click, no
@@ -1567,7 +1751,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             nothing until a rearrange happens (the exact bug the old gridline-width control had).
             No grey pill wrapper here - the number input's own border already gives this cluster a
             visible edge, so a second background box around it would be redundant chrome. */}
-        <label className="flex items-center gap-1.5 text-xs font-medium text-neutral-500 dark:text-neutral-400" title="Board padding">
+        <label className="shrink-0 flex items-center gap-1.5 text-xs font-medium text-neutral-500 dark:text-neutral-400" title="Board padding">
           Padding
           <input
             type="number"
@@ -1584,17 +1768,17 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           title={`Re-apply "${ARRANGE_STYLES.find((s) => s.key === arrangeStyle)?.label}" using the current padding value`}
           onClick={() => handleArrange(arrangeStyle)}
           disabled={!store.doc || arrangeableImageCount < 2}
-          className="h-8 px-2.5 rounded-lg text-xs font-semibold text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+          className="shrink-0 h-8 px-2.5 rounded-lg text-xs font-semibold text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors disabled:opacity-40 disabled:pointer-events-none whitespace-nowrap"
         >
           Apply
         </button>
 
-        <div className="w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
 
         {/* Undo/Redo as one true two-segment control (shared border, hairline divider between the
             halves) rather than two loose buttons floating in a grey box - the visual convention
             for "this pair is one control" everywhere from Photoshop to Figma. */}
-        <div className="inline-flex items-center h-9 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+        <div className="shrink-0 inline-flex items-center h-9 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
           <button
             type="button"
             title="Undo"
@@ -1615,12 +1799,12 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           </button>
         </div>
 
-        <div className="w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
 
         {/* Zoom as a single bordered segmented control (- / value / + / fit) - same "one shared
             border, hairline dividers between segments" language as Undo/Redo above, standard for
             a zoom control in every design tool. */}
-        <div className="inline-flex items-center h-9 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+        <div className="shrink-0 inline-flex items-center h-9 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
           <button
             type="button"
             title="Zoom out"
@@ -1694,12 +1878,13 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               setBackgroundMenuAnchor(null);
               setAlignMenuAnchor(null);
               setSizeMenuAnchor(null);
+              setShapeMenuAnchor(null);
               const rect = shareButtonRef.current?.getBoundingClientRect();
               if (rect) setShareMenuAnchor({ top: rect.bottom + 6, left: rect.right - 224 });
             }
           }}
           disabled={!store.doc || store.doc.images.length === 0}
-          className="flex items-center gap-1.5 h-9 px-3.5 rounded-lg text-sm font-semibold tracking-tight bg-gradient-to-b from-neutral-800 to-neutral-950 dark:from-white dark:to-neutral-100 text-white dark:text-neutral-900 shadow-[0_1px_2px_rgba(0,0,0,0.25)] hover:shadow-[0_2px_6px_rgba(0,0,0,0.3)] active:shadow-none transition-all disabled:opacity-50 disabled:shadow-none"
+          className="shrink-0 flex items-center gap-1.5 h-9 px-3.5 rounded-lg text-sm font-semibold tracking-tight bg-gradient-to-b from-neutral-800 to-neutral-950 dark:from-white dark:to-neutral-100 text-white dark:text-neutral-900 shadow-[0_1px_2px_rgba(0,0,0,0.25)] hover:shadow-[0_2px_6px_rgba(0,0,0,0.3)] active:shadow-none transition-all disabled:opacity-50 disabled:shadow-none whitespace-nowrap"
         >
           <IoShareOutline size={16} />
           {isExporting ? "Saving…" : isCopyingToClipboard ? "Copying…" : "Share"}
@@ -1869,9 +2054,11 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             onApplyStyleToAllImages={handleApplyImageStyleToAll}
             onApplyStyleToAllTexts={handleApplyTextStyleToAll}
             onApplyStyleToAllBlurs={handleApplyBlurStyleToAll}
+            onApplyStyleToAllShapes={handleApplyShapeStyleToAll}
             boardImageCount={store.doc?.images.filter((item) => item.kind === "image").length ?? 0}
             boardTextCount={store.doc?.images.filter((item) => item.kind === "text").length ?? 0}
             boardBlurCount={store.doc?.images.filter((item) => item.kind === "blur").length ?? 0}
+            boardShapeCount={store.doc?.images.filter((item) => item.kind === "shape").length ?? 0}
             onReplaceImage={(image) => void handleReplaceImage(image)}
             isReplacingImage={isReplacingImage}
             onNudge={handleNudge}

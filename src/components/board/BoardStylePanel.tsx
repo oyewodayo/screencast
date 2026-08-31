@@ -28,18 +28,44 @@ import {
   IoContrastOutline,
   IoCopyOutline,
   IoImageOutline,
+  IoEllipseOutline,
   IoLockClosed,
   IoLockOpenOutline,
   IoOptionsOutline,
+  IoShapesOutline,
+  IoSquareOutline,
   IoSwapHorizontalOutline,
   IoText,
   IoTrashOutline,
 } from "react-icons/io5";
-import { TbArrowsMove, TbBlur } from "react-icons/tb";
-import { BoardBlur, BoardImage, BoardItem, BoardShadow, BoardText } from "../../utils/boardTypes";
-import { BOARD_FONT_OPTIONS } from "../../utils/boardFonts";
+import { TbArrowBigRight, TbArrowsMove, TbArrowUpRight, TbBlur, TbHexagon, TbLine, TbOctagon, TbPentagon, TbStar, TbTriangle } from "react-icons/tb";
+import { BoardBlur, BoardImage, BoardItem, BoardShadow, BoardShape, BoardText } from "../../utils/boardTypes";
+import { BOARD_FONT_GROUPS, BOARD_FONT_OPTIONS } from "../../utils/boardFonts";
+import { growTextItemToFitContent } from "../../handlers/boardHandlers";
 
 const DEFAULT_SHADOW: BoardShadow = { blur: 16, offsetX: 0, offsetY: 6, color: "rgba(0,0,0,0.35)" };
+
+// Same shapeType/sides/points parameterization as BoardEditor.tsx's SHAPE_ADD_PRESETS (Triangle/
+// Pentagon/Hexagon/Octagon all share the "polygon" shapeType at a different `sides` - see
+// BoardShape's own doc comment in boardTypes.ts), but this list SWITCHES the current selection's
+// type rather than creating a new item, so it only needs the icon/title/target fields, not a label
+// or add-menu group.
+const SHAPE_TYPE_PICKS: { icon: ReactNode; title: string; shapeType: BoardShape["shapeType"]; sides?: number; points?: number }[] = [
+  { icon: <IoSquareOutline size={14} />, title: "Rectangle", shapeType: "rectangle" },
+  { icon: <IoEllipseOutline size={14} />, title: "Ellipse", shapeType: "ellipse" },
+  { icon: <TbTriangle size={14} />, title: "Triangle", shapeType: "polygon", sides: 3 },
+  { icon: <TbPentagon size={14} />, title: "Pentagon", shapeType: "polygon", sides: 5 },
+  { icon: <TbHexagon size={14} />, title: "Hexagon", shapeType: "polygon", sides: 6 },
+  { icon: <TbOctagon size={14} />, title: "Octagon", shapeType: "polygon", sides: 8 },
+  { icon: <TbStar size={14} />, title: "Star", shapeType: "star", points: 5 },
+  { icon: <TbLine size={14} />, title: "Line", shapeType: "line" },
+  { icon: <TbArrowUpRight size={14} />, title: "Arrow", shapeType: "arrow" },
+  { icon: <TbArrowBigRight size={14} />, title: "Block arrow", shapeType: "block-arrow" },
+];
+
+// Which shapeTypes have an interior worth filling - a straight line/arrow has none (see BoardShape's
+// own doc comment), everything else does.
+const SHAPE_FILL_TYPES: BoardShape["shapeType"][] = ["rectangle", "ellipse", "polygon", "star", "block-arrow"];
 
 // A native <input type="color"> only ever accepts/reports a 6-digit hex - it silently rejects an
 // rgba() string outright, which is how DEFAULT_SHADOW's own color (and any shadow color set some
@@ -79,9 +105,11 @@ interface BoardStylePanelProps {
   onApplyStyleToAllImages: (source: BoardImage) => void;
   onApplyStyleToAllTexts: (source: BoardText) => void;
   onApplyStyleToAllBlurs: (source: BoardBlur) => void;
+  onApplyStyleToAllShapes: (source: BoardShape) => void;
   boardImageCount: number;
   boardTextCount: number;
   boardBlurCount: number;
+  boardShapeCount: number;
   // Swaps the selected image's underlying photo, keeping its position/size/rotation/style exactly
   // as they are (see BoardEditor.tsx's handleReplaceImage) - single-image selection only, same
   // reasoning as onApplyStyleToAllImages above. Also reachable from BoardCanvas.tsx's own
@@ -207,9 +235,11 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   onApplyStyleToAllImages,
   onApplyStyleToAllTexts,
   onApplyStyleToAllBlurs,
+  onApplyStyleToAllShapes,
   boardImageCount,
   boardTextCount,
   boardBlurCount,
+  boardShapeCount,
   onReplaceImage,
   isReplacingImage,
   onNudge,
@@ -219,24 +249,34 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   const ids = new Set(items.map((item) => item.id));
 
   // Narrowed once here rather than re-filtering inline at each field below - also what lets
-  // setImageField/setTextField/setBlurField stay fully typed against BoardImage/BoardText/BoardBlur
-  // instead of casting.
+  // setImageField/setTextField/setBlurField/setShapeField stay fully typed against
+  // BoardImage/BoardText/BoardBlur/BoardShape instead of casting.
   const imageItems = items.filter((item): item is BoardImage => item.kind === "image");
   const textItems = items.filter((item): item is BoardText => item.kind === "text");
   const blurItems = items.filter((item): item is BoardBlur => item.kind === "blur");
+  const shapeItems = items.filter((item): item is BoardShape => item.kind === "shape");
   const allImages = imageItems.length === items.length;
   const allText = textItems.length === items.length;
   const allBlur = blurItems.length === items.length;
+  const allShapes = shapeItems.length === items.length;
   const allLocked = items.every((item) => item.locked);
+  const kindLabel = allText ? "text" : allBlur ? "blur" : allShapes ? "shape" : "image";
 
   const setImageField = <K extends keyof BoardImage>(key: K, value: BoardImage[K]): void => {
     onChange(imageItems, imageItems.map((img) => ({ ...img, [key]: value, updatedAt: Date.now() })));
   };
+  // growTextItemToFitContent after every field change (not just text/fontSize) - harmless for a
+  // field that doesn't affect wrapping (its own grow-only check just finds nothing to grow), and
+  // means every path that could make wrapped content taller - font size, font family/weight/style,
+  // padding - grows the box automatically without needing its own separate special-cased setter.
   const setTextField = <K extends keyof BoardText>(key: K, value: BoardText[K]): void => {
-    onChange(textItems, textItems.map((t) => ({ ...t, [key]: value, updatedAt: Date.now() })));
+    onChange(textItems, textItems.map((t) => growTextItemToFitContent({ ...t, [key]: value, updatedAt: Date.now() })));
   };
   const setBlurField = <K extends keyof BoardBlur>(key: K, value: BoardBlur[K]): void => {
     onChange(blurItems, blurItems.map((b) => ({ ...b, [key]: value, updatedAt: Date.now() })));
+  };
+  const setShapeField = <K extends keyof BoardShape>(key: K, value: BoardShape[K]): void => {
+    onChange(shapeItems, shapeItems.map((s) => ({ ...s, [key]: value, updatedAt: Date.now() })));
   };
   const setOpacity = (value: number): void => {
     onChange(items, items.map((item) => ({ ...item, opacity: value, updatedAt: Date.now() })));
@@ -258,14 +298,16 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
               ? "bg-gradient-to-br from-blue-500 to-indigo-600"
               : allBlur
               ? "bg-gradient-to-br from-slate-500 to-slate-700"
+              : allShapes
+              ? "bg-gradient-to-br from-emerald-500 to-teal-600"
               : "bg-gradient-to-br from-neutral-500 to-neutral-700"
           }`}
         >
-          {allText ? <IoText size={16} /> : allBlur ? <TbBlur size={17} /> : <IoImageOutline size={16} />}
+          {allText ? <IoText size={16} /> : allBlur ? <TbBlur size={17} /> : allShapes ? <IoShapesOutline size={16} /> : <IoImageOutline size={16} />}
         </div>
         <div className="min-w-0">
           <p className="text-sm font-semibold text-neutral-800 dark:text-neutral-100 truncate">
-            {items.length > 1 ? `${items.length} items selected` : allText ? "Text" : allBlur ? "Blur" : "Image"}
+            {items.length > 1 ? `${items.length} items selected` : allText ? "Text" : allBlur ? "Blur" : allShapes ? "Shape" : "Image"}
           </p>
           <p className="text-[11px] text-neutral-400 dark:text-neutral-500">Style &amp; layout</p>
         </div>
@@ -361,10 +403,14 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
               {!BOARD_FONT_OPTIONS.some((option) => option.value === textItems[0].fontFamily) && (
                 <option value={textItems[0].fontFamily}>{textItems[0].fontFamily}</option>
               )}
-              {BOARD_FONT_OPTIONS.map((option) => (
-                <option key={option.id} value={option.value} style={{ fontFamily: option.value }}>
-                  {option.label}
-                </option>
+              {BOARD_FONT_GROUPS.map((group) => (
+                <optgroup key={group} label={group}>
+                  {BOARD_FONT_OPTIONS.filter((option) => option.group === group).map((option) => (
+                    <option key={option.id} value={option.value} style={{ fontFamily: option.value }}>
+                      {option.label}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
           </label>
@@ -583,6 +629,122 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         </div>
       )}
 
+      {allShapes && (
+        <div className={CARD}>
+          <SectionHeader icon={<IoShapesOutline size={12} />} label="Shape" />
+
+          <div className="grid grid-cols-5 gap-1">
+            {SHAPE_TYPE_PICKS.map((pick) => {
+              const isActive =
+                shapeItems[0].shapeType === pick.shapeType &&
+                (pick.sides === undefined || (shapeItems[0].sides ?? 5) === pick.sides) &&
+                (pick.points === undefined || (shapeItems[0].points ?? 5) === pick.points);
+              return (
+                <button
+                  key={pick.title}
+                  type="button"
+                  title={pick.title}
+                  onClick={() =>
+                    onChange(
+                      shapeItems,
+                      shapeItems.map((s) => ({
+                        ...s,
+                        shapeType: pick.shapeType,
+                        sides: pick.sides ?? s.sides,
+                        points: pick.points ?? s.points,
+                        updatedAt: Date.now(),
+                      }))
+                    )
+                  }
+                  className={`h-9 flex items-center justify-center rounded-lg border transition-colors ${
+                    isActive
+                      ? "border-blue-300 dark:border-blue-500/40 bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                      : "border-neutral-200 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                  }`}
+                >
+                  {pick.icon}
+                </button>
+              );
+            })}
+          </div>
+
+          {SHAPE_FILL_TYPES.includes(shapeItems[0].shapeType) && (
+            <div className="flex items-center gap-2">
+              <input
+                type="color"
+                value={shapeItems[0].fillColor ?? "#93c5fd"}
+                onChange={(e) => setShapeField("fillColor", e.target.value)}
+                className={`${SWATCH} ${shapeItems[0].fillColor === null ? "opacity-30" : ""}`}
+              />
+              <button type="button" onClick={() => setShapeField("fillColor", shapeItems[0].fillColor === null ? "#93c5fd" : null)} className={`flex-1 ${GHOST_BUTTON}`}>
+                {shapeItems[0].fillColor === null ? "Add fill" : "Remove fill"}
+              </button>
+            </div>
+          )}
+
+          {shapeItems[0].shapeType === "rectangle" && (
+            <SliderField
+              label="Corner radius"
+              display={`${shapeItems[0].cornerRadius}px`}
+              min={0}
+              max={200}
+              value={shapeItems[0].cornerRadius}
+              onChange={(v) => setShapeField("cornerRadius", v)}
+            />
+          )}
+
+          {shapeItems[0].shapeType === "polygon" && (
+            <SliderField label="Sides" display={`${shapeItems[0].sides ?? 5}`} min={3} max={12} value={shapeItems[0].sides ?? 5} onChange={(v) => setShapeField("sides", v)} />
+          )}
+
+          {shapeItems[0].shapeType === "star" && (
+            <>
+              <SliderField label="Points" display={`${shapeItems[0].points ?? 5}`} min={3} max={12} value={shapeItems[0].points ?? 5} onChange={(v) => setShapeField("points", v)} />
+              <SliderField
+                label="Spike sharpness"
+                display={`${Math.round((shapeItems[0].innerRadiusRatio ?? 0.45) * 100)}%`}
+                min={0.15}
+                max={0.85}
+                step={0.01}
+                value={shapeItems[0].innerRadiusRatio ?? 0.45}
+                onChange={(v) => setShapeField("innerRadiusRatio", v)}
+              />
+            </>
+          )}
+
+          <ColorField label="Stroke color" value={shapeItems[0].strokeColor} onChange={(v) => setShapeField("strokeColor", v)} />
+          <SliderField
+            label="Stroke width"
+            display={`${shapeItems[0].strokeWidth}px`}
+            min={0}
+            max={40}
+            value={shapeItems[0].strokeWidth}
+            onChange={(v) => setShapeField("strokeWidth", v)}
+          />
+
+          <div className="inline-flex items-center h-8 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+            {(["solid", "dashed", "dotted"] as const).map((style) => (
+              <button
+                key={style}
+                type="button"
+                onClick={() => setShapeField("strokeStyle", style)}
+                className={`flex-1 h-full flex items-center justify-center text-[11px] font-medium capitalize transition-colors ${
+                  (shapeItems[0].strokeStyle ?? "solid") === style ? SEGMENT_ON : SEGMENT_OFF
+                }`}
+              >
+                {style}
+              </button>
+            ))}
+          </div>
+
+          {shapeItems.length === 1 && boardShapeCount > 1 && (
+            <button type="button" onClick={() => onApplyStyleToAllShapes(shapeItems[0])} className={GHOST_BUTTON}>
+              Apply style to all shapes
+            </button>
+          )}
+        </div>
+      )}
+
       <div className={CARD}>
         <SectionHeader icon={<IoContrastOutline size={12} />} label="Appearance" />
         <SliderField label="Opacity" display={`${Math.round(primary.opacity * 100)}%`} min={0.1} max={1} step={0.05} value={primary.opacity} onChange={setOpacity} />
@@ -598,7 +760,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       </button>
 
       <button type="button" onClick={() => onDuplicate(ids)} className={`flex items-center justify-center gap-1.5 ${GHOST_BUTTON}`}>
-        <IoCopyOutline size={14} /> Duplicate {items.length > 1 ? "items" : allText ? "text" : allBlur ? "blur" : "image"}
+        <IoCopyOutline size={14} /> Duplicate {items.length > 1 ? "items" : kindLabel}
       </button>
 
       <div className="flex gap-2">
@@ -615,7 +777,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         onClick={() => onDelete(ids)}
         className="flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-semibold text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
       >
-        <IoTrashOutline size={14} /> Delete {items.length > 1 ? "items" : allText ? "text" : allBlur ? "blur" : "image"}
+        <IoTrashOutline size={14} /> Delete {items.length > 1 ? "items" : kindLabel}
       </button>
     </div>
   );

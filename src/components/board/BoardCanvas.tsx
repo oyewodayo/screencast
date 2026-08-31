@@ -24,6 +24,7 @@ import {
   applyRotate,
   GroupBounds,
   groupBoundingBox,
+  growTextItemToFitContent,
   hitTestBoardItem,
   paddedCanvasSize,
   renderBoardToCanvas,
@@ -31,6 +32,7 @@ import {
   resizeHandlePoints,
   rotateHandlePoint,
 } from "../../handlers/boardHandlers";
+import { preloadBoardFonts } from "../../utils/boardFonts";
 
 // All three below are CSS-pixel sizes, not canvas-buffer ones - the buffer stays at
 // doc.canvasWidth/canvasHeight regardless of zoom (see this file's own top comment), so a fixed
@@ -114,6 +116,23 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
   const dragRef = useRef<DragState | null>(null);
   const [contextMenu, setContextMenu] = useState<{ item: BoardItem; x: number; y: number } | null>(null);
 
+  // Bumped once BoardText's bundled "Modern" webfonts (see boardFonts.css/preloadBoardFonts's own
+  // doc comments) finish loading, purely to force draw() below to run again - draw() never reads
+  // this value itself, it's only listed in draw's dependency array as a trigger. Without it, a
+  // board that already uses one of these fonts on first open would draw its very first frame (or
+  // every frame until the next edit) with a fallback face: canvas text, unlike DOM text, doesn't
+  // automatically repaint once a font it already tried to use finishes loading in the background.
+  const [fontsReadyTick, setFontsReadyTick] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    preloadBoardFonts().then(() => {
+      if (!cancelled) setFontsReadyTick((n) => n + 1);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Marquee (rubber-band) select - starts whenever a plain pointerdown misses every item (see
   // handlePointerDown's final fallback below). `marqueeRef` holds the gesture's fixed start info
   // (not React state - nothing here needs to trigger a render on its own, only marqueeRect below
@@ -152,7 +171,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
     if (!id) return;
     const before = doc.images.find((item) => item.id === id);
     if (!before || before.kind !== "text" || before.text === editingTextDraft) return;
-    onEditImage(before, { ...before, text: editingTextDraft, updatedAt: Date.now() });
+    onEditImage(before, growTextItemToFitContent({ ...before, text: editingTextDraft, updatedAt: Date.now() }));
   };
 
   const cancelTextEdit = (): void => {
@@ -229,7 +248,9 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
       ctx.restore();
     }
     ctx.restore();
-  }, [doc, displayImages, imageBitmaps, selectedIds, zoom, marqueeRect, snapGuides]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fontsReadyTick is a pure redraw
+    // trigger (see its own doc comment above), draw() never reads it directly.
+  }, [doc, displayImages, imageBitmaps, selectedIds, zoom, marqueeRect, snapGuides, fontsReadyTick]);
 
   useEffect(() => {
     draw();
@@ -510,7 +531,17 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
         }
       }
       setSnapGuides({ vertical: guideX !== null ? [guideX] : [], horizontal: guideY !== null ? [guideY] : [] });
-      setLiveImages(drag.startImages.map((image) => (drag.ids.has(image.id) ? applyResize(image, corner, snappedX, snappedY) : image)));
+      // A text item specifically also gets grown post-resize: narrowing its width can force more
+      // wrapped lines than its (also just-changed) height now fits, which would otherwise silently
+      // clip text the same way an untouched box would (see growTextItemToFitContent's own doc
+      // comment) - every other kind is unaffected, resized exactly as dragged.
+      setLiveImages(
+        drag.startImages.map((image) => {
+          if (!drag.ids.has(image.id)) return image;
+          const resized = applyResize(image, corner, snappedX, snappedY);
+          return resized.kind === "text" ? growTextItemToFitContent(resized) : resized;
+        })
+      );
       return;
     }
 
@@ -557,7 +588,14 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
   };
 
   const { width: bufferWidth, height: bufferHeight, padding } = paddedCanvasSize(doc);
-  const editingItem = editingTextId ? (doc.images.find((item) => item.id === editingTextId) as BoardText | undefined) : undefined;
+  // From displayImages (liveImages while editing, doc.images otherwise), NOT doc.images directly -
+  // the overlay below sizes itself off this item's own x/y/width/height, and doc.images only ever
+  // has the pre-edit committed height (the store isn't touched until commitTextEdit on blur). Using
+  // the live one is what makes the actual editable/clickable overlay area grow in step with the
+  // canvas underneath as growTextItemToFitContent grows it on every keystroke (see the textarea's
+  // own onChange above) - without this the overlay would stay stuck at its old (too short) height
+  // while the visibly-taller box rendered underneath it.
+  const editingItem = editingTextId ? (displayImages.find((item) => item.id === editingTextId) as BoardText | undefined) : undefined;
 
   return (
     <>
@@ -600,7 +638,14 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
             value={editingTextDraft}
             onChange={(e) => {
               setEditingTextDraft(e.target.value);
-              setLiveImages(doc.images.map((item) => (item.id === editingItem.id ? { ...item, text: e.target.value } : item)));
+              // growTextItemToFitContent here, not just on final commit, is what makes the box
+              // visibly grow downward AS the user types (matches editingItem's own live-height doc
+              // comment below) rather than only snapping to its new size once editing ends.
+              setLiveImages(
+                doc.images.map((item) =>
+                  item.id === editingItem.id && item.kind === "text" ? growTextItemToFitContent({ ...item, text: e.target.value }) : item
+                )
+              );
             }}
             onFocus={(e) => e.currentTarget.select()}
             onBlur={commitTextEdit}
@@ -709,7 +754,14 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
               className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
             >
               <IoTrashOutline size={15} className="shrink-0" />
-              Delete {contextMenu.item.kind === "text" ? "text" : contextMenu.item.kind === "blur" ? "blur" : "image"}
+              Delete{" "}
+              {contextMenu.item.kind === "text"
+                ? "text"
+                : contextMenu.item.kind === "blur"
+                  ? "blur"
+                  : contextMenu.item.kind === "shape"
+                    ? "shape"
+                    : "image"}
             </button>
           </div>,
           document.body

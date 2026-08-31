@@ -105,7 +105,43 @@ export interface BoardBlur extends BoardItemBase {
   strength: number;
 }
 
-export type BoardItem = BoardImage | BoardText | BoardBlur;
+// A basic vector shape - the Board feature's fourth item kind, for callouts/diagrams/emphasis on
+// top of the photos (an arrow pointing at something, a box drawn around it, a divider line, a
+// starburst). `rectangle`/`ellipse`/`polygon`/`star`/`block-arrow` are filled+stroked shapes
+// inscribed in the item's own border-box, same box model every other kind uses (a non-square box
+// stretches the shape to fill it, same as an ellipse would, rather than inscribing a fixed-aspect
+// shape and leaving dead space). `line`/`arrow` reuse that exact same box rather than a dedicated
+// two-point (start/end) model: the line is always drawn along the box's own horizontal midline (from
+// (x, y+height/2) to (x+width, y+height/2)) in LOCAL space, so a corner resize only ever changes its
+// length and its (otherwise invisible) grab thickness - never puts a kink or a diagonal slant in it -
+// and rotating the item angles the whole straight line, same as rotating any other item. This is
+// what gives every one of these full move/resize/rotate/select/lock parity for free, the same
+// reasoning BoardItemBase's own doc comment gives for BoardText.
+export interface BoardShape extends BoardItemBase {
+  kind: "shape";
+  shapeType: "rectangle" | "ellipse" | "polygon" | "star" | "line" | "arrow" | "block-arrow";
+  // Ignored for "line"/"arrow" (nothing to fill - a straight line has no interior). `null` = no
+  // fill, same "null = transparent" convention as every other optional-fill field in this file.
+  fillColor: string | null;
+  strokeColor: string;
+  strokeWidth: number;
+  // Absent on a shape created before this existed - resolves to "solid", its original/only
+  // behavior (same "missing = the original behavior" convention as BoardBlur.mode).
+  strokeStyle?: "solid" | "dashed" | "dotted";
+  cornerRadius: number; // "rectangle" only
+  // "polygon" only, 3-12 - a triangle, pentagon, hexagon, octagon etc. are all just this one
+  // shapeType at a different `sides`, not their own separate shapeType values (see
+  // boardCanvasShapes.ts's SHAPE_ADD_PRESETS for the toolbar's named quick-adds). Absent on an
+  // older polygon shape - resolves to 5 (pentagon), boardHandlers.ts's regularPolygonPath default.
+  sides?: number;
+  // "star" only, 3-12 points. Absent on an older star - resolves to 5.
+  points?: number;
+  // "star" only, 0-1 - how far the inner (concave) vertices sit toward the center relative to the
+  // outer points; smaller = spikier. Absent on an older star - resolves to 0.45.
+  innerRadiusRatio?: number;
+}
+
+export type BoardItem = BoardImage | BoardText | BoardBlur | BoardShape;
 
 // Which of the four background renderers is active - see boardHandlers.ts's renderBoardToCanvas
 // for how each one actually paints. Old boards saved before "grid"/"image"/"gradient" existed
@@ -291,6 +327,57 @@ export function createDefaultBoardText(id: string, x: number, y: number): BoardT
 }
 
 const DEFAULT_BLUR_SIZE = 180;
+
+// One size/stroke default per shapeType rather than a single shared default - a filled shape wants
+// to start as a visible, roughly-square box, a line/arrow wants to start long and thin with no fill
+// at all (fillColor is ignored for those two anyway, but kept null rather than a throwaway color so
+// there's nothing misleading to inspect on disk), and a block arrow wants a wide aspect ratio so its
+// head/shaft proportions read correctly from the moment it's dropped in.
+const SHAPE_DEFAULTS: Record<BoardShape["shapeType"], { width: number; height: number; fillColor: string | null; strokeColor: string; strokeWidth: number }> = {
+  rectangle: { width: 220, height: 150, fillColor: "#93c5fd", strokeColor: "#2563eb", strokeWidth: 2 },
+  ellipse: { width: 170, height: 170, fillColor: "#93c5fd", strokeColor: "#2563eb", strokeWidth: 2 },
+  polygon: { width: 180, height: 170, fillColor: "#93c5fd", strokeColor: "#2563eb", strokeWidth: 2 },
+  star: { width: 180, height: 170, fillColor: "#fde68a", strokeColor: "#d97706", strokeWidth: 2 },
+  line: { width: 240, height: 40, fillColor: null, strokeColor: "#111111", strokeWidth: 3 },
+  arrow: { width: 240, height: 40, fillColor: null, strokeColor: "#111111", strokeWidth: 3 },
+  "block-arrow": { width: 220, height: 110, fillColor: "#93c5fd", strokeColor: "#2563eb", strokeWidth: 2 },
+};
+
+// Optional per-shape overrides for the few fields that only matter for specific shapeTypes
+// (polygon's `sides`, star's `points`/`innerRadiusRatio`) - lets the toolbar's named quick-adds
+// (Triangle, Pentagon, Hexagon... - see BoardEditor.tsx's SHAPE_ADD_PRESETS) all share this one
+// factory instead of each needing their own.
+export function createDefaultBoardShape(
+  id: string,
+  shapeType: BoardShape["shapeType"],
+  x: number,
+  y: number,
+  overrides?: Partial<Pick<BoardShape, "sides" | "points" | "innerRadiusRatio">>
+): BoardShape {
+  const now = Date.now();
+  const defaults = SHAPE_DEFAULTS[shapeType];
+  return {
+    kind: "shape",
+    id,
+    shapeType,
+    x,
+    y,
+    width: defaults.width,
+    height: defaults.height,
+    rotation: 0,
+    fillColor: defaults.fillColor,
+    strokeColor: defaults.strokeColor,
+    strokeWidth: defaults.strokeWidth,
+    strokeStyle: "solid",
+    cornerRadius: 0,
+    sides: shapeType === "polygon" ? overrides?.sides ?? 5 : undefined,
+    points: shapeType === "star" ? overrides?.points ?? 5 : undefined,
+    innerRadiusRatio: shapeType === "star" ? overrides?.innerRadiusRatio ?? 0.45 : undefined,
+    opacity: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
 
 export function createDefaultBoardBlur(id: string, x: number, y: number): BoardBlur {
   const now = Date.now();
