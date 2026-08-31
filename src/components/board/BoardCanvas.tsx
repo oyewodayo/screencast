@@ -15,7 +15,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
 import { TbStackBack, TbStackFront } from "react-icons/tb";
-import { BoardDocument, BoardImage, BoardItem } from "../../utils/boardTypes";
+import { BoardDocument, BoardImage, BoardItem, BoardText } from "../../utils/boardTypes";
 import {
   ResizeCorner,
   applyMove,
@@ -94,6 +94,34 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
   const dragRef = useRef<DragState | null>(null);
   const [contextMenu, setContextMenu] = useState<{ item: BoardItem; x: number; y: number } | null>(null);
 
+  // Double-click-to-edit text - see BoardText's own doc comment in boardTypes.ts for why this is a
+  // transparent textarea overlay (visible caret/selection only - color: transparent, see the style
+  // below) driving the SAME liveImages staging drag/resize/rotate already use, rather than a styled
+  // one rendering its own visible text: every keystroke re-stages the draft into liveImages so the
+  // canvas underneath redraws with the item's real font/color/background/alignment live, and the
+  // overlay never has to duplicate that rendering itself or fight with stale canvas content showing
+  // through a transparent-background text box. Committed (via onEditImage, one undo step for the
+  // whole edit) on blur; Escape discards the draft instead. Enter is deliberately NOT intercepted -
+  // it inserts a newline, same as any multi-line text field; blur (click elsewhere) is what ends
+  // editing, matching Notion/Figma text-box conventions.
+  const [editingTextId, setEditingTextId] = useState<string | null>(null);
+  const [editingTextDraft, setEditingTextDraft] = useState("");
+
+  const commitTextEdit = (): void => {
+    const id = editingTextId;
+    setEditingTextId(null);
+    setLiveImages(null);
+    if (!id) return;
+    const before = doc.images.find((item) => item.id === id);
+    if (!before || before.kind !== "text" || before.text === editingTextDraft) return;
+    onEditImage(before, { ...before, text: editingTextDraft, updatedAt: Date.now() });
+  };
+
+  const cancelTextEdit = (): void => {
+    setEditingTextId(null);
+    setLiveImages(null);
+  };
+
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
@@ -164,6 +192,17 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
     }
     onSelect(new Set([hit.id]));
     setContextMenu({ item: hit, x: e.clientX, y: e.clientY });
+  };
+
+  // Double-click a text tile to start editing it in place - see editingTextId's own doc comment.
+  // No-ops for an image/blur tile (or empty canvas) - there's nothing to type into.
+  const handleDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>): void => {
+    const { x, y } = clientToCanvasSpace(e.clientX, e.clientY);
+    const hit = hitTestBoardItem(doc.images, x, y);
+    if (!hit || hit.kind !== "text") return;
+    onSelect(new Set([hit.id]));
+    setEditingTextId(hit.id);
+    setEditingTextDraft(hit.text);
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>): void => {
@@ -254,35 +293,95 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
     else onBatchEditImages(before, after);
   };
 
-  const { width: bufferWidth, height: bufferHeight } = paddedCanvasSize(doc);
+  const { width: bufferWidth, height: bufferHeight, padding } = paddedCanvasSize(doc);
+  const editingItem = editingTextId ? (doc.images.find((item) => item.id === editingTextId) as BoardText | undefined) : undefined;
 
   return (
     <>
-      <canvas
-        ref={canvasRef}
-        style={{
-          width: bufferWidth * zoom,
-          height: bufferHeight * zoom,
-          // Always-on checkerboard sitting behind the canvas's own pixels - invisible wherever the
-          // board has an opaque background (a color, a grid with a base fill, or a chosen image),
-          // but shows through cleanly wherever that background is transparent - color mode's
-          // backgroundColor null, grid mode's baseColor null, or image mode with nothing chosen
-          // yet - or an image's own opacity is under 100%, the same "see-through" convention every
-          // other image editor uses. See boardHandlers.ts's renderBoardToCanvas for which of the
-          // three background modes is actually responsible for what gets drawn into the pixels
-          // this sits behind.
-          backgroundImage:
-            "repeating-conic-gradient(#0000000f 0% 25%, transparent 0% 50%), repeating-conic-gradient(#0000000f 0% 25%, transparent 0% 50%)",
-          backgroundSize: "20px 20px",
-          backgroundPosition: "0 0, 10px 10px",
-        }}
-        className="shrink-0 rounded-sm shadow-lg cursor-default touch-none bg-white dark:bg-neutral-700"
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
-        onContextMenu={handleContextMenu}
-      />
+      {/* Sized exactly like the canvas below (same width/height) purely so the text-edit overlay
+          has a positioned ancestor to place itself against with plain left/top math - no change to
+          how this sits in BoardEditor.tsx's own centering flex container, since the wrapper is the
+          same box the bare canvas used to be. */}
+      <div className="relative shrink-0" style={{ width: bufferWidth * zoom, height: bufferHeight * zoom }}>
+        <canvas
+          ref={canvasRef}
+          style={{
+            width: bufferWidth * zoom,
+            height: bufferHeight * zoom,
+            // Always-on checkerboard sitting behind the canvas's own pixels - invisible wherever the
+            // board has an opaque background (a color, a grid with a base fill, or a chosen image),
+            // but shows through cleanly wherever that background is transparent - color mode's
+            // backgroundColor null, grid mode's baseColor null, or image mode with nothing chosen
+            // yet - or an image's own opacity is under 100%, the same "see-through" convention every
+            // other image editor uses. See boardHandlers.ts's renderBoardToCanvas for which of the
+            // three background modes is actually responsible for what gets drawn into the pixels
+            // this sits behind.
+            backgroundImage:
+              "repeating-conic-gradient(#0000000f 0% 25%, transparent 0% 50%), repeating-conic-gradient(#0000000f 0% 25%, transparent 0% 50%)",
+            backgroundSize: "20px 20px",
+            backgroundPosition: "0 0, 10px 10px",
+          }}
+          className="rounded-sm shadow-lg cursor-default touch-none bg-white dark:bg-neutral-700"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          onContextMenu={handleContextMenu}
+          onDoubleClick={handleDoubleClick}
+        />
+
+        {editingItem && (
+          <textarea
+            key={editingItem.id}
+            autoFocus
+            value={editingTextDraft}
+            onChange={(e) => {
+              setEditingTextDraft(e.target.value);
+              setLiveImages(doc.images.map((item) => (item.id === editingItem.id ? { ...item, text: e.target.value } : item)));
+            }}
+            onFocus={(e) => e.currentTarget.select()}
+            onBlur={commitTextEdit}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                cancelTextEdit();
+              }
+              // Enter is deliberately left alone - see this component's editingTextId doc comment.
+            }}
+            spellCheck={false}
+            style={{
+              position: "absolute",
+              left: (padding + editingItem.x) * zoom,
+              top: (padding + editingItem.y) * zoom,
+              width: editingItem.width * zoom,
+              height: editingItem.height * zoom,
+              transform: `rotate(${editingItem.rotation}rad)`,
+              transformOrigin: "center",
+              padding: editingItem.padding * zoom,
+              fontSize: editingItem.fontSize * zoom,
+              fontFamily: editingItem.fontFamily,
+              fontWeight: editingItem.fontWeight,
+              fontStyle: editingItem.fontStyle,
+              textAlign: editingItem.textAlign,
+              lineHeight: 1.25,
+              // Invisible text/background on purpose - liveImages (see onChange) restages the same
+              // draft into the canvas underneath on every keystroke, which already renders it with
+              // the item's real font/color/background/corner-radius. This overlay exists only to
+              // capture keystrokes/IME/selection at the right screen position - color: transparent
+              // keeps its own (unstyled, unclipped) text invisible while the caret and native
+              // selection highlight stay visible, so there's no double-rendered or mismatched text
+              // flashing on top of the real one.
+              color: "transparent",
+              caretColor: editingItem.color,
+              background: "transparent",
+              border: "none",
+              outline: "none",
+              resize: "none",
+              boxSizing: "border-box",
+            }}
+          />
+        )}
+      </div>
 
       {contextMenu &&
         createPortal(
@@ -336,7 +435,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
               className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
             >
               <IoTrashOutline size={15} className="shrink-0" />
-              Delete {contextMenu.item.kind === "text" ? "text" : "image"}
+              Delete {contextMenu.item.kind === "text" ? "text" : contextMenu.item.kind === "blur" ? "blur" : "image"}
             </button>
           </div>,
           document.body

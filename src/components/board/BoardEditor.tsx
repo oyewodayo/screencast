@@ -32,9 +32,9 @@ import {
   IoSaveOutline,
   IoShareOutline,
 } from "react-icons/io5";
-import { TbCircleDashed, TbColumns, TbSpiral, TbStairsUp } from "react-icons/tb";
+import { TbBlur, TbCircleDashed, TbColumns, TbSpiral, TbStairsUp } from "react-icons/tb";
 import useBoardStore from "../../hooks/useBoardStore";
-import { BoardBackgroundMode, BoardImage, BoardItem, BoardText, createDefaultBoardImage, createDefaultBoardText } from "../../utils/boardTypes";
+import { BoardBackgroundMode, BoardBlur, BoardImage, BoardItem, BoardText, createDefaultBoardBlur, createDefaultBoardImage, createDefaultBoardText } from "../../utils/boardTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import {
@@ -395,6 +395,19 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     setSelectedIds(new Set([id]));
   }, [store]);
 
+  // Same "drop centered, select immediately" pattern as handleAddText above - a blur region has no
+  // source file either, so this is just one addImage call. Sized/shaped so it drops in ready to
+  // drag straight onto whatever needs covering (see createDefaultBoardBlur's own defaults).
+  const handleAddBlur = useCallback((): void => {
+    if (!store.doc) return;
+    const id = crypto.randomUUID();
+    const x = store.doc.canvasWidth / 2 - 90;
+    const y = store.doc.canvasHeight / 2 - 90;
+    const blur = createDefaultBoardBlur(id, x, y);
+    store.addImage(blur);
+    setSelectedIds(new Set([id]));
+  }, [store]);
+
   // Drop target for a sidebar image drag (see libraryDraggingFiles prop doc comment) - accepts the
   // drop only while the dragged batch actually contains at least one image, so dropping e.g. a
   // dragged PDF here shows the browser's native "not droppable" cursor instead of silently doing
@@ -470,6 +483,27 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     [store]
   );
 
+  // Blur counterpart to handleApplyImageStyleToAll/handleApplyTextStyleToAll above - same
+  // reasoning: geometry (position/size/rotation) stays per-item, only shape/corner radius/strength/
+  // opacity copy across.
+  const handleApplyBlurStyleToAll = useCallback(
+    (source: BoardBlur) => {
+      if (!store.doc) return;
+      const targets = store.doc.images.filter((item): item is BoardBlur => item.kind === "blur" && item.id !== source.id);
+      if (targets.length === 0) return;
+      const styled = targets.map((b) => ({
+        ...b,
+        shape: source.shape,
+        cornerRadius: source.cornerRadius,
+        strength: source.strength,
+        opacity: source.opacity,
+        updatedAt: Date.now(),
+      }));
+      store.batchEditImages(targets, styled);
+    },
+    [store]
+  );
+
   const handleDeleteSelected = useCallback(
     (ids: Set<string>) => {
       if (!store.doc) return;
@@ -479,6 +513,24 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       setSelectedIds(new Set());
     },
     [store]
+  );
+
+  // Moves every selected item by (dx, dy) * step - shared by the keyboard arrow-key handler below
+  // AND BoardStylePanel's own directional-pad control, so the two are guaranteed to always agree on
+  // what a "nudge" actually does rather than two independent implementations drifting apart. `dx`/
+  // `dy` are unit direction (-1/0/1), `step` is the actual pixel distance - callers pass
+  // NUDGE_STEP/NUDGE_STEP_SHIFT for keyboard's plain/Shift convention, and the D-pad's own buttons
+  // mirror that exact convention (click vs. Shift-click) rather than inventing a different one.
+  const handleNudge = useCallback(
+    (dx: number, dy: number, step: number) => {
+      if (!store.doc || selectedIds.size === 0) return;
+      const targets = store.doc.images.filter((img) => selectedIds.has(img.id));
+      if (targets.length === 0) return;
+      const moved = targets.map((img) => applyMove(img, dx * step, dy * step));
+      if (targets.length === 1) store.editImage(targets[0], moved[0]);
+      else store.batchEditImages(targets, moved);
+    },
+    [store, selectedIds]
   );
 
   const handleBringToFront = useCallback(
@@ -748,13 +800,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       if (!e.ctrlKey && !e.metaKey && e.key in NUDGE_DIRECTIONS && selectedIds.size > 0 && store.doc) {
         e.preventDefault();
         const [dirX, dirY] = NUDGE_DIRECTIONS[e.key];
-        const step = e.shiftKey ? NUDGE_STEP_SHIFT : NUDGE_STEP;
-        const targets = store.doc.images.filter((img) => selectedIds.has(img.id));
-        if (targets.length > 0) {
-          const moved = targets.map((img) => applyMove(img, dirX * step, dirY * step));
-          if (targets.length === 1) store.editImage(targets[0], moved[0]);
-          else store.batchEditImages(targets, moved);
-        }
+        handleNudge(dirX, dirY, e.shiftKey ? NUDGE_STEP_SHIFT : NUDGE_STEP);
         return;
       }
       if (e.ctrlKey || e.metaKey) {
@@ -773,7 +819,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [selectedIds, handleDeleteSelected, store]);
+  }, [selectedIds, handleDeleteSelected, handleNudge, store]);
 
   const nameInputRef = useRef<HTMLInputElement>(null);
 
@@ -805,6 +851,10 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
 
         <button type="button" title="Add text" onClick={handleAddText} disabled={!store.doc} className={TOOLBAR_CHIP}>
           <IoText size={15} /> Text
+        </button>
+
+        <button type="button" title="Add a blur region - drag it over anything you want to obscure" onClick={handleAddBlur} disabled={!store.doc} className={TOOLBAR_CHIP}>
+          <TbBlur size={15} /> Blur
         </button>
 
         <div className="w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
@@ -1237,7 +1287,16 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       <div className="flex-1 min-h-0 flex">
         <div
           ref={containerRef}
-          className={`relative flex-1 min-w-0 overflow-auto flex items-center justify-center p-6 transition-colors ${
+          // grid + place-items-center, not flex + items-center/justify-center - the two look
+          // identical whenever the canvas fits inside the viewport, but only grid centering stays
+          // scrollable to ALL of an oversized child once it's bigger than the container (a huge
+          // board at a low zoom can still be bigger than the window - see the Circle/Heart/Masonry
+          // arrangements this got reported against). Flexbox centering shifts an overflowing child
+          // by a negative margin-equivalent offset that most browsers' scroll containers don't
+          // extend scrollable range to cover, so the top/left overflow becomes permanently
+          // unreachable while the bottom/right overflow scrolls fine - a well-documented Chromium/
+          // Firefox flexbox quirk that CSS Grid's own centering doesn't share.
+          className={`relative flex-1 min-w-0 overflow-auto grid place-items-center p-6 transition-colors ${
             isDragOverCanvas && draggedLibraryImagePaths.length > 0 ? "bg-blue-50/60 dark:bg-blue-500/10" : ""
           }`}
           // Sidebar-image-drop target - see libraryDraggingFiles/draggedLibraryImagePaths above.
@@ -1303,10 +1362,13 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             onSendToBack={handleSendToBack}
             onApplyStyleToAllImages={handleApplyImageStyleToAll}
             onApplyStyleToAllTexts={handleApplyTextStyleToAll}
+            onApplyStyleToAllBlurs={handleApplyBlurStyleToAll}
             boardImageCount={store.doc?.images.filter((item) => item.kind === "image").length ?? 0}
             boardTextCount={store.doc?.images.filter((item) => item.kind === "text").length ?? 0}
+            boardBlurCount={store.doc?.images.filter((item) => item.kind === "blur").length ?? 0}
             onReplaceImage={(image) => void handleReplaceImage(image)}
             isReplacingImage={isReplacingImage}
+            onNudge={handleNudge}
           />
         )}
       </div>

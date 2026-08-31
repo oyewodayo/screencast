@@ -6,7 +6,7 @@
 // no shared code, per the Board feature's "build from scratch" requirement (the single-image
 // editor's tools don't fit this feature's per-image padding/border/margin/radius needs).
 
-import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGridBackground, BoardImage, BoardItem, BoardText } from "../utils/boardTypes";
+import { BoardBackgroundMode, BoardBlur, BoardCommand, BoardDocument, BoardGridBackground, BoardImage, BoardItem, BoardText } from "../utils/boardTypes";
 
 // ---- Geometry helpers -----------------------------------------------------------------------
 
@@ -185,6 +185,58 @@ function renderBoardText(ctx: CanvasRenderingContext2D, item: BoardText): void {
   ctx.restore();
 }
 
+// Draws nothing of its own - re-samples whatever's already been composited onto `canvasSource` (in
+// z-order, so only what's BENEATH this item in the stack) through a blurred, clipped copy of
+// itself. `canvasSource` is the very canvas `ctx` is drawing into (renderBoardToCanvas passes its
+// own `canvas` argument straight through) - drawImage reading from the same canvas it's drawing to
+// is well-defined (the source is a snapshot of what's been rasterized so far) and is exactly what
+// "blur what's underneath" needs.
+//
+// The clip path is set up under this item's own rotate/translate transform (so a rotated blur
+// region gets a correspondingly rotated - or elliptical - outline), but the actual drawImage below
+// deliberately runs under a RESET (identity) transform. That's not an oversight: canvas blur is
+// isotropic, so rotating the *sampled* content would just reveal blurred pixels from a different
+// part of the board (whatever rotation carried into view) rather than blurring what's actually
+// under the clip window - the rotation belongs only to the clip shape, never to the sampling.
+function renderBoardBlur(ctx: CanvasRenderingContext2D, canvasSource: HTMLCanvasElement, item: BoardBlur): void {
+  if (item.strength <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = item.opacity;
+
+  // Captured BEFORE this item's own rotate below, deliberately - getTransform().a is only the pure
+  // doc-space -> device-pixel scale renderBoardToCanvas's caller set up (1 for the live editing
+  // canvas, smaller for a thumbnail/export render) while no rotation is mixed into the matrix yet.
+  // Reading it any later would return `scale * cos(item.rotation)` instead (a rotated item's own
+  // rotate() call mixes into a/b/c/d too, not just e/f) - at 90° that's ~0, silently killing the
+  // blur entirely. item.strength is authored in doc-space px, so it needs exactly this factor to
+  // come out looking the same at any zoom or export size.
+  const deviceScale = ctx.getTransform().a;
+
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
+  ctx.translate(cx, cy);
+  ctx.rotate(item.rotation);
+  ctx.translate(-cx, -cy);
+
+  ctx.beginPath();
+  if (item.shape === "ellipse") {
+    ctx.ellipse(cx, cy, item.width / 2, item.height / 2, 0, 0, Math.PI * 2);
+  } else {
+    roundedRectPath(ctx, item.x, item.y, item.width, item.height, item.shape === "rounded" ? item.cornerRadius : 0);
+  }
+  ctx.clip();
+
+  // Clip regions persist across later transform changes (they're resolved against the CTM active
+  // at clip() time, not re-evaluated afterward) - so resetting here doesn't affect the shape above,
+  // only where/how the source gets sampled.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.filter = `blur(${item.strength * deviceScale}px)`;
+  ctx.drawImage(canvasSource, 0, 0);
+  ctx.filter = "none";
+
+  ctx.restore();
+}
+
 // Resolves doc.padding defensively (Number.isFinite guard - same reasoning safeGap used to have
 // for the old gridlineWidth field: a board saved before `padding` existed loads it as `undefined`,
 // which must never reach arithmetic as NaN - this exact bug already slipped through once, into the
@@ -256,9 +308,9 @@ function drawGridBackground(ctx: CanvasRenderingContext2D, width: number, height
 }
 
 // Renders the full board: background (see the three-renderer comment above), then every item
-// (image or text) in array order (last = topmost), inset by paddedCanvasSize's padding so item
-// coordinates stay in the document's own unpadded space throughout (BoardItem.x/y never account
-// for padding - callers
+// (image, text, or blur) in array order (last = topmost), inset by paddedCanvasSize's padding so
+// item coordinates stay in the document's own unpadded space throughout (BoardItem.x/y never
+// account for padding - callers
 // doing hit-testing/pointer math against the same buffer must subtract padding back out, see
 // BoardCanvas.tsx's pointerToCanvasSpace). `canvas` must already be sized to
 // `paddedCanvasSize(doc).width * scale` / `.height * scale` by the caller (same split of
@@ -294,6 +346,7 @@ export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocumen
   ctx.translate(padding, padding);
   for (const item of doc.images) {
     if (item.kind === "text") renderBoardText(ctx, item);
+    else if (item.kind === "blur") renderBoardBlur(ctx, canvas, item);
     else renderBoardImage(ctx, item, imageBitmaps.get(item.assetFileName) ?? null);
   }
   ctx.restore();

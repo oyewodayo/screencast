@@ -76,7 +76,22 @@ export interface BoardText extends BoardItemBase {
   padding: number;
 }
 
-export type BoardItem = BoardImage | BoardText;
+// A free-floating blur region - the Board feature's third item kind, for obscuring something in a
+// photo underneath (a face, a license plate, whatever) without editing the photo itself. Unlike
+// BoardImage/BoardText, this kind draws nothing of its own - boardHandlers.ts's renderBoardBlur
+// instead re-samples whatever's already been composited beneath it (in z-order) through a blurred,
+// clipped copy of the canvas so far. `shape` controls the clip outline (a plain rect, a rounded
+// rect using `cornerRadius`, or an ellipse inscribed in the box) - independent of `strength`, the
+// blur radius in doc-space px, which is what BoardStylePanel's "Blur" section actually calls
+// strength.
+export interface BoardBlur extends BoardItemBase {
+  kind: "blur";
+  shape: "rect" | "rounded" | "ellipse";
+  cornerRadius: number; // only used when shape is "rounded"
+  strength: number; // blur radius, doc-space px
+}
+
+export type BoardItem = BoardImage | BoardText | BoardBlur;
 
 // Which of the three background renderers is active - see boardHandlers.ts's renderBoardToCanvas
 // for how each one actually paints. Old boards saved before this existed simply lack the field on
@@ -241,6 +256,29 @@ export function createDefaultBoardText(id: string, x: number, y: number): BoardT
     backgroundColor: null,
     cornerRadius: 0,
     padding: 8,
+    opacity: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+const DEFAULT_BLUR_SIZE = 180;
+
+export function createDefaultBoardBlur(id: string, x: number, y: number): BoardBlur {
+  const now = Date.now();
+  return {
+    kind: "blur",
+    id,
+    x,
+    y,
+    width: DEFAULT_BLUR_SIZE,
+    height: DEFAULT_BLUR_SIZE,
+    rotation: 0,
+    // Ellipse by default - the common "blur out a face" case reads more naturally as a soft oval
+    // than a hard-edged rectangle; either is one click away in the style panel.
+    shape: "ellipse",
+    cornerRadius: 0,
+    strength: 18,
     opacity: 1,
     createdAt: now,
     updatedAt: now,

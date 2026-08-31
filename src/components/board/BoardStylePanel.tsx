@@ -18,9 +18,22 @@
 // fields commit immediately on change (no debounce/live-preview split like the image editor's
 // brightness/contrast sliders use - these are discrete numeric/color fields, not a continuous drag
 // gesture that needs its own pre-commit staging).
-import React, { ReactNode } from "react";
-import { IoColorFillOutline, IoContrastOutline, IoImageOutline, IoOptionsOutline, IoSwapHorizontalOutline, IoText, IoTrashOutline } from "react-icons/io5";
-import { BoardImage, BoardItem, BoardText } from "../../utils/boardTypes";
+import React, { ReactNode, useState } from "react";
+import {
+  IoChevronBack,
+  IoChevronDown,
+  IoChevronForward,
+  IoChevronUp,
+  IoColorFillOutline,
+  IoContrastOutline,
+  IoImageOutline,
+  IoOptionsOutline,
+  IoSwapHorizontalOutline,
+  IoText,
+  IoTrashOutline,
+} from "react-icons/io5";
+import { TbArrowsMove, TbBlur } from "react-icons/tb";
+import { BoardBlur, BoardImage, BoardItem, BoardText } from "../../utils/boardTypes";
 
 interface BoardStylePanelProps {
   items: BoardItem[]; // the full selected set - fields showing a mixed value across them just show the first one's
@@ -38,8 +51,10 @@ interface BoardStylePanelProps {
   // nothing else on the board to apply to.
   onApplyStyleToAllImages: (source: BoardImage) => void;
   onApplyStyleToAllTexts: (source: BoardText) => void;
+  onApplyStyleToAllBlurs: (source: BoardBlur) => void;
   boardImageCount: number;
   boardTextCount: number;
+  boardBlurCount: number;
   // Swaps the selected image's underlying photo, keeping its position/size/rotation/style exactly
   // as they are (see BoardEditor.tsx's handleReplaceImage) - single-image selection only, same
   // reasoning as onApplyStyleToAllImages above. Also reachable from BoardCanvas.tsx's own
@@ -47,6 +62,11 @@ interface BoardStylePanelProps {
   // same prop.
   onReplaceImage: (image: BoardImage) => void;
   isReplacingImage: boolean;
+  // Moves every selected item by (dx, dy) * step - the same function the keyboard arrow-key handler
+  // calls (see BoardEditor.tsx's handleNudge), so a click here and pressing an arrow key always
+  // agree on what "nudge" means. Works for any selection regardless of kind - position is the one
+  // thing every board item shares, unlike the kind-specific cards below.
+  onNudge: (dx: number, dy: number, step: number) => void;
 }
 
 // ---- Shared field primitives -------------------------------------------------------------------
@@ -71,6 +91,13 @@ const SectionHeader: React.FC<{ icon: ReactNode; label: string }> = ({ icon, lab
   </div>
 );
 
+// The value badge (e.g. "36px") doubles as a click-to-edit number field - dragging the slider isn't
+// precise enough to land on an exact value, so typing one directly is the other half of this
+// control, not a separate feature. `isEditingValue`/`draftValue` are local UI state (which mode this
+// one field is in right now), not the field's actual value - that still comes from `value`/
+// `onChange` same as the slider itself, and both fire on every keystroke for the same real-time
+// effect the slider already has, only clamping to [min, max] on commit (blur/Enter) so a value
+// typed mid-edit (e.g. "1" on the way to "12") isn't force-clamped before the user finishes typing.
 const SliderField: React.FC<{ label: string; value: number; display: string; min: number; max: number; step?: number; onChange: (v: number) => void }> = ({
   label,
   value,
@@ -79,15 +106,62 @@ const SliderField: React.FC<{ label: string; value: number; display: string; min
   max,
   step,
   onChange,
-}) => (
-  <div className="flex flex-col gap-1.5">
-    <div className="flex items-center justify-between">
-      <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">{label}</span>
-      <span className="text-[11px] font-semibold tabular-nums text-neutral-500 dark:text-neutral-400 bg-neutral-100 dark:bg-neutral-800 px-1.5 py-0.5 rounded-md">{display}</span>
+}) => {
+  const [isEditingValue, setIsEditingValue] = useState(false);
+  const [draftValue, setDraftValue] = useState("");
+
+  const commit = (raw: string): void => {
+    const parsed = Number(raw);
+    if (raw.trim() !== "" && Number.isFinite(parsed)) onChange(Math.min(max, Math.max(min, parsed)));
+    setIsEditingValue(false);
+  };
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">{label}</span>
+        {isEditingValue ? (
+          <input
+            type="number"
+            autoFocus
+            value={draftValue}
+            min={min}
+            max={max}
+            step={step ?? 1}
+            onFocus={(e) => e.currentTarget.select()}
+            onChange={(e) => {
+              setDraftValue(e.target.value);
+              const parsed = Number(e.target.value);
+              if (e.target.value.trim() !== "" && Number.isFinite(parsed)) onChange(parsed);
+            }}
+            onBlur={(e) => commit(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setIsEditingValue(false);
+              }
+            }}
+            className="w-14 text-[11px] font-semibold tabular-nums text-neutral-700 dark:text-neutral-200 bg-white dark:bg-neutral-900 border border-blue-300 dark:border-blue-500/50 rounded-md px-1.5 py-0.5 text-right outline-none"
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => {
+              setDraftValue(String(value));
+              setIsEditingValue(true);
+            }}
+            title="Click to type an exact value"
+            className="text-[11px] font-semibold tabular-nums text-neutral-500 dark:text-neutral-400 bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 px-1.5 py-0.5 rounded-md transition-colors"
+          >
+            {display}
+          </button>
+        )}
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} className="w-full accent-blue-500" />
     </div>
-    <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} className="w-full accent-blue-500" />
-  </div>
-);
+  );
+};
 
 const ColorField: React.FC<{ label: string; value: string; onChange: (v: string) => void; dimmed?: boolean }> = ({ label, value, onChange, dimmed }) => (
   <label className="flex items-center justify-between gap-2">
@@ -104,27 +178,36 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   onSendToBack,
   onApplyStyleToAllImages,
   onApplyStyleToAllTexts,
+  onApplyStyleToAllBlurs,
   boardImageCount,
   boardTextCount,
+  boardBlurCount,
   onReplaceImage,
   isReplacingImage,
+  onNudge,
 }) => {
   if (items.length === 0) return null;
   const primary = items[0];
   const ids = new Set(items.map((item) => item.id));
 
   // Narrowed once here rather than re-filtering inline at each field below - also what lets
-  // setImageField/setTextField stay fully typed against BoardImage/BoardText instead of casting.
+  // setImageField/setTextField/setBlurField stay fully typed against BoardImage/BoardText/BoardBlur
+  // instead of casting.
   const imageItems = items.filter((item): item is BoardImage => item.kind === "image");
   const textItems = items.filter((item): item is BoardText => item.kind === "text");
+  const blurItems = items.filter((item): item is BoardBlur => item.kind === "blur");
   const allImages = imageItems.length === items.length;
   const allText = textItems.length === items.length;
+  const allBlur = blurItems.length === items.length;
 
   const setImageField = <K extends keyof BoardImage>(key: K, value: BoardImage[K]): void => {
     onChange(imageItems, imageItems.map((img) => ({ ...img, [key]: value, updatedAt: Date.now() })));
   };
   const setTextField = <K extends keyof BoardText>(key: K, value: BoardText[K]): void => {
     onChange(textItems, textItems.map((t) => ({ ...t, [key]: value, updatedAt: Date.now() })));
+  };
+  const setBlurField = <K extends keyof BoardBlur>(key: K, value: BoardBlur[K]): void => {
+    onChange(blurItems, blurItems.map((b) => ({ ...b, [key]: value, updatedAt: Date.now() })));
   };
   const setOpacity = (value: number): void => {
     onChange(items, items.map((item) => ({ ...item, opacity: value, updatedAt: Date.now() })));
@@ -140,17 +223,71 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       <div className="flex items-center gap-2.5 px-0.5">
         <div
           className={`flex items-center justify-center w-9 h-9 rounded-xl shrink-0 text-white shadow-sm ${
-            allText ? "bg-gradient-to-br from-purple-500 to-fuchsia-600" : allImages ? "bg-gradient-to-br from-blue-500 to-indigo-600" : "bg-gradient-to-br from-neutral-500 to-neutral-700"
+            allText
+              ? "bg-gradient-to-br from-purple-500 to-fuchsia-600"
+              : allImages
+              ? "bg-gradient-to-br from-blue-500 to-indigo-600"
+              : allBlur
+              ? "bg-gradient-to-br from-slate-500 to-slate-700"
+              : "bg-gradient-to-br from-neutral-500 to-neutral-700"
           }`}
         >
-          {allText ? <IoText size={16} /> : <IoImageOutline size={16} />}
+          {allText ? <IoText size={16} /> : allBlur ? <TbBlur size={17} /> : <IoImageOutline size={16} />}
         </div>
         <div className="min-w-0">
           <p className="text-sm font-semibold text-neutral-800 dark:text-neutral-100 truncate">
-            {items.length > 1 ? `${items.length} items selected` : allText ? "Text" : "Image"}
+            {items.length > 1 ? `${items.length} items selected` : allText ? "Text" : allBlur ? "Blur" : "Image"}
           </p>
           <p className="text-[11px] text-neutral-400 dark:text-neutral-500">Style &amp; layout</p>
         </div>
+      </div>
+
+      <div className={CARD}>
+        <SectionHeader icon={<TbArrowsMove size={12} />} label="Position" />
+        <div className="grid grid-cols-3 grid-rows-3 gap-1 w-28 mx-auto">
+          <div />
+          <button
+            type="button"
+            title="Move up (Shift = 10px)"
+            onClick={(e) => onNudge(0, -1, e.shiftKey ? 10 : 1)}
+            className="flex items-center justify-center w-8 h-8 rounded-lg bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 hover:bg-blue-50 dark:hover:bg-blue-500/15 hover:text-blue-600 dark:hover:text-blue-400 active:scale-95 transition-colors"
+          >
+            <IoChevronUp size={16} />
+          </button>
+          <div />
+
+          <button
+            type="button"
+            title="Move left (Shift = 10px)"
+            onClick={(e) => onNudge(-1, 0, e.shiftKey ? 10 : 1)}
+            className="flex items-center justify-center w-8 h-8 rounded-lg bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 hover:bg-blue-50 dark:hover:bg-blue-500/15 hover:text-blue-600 dark:hover:text-blue-400 active:scale-95 transition-colors"
+          >
+            <IoChevronBack size={16} />
+          </button>
+          <div className="flex items-center justify-center text-neutral-300 dark:text-neutral-700">
+            <TbArrowsMove size={14} />
+          </div>
+          <button
+            type="button"
+            title="Move right (Shift = 10px)"
+            onClick={(e) => onNudge(1, 0, e.shiftKey ? 10 : 1)}
+            className="flex items-center justify-center w-8 h-8 rounded-lg bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 hover:bg-blue-50 dark:hover:bg-blue-500/15 hover:text-blue-600 dark:hover:text-blue-400 active:scale-95 transition-colors"
+          >
+            <IoChevronForward size={16} />
+          </button>
+
+          <div />
+          <button
+            type="button"
+            title="Move down (Shift = 10px)"
+            onClick={(e) => onNudge(0, 1, e.shiftKey ? 10 : 1)}
+            className="flex items-center justify-center w-8 h-8 rounded-lg bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 hover:bg-blue-50 dark:hover:bg-blue-500/15 hover:text-blue-600 dark:hover:text-blue-400 active:scale-95 transition-colors"
+          >
+            <IoChevronDown size={16} />
+          </button>
+          <div />
+        </div>
+        <p className="text-[10px] text-neutral-400 dark:text-neutral-500 text-center -mt-1">Hold Shift for 10px steps</p>
       </div>
 
       {allImages && imageItems.length === 1 && (
@@ -158,7 +295,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
           type="button"
           onClick={() => onReplaceImage(imageItems[0])}
           disabled={isReplacingImage}
-          className="flex items-center justify-center gap-1.5 h-10 rounded-xl text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] transition-all disabled:opacity-50 disabled:shadow-none"
+          className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] transition-all disabled:opacity-50 disabled:shadow-none"
         >
           <IoSwapHorizontalOutline size={15} /> {isReplacingImage ? "Replacing…" : "Replace image"}
         </button>
@@ -217,7 +354,6 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
               ))}
             </div>
           </div>
-
           <ColorField label="Text color" value={textItems[0].color} onChange={(v) => setTextField("color", v)} />
         </div>
       )}
@@ -286,6 +422,45 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         </div>
       )}
 
+      {allBlur && (
+        <div className={CARD}>
+          <SectionHeader icon={<TbBlur size={12} />} label="Blur" />
+
+          <div className="inline-flex items-center h-8 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+            {(["rect", "rounded", "ellipse"] as const).map((shape) => (
+              <button
+                key={shape}
+                type="button"
+                title={shape === "rect" ? "Rectangle" : shape === "rounded" ? "Rounded rectangle" : "Ellipse"}
+                onClick={() => setBlurField("shape", shape)}
+                className={`flex-1 h-full flex items-center justify-center text-[11px] font-medium capitalize transition-colors ${blurItems[0].shape === shape ? SEGMENT_ON : SEGMENT_OFF}`}
+              >
+                {shape}
+              </button>
+            ))}
+          </div>
+
+          {blurItems[0].shape === "rounded" && (
+            <SliderField
+              label="Corner radius"
+              display={`${blurItems[0].cornerRadius}px`}
+              min={0}
+              max={200}
+              value={blurItems[0].cornerRadius}
+              onChange={(v) => setBlurField("cornerRadius", v)}
+            />
+          )}
+
+          <SliderField label="Strength" display={`${blurItems[0].strength}px`} min={0} max={60} value={blurItems[0].strength} onChange={(v) => setBlurField("strength", v)} />
+
+          {blurItems.length === 1 && boardBlurCount > 1 && (
+            <button type="button" onClick={() => onApplyStyleToAllBlurs(blurItems[0])} className={GHOST_BUTTON}>
+              Apply style to all blur regions
+            </button>
+          )}
+        </div>
+      )}
+
       <div className={CARD}>
         <SectionHeader icon={<IoContrastOutline size={12} />} label="Appearance" />
         <SliderField label="Opacity" display={`${Math.round(primary.opacity * 100)}%`} min={0.1} max={1} step={0.05} value={primary.opacity} onChange={setOpacity} />
@@ -305,7 +480,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         onClick={() => onDelete(ids)}
         className="flex items-center justify-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-semibold text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
       >
-        <IoTrashOutline size={14} /> Delete {items.length > 1 ? "items" : allText ? "text" : "image"}
+        <IoTrashOutline size={14} /> Delete {items.length > 1 ? "items" : allText ? "text" : allBlur ? "blur" : "image"}
       </button>
     </div>
   );
