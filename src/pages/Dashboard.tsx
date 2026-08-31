@@ -53,6 +53,7 @@ import {
   IoAddCircleOutline,
   IoBuildOutline,
   IoPin,
+  IoLocateOutline,
   IoRefresh,
   IoSearch,
   IoClose,
@@ -1623,6 +1624,26 @@ const setScreen = () => {
 		return () => document.removeEventListener("keydown", handleKeyDown);
 	}, [selectedFile, files, audioShuffle, dockerMode]);
 
+	// Escape clears the current multi-selection - the sidebar's checkbox multi-select and the
+	// image gallery's Ctrl/Shift-click selection (ImageFolderGallery.tsx) are the same
+	// selectedFilePaths Set, so this one shortcut covers both. Only attached while there's
+	// actually a selection to clear, and skipped while focus is in a text field (the search box,
+	// an inline rename, a new-folder name) so it doesn't steal Escape from whatever that field's
+	// own handler - or its default browser behavior - would otherwise do with it.
+	useEffect(() => {
+		if (selectedFilePaths.size === 0) return;
+
+		const handleEscape = (e: KeyboardEvent) => {
+			if (e.key !== "Escape") return;
+			const target = e.target as HTMLElement | null;
+			if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+			setSelectedFilePaths(new Set());
+		};
+
+		document.addEventListener("keydown", handleEscape);
+		return () => document.removeEventListener("keydown", handleEscape);
+	}, [selectedFilePaths.size]);
+
 	// Opens a native OS file picker scoped to nowhere in particular — unlike the sidebar (which
 	// only ever lists files under the app's own Briefcast folder), this lets the user view/play
 	// any video, audio, image, or PDF already sitting anywhere else on their system. Selecting
@@ -1674,6 +1695,45 @@ const setScreen = () => {
 		}
 		return null;
 	};
+
+	// Set right before a scroll-into-view should happen, then consumed (and reset to null) by the
+	// effect below - not read directly, just a trigger. A plain function call can't do this itself
+	// because the target row may not exist in the DOM yet (its category tab might not be active,
+	// its folder might be collapsed) until the state changes below actually re-render the sidebar.
+	const [pendingScrollToPath, setPendingScrollToPath] = useState<string | null>(null);
+
+	// Jumps the sidebar to wherever the currently open file actually lives - switches to its
+	// category tab and expands its folder if either is hiding it, then scrolls its row into view.
+	// See the "now open" sticky banner below for the one caller.
+	const handleJumpToOpenFile = () => {
+		if (!selectedFile) return;
+		const category = getFileCategory(selectedFile.name);
+		if (category && category !== activeFileCategory) {
+			setActiveFileCategory(category);
+			setSelectedFilePaths(new Set());
+			setSelectedFolder(null);
+		}
+		const folder = findFileFolder(selectedFile.sourcePath);
+		if (folder !== null && collapsedFolders.has(folder)) {
+			setCollapsedFolders((prev) => {
+				const next = new Set(prev);
+				next.delete(folder);
+				return next;
+			});
+		}
+		setPendingScrollToPath(selectedFile.sourcePath);
+	};
+
+	// Runs after whichever of the category/collapse-state changes above actually needed to happen
+	// has committed and re-rendered the sidebar, so the target row is guaranteed to exist in the
+	// DOM by the time this queries for it - a plain setTimeout/rAF after the click would be racing
+	// that render instead of waiting on it.
+	useEffect(() => {
+		if (!pendingScrollToPath) return;
+		const row = document.querySelector(`[data-file-path="${CSS.escape(pendingScrollToPath)}"]`);
+		row?.scrollIntoView({ behavior: "smooth", block: "center" });
+		setPendingScrollToPath(null);
+	}, [pendingScrollToPath, activeFileCategory, collapsedFolders]);
 
 	// True only if the filesystem folder is completely empty — no files of any type, no
 	// subfolders — not merely "no files in the currently active category". Root can never be
@@ -2306,6 +2366,36 @@ const setScreen = () => {
                 <div
                   className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto overscroll-contain flex-1 text-neutral-800 dark:text-neutral-200"
                 >
+                {/* "Now open" banner - pinned to the top of this scrolling list (not the whole
+                    sidebar; the search box/tabs/Files header above it never scroll away in the
+                    first place) so it's always reachable no matter how deep the currently open
+                    file's row has scrolled off screen in a long library. Clicking it switches to
+                    that file's category tab and expands its folder if either is hiding its row
+                    (see handleJumpToOpenFile), then scrolls straight to it - the file itself is
+                    already visually marked once found (the existing bg-blue-50/text-blue-600
+                    "currently open" row styling below), so this doesn't add a second, redundant
+                    highlight on arrival. */}
+                {selectedFile && (
+                  <button
+                    type="button"
+                    onClick={handleJumpToOpenFile}
+                    title={`Locate "${selectedFile.name}" in the sidebar`}
+                    className="sticky top-0 z-10 -mx-3 -mt-3 mb-2 flex w-[calc(100%+1.5rem)] items-center gap-2 border-b border-blue-200 bg-blue-50/95 px-3 py-2 text-left backdrop-blur-sm transition-colors hover:bg-blue-100 dark:border-blue-500/30 dark:bg-blue-500/15 dark:hover:bg-blue-500/25"
+                  >
+                    <span className="shrink-0 text-blue-500 dark:text-blue-400">
+                      {categoryIcon(getFileCategory(selectedFile.name))}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="mb-0.5 block text-[10px] font-semibold uppercase leading-none tracking-wide text-blue-400 dark:text-blue-500/80">
+                        Now open
+                      </span>
+                      <span className="block truncate text-xs font-medium leading-tight text-blue-700 dark:text-blue-300">
+                        {formatFileName(selectedFile.name)}
+                      </span>
+                    </span>
+                    <IoLocateOutline size={14} className="shrink-0 text-blue-400 dark:text-blue-500" />
+                  </button>
+                )}
                 {activeFileCategory === "trash" ? (
                   filteredTrashItems.length === 0 ? (
                     <p>{isSearchingFiles ? "No matching trash items" : "Trash is empty"}</p>
@@ -2467,6 +2557,7 @@ const setScreen = () => {
                           {fileList.map((file) => (
                             <li
                               key={file.path}
+                              data-file-path={file.path}
                               draggable
                               onDragStart={(e) => {
                                 setDraggingFiles(filesToActOn(file));

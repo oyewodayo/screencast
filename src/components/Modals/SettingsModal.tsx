@@ -620,6 +620,17 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   <ShortcutRow keys="Ctrl+Shift+D" description="Toggle the annotation tool's draw mode (see Annotation settings)" />
                 </Section>
 
+                <Section title="File selection">
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1 mb-1">
+                    Unlike the shortcuts above, these only work while Briefcast is the focused window. The
+                    Ctrl/Shift-click gestures are specific to the image gallery grid (Image tab &gt; a folder); the
+                    sidebar's own file list selects via its checkboxes instead.
+                  </p>
+                  <ShortcutRow keys="Ctrl/Cmd+Click" description="Add or remove one photo from the current selection, in the image gallery" />
+                  <ShortcutRow keys="Shift+Click" description="Select every photo between your last click and this one, in the image gallery" />
+                  <ShortcutRow keys="Esc" description="Clear the current file selection - sidebar or image gallery" />
+                </Section>
+
                 <Section title="Recording & screenshots">
                   <BulletList items={[
                     <>Record screen, webcam, and mic in any combination - Screen+Video+Audio, Screen+Audio, Video+Audio, Screen only, Video only, or Audio only.</>,
