@@ -29,6 +29,12 @@ interface BoardItemBase {
   height: number;
   rotation: number; // radians, around the box's own center
   opacity: number;
+  // Absent/false on every item created before this existed, same "missing = off" convention as
+  // BoardDocument.backgroundMode. A locked item can't be hit-tested (clicked, marquee-enclosed) on
+  // the canvas - see boardHandlers.ts's hitTestBoardItem and BoardCanvas.tsx's marquee filter - so
+  // it can't be accidentally dragged/resized/rotated; it's still fully manageable (select, unlock,
+  // reorder, delete) from BoardLayerPanel, which selects by id rather than by hit-testing.
+  locked?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -88,16 +94,24 @@ export interface BoardBlur extends BoardItemBase {
   kind: "blur";
   shape: "rect" | "rounded" | "ellipse";
   cornerRadius: number; // only used when shape is "rounded"
-  strength: number; // blur radius, doc-space px
+  // Blurred (soft, still somewhat legible at low strength) or pixelated (hard mosaic blocks, the
+  // "redacted" look) - two different renderers in boardHandlers.ts's renderBoardBlur sharing this
+  // one item kind since everything else about them (shape, opacity, geometry) is identical. Absent
+  // on a blur item created before this existed - resolves to "blur", its original/only behavior.
+  mode?: "blur" | "pixelate";
+  // Meaning depends on `mode`: blur radius in doc-space px when "blur" (the original behavior),
+  // or mosaic block size in doc-space px when "pixelate" - one field rather than two so switching
+  // modes keeps whatever intensity was already dialed in instead of resetting it.
+  strength: number;
 }
 
 export type BoardItem = BoardImage | BoardText | BoardBlur;
 
-// Which of the three background renderers is active - see boardHandlers.ts's renderBoardToCanvas
-// for how each one actually paints. Old boards saved before this existed simply lack the field on
-// disk; every reader treats an absent backgroundMode as "color", so those boards keep rendering
-// exactly as they did before this feature - no migration step needed.
-export type BoardBackgroundMode = "color" | "grid" | "image";
+// Which of the four background renderers is active - see boardHandlers.ts's renderBoardToCanvas
+// for how each one actually paints. Old boards saved before "grid"/"image"/"gradient" existed
+// simply lack the field on disk; every reader treats an absent backgroundMode as "color", so those
+// boards keep rendering exactly as they did before this feature - no migration step needed.
+export type BoardBackgroundMode = "color" | "grid" | "image" | "gradient";
 
 export interface BoardGridBackground {
   spacing: number; // px between lines, in the board's own (unscaled) document space
@@ -106,6 +120,12 @@ export interface BoardGridBackground {
   // backgroundColor, so a grid can sit on a transparent board (visible in an exported PNG's alpha)
   // exactly like a plain color background can.
   baseColor: string | null;
+}
+
+export interface BoardGradientBackground {
+  from: string;
+  to: string;
+  angleDeg: number; // 0 = left-to-right, 90 = top-to-bottom, matching CSS linear-gradient's own angle direction
 }
 
 export type BoardCommand =
@@ -136,6 +156,7 @@ export type BoardCommand =
   // Asset filename (this board's own assets/ folder, same convention as BoardImage.assetFileName)
   // or null for "no image chosen yet" - only actually painted when backgroundMode is "image".
   | { type: "background-image"; before: string | null; after: string | null }
+  | { type: "background-gradient"; before: BoardGradientBackground; after: BoardGradientBackground }
   | { type: "canvas-size"; before: { width: number; height: number }; after: { width: number; height: number } }
   | { type: "padding"; before: number; after: number };
 
@@ -156,6 +177,7 @@ export interface BoardDocument {
   backgroundMode?: BoardBackgroundMode;
   backgroundGrid?: BoardGridBackground;
   backgroundImage?: string | null;
+  backgroundGradient?: BoardGradientBackground;
   // Blank margin (px) added around the *outside* of canvasWidth/canvasHeight at render/export
   // time - a mat/frame border around the whole composed board, like a photo frame. Purely a
   // rendering-time inset: no BoardImage's x/y ever changes because of it, which is what makes it
@@ -283,6 +305,7 @@ export function createDefaultBoardBlur(id: string, x: number, y: number): BoardB
     // Ellipse by default - the common "blur out a face" case reads more naturally as a soft oval
     // than a hard-edged rectangle; either is one click away in the style panel.
     shape: "ellipse",
+    mode: "blur",
     cornerRadius: 0,
     strength: 18,
     opacity: 1,

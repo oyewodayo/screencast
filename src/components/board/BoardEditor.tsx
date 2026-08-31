@@ -19,6 +19,7 @@ import {
   IoCheckmarkCircle,
   IoChevronDown,
   IoCloudDownloadOutline,
+  IoColorFilterOutline,
   IoColorPaletteOutline,
   IoCopyOutline,
   IoExpandOutline,
@@ -55,6 +56,7 @@ import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import {
   applyMove,
   AutoLayoutResult,
+  DEFAULT_BOARD_GRADIENT,
   DEFAULT_BOARD_GRID,
   groupBoundingBox,
   layoutImagesInCascade,
@@ -69,6 +71,7 @@ import {
   paddedCanvasSize,
   renderBoardToCanvas,
   resolveBackgroundMode,
+  resolveBoardGradient,
   resolveBoardGrid,
   resolveBoardPadding,
 } from "../../handlers/boardHandlers";
@@ -122,6 +125,7 @@ const ARRANGE_STYLES: { key: ArrangeStyle; label: string; description: string; i
 const BACKGROUND_MODE_META: Record<BoardBackgroundMode, { label: string; icon: ReactNode }> = {
   color: { label: "Color", icon: <IoColorPaletteOutline size={16} /> },
   grid: { label: "Grid", icon: <IoGridOutline size={16} /> },
+  gradient: { label: "Gradient", icon: <IoColorFilterOutline size={16} /> },
   image: { label: "Image", icon: <IoImageOutline size={16} /> },
 };
 
@@ -579,6 +583,9 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
         id: crypto.randomUUID(),
         x: item.x + DUPLICATE_OFFSET,
         y: item.y + DUPLICATE_OFFSET,
+        // Never inherit lock - a duplicate is meant to land ready to reposition (see this
+        // function's own doc comment above), which a locked copy would immediately defeat.
+        locked: false,
         createdAt: now,
         updatedAt: now,
       }));
@@ -714,6 +721,19 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       const next = [...images];
       [next[index], next[swapWith]] = [next[swapWith], next[index]];
       store.reorderImages(next);
+    },
+    [store]
+  );
+
+  // Toggles BoardItemBase.locked - see its own doc comment in boardTypes.ts. A plain single-item
+  // edit (not undo-tracked as anything special), so locking/unlocking is itself undoable like any
+  // other edit.
+  const handleToggleLock = useCallback(
+    (id: string) => {
+      if (!store.doc) return;
+      const before = store.doc.images.find((img) => img.id === id);
+      if (!before) return;
+      store.editImage(before, { ...before, locked: !before.locked, updatedAt: Date.now() });
     },
     [store]
   );
@@ -860,6 +880,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
   // here rather than re-deriving inline at each of the panel's three per-mode branches below.
   const currentBackgroundMode: BoardBackgroundMode = store.doc ? resolveBackgroundMode(store.doc) : "color";
   const currentGrid = store.doc ? resolveBoardGrid(store.doc) : DEFAULT_BOARD_GRID;
+  const currentGradient = store.doc ? resolveBoardGradient(store.doc) : DEFAULT_BOARD_GRADIENT;
   // "Arrange"/"Apply" are only ever meaningful across 2+ images - see handleArrange's own comment
   // for why text items don't count here.
   const arrangeableImageCount = store.doc ? store.doc.images.filter((item) => item.kind === "image").length : 0;
@@ -1046,7 +1067,10 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           store.redo();
         } else if (key === "a") {
           e.preventDefault();
-          if (store.doc) setSelectedIds(new Set(store.doc.images.map((img) => img.id)));
+          // Locked items excluded - Ctrl+A is exactly the "accidentally sweep something up" case
+          // locking exists to prevent (see BoardItemBase.locked's own doc comment); they're still
+          // reachable individually through BoardLayerPanel.
+          if (store.doc) setSelectedIds(new Set(store.doc.images.filter((img) => !img.locked).map((img) => img.id)));
         } else if (key === "d" && selectedIds.size > 0) {
           // preventDefault here is load-bearing, not just tidy - Ctrl+D is the browser's own
           // "bookmark this page" shortcut, which would otherwise fire alongside the duplicate.
@@ -1357,6 +1381,46 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
                       {currentGrid.baseColor === null ? "Restore base color" : "Make base transparent"}
                     </button>
                   </div>
+                </div>
+              )}
+
+              {currentBackgroundMode === "gradient" && (
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center gap-2">
+                    <label className="flex-1 flex items-center justify-between gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                      From
+                      <input
+                        type="color"
+                        value={currentGradient.from}
+                        onChange={(e) => store.setBackgroundGradient({ ...currentGradient, from: e.target.value })}
+                        className="w-9 h-9 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
+                      />
+                    </label>
+                    <label className="flex-1 flex items-center justify-between gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                      To
+                      <input
+                        type="color"
+                        value={currentGradient.to}
+                        onChange={(e) => store.setBackgroundGradient({ ...currentGradient, to: e.target.value })}
+                        className="w-9 h-9 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
+                      />
+                    </label>
+                  </div>
+                  <label className="flex items-center justify-between gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                    Angle ({currentGradient.angleDeg}°)
+                    <input
+                      type="range"
+                      min={0}
+                      max={359}
+                      value={currentGradient.angleDeg}
+                      onChange={(e) => store.setBackgroundGradient({ ...currentGradient, angleDeg: Number(e.target.value) })}
+                      className="w-32 accent-blue-500"
+                    />
+                  </label>
+                  <div
+                    className="h-10 rounded-md border border-neutral-200 dark:border-neutral-700"
+                    style={{ background: `linear-gradient(${currentGradient.angleDeg}deg, ${currentGradient.from}, ${currentGradient.to})` }}
+                  />
                 </div>
               )}
 
@@ -1789,6 +1853,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             onSelect={setSelectedIds}
             onStepReorder={handleStepReorder}
             onReorder={handleReorderLayer}
+            onToggleLock={handleToggleLock}
             onClose={() => setShowLayerPanel(false)}
           />
         )}

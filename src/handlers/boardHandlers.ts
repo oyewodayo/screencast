@@ -6,7 +6,7 @@
 // no shared code, per the Board feature's "build from scratch" requirement (the single-image
 // editor's tools don't fit this feature's per-image padding/border/margin/radius needs).
 
-import { BoardBackgroundMode, BoardBlur, BoardCommand, BoardDocument, BoardGridBackground, BoardImage, BoardItem, BoardText } from "../utils/boardTypes";
+import { BoardBackgroundMode, BoardBlur, BoardCommand, BoardDocument, BoardGradientBackground, BoardGridBackground, BoardImage, BoardItem, BoardText } from "../utils/boardTypes";
 
 // ---- Geometry helpers -----------------------------------------------------------------------
 
@@ -230,9 +230,31 @@ function renderBoardBlur(ctx: CanvasRenderingContext2D, canvasSource: HTMLCanvas
   // at clip() time, not re-evaluated afterward) - so resetting here doesn't affect the shape above,
   // only where/how the source gets sampled.
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.filter = `blur(${item.strength * deviceScale}px)`;
-  ctx.drawImage(canvasSource, 0, 0);
-  ctx.filter = "none";
+
+  if (item.mode === "pixelate") {
+    // Mosaic effect: draw the WHOLE composited-so-far canvas down to a tiny offscreen buffer (one
+    // pixel per block), then blow that back up with smoothing off - each source block collapses to
+    // a single flat-colored cell. Cheaper to downscale the whole canvas than just this item's own
+    // region (no need to compute/clip a sub-rect in source space), and the clip already set up
+    // above restricts what actually ends up visible either way.
+    const blockSize = Math.max(2, item.strength) * deviceScale;
+    const smallWidth = Math.max(1, Math.round(canvasSource.width / blockSize));
+    const smallHeight = Math.max(1, Math.round(canvasSource.height / blockSize));
+    const tiny = document.createElement("canvas");
+    tiny.width = smallWidth;
+    tiny.height = smallHeight;
+    const tinyCtx = tiny.getContext("2d");
+    if (tinyCtx) {
+      tinyCtx.drawImage(canvasSource, 0, 0, smallWidth, smallHeight);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(tiny, 0, 0, smallWidth, smallHeight, 0, 0, canvasSource.width, canvasSource.height);
+      ctx.imageSmoothingEnabled = true;
+    }
+  } else {
+    ctx.filter = `blur(${item.strength * deviceScale}px)`;
+    ctx.drawImage(canvasSource, 0, 0);
+    ctx.filter = "none";
+  }
 
   ctx.restore();
 }
@@ -283,6 +305,35 @@ export function resolveBackgroundMode(doc: BoardDocument): BoardBackgroundMode {
   return doc.backgroundMode ?? "color";
 }
 
+export const DEFAULT_BOARD_GRADIENT: BoardGradientBackground = { from: "#6366f1", to: "#ec4899", angleDeg: 135 };
+
+// Same defensive-default reasoning as resolveBoardGrid - a board that's never touched Gradient mode
+// simply has no backgroundGradient on disk.
+export function resolveBoardGradient(doc: BoardDocument): BoardGradientBackground {
+  return doc.backgroundGradient ?? DEFAULT_BOARD_GRADIENT;
+}
+
+// CSS linear-gradient's own angle convention (0deg = bottom-to-top, 90deg = left-to-right, clockwise
+// from there) rather than canvas's own two-point createLinearGradient call, which this converts
+// into - picked because it's the convention a color-picker/angle-slider UI already reads naturally.
+function drawGradientBackground(ctx: CanvasRenderingContext2D, width: number, height: number, gradient: BoardGradientBackground): void {
+  const radians = ((gradient.angleDeg - 90) * Math.PI) / 180;
+  const cx = width / 2;
+  const cy = height / 2;
+  // Half-diagonal ensures the gradient's two stops always land outside the canvas regardless of
+  // angle, so the fill never looks clipped/banded at a corner.
+  const halfLength = Math.hypot(width, height) / 2;
+  const x0 = cx - Math.cos(radians) * halfLength;
+  const y0 = cy - Math.sin(radians) * halfLength;
+  const x1 = cx + Math.cos(radians) * halfLength;
+  const y1 = cy + Math.sin(radians) * halfLength;
+  const linear = ctx.createLinearGradient(x0, y0, x1, y1);
+  linear.addColorStop(0, gradient.from);
+  linear.addColorStop(1, gradient.to);
+  ctx.fillStyle = linear;
+  ctx.fillRect(0, 0, width, height);
+}
+
 function drawGridBackground(ctx: CanvasRenderingContext2D, width: number, height: number, grid: BoardGridBackground): void {
   if (grid.baseColor) {
     ctx.fillStyle = grid.baseColor;
@@ -329,6 +380,8 @@ export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocumen
   const mode = resolveBackgroundMode(doc);
   if (mode === "grid") {
     drawGridBackground(ctx, width, height, resolveBoardGrid(doc));
+  } else if (mode === "gradient") {
+    drawGradientBackground(ctx, width, height, resolveBoardGradient(doc));
   } else if (mode === "image" && doc.backgroundImage) {
     const bg = imageBitmaps.get(doc.backgroundImage);
     // Left blank (transparent) until decoded - same "frame renders immediately, photo pops in
@@ -356,10 +409,13 @@ export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocumen
 
 // Click-to-select hit test, topmost (last-drawn) item first - works identically for an image or a
 // text item since both are BoardItem's shared border-box geometry (see BoardItemBase's own doc
-// comment in boardTypes.ts).
+// comment in boardTypes.ts). Skips locked items entirely - see BoardItemBase.locked's own doc
+// comment for why a locked item is meant to be unreachable by clicking the canvas at all (only
+// BoardLayerPanel, which selects by id, can still reach it).
 export function hitTestBoardItem(items: BoardItem[], x: number, y: number): BoardItem | null {
   for (let i = items.length - 1; i >= 0; i--) {
     const item = items[i];
+    if (item.locked) continue;
     const cx = item.x + item.width / 2;
     const cy = item.y + item.height / 2;
     const local = unrotatePoint(x, y, cx, cy, item.rotation);
@@ -921,6 +977,8 @@ export function applyCommand(doc: BoardDocument, command: BoardCommand): BoardDo
       return { ...doc, backgroundGrid: command.after, updatedAt };
     case "background-image":
       return { ...doc, backgroundImage: command.after, updatedAt };
+    case "background-gradient":
+      return { ...doc, backgroundGradient: command.after, updatedAt };
     case "canvas-size":
       return { ...doc, canvasWidth: command.after.width, canvasHeight: command.after.height, updatedAt };
     case "padding":
@@ -952,6 +1010,8 @@ export function invertCommand(command: BoardCommand): BoardCommand {
       return { type: "background-grid", before: command.after, after: command.before };
     case "background-image":
       return { type: "background-image", before: command.after, after: command.before };
+    case "background-gradient":
+      return { type: "background-gradient", before: command.after, after: command.before };
     case "canvas-size":
       return { type: "canvas-size", before: command.after, after: command.before };
     case "padding":

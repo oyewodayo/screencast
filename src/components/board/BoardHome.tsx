@@ -7,7 +7,7 @@
 // the user wants.
 import React, { useCallback, useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { IoAdd, IoChevronDown, IoCopyOutline, IoEllipsisVertical, IoImagesOutline, IoTrashOutline } from "react-icons/io5";
+import { IoAdd, IoChevronDown, IoCopyOutline, IoEllipsisVertical, IoImagesOutline, IoSearchOutline, IoTrashOutline } from "react-icons/io5";
 import { BoardSummary, createEmptyBoardDocument, DEFAULT_BOARD_HEIGHT, DEFAULT_BOARD_WIDTH } from "../../utils/boardTypes";
 import { applyBoardTemplate, BOARD_TEMPLATES, BoardTemplate } from "../../utils/boardTemplates";
 import { BOARD_SIZE_PRESET_GROUPS, BOARD_SIZE_PRESETS, BoardSizePreset } from "../../utils/boardCanvasSizes";
@@ -52,6 +52,7 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
   // for this one case.
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
 
   const refresh = useCallback(() => {
     invoke<BoardSummary[]>("list_boards")
@@ -253,8 +254,30 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
       {boards && boards.length > 0 && (
         <div className="relative w-full max-w-3xl">
           <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">Your boards</p>
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-            {boards.map((board) => (
+          {/* Only worth the extra chrome once there's enough boards that scanning the grid by eye
+              stops being faster than typing a name - a handful of boards doesn't need a search box
+              sitting above them. */}
+          {boards.length > 6 && (
+            <div className="relative max-w-xs mx-auto mb-3">
+              <IoSearchOutline size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 dark:text-neutral-500 pointer-events-none" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search boards..."
+                className="w-full h-8 pl-8 pr-2.5 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-sm text-gray-700 dark:text-neutral-200 outline-none focus:border-blue-400 dark:focus:border-blue-500 transition-colors"
+              />
+            </div>
+          )}
+          {(() => {
+            const query = searchQuery.trim().toLowerCase();
+            const filteredBoards = query ? boards.filter((board) => (board.name || "Untitled board").toLowerCase().includes(query)) : boards;
+            if (filteredBoards.length === 0) {
+              return <p className="text-center text-sm text-gray-400 dark:text-neutral-500 py-6">No boards match "{searchQuery.trim()}"</p>;
+            }
+            return (
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                {filteredBoards.map((board) => (
               // A plain div (not <button>) - it needs to contain the 3-dot menu's own <button>,
               // and nested interactive elements aren't valid HTML/accessible; role="button" +
               // tabIndex + onKeyDown keep it keyboard-operable instead.
@@ -329,8 +352,10 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                   <p className="text-xs text-gray-400 dark:text-neutral-500">{formatUpdatedAt(board.updated_at)}</p>
                 </div>
               </div>
-            ))}
-          </div>
+                ))}
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>

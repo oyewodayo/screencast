@@ -290,7 +290,11 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
 
     if (selectedIds.size === 1) {
       const image = doc.images.find((img) => selectedIds.has(img.id));
-      if (image) {
+      // A locked item can end up selected via BoardLayerPanel (which selects by id, not by hit-
+      // testing - see hitTestBoardItem's own doc comment) - its resize/rotate handles simply don't
+      // exist as far as pointer-down is concerned, so this falls through to the plain hit-test
+      // below, which also skips it, so a click anywhere near it just starts a marquee/deselects.
+      if (image && !image.locked) {
         const handles = resizeHandlePoints(image);
         for (const corner of Object.keys(handles) as ResizeCorner[]) {
           if (Math.hypot(x - handles[corner].x, y - handles[corner].y) <= hitRadius) {
@@ -396,7 +400,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
         height: Math.abs(y - marquee.startY),
       };
       setMarqueeRect(rect);
-      const enclosed = doc.images.filter((item) => rectsIntersect(groupBoundingBox([item]), rect));
+      const enclosed = doc.images.filter((item) => !item.locked && rectsIntersect(groupBoundingBox([item]), rect));
       const next = new Set(marquee.baseSelection);
       for (const item of enclosed) next.add(item.id);
       onSelect(next);

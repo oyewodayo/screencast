@@ -7,7 +7,7 @@
 // and click a row to select that item directly - handy once several items overlap and picking the
 // right one by clicking the canvas gets fiddly.
 import React, { useState } from "react";
-import { IoChevronDown, IoChevronUp, IoCloseOutline, IoImageOutline, IoText } from "react-icons/io5";
+import { IoChevronDown, IoChevronUp, IoCloseOutline, IoImageOutline, IoLockClosed, IoLockOpenOutline, IoText } from "react-icons/io5";
 import { TbBlur, TbGripVertical } from "react-icons/tb";
 import { BoardItem } from "../../utils/boardTypes";
 
@@ -22,6 +22,10 @@ interface BoardLayerPanelProps {
   // Free (not just one-step) reorder via dragging a row onto another - see BoardEditor.tsx's
   // handleReorderLayer. Drops the dragged item into the target's current stacking position.
   onReorder: (draggedId: string, targetId: string) => void;
+  // Toggles BoardItemBase.locked - see its own doc comment in boardTypes.ts for what locking does
+  // (blocks canvas hit-testing/dragging; this panel remains the one place a locked item can still
+  // be selected, unlocked, reordered, or deleted).
+  onToggleLock: (id: string) => void;
   onClose: () => void;
 }
 
@@ -37,7 +41,7 @@ function layerLabel(item: BoardItem): string {
   return "Image";
 }
 
-const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, onSelect, onStepReorder, onReorder, onClose }) => {
+const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, onSelect, onStepReorder, onReorder, onToggleLock, onClose }) => {
   // Front-to-back for display; each row still knows its own true index in `items` (the array
   // BoardEditor.tsx and onStepReorder both work in) via `items.length - 1 - displayIndex`.
   const frontToBack = [...items].reverse();
@@ -118,7 +122,22 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
             >
               <TbGripVertical size={13} className="shrink-0 text-neutral-300 dark:text-neutral-600 cursor-grab" />
               <span className={`shrink-0 ${isSelected ? "text-blue-500" : "text-neutral-400 dark:text-neutral-500"}`}>{KIND_ICON[item.kind]}</span>
-              <span className="min-w-0 flex-1 truncate text-sm">{layerLabel(item)}</span>
+              <span className={`min-w-0 flex-1 truncate text-sm ${item.locked ? "italic text-neutral-400 dark:text-neutral-500" : ""}`}>{layerLabel(item)}</span>
+              <button
+                type="button"
+                title={item.locked ? "Unlock - re-enables dragging/resizing on the canvas" : "Lock - can't be clicked, dragged, or resized on the canvas until unlocked"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleLock(item.id);
+                }}
+                className={`shrink-0 w-5 h-5 flex items-center justify-center rounded transition-colors ${
+                  item.locked
+                    ? "text-amber-500 hover:bg-amber-100 dark:hover:bg-amber-500/10"
+                    : "text-neutral-300 dark:text-neutral-600 opacity-0 group-hover:opacity-100 hover:bg-neutral-200 dark:hover:bg-neutral-700 hover:text-neutral-600 dark:hover:text-neutral-300"
+                }`}
+              >
+                {item.locked ? <IoLockClosed size={12} /> : <IoLockOpenOutline size={12} />}
+              </button>
               <div className="shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
                 <button
                   type="button"

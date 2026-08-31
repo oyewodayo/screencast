@@ -28,13 +28,35 @@ import {
   IoContrastOutline,
   IoCopyOutline,
   IoImageOutline,
+  IoLockClosed,
+  IoLockOpenOutline,
   IoOptionsOutline,
   IoSwapHorizontalOutline,
   IoText,
   IoTrashOutline,
 } from "react-icons/io5";
 import { TbArrowsMove, TbBlur } from "react-icons/tb";
-import { BoardBlur, BoardImage, BoardItem, BoardText } from "../../utils/boardTypes";
+import { BoardBlur, BoardImage, BoardItem, BoardShadow, BoardText } from "../../utils/boardTypes";
+import { BOARD_FONT_OPTIONS } from "../../utils/boardFonts";
+
+const DEFAULT_SHADOW: BoardShadow = { blur: 16, offsetX: 0, offsetY: 6, color: "rgba(0,0,0,0.35)" };
+
+// A native <input type="color"> only ever accepts/reports a 6-digit hex - it silently rejects an
+// rgba() string outright, which is how DEFAULT_SHADOW's own color (and any shadow color set some
+// other way) is stored. Converts just enough to seed the swatch's displayed value; editing through
+// the swatch itself then writes back a plain opaque hex, same "no alpha via a plain color input"
+// limitation every other ColorField in this panel already has.
+function rgbaToHex(color: string): string {
+  const match = color.match(/rgba?\(([^)]+)\)/i);
+  if (match) {
+    const [r, g, b] = match[1].split(",").map((part) => parseFloat(part.trim()));
+    if ([r, g, b].every((n) => Number.isFinite(n))) {
+      const toHex = (n: number) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+      return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+    }
+  }
+  return /^#[0-9a-fA-F]{6}$/.test(color) ? color : "#000000";
+}
 
 interface BoardStylePanelProps {
   items: BoardItem[]; // the full selected set - fields showing a mixed value across them just show the first one's
@@ -205,6 +227,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   const allImages = imageItems.length === items.length;
   const allText = textItems.length === items.length;
   const allBlur = blurItems.length === items.length;
+  const allLocked = items.every((item) => item.locked);
 
   const setImageField = <K extends keyof BoardImage>(key: K, value: BoardImage[K]): void => {
     onChange(imageItems, imageItems.map((img) => ({ ...img, [key]: value, updatedAt: Date.now() })));
@@ -324,6 +347,28 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         <div className={CARD}>
           <SectionHeader icon={<IoOptionsOutline size={12} />} label="Typography" />
 
+          <label className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Font</span>
+            <select
+              value={textItems[0].fontFamily}
+              onChange={(e) => setTextField("fontFamily", e.target.value)}
+              className="w-full h-9 px-2.5 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950/60 text-sm text-neutral-800 dark:text-neutral-100 outline-none focus:border-blue-400 dark:focus:border-blue-500 transition-colors"
+              style={{ fontFamily: textItems[0].fontFamily }}
+            >
+              {/* A saved fontFamily string with no matching option (an older board, or edited some
+                  other way) still shows as a selectable, selected entry - see boardFonts.ts's
+                  boardFontLabel for the same fallback reasoning applied to its label. */}
+              {!BOARD_FONT_OPTIONS.some((option) => option.value === textItems[0].fontFamily) && (
+                <option value={textItems[0].fontFamily}>{textItems[0].fontFamily}</option>
+              )}
+              {BOARD_FONT_OPTIONS.map((option) => (
+                <option key={option.id} value={option.value} style={{ fontFamily: option.value }}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
           <SliderField label="Font size" display={`${textItems[0].fontSize}px`} min={10} max={140} value={textItems[0].fontSize} onChange={(v) => setTextField("fontSize", v)} />
 
           <div className="flex items-center gap-2">
@@ -420,6 +465,54 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
           />
           <ColorField label="Frame color" value={imageItems[0].backgroundColor} onChange={(v) => setImageField("backgroundColor", v)} />
 
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setImageField("shadow", imageItems[0].shadow ? undefined : DEFAULT_SHADOW)}
+              className={`flex-1 ${GHOST_BUTTON}`}
+            >
+              {imageItems[0].shadow ? "Remove shadow" : "Add shadow"}
+            </button>
+          </div>
+
+          {imageItems[0].shadow && (
+            <>
+              <SliderField
+                label="Shadow blur"
+                display={`${imageItems[0].shadow.blur}px`}
+                min={0}
+                max={80}
+                value={imageItems[0].shadow.blur}
+                onChange={(v) => setImageField("shadow", { ...(imageItems[0].shadow ?? DEFAULT_SHADOW), blur: v })}
+              />
+              <SliderField
+                label="Shadow offset X"
+                display={`${imageItems[0].shadow.offsetX}px`}
+                min={-60}
+                max={60}
+                value={imageItems[0].shadow.offsetX}
+                onChange={(v) => setImageField("shadow", { ...(imageItems[0].shadow ?? DEFAULT_SHADOW), offsetX: v })}
+              />
+              <SliderField
+                label="Shadow offset Y"
+                display={`${imageItems[0].shadow.offsetY}px`}
+                min={-60}
+                max={60}
+                value={imageItems[0].shadow.offsetY}
+                onChange={(v) => setImageField("shadow", { ...(imageItems[0].shadow ?? DEFAULT_SHADOW), offsetY: v })}
+              />
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Shadow color</span>
+                <input
+                  type="color"
+                  value={rgbaToHex(imageItems[0].shadow.color)}
+                  onChange={(e) => setImageField("shadow", { ...(imageItems[0].shadow ?? DEFAULT_SHADOW), color: e.target.value })}
+                  className={SWATCH}
+                />
+              </label>
+            </>
+          )}
+
           {imageItems.length === 1 && boardImageCount > 1 && (
             <button type="button" onClick={() => onApplyStyleToAllImages(imageItems[0])} className={GHOST_BUTTON}>
               Apply style to all images
@@ -431,6 +524,22 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       {allBlur && (
         <div className={CARD}>
           <SectionHeader icon={<TbBlur size={12} />} label="Blur" />
+
+          <div className="inline-flex items-center h-8 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+            {(["blur", "pixelate"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                title={mode === "blur" ? "Soft blur - still somewhat legible underneath" : "Pixelate - hard mosaic blocks, fully obscured"}
+                onClick={() => setBlurField("mode", mode)}
+                className={`flex-1 h-full flex items-center justify-center text-[11px] font-medium capitalize transition-colors ${
+                  (blurItems[0].mode ?? "blur") === mode ? SEGMENT_ON : SEGMENT_OFF
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
 
           <div className="inline-flex items-center h-8 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
             {(["rect", "rounded", "ellipse"] as const).map((shape) => (
@@ -457,7 +566,14 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
             />
           )}
 
-          <SliderField label="Strength" display={`${blurItems[0].strength}px`} min={0} max={60} value={blurItems[0].strength} onChange={(v) => setBlurField("strength", v)} />
+          <SliderField
+            label={(blurItems[0].mode ?? "blur") === "pixelate" ? "Block size" : "Strength"}
+            display={`${blurItems[0].strength}px`}
+            min={(blurItems[0].mode ?? "blur") === "pixelate" ? 2 : 0}
+            max={(blurItems[0].mode ?? "blur") === "pixelate" ? 80 : 60}
+            value={blurItems[0].strength}
+            onChange={(v) => setBlurField("strength", v)}
+          />
 
           {blurItems.length === 1 && boardBlurCount > 1 && (
             <button type="button" onClick={() => onApplyStyleToAllBlurs(blurItems[0])} className={GHOST_BUTTON}>
@@ -471,6 +587,15 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         <SectionHeader icon={<IoContrastOutline size={12} />} label="Appearance" />
         <SliderField label="Opacity" display={`${Math.round(primary.opacity * 100)}%`} min={0.1} max={1} step={0.05} value={primary.opacity} onChange={setOpacity} />
       </div>
+
+      <button
+        type="button"
+        onClick={() => onChange(items, items.map((item) => ({ ...item, locked: !allLocked, updatedAt: Date.now() })))}
+        className={`flex items-center justify-center gap-1.5 ${GHOST_BUTTON}`}
+      >
+        {allLocked ? <IoLockClosed size={14} /> : <IoLockOpenOutline size={14} />}
+        {allLocked ? `Unlock ${items.length > 1 ? "items" : "item"}` : `Lock ${items.length > 1 ? "items" : "item"}`}
+      </button>
 
       <button type="button" onClick={() => onDuplicate(ids)} className={`flex items-center justify-center gap-1.5 ${GHOST_BUTTON}`}>
         <IoCopyOutline size={14} /> Duplicate {items.length > 1 ? "items" : allText ? "text" : allBlur ? "blur" : "image"}

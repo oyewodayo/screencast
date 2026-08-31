@@ -7,8 +7,8 @@
 // id that's already guaranteed to exist.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
-import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGridBackground, BoardItem } from "../utils/boardTypes";
-import { applyCommand, invertCommand, resolveBackgroundMode, resolveBoardGrid } from "../handlers/boardHandlers";
+import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGradientBackground, BoardGridBackground, BoardItem } from "../utils/boardTypes";
+import { applyCommand, invertCommand, resolveBackgroundMode, resolveBoardGradient, resolveBoardGrid } from "../handlers/boardHandlers";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
@@ -39,6 +39,7 @@ export interface UseBoardStoreResult {
   // remembered independently so flipping back to a previously-used mode restores it as last left.
   setBackgroundMode: (mode: BoardBackgroundMode) => void;
   setBackgroundGrid: (grid: BoardGridBackground) => void;
+  setBackgroundGradient: (gradient: BoardGradientBackground) => void;
   // Asset filename already imported into this board's assets/ folder (see BoardEditor.tsx's
   // handleChooseBackgroundImage), or null to clear it - this setter doesn't do any importing
   // itself, same division of responsibility as addImage/BoardEditor's own handleAddImages.
@@ -225,6 +226,15 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     [dispatch]
   );
 
+  const setBackgroundGradient = useCallback(
+    (gradient: BoardGradientBackground) => {
+      const current = docRef.current;
+      if (!current) return;
+      dispatch({ type: "background-gradient", before: resolveBoardGradient(current), after: gradient });
+    },
+    [dispatch]
+  );
+
   const setBackgroundImage = useCallback(
     (assetFileName: string | null) => {
       const current = docRef.current;
@@ -301,6 +311,7 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     setBackgroundColor,
     setBackgroundMode,
     setBackgroundGrid,
+    setBackgroundGradient,
     setBackgroundImage,
     setCanvasSize,
     setPadding,
