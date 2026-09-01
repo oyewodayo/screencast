@@ -1,0 +1,25 @@
+/* components/docs/docFindReplace.css
+ *
+ * Highlight styling for docFindReplace.ts's decorations - a plain CSS class pair (not Tailwind
+ * arbitrary-variant classes on EditorContent, unlike most of this editor's other styling) since a
+ * decoration's own `class` attribute is the only hook available on it, and the highlight color
+ * needs to survive being layered under text-color/highlight-mark styling that's already on the
+ * text, which a straightforward background-color handles fine without extra specificity fights.
+ */
+
+.doc-search-match {
+  background-color: rgba(250, 204, 21, 0.35);
+  border-radius: 2px;
+}
+
+.doc-search-match-active {
+  background-color: rgba(249, 115, 22, 0.55);
+}
+
+.dark .doc-search-match {
+  background-color: rgba(250, 204, 21, 0.25);
+}
+
+.dark .doc-search-match-active {
+  background-color: rgba(249, 115, 22, 0.45);
+}

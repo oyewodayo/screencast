@@ -4,13 +4,13 @@
 // useDocsEditStore instance and the Tiptap editor bound to its Y.Doc via @tiptap/extension-
 // collaboration. Much shorter than BoardEditor since there's no canvas/selection/image logic here
 // - just a title field, a formatting toolbar, and the editable content area.
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { useEditor, EditorContent } from "@tiptap/react";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
-import { IoArrowBack, IoClose, IoTimeOutline } from "react-icons/io5";
+import { IoArrowBack, IoChatbubbleOutline, IoClose, IoOptionsOutline, IoSearch, IoTimeOutline } from "react-icons/io5";
 import {
   MdFormatBold,
   MdFormatItalic,
@@ -36,6 +36,13 @@ import {
   MdTableChart,
   MdTableRows,
   MdImage,
+  MdSuperscript,
+  MdSubscript,
+  MdFormatClear,
+  MdFormatLineSpacing,
+  MdFormatIndentIncrease,
+  MdFormatIndentDecrease,
+  MdAddComment,
 } from "react-icons/md";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
@@ -43,9 +50,21 @@ import { buildDocxBytes } from "../../utils/docDocx";
 import { LibraryFileEntry } from "../../utils/docTypes";
 import { createDocImagePasteExtension, uploadImageFromPath } from "../../utils/docImagePaste";
 import { createSlashCommandExtension } from "../../utils/docSlashCommand";
+import DocFindReplace from "../../utils/docFindReplace";
 import { getDocContentExtensions, docProseClassName } from "../../utils/docSchemaExtensions";
 import DocVersionHistoryPanel from "./DocVersionHistoryPanel";
+import DocFindReplaceBar from "./DocFindReplaceBar";
+import DocCommentsSidebar from "./DocCommentsSidebar";
+import DocPageSetupPopover from "./DocPageSetupPopover";
+import DocColorPicker from "./DocColorPicker";
+import DocAutoPaginate from "../../utils/docAutoPaginate";
+import { PAGE_DIMENSIONS_IN, PAGE_MARGIN_IN, marginPx, pageWidthPx } from "../../utils/docPageGeometry";
 import "./docCodeHighlight.css";
+import "./docFindReplace.css";
+import "./docComments.css";
+import "./docPageLayout.css";
+import "./docLinks.css";
+import "../board/boardFonts.css";
 
 interface DocsEditorProps {
   docId: string;
@@ -61,15 +80,34 @@ const toolbarButtonClass = (active: boolean, disabled = false): string =>
 
 const toolbarDivider = <div className="w-px h-6 bg-neutral-300 dark:bg-neutral-600 mx-2" />;
 
-// Common web-safe fonts - matches the ones .docx documents (and Word itself) most commonly use,
-// since the main reason to pick a font here is either matching an imported document or preparing
-// one for export, not general-purpose web typography.
-const FONT_FAMILIES = ["Arial", "Calibri", "Cambria", "Courier New", "Georgia", "Helvetica", "Times New Roman", "Verdana"];
+// Classic web-safe fonts (matches what .docx documents and Word itself most commonly use, for
+// importing/exporting fidelity) plus a handful of modern ones - the latter self-hosted via
+// boardFonts.css (imported below) rather than plain OS font names, the same "renders the same on
+// every machine, not just ones that happen to have it installed" reasoning that file's own header
+// comment gives for BoardText's font picker. Bebas Neue is left out here - a display-only all-caps
+// face fits BoardText's poster-style text but not general document prose.
+const FONT_FAMILIES = [
+  "Arial",
+  "Calibri",
+  "Cambria",
+  "Courier New",
+  "Georgia",
+  "Helvetica",
+  "Times New Roman",
+  "Verdana",
+  "Inter",
+  "Poppins",
+  "Montserrat",
+  "Space Grotesk",
+  "Playfair Display",
+];
+
 
 const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, onOpenLinkedFile }) => {
   const store = useDocsEditStore(docId);
   const [showLinkInput, setShowLinkInput] = useState(false);
   const [linkUrl, setLinkUrl] = useState("");
+  const [linkText, setLinkText] = useState("");
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
@@ -77,8 +115,14 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const [showTextColorPicker, setShowTextColorPicker] = useState(false);
   const [showHighlightPicker, setShowHighlightPicker] = useState(false);
   const [showAlignMenu, setShowAlignMenu] = useState(false);
+  const [showLineSpacingMenu, setShowLineSpacingMenu] = useState(false);
   const [showTableOptions, setShowTableOptions] = useState(false);
   const [showVersionHistory, setShowVersionHistory] = useState(false);
+  const [showFindReplace, setShowFindReplace] = useState(false);
+  const [showComments, setShowComments] = useState(false);
+  const [showCommentInput, setShowCommentInput] = useState(false);
+  const [commentDraft, setCommentDraft] = useState("");
+  const [showPageSetup, setShowPageSetup] = useState(false);
 
   const editor = useEditor(
     {
@@ -93,6 +137,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
         createDocImagePasteExtension(docId),
         createSlashCommandExtension(docId),
+        DocFindReplace,
+        DocAutoPaginate,
         Placeholder.configure({ placeholder: "Start writing…" }),
       ],
       editable: !store.loading,
@@ -115,6 +161,15 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     },
     [store.ydoc]
   );
+
+  // Meta-only transaction, not an editor recreation - changing page size shouldn't disturb cursor
+  // position or the Collaboration binding, and docAutoPaginate.ts's own plugin `update()` hook
+  // reacts to this to trigger an immediate recompute (a page-size change doesn't itself resize
+  // view.dom, so the extension's ResizeObserver wouldn't fire for it on its own).
+  useEffect(() => {
+    if (!editor || store.pageSize === null) return;
+    editor.commands.setPaginationPageSize(store.pageSize);
+  }, [editor, store.pageSize]);
 
   const handleBack = useCallback(() => {
     store.flushSave().catch((err) => console.error("Failed to save before navigating back:", err));
@@ -145,17 +200,72 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       editor.chain().focus().unsetLink().run();
       return;
     }
-    setLinkUrl("");
-    setShowLinkInput(true);
+    // Toggle closed if the popover's already open (matches every other toolbar popover's own
+    // open/close button in this file) - previously this only ever forced it open, so clicking the
+    // link icon a second time to dismiss it silently did nothing.
+    setShowLinkInput((prev) => {
+      const next = !prev;
+      if (next) {
+        setLinkUrl("");
+        setLinkText("");
+      }
+      return next;
+    });
   }, [editor]);
 
   const applyLink = useCallback(() => {
     if (!editor) return;
     const url = linkUrl.trim();
-    if (url) editor.chain().focus().setLink({ href: url }).run();
+    if (url) {
+      if (editor.state.selection.empty) {
+        // Nothing selected to attach the link mark to - a mark needs a range of text to wrap, so
+        // setLink alone would silently do nothing here. Insert the link's own text (whatever the
+        // user typed in the Text field, falling back to the URL itself) as new marked text at the
+        // cursor instead, same as Word/Docs' own "no selection" insert-link behavior.
+        const displayText = linkText.trim() || url;
+        editor
+          .chain()
+          .focus()
+          .insertContent({ type: "text", text: displayText, marks: [{ type: "link", attrs: { href: url } }] })
+          .run();
+      } else {
+        editor.chain().focus().setLink({ href: url }).run();
+      }
+    }
     setShowLinkInput(false);
     setLinkUrl("");
-  }, [editor, linkUrl]);
+    setLinkText("");
+  }, [editor, linkUrl, linkText]);
+
+  // The mark is applied first (crypto.randomUUID() as its own commentId) so the anchor exists in
+  // the doc even if the add_doc_comment invoke below fails - a comment record with no mark would be
+  // useless, but a mark with no record is at worst an inert highlight, cleaned up the next time
+  // anyone tries to delete it (unsetComment no-ops harmlessly if the backend record never landed).
+  const submitComment = useCallback(async () => {
+    if (!editor) return;
+    const text = commentDraft.trim();
+    if (!text) return;
+    const markId = crypto.randomUUID();
+    editor.chain().focus().setComment(markId).run();
+    setCommentDraft("");
+    setShowCommentInput(false);
+    const comment = await store.addComment(markId, text);
+    if (comment) setShowComments(true);
+  }, [editor, commentDraft, store]);
+
+  // Deleting a comment also strips its mark from wherever it currently sits in the doc, so a
+  // deleted comment never leaves an orphaned highlight behind - unsetComment no-ops harmlessly if
+  // the mark was already gone for some other reason.
+  const handleDeleteComment = useCallback(
+    (commentId: string) => {
+      if (editor) {
+        const target = store.comments.find((c) => c.id === commentId);
+        if (target) editor.commands.unsetComment(target.mark_id);
+      }
+      void store.deleteComment(commentId);
+    },
+    [editor, store]
+  );
 
   // Toolbar-driven counterpart to docImagePaste.ts's paste/drop handling - the only other way to
   // get an image into a doc up to now, which meant there was no clean way to insert one without
@@ -228,7 +338,80 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   }, [libraryFiles, fileFilter]);
 
   return (
-    <div className="w-full h-full flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950 print:bg-white print:h-auto print:block">
+    <div
+      className="w-full h-full flex flex-col bg-gradient-to-b from-neutral-100 to-neutral-200 dark:from-neutral-900 dark:to-neutral-950 print:bg-white print:h-auto print:block"
+      // Ctrl/Cmd+F opens the find bar instead of the browser's own native page-search - captured
+      // at this wrapper (not a Tiptap keyboard-shortcut binding) since opening/closing is UI state
+      // this component owns, not something docFindReplace.ts's extension has any reason to know
+      // about.
+      onKeyDownCapture={(e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+          e.preventDefault();
+          setShowFindReplace(true);
+          return;
+        }
+        // Escape closes whatever toolbar popover is currently open - one handler here rather than
+        // repeating the same keydown case in every popover, since this wrapper already sees every
+        // keystroke in capture phase before the popover's own contents do. Harmless to call on
+        // every Escape press even when nothing is open (each setter is a no-op against its own
+        // already-false state). showFindReplace is deliberately not reset here - DocFindReplaceBar
+        // owns its own Escape handling (it also needs to clear the live search decorations via
+        // editor.commands.clearSearch(), not just hide the bar), and showComments is a persistent
+        // docked panel, not a transient popover, so it's left open like the rest of the app's
+        // sidebars are.
+        if (e.key === "Escape") {
+          setShowLinkInput(false);
+          setShowExportMenu(false);
+          setShowFilePicker(false);
+          setShowTextColorPicker(false);
+          setShowHighlightPicker(false);
+          setShowAlignMenu(false);
+          setShowLineSpacingMenu(false);
+          setShowTableOptions(false);
+          setShowCommentInput(false);
+          setShowPageSetup(false);
+          setShowVersionHistory(false);
+        }
+      }}
+    >
+      {/* Sets the actual paper size/margin Chromium's print engine uses for Print/Save-as-PDF -
+          CSS `@page { size: ... }` is well-supported there (unlike Paged Media margin-box *content*,
+          which isn't - see the header/footer divs below for why those use a different mechanism).
+          The page card's own width/padding are set here too (as a real stylesheet rule targeting
+          `.doc-page-card`, not inline style props) specifically so the `@media print` override
+          below can win: an inline `style` attribute always beats any class - including a
+          `print:...` one - regardless of the media query, so a `print:max-w-none`/`print:p-0`
+          Tailwind class on this element would silently never have applied while width/padding were
+          set inline. */}
+      <style>{`
+        @page { size: ${PAGE_DIMENSIONS_IN[store.pageSize ?? "letter"].cssSize}; margin: ${PAGE_MARGIN_IN}in; }
+        .doc-page-card { max-width: ${pageWidthPx(store.pageSize ?? "letter")}px; padding: ${marginPx()}px; }
+        @media print {
+          .doc-page-card { max-width: none; padding: 0; }
+        }
+      `}</style>
+
+      {/* Repeating header/footer: hidden on screen, shown only for print. `position: fixed` is a
+          Chromium-specific quirk (not standards Paged Media) that makes an element repeat on every
+          printed page rather than appearing once - the only reliable way to get repeating page
+          chrome out of a Chromium print engine, which has no margin-box content support. */}
+      {store.headerText && (
+        <div
+          className="hidden print:block fixed text-xs text-neutral-500"
+          style={{ top: "0.3in", left: `${PAGE_MARGIN_IN}in`, right: `${PAGE_MARGIN_IN}in` }}
+        >
+          {store.headerText}
+        </div>
+      )}
+      {store.footerText && (
+        <div
+          className="hidden print:block fixed text-xs text-neutral-500"
+          style={{ bottom: "0.3in", left: `${PAGE_MARGIN_IN}in`, right: `${PAGE_MARGIN_IN}in` }}
+        >
+          {store.footerText}
+        </div>
+      )}
+
       <div className="shrink-0 flex items-center gap-2 px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/80 dark:bg-neutral-900/80 backdrop-blur-sm print:hidden">
         <button
           type="button"
@@ -270,7 +453,14 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         // entire render tree - confirmed via a headless React+StrictMode repro reproducing the
         // exact "editor.can(...).undo is not a function" crash. Optional-chaining the call (not
         // just gating the surrounding render on `loading`) is what actually closes this gap.
-        <div className="shrink-0 flex items-center gap-1 px-3 py-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/95 dark:bg-neutral-900/95 shadow-[0_1px_2px_rgba(0,0,0,0.04)] flex-wrap print:hidden">
+        //
+        // Two rows, not one long wrapping bar: row 1 is everything about how text itself looks
+        // (undo/redo, style, font, character formatting, colors) - the "Home tab" equivalent; row
+        // 2 is document structure/insertion and doc-level tools (alignment/spacing/lists, insert,
+        // comments/links/find/history/page setup/export). Deliberately grouped rather than left to
+        // wrap wherever the window happens to run out of width.
+        <>
+          <div className="shrink-0 flex items-center gap-1 px-3 pt-2 pb-1 bg-white/95 dark:bg-neutral-900/95 flex-wrap print:hidden">
           {/* editor.can()/isActive() checks that a button needs more than once (disabled state +
               className + onClick guard, or className + icon choice) are hoisted to a local const
               rather than re-invoked per usage - this toolbar re-renders on every editor
@@ -293,17 +483,23 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
           {toolbarDivider}
 
-          {([1, 2, 3] as const).map((level) => (
-            <button
-              key={level}
-              type="button"
-              title={`Heading ${level}`}
-              onClick={() => editor.chain().focus().toggleHeading({ level }).run()}
-              className={`${toolbarButtonClass(editor.isActive("heading", { level }))} text-sm font-semibold`}
-            >
-              H{level}
-            </button>
-          ))}
+          {/* One dropdown (Normal/Heading 1-3) rather than three separate H1/H2/H3 buttons - same
+              information, closer to Word's own Home-tab "Styles" gallery footprint. */}
+          <select
+            title="Paragraph style"
+            value={([1, 2, 3] as const).find((level) => editor.isActive("heading", { level }))?.toString() ?? "normal"}
+            onChange={(e) => {
+              const value = e.target.value;
+              if (value === "normal") editor.chain().focus().setParagraph().run();
+              else editor.chain().focus().toggleHeading({ level: Number(value) as 1 | 2 | 3 }).run();
+            }}
+            className="w-28 px-1.5 py-1.5 text-xs rounded-md border border-neutral-200 dark:border-neutral-700 bg-transparent text-neutral-700 dark:text-neutral-200 outline-none"
+          >
+            <option value="normal">Normal</option>
+            <option value="1">Heading 1</option>
+            <option value="2">Heading 2</option>
+            <option value="3">Heading 3</option>
+          </select>
 
           {toolbarDivider}
 
@@ -351,14 +547,48 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           <button type="button" title="Italic" onClick={() => editor.chain().focus().toggleItalic().run()} className={toolbarButtonClass(editor.isActive("italic"))}>
             <MdFormatItalic size={18} />
           </button>
-          <button type="button" title="Underline" onClick={() => editor.chain().focus().toggleUnderline().run()} className={toolbarButtonClass(editor.isActive("underline"))}>
-            <MdFormatUnderlined size={18} />
-          </button>
+          {(() => {
+            // On a link, "Underline" toggles the link's own underlineOff attribute (see
+            // docLinkExtension.ts) instead of the generic underline mark - an autolinked URL/email
+            // never gets that mark applied, only docLinks.css's default styling does, and plain
+            // CSS has no per-instance "toggle" of its own the way a mark or attribute does.
+            const onLink = editor.isActive("link");
+            const linkUnderlineOff = editor.getAttributes("link").underlineOff === true;
+            const underlineActive = onLink ? !linkUnderlineOff : editor.isActive("underline");
+            return (
+              <button
+                type="button"
+                title="Underline"
+                onClick={() =>
+                  onLink
+                    ? editor.chain().focus().updateAttributes("link", { underlineOff: !linkUnderlineOff }).run()
+                    : editor.chain().focus().toggleUnderline().run()
+                }
+                className={toolbarButtonClass(underlineActive)}
+              >
+                <MdFormatUnderlined size={18} />
+              </button>
+            );
+          })()}
           <button type="button" title="Strikethrough" onClick={() => editor.chain().focus().toggleStrike().run()} className={toolbarButtonClass(editor.isActive("strike"))}>
             <MdStrikethroughS size={18} />
           </button>
           <button type="button" title="Inline code" onClick={() => editor.chain().focus().toggleCode().run()} className={toolbarButtonClass(editor.isActive("code"))}>
             <MdCode size={18} />
+          </button>
+          <button type="button" title="Superscript" onClick={() => editor.chain().focus().toggleSuperscript().run()} className={toolbarButtonClass(editor.isActive("superscript"))}>
+            <MdSuperscript size={18} />
+          </button>
+          <button type="button" title="Subscript" onClick={() => editor.chain().focus().toggleSubscript().run()} className={toolbarButtonClass(editor.isActive("subscript"))}>
+            <MdSubscript size={18} />
+          </button>
+          <button
+            type="button"
+            title="Clear formatting"
+            onClick={() => editor.chain().focus().unsetAllMarks().clearNodes().run()}
+            className={toolbarButtonClass(false)}
+          >
+            <MdFormatClear size={18} />
           </button>
 
           {toolbarDivider}
@@ -374,23 +604,18 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               </span>
             </button>
             {showTextColorPicker && (
-              <div className="absolute left-0 top-full mt-1 z-10 flex items-center gap-2 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-2">
-                <input
-                  type="color"
-                  title="Text color"
-                  onChange={(e) => editor.chain().focus().setColor(e.target.value).run()}
-                  className="w-7 h-7 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
+              <div className="absolute left-0 top-full mt-1 z-10">
+                <DocColorPicker
+                  value={(editor.getAttributes("textStyle").color as string | undefined) ?? null}
+                  onChange={(color) => editor.chain().focus().setColor(color).run()}
+                  onClear={() => {
                     editor.chain().focus().unsetColor().run();
                     setShowTextColorPicker(false);
                   }}
-                  className="text-xs text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:underline whitespace-nowrap"
-                >
-                  Clear color
-                </button>
+                  onClose={() => setShowTextColorPicker(false)}
+                  storageKey="text"
+                  clearLabel="Clear color"
+                />
               </div>
             )}
           </div>
@@ -406,29 +631,24 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               </span>
             </button>
             {showHighlightPicker && (
-              <div className="absolute left-0 top-full mt-1 z-10 flex items-center gap-2 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-2">
-                <input
-                  type="color"
-                  title="Highlight color"
-                  onChange={(e) => editor.chain().focus().setHighlight({ color: e.target.value }).run()}
-                  className="w-7 h-7 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
+              <div className="absolute left-0 top-full mt-1 z-10">
+                <DocColorPicker
+                  value={(editor.getAttributes("highlight").color as string | undefined) ?? null}
+                  onChange={(color) => editor.chain().focus().setHighlight({ color }).run()}
+                  onClear={() => {
                     editor.chain().focus().unsetHighlight().run();
                     setShowHighlightPicker(false);
                   }}
-                  className="text-xs text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:underline whitespace-nowrap"
-                >
-                  Clear highlight
-                </button>
+                  onClose={() => setShowHighlightPicker(false)}
+                  storageKey="highlight"
+                  clearLabel="Clear highlight"
+                />
               </div>
             )}
           </div>
+          </div>
 
-          {toolbarDivider}
-
+          <div className="shrink-0 flex items-center gap-1 px-3 pt-1 pb-2 border-b border-neutral-200 dark:border-neutral-800 bg-white/95 dark:bg-neutral-900/95 shadow-[0_1px_2px_rgba(0,0,0,0.04)] flex-wrap print:hidden">
           <div className="relative">
             {(() => {
               const activeAlign = (["left", "center", "right", "justify"] as const).find((align) => editor.isActive({ textAlign: align })) ?? "left";
@@ -466,6 +686,46 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             )}
           </div>
 
+          <div className="relative">
+            <button type="button" title="Line spacing" onClick={() => setShowLineSpacingMenu((v) => !v)} className={toolbarButtonClass(showLineSpacingMenu)}>
+              <MdFormatLineSpacing size={18} />
+            </button>
+            {showLineSpacingMenu && (
+              <div className="absolute left-0 top-full mt-1 z-10 w-24 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-1">
+                {[1, 1.15, 1.5, 2].map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => {
+                      editor.chain().focus().setLineSpacing(value).run();
+                      setShowLineSpacingMenu(false);
+                    }}
+                    className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+                  >
+                    {value}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => {
+                    editor.chain().focus().unsetLineSpacing().run();
+                    setShowLineSpacingMenu(false);
+                  }}
+                  className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-700 border-t border-neutral-100 dark:border-neutral-700 mt-0.5 pt-1.5"
+                >
+                  Default
+                </button>
+              </div>
+            )}
+          </div>
+
+          <button type="button" title="Decrease indent" onClick={() => editor.chain().focus().outdent().run()} className={toolbarButtonClass(false)}>
+            <MdFormatIndentDecrease size={18} />
+          </button>
+          <button type="button" title="Increase indent" onClick={() => editor.chain().focus().indent().run()} className={toolbarButtonClass(false)}>
+            <MdFormatIndentIncrease size={18} />
+          </button>
+
           {toolbarDivider}
 
           <button type="button" title="Blockquote" onClick={() => editor.chain().focus().toggleBlockquote().run()} className={toolbarButtonClass(editor.isActive("blockquote"))}>
@@ -502,21 +762,40 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             {/* The Tauri dialog allowlist only exposes "message"/"open" - no native text-prompt
                 dialog - so the URL has to come from an inline popover instead of window.prompt. */}
             {showLinkInput && (
-              <div className="absolute left-0 top-full mt-1 z-10 flex items-center gap-1 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-1.5">
-                <input
-                  autoFocus
-                  value={linkUrl}
-                  onChange={(e) => setLinkUrl(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") applyLink();
-                    if (e.key === "Escape") setShowLinkInput(false);
-                  }}
-                  placeholder="https://…"
-                  className="w-48 px-2 py-1 text-sm rounded border border-neutral-200 dark:border-neutral-700 bg-transparent outline-none text-neutral-800 dark:text-neutral-100"
-                />
-                <button type="button" onClick={applyLink} className="px-2 py-1 text-sm rounded bg-blue-600 text-white hover:bg-blue-700">
-                  Add
-                </button>
+              <div className="absolute left-0 top-full mt-1 z-10 flex flex-col gap-1 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-1.5">
+                {/* Only shown with no selection - with one, the selected text already *is* the
+                    link's visible label, same as before. Without one, setLink has no text range to
+                    attach the mark to, so applyLink instead inserts this (or the URL itself, if
+                    left blank) as new text at the cursor. */}
+                {editor.state.selection.empty && (
+                  <input
+                    autoFocus
+                    value={linkText}
+                    onChange={(e) => setLinkText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") applyLink();
+                      if (e.key === "Escape") setShowLinkInput(false);
+                    }}
+                    placeholder="Text to display"
+                    className="w-48 px-2 py-1 text-sm rounded border border-neutral-200 dark:border-neutral-700 bg-transparent outline-none text-neutral-800 dark:text-neutral-100"
+                  />
+                )}
+                <div className="flex items-center gap-1">
+                  <input
+                    autoFocus={!editor.state.selection.empty}
+                    value={linkUrl}
+                    onChange={(e) => setLinkUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") applyLink();
+                      if (e.key === "Escape") setShowLinkInput(false);
+                    }}
+                    placeholder="https://…"
+                    className="w-48 px-2 py-1 text-sm rounded border border-neutral-200 dark:border-neutral-700 bg-transparent outline-none text-neutral-800 dark:text-neutral-100"
+                  />
+                  <button type="button" onClick={applyLink} className="px-2 py-1 text-sm rounded bg-blue-600 text-white hover:bg-blue-700">
+                    Add
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -568,6 +847,63 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           )}
 
           <div className="ml-auto flex items-center gap-1">
+            <div className="relative">
+              <button
+                type="button"
+                title="Add comment"
+                disabled={!editor || editor.state.selection.empty}
+                onClick={() => {
+                  setCommentDraft("");
+                  setShowCommentInput(true);
+                }}
+                className={toolbarButtonClass(showCommentInput, !editor || editor.state.selection.empty)}
+              >
+                <MdAddComment size={18} />
+              </button>
+              {showCommentInput && (
+                <div className="absolute right-0 top-full mt-1 z-10 w-64 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-2">
+                  <textarea
+                    autoFocus
+                    rows={3}
+                    value={commentDraft}
+                    onChange={(e) => setCommentDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setShowCommentInput(false);
+                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void submitComment();
+                    }}
+                    placeholder="Comment…"
+                    className="w-full px-2 py-1.5 text-sm rounded border border-neutral-200 dark:border-neutral-700 bg-transparent outline-none text-neutral-800 dark:text-neutral-100 resize-none"
+                  />
+                  <div className="flex justify-end gap-1.5 mt-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowCommentInput(false)}
+                      className="px-2 py-1 text-xs rounded text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!commentDraft.trim()}
+                      onClick={() => void submitComment()}
+                      className="px-2.5 py-1 text-xs rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40"
+                    >
+                      Comment
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <button
+              type="button"
+              title="Comments"
+              onClick={() => setShowComments((v) => !v)}
+              className={toolbarButtonClass(showComments)}
+            >
+              <IoChatbubbleOutline size={17} />
+            </button>
+
             {store.linkedTo ? (
               <div className="flex items-center gap-1 pl-2 pr-1 py-1 rounded-md bg-neutral-100 dark:bg-neutral-800 text-xs text-neutral-600 dark:text-neutral-300">
                 <MdInsertLink size={14} />
@@ -634,6 +970,15 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
             <button
               type="button"
+              title="Find and replace (Ctrl+F)"
+              onClick={() => setShowFindReplace(true)}
+              className={toolbarButtonClass(showFindReplace)}
+            >
+              <IoSearch size={17} />
+            </button>
+
+            <button
+              type="button"
               title="Version history"
               onClick={() => {
                 store.refreshVersions();
@@ -643,6 +988,21 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             >
               <IoTimeOutline size={18} />
             </button>
+
+            <div className="relative">
+              <button type="button" title="Page setup" onClick={() => setShowPageSetup((v) => !v)} className={toolbarButtonClass(showPageSetup)}>
+                <IoOptionsOutline size={18} />
+              </button>
+              {showPageSetup && (
+                <DocPageSetupPopover
+                  pageSize={store.pageSize}
+                  headerText={store.headerText}
+                  footerText={store.footerText}
+                  onApply={(size, header, footer) => void store.setPageSetup(size, header, footer)}
+                  onClose={() => setShowPageSetup(false)}
+                />
+              )}
+            </div>
 
             <div className="relative">
               <button type="button" title="Export" onClick={() => setShowExportMenu((v) => !v)} className={toolbarButtonClass(showExportMenu)}>
@@ -683,24 +1043,48 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             </div>
           </div>
         </div>
+        </>
       )}
 
-      {/* print:overflow-visible/h-auto/block - without these, this flex/overflow-auto box (built
-          for on-screen scrolling) clips the document to whatever fits in the viewport instead of
-          flowing across printed pages, since overflow:auto content doesn't reflow for print the
-          way normal block content does. */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-8 py-10 print:flex-none print:h-auto print:overflow-visible print:block print:p-0">
-        {store.loading || !editor ? (
-          <div className="flex items-center justify-center h-full text-neutral-400 dark:text-neutral-500 text-sm">Loading…</div>
-        ) : store.loadError ? (
-          <div className="flex items-center justify-center h-full text-red-500 dark:text-red-400 text-sm">{store.loadError}</div>
-        ) : (
-          // The "page": a bounded card on the surrounding gray backdrop, rather than content
-          // floating directly on the app background - gives the document a distinct identity the
-          // way Docs/Notion-style editors do, instead of blending into the chrome around it.
-          <div className="max-w-3xl mx-auto bg-white dark:bg-neutral-900 rounded-xl ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-sm px-14 py-14 min-h-[75vh] print:shadow-none print:ring-0 print:rounded-none print:px-0 print:py-0 print:max-w-none print:min-h-0">
-            <EditorContent editor={editor} className={docProseClassName} />
-          </div>
+      {editor && showFindReplace && <DocFindReplaceBar editor={editor} onClose={() => setShowFindReplace(false)} />}
+
+      <div className="flex-1 min-h-0 flex print:block">
+        {/* print:overflow-visible/h-auto/block - without these, this flex/overflow-auto box (built
+            for on-screen scrolling) clips the document to whatever fits in the viewport instead of
+            flowing across printed pages, since overflow:auto content doesn't reflow for print the
+            way normal block content does. */}
+        <div className="flex-1 min-w-0 overflow-y-auto px-8 py-10 print:flex-none print:h-auto print:overflow-visible print:block print:p-0">
+          {store.loading || !editor ? (
+            <div className="flex items-center justify-center h-full text-neutral-400 dark:text-neutral-500 text-sm">Loading…</div>
+          ) : store.loadError ? (
+            <div className="flex items-center justify-center h-full text-red-500 dark:text-red-400 text-sm">{store.loadError}</div>
+          ) : (
+            // The "page": a bounded card on the surrounding gray backdrop, rather than content
+            // floating directly on the app background - gives the document a distinct identity the
+            // way Docs/Notion-style editors do, instead of blending into the chrome around it.
+            // Square corners, not rounded - a real printed page has a flat-cut edge, and
+            // docAutoPaginate.ts's own page-gap dividers (docPageLayout.css) are flat too, so a
+            // rounded top/bottom here would be the one page edge in the whole document that
+            // doesn't match the rest.
+            // Width and padding (the exact real 1in print margin, not an arbitrary Tailwind spacing
+            // step - both for true on-screen/print WYSIWYG and because docAutoPaginate.ts measures
+            // against this real content-area size) come from the `.doc-page-card` rule injected
+            // above, whose own `@media print` override hands full-page sizing to the `@page` rule.
+            <div className="doc-page-card mx-auto bg-white dark:bg-neutral-900 ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-sm min-h-[75vh] print:shadow-none print:ring-0 print:mx-0 print:min-h-0">
+              <EditorContent editor={editor} className={docProseClassName} />
+            </div>
+          )}
+        </div>
+
+        {editor && showComments && (
+          <DocCommentsSidebar
+            editor={editor}
+            comments={store.comments}
+            onResolve={(id) => void store.resolveComment(id)}
+            onReopen={(id) => void store.reopenComment(id)}
+            onDelete={handleDeleteComment}
+            onClose={() => setShowComments(false)}
+          />
         )}
       </div>
 

@@ -84,6 +84,16 @@ struct DocMeta {
     // before folders existed keep deserializing as "unfiled" (None), same convention as linked_to.
     #[serde(rename = "folderId", default, skip_serializing_if = "Option::is_none")]
     folder_id: Option<String>,
+    // Print/PDF-export page setup - "letter"/"a4"/"legal", and repeating header/footer text (see
+    // DocsEditor.tsx's own comment on the position:fixed trick that makes those actually repeat on
+    // every printed page in Chromium). None/absent means "use the app's own defaults" everywhere
+    // these are read, same default-lets-old-docs-deserialize convention as folder_id/linked_to.
+    #[serde(rename = "pageSize", default, skip_serializing_if = "Option::is_none")]
+    page_size: Option<String>,
+    #[serde(rename = "headerText", default, skip_serializing_if = "Option::is_none")]
+    header_text: Option<String>,
+    #[serde(rename = "footerText", default, skip_serializing_if = "Option::is_none")]
+    footer_text: Option<String>,
 }
 
 // Unlike DocMeta (an internal, camelCase-keyed storage format never returned to the frontend
@@ -280,6 +290,9 @@ pub struct LoadedDoc {
     linked_to: Option<String>,
     deleted_at: Option<String>,
     folder_id: Option<String>,
+    page_size: Option<String>,
+    header_text: Option<String>,
+    footer_text: Option<String>,
 }
 
 fn read_meta(dir: &PathBuf) -> Option<DocMeta> {
@@ -343,7 +356,17 @@ pub fn create_doc(id: String, title: String, bytes: Vec<u8>, folder_id: Option<S
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create document folder: {}", e))?;
 
     let now = chrono::Local::now().to_rfc3339();
-    let meta = DocMeta { title: title.clone(), created_at: now.clone(), updated_at: now.clone(), linked_to: None, deleted_at: None, folder_id };
+    let meta = DocMeta {
+        title: title.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        linked_to: None,
+        deleted_at: None,
+        folder_id,
+        page_size: None,
+        header_text: None,
+        footer_text: None,
+    };
     write_meta(&dir, &meta)?;
 
     let target = dir.join("doc.bin");
@@ -364,15 +387,18 @@ pub fn save_doc(id: String, bytes: Vec<u8>, title: String) -> Result<(), String>
     fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write document: {}", e))?;
     fs::rename(&tmp, &target).map_err(|e| format!("Failed to save document: {}", e))?;
 
-    // Preserve created_at/linked_to/deleted_at/folder_id from any existing metadata - this command
-    // only ever changes content/title, never the doc's link, trash, or folder state.
+    // Preserve every field this command doesn't itself own from any existing metadata - it only
+    // ever changes content/title, never the doc's link/trash/folder state or its page setup.
     let now = chrono::Local::now().to_rfc3339();
     let existing = read_meta(&dir);
     let created_at = existing.as_ref().map(|m| m.created_at.clone()).unwrap_or_else(|| now.clone());
     let linked_to = existing.as_ref().and_then(|m| m.linked_to.clone());
     let deleted_at = existing.as_ref().and_then(|m| m.deleted_at.clone());
-    let folder_id = existing.and_then(|m| m.folder_id);
-    write_meta(&dir, &DocMeta { title, created_at, updated_at: now, linked_to, deleted_at, folder_id })
+    let folder_id = existing.as_ref().and_then(|m| m.folder_id.clone());
+    let page_size = existing.as_ref().and_then(|m| m.page_size.clone());
+    let header_text = existing.as_ref().and_then(|m| m.header_text.clone());
+    let footer_text = existing.and_then(|m| m.footer_text);
+    write_meta(&dir, &DocMeta { title, created_at, updated_at: now, linked_to, deleted_at, folder_id, page_size, header_text, footer_text })
 }
 
 #[command]
@@ -380,7 +406,43 @@ pub fn load_doc(id: String) -> Result<LoadedDoc, String> {
     let dir = doc_dir(&id)?;
     let bytes = fs::read(dir.join("doc.bin")).map_err(|e| format!("Failed to load document: {}", e))?;
     let meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
-    Ok(LoadedDoc { bytes, title: meta.title, created_at: meta.created_at, updated_at: meta.updated_at, linked_to: meta.linked_to, deleted_at: meta.deleted_at, folder_id: meta.folder_id })
+    Ok(LoadedDoc {
+        bytes,
+        title: meta.title,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        linked_to: meta.linked_to,
+        deleted_at: meta.deleted_at,
+        folder_id: meta.folder_id,
+        page_size: meta.page_size,
+        header_text: meta.header_text,
+        footer_text: meta.footer_text,
+    })
+}
+
+// Meta-only field, written straight through like link_doc_to_file - independent of the debounced
+// Yjs save_doc path, since page setup isn't part of the document's actual content.
+#[derive(Debug, serde::Serialize)]
+pub struct DocPageSetup {
+    page_size: Option<String>,
+    header_text: Option<String>,
+    footer_text: Option<String>,
+}
+
+#[command]
+pub fn set_doc_page_setup(
+    id: String,
+    page_size: Option<String>,
+    header_text: Option<String>,
+    footer_text: Option<String>,
+) -> Result<DocPageSetup, String> {
+    let dir = doc_dir(&id)?;
+    let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
+    meta.page_size = page_size;
+    meta.header_text = header_text;
+    meta.footer_text = footer_text;
+    write_meta(&dir, &meta)?;
+    Ok(DocPageSetup { page_size: meta.page_size, header_text: meta.header_text, footer_text: meta.footer_text })
 }
 
 // Soft delete: moves the doc's whole folder into Docs/.trash/<id> rather than removing it, same
@@ -727,4 +789,95 @@ pub fn restore_doc_version(id: String, version_id: String) -> Result<Vec<u8>, St
     }
 
     Ok(restored_bytes)
+}
+
+// ---- Comments ----
+//
+// One flat manifest per doc, Docs/<id>/comments.json - comments are metadata anchored to a range
+// of the doc's content, not content themselves, same "sibling file, not folded into doc.bin"
+// reasoning as folders.json/meta.json. `mark_id` is the id embedded in the live editor's `comment`
+// mark (docCommentMark.ts) - the actual text range a comment is anchored to is never stored here,
+// only looked up live by walking the current doc for a mark carrying this id, since ProseMirror
+// positions shift as the document is edited and a stored from/to would go stale immediately.
+
+const COMMENTS_FILE_NAME: &str = "comments.json";
+
+// Unlike DocMeta (internal, camelCase-keyed, never returned as-is), DocComment crosses the command
+// boundary directly - same plain-snake_case, always-emit-Option-as-null convention as DocSummary/
+// DocFolder, not the storage-only skip_serializing_if treatment linked_to/folder_id use.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DocComment {
+    id: String,
+    mark_id: String,
+    text: String,
+    created_at: String,
+    resolved_at: Option<String>,
+}
+
+fn comments_path(id: &str) -> Result<PathBuf, String> {
+    Ok(doc_dir(id)?.join(COMMENTS_FILE_NAME))
+}
+
+fn read_comments(id: &str) -> Result<Vec<DocComment>, String> {
+    let path = comments_path(id)?;
+    let Ok(json) = fs::read_to_string(&path) else { return Ok(Vec::new()) };
+    serde_json::from_str(&json).map_err(|e| format!("Failed to parse comments: {}", e))
+}
+
+fn write_comments(id: &str, comments: &[DocComment]) -> Result<(), String> {
+    let path = comments_path(id)?;
+    let json = serde_json::to_string(comments).map_err(|e| format!("Failed to encode comments: {}", e))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write comments: {}", e))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("Failed to save comments: {}", e))
+}
+
+#[command]
+pub fn list_doc_comments(id: String) -> Result<Vec<DocComment>, String> {
+    read_comments(&id)
+}
+
+// id/mark_id are both frontend-generated (crypto.randomUUID()) - mark_id doubles as the comment
+// mark's own attribute value applied to the selection at the same moment this is called, so the
+// two ids start out equal, though only mark_id is ever looked up against the live document again.
+#[command]
+pub fn add_doc_comment(id: String, comment_id: String, mark_id: String, text: String) -> Result<DocComment, String> {
+    let mut comments = read_comments(&id)?;
+    let comment = DocComment {
+        id: comment_id,
+        mark_id,
+        text,
+        created_at: chrono::Local::now().to_rfc3339(),
+        resolved_at: None,
+    };
+    comments.push(comment.clone());
+    write_comments(&id, &comments)?;
+    Ok(comment)
+}
+
+#[command]
+pub fn resolve_doc_comment(id: String, comment_id: String) -> Result<DocComment, String> {
+    let mut comments = read_comments(&id)?;
+    let comment = comments.iter_mut().find(|c| c.id == comment_id).ok_or_else(|| "Comment not found".to_string())?;
+    comment.resolved_at = Some(chrono::Local::now().to_rfc3339());
+    let result = comment.clone();
+    write_comments(&id, &comments)?;
+    Ok(result)
+}
+
+#[command]
+pub fn reopen_doc_comment(id: String, comment_id: String) -> Result<DocComment, String> {
+    let mut comments = read_comments(&id)?;
+    let comment = comments.iter_mut().find(|c| c.id == comment_id).ok_or_else(|| "Comment not found".to_string())?;
+    comment.resolved_at = None;
+    let result = comment.clone();
+    write_comments(&id, &comments)?;
+    Ok(result)
+}
+
+#[command]
+pub fn delete_doc_comment(id: String, comment_id: String) -> Result<(), String> {
+    let mut comments = read_comments(&id)?;
+    comments.retain(|c| c.id != comment_id);
+    write_comments(&id, &comments)
 }

@@ -21,6 +21,7 @@ import {
   MdImage,
   MdHorizontalRule,
   MdShortText,
+  MdInsertPageBreak,
 } from "react-icons/md";
 import SlashCommandMenu, { SlashCommandItem } from "../components/docs/SlashCommandMenu";
 import { uploadImageFromPath } from "./docImagePaste";
@@ -87,6 +88,12 @@ function buildItems(docId: string): SlashCommandItem[] {
       keywords: ["divider", "hr", "line", "separator"],
       icon: MdHorizontalRule,
       run: (editor, range) => editor.chain().focus().deleteRange(range).setHorizontalRule().run(),
+    },
+    {
+      title: "Page break",
+      keywords: ["page", "break", "pagebreak"],
+      icon: MdInsertPageBreak,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).setPageBreak().run(),
     },
     {
       title: "Image",

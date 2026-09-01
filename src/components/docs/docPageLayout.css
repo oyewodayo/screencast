@@ -1,0 +1,52 @@
+/* components/docs/docPageLayout.css
+ *
+ * The live auto-pagination gap (docAutoPaginate.ts) - styled to look like the current page card
+ * genuinely ending and a new one beginning (a flat closing/opening edge + a small shadow on each,
+ * gray canvas showing through the gap), not just a blank spacer inside one continuous white card.
+ * Edges are straight, not rounded - a real page's edge is a flat cut, not a rounded corner (only
+ * the document's own outer top/bottom keep the rounded-card treatment, from the page container
+ * itself, untouched by this file). Height is set per-instance via inline style (it depends on how
+ * much space was actually left on that page - a runtime measurement, not something CSS can
+ * express), everything else is static.
+ *
+ * The -96px horizontal margins pull the gap out to the page card's full width, undoing its own
+ * padding - safe to hardcode rather than read from docPageGeometry.ts's marginPx(), since
+ * PAGE_MARGIN_IN is a fixed 1in constant there, not something that varies per page size.
+ */
+
+.doc-page-gap {
+  position: relative;
+  margin-left: -96px;
+  margin-right: -96px;
+  background: #e5e5e5;
+}
+
+.doc-page-gap::before,
+.doc-page-gap::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 20px;
+  background: #ffffff;
+}
+
+.doc-page-gap::before {
+  top: 0;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.doc-page-gap::after {
+  bottom: 0;
+  box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.dark .doc-page-gap {
+  background: #0a0a0a;
+}
+
+.dark .doc-page-gap::before,
+.dark .doc-page-gap::after {
+  background: #171717;
+  box-shadow: none;
+}

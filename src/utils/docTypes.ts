@@ -31,6 +31,20 @@ export interface DocFolder {
 // (DocFolderSidebar.tsx) - shared here so the two files can't drift on the exact string.
 export const DOC_DRAG_MIME = "application/x-briefcast-doc-id";
 
+// "letter"/"a4"/"legal" - kept as a plain string union (not an enum) since it round-trips straight
+// through docs.rs's DocMeta.page_size with no translation needed.
+export type DocPageSize = "letter" | "a4" | "legal";
+
+// Frontend mirror of docs.rs's DocComment - see its own header comment on why the anchored text
+// range is never stored here, only `mark_id` (looked up live against the current document).
+export interface DocComment {
+  id: string;
+  mark_id: string;
+  text: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 // Frontend mirror of docs.rs's DocVersionSummary - a single point-in-time snapshot of a doc's
 // content, listed by useDocsEditStore.ts's `versions` and shown in DocVersionHistoryPanel.tsx.
 export interface DocVersionSummary {

@@ -294,6 +294,12 @@ fn main() {
             services::docs::list_doc_versions,
             services::docs::load_doc_version,
             services::docs::restore_doc_version,
+            services::docs::list_doc_comments,
+            services::docs::add_doc_comment,
+            services::docs::resolve_doc_comment,
+            services::docs::reopen_doc_comment,
+            services::docs::delete_doc_comment,
+            services::docs::set_doc_page_setup,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

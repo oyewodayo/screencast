@@ -13,7 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { appWindow } from "@tauri-apps/api/window";
 import * as Y from "yjs";
-import { DocVersionSummary } from "../utils/docTypes";
+import { DocComment, DocPageSize, DocVersionSummary } from "../utils/docTypes";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 // Confirmed with the user: a periodic snapshot every ~10 minutes while a doc is actively being
@@ -29,6 +29,15 @@ interface LoadedDoc {
   created_at: string;
   updated_at: string;
   linked_to: string | null;
+  page_size: DocPageSize | null;
+  header_text: string | null;
+  footer_text: string | null;
+}
+
+interface DocPageSetupResult {
+  page_size: DocPageSize | null;
+  header_text: string | null;
+  footer_text: string | null;
 }
 
 interface DocSummaryResult {
@@ -57,6 +66,20 @@ export interface UseDocsEditStoreResult {
   versions: DocVersionSummary[];
   refreshVersions: () => void;
   restoreVersion: (versionId: string) => Promise<void>;
+  // Comments - see docs.rs's "Comments" section. markId is the id shared between a DocComment
+  // record and the live `comment` mark (docCommentMark.ts) anchoring it.
+  comments: DocComment[];
+  refreshComments: () => void;
+  addComment: (markId: string, text: string) => Promise<DocComment | null>;
+  resolveComment: (commentId: string) => Promise<void>;
+  reopenComment: (commentId: string) => Promise<void>;
+  deleteComment: (commentId: string) => Promise<void>;
+  // Page setup - see docs.rs's set_doc_page_setup. Meta-only, like linkedTo, written straight
+  // through rather than routed through the debounced save_doc path.
+  pageSize: DocPageSize | null;
+  headerText: string | null;
+  footerText: string | null;
+  setPageSetup: (pageSize: DocPageSize | null, headerText: string | null, footerText: string | null) => Promise<void>;
 }
 
 export default function useDocsEditStore(docId: string | undefined): UseDocsEditStoreResult {
@@ -68,6 +91,10 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
   const [saveError, setSaveError] = useState<string | null>(null);
   const [linkedTo, setLinkedTo] = useState<string | null>(null);
   const [versions, setVersions] = useState<DocVersionSummary[]>([]);
+  const [comments, setComments] = useState<DocComment[]>([]);
+  const [pageSize, setPageSizeState] = useState<DocPageSize | null>(null);
+  const [headerText, setHeaderTextState] = useState<string | null>(null);
+  const [footerText, setFooterTextState] = useState<string | null>(null);
 
   const ydocRef = useRef<Y.Doc | null>(null);
   const titleRef = useRef<string>("");
@@ -153,6 +180,14 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
       .catch((err) => console.error("Failed to list document versions:", err));
   }, []);
 
+  const refreshComments = useCallback((idOverride?: string) => {
+    const id = idOverride ?? docIdRef.current;
+    if (!id) return;
+    invoke<DocComment[]>("list_doc_comments", { id })
+      .then(setComments)
+      .catch((err) => console.error("Failed to list document comments:", err));
+  }, []);
+
   // (Re)loads docIdRef.current's content from disk into a fresh Y.Doc, replacing whatever was
   // there. Used both by the docId-change effect below (a normal doc switch/first open) and by
   // restoreVersion (reloading in place after the backend has overwritten doc.bin with an older
@@ -186,7 +221,11 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
       setTitleState(result.title);
       titleRef.current = result.title;
       setLinkedTo(result.linked_to);
+      setPageSizeState(result.page_size);
+      setHeaderTextState(result.header_text);
+      setFooterTextState(result.footer_text);
       setYdoc(doc);
+      refreshComments(id);
 
       // On-open snapshot - docs.rs's write_version dedups against the latest existing version, so
       // this is a no-op on disk (and in the returned list) if nothing changed since the last one.
@@ -200,7 +239,7 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
     } finally {
       if (loadGenerationRef.current === generation) setLoading(false);
     }
-  }, [scheduleAutosave, refreshVersions]);
+  }, [scheduleAutosave, refreshVersions, refreshComments]);
 
   useEffect(() => {
     docIdRef.current = docId;
@@ -289,6 +328,70 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
     }
   }, []);
 
+  const addComment = useCallback(async (markId: string, text: string): Promise<DocComment | null> => {
+    const id = docIdRef.current;
+    if (!id) return null;
+    try {
+      const comment = await invoke<DocComment>("add_doc_comment", { id, commentId: markId, markId, text });
+      setComments((prev) => [...prev, comment]);
+      return comment;
+    } catch (err) {
+      console.error("Failed to add comment:", err);
+      return null;
+    }
+  }, []);
+
+  const resolveComment = useCallback(async (commentId: string) => {
+    const id = docIdRef.current;
+    if (!id) return;
+    try {
+      const updated = await invoke<DocComment>("resolve_doc_comment", { id, commentId });
+      setComments((prev) => prev.map((c) => (c.id === commentId ? updated : c)));
+    } catch (err) {
+      console.error("Failed to resolve comment:", err);
+    }
+  }, []);
+
+  const reopenComment = useCallback(async (commentId: string) => {
+    const id = docIdRef.current;
+    if (!id) return;
+    try {
+      const updated = await invoke<DocComment>("reopen_doc_comment", { id, commentId });
+      setComments((prev) => prev.map((c) => (c.id === commentId ? updated : c)));
+    } catch (err) {
+      console.error("Failed to reopen comment:", err);
+    }
+  }, []);
+
+  const deleteComment = useCallback(async (commentId: string) => {
+    const id = docIdRef.current;
+    if (!id) return;
+    try {
+      await invoke("delete_doc_comment", { id, commentId });
+      setComments((prev) => prev.filter((c) => c.id !== commentId));
+    } catch (err) {
+      console.error("Failed to delete comment:", err);
+    }
+  }, []);
+
+  const setPageSetup = useCallback(async (nextPageSize: DocPageSize | null, nextHeaderText: string | null, nextFooterText: string | null) => {
+    const id = docIdRef.current;
+    if (!id) return;
+    try {
+      const result = await invoke<DocPageSetupResult>("set_doc_page_setup", {
+        id,
+        pageSize: nextPageSize,
+        headerText: nextHeaderText,
+        footerText: nextFooterText,
+      });
+      setPageSizeState(result.page_size);
+      setHeaderTextState(result.header_text);
+      setFooterTextState(result.footer_text);
+    } catch (err) {
+      console.error("Failed to update page setup:", err);
+    }
+  }, []);
+
   const unlinkDoc = useCallback(async () => {
     const id = docIdRef.current;
     if (!id) return;
@@ -315,5 +418,15 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
     versions,
     refreshVersions,
     restoreVersion,
+    comments,
+    refreshComments,
+    addComment,
+    resolveComment,
+    reopenComment,
+    deleteComment,
+    pageSize,
+    headerText,
+    footerText,
+    setPageSetup,
   };
 }
