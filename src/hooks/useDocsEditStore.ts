@@ -13,8 +13,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { appWindow } from "@tauri-apps/api/window";
 import * as Y from "yjs";
+import { DocVersionSummary } from "../utils/docTypes";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
+// Confirmed with the user: a periodic snapshot every ~10 minutes while a doc is actively being
+// edited (only if something changed since the last one - see dirtySinceVersionRef), plus one more
+// whenever a doc is opened (see loadDoc's own snapshot call) - covers both "undo a mistake from a
+// few minutes ago" and "go back to yesterday's version" without any manual action. Retention (last
+// 20 per doc) is enforced server-side, in docs.rs's write_version.
+const VERSION_SNAPSHOT_INTERVAL_MS = 10 * 60 * 1000;
 
 interface LoadedDoc {
   bytes: number[];
@@ -46,6 +53,10 @@ export interface UseDocsEditStoreResult {
   linkedTo: string | null;
   linkDoc: (filePath: string) => Promise<void>;
   unlinkDoc: () => Promise<void>;
+  // Version history - see docs.rs's "Version history" section for the storage/retention side.
+  versions: DocVersionSummary[];
+  refreshVersions: () => void;
+  restoreVersion: (versionId: string) => Promise<void>;
 }
 
 export default function useDocsEditStore(docId: string | undefined): UseDocsEditStoreResult {
@@ -56,11 +67,22 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [linkedTo, setLinkedTo] = useState<string | null>(null);
+  const [versions, setVersions] = useState<DocVersionSummary[]>([]);
 
   const ydocRef = useRef<Y.Doc | null>(null);
   const titleRef = useRef<string>("");
   const docIdRef = useRef<string | undefined>(docId);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True once the open Y.Doc has changed since the last version snapshot (on-open or periodic) -
+  // separate from the autosave path entirely, since autosave's own "is there anything pending"
+  // state (saveTimerRef) resets every 800ms regardless of version-snapshot cadence.
+  const dirtySinceVersionRef = useRef(false);
+  // Bumped on every loadDoc() call (initial load, doc switch, or a restore's own reload) so a
+  // load that's been superseded by a newer one can detect that and bail before touching state,
+  // replacing the single effect-scoped `cancelled` flag this used to rely on - loadDoc is now
+  // called from more than one place, so that flag couldn't be scoped to just the docId effect
+  // anymore.
+  const loadGenerationRef = useRef(0);
 
   useEffect(() => {
     titleRef.current = title;
@@ -123,49 +145,110 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
     };
   }, [flushSave]);
 
-  useEffect(() => {
-    docIdRef.current = docId;
-    if (!docId) return;
-    let cancelled = false;
+  const refreshVersions = useCallback((idOverride?: string) => {
+    const id = idOverride ?? docIdRef.current;
+    if (!id) return;
+    invoke<DocVersionSummary[]>("list_doc_versions", { id })
+      .then(setVersions)
+      .catch((err) => console.error("Failed to list document versions:", err));
+  }, []);
 
-    // Switching documents (or unmounting) - flush whatever the previous Y.Doc had pending, then
-    // release its internal observers. Safe to call even on first mount, when ydocRef is still null.
-    // flushSave() now throws on failure (so the save-on-quit handler above can catch it) - this
-    // fire-and-forget call needs its own catch or a failed autosave-on-navigate produces an
-    // unhandled promise rejection.
-    flushSave().catch((err) => console.error("Failed to save while switching documents:", err));
+  // (Re)loads docIdRef.current's content from disk into a fresh Y.Doc, replacing whatever was
+  // there. Used both by the docId-change effect below (a normal doc switch/first open) and by
+  // restoreVersion (reloading in place after the backend has overwritten doc.bin with an older
+  // version) - factored out specifically so those two callers don't duplicate this. Superseded
+  // loads (a newer loadDoc() call started before this one's invoke() resolved) detect that via
+  // loadGenerationRef and bail without touching state, replacing the old effect-scoped `cancelled`
+  // flag, which couldn't be shared across more than one call site.
+  const loadDoc = useCallback(async () => {
+    const id = docIdRef.current;
+    if (!id) return;
+    const generation = ++loadGenerationRef.current;
+
     ydocRef.current?.destroy();
     ydocRef.current = null;
     setYdoc(null);
     setLoading(true);
     setLoadError(null);
 
-    (async () => {
-      try {
-        const result = await invoke<LoadedDoc>("load_doc", { id: docId });
-        if (cancelled) return;
-        const doc = new Y.Doc();
-        Y.applyUpdate(doc, new Uint8Array(result.bytes));
-        // Fires on every change to the doc, local edits included - the same signal a future
-        // real-time provider's incoming remote updates would also flow through.
-        doc.on("update", scheduleAutosave);
-        ydocRef.current = doc;
-        setTitleState(result.title);
-        setLinkedTo(result.linked_to);
-        setYdoc(doc);
-      } catch (err) {
-        console.error("Failed to load document:", err);
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
+    try {
+      const result = await invoke<LoadedDoc>("load_doc", { id });
+      if (loadGenerationRef.current !== generation) return;
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, new Uint8Array(result.bytes));
+      // Fires on every change to the doc, local edits included - the same signal a future
+      // real-time provider's incoming remote updates would also flow through.
+      doc.on("update", () => {
+        dirtySinceVersionRef.current = true;
+        scheduleAutosave();
+      });
+      ydocRef.current = doc;
+      setTitleState(result.title);
+      titleRef.current = result.title;
+      setLinkedTo(result.linked_to);
+      setYdoc(doc);
 
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [docId]);
+      // On-open snapshot - docs.rs's write_version dedups against the latest existing version, so
+      // this is a no-op on disk (and in the returned list) if nothing changed since the last one.
+      dirtySinceVersionRef.current = false;
+      invoke("create_doc_version", { id, bytes: result.bytes })
+        .then(() => refreshVersions(id))
+        .catch((err) => console.error("Failed to snapshot document version on open:", err));
+    } catch (err) {
+      console.error("Failed to load document:", err);
+      if (loadGenerationRef.current === generation) setLoadError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (loadGenerationRef.current === generation) setLoading(false);
+    }
+  }, [scheduleAutosave, refreshVersions]);
+
+  useEffect(() => {
+    docIdRef.current = docId;
+    if (!docId) return;
+
+    // Switching documents (or first open) - flush whatever the previous Y.Doc had pending before
+    // loadDoc() destroys it. Safe to call even on first mount, when ydocRef is still null.
+    // flushSave() now throws on failure (so the save-on-quit handler above can catch it) - this
+    // fire-and-forget call needs its own catch or a failed autosave-on-navigate produces an
+    // unhandled promise rejection.
+    flushSave().catch((err) => console.error("Failed to save while switching documents:", err));
+    void loadDoc();
+  }, [docId, flushSave, loadDoc]);
+
+  // Periodic version snapshot while a doc is open - re-armed whenever `ydoc` itself changes
+  // (a real doc switch, or restoreVersion's own reload), which conveniently also means a doc with
+  // no edits since it was opened never even starts a wasted timer render-over-render.
+  useEffect(() => {
+    if (!ydoc) return;
+    const interval = setInterval(() => {
+      if (!dirtySinceVersionRef.current) return;
+      const id = docIdRef.current;
+      if (!id) return;
+      const bytes = Array.from(Y.encodeStateAsUpdate(ydoc));
+      dirtySinceVersionRef.current = false;
+      invoke("create_doc_version", { id, bytes })
+        .then(() => refreshVersions(id))
+        .catch((err) => console.error("Failed to snapshot document version:", err));
+    }, VERSION_SNAPSHOT_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [ydoc, refreshVersions]);
+
+  const restoreVersion = useCallback(
+    async (versionId: string) => {
+      const id = docIdRef.current;
+      if (!id) return;
+      // Cancel (don't flush) any pending autosave - those in-memory bytes are about to be
+      // discarded wholesale by loadDoc()'s reload below, and flushing them first would just
+      // immediately get overwritten by restore_doc_version's own write to doc.bin anyway.
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      await invoke("restore_doc_version", { id, versionId });
+      await loadDoc();
+    },
+    [loadDoc]
+  );
 
   // Final flush + teardown on unmount (the docId-change branch above already handles the
   // switching-documents case).
@@ -174,6 +257,12 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
       flushSave().catch((err) => console.error("Failed to save on unmount:", err));
       ydocRef.current?.destroy();
       ydocRef.current = null;
+      // Bumping the generation here (not just on the next loadDoc() call) is what makes an
+      // in-flight load's own `if (loadGenerationRef.current !== generation) return` catch a true
+      // unmount too, not just "superseded by a newer load" - without this, a load() started right
+      // before navigating away from a doc would still call setState after unmount once its
+      // invoke() resolved.
+      loadGenerationRef.current++;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -211,5 +300,20 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
     }
   }, []);
 
-  return { ydoc, title, setTitle, loading, loadError, isSaving, saveError, flushSave, linkedTo, linkDoc, unlinkDoc };
+  return {
+    ydoc,
+    title,
+    setTitle,
+    loading,
+    loadError,
+    isSaving,
+    saveError,
+    flushSave,
+    linkedTo,
+    linkDoc,
+    unlinkDoc,
+    versions,
+    refreshVersions,
+    restoreVersion,
+  };
 }

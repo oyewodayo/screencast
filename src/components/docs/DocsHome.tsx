@@ -4,15 +4,16 @@
 // BoardHome.tsx's list/create/delete UX closely (including its two-step delete confirm and
 // click-outside-closes-menu handling) since Docs and Board are both per-item project folders under
 // briefcast_dir(), just with a Y.Doc instead of a canvas as the content.
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
-import { IoAdd, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoPin, IoSearch, IoTrashOutline } from "react-icons/io5";
+import { IoAdd, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoPin, IoSearch, IoTrashOutline } from "react-icons/io5";
 import { MdFileUpload } from "react-icons/md";
 import * as Y from "yjs";
-import { DocSummary } from "../../utils/docTypes";
+import { DOC_DRAG_MIME, DocFolder, DocSummary, flattenFolderTree } from "../../utils/docTypes";
 import { getPinnedDocIds, toggleDocPin, forgetDocPin } from "../../utils/docLibraryHistory";
 import { importDocxFile } from "../../utils/docxImport";
+import DocFolderSidebar from "./DocFolderSidebar";
 
 interface DocsHomeProps {
   onOpenDoc: (id: string) => void;
@@ -68,6 +69,82 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   // caching the result. This is a deliberate full-corpus decode on every DocsHome visit, not a
   // persistent index - acceptable at desktop/local doc-count scale, not meant to scale past that.
   const [bodyCache, setBodyCache] = useState<Record<string, string>>({});
+
+  // Folder tree - see docTypes.ts's DocFolder/flattenFolderTree comments. null selection means
+  // DocFolderSidebar's "All Documents" root, not "no folders exist yet".
+  const [folders, setFolders] = useState<DocFolder[]>([]);
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
+  // Which doc card's "Move to ▸" submenu is open (nested inside that card's own 3-dot menu).
+  const [moveMenuDocId, setMoveMenuDocId] = useState<string | null>(null);
+
+  const refreshFolders = useCallback(() => {
+    invoke<DocFolder[]>("list_doc_folders")
+      .then(setFolders)
+      .catch((err) => console.error("Failed to list document folders:", err));
+  }, []);
+
+  useEffect(() => {
+    refreshFolders();
+  }, [refreshFolders]);
+
+  // A folder (or one of its ancestors) can disappear out from under the current selection -
+  // deleted via its own menu, or in a future multi-window scenario - so if the selected id no
+  // longer resolves to a real folder, fall back to "All Documents" rather than showing an empty
+  // grid with no obvious way back.
+  useEffect(() => {
+    if (selectedFolderId && !folders.some((f) => f.id === selectedFolderId)) {
+      setSelectedFolderId(null);
+    }
+  }, [folders, selectedFolderId]);
+
+  const handleCreateFolder = useCallback(
+    (parentId: string | null, name: string) => {
+      invoke<DocFolder>("create_doc_folder", { id: crypto.randomUUID(), name, parentId })
+        .then((folder) => setFolders((prev) => [...prev, folder]))
+        .catch((err) => {
+          console.error("Failed to create folder:", err);
+          setError(err instanceof Error ? err.message : String(err));
+        });
+    },
+    []
+  );
+
+  const handleRenameFolder = useCallback((id: string, name: string) => {
+    invoke<DocFolder>("rename_doc_folder", { id, name })
+      .then((updated) => setFolders((prev) => prev.map((f) => (f.id === id ? updated : f))))
+      .catch((err) => {
+        console.error("Failed to rename folder:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      });
+  }, []);
+
+  const handleDeleteFolder = useCallback((id: string) => {
+    invoke("delete_doc_folder", { id })
+      .then(() => {
+        refreshFolders();
+        // Deleting un-files (doesn't delete) any doc that was filed under this folder or a
+        // descendant of it - re-list so those docs' folder_id updates reflect that immediately.
+        refresh();
+      })
+      .catch((err) => {
+        console.error("Failed to delete folder:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleMoveDocToFolder = useCallback((docId: string, folderId: string | null) => {
+    invoke<DocSummary>("set_doc_folder", { id: docId, folderId })
+      .then((updated) => setDocs((prev) => prev?.map((d) => (d.id === docId ? updated : d)) ?? prev))
+      .catch((err) => {
+        console.error("Failed to move document:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        setMoveMenuDocId(null);
+        setOpenMenuId(null);
+      });
+  }, []);
 
   const refresh = useCallback(() => {
     invoke<DocSummary[]>("list_docs")
@@ -135,6 +212,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     const handleClickOutside = (): void => {
       setOpenMenuId(null);
       setConfirmDeleteId(null);
+      setMoveMenuDocId(null);
     };
     document.addEventListener("click", handleClickOutside);
     return () => document.removeEventListener("click", handleClickOutside);
@@ -202,7 +280,9 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
       const existingCount = docs?.length ?? 0;
       const title = `Untitled document ${existingCount + 1}`;
       const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
-      await invoke("create_doc", { id, title, bytes });
+      // Files into whichever folder is currently being browsed - so clicking "New document" while
+      // inside a folder lands the doc there immediately instead of leaving it unfiled.
+      await invoke("create_doc", { id, title, bytes, folderId: selectedFolderId });
       onOpenDoc(id);
     } catch (err) {
       console.error("Failed to create document:", err);
@@ -210,7 +290,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     } finally {
       setIsCreating(false);
     }
-  }, [docs, onOpenDoc]);
+  }, [docs, selectedFolderId, onOpenDoc]);
 
   const handleImportDocx = useCallback(async () => {
     setError(null);
@@ -245,10 +325,15 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
 
   const normalizedQuery = searchQuery.trim().toLowerCase();
   const isSearching = normalizedQuery.length > 0;
-  const filteredDocs = docs?.filter(
+  // Search deliberately ignores the selected folder (searches every doc) - folder selection only
+  // scopes the plain browse view, so switching into a folder never hides a search result that
+  // happens to live elsewhere.
+  const folderScopedDocs = docs?.filter((d) => d.folder_id === selectedFolderId);
+  const filteredDocs = (isSearching ? docs : folderScopedDocs)?.filter(
     (d) => !isSearching || d.title.toLowerCase().includes(normalizedQuery) || (bodyCache[d.id] ?? "").includes(normalizedQuery)
   );
   const pinnedDocs = filteredDocs?.filter((d) => pinnedIds.includes(d.id)) ?? [];
+  const moveTargets = useMemo(() => flattenFolderTree(folders), [folders]);
 
   const renderCard = (doc: DocSummary) => (
     // A plain div (not <button>) - it needs to contain the 3-dot menu's own <button>, and nested
@@ -265,6 +350,14 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
           onOpenDoc(doc.id);
         }
       }}
+      // Additive on top of the "Move to ▸" menu (kept as-is for keyboard/precision use) - both
+      // paths end at the same handleMoveDocToFolder call, so there's exactly one place that
+      // actually invokes set_doc_folder.
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.setData(DOC_DRAG_MIME, doc.id);
+        e.dataTransfer.effectAllowed = "move";
+      }}
       className="group relative flex flex-col rounded-md bg-white/90 dark:bg-neutral-900/90 border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors cursor-pointer"
     >
       <div className="absolute top-1.5 right-1.5 z-10">
@@ -274,6 +367,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
           onClick={(e) => {
             e.stopPropagation();
             setConfirmDeleteId(null);
+            setMoveMenuDocId(null);
             setOpenMenuId((prev) => (prev === doc.id ? null : doc.id));
           }}
           className={`p-1 rounded-md bg-black/40 hover:bg-black/60 text-white transition-opacity ${
@@ -286,7 +380,13 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
         {openMenuId === doc.id && (
           <div
             onClick={(e) => e.stopPropagation()}
-            className="absolute right-0 top-full mt-1 w-44 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg overflow-hidden"
+            // No `overflow-hidden` here (unlike DocFolderSidebar's own menu) - the "Move to ▸"
+            // flyout below deliberately escapes this container's bounds via `right-full`, and
+            // overflow-hidden clips a positioned descendant to its ancestor's box regardless of
+            // what it's positioned *relative to*, which made the flyout render but never be
+            // visible. rounded-t-md/rounded-b-md on the first/last row keep the corners looking
+            // right without it.
+            className="absolute right-0 top-full mt-1 w-44 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg"
           >
             <button
               type="button"
@@ -294,15 +394,57 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
                 setPinnedIds(toggleDocPin(doc.id));
                 setOpenMenuId(null);
               }}
-              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-50 dark:hover:bg-neutral-700"
+              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-50 dark:hover:bg-neutral-700 rounded-t-md"
             >
               <IoPin size={14} />
               {pinnedIds.includes(doc.id) ? "Unpin document" : "Pin document"}
             </button>
+
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setMoveMenuDocId((prev) => (prev === doc.id ? null : doc.id))}
+                className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-50 dark:hover:bg-neutral-700"
+              >
+                <IoFolderOutline size={14} />
+                Move to…
+              </button>
+              {moveMenuDocId === doc.id && (
+                <div className="absolute right-full top-0 mr-1 w-48 max-h-60 overflow-y-auto bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg py-1">
+                  <button
+                    type="button"
+                    onClick={() => handleMoveDocToFolder(doc.id, null)}
+                    className={`w-full text-left px-3 py-1.5 text-sm hover:bg-gray-50 dark:hover:bg-neutral-700 ${
+                      doc.folder_id === null ? "text-blue-600 dark:text-blue-400 font-medium" : "text-gray-700 dark:text-neutral-200"
+                    }`}
+                  >
+                    All Documents (unfiled)
+                  </button>
+                  {moveTargets.length === 0 ? (
+                    <p className="px-3 py-1.5 text-xs text-gray-400 dark:text-neutral-500">No folders yet</p>
+                  ) : (
+                    moveTargets.map(({ folder, depth }) => (
+                      <button
+                        key={folder.id}
+                        type="button"
+                        onClick={() => handleMoveDocToFolder(doc.id, folder.id)}
+                        style={{ paddingLeft: `${12 + depth * 14}px` }}
+                        className={`w-full text-left pr-3 py-1.5 text-sm truncate hover:bg-gray-50 dark:hover:bg-neutral-700 ${
+                          doc.folder_id === folder.id ? "text-blue-600 dark:text-blue-400 font-medium" : "text-gray-700 dark:text-neutral-200"
+                        }`}
+                      >
+                        {folder.name}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+
             <button
               type="button"
               onClick={() => (confirmDeleteId === doc.id ? void handleDeleteDoc(doc.id) : setConfirmDeleteId(doc.id))}
-              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
+              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-b-md"
             >
               <IoTrashOutline size={14} />
               {confirmDeleteId === doc.id ? "Confirm delete?" : "Delete document"}
@@ -328,7 +470,19 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   );
 
   return (
-    <div className="relative flex flex-col items-center justify-start h-full w-full gap-6 px-8 py-10 overflow-y-auto">
+    <div className="flex h-full w-full">
+      {!showTrash && (
+        <DocFolderSidebar
+          folders={folders}
+          selectedFolderId={selectedFolderId}
+          onSelectFolder={setSelectedFolderId}
+          onCreateFolder={handleCreateFolder}
+          onRenameFolder={handleRenameFolder}
+          onDeleteFolder={handleDeleteFolder}
+          onDropDoc={handleMoveDocToFolder}
+        />
+      )}
+      <div className="relative flex-1 min-w-0 flex flex-col items-center justify-start h-full gap-6 px-8 py-10 overflow-y-auto">
       <div className="relative flex flex-col items-center gap-3 text-center">
         <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
           <IoDocumentTextOutline size={28} />
@@ -443,14 +597,21 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
             </div>
           )}
 
-          <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">Your documents</p>
+          <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
+            {isSearching ? "Search results" : selectedFolderId ? folders.find((f) => f.id === selectedFolderId)?.name ?? "Folder" : "Your documents"}
+          </p>
           {filteredDocs && filteredDocs.length > 0 ? (
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">{filteredDocs.map(renderCard)}</div>
-          ) : (
+          ) : isSearching ? (
             <p className="text-center text-sm text-gray-400 dark:text-neutral-500">No documents match "{searchQuery}"</p>
+          ) : (
+            <p className="text-center text-sm text-gray-400 dark:text-neutral-500">
+              {selectedFolderId ? "No documents in this folder yet" : "No unfiled documents - everything is organized into folders"}
+            </p>
           )}
         </div>
       )}
+      </div>
     </div>
   );
 };

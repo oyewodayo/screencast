@@ -10,7 +10,7 @@ import { open as openFileDialog } from "@tauri-apps/api/dialog";
 import { useEditor, EditorContent } from "@tiptap/react";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
-import { IoArrowBack, IoClose } from "react-icons/io5";
+import { IoArrowBack, IoClose, IoTimeOutline } from "react-icons/io5";
 import {
   MdFormatBold,
   MdFormatItalic,
@@ -42,7 +42,10 @@ import { docJsonToMarkdown } from "../../utils/docMarkdown";
 import { buildDocxBytes } from "../../utils/docDocx";
 import { LibraryFileEntry } from "../../utils/docTypes";
 import { createDocImagePasteExtension, uploadImageFromPath } from "../../utils/docImagePaste";
-import { getDocContentExtensions } from "../../utils/docSchemaExtensions";
+import { createSlashCommandExtension } from "../../utils/docSlashCommand";
+import { getDocContentExtensions, docProseClassName } from "../../utils/docSchemaExtensions";
+import DocVersionHistoryPanel from "./DocVersionHistoryPanel";
+import "./docCodeHighlight.css";
 
 interface DocsEditorProps {
   docId: string;
@@ -75,6 +78,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const [showHighlightPicker, setShowHighlightPicker] = useState(false);
   const [showAlignMenu, setShowAlignMenu] = useState(false);
   const [showTableOptions, setShowTableOptions] = useState(false);
+  const [showVersionHistory, setShowVersionHistory] = useState(false);
 
   const editor = useEditor(
     {
@@ -88,6 +92,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         // eventually receive remote updates too.
         ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
         createDocImagePasteExtension(docId),
+        createSlashCommandExtension(docId),
         Placeholder.configure({ placeholder: "Start writing…" }),
       ],
       editable: !store.loading,
@@ -204,6 +209,17 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     }
   }, [editor, store.title]);
 
+  // Recomputed on every render, not memoized on editor content - the toolbar area already
+  // re-renders on every transaction (see the canUndo/canRedo comment above), so this is no more
+  // work than that, and memoizing against a Tiptap editor instance (which never itself changes
+  // identity on content edits) would just leave the count stale.
+  const wordCount = useMemo(() => {
+    if (!editor) return 0;
+    const text = editor.getText().trim();
+    return text ? text.split(/\s+/).length : 0;
+  }, [editor, editor?.state.doc]);
+  const charCount = editor ? editor.getText().length : 0;
+
   const linkedFile = useMemo(() => libraryFiles.find((f) => f.path === store.linkedTo), [libraryFiles, store.linkedTo]);
   const filteredLibraryFiles = useMemo(() => {
     const q = fileFilter.trim().toLowerCase();
@@ -229,6 +245,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           placeholder="Untitled document"
           className="min-w-0 flex-1 max-w-xs px-2 py-1 rounded-md text-sm font-medium bg-transparent border border-transparent hover:border-neutral-300 dark:hover:border-neutral-700 focus:border-blue-400 dark:focus:border-blue-500 outline-none text-neutral-800 dark:text-neutral-100"
         />
+
+        {editor && !store.loading && (
+          <span className="text-xs text-neutral-400 dark:text-neutral-500 shrink-0 print:hidden">
+            {wordCount.toLocaleString()} {wordCount === 1 ? "word" : "words"} · {charCount.toLocaleString()} characters
+          </span>
+        )}
 
         <span className="text-xs text-neutral-400 dark:text-neutral-500 shrink-0">
           {exportStatus ?? (store.isSaving ? "Saving…" : store.saveError ? "Save failed" : "")}
@@ -610,6 +632,18 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               </div>
             )}
 
+            <button
+              type="button"
+              title="Version history"
+              onClick={() => {
+                store.refreshVersions();
+                setShowVersionHistory(true);
+              }}
+              className={toolbarButtonClass(false)}
+            >
+              <IoTimeOutline size={18} />
+            </button>
+
             <div className="relative">
               <button type="button" title="Export" onClick={() => setShowExportMenu((v) => !v)} className={toolbarButtonClass(showExportMenu)}>
                 <MdFileDownload size={18} />
@@ -665,40 +699,19 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           // floating directly on the app background - gives the document a distinct identity the
           // way Docs/Notion-style editors do, instead of blending into the chrome around it.
           <div className="max-w-3xl mx-auto bg-white dark:bg-neutral-900 rounded-xl ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-sm px-14 py-14 min-h-[75vh] print:shadow-none print:ring-0 print:rounded-none print:px-0 print:py-0 print:max-w-none print:min-h-0">
-            <EditorContent
-              editor={editor}
-              className={[
-                "prose prose-sm dark:prose-invert prose-neutral max-w-none",
-                "[&_.ProseMirror]:outline-none [&_.ProseMirror]:min-h-[50vh]",
-                // Uniform rhythm between every top-level block (paragraph/heading/list/quote/code)
-                // instead of Typography's own per-element-type spacing scale, which is what made
-                // the gaps between block types look inconsistent.
-                "[&_.ProseMirror>*]:my-0 [&_.ProseMirror>*+*]:mt-4",
-                // Code blocks: full card width (not sized to content), a real monospace stack, and
-                // a small static "Code" label so it reads as a distinct block at a glance - no
-                // per-language syntax highlighting yet, that's a separate feature.
-                "[&_.ProseMirror_pre]:w-full [&_.ProseMirror_pre]:box-border [&_.ProseMirror_pre]:font-mono [&_.ProseMirror_pre]:text-[13px] [&_.ProseMirror_pre]:leading-relaxed",
-                "[&_.ProseMirror_pre]:relative [&_.ProseMirror_pre]:rounded-lg [&_.ProseMirror_pre]:pt-7",
-                "[&_.ProseMirror_pre::before]:content-['Code'] [&_.ProseMirror_pre::before]:absolute [&_.ProseMirror_pre::before]:top-2 [&_.ProseMirror_pre::before]:right-3",
-                "[&_.ProseMirror_pre::before]:text-[10px] [&_.ProseMirror_pre::before]:uppercase [&_.ProseMirror_pre::before]:tracking-wide [&_.ProseMirror_pre::before]:text-neutral-400",
-                // Blockquote: a soft tint behind the existing left-border-and-italic Typography
-                // default, so it reads as its own block rather than just indented italic text.
-                "[&_.ProseMirror_blockquote]:bg-neutral-50 dark:[&_.ProseMirror_blockquote]:bg-neutral-800/40 [&_.ProseMirror_blockquote]:rounded-r-md [&_.ProseMirror_blockquote]:py-1",
-                // Empty-doc placeholder ("Start writing…") - @tiptap/extension-placeholder decorates
-                // the empty paragraph with `is-editor-empty` + a data-placeholder attribute rather
-                // than rendering real text, so this is what actually makes it visible.
-                "[&_.ProseMirror_p.is-editor-empty::before]:content-[attr(data-placeholder)] [&_.ProseMirror_p.is-editor-empty::before]:float-left",
-                "[&_.ProseMirror_p.is-editor-empty::before]:h-0 [&_.ProseMirror_p.is-editor-empty::before]:pointer-events-none",
-                "[&_.ProseMirror_p.is-editor-empty::before]:text-neutral-400 dark:[&_.ProseMirror_p.is-editor-empty::before]:text-neutral-500",
-                // Image selection/resize/crop/reorder styling lives entirely inside
-                // DocImageView.tsx (a custom NodeView), driven by the `selected` prop Tiptap passes
-                // it directly - not global CSS, since ProseMirror-selectednode lands on the
-                // NodeView's own wrapper element rather than the raw <img> once a NodeView owns it.
-              ].join(" ")}
-            />
+            <EditorContent editor={editor} className={docProseClassName} />
           </div>
         )}
       </div>
+
+      {showVersionHistory && (
+        <DocVersionHistoryPanel
+          docId={docId}
+          versions={store.versions}
+          onClose={() => setShowVersionHistory(false)}
+          onRestore={store.restoreVersion}
+        />
+      )}
     </div>
   );
 };
