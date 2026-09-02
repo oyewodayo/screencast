@@ -24,6 +24,16 @@ base64 = "0.22"
 # the folder, etc.) - notify-debouncer-mini re-exports a compatible `notify` itself, so it isn't
 # also listed as a direct dependency here.
 notify-debouncer-mini = "0.7"
+# Backs services/docs_search.rs's full-text search index for the Docs feature (DocsHome.tsx's
+# search used to decode every doc's full Yjs bytes into memory on every search keystroke, which
+# doesn't scale past a modest doc count - see that file's own comment). "bundled" statically links
+# SQLite itself rather than requiring one already installed on the machine, which matters a lot for
+# a distributed desktop app - and, usefully, libsqlite3-sys's own build script passes
+# -DSQLITE_ENABLE_FTS5 unconditionally for every bundled build, so the FTS5 virtual-table module
+# the index is built on needs no separate feature flag here. (rusqlite has no feature literally
+# named "fts5" at all, in this or any version - confirmed directly against its own Cargo.toml and
+# libsqlite3-sys's build.rs after cargo's dependency resolution rejected that name outright.)
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Win32 bindings — only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the

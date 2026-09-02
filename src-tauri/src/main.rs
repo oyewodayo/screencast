@@ -25,6 +25,7 @@ mod services {
     pub mod file_watcher;
     pub mod boards;
     pub mod docs;
+    pub mod docs_search;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
@@ -300,6 +301,10 @@ fn main() {
             services::docs::reopen_doc_comment,
             services::docs::delete_doc_comment,
             services::docs::set_doc_page_setup,
+            services::docs_search::index_doc_content,
+            services::docs_search::remove_doc_from_index,
+            services::docs_search::list_indexed_doc_ids,
+            services::docs_search::search_docs,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

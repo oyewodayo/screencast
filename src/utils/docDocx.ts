@@ -11,15 +11,23 @@ import type { JSONContent } from "@tiptap/core";
 import {
   AlignmentType,
   BorderStyle,
+  CommentReference,
+  CommentRangeEnd,
+  CommentRangeStart,
   Document,
   ExternalHyperlink,
+  Footer,
+  Header,
   HeadingLevel,
   IBordersOptions,
+  type ICommentOptions,
   ImageRun,
   LevelFormat,
   Packer,
+  PageBreak,
   Paragraph,
   ParagraphChild,
+  type PositiveUniversalMeasure,
   Table,
   TableCell,
   TableRow,
@@ -28,6 +36,8 @@ import {
   WidthType,
 } from "docx";
 import { invoke } from "@tauri-apps/api/tauri";
+import type { DocComment, DocPageSize } from "./docTypes";
+import { PAGE_DIMENSIONS_IN, PAGE_MARGIN_IN } from "./docPageGeometry";
 
 const ALIGNMENT_BY_TEXT_ALIGN: Record<string, (typeof AlignmentType)[keyof typeof AlignmentType]> = {
   left: AlignmentType.LEFT,
@@ -128,10 +138,36 @@ function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
   };
 }
 
-async function renderInline(content: JSONContent[] | undefined, forceBold = false): Promise<ParagraphChild[]> {
+// commentIdFor maps a comment mark's UUID commentId to the small sequential integer id real .docx
+// comments need (Word's own CommentRangeStart/End/Reference/Comment XML all key off a plain
+// number, not a UUID) - passed in from DocxBuilder rather than looked up globally, since the
+// mapping (and which comments actually got referenced, for the final Comments list) is per-export
+// state, not something this standalone function should own itself.
+async function renderInline(content: JSONContent[] | undefined, commentIdFor: (uuid: string) => number, forceBold = false): Promise<ParagraphChild[]> {
   if (!content) return [];
   const runs: ParagraphChild[] = [];
+  // A comment mark wraps a *range* of text, which can span several runs (e.g. commented text that's
+  // also partly bold) - tracked here as "the comment range currently open", closed either when the
+  // next node's commentId differs or at the end of this content array. Only handles ranges within a
+  // single call to renderInline (i.e. within one paragraph/list-item/etc's own content) - a comment
+  // spanning across separate top-level blocks is a rarer case this doesn't attempt to reconstruct.
+  let activeCommentId: string | null = null;
+  const closeComment = () => {
+    if (!activeCommentId) return;
+    const numericId = commentIdFor(activeCommentId);
+    runs.push(new CommentRangeEnd(numericId));
+    runs.push(new CommentReference(numericId));
+    activeCommentId = null;
+  };
   for (const node of content) {
+    const commentId = (node.marks?.find((m) => m.type === "comment")?.attrs?.commentId as string | undefined) ?? null;
+    if (commentId !== activeCommentId) {
+      closeComment();
+      if (commentId) {
+        runs.push(new CommentRangeStart(commentIdFor(commentId)));
+        activeCommentId = commentId;
+      }
+    }
     if (node.type === "text") {
       const options = { text: node.text ?? "", ...runOptionsFromMarks(node.marks, forceBold) };
       const link = node.marks?.find((m) => m.type === "link");
@@ -153,6 +189,7 @@ async function renderInline(content: JSONContent[] | undefined, forceBold = fals
       if (image) runs.push(image);
     }
   }
+  closeComment();
   return runs;
 }
 
@@ -188,6 +225,22 @@ interface NumberingLevel {
 class DocxBuilder {
   private numberingConfigs: { reference: string; levels: NumberingLevel[] }[] = [];
   private nextListId = 0;
+  // Populated by build() before any rendering starts - the DocComment records available to look up
+  // each referenced commentId's actual text/date when the final Comments list is assembled.
+  private comments: DocComment[] = [];
+  private commentNumericIds = new Map<string, number>();
+  private nextCommentNumericId = 0;
+
+  // An arrow class field (auto-bound), not a plain method, so it can be passed directly as
+  // renderInline's commentIdFor callback without a separate .bind(this) at every call site.
+  private commentIdFor = (uuid: string): number => {
+    let id = this.commentNumericIds.get(uuid);
+    if (id === undefined) {
+      id = this.nextCommentNumericId++;
+      this.commentNumericIds.set(uuid, id);
+    }
+    return id;
+  };
 
   private registerNumberingLevel(reference: string, level: number, start: number): void {
     let config = this.numberingConfigs.find((c) => c.reference === reference);
@@ -213,7 +266,7 @@ class DocxBuilder {
         if (child.type === "paragraph") {
           out.push(
             new Paragraph({
-              children: await renderInline(child.content),
+              children: await renderInline(child.content, this.commentIdFor),
               bullet: { level },
               alignment: alignmentFor(child),
             })
@@ -239,7 +292,7 @@ class DocxBuilder {
         if (child.type === "paragraph") {
           out.push(
             new Paragraph({
-              children: await renderInline(child.content),
+              children: await renderInline(child.content, this.commentIdFor),
               numbering: { reference: ref, level },
               alignment: alignmentFor(child),
             })
@@ -311,7 +364,7 @@ class DocxBuilder {
       case "paragraph":
         return [
           new Paragraph({
-            children: await renderInline(node.content, forceBold),
+            children: await renderInline(node.content, this.commentIdFor, forceBold),
             alignment: alignmentFor(node),
             indent,
             border,
@@ -321,7 +374,7 @@ class DocxBuilder {
         const level = (node.attrs?.level as number) ?? 1;
         return [
           new Paragraph({
-            children: await renderInline(node.content, forceBold),
+            children: await renderInline(node.content, this.commentIdFor, forceBold),
             heading: HEADING_BY_LEVEL[level],
             alignment: alignmentFor(node),
             indent,
@@ -366,8 +419,12 @@ class DocxBuilder {
         const table = await this.renderTable(node);
         return table ? [table] : [];
       }
+      // docx's own PageBreak is a Run (extends Run - see its own import), the standard idiom for
+      // forcing one is a Paragraph containing nothing but it.
+      case "pageBreak":
+        return [new Paragraph({ children: [new PageBreak()] })];
       default:
-        return [new Paragraph({ children: await renderInline(node.content, forceBold) })];
+        return [new Paragraph({ children: await renderInline(node.content, this.commentIdFor, forceBold) })];
     }
   }
 
@@ -377,12 +434,60 @@ class DocxBuilder {
     return out;
   }
 
-  async build(json: JSONContent, title: string): Promise<Uint8Array> {
+  async build(json: JSONContent, title: string, options: DocxExportOptions = {}): Promise<Uint8Array> {
+    this.comments = options.comments ?? [];
     const children = await this.renderBlocks(json.content ?? []);
+
+    // Only comments whose mark actually appears somewhere in the rendered content end up here -
+    // commentNumericIds is populated exclusively by renderInline's commentIdFor calls during the
+    // renderBlocks() pass just above, so a resolved-but-still-anchored comment still exports (this
+    // format has no "resolved" concept to preserve), while a comment whose mark was already
+    // removed from the doc doesn't produce a dangling, unreferenced Comment entry.
+    // Document's own `comments` option wants plain ICommentOptions data, not Comment class
+    // instances (those are what docx builds internally *from* this data) - confirmed by the type
+    // error passing `new Comment(...)` here originally produced.
+    const commentChildren: ICommentOptions[] = [...this.commentNumericIds.entries()].map(([uuid, id]) => {
+      const comment = this.comments.find((c) => c.mark_id === uuid);
+      return {
+        id,
+        author: "Briefcast",
+        initials: "BC",
+        date: comment?.created_at ? new Date(comment.created_at) : new Date(),
+        children: [new Paragraph({ children: [new TextRun(comment?.text ?? "")] })],
+      };
+    });
+
+    // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
+    // the same real 1in margin on every side, not docx's own unrelated defaults.
+    const dims = PAGE_DIMENSIONS_IN[options.pageSize ?? "letter"];
+    const width = `${dims.width}in` as PositiveUniversalMeasure;
+    const height = `${dims.height}in` as PositiveUniversalMeasure;
+    const margin = `${PAGE_MARGIN_IN}in` as PositiveUniversalMeasure;
+
     const doc = new Document({
       title,
       numbering: { config: this.numberingConfigs },
-      sections: [{ children }],
+      comments: commentChildren.length > 0 ? { children: commentChildren } : undefined,
+      sections: [
+        {
+          properties: {
+            page: {
+              size: { width, height },
+              margin: { top: margin, bottom: margin, left: margin, right: margin },
+            },
+          },
+          // Repeats on every page in real Word, unlike the CSS position:fixed trick the live
+          // print/PDF path needs (see DocsEditor.tsx's own comment on that) - .docx's header/footer
+          // model is native page-chrome, no workaround required here.
+          headers: options.headerText
+            ? { default: new Header({ children: [new Paragraph({ children: [new TextRun(options.headerText)] })] }) }
+            : undefined,
+          footers: options.footerText
+            ? { default: new Footer({ children: [new Paragraph({ children: [new TextRun(options.footerText)] })] }) }
+            : undefined,
+          children,
+        },
+      ],
     });
     // Packer.toBuffer() hardcodes JSZip's "nodebuffer" output type internally, which requires
     // Node's global Buffer and throws ("nodebuffer is not supported by this platform") in a
@@ -392,6 +497,13 @@ class DocxBuilder {
   }
 }
 
-export async function buildDocxBytes(json: JSONContent, title: string): Promise<Uint8Array> {
-  return new DocxBuilder().build(json, title);
+export interface DocxExportOptions {
+  comments?: DocComment[];
+  pageSize?: DocPageSize | null;
+  headerText?: string | null;
+  footerText?: string | null;
+}
+
+export async function buildDocxBytes(json: JSONContent, title: string, options?: DocxExportOptions): Promise<Uint8Array> {
+  return new DocxBuilder().build(json, title, options);
 }

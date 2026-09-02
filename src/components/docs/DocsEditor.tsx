@@ -289,7 +289,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     async (extension: "md" | "txt") => {
       if (!editor) return;
       setShowExportMenu(false);
-      const content = extension === "md" ? docJsonToMarkdown(editor.getJSON()) : editor.getText({ blockSeparator: "\n\n" });
+      const content = extension === "md" ? docJsonToMarkdown(editor.getJSON(), store.comments) : editor.getText({ blockSeparator: "\n\n" });
       try {
         await invoke("export_doc", { docTitle: store.title, extension, content });
         setExportStatus("Exported");
@@ -308,7 +308,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     setShowExportMenu(false);
     setExportStatus("Exporting…");
     try {
-      const bytes = await buildDocxBytes(editor.getJSON(), store.title);
+      const bytes = await buildDocxBytes(editor.getJSON(), store.title, {
+        comments: store.comments,
+        pageSize: store.pageSize,
+        headerText: store.headerText,
+        footerText: store.footerText,
+      });
       await invoke("export_doc_binary", { docTitle: store.title, extension: "docx", bytes: Array.from(bytes) });
       setExportStatus("Exported");
     } catch (err) {
@@ -348,6 +353,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
           e.preventDefault();
           setShowFindReplace(true);
+          return;
+        }
+        // Ctrl/Cmd+K opens the same "Add link"/"Remove link" popover the toolbar button does - one
+        // of the most reflexive shortcuts from both Word and Docs, previously toolbar-only here.
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+          e.preventDefault();
+          toggleLink();
           return;
         }
         // Escape closes whatever toolbar popover is currently open - one handler here rather than
@@ -416,7 +428,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         <button
           type="button"
           onClick={handleBack}
-          title="Back to docs"
+          title="Back to docs" aria-label="Back to docs"
           className="p-2 rounded-md text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
         >
           <IoArrowBack size={18} />
@@ -471,10 +483,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             const canRedo = editor.can().redo?.() ?? false;
             return (
               <>
-                <button type="button" title="Undo" disabled={!canUndo} onClick={() => canUndo && editor.chain().focus().undo().run()} className={toolbarButtonClass(false, !canUndo)}>
+                <button type="button" title="Undo" aria-label="Undo" disabled={!canUndo} onClick={() => canUndo && editor.chain().focus().undo().run()} className={toolbarButtonClass(false, !canUndo)}>
                   <MdUndo size={18} />
                 </button>
-                <button type="button" title="Redo" disabled={!canRedo} onClick={() => canRedo && editor.chain().focus().redo().run()} className={toolbarButtonClass(false, !canRedo)}>
+                <button type="button" title="Redo" aria-label="Redo" disabled={!canRedo} onClick={() => canRedo && editor.chain().focus().redo().run()} className={toolbarButtonClass(false, !canRedo)}>
                   <MdRedo size={18} />
                 </button>
               </>
@@ -486,7 +498,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           {/* One dropdown (Normal/Heading 1-3) rather than three separate H1/H2/H3 buttons - same
               information, closer to Word's own Home-tab "Styles" gallery footprint. */}
           <select
-            title="Paragraph style"
+            title="Paragraph style" aria-label="Paragraph style"
             value={([1, 2, 3] as const).find((level) => editor.isActive("heading", { level }))?.toString() ?? "normal"}
             onChange={(e) => {
               const value = e.target.value;
@@ -508,7 +520,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               behind a click, same reasoning Google Docs' own toolbar uses for keeping them always
               visible instead of in an overflow menu. */}
           <select
-            title="Font family"
+            title="Font family" aria-label="Font family"
             value={editor.getAttributes("textStyle").fontFamily ?? ""}
             onChange={(e) => {
               const value = e.target.value;
@@ -526,7 +538,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           </select>
           <input
             type="number"
-            title="Font size (pt)"
+            title="Font size (pt)" aria-label="Font size (pt)"
             min={1}
             max={200}
             value={editor.getAttributes("textStyle").fontSize ?? ""}
@@ -541,10 +553,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
           {toolbarDivider}
 
-          <button type="button" title="Bold" onClick={() => editor.chain().focus().toggleBold().run()} className={toolbarButtonClass(editor.isActive("bold"))}>
+          <button type="button" title="Bold" aria-label="Bold" onClick={() => editor.chain().focus().toggleBold().run()} className={toolbarButtonClass(editor.isActive("bold"))}>
             <MdFormatBold size={18} />
           </button>
-          <button type="button" title="Italic" onClick={() => editor.chain().focus().toggleItalic().run()} className={toolbarButtonClass(editor.isActive("italic"))}>
+          <button type="button" title="Italic" aria-label="Italic" onClick={() => editor.chain().focus().toggleItalic().run()} className={toolbarButtonClass(editor.isActive("italic"))}>
             <MdFormatItalic size={18} />
           </button>
           {(() => {
@@ -558,7 +570,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             return (
               <button
                 type="button"
-                title="Underline"
+                title="Underline" aria-label="Underline"
                 onClick={() =>
                   onLink
                     ? editor.chain().focus().updateAttributes("link", { underlineOff: !linkUnderlineOff }).run()
@@ -570,21 +582,21 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               </button>
             );
           })()}
-          <button type="button" title="Strikethrough" onClick={() => editor.chain().focus().toggleStrike().run()} className={toolbarButtonClass(editor.isActive("strike"))}>
+          <button type="button" title="Strikethrough" aria-label="Strikethrough" onClick={() => editor.chain().focus().toggleStrike().run()} className={toolbarButtonClass(editor.isActive("strike"))}>
             <MdStrikethroughS size={18} />
           </button>
-          <button type="button" title="Inline code" onClick={() => editor.chain().focus().toggleCode().run()} className={toolbarButtonClass(editor.isActive("code"))}>
+          <button type="button" title="Inline code" aria-label="Inline code" onClick={() => editor.chain().focus().toggleCode().run()} className={toolbarButtonClass(editor.isActive("code"))}>
             <MdCode size={18} />
           </button>
-          <button type="button" title="Superscript" onClick={() => editor.chain().focus().toggleSuperscript().run()} className={toolbarButtonClass(editor.isActive("superscript"))}>
+          <button type="button" title="Superscript" aria-label="Superscript" onClick={() => editor.chain().focus().toggleSuperscript().run()} className={toolbarButtonClass(editor.isActive("superscript"))}>
             <MdSuperscript size={18} />
           </button>
-          <button type="button" title="Subscript" onClick={() => editor.chain().focus().toggleSubscript().run()} className={toolbarButtonClass(editor.isActive("subscript"))}>
+          <button type="button" title="Subscript" aria-label="Subscript" onClick={() => editor.chain().focus().toggleSubscript().run()} className={toolbarButtonClass(editor.isActive("subscript"))}>
             <MdSubscript size={18} />
           </button>
           <button
             type="button"
-            title="Clear formatting"
+            title="Clear formatting" aria-label="Clear formatting"
             onClick={() => editor.chain().focus().unsetAllMarks().clearNodes().run()}
             className={toolbarButtonClass(false)}
           >
@@ -594,7 +606,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           {toolbarDivider}
 
           <div className="relative">
-            <button type="button" title="Text color" onClick={() => setShowTextColorPicker((v) => !v)} className={toolbarButtonClass(showTextColorPicker)}>
+            <button type="button" title="Text color" aria-label="Text color" onClick={() => setShowTextColorPicker((v) => !v)} className={toolbarButtonClass(showTextColorPicker)}>
               <span className="flex flex-col items-center">
                 <MdFormatColorText size={18} />
                 <span
@@ -621,7 +633,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           </div>
 
           <div className="relative">
-            <button type="button" title="Highlight color" onClick={() => setShowHighlightPicker((v) => !v)} className={toolbarButtonClass(showHighlightPicker)}>
+            <button type="button" title="Highlight color" aria-label="Highlight color" onClick={() => setShowHighlightPicker((v) => !v)} className={toolbarButtonClass(showHighlightPicker)}>
               <span className="flex flex-col items-center">
                 <MdFormatColorFill size={18} />
                 <span
@@ -654,7 +666,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               const activeAlign = (["left", "center", "right", "justify"] as const).find((align) => editor.isActive({ textAlign: align })) ?? "left";
               const AlignIcon = { left: MdFormatAlignLeft, center: MdFormatAlignCenter, right: MdFormatAlignRight, justify: MdFormatAlignJustify }[activeAlign];
               return (
-                <button type="button" title="Align" onClick={() => setShowAlignMenu((v) => !v)} className={toolbarButtonClass(showAlignMenu)}>
+                <button type="button" title="Align" aria-label="Align" onClick={() => setShowAlignMenu((v) => !v)} className={toolbarButtonClass(showAlignMenu)}>
                   <AlignIcon size={18} />
                 </button>
               );
@@ -673,6 +685,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                     key={align}
                     type="button"
                     title={label}
+                    aria-label={label}
                     onClick={() => {
                       editor.chain().focus().setTextAlign(align).run();
                       setShowAlignMenu(false);
@@ -687,7 +700,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           </div>
 
           <div className="relative">
-            <button type="button" title="Line spacing" onClick={() => setShowLineSpacingMenu((v) => !v)} className={toolbarButtonClass(showLineSpacingMenu)}>
+            <button type="button" title="Line spacing" aria-label="Line spacing" onClick={() => setShowLineSpacingMenu((v) => !v)} className={toolbarButtonClass(showLineSpacingMenu)}>
               <MdFormatLineSpacing size={18} />
             </button>
             {showLineSpacingMenu && (
@@ -719,34 +732,34 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             )}
           </div>
 
-          <button type="button" title="Decrease indent" onClick={() => editor.chain().focus().outdent().run()} className={toolbarButtonClass(false)}>
+          <button type="button" title="Decrease indent" aria-label="Decrease indent" onClick={() => editor.chain().focus().outdent().run()} className={toolbarButtonClass(false)}>
             <MdFormatIndentDecrease size={18} />
           </button>
-          <button type="button" title="Increase indent" onClick={() => editor.chain().focus().indent().run()} className={toolbarButtonClass(false)}>
+          <button type="button" title="Increase indent" aria-label="Increase indent" onClick={() => editor.chain().focus().indent().run()} className={toolbarButtonClass(false)}>
             <MdFormatIndentIncrease size={18} />
           </button>
 
           {toolbarDivider}
 
-          <button type="button" title="Blockquote" onClick={() => editor.chain().focus().toggleBlockquote().run()} className={toolbarButtonClass(editor.isActive("blockquote"))}>
+          <button type="button" title="Blockquote" aria-label="Blockquote" onClick={() => editor.chain().focus().toggleBlockquote().run()} className={toolbarButtonClass(editor.isActive("blockquote"))}>
             <MdFormatQuote size={18} />
           </button>
-          <button type="button" title="Code block" onClick={() => editor.chain().focus().toggleCodeBlock().run()} className={toolbarButtonClass(editor.isActive("codeBlock"))}>
+          <button type="button" title="Code block" aria-label="Code block" onClick={() => editor.chain().focus().toggleCodeBlock().run()} className={toolbarButtonClass(editor.isActive("codeBlock"))}>
             <MdDataObject size={18} />
           </button>
 
           {toolbarDivider}
 
-          <button type="button" title="Bullet list" onClick={() => editor.chain().focus().toggleBulletList().run()} className={toolbarButtonClass(editor.isActive("bulletList"))}>
+          <button type="button" title="Bullet list" aria-label="Bullet list" onClick={() => editor.chain().focus().toggleBulletList().run()} className={toolbarButtonClass(editor.isActive("bulletList"))}>
             <MdFormatListBulleted size={18} />
           </button>
-          <button type="button" title="Numbered list" onClick={() => editor.chain().focus().toggleOrderedList().run()} className={toolbarButtonClass(editor.isActive("orderedList"))}>
+          <button type="button" title="Numbered list" aria-label="Numbered list" onClick={() => editor.chain().focus().toggleOrderedList().run()} className={toolbarButtonClass(editor.isActive("orderedList"))}>
             <MdFormatListNumbered size={18} />
           </button>
 
           {toolbarDivider}
 
-          <button type="button" title="Insert image" onClick={() => void handleInsertImage()} className={toolbarButtonClass(false)}>
+          <button type="button" title="Insert image" aria-label="Insert image" onClick={() => void handleInsertImage()} className={toolbarButtonClass(false)}>
             <MdImage size={18} />
           </button>
 
@@ -754,7 +767,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             {(() => {
               const isLinkActive = editor.isActive("link");
               return (
-                <button type="button" title={isLinkActive ? "Remove link" : "Add link"} onClick={toggleLink} className={toolbarButtonClass(isLinkActive)}>
+                <button
+                  type="button"
+                  title={isLinkActive ? "Remove link" : "Add link"}
+                  aria-label={isLinkActive ? "Remove link" : "Add link"}
+                  onClick={toggleLink}
+                  className={toolbarButtonClass(isLinkActive)}
+                >
                   {isLinkActive ? <MdLinkOff size={18} /> : <MdLink size={18} />}
                 </button>
               );
@@ -802,7 +821,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
           <button
             type="button"
-            title="Insert table"
+            title="Insert table" aria-label="Insert table"
             onClick={() => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()}
             className={toolbarButtonClass(false)}
           >
@@ -811,7 +830,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
           {editor.isActive("table") && (
             <div className="relative">
-              <button type="button" title="Table options" onClick={() => setShowTableOptions((v) => !v)} className={toolbarButtonClass(showTableOptions)}>
+              <button type="button" title="Table options" aria-label="Table options" onClick={() => setShowTableOptions((v) => !v)} className={toolbarButtonClass(showTableOptions)}>
                 <MdTableRows size={18} />
               </button>
               {showTableOptions && (
@@ -850,7 +869,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             <div className="relative">
               <button
                 type="button"
-                title="Add comment"
+                title="Add comment" aria-label="Add comment"
                 disabled={!editor || editor.state.selection.empty}
                 onClick={() => {
                   setCommentDraft("");
@@ -897,7 +916,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
             <button
               type="button"
-              title="Comments"
+              title="Comments" aria-label="Comments"
               onClick={() => setShowComments((v) => !v)}
               className={toolbarButtonClass(showComments)}
             >
@@ -909,7 +928,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                 <MdInsertLink size={14} />
                 <button
                   type="button"
-                  title="Open linked recording"
+                  title="Open linked recording" aria-label="Open linked recording"
                   onClick={() => linkedFile && onOpenLinkedFile?.(linkedFile.path, linkedFile.name)}
                   className="truncate max-w-[10rem] hover:underline text-left"
                 >
@@ -917,7 +936,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                 </button>
                 <button
                   type="button"
-                  title="Unlink"
+                  title="Unlink" aria-label="Unlink"
                   onClick={() => void store.unlinkDoc()}
                   className="p-0.5 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 hover:text-red-500"
                 >
@@ -928,7 +947,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               <div className="relative">
                 <button
                   type="button"
-                  title="Link to recording"
+                  title="Link to recording" aria-label="Link to recording"
                   onClick={() => setShowFilePicker((v) => !v)}
                   className={toolbarButtonClass(showFilePicker)}
                 >
@@ -970,7 +989,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
             <button
               type="button"
-              title="Find and replace (Ctrl+F)"
+              title="Find and replace (Ctrl+F)" aria-label="Find and replace (Ctrl+F)"
               onClick={() => setShowFindReplace(true)}
               className={toolbarButtonClass(showFindReplace)}
             >
@@ -979,7 +998,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
 
             <button
               type="button"
-              title="Version history"
+              title="Version history" aria-label="Version history"
               onClick={() => {
                 store.refreshVersions();
                 setShowVersionHistory(true);
@@ -990,7 +1009,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             </button>
 
             <div className="relative">
-              <button type="button" title="Page setup" onClick={() => setShowPageSetup((v) => !v)} className={toolbarButtonClass(showPageSetup)}>
+              <button type="button" title="Page setup" aria-label="Page setup" onClick={() => setShowPageSetup((v) => !v)} className={toolbarButtonClass(showPageSetup)}>
                 <IoOptionsOutline size={18} />
               </button>
               {showPageSetup && (
@@ -1005,7 +1024,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             </div>
 
             <div className="relative">
-              <button type="button" title="Export" onClick={() => setShowExportMenu((v) => !v)} className={toolbarButtonClass(showExportMenu)}>
+              <button type="button" title="Export" aria-label="Export" onClick={() => setShowExportMenu((v) => !v)} className={toolbarButtonClass(showExportMenu)}>
                 <MdFileDownload size={18} />
               </button>
               {showExportMenu && (

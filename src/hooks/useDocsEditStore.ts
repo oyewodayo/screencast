@@ -14,6 +14,7 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { appWindow } from "@tauri-apps/api/window";
 import * as Y from "yjs";
 import { DocComment, DocPageSize, DocVersionSummary } from "../utils/docTypes";
+import { extractPlainText } from "../utils/docYjsText";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 // Confirmed with the user: a periodic snapshot every ~10 minutes while a doc is actively being
@@ -131,6 +132,12 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
       await invoke("save_doc", { id, bytes, title: titleRef.current });
       setIsSaving(false);
       setSaveError(null);
+      // Keeps docs_search.rs's FTS5 index fresh on every autosave - fire-and-forget, a search
+      // index lagging slightly behind an in-flight edit isn't worth surfacing as a save error.
+      const body = extractPlainText(current.getXmlFragment("default"));
+      invoke("index_doc_content", { id, title: titleRef.current, body }).catch((err) =>
+        console.error("Failed to update search index:", err)
+      );
     } catch (err) {
       setIsSaving(false);
       setSaveError(err instanceof Error ? err.message : String(err));
@@ -233,6 +240,14 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
       invoke("create_doc_version", { id, bytes: result.bytes })
         .then(() => refreshVersions(id))
         .catch((err) => console.error("Failed to snapshot document version on open:", err));
+
+      // On-open reindex - the other half of keeping docs_search.rs's FTS5 index current (the
+      // autosave path in flushSave is the other), and also what backfills a doc that predates the
+      // index or was just restored from trash (DocsHome.tsx's own lazy backfill pass would
+      // otherwise be the only thing to pick it up).
+      invoke("index_doc_content", { id, title: result.title, body: extractPlainText(doc.getXmlFragment("default")) }).catch((err) =>
+        console.error("Failed to update search index on open:", err)
+      );
     } catch (err) {
       console.error("Failed to load document:", err);
       if (loadGenerationRef.current === generation) setLoadError(err instanceof Error ? err.message : String(err));

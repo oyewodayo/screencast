@@ -13,6 +13,7 @@ import * as Y from "yjs";
 import { DOC_DRAG_MIME, DocFolder, DocSummary, flattenFolderTree } from "../../utils/docTypes";
 import { getPinnedDocIds, toggleDocPin, forgetDocPin } from "../../utils/docLibraryHistory";
 import { importDocxFile } from "../../utils/docxImport";
+import { extractPlainText } from "../../utils/docYjsText";
 import DocFolderSidebar from "./DocFolderSidebar";
 
 interface DocsHomeProps {
@@ -23,26 +24,6 @@ function formatUpdatedAt(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-}
-
-// Y.XmlFragment/Y.XmlElement's own .toString() embeds tag and formatting-attribute names in the
-// output (e.g. "<paragraph><bold>Hello world</bold></paragraph>" - verified directly against the
-// installed yjs version), so using it for search would make every document that happens to use
-// bold/a table/a link etc. false-positive match a search for "bold"/"table"/"link" regardless of
-// its actual text. Walk the tree and concatenate only Y.XmlText nodes' real inserted text (via
-// .toDelta(), which separates the plain string from its formatting attributes) instead.
-function extractPlainText(node: Y.XmlFragment | Y.XmlElement): string {
-  let text = "";
-  for (const child of node.toArray()) {
-    if (child instanceof Y.XmlText) {
-      for (const op of child.toDelta()) {
-        if (typeof op.insert === "string") text += op.insert;
-      }
-    } else if (child instanceof Y.XmlElement) {
-      text += extractPlainText(child) + " ";
-    }
-  }
-  return text;
 }
 
 const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
@@ -64,11 +45,10 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   const [showTrash, setShowTrash] = useState(false);
   const [trashedDocs, setTrashedDocs] = useState<DocSummary[] | null>(null);
   const [confirmPermanentDeleteId, setConfirmPermanentDeleteId] = useState<string | null>(null);
-  // Body-text cache for search, keyed by doc id - list_docs only ever reads meta.json (title/dates),
-  // never doc.bin, so searching body text means decoding each doc's Yjs bytes client-side once and
-  // caching the result. This is a deliberate full-corpus decode on every DocsHome visit, not a
-  // persistent index - acceptable at desktop/local doc-count scale, not meant to scale past that.
-  const [bodyCache, setBodyCache] = useState<Record<string, string>>({});
+  // Search now goes through docs_search.rs's SQLite FTS5 index rather than decoding every doc's
+  // Yjs bytes into memory on every search keystroke - null means "not currently searching" (as
+  // opposed to an empty Set, which means "searched, nothing matched").
+  const [searchMatchIds, setSearchMatchIds] = useState<Set<string> | null>(null);
 
   // Folder tree - see docTypes.ts's DocFolder/flattenFolderTree comments. null selection means
   // DocFolderSidebar's "All Documents" root, not "no folders exist yet".
@@ -160,47 +140,68 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     refresh();
   }, [refresh]);
 
-  // Deferred until the user actually types into search (not eagerly on every DocsHome mount) -
-  // indexing means one load_doc round trip + a Yjs decode per doc, a real cost not worth paying
-  // just for landing on this screen, especially as the doc count grows. Once triggered, the
-  // missing docs are indexed in parallel rather than one invoke at a time.
+  // Runs the actual search against docs_search.rs's FTS5 index on every query change - fast
+  // enough (a local SQLite query) that this isn't debounced. Resets to null (not searching) for an
+  // empty query.
   useEffect(() => {
-    if (searchQuery.trim().length === 0 || !docs || docs.length === 0) return;
-    const missing = docs.filter((d) => !(d.id in bodyCache));
-    if (missing.length === 0) return;
+    const query = searchQuery.trim();
+    if (!query) {
+      setSearchMatchIds(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<string[]>("search_docs", { query })
+      .then((ids) => {
+        if (!cancelled) setSearchMatchIds(new Set(ids));
+      })
+      .catch((err) => {
+        console.error("Failed to search documents:", err);
+        if (!cancelled) setSearchMatchIds(new Set());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [searchQuery]);
+
+  // Lazily backfills the search index for any doc that isn't in it yet - a doc created before this
+  // index existed, or one just restored from trash, has no row there until it's next opened/saved
+  // (useDocsEditStore.ts indexes on both). Runs whenever the doc list changes (not just once on
+  // mount), so a freshly-created doc that hasn't been opened yet still gets picked up here rather
+  // than staying unsearchable until its first real edit. One load_doc round trip + a Yjs decode per
+  // missing doc, done in parallel and entirely in the background - never blocks the UI, and a
+  // single doc failing to decode doesn't block indexing the rest (same fail-soft posture list_docs
+  // itself already uses for a corrupt folder).
+  useEffect(() => {
+    if (!docs || docs.length === 0) return;
     let cancelled = false;
 
-    Promise.all(
-      missing.map(async (doc) => {
-        try {
-          const result = await invoke<{ bytes: number[] }>("load_doc", { id: doc.id });
-          const ydoc = new Y.Doc();
-          Y.applyUpdate(ydoc, new Uint8Array(result.bytes));
-          const text = extractPlainText(ydoc.getXmlFragment("default")).toLowerCase();
-          ydoc.destroy();
-          return [doc.id, text] as const;
-        } catch (err) {
-          // One doc failing to decode shouldn't block indexing the rest - same fail-soft posture
-          // as list_docs skipping a corrupt folder.
-          console.error(`Failed to index document ${doc.id} for search:`, err);
-          return null;
-        }
+    invoke<string[]>("list_indexed_doc_ids")
+      .then((indexedIds) => {
+        if (cancelled) return null;
+        const indexed = new Set(indexedIds);
+        const missing = docs.filter((d) => !indexed.has(d.id));
+        if (missing.length === 0) return null;
+        return Promise.all(
+          missing.map(async (doc) => {
+            try {
+              const result = await invoke<{ bytes: number[] }>("load_doc", { id: doc.id });
+              const ydoc = new Y.Doc();
+              Y.applyUpdate(ydoc, new Uint8Array(result.bytes));
+              const body = extractPlainText(ydoc.getXmlFragment("default"));
+              ydoc.destroy();
+              await invoke("index_doc_content", { id: doc.id, title: doc.title, body });
+            } catch (err) {
+              console.error(`Failed to backfill search index for document ${doc.id}:`, err);
+            }
+          })
+        );
       })
-    ).then((results) => {
-      if (cancelled) return;
-      const decoded = results.filter((r): r is readonly [string, string] => r !== null);
-      if (decoded.length === 0) return;
-      setBodyCache((prev) => {
-        const next = { ...prev };
-        for (const [id, text] of decoded) next[id] = text;
-        return next;
-      });
-    });
+      .catch((err) => console.error("Failed to check search index state:", err));
 
     return () => {
       cancelled = true;
     };
-  }, [searchQuery, docs, bodyCache]);
+  }, [docs]);
 
   // Closes an open card menu (and drops any pending delete confirmation) on any click outside it -
   // must be "click", not "mousedown", for the same ordering reason documented in BoardHome.tsx:
@@ -227,6 +228,10 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
       setConfirmDeleteId(null);
       setDocs((prev) => prev?.filter((d) => d.id !== id) ?? prev);
       setPinnedIds(forgetDocPin(id));
+      // Best-effort - a trashed doc lingering in the search index a little longer isn't a
+      // correctness problem (list_docs already excludes it from the normal list this filters
+      // against), so a failure here isn't worth surfacing as an error to the user.
+      invoke("remove_doc_from_index", { id }).catch((err) => console.error("Failed to remove document from search index:", err));
     } catch (err) {
       console.error("Failed to delete document:", err);
       setError(err instanceof Error ? err.message : String(err));
@@ -323,15 +328,14 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     }
   }, [onOpenDoc]);
 
-  const normalizedQuery = searchQuery.trim().toLowerCase();
-  const isSearching = normalizedQuery.length > 0;
+  const isSearching = searchQuery.trim().length > 0;
   // Search deliberately ignores the selected folder (searches every doc) - folder selection only
   // scopes the plain browse view, so switching into a folder never hides a search result that
   // happens to live elsewhere.
   const folderScopedDocs = docs?.filter((d) => d.folder_id === selectedFolderId);
-  const filteredDocs = (isSearching ? docs : folderScopedDocs)?.filter(
-    (d) => !isSearching || d.title.toLowerCase().includes(normalizedQuery) || (bodyCache[d.id] ?? "").includes(normalizedQuery)
-  );
+  // searchMatchIds already covers both title and body (both are indexed columns in docs_search.rs)
+  // - no separate client-side title check needed anymore.
+  const filteredDocs = (isSearching ? docs : folderScopedDocs)?.filter((d) => !isSearching || searchMatchIds?.has(d.id) === true);
   const pinnedDocs = filteredDocs?.filter((d) => pinnedIds.includes(d.id)) ?? [];
   const moveTargets = useMemo(() => flattenFolderTree(folders), [folders]);
 
