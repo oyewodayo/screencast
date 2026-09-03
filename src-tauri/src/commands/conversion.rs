@@ -871,6 +871,10 @@ pub struct KeepSegment {
     pub ken_burns: Option<ClipKenBurns>,
     pub transition_in: Option<ClipTransitionIn>,
     pub crop: Option<ClipCrop>,
+    // Horizontal mirror, applied first (before crop/Ken Burns) so crop/pan coordinates always
+    // describe the already-mirrored frame the same way the live preview's own CSS transform order
+    // does (VideoPlayer.tsx). None/false means the pre-existing unmirrored look.
+    pub flip_horizontal: Option<bool>,
 }
 
 // One text or image overlay, already fully rendered client-side to a transparent PNG matching
@@ -890,7 +894,13 @@ pub struct OverlayImage {
     pub y: i64,
     pub start_time: f64,
     pub end_time: f64,
-    pub fade: bool,
+    // Mirrors OverlayAnimation (videoEditTypes.ts) minus "pop" - the frontend maps "pop" to "fade"
+    // before sending (see exportEdited's own comment), since a true scale-up/overshoot animation
+    // needs a time-varying overlay *size*, not just x/y or alpha, which is a bigger lift than the
+    // x/y-expression approach overlay_position_expr below uses for slide-*. Sanitized against
+    // ALLOWED_OVERLAY_ANIMATIONS the same way transition_type already is (sanitize_transition_name)
+    // - interpolated directly into the filter_complex string, so this is a real security boundary.
+    pub animation: String,
 }
 
 // A blurred region burned into the output video for its own [start_time,end_time) window - unlike
@@ -1024,6 +1034,9 @@ fn crop_chain(c: &ClipCrop) -> String {
 // doc comment for why that's never both.
 fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>) -> String {
     let mut extra = String::new();
+    if seg.flip_horizontal.unwrap_or(false) {
+        extra.push_str(",hflip");
+    }
     if let Some(cf) = &seg.color_filter {
         if cf.preset != "none" {
             extra.push_str(&color_filter_chain(cf));
@@ -1057,6 +1070,63 @@ const ALLOWED_TRANSITIONS: &[&str] = &["fade", "fadeblack", "wipeleft", "wiperig
 
 fn sanitize_transition_name(name: &str) -> &str {
     ALLOWED_TRANSITIONS.iter().find(|&&t| t == name).copied().unwrap_or("fade")
+}
+
+// Mirrors OverlayImage.animation's own doc comment - "pop" is deliberately absent (frontend maps
+// it to "fade" before it ever reaches here). Same security-boundary reasoning as
+// ALLOWED_TRANSITIONS: this string is interpolated directly into the filter_complex below.
+const ALLOWED_OVERLAY_ANIMATIONS: &[&str] = &["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"];
+
+fn sanitize_overlay_animation(name: &str) -> &str {
+    ALLOWED_OVERLAY_ANIMATIONS.iter().find(|&&a| a == name).copied().unwrap_or("none")
+}
+
+// Matches the live preview's own slide timing exactly (overlayAnimationStyle, VideoOverlayLayer.tsx)
+// so a slide overlay looks the same in the exported file as it did on screen: `ramp` is how long the
+// entry/exit glide takes (clamped to half the overlay's own duration so a very short overlay still
+// finishes entering before it starts leaving), and `progress` is 0 right at either edge of
+// [start_time,end_time), ramping to 1 once "fully arrived" - `remaining = 1-progress` is then how far
+// from settled the overlay still is, which is what actually drives how far it's offset from its
+// resting (ov.x, ov.y) position. ffmpeg's `clip(x,min,max)` and `min(a,b)` eval functions reproduce
+// the same clamp/min the preview's own plain JS math uses.
+const OVERLAY_ANIMATION_RAMP_SEC: f64 = 0.4;
+const OVERLAY_SLIDE_DISTANCE_FRACTION: f64 = 0.12;
+
+fn overlay_slide_remaining_expr(start_time: f64, end_time: f64) -> String {
+    let ramp = OVERLAY_ANIMATION_RAMP_SEC.min((end_time - start_time) / 2.0).max(0.001);
+    format!(
+        "(1-clip(min((t-{start:.3})/{ramp:.4},({end:.3}-t)/{ramp:.4}),0,1))",
+        start = start_time, end = end_time, ramp = ramp
+    )
+}
+
+// The overlay filter's own x/y, as ffmpeg expression strings - a plain integer for "none"/"fade"
+// (unchanged from before slide support existed), or a `main_w`/`main_h`-relative expression that
+// glides in from the corresponding off-screen edge and back out for "slide-*", built with the exact
+// same distance-from-resting-position idiom overlayAnimationStyle's own `remaining * distance` uses
+// (VideoOverlayLayer.tsx) - `main_w`/`main_h` are the overlay filter's own built-in variables for the
+// base video's pixel dimensions, evaluated per-frame, so no separate output-resolution lookup is
+// needed here the way ken_burns_chain needs one.
+fn overlay_position_expr(ov: &OverlayImage, animation: &str) -> (String, String) {
+    match animation {
+        "slide-left" => (
+            format!("({x})-(main_w*{frac})*{remaining}", x = ov.x, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+            ov.y.to_string(),
+        ),
+        "slide-right" => (
+            format!("({x})+(main_w*{frac})*{remaining}", x = ov.x, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+            ov.y.to_string(),
+        ),
+        "slide-up" => (
+            ov.x.to_string(),
+            format!("({y})-(main_h*{frac})*{remaining}", y = ov.y, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+        ),
+        "slide-down" => (
+            ov.x.to_string(),
+            format!("({y})+(main_h*{frac})*{remaining}", y = ov.y, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+        ),
+        _ => (ov.x.to_string(), ov.y.to_string()),
+    }
 }
 
 fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
@@ -1111,6 +1181,21 @@ fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
 // segment with either effect set would take the (already forced, since has_clip_effects) filter-
 // graph export path but have that one effect silently skipped - an uncropped/unpanned file, no
 // error, no indication anything was dropped.
+// Export quality presets - (libx264 preset, CRF) pairs. "standard" is the exact pair every export
+// used unconditionally before this existed, so a caller that doesn't pass `quality` at all (or
+// passes an unrecognized value) gets today's already-proven behavior, not a silent change.
+// "high"'s slower preset spends more encode time finding smaller/cleaner bitrate allocations for
+// the same visual quality; "small"'s faster preset trades some of that quality back for a shorter
+// export - both directions users of a screen-recording tool routinely want (a quick draft to share
+// immediately vs. a final archival-quality copy).
+fn resolve_export_quality(quality: Option<&str>) -> (&'static str, &'static str) {
+    match quality.unwrap_or("standard") {
+        "high" => ("slow", "18"),
+        "small" => ("veryfast", "28"),
+        _ => ("medium", "23"),
+    }
+}
+
 fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
     let mut cmd = Command::new(ffprobe_path);
     cmd.args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", source_path]);
@@ -1164,9 +1249,11 @@ fn write_temp_overlay_png(data_base64: &str, index: usize) -> Result<PathBuf, St
 // convert_to_mp4/convert_video/convert_audio above, there is no `preserve_original` parameter
 // here at all, because there is no "false" branch to have.
 //
-// `output_base_path` only names/locates the output - it's the file the timeline was opened on,
-// which is not necessarily the source of any particular segment once clips have been dragged in
-// from elsewhere (see DockerFile/DockerFile.path in VideoTimelineDocker.tsx).
+// `output_base_path` only names/locates the DEFAULT output location (still used for the progress
+// event's own progress_key regardless) - it's the file the timeline was opened on, which is not
+// necessarily the source of any particular segment once clips have been dragged in from elsewhere
+// (see DockerFile/DockerFile.path in VideoTimelineDocker.tsx). `output_path`, when set, overrides
+// where the actual file gets written - see its own doc comment below.
 //
 // A single kept segment with no overlays (plain trim, no cuts, no drag-ins, nothing composited)
 // uses fast, low-artifact `-ss`/`-to` range extraction on that one input and no filter graph at
@@ -1194,21 +1281,35 @@ pub async fn export_trimmed_video(
     // exportEdited already uses for overlay rendering when videoPixelSize itself is null.
     video_width: Option<i64>,
     video_height: Option<i64>,
+    // "standard" (unrecognized/omitted falls back to this too - see resolve_export_quality),
+    // "high", or "small" - the encode speed/CRF trade-off the Save button's quality picker offers.
+    quality: Option<String>,
+    // Overrides the default "<output_base_path's name> (edited).<ext>" location - set when the
+    // user picks a destination via the Save button's "Choose location…" option. Still runs through
+    // unique_output_path (run_conversion) the same as the default location does, so a second export
+    // to the exact same custom path doesn't clobber the first.
+    output_path: Option<String>,
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
     }
+    let (quality_preset, quality_crf) = resolve_export_quality(quality.as_deref());
 
     // The primary video's OWN audio level (distinct from any audio overlay's own volume/muted,
     // which are separate mixed-in tracks) - 0.0 when muted, otherwise whatever the editor's track
     // volume slider was set to.
     let effective_video_volume = if audio_muted { 0.0 } else { audio_volume.max(0.0) };
 
-    let base = PathBuf::from(&output_base_path);
-    let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext = base.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
-    let parent = base.parent().map(PathBuf::from).unwrap_or_default();
-    let output = parent.join(format!("{} (edited).{}", stem, ext));
+    let output = match output_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let base = PathBuf::from(&output_base_path);
+            let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let ext = base.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
+            let parent = base.parent().map(PathBuf::from).unwrap_or_default();
+            parent.join(format!("{} (edited).{}", stem, ext))
+        }
+    };
 
     let mut inputs: Vec<InputSpec> = segments.iter().map(|s| InputSpec::plain(s.source_path.clone())).collect();
 
@@ -1288,6 +1389,7 @@ pub async fn export_trimmed_video(
     // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
     let has_clip_effects = segments.iter().any(|s| {
         s.color_filter.as_ref().map_or(false, |cf| cf.preset != "none") || s.ken_burns.is_some() || s.transition_in.is_some() || s.crop.is_some()
+            || s.flip_horizontal.unwrap_or(false)
     });
     // Any segment beyond the first requesting a transition - gates the pairwise xfade/acrossfade
     // fold below instead of the plain all-at-once `concat=n=N` the multi-segment branch has always
@@ -1303,8 +1405,8 @@ pub async fn export_trimmed_video(
             "-ss".into(), format!("{:.3}", seg.start),
             "-to".into(), format!("{:.3}", seg.end),
             "-c:v".into(), "libx264".into(),
-            "-preset".into(), "medium".into(),
-            "-crf".into(), "23".into(),
+            "-preset".into(), quality_preset.into(),
+            "-crf".into(), quality_crf.into(),
             "-c:a".into(), "aac".into(),
             "-b:a".into(), "128k".into(),
             "-movflags".into(), "+faststart".into(),
@@ -1518,14 +1620,16 @@ pub async fn export_trimmed_video(
 
         // Chains each overlay onto whatever the blur pass above left [current_label] pointing at
         // (still "base" if there were no blur regions) in turn, the last one landing on [outv]. A
-        // still PNG is "faded" via ffmpeg's own fade filter for overlays with animation:"fade" set
-        // in the editor - alpha=1 fades the alpha channel itself rather than to black, which is
-        // exactly what a transparent-background overlay needs - before being composited via
-        // `overlay` gated to that overlay's own [start,end) window on the output timeline either way.
+        // still PNG is "faded" via ffmpeg's own fade filter for animation:"fade" - alpha=1 fades the
+        // alpha channel itself rather than to black, which is exactly what a transparent-background
+        // overlay needs - or, for animation:"slide-*", composited at a time-varying x/y instead (see
+        // overlay_position_expr) - before being composited via `overlay` gated to that overlay's own
+        // [start,end) window on the output timeline either way.
         let overlay_input_base = segments.len();
         for (i, ov) in overlays.iter().enumerate() {
             let source_label = format!("{}:v", overlay_input_base + i);
-            let composited_label = if ov.fade {
+            let animation = sanitize_overlay_animation(&ov.animation);
+            let composited_label = if animation == "fade" {
                 let faded_label = format!("ovfade{}", i);
                 let fade_out_start = (ov.end_time - 0.4).max(ov.start_time);
                 filter.push_str(&format!(
@@ -1536,10 +1640,11 @@ pub async fn export_trimmed_video(
             } else {
                 source_label
             };
+            let (x_expr, y_expr) = overlay_position_expr(ov, animation);
             let next_label = if i + 1 == overlays.len() { "outv".to_string() } else { format!("ov{}", i) };
             filter.push_str(&format!(
-                "[{}][{}]overlay=x={}:y={}:enable='between(t,{:.3},{:.3})'[{}];",
-                current_label, composited_label, ov.x, ov.y, ov.start_time, ov.end_time, next_label
+                "[{}][{}]overlay=x='{}':y='{}':enable='between(t,{:.3},{:.3})'[{}];",
+                current_label, composited_label, x_expr, y_expr, ov.start_time, ov.end_time, next_label
             ));
             current_label = next_label;
         }
@@ -1616,8 +1721,8 @@ pub async fn export_trimmed_video(
             "-map".into(), "[outv]".into(),
             "-map".into(), format!("[{}]", audio_label),
             "-c:v".into(), "libx264".into(),
-            "-preset".into(), "medium".into(),
-            "-crf".into(), "23".into(),
+            "-preset".into(), quality_preset.into(),
+            "-crf".into(), quality_crf.into(),
             "-c:a".into(), "aac".into(),
             "-b:a".into(), "128k".into(),
             "-movflags".into(), "+faststart".into(),

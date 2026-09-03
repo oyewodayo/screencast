@@ -164,18 +164,23 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const effects = activeClipEffectsRef.current;
     const crop = liveCropOverrideRef.current ?? effects?.crop;
     const kb = effects?.kenBurns;
+    // Mirrors the raw frame first (rightmost/innermost - see cropStaticTransform's own comment on
+    // CSS transform composition order), matching conversion.rs's segment_effect_chain, which runs
+    // `hflip` before crop/Ken Burns so crop/pan coordinates describe the already-mirrored frame the
+    // same way in both preview and export.
+    const flipTransform = effects?.flipHorizontal ? 'scaleX(-1)' : '';
     if (!crop && !kb) {
-      video.style.transform = '';
+      video.style.transform = flipTransform;
       return;
     }
     const cropTransform = crop ? cropStaticTransform(crop) : '';
     if (!kb) {
-      video.style.transform = cropTransform;
+      video.style.transform = `${cropTransform} ${flipTransform}`.trim();
       return;
     }
     const duration = Math.max(0.01, effects!.sourceEnd - effects!.sourceStart);
     const progress = Math.max(0, Math.min(1, (video.currentTime - effects!.sourceStart) / duration));
-    video.style.transform = `${cropTransform} ${kenBurnsTransform(kb, progress)}`.trim();
+    video.style.transform = `${cropTransform} ${kenBurnsTransform(kb, progress)} ${flipTransform}`.trim();
   };
 
   useImperativeHandle(ref, () => ({
@@ -519,7 +524,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       video.style.transform = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop]);
+  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);

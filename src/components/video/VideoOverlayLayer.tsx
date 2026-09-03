@@ -529,6 +529,7 @@ const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) =>
               <button
                 key={opt.value}
                 type="button"
+                title={opt.value === "pop" ? "Exports as Fade - the scale animation is preview-only" : undefined}
                 onClick={() => {
                   onChange(opt.value);
                   setMenuPos(null);

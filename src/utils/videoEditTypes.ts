@@ -91,6 +91,11 @@ export interface Clip {
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
   crop?: ClipCrop;
+  // Horizontal mirror of the clip's own frame - applied first, before crop/Ken Burns, in both the
+  // live preview (VideoPlayer's CSS transform) and export (conversion.rs's segment_effect_chain),
+  // so crop/pan coordinates always describe the already-mirrored frame identically in both places.
+  // Undefined/false means the pre-existing unmirrored look.
+  flipHorizontal?: boolean;
 }
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
@@ -269,6 +274,7 @@ export interface KeepSegment {
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
   crop?: ClipCrop;
+  flipHorizontal?: boolean;
 }
 
 export interface VideoEditState {

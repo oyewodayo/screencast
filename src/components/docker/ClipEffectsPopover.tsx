@@ -14,7 +14,7 @@ import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType } from "../../u
 import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 
-export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop">>;
+export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal">>;
 
 const DEFAULT_COLOR_INTENSITY = 0.7;
 const DEFAULT_KEN_BURNS_INTENSITY = 0.5;

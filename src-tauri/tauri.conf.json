@@ -26,6 +26,7 @@
       },
       "dialog": {
         "all": false,
+        "ask": true,
         "message": true,
         "open": true,
         "save": true

@@ -2,7 +2,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { open as openFileDialog } from "@tauri-apps/api/dialog";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/api/dialog";
 import { BsCursor } from "react-icons/bs";
 import { MdBlurOn, MdFlip } from "react-icons/md";
 import {
@@ -34,7 +34,7 @@ import {
   IoImageOutline,
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
-import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
+import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
 import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, TextOverlay } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
@@ -42,6 +42,7 @@ import { overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandl
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover from "./ClipEffectsPopover";
+import ExportOptionsPopover from "./ExportOptionsPopover";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 
 const MIN_PX_PER_SEC = 8;
@@ -73,26 +74,6 @@ interface ThumbFrame {
   src: string;
 }
 
-// Inert-for-now toolbar button — visually present (matching the reference layout) but not wired
-// to anything yet. Dimmed and labeled so it reads as "not implemented", not broken.
-const ToolButton: React.FC<{ title: string; children: React.ReactNode; active?: boolean }> = ({
-  title,
-  children,
-  active,
-}) => (
-  <button
-    type="button"
-    title={`${title} (coming soon)`}
-    disabled
-    className={`flex items-center justify-center w-7 h-7 rounded text-neutral-500 disabled:cursor-default ${
-      active ? "bg-neutral-700 text-neutral-200" : ""
-    }`}
-  >
-    {children}
-  </button>
-);
-
-// Real (wired) toolbar button — Undo/Redo/Split/Delete, unlike ToolButton's stubs above.
 const ActionButton: React.FC<{
   title: string;
   onClick: () => void;
@@ -287,8 +268,9 @@ interface VideoTimelineDockerProps {
 // The video-specific "file tools" docker: a scrubbable timeline (ruler + playhead + reorderable
 // clip blocks) instead of the generic info/actions panel FileToolsDocker uses for other
 // categories. The playhead is real (synced both ways with the actual player via currentTime/
-// onSeek); the thumbnail filmstrip is captured from real frames and sliced per clip. Most of the
-// toolbar above it is a visual scaffold for now — see ToolButton's "(coming soon)" tooltip.
+// onSeek); the thumbnail filmstrip is captured from real frames and sliced per clip. Every toolbar
+// button above it is wired to real state (see ActionButton) - split/delete/crop/mirror/effects/
+// text/image/blur/audio all mutate the edit store directly.
 // Track-level actions (rename/convert/reveal/delete) live in the "..." menu on the left rail,
 // reusing the same handlers FileToolsDocker's generic panel uses for every other category.
 const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
@@ -458,6 +440,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [pxPerSec]);
 
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const selectedClip = selectedClipId ? editStore.clips.find((c) => c.id === selectedClipId) ?? null : null;
   // Effects popover (color grade/Ken Burns/transition) for whichever clip is selected - opened
   // from the toolbar's Effects button, closed the same "outside click" way AudioOverlayPopover
   // closes itself, plus whenever selection moves to a different clip (below) so it never keeps
@@ -467,6 +450,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   useEffect(() => {
     setEffectsPopoverAnchor(null);
   }, [selectedClipId]);
+
+  // Save button's quality/destination options (ExportOptionsPopover) - both default to exactly
+  // the behavior export_trimmed_video already had before this existed: "standard" quality, and a
+  // null customOutputPath meaning "next to the source file" (see handleSave below).
+  const [exportOptionsAnchor, setExportOptionsAnchor] = useState<{ left: number; top: number } | null>(null);
+  const exportOptionsButtonRef = useRef<HTMLButtonElement>(null);
+  const [exportQuality, setExportQuality] = useState<ExportQuality>("standard");
+  const [customOutputPath, setCustomOutputPath] = useState<string | null>(null);
 
   // Live drag state for resizing a single clip's start/end edge - delta-based (pixels moved since
   // the drag began, converted to a time delta) rather than re-deriving from click position, so it
@@ -1206,8 +1197,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
 
   const handleSave = async () => {
-    const result = await editStore.exportEdited(videoPixelSize);
+    const result = await editStore.exportEdited(videoPixelSize, { quality: exportQuality, outputPath: customOutputPath ?? undefined });
     if (result) onExported(result.path, result.name);
+  };
+
+  // Defaults the save dialog to exactly the same "<name> (edited).<ext>" filename
+  // export_trimmed_video would otherwise pick on its own (see its own doc comment,
+  // conversion.rs) - the user is choosing WHERE to put it, not renaming it.
+  const handleChooseExportLocation = async () => {
+    const stem = file.path.replace(/\.[^./\\]+$/, "").split(/[\\/]/).pop() ?? file.name;
+    const ext = file.path.split(".").pop() ?? "mp4";
+    const chosen = await saveFileDialog({ defaultPath: `${stem} (edited).${ext}`, filters: [{ name: ext.toUpperCase(), extensions: [ext] }] });
+    if (chosen) setCustomOutputPath(chosen);
   };
 
   // Drag-in: a file dropped on the track, from either the Briefcast sidebar (draggingLibraryFile,
@@ -1219,11 +1220,6 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
   const handleTrackDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    // Temporary diagnostic - if "track onDrop fired" never appears in the console during a
-    // sidebar-to-timeline drag, the browser never dispatched onDrop at all (points at something
-    // intercepting the drag before it reaches this element); if it appears but draggingLibraryFile
-    // is null, the drop landed here without Dashboard's drag-start state having been set.
-    console.log("[VideoTimelineDocker] track onDrop fired", { draggingLibraryFile, clientX: e.clientX });
     if (draggingLibraryFile) {
       void editStore.insertClipAt(draggingLibraryFile.path, computeOverIndex(e.clientX));
     }
@@ -1231,7 +1227,6 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
   useEffect(() => {
     if (!pendingTimelineInsert) return;
-    console.log("[VideoTimelineDocker] pendingTimelineInsert received", pendingTimelineInsert);
     const { paths, clientX } = pendingTimelineInsert;
     const index = computeOverIndex(clientX);
     (async () => {
@@ -1340,11 +1335,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   useEffect(() => {
     onActiveClipChange?.(
       activeClip
-        ? { id: activeClip.id, sourceStart: activeClip.start, sourceEnd: activeClip.end, colorFilter: activeClip.colorFilter, kenBurns: activeClip.kenBurns, crop: activeClip.crop }
+        ? {
+            id: activeClip.id,
+            sourceStart: activeClip.start,
+            sourceEnd: activeClip.end,
+            colorFilter: activeClip.colorFilter,
+            kenBurns: activeClip.kenBurns,
+            crop: activeClip.crop,
+            flipHorizontal: activeClip.flipHorizontal,
+          }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop]);
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -1442,7 +1445,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoCropOutline size={15} className={isCroppingClip ? "text-blue-400" : undefined} />
           </ActionButton>
-          <ToolButton title="Mirror"><MdFlip size={15} /></ToolButton>
+          <ActionButton
+            title={selectedClipId ? "Mirror clip horizontally" : "Select a clip to mirror"}
+            onClick={() => selectedClip && editStore.updateClipEffects(selectedClip.id, { flipHorizontal: !selectedClip.flipHorizontal })}
+            disabled={!selectedClipId}
+          >
+            <MdFlip size={15} className={selectedClip?.flipHorizontal ? "text-blue-400" : undefined} />
+          </ActionButton>
           <button
             ref={effectsButtonRef}
             type="button"
@@ -1489,20 +1498,39 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            title={editStore.exportError ?? "Save the trimmed/cut/reordered result as a new file - the original is never modified"}
-            onClick={handleSave}
-            disabled={!editStore.canUndo || editStore.isExporting}
-            className="flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium bg-blue-600 text-white hover:bg-blue-500 disabled:bg-neutral-700 disabled:text-neutral-400 disabled:cursor-default"
-          >
-            <IoSaveOutline size={14} />
-            {editStore.isExporting
-              ? editStore.exportProgress != null
-                ? `Saving… ${Math.round(editStore.exportProgress)}%`
-                : "Saving…"
-              : "Save"}
-          </button>
+          <div className="flex items-center">
+            <button
+              type="button"
+              title={editStore.exportError ?? "Save the trimmed/cut/reordered result as a new file - the original is never modified"}
+              onClick={handleSave}
+              disabled={!editStore.canUndo || editStore.isExporting}
+              className="flex items-center gap-1.5 h-7 pl-2.5 pr-2 rounded-l text-xs font-medium bg-blue-600 text-white hover:bg-blue-500 disabled:bg-neutral-700 disabled:text-neutral-400 disabled:cursor-default"
+            >
+              <IoSaveOutline size={14} />
+              {editStore.isExporting
+                ? editStore.exportProgress != null
+                  ? `Saving… ${Math.round(editStore.exportProgress)}%`
+                  : "Saving…"
+                : "Save"}
+            </button>
+            <button
+              ref={exportOptionsButtonRef}
+              type="button"
+              title="Export options (quality, destination)"
+              disabled={!editStore.canUndo || editStore.isExporting}
+              onClick={() => {
+                if (exportOptionsAnchor) {
+                  setExportOptionsAnchor(null);
+                  return;
+                }
+                const rect = exportOptionsButtonRef.current?.getBoundingClientRect();
+                if (rect) setExportOptionsAnchor({ left: rect.left, top: rect.bottom + 4 });
+              }}
+              className="flex items-center justify-center h-7 w-5 rounded-r border-l border-blue-500/50 bg-blue-600 text-white hover:bg-blue-500 disabled:bg-neutral-700 disabled:text-neutral-400 disabled:border-neutral-600 disabled:cursor-default"
+            >
+              <IoChevronDown size={10} />
+            </button>
+          </div>
           <div className="w-px h-5 bg-neutral-700 mx-1" />
           <button
             type="button"
@@ -2057,6 +2085,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </div>
         </div>
       </div>
+
+      {exportOptionsAnchor && (
+        <ExportOptionsPopover
+          anchor={exportOptionsAnchor}
+          quality={exportQuality}
+          onQualityChange={setExportQuality}
+          customOutputName={customOutputPath ? customOutputPath.split(/[\\/]/).pop() ?? customOutputPath : null}
+          onChooseLocation={handleChooseExportLocation}
+          onResetLocation={() => setCustomOutputPath(null)}
+          onClose={() => setExportOptionsAnchor(null)}
+        />
+      )}
 
       {selectedClipId &&
         effectsPopoverAnchor &&

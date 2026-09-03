@@ -2,7 +2,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { listen } from "@tauri-apps/api/event";
-import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
+import { ask } from "@tauri-apps/api/dialog";
+import { appWindow } from "@tauri-apps/api/window";
+import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, OverlayAnimation, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
@@ -56,6 +58,27 @@ async function fetchDuration(path: string): Promise<number | null> {
   }
 }
 
+// Mirrors export_trimmed_video's own `quality`/`output_path` params (conversion.rs) - both
+// optional so a caller that passes nothing gets the exact same default behavior as before this
+// existed (resolve_export_quality's own "standard" fallback, and the default "<name> (edited).ext"
+// location next to the source).
+export type ExportQuality = "standard" | "high" | "small";
+export interface ExportOptions {
+  quality?: ExportQuality;
+  outputPath?: string;
+}
+
+// export_trimmed_video's OverlayImage.animation accepts everything OverlayAnimation does except
+// "pop" - a true scale-up/overshoot animation needs a time-varying overlay *size* in the ffmpeg
+// filter graph, not just the x/y-expression approach slide-* uses (see overlay_position_expr,
+// conversion.rs), so it isn't burned in yet. Falls back to "fade" rather than "none" so a "pop"
+// overlay still gets *some* motion in the exported file instead of appearing as a static hard cut.
+function exportOverlayAnimation(animation: OverlayAnimation | undefined): string {
+  if (!animation || animation === "none") return "none";
+  if (animation === "pop") return "fade";
+  return animation;
+}
+
 type TextOverlayContentPatch = Partial<
   Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize">
 >;
@@ -64,7 +87,7 @@ type ImageOverlayContentPatch = Partial<
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -171,7 +194,10 @@ export interface UseVideoEditStoreResult {
   // videoPixelSize (the primary file's native resolution) is required to render text/image
   // overlays for burn-in - pass null (no overlays possible, e.g. audio-only export path) to skip
   // rendering them and export a plain trim, same as before overlays existed.
-  exportEdited: (videoPixelSize: { width: number; height: number } | null) => Promise<{ path: string; name: string } | null>;
+  exportEdited: (
+    videoPixelSize: { width: number; height: number } | null,
+    options?: ExportOptions
+  ) => Promise<{ path: string; name: string } | null>;
 }
 
 // Non-destructive edit state (an ordered, reorderable, multi-source-capable list of clips) for
@@ -196,6 +222,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   const stateRef = useRef<VideoEditState | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sourceDurationsRef = useRef<Record<string, number>>({});
+  // Mirrors isExporting for the close-guard effect below, which needs the CURRENT value at the
+  // moment the user tries to close the window, not whatever was true when that effect last
+  // re-subscribed - same "ref alongside state" reasoning as activeClipEffectsRef (VideoPlayer.tsx).
+  const isExportingRef = useRef(false);
+  isExportingRef.current = isExporting;
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
@@ -294,16 +325,23 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourcePath]);
 
-  const flushSave = useCallback(() => {
+  // Returns the save's own promise (rather than firing-and-forgetting it, like most callers here
+  // only need) so the close-guard effect below can actually AWAIT it finishing before letting the
+  // window close - a bare setTimeout-scheduled invoke() has no way to block window teardown, so
+  // without this a close right after an edit could tear down the webview before the IPC call ever
+  // reached Rust.
+  const flushSave = useCallback((): Promise<void> => {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
     }
     const current = stateRef.current;
-    if (!sourcePath || !current) return;
-    invoke("save_video_edit_state", { videoPath: sourcePath, json: JSON.stringify(current) }).catch((err) =>
-      console.error("Failed to save video edit state:", err)
-    );
+    if (!sourcePath || !current) return Promise.resolve();
+    return invoke("save_video_edit_state", { videoPath: sourcePath, json: JSON.stringify(current) })
+      .then(() => undefined)
+      .catch((err) => {
+        console.error("Failed to save video edit state:", err);
+      });
   }, [sourcePath]);
 
   const scheduleAutosave = useCallback(() => {
@@ -313,7 +351,49 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
 
   // Flush any pending save when switching files or unmounting so a trailing edit isn't lost.
   useEffect(() => {
-    return () => flushSave();
+    return () => {
+      void flushSave();
+    };
+  }, [sourcePath, flushSave]);
+
+  // Guards the whole app window closing while this file's editor is open - mirrors
+  // useDocsEditStore's own onCloseRequested guard (save-on-quit), plus a video-specific check the
+  // docs editor has no equivalent of: closing mid-export would kill the ffmpeg child process
+  // mid-write (see cancel_conversion), leaving a truncated "(edited)" file on disk with no
+  // indication anything went wrong. Registered only while a file is actually open, same as the
+  // docs editor's own version, so closing from anywhere else in the app is unaffected.
+  useEffect(() => {
+    if (!sourcePath) return;
+    let ownClose = false; // true once *we* called appWindow.close() - let that one through untouched
+    let pendingClose: Promise<void> | null = null; // dedupes a rapid double-click on the close button
+
+    const unlistenPromise = appWindow.onCloseRequested(async (event) => {
+      if (ownClose) return;
+      event.preventDefault();
+      if (pendingClose) {
+        await pendingClose;
+        return;
+      }
+      pendingClose = (async () => {
+        if (isExportingRef.current) {
+          const shouldCancelAndClose = await ask(
+            "A video export is still in progress. Closing now will cancel it, and the exported file will be incomplete.",
+            { title: "Export in progress", type: "warning" }
+          );
+          if (!shouldCancelAndClose) return; // leave the window open - nothing else to do
+          await invoke("cancel_conversion").catch(() => {}); // best-effort; proceeding to close either way
+        }
+        await flushSave();
+        ownClose = true;
+        await appWindow.close();
+      })();
+      await pendingClose;
+      pendingClose = null; // lets a later close attempt (the user declined this one) re-prompt cleanly
+    });
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
   }, [sourcePath, flushSave]);
 
   const setDuration = useCallback(
@@ -747,10 +827,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   const insertClipAt = useCallback(
     async (newClipSourcePath: string, atIndex: number) => {
       const current = stateRef.current;
-      // Temporary diagnostic, see the matching log in VideoTimelineDocker's handleTrackDrop -
       // `current == null` here means the edit store hasn't finished loading/seeding yet (a real
       // possible race right after opening a file), which would silently swallow every insert.
-      console.log("[useVideoEditStore] insertClipAt called", { newClipSourcePath, atIndex, hasState: !!current });
       if (!current) return;
       // Captured before the await below - if the user switches to a different video while a
       // duration lookup is in flight, sourcePathRef.current no longer matches this by the time we
@@ -762,7 +840,6 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       let duration = getSourceDuration(newClipSourcePath);
       if (duration == null) {
         duration = await fetchDuration(newClipSourcePath);
-        console.log("[useVideoEditStore] fetched duration for inserted clip", { newClipSourcePath, duration });
         if (duration == null) return; // couldn't read this file - nothing to insert
         if (sourcePathRef.current !== requestedForSourcePath) return; // switched files mid-lookup
         registerSourceDuration(newClipSourcePath, duration);
@@ -827,27 +904,26 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // Overlays whose own render comes back null (empty text, zero-size box, an image that failed to
   // decode) are just skipped rather than failing the whole export.
   const exportEdited = useCallback(
-    async (videoPixelSize: { width: number; height: number } | null): Promise<{ path: string; name: string } | null> => {
+    async (
+      videoPixelSize: { width: number; height: number } | null,
+      options?: ExportOptions
+    ): Promise<{ path: string; name: string } | null> => {
       const current = stateRef.current;
       if (!sourcePath || !current || current.clips.length === 0) return null;
       setIsExporting(true);
       setExportError(null);
       try {
-        const overlays: { dataBase64: string; x: number; y: number; startTime: number; endTime: number; fade: boolean }[] = [];
+        const overlays: { dataBase64: string; x: number; y: number; startTime: number; endTime: number; animation: string }[] = [];
         if (videoPixelSize) {
           const { width: pxW, height: pxH } = videoPixelSize;
           for (const o of current.textOverlays) {
             const rendered = renderTextOverlayToPng(o, pxW, pxH);
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: o.animation === "fade" });
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation) });
           }
           for (const o of current.imageOverlays) {
             // eslint-disable-next-line no-await-in-loop
             const rendered = await renderImageOverlayToPng(o, pxW, pxH);
-            // "slide" and "pop" have no export-side equivalent yet (would need a time-varying
-            // ffmpeg overlay x/y or scale expression, not just the alpha fade filter this "fade"
-            // flag already drives) - preview-only for now, same as every other overlay aesthetic
-            // was before its own burn-in support was added.
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: o.animation === "fade" });
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation) });
           }
         }
 
@@ -893,7 +969,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             fadeOut: o.fadeOutSec ?? 0,
           }));
 
-        const outputPath = await invoke<string>("export_trimmed_video", {
+        const resultPath = await invoke<string>("export_trimmed_video", {
           outputBasePath: sourcePath,
           segments: toKeepSegments(current.clips),
           overlays,
@@ -903,9 +979,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           audioVolume: current.videoAudioVolume,
           videoWidth: videoPixelSize?.width ?? null,
           videoHeight: videoPixelSize?.height ?? null,
+          quality: options?.quality ?? null,
+          outputPath: options?.outputPath ?? null,
         });
-        const name = outputPath.split(/[\\/]/).pop() ?? outputPath;
-        return { path: outputPath, name };
+        const name = resultPath.split(/[\\/]/).pop() ?? resultPath;
+        return { path: resultPath, name };
       } catch (err) {
         setExportError(err instanceof Error ? err.message : String(err));
         return null;

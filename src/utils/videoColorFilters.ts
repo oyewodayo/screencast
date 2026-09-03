@@ -130,4 +130,5 @@ export interface ActiveClipEffects {
   colorFilter?: ClipColorFilter;
   kenBurns?: ClipKenBurns;
   crop?: ClipCrop;
+  flipHorizontal?: boolean;
 }
