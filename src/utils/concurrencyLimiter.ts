@@ -12,7 +12,19 @@
 // hard enough to freeze the whole app ("Not Responding", fan noise, multi-GB RAM growth - observed
 // directly). A single SHARED limiter is what actually fixes that: it doesn't matter how many
 // callers want a thumbnail right now, only how many run at once, app-wide.
-export function createLimiter(maxConcurrent: number) {
+// A task that never settles - an invoke() stuck on something below the JS promise layer (seen in
+// practice: a request that produced no backend log line, no error, no result, indefinitely, with
+// the Rust process sitting fully idle - so not a slow decode, an actual hang) - would otherwise
+// hold its slot forever. Since active only ever goes back down inside the `finally` below, one
+// such hang permanently shrinks this limiter's real capacity by one; enough of them (plausible
+// over a long session touching many folders) and every future caller, including totally unrelated
+// ones like SidebarFileIcon, queues forever behind a queue that can never drain. Racing every task
+// against this timeout guarantees the slot always gets released - the abandoned task's own promise
+// (uncancellable; the JS side has no way to actually stop an in-flight invoke) just settles later
+// into the void, unread.
+const DEFAULT_TASK_TIMEOUT_MS = 45000;
+
+export function createLimiter(maxConcurrent: number, taskTimeoutMs: number = DEFAULT_TASK_TIMEOUT_MS) {
   let active = 0;
   const queue: Array<() => void> = [];
 
@@ -28,9 +40,14 @@ export function createLimiter(maxConcurrent: number) {
     return new Promise<void>((resolve) => {
       queue.push(resolve);
       runNext();
-    }).then(task).finally(() => {
-      active--;
-      runNext();
+    }).then(() => {
+      const timeout = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(`Timed out after ${taskTimeoutMs}ms waiting for task`)), taskTimeoutMs);
+      });
+      return Promise.race([task(), timeout]).finally(() => {
+        active--;
+        runNext();
+      });
     });
   };
 }

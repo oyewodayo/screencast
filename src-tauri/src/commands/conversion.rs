@@ -644,6 +644,14 @@ const GALLERY_THUMBNAIL_MAX_DIMENSION: u32 = 480;
 // shelling out to ffmpeg for something this small.
 #[tauri::command]
 pub async fn get_image_thumbnail(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+    // Unconditional entry log (cache hit or miss) - the only line in this command that always
+    // fires. Every other line here only logs on error, so a request that hangs (concurrencyLimiter
+    // ts's withLimit racing it against a timeout instead of waiting forever - see that file's own
+    // comment) previously left zero trace of ever having reached Rust at all: nothing in this log
+    // to say whether the hang was in here or below the IPC layer entirely. This one line answers
+    // that immediately next time - if it's missing for a stuck request, look at the frontend/IPC
+    // side instead of in here.
+    log::debug!("get_image_thumbnail: {}", input_path);
     let input = PathBuf::from(&input_path);
     let cache_path = preview_cache_path(&input, "thumb_v1", "jpg")?;
 

@@ -56,3 +56,17 @@ x11rb = { version = "0.13", features = ["randr", "composite"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+# `cargo tauri dev` builds this crate itself at opt-level 0 (fast incremental rebuilds while
+# iterating), but that setting also applied to every DEPENDENCY - including `image`, whose
+# JPEG/HEIC decode-resize-encode path (get_image_thumbnail in commands/conversion.rs) is tight
+# numeric/loop code that unoptimized Rust runs roughly one to two orders of magnitude slower than
+# release - measured directly against briefcast_preview_cache/thumb_v1: consecutive thumbnails
+# landing ~5-8s apart under the shared 4-way thumbnailLimiter, which made a few-hundred-image
+# gallery (e.g. a 477-image folder) look permanently blank rather than just slow to fill in, since
+# it would take on the order of an hour to finish. Bumping just the dependency graph to opt-level 3
+# (this crate's own code, which is what you're actually iterating on, stays unoptimized for fast
+# rebuilds) gets `image`/`rusqlite`/etc. back to near-release decode speed with no change to normal
+# edit-save-reload turnaround.
+[profile.dev.package."*"]
+opt-level = 3

@@ -1533,13 +1533,23 @@ const setScreen = () => {
 
 	// Cycles to the previous/next image relative to whatever's currently selected, wrapping
 	// around at either end (matches how most image viewers handle prev/next at the boundaries).
+	//
+	// `images` is `getFlatFilesForCategory`'s raw order - whatever list_briefcast_files' own
+	// std::fs::read_dir happened to return (no sort applied on either side), which is an NTFS
+	// directory-enumeration order, not a guaranteed name/date order. Confirmed directly (both the
+	// on-screen "Next (→)" button and the keyboard Down/Right arrows, which call this with the
+	// exact same direction=1) that walking that raw order forward from a file lands on what a
+	// user reading the gallery grid perceives as the PREVIOUS tile, not the next one - so `next`/
+	// `previous` here are named for what they mean to the caller (Next button, Right/Down arrow =
+	// "forward"), and the sign flip below is what makes that match raw array order rather than
+	// fight it.
 	const navigateImage = (direction: 1 | -1) => {
 		if (!selectedFile) return;
 		const images = getFlatFilesForCategory("image");
 		if (images.length === 0) return;
 		const currentIndex = images.findIndex((file) => file.path === selectedFile.sourcePath);
 		if (currentIndex === -1) return;
-		const nextIndex = (currentIndex + direction + images.length) % images.length;
+		const nextIndex = (currentIndex - direction + images.length) % images.length;
 		const next = images[nextIndex];
 		loadFileForPlayback(next.path, next.name);
 	};
@@ -3089,24 +3099,36 @@ const setScreen = () => {
               }}
             />
           )}
-         <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
+         <div className="relative flex-1 min-w-0 min-h-0 flex flex-col bg-gray-100 dark:bg-neutral-950">
 
           {/* selectedFolder !== null, not a truthy check - the root ("Briefcast") folder's key is
               "", which is falsy in JS even though it's a perfectly valid, currently-selected
               folder. A truthy check here silently treated selecting the root folder as "nothing
               selected" (observed directly: clicking it fell through to the empty state instead of
-              showing a gallery). Same fix applies to the two ternary branches below. */}
+              showing a gallery). Same fix applies to the two ternary branches below.
+
+              A real row above the viewer, not an absolute overlay on top of it - it used to float
+              at top-3 left-3 directly over whatever the active viewer rendered there, which for
+              ImageEditor/PdfAnnotator is that viewer's own persistent header (also flush top-left:
+              a tools-toggle icon then the filename) - the two sat in the exact same few pixels, so
+              this button visually swallowed the icon and the start of the filename (observed
+              directly: only the filename's tail end still peeked out past this button's right
+              edge). Stacking it as its own shrink-0 row instead means every viewer's own header,
+              image/pdf included, renders in the space actually left for it. */}
           {selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
-            <button
-              type="button"
-              onClick={() => setSelectedFile(null)}
-              className="absolute top-3 left-3 z-10 flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
-            >
-              <IoChevronBack size={14} />
-              Back to {folderDisplayName(selectedFolder)}
-            </button>
+            <div className="shrink-0 px-3 pt-3">
+              <button
+                type="button"
+                onClick={() => setSelectedFile(null)}
+                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
+              >
+                <IoChevronBack size={14} />
+                Back to {folderDisplayName(selectedFolder)}
+              </button>
+            </div>
           )}
 
+          <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center">
           {boardScreen ? (
             <BoardWorkspace ref={boardEditorRef} screen={boardScreen} onScreenChange={setBoardScreen} libraryDraggingFiles={draggingFiles} />
           ) : docsScreen ? (
@@ -3428,6 +3450,7 @@ const setScreen = () => {
               )}
             </div>
           )}
+          </div>
         </div>
         </div>
       </div>

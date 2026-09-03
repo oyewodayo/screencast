@@ -101,8 +101,24 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
   // never rendered.
   const lastClickedIndexRef = useRef<number | null>(null);
 
+  // Component-lifetime guard (unmount only) - NOT a per-effect-run flag. `files` is a prop that
+  // can get a brand-new array reference (via Dashboard.tsx's useMemo) any time Dashboard's
+  // top-level file list changes for ANY reason, including something with zero relation to this
+  // folder - e.g. a Docs autosave writing doc.bin/search.db under Briefcast/Docs, picked up by the
+  // recursive file_watcher and re-fetched as a whole new file list. That reruns this effect below.
+  // A per-run `cancelled` flag used to treat that rerun as "abandon whatever's in flight," which
+  // silently dropped every not-yet-resolved thumbnail instead of saving it to `thumbUrls` - so the
+  // very next run saw those files as still-pending and re-requested them from scratch. If unrelated
+  // refreshes kept arriving faster than a thumbnail (especially a HEIC one, which shells out to the
+  // bundled heif-thumbnailer) could round-trip, no thumbnail ever survived to be committed - every
+  // tile stayed blank forever. Gating only on unmount lets an in-flight request finish and land in
+  // state no matter how many times this effect reruns in the meantime.
+  const mountedRef = useRef(true);
+  useEffect(() => () => {
+    mountedRef.current = false;
+  }, []);
+
   useEffect(() => {
-    let cancelled = false;
     const pending = files.filter((file) => !thumbUrls[file.path]);
 
     // Routed through the shared thumbnailLimiter (concurrencyLimiter.ts) instead of a
@@ -116,15 +132,11 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
     pending.forEach((file) => {
       thumbnailLimiter(() => resolveThumbnailUrl(file))
         .then((url) => {
-          if (cancelled) return;
+          if (!mountedRef.current) return;
           setThumbUrls((prev) => (prev[file.path] ? prev : { ...prev, [file.path]: url }));
         })
         .catch((err) => console.error(`Failed to resolve thumbnail for ${file.path}:`, err));
     });
-
-    return () => {
-      cancelled = true;
-    };
     // Only re-run when the folder's file list itself changes - thumbUrls updates every time a
     // thumbnail resolves, and including it here would re-trigger this effect on every single one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
