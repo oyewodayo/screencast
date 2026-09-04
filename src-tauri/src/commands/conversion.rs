@@ -885,6 +885,10 @@ pub struct KeepSegment {
     // own doc comment (videoEditTypes.ts) for the full "this changes the segment's own OUTPUT
     // duration" story; segment_speed() below is what actually clamps/defaults this.
     pub speed: Option<f64>,
+    // Background-noise reduction strength, 0..1 - None/0 means off. See Clip.noiseReduction's own
+    // doc comment (videoEditTypes.ts) for why this has no live-preview equivalent; segment_noise_
+    // reduction_db() below is what actually clamps/maps this to afftdn's own `nr` dB parameter.
+    pub noise_reduction: Option<f64>,
 }
 
 // One text or image overlay, already fully rendered client-side to a transparent PNG matching
@@ -1145,6 +1149,22 @@ fn segment_speed(seg: &KeepSegment) -> f64 {
     seg.speed.unwrap_or(1.0).max(0.25).min(4.0)
 }
 
+// This segment's own noise-reduction strength (0..1, clamped defensively same as segment_speed's
+// own comment explains) mapped to afftdn's `nr` parameter - its dB range is documented as
+// 0.01..97, but anything past ~40dB starts eating into the wanted signal along with the noise for
+// typical screen-recording mic input, so this maps onto the gentler 4..40 subrange rather than
+// afftdn's full range. None/0 returns None (no filter at all) rather than "afftdn=nr=4" - keeps a
+// clip that's never touched this feature byte-for-byte identical to before it existed, and skips
+// an unnecessary filter stage in the common case.
+fn segment_noise_reduction_db(seg: &KeepSegment) -> Option<f64> {
+    let strength = seg.noise_reduction.unwrap_or(0.0).max(0.0).min(1.0);
+    if strength <= 0.0 {
+        None
+    } else {
+        Some(4.0 + strength * 36.0)
+    }
+}
+
 // Decomposes an arbitrary speed factor into a chain of ffmpeg `atempo` filters, each within the
 // single-instance range libavfilter enforces (0.5..2.0) - `atempo=4.0` alone is rejected outright
 // at that value, so a larger speed-up/slow-down needs several chained instances instead (e.g. 4x
@@ -1355,13 +1375,19 @@ fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(
 // track of the same duration (`anullsrc`, a filter *source*, needs no `-i` input of its own) so
 // concat/xfade/acrossfade downstream always have a real audio stream to work with regardless of
 // whether the source did.
-fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, speed: f64, out_label: &str) -> String {
+fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, speed: f64, noise_reduction_db: Option<f64>, out_label: &str) -> String {
     if has_audio {
         // atempo_chain (not a bare "atempo={speed}") since ffmpeg rejects a single atempo instance
         // outside 0.5..2.0 - see its own doc comment. A speed of 1 still resolves to exactly
         // "atempo=1.0000", functionally a no-op, so this needs no separate branch for that case.
+        // afftdn runs AFTER atempo - it's a per-frame spectral filter, order relative to tempo
+        // doesn't change its own output, so there's no reason to special-case which comes first.
+        let denoise = match noise_reduction_db {
+            Some(db) => format!(",afftdn=nr={:.2}", db),
+            None => String::new(),
+        };
         format!(
-            "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo}[{out}];",
+            "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo}{denoise}[{out}];",
             idx = input_index, tempo = atempo_chain(speed), out = out_label
         )
     } else {
@@ -1640,7 +1666,7 @@ pub async fn export_trimmed_video(
                 "[0:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{2:.4}{3}[base];",
                 seg.start, seg.end, speed, extra
             ));
-            filter.push_str(&audio_trim_chain(segment_has_audio[0], 0, seg.start, seg.end, speed, "outa"));
+            filter.push_str(&audio_trim_chain(segment_has_audio[0], 0, seg.start, seg.end, speed, segment_noise_reduction_db(seg), "outa"));
         } else if !has_transitions {
             // Same segment-major trim+concat pattern as before this function grew overlay support
             // - concat's inputs must interleave [v0][a0][v1][a1]..., not group all video labels
@@ -1655,7 +1681,7 @@ pub async fn export_trimmed_video(
                     "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{4:.4}{3}[v{2}];",
                     seg.start, seg.end, i, extra, speed
                 ));
-                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, &format!("a{}", i)));
+                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, segment_noise_reduction_db(seg), &format!("a{}", i)));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
             }
             filter.push_str(&format!("{}concat=n={}:v=1:a=1[base][outa];", concat_inputs, segments.len()));
@@ -1680,7 +1706,7 @@ pub async fn export_trimmed_video(
                     "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{5:.4}{3},fps={4:.3}[v{2}];",
                     seg.start, seg.end, i, extra, target_fps, speed
                 ));
-                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, &format!("a{}", i)));
+                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, segment_noise_reduction_db(seg), &format!("a{}", i)));
             }
 
             // Folds left-to-right: `accumulated` tracks the CURRENT duration of whatever

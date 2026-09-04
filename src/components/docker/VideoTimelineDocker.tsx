@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/api/dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdBlurOn, MdFlip, MdGraphicEq, MdPictureInPictureAlt } from "react-icons/md";
+import { MdBlurOn, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -34,6 +34,7 @@ import {
   IoImageOutline,
   IoLocateOutline,
   IoSpeedometerOutline,
+  IoSyncOutline,
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
@@ -45,6 +46,7 @@ import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClamped
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover from "./ClipEffectsPopover";
 import SpeedPopover from "./SpeedPopover";
+import NoiseReductionPopover from "./NoiseReductionPopover";
 import ExportOptionsPopover from "./ExportOptionsPopover";
 import SilenceDetectionPopover, { SilenceDetectionState } from "./SilenceDetectionPopover";
 import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
@@ -325,6 +327,12 @@ interface VideoTimelineDockerProps {
   // without needing to know about clips at all - same "report state this component already tracks
   // upward for a sibling to consume" reasoning as onOutputTimeChange just above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  // The reverse direction for noise reduction specifically: VideoPlayer (a sibling) is the one
+  // that actually knows whether the live Web Audio denoiser is idle/calibrating/active (see its
+  // own onNoiseReductionStatusChange prop), and NoiseReductionPopover (rendered by THIS component)
+  // is what needs to show that as a spinner - Dashboard just relays the value it already round-
+  // trips through activeClipEffects's own reverse-direction sibling, onActiveClipChange, above.
+  noiseReductionStatus?: "idle" | "calibrating" | "active";
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
   // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
@@ -390,6 +398,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onTimelineInsertHandled,
   onOutputTimeChange,
   onActiveClipChange,
+  noiseReductionStatus = "idle",
   selectedOverlayId = null,
   onSelectOverlay,
   isPlacingText = false,
@@ -563,6 +572,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const speedButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     setSpeedPopoverAnchor(null);
+  }, [selectedClipId]);
+
+  // Noise reduction popover - same standalone toolbar button/popover shape as Speed just above,
+  // for the same reason: an audio-cleanup feature with its own presets/strength control earns its
+  // own surface rather than being buried in "Clip effects" (which stays color/Ken Burns/transition
+  // only). Export-only (afftdn, conversion.rs) - there's no live-preview equivalent, unlike speed.
+  const [noiseReductionPopoverAnchor, setNoiseReductionPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
+  const noiseReductionButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    setNoiseReductionPopoverAnchor(null);
   }, [selectedClipId]);
 
   // Save button's quality/destination options (ExportOptionsPopover) - both default to exactly
@@ -1691,11 +1710,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             crop: activeClip.crop,
             flipHorizontal: activeClip.flipHorizontal,
             speed: activeClip.speed,
+            noiseReduction: activeClip.noiseReduction,
           }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed]);
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.noiseReduction]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -1811,6 +1831,29 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             }`}
           >
             <IoSpeedometerOutline size={15} className={selectedClip?.speed && selectedClip.speed !== 1 ? "text-blue-400" : undefined} />
+          </button>
+          <button
+            ref={noiseReductionButtonRef}
+            type="button"
+            title={selectedClipId ? "Reduce background noise" : "Select a clip to reduce its noise"}
+            disabled={!selectedClipId}
+            onClick={() => {
+              if (noiseReductionPopoverAnchor) {
+                setNoiseReductionPopoverAnchor(null);
+                return;
+              }
+              const rect = noiseReductionButtonRef.current?.getBoundingClientRect();
+              if (rect) setNoiseReductionPopoverAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+              noiseReductionPopoverAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            {selectedClipId === activeClip?.id && noiseReductionStatus === "calibrating" ? (
+              <IoSyncOutline size={15} className="text-blue-400 animate-spin" />
+            ) : (
+              <MdOutlineNoiseControlOff size={15} className={selectedClip?.noiseReduction ? "text-blue-400" : undefined} />
+            )}
           </button>
           <ActionButton
             title={selectedClipId ? "Mirror clip horizontally" : "Select a clip to mirror"}
@@ -2627,6 +2670,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               anchor={speedPopoverAnchor}
               onUpdate={(speed) => editStore.updateClipEffects(clip.id, { speed })}
               onClose={() => setSpeedPopoverAnchor(null)}
+            />
+          );
+        })()}
+
+      {selectedClipId &&
+        noiseReductionPopoverAnchor &&
+        (() => {
+          const clip = editStore.clips.find((c) => c.id === selectedClipId);
+          if (!clip) return null;
+          return (
+            <NoiseReductionPopover
+              strength={clip.noiseReduction ?? 0}
+              status={noiseReductionStatus}
+              anchor={noiseReductionPopoverAnchor}
+              onUpdate={(noiseReduction) => editStore.updateClipEffects(clip.id, { noiseReduction })}
+              onClose={() => setNoiseReductionPopoverAnchor(null)}
             />
           );
         })()}

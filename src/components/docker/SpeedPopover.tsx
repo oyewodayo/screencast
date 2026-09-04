@@ -6,11 +6,12 @@
 // ramping, etc.) to earn its own button rather than being one more section buried inside "Clip
 // effects", the same reasoning Crop already got its own standalone toolbar button for. Same portal
 // + useClampedPopoverPosition + outside-click-close shape as ClipEffectsPopover/SilenceDetectionPopover.
-import React, { useEffect, useState } from "react";
+import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
-import { IoChevronDown, IoChevronUp, IoClose, IoSpeedometerOutline } from "react-icons/io5";
+import { IoClose, IoSpeedometerOutline } from "react-icons/io5";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import Slider from "./Slider";
+import NumberStepper from "./NumberStepper";
 
 // Same range export_trimmed_video's own atempo_chain (conversion.rs) is built to handle cleanly -
 // see that function's own doc comment for why arbitrarily large factors aren't offered here.
@@ -31,68 +32,6 @@ interface SpeedPopoverProps {
   onUpdate: (speed: number | undefined) => void;
   onClose: () => void;
 }
-
-// A speed/duration field editable three ways at once: type a value directly, click the up/down
-// steppers, or (for speed) drag the slider next to it - all three just call the same onChange.
-// Shows a formatted (suffixed, fixed-precision) string while not focused, and the raw editable
-// number while it is, so a mid-edit value like "1." isn't fought over by re-formatting on every
-// keystroke.
-const NumberStepper: React.FC<{
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  decimals: number;
-  suffix: string;
-  onChange: (next: number) => void;
-}> = ({ value, min, max, step, decimals, suffix, onChange }) => {
-  const [draft, setDraft] = useState<string | null>(null);
-
-  const commit = (raw: string) => {
-    const parsed = Number(raw);
-    if (Number.isFinite(parsed)) onChange(Math.max(min, Math.min(max, parsed)));
-    setDraft(null);
-  };
-  const nudge = (delta: number) => onChange(Math.max(min, Math.min(max, value + delta)));
-
-  return (
-    <div className="flex items-center shrink-0 rounded bg-black/40 ring-1 ring-white/10 overflow-hidden">
-      <input
-        type="text"
-        inputMode="decimal"
-        value={draft ?? `${value.toFixed(decimals)}${suffix}`}
-        onFocus={() => setDraft(value.toFixed(decimals))}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={(e) => commit(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") e.currentTarget.blur();
-          else if (e.key === "Escape") setDraft(null);
-        }}
-        className="w-14 bg-transparent pl-1.5 py-1 text-[11px] text-right tabular-nums text-white/90 outline-none"
-      />
-      <div className="flex flex-col border-l border-white/10">
-        <button
-          type="button"
-          tabIndex={-1}
-          title="Increase"
-          onClick={() => nudge(step)}
-          className="px-1 h-3.5 flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10"
-        >
-          <IoChevronUp size={9} />
-        </button>
-        <button
-          type="button"
-          tabIndex={-1}
-          title="Decrease"
-          onClick={() => nudge(-step)}
-          className="px-1 h-3.5 flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 border-t border-white/10"
-        >
-          <IoChevronDown size={9} />
-        </button>
-      </div>
-    </div>
-  );
-};
 
 const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anchor, onUpdate, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);

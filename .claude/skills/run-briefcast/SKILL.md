@@ -98,6 +98,22 @@ for a person, useless for scripted screenshots since nothing but a human can see
 
 ## Gotchas
 
+- **`launch` doesn't always attach to the main window.** The app creates three windows
+  (`tauri.conf.json`: main, `recording-overlay`, `screenshot-overlay`), and which one WebDriver's
+  session considers "current" after `launch` isn't reliably the main one across runs - a `ss`/`eval`
+  right after launch can land on a blank overlay window instead. If a selector that should exist
+  comes back not-found, don't assume the DOM is wrong - check first:
+  ```js
+  const state = JSON.parse(require('fs').readFileSync('.claude/skills/run-briefcast/tools/session.json','utf-8'));
+  const base = `http://localhost:${state.port}/session/${state.sessionId}`;
+  const handles = await (await fetch(base+'/window/handles')).json(); // .value: array of handles
+  // switch + check location.href for each via POST base+'/window' {handle} then /execute/sync
+  // 'return location.href' - the main window is the one at "https://tauri.localhost/" with no
+  // path suffix (overlays are "/recording-overlay", "/screenshot-overlay"). Once you POST
+  // base+'/window' {handle: <the right one>}, that choice persists for the rest of the WebDriver
+  // session (including from later, separate `driver.mjs` CLI invocations) - no need to reselect
+  // it every command, only when it's actually wrong.
+  ```
 - **Single-instance guard.** `src-tauri/src/main.rs` binds `127.0.0.1:47813` before doing anything
   else; a second launch just pops a native "already running" `MessageBoxW` and exits 0 - no error,
   no window, nothing WebDriver can see. `driver.mjs launch` checks this port first and fails loudly

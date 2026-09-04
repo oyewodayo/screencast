@@ -117,6 +117,13 @@ export interface Clip {
   // any Ken Burns/transition timing on that segment, so their own duration math already operates in
   // OUTPUT time and needs no separate speed-awareness of its own.
   speed?: number;
+  // Background-noise reduction strength, 0..1 - undefined/0 means off, the pre-existing look.
+  // Unlike color/Ken Burns/crop, this has no live-preview equivalent: it's an FFT denoiser
+  // (afftdn) that only ever runs at export time (conversion.rs's audio_trim_chain) - there's no
+  // cheap way to run the same filter over the live <video> element's audio in the browser, so
+  // NoiseReductionPopover shows a "preview plays the original audio" note rather than pretending
+  // this is previewable the way speed/crop are.
+  noiseReduction?: number;
 }
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
@@ -334,6 +341,7 @@ export interface KeepSegment {
   crop?: ClipCrop;
   flipHorizontal?: boolean;
   speed?: number;
+  noiseReduction?: number;
 }
 
 export interface VideoEditState {

@@ -51,6 +51,10 @@ interface Props {
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
+  // through to FileToolsDocker/VideoTimelineDocker - same shape as onActiveClipChange above, just
+  // travelling player-to-timeline-docker instead of the other way.
+  noiseReductionStatus?: "idle" | "calibrating" | "active";
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // FileToolsDocker/VideoTimelineDocker.
   selectedOverlayId?: string | null;
@@ -173,6 +177,7 @@ const BottomDocker = ({
   onTimelineInsertHandled,
   onOutputTimeChange,
   onActiveClipChange,
+  noiseReductionStatus,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -558,6 +563,7 @@ const BottomDocker = ({
             onTimelineInsertHandled={onTimelineInsertHandled}
             onOutputTimeChange={onOutputTimeChange}
             onActiveClipChange={onActiveClipChange}
+            noiseReductionStatus={noiseReductionStatus}
             selectedOverlayId={selectedOverlayId}
             onSelectOverlay={onSelectOverlay}
             isPlacingText={isPlacingText}

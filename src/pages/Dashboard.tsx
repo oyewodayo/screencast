@@ -428,6 +428,12 @@ const Dashboard = () => {
   // in Dashboard state, passed to both the timeline docker and the sibling player" shape as
   // currentOutputTime just above.
   const [activeClipEffects, setActiveClipEffects] = useState<ActiveClipEffects | null>(null);
+  // Live status of VideoPlayer's own noise-reduction Web Audio graph (see its
+  // onNoiseReductionStatusChange prop) - relayed straight through to VideoTimelineDocker
+  // (noiseReductionStatus) so NoiseReductionPopover can show it, same round-trip shape as
+  // activeClipEffects just above, just travelling the other direction (player -> timeline docker
+  // instead of timeline docker -> player).
+  const [noiseReductionStatus, setNoiseReductionStatus] = useState<"idle" | "calibrating" | "active">("idle");
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [isPlacingText, setIsPlacingText] = useState<boolean>(false);
   const [selectedImageOverlayId, setSelectedImageOverlayId] = useState<string | null>(null);
@@ -3311,6 +3317,7 @@ const setScreen = () => {
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted}
                 activeClipEffects={activeClipEffects}
+                onNoiseReductionStatusChange={setNoiseReductionStatus}
               />
             )
           ) : selectedFolder !== null && activeFileCategory === "image" ? (
@@ -3519,6 +3526,7 @@ const setScreen = () => {
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         onOutputTimeChange={setCurrentOutputTime}
         onActiveClipChange={setActiveClipEffects}
+        noiseReductionStatus={noiseReductionStatus}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={setSelectedOverlayId}
         isPlacingText={isPlacingText}

@@ -72,6 +72,9 @@ interface FileToolsDockerProps {
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
+  // through to VideoTimelineDocker - see its own prop doc comment.
+  noiseReductionStatus?: "idle" | "calibrating" | "active";
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // VideoTimelineDocker - see its own prop doc comments.
   selectedOverlayId?: string | null;
@@ -123,6 +126,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onTimelineInsertHandled,
   onOutputTimeChange,
   onActiveClipChange,
+  noiseReductionStatus,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -165,6 +169,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onTimelineInsertHandled={onTimelineInsertHandled}
         onOutputTimeChange={onOutputTimeChange}
         onActiveClipChange={onActiveClipChange}
+        noiseReductionStatus={noiseReductionStatus}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={onSelectOverlay}
         isPlacingText={isPlacingText}

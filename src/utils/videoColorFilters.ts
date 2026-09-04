@@ -147,4 +147,5 @@ export interface ActiveClipEffects {
   crop?: ClipCrop;
   flipHorizontal?: boolean;
   speed?: number;
+  noiseReduction?: number;
 }

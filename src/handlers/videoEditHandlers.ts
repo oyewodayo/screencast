@@ -32,7 +32,7 @@ function sanitizeCrop(crop: ClipCrop | undefined): ClipCrop | undefined {
 // the same order as `clips` - that order is exactly the desired playback/output order, so this is
 // a type-only projection, not a sort or a merge.
 export function toKeepSegments(clips: Clip[]): KeepSegment[] {
-  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn, crop, flipHorizontal, speed }) => ({
+  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn, crop, flipHorizontal, speed, noiseReduction }) => ({
     sourcePath,
     start,
     end,
@@ -42,6 +42,7 @@ export function toKeepSegments(clips: Clip[]): KeepSegment[] {
     crop: sanitizeCrop(crop),
     flipHorizontal,
     speed,
+    noiseReduction,
   }));
 }
 
@@ -254,7 +255,7 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
 // transition) - same "one function, Partial<T> patch" shape as updateOverlay, but standalone
 // since Clip (unlike every overlay type) has no updatedAt for anything to read back, so it can't
 // reuse updateOverlay<T extends {id,updatedAt}> as-is.
-export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed">>): Clip[] {
+export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction">>): Clip[] {
   return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
 
