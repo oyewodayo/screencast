@@ -980,7 +980,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     </svg>
   );
 
-  const renderVolumeIcon = (): JSX.Element => {
+  const renderVolumeIcon = (): React.JSX.Element => {
     switch (volumeLevel) {
       case 'low':
         return <VolumeLowIcon />;

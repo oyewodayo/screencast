@@ -1,6 +1,6 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+@plugin "@tailwindcss/typography";
 
 :root {
   font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
@@ -40,10 +40,18 @@ body {
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+/* Plain CSS rather than @apply dark: - Tailwind v4's custom dark variant wraps in a :where()
+   that the CSS minifier can't combine with a vendor-prefixed pseudo-element selector. */
 ::-webkit-scrollbar-thumb {
-  @apply bg-black/15 dark:bg-white/15;
+  background-color: rgb(0 0 0 / 0.15);
   border-radius: 9999px;
 }
+.dark ::-webkit-scrollbar-thumb {
+  background-color: rgb(255 255 255 / 0.15);
+}
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-black/25 dark:bg-white/25;
+  background-color: rgb(0 0 0 / 0.25);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(255 255 255 / 0.25);
 }

@@ -15,7 +15,7 @@ import {
 } from "../handlers/pdfAnnotationHandlers";
 
 interface UseStrokeCaptureOptions {
-  scratchCanvasRef: RefObject<HTMLCanvasElement>;
+  scratchCanvasRef: RefObject<HTMLCanvasElement | null>;
   enabled: boolean;
   tool: AnnotationTool | null; // null = no tool selected, capture is disabled entirely
   color: string;
