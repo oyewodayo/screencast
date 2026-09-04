@@ -2332,3 +2332,328 @@ fn parse_silence_ranges(stderr: &str) -> Vec<SilentRange> {
     }
     ranges
 }
+
+// ---- Unit tests -------------------------------------------------------------------------------
+//
+// Covers the pure, deterministic filter-string builders/sanitizers/parsers in this file - no
+// ffmpeg/ffprobe process spawned, no Tauri AppHandle/Window needed. These are the functions a
+// future Tauri version bump (or any other refactor) should be able to leave completely unchanged;
+// if one of these tests breaks, the export's actual OUTPUT changed, not just its plumbing.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Bare-minimum KeepSegment with every optional field off - individual tests override just the
+    // field(s) they care about via struct-update syntax (`..base_segment()`), so adding a new field
+    // to KeepSegment later only means updating this one helper, not every test.
+    fn base_segment() -> KeepSegment {
+        KeepSegment {
+            source_path: "clip.mp4".to_string(),
+            start: 0.0,
+            end: 10.0,
+            color_filter: None,
+            ken_burns: None,
+            transition_in: None,
+            crop: None,
+            flip_horizontal: None,
+            speed: None,
+            noise_reduction: None,
+        }
+    }
+
+    // ---- segment_speed / segment_noise_reduction_db --------------------------------------------
+
+    #[test]
+    fn segment_speed_defaults_to_1x_when_unset() {
+        assert_eq!(segment_speed(&base_segment()), 1.0);
+    }
+
+    #[test]
+    fn segment_speed_clamps_to_0_25_4_range() {
+        let mut seg = base_segment();
+        seg.speed = Some(100.0);
+        assert_eq!(segment_speed(&seg), 4.0);
+        seg.speed = Some(0.001);
+        assert_eq!(segment_speed(&seg), 0.25);
+        seg.speed = Some(1.5);
+        assert_eq!(segment_speed(&seg), 1.5);
+    }
+
+    #[test]
+    fn segment_noise_reduction_db_is_none_when_off() {
+        let seg = base_segment();
+        assert_eq!(segment_noise_reduction_db(&seg), None);
+
+        let mut zero = base_segment();
+        zero.noise_reduction = Some(0.0);
+        assert_eq!(segment_noise_reduction_db(&zero), None);
+    }
+
+    #[test]
+    fn segment_noise_reduction_db_maps_0_to_1_onto_4_to_40_db() {
+        let mut seg = base_segment();
+        seg.noise_reduction = Some(1.0);
+        assert_eq!(segment_noise_reduction_db(&seg), Some(40.0));
+
+        seg.noise_reduction = Some(0.5);
+        assert_eq!(segment_noise_reduction_db(&seg), Some(22.0));
+
+        // Clamped even if a stale/hand-edited sidecar carries an out-of-range value.
+        seg.noise_reduction = Some(5.0);
+        assert_eq!(segment_noise_reduction_db(&seg), Some(40.0));
+        seg.noise_reduction = Some(-5.0);
+        assert_eq!(segment_noise_reduction_db(&seg), None);
+    }
+
+    // ---- atempo_chain ---------------------------------------------------------------------------
+
+    #[test]
+    fn atempo_chain_1x_is_a_single_noop_stage() {
+        assert_eq!(atempo_chain(1.0), "atempo=1.0000");
+    }
+
+    #[test]
+    fn atempo_chain_within_single_instance_range_needs_no_chaining() {
+        assert_eq!(atempo_chain(2.0), "atempo=2.0000");
+        assert_eq!(atempo_chain(0.5), "atempo=0.5000");
+        assert_eq!(atempo_chain(1.37), "atempo=1.3700");
+    }
+
+    #[test]
+    fn atempo_chain_above_2x_splits_into_two_stages() {
+        // 4.0 -> one atempo=2.0 stage, remaining 2.0 -> loop condition is `> 2.0` so exactly 2.0
+        // stops there, leaving a second atempo=2.0000 stage for the remainder.
+        assert_eq!(atempo_chain(4.0), "atempo=2.0000,atempo=2.0000");
+    }
+
+    #[test]
+    fn atempo_chain_below_0_5x_splits_into_two_stages() {
+        assert_eq!(atempo_chain(0.25), "atempo=0.5000,atempo=0.5000");
+    }
+
+    // ---- sanitizers - the security-boundary functions --------------------------------------------
+
+    #[test]
+    fn sanitize_transition_name_passes_through_allowed_values() {
+        assert_eq!(sanitize_transition_name("wipeleft"), "wipeleft");
+        assert_eq!(sanitize_transition_name("dissolve"), "dissolve");
+    }
+
+    #[test]
+    fn sanitize_transition_name_falls_back_to_fade_for_anything_else() {
+        assert_eq!(sanitize_transition_name("fade"), "fade");
+        assert_eq!(sanitize_transition_name(""), "fade");
+        assert_eq!(sanitize_transition_name("'; DROP TABLE clips; --"), "fade");
+    }
+
+    #[test]
+    fn sanitize_overlay_animation_passes_through_allowed_values_only() {
+        assert_eq!(sanitize_overlay_animation("slide-left"), "slide-left");
+        assert_eq!(sanitize_overlay_animation("pop"), "none"); // "pop" is preview-only, never sent
+        assert_eq!(sanitize_overlay_animation("anything-else"), "none");
+    }
+
+    #[test]
+    fn sanitize_pip_shape_passes_through_allowed_values_only() {
+        assert_eq!(sanitize_pip_shape("circle"), "circle");
+        assert_eq!(sanitize_pip_shape("rounded"), "rounded");
+        assert_eq!(sanitize_pip_shape("hexagon"), "rectangle");
+    }
+
+    // ---- color_filter_chain / ken_burns_chain / crop_chain ---------------------------------------
+
+    #[test]
+    fn color_filter_chain_none_preset_is_a_noop() {
+        let cf = ClipColorFilter { preset: "none".to_string(), intensity: 0.7 };
+        assert_eq!(color_filter_chain(&cf), "");
+    }
+
+    #[test]
+    fn color_filter_chain_bw_at_full_intensity_fully_desaturates() {
+        let cf = ClipColorFilter { preset: "bw".to_string(), intensity: 1.0 };
+        assert_eq!(color_filter_chain(&cf), ",eq=saturation=0.000");
+    }
+
+    #[test]
+    fn color_filter_chain_clamps_out_of_range_intensity() {
+        let over = ClipColorFilter { preset: "bw".to_string(), intensity: 5.0 };
+        let under = ClipColorFilter { preset: "bw".to_string(), intensity: -5.0 };
+        assert_eq!(color_filter_chain(&over), ",eq=saturation=0.000"); // clamped to 1.0
+        assert_eq!(color_filter_chain(&under), ",eq=saturation=1.000"); // clamped to 0.0
+    }
+
+    #[test]
+    fn crop_chain_clamps_position_so_the_window_never_crosses_the_far_edge() {
+        // x=0.9 with width=0.5 would crop past the right edge (0.9+0.5 > 1.0) - x must clamp to
+        // 1.0-width=0.5, not the raw 0.9 the caller passed.
+        let c = ClipCrop { x: 0.9, y: 0.0, width: 0.5, height: 0.5 };
+        assert_eq!(crop_chain(&c), ",crop=w='iw*0.5000':h='ih*0.5000':x='iw*0.5000':y='ih*0.0000'");
+    }
+
+    #[test]
+    fn crop_chain_rejects_a_degenerate_near_zero_area_crop() {
+        let c = ClipCrop { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        // width/height floor at 0.05, never truly 0.
+        assert_eq!(crop_chain(&c), ",crop=w='iw*0.0500':h='ih*0.0500':x='iw*0.0000':y='ih*0.0000'");
+    }
+
+    #[test]
+    fn ken_burns_chain_unrecognized_preset_is_a_noop() {
+        let kb = ClipKenBurns { preset: "sparkle".to_string(), intensity: None, target_x: None, target_y: None };
+        assert_eq!(ken_burns_chain(&kb, 5.0, 1920, 1080), "");
+    }
+
+    #[test]
+    fn ken_burns_chain_zoom_in_ends_at_the_scaled_output_resolution() {
+        let kb = ClipKenBurns { preset: "zoom-in".to_string(), intensity: Some(1.0), target_x: None, target_y: None };
+        let chain = ken_burns_chain(&kb, 5.0, 1920, 1080);
+        assert!(chain.starts_with(",crop="), "expected a crop expression, got: {chain}");
+        assert!(chain.ends_with(",scale=1920:1080"), "expected a trailing scale to output resolution, got: {chain}");
+    }
+
+    // ---- segment_effect_chain - ordering matters (mirrored in VideoPlayer.tsx's own preview) -----
+
+    #[test]
+    fn segment_effect_chain_applies_hflip_before_color_before_crop() {
+        let mut seg = base_segment();
+        seg.flip_horizontal = Some(true);
+        seg.color_filter = Some(ClipColorFilter { preset: "bw".to_string(), intensity: 1.0 });
+        seg.crop = Some(ClipCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080));
+        let hflip_pos = chain.find("hflip").expect("hflip missing");
+        let color_pos = chain.find("eq=saturation").expect("color filter missing");
+        let crop_pos = chain.find("crop=").expect("crop missing");
+        assert!(hflip_pos < color_pos && color_pos < crop_pos, "wrong order: {chain}");
+    }
+
+    #[test]
+    fn segment_effect_chain_skips_the_extra_scale_when_ken_burns_will_scale_anyway() {
+        let mut seg = base_segment();
+        seg.crop = Some(ClipCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        seg.ken_burns = Some(ClipKenBurns { preset: "zoom-in".to_string(), intensity: Some(0.5), target_x: None, target_y: None });
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080));
+        // Exactly one scale=1920:1080 (Ken Burns' own trailing one), not two.
+        assert_eq!(chain.matches("scale=1920:1080").count(), 1);
+    }
+
+    #[test]
+    fn segment_effect_chain_with_no_effects_is_empty() {
+        assert_eq!(segment_effect_chain(&base_segment(), Some(1920), Some(1080)), "");
+    }
+
+    // ---- audio_trim_chain -----------------------------------------------------------------------
+
+    #[test]
+    fn audio_trim_chain_no_audio_synthesizes_silence_of_the_right_output_duration() {
+        // 10 source seconds at 2x speed -> 5 output seconds.
+        let chain = audio_trim_chain(false, 0, 0.0, 10.0, 2.0, None, "outa");
+        assert_eq!(chain, "anullsrc=channel_layout=stereo:sample_rate=44100:duration=5.000[outa];");
+    }
+
+    #[test]
+    fn audio_trim_chain_with_audio_includes_tempo_but_no_denoise_when_off() {
+        let chain = audio_trim_chain(true, 0, 1.0, 5.0, 1.0, None, "outa");
+        assert_eq!(chain, "[0:a]atrim=start=1.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000[outa];");
+    }
+
+    #[test]
+    fn audio_trim_chain_appends_afftdn_after_atempo_when_noise_reduction_is_set() {
+        let chain = audio_trim_chain(true, 2, 0.0, 5.0, 1.0, Some(22.0), "a2");
+        assert_eq!(chain, "[2:a]atrim=start=0.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000,afftdn=nr=22.00[a2];");
+    }
+
+    // ---- overlay animation expressions ------------------------------------------------------------
+
+    #[test]
+    fn overlay_position_expr_none_and_fade_are_static_coordinates() {
+        let ov = OverlayImage { data_base64: String::new(), x: 100, y: 200, start_time: 0.0, end_time: 5.0, animation: "none".to_string() };
+        assert_eq!(overlay_position_expr(&ov, "none"), ("100".to_string(), "200".to_string()));
+        assert_eq!(overlay_position_expr(&ov, "fade"), ("100".to_string(), "200".to_string()));
+    }
+
+    #[test]
+    fn overlay_position_expr_slide_left_only_animates_x() {
+        let ov = OverlayImage { data_base64: String::new(), x: 100, y: 200, start_time: 0.0, end_time: 5.0, animation: "slide-left".to_string() };
+        let (x, y) = overlay_position_expr(&ov, "slide-left");
+        assert_eq!(y, "200"); // y untouched
+        assert!(x.contains("main_w"), "expected an x expression referencing main_w, got: {x}");
+    }
+
+    // ---- parse_duration / parse_silence_ranges - real ffmpeg stderr text shapes ------------------
+
+    #[test]
+    fn parse_duration_reads_the_standard_ffmpeg_banner_line() {
+        let output = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':\n  Duration: 00:02:03.45, start: 0.000000, bitrate: 1234 kb/s\n";
+        assert_eq!(parse_duration(output), Some(123.45));
+    }
+
+    #[test]
+    fn parse_duration_returns_none_when_no_duration_line_present() {
+        assert_eq!(parse_duration("some unrelated ffmpeg output\n"), None);
+    }
+
+    #[test]
+    fn parse_silence_ranges_pairs_start_and_end_lines() {
+        let stderr = "\
+[silencedetect @ 0x1] silence_start: 12.345
+[silencedetect @ 0x1] silence_end: 15.678 | silence_duration: 3.333
+[silencedetect @ 0x1] silence_start: 20.0
+[silencedetect @ 0x1] silence_end: 21.5 | silence_duration: 1.5
+";
+        let ranges = parse_silence_ranges(stderr);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].start, 12.345);
+        assert_eq!(ranges[0].end, 15.678);
+        assert_eq!(ranges[1].start, 20.0);
+        assert_eq!(ranges[1].end, 21.5);
+    }
+
+    #[test]
+    fn parse_silence_ranges_drops_a_trailing_unmatched_silence_start() {
+        // The file ends while still silent - no matching silence_end line at all.
+        let stderr = "[silencedetect @ 0x1] silence_start: 12.345\n";
+        assert_eq!(parse_silence_ranges(stderr).len(), 0);
+    }
+
+    // ---- resolve_export_quality / should_convert_file / unique_output_path ------------------------
+
+    #[test]
+    fn resolve_export_quality_unrecognized_and_missing_both_fall_back_to_standard() {
+        assert_eq!(resolve_export_quality(None), ("medium", "23"));
+        assert_eq!(resolve_export_quality(Some("ultra")), ("medium", "23"));
+        assert_eq!(resolve_export_quality(Some("high")), ("slow", "18"));
+        assert_eq!(resolve_export_quality(Some("small")), ("veryfast", "28"));
+    }
+
+    #[test]
+    fn should_convert_file_flags_only_the_documented_extensions() {
+        assert!(should_convert_file("clip.mkv".to_string()));
+        assert!(should_convert_file("clip.MOV".to_string())); // case-insensitive
+        assert!(!should_convert_file("clip.mp4".to_string()));
+        assert!(!should_convert_file("no_extension".to_string()));
+    }
+
+    #[test]
+    fn unique_output_path_appends_a_counter_when_the_target_already_exists() {
+        let dir = std::env::temp_dir().join(format!("briefcast_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.mp4");
+        std::fs::write(&target, b"existing").unwrap();
+
+        let resolved = unique_output_path(target.clone());
+        assert_eq!(resolved, dir.join("out (1).mp4"));
+
+        // With "out (1).mp4" ALSO taken, the next free slot is "(2)".
+        std::fs::write(&resolved, b"existing").unwrap();
+        assert_eq!(unique_output_path(target.clone()), dir.join("out (2).mp4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_output_path_returns_the_path_unchanged_when_free() {
+        let dir = std::env::temp_dir().join(format!("briefcast_test_free_{}", std::process::id()));
+        let target = dir.join("brand_new.mp4"); // dir deliberately never created - can't exist
+        assert_eq!(unique_output_path(target.clone()), target);
+    }
+}

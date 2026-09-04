@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Windows only, matching this app's actual primary dev/target platform - the per-OS native code
+# under src-tauri/src/commands/{recording,window_capture}/{macos,linux}.rs is #[cfg(target_os)]-
+# gated and can't be compiled/tested here either way (see .claude/skills/run-briefcast/SKILL.md's
+# own note on this). Frontend and Rust unit tests are both pure-logic-only in this initial pass
+# (see the "Pure functions only" handler files and conversion.rs's own #[cfg(test)] module) so
+# platform shouldn't actually matter for what's covered yet - a Linux/macOS matrix is a reasonable
+# future addition once there's native-code coverage to actually gain from it.
+jobs:
+  frontend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test
+
+  rust:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      # Not `tauri build`/`--features custom-protocol` - that needs the bundled ffmpeg/heif binary
+      # resources and the full Tauri bundling toolchain, neither of which this test suite (pure
+      # unit tests only, see conversion.rs's own #[cfg(test)] module) actually needs.
+      - run: cargo test
