@@ -25,11 +25,18 @@ mod services {
     pub mod file_watcher;
     pub mod boards;
     pub mod docs;
+    pub mod docs_search;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
     #[cfg(target_os = "windows")]
     pub mod loopback_audio;
+    // A Win32 low-level mouse hook, Windows-only for the same reason loopback_audio above is
+    // (SetWindowsHookExW/WH_MOUSE_LL has no cross-platform equivalent this app's existing `windows`
+    // crate dependency could reuse) - see the module's own doc comment for why this needed no new
+    // Cargo dependency at all.
+    #[cfg(target_os = "windows")]
+    pub mod click_tracker;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
     // ffmpeg build mis-decodes multi-image HEIC files (Portrait mode, Deep Fusion, etc.) as a
@@ -37,6 +44,15 @@ mod services {
     // in <img> tags, so this problem - and this module - is Windows-only.
     #[cfg(target_os = "windows")]
     pub mod heic_windows;
+    // Fallback HEIC/HEIF decoder for when heic_windows above fails (most commonly: the machine
+    // has "HEIF Image Extensions" but not the separate "HEVC Video Extensions" package, so WIC
+    // can open the container but not decode its pixels - see heic_windows.rs's own doc comment).
+    // Shells out to a bundled libheif build instead of the ffmpeg fallback this used to be - see
+    // heif_tool.rs's own doc comment for why ffmpeg's HEIF tile-grid reconstruction isn't good
+    // enough here. Windows-only for the same reason heic_windows is: it's the only platform this
+    // fallback path is ever reached from.
+    #[cfg(target_os = "windows")]
+    pub mod heif_tool;
 }
 use simplelog::{CombinedLogger, WriteLogger, TermLogger, ColorChoice, TerminalMode, ConfigBuilder};
 
@@ -49,7 +65,44 @@ fn get_os_info() -> String {
     OS.to_string().to_uppercase()
 }
 
+// Shows a native "already running" notice before the duplicate process exits - Windows only for
+// now (matches this codebase's existing "Windows is the verified platform" posture elsewhere,
+// e.g. loopback_audio.rs/heic_windows.rs), since MessageBoxW needs no Tauri app context to call,
+// unlike tauri::api::dialog which assumes a running app. A silent exit is an acceptable fallback
+// on macOS/Linux - a launcher/dock effectively already fills this role there by focusing the
+// existing window instead of spawning a second process in the first place.
+#[cfg(target_os = "windows")]
+fn show_already_running_message() {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    let title: Vec<u16> = "Briefcast".encode_utf16().chain(std::iter::once(0)).collect();
+    let text: Vec<u16> = "Briefcast is already running.".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+    }
+}
+
 fn main() {
+    // Single-instance guard: binding a fixed localhost port is atomic and self-cleaning (the OS
+    // releases it the moment this process exits, crash or not - no stale-PID-file cleanup needed,
+    // unlike a lock file). A second launch failing this bind means a first instance is already
+    // running and already holds every global shortcut (Ctrl+Shift+R/H/B/D, see Dashboard.tsx) -
+    // letting a second copy proceed anyway is exactly what produced "Couldn't register the
+    // panel-buttons shortcut... it may already be in use by another app": that "another app" was
+    // just an earlier copy of this same app. The listener is kept bound for main()'s entire
+    // lifetime (held in this variable, never touched again) rather than dropped right after the
+    // check, which would let a third launch slip in during the race between checking and the app
+    // actually starting up.
+    let _single_instance_guard = match std::net::TcpListener::bind(("127.0.0.1", 47_813)) {
+        Ok(listener) => listener,
+        Err(_) => {
+            #[cfg(target_os = "windows")]
+            show_already_running_message();
+            std::process::exit(0);
+        }
+    };
+
     let context = tauri::generate_context!();
 
     // Resolve logs to the app's own data directory instead of the process's current working
@@ -154,6 +207,7 @@ fn main() {
             commands::recording::get_connected_devices,
             commands::recording::start_recording,
             commands::recording::stop_recording,
+            commands::recording::load_click_sidecar,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,
@@ -175,8 +229,12 @@ fn main() {
             commands::conversion::should_convert_file,
             commands::conversion::convert_video,
             commands::conversion::convert_image,
+            commands::conversion::get_heic_preview,
+            commands::conversion::get_image_thumbnail,
+            commands::conversion::get_video_thumbnail,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
+            commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,
 
@@ -212,12 +270,14 @@ fn main() {
             services::image_annotations::save_edited_image,
             services::boards::list_boards,
             services::boards::create_board,
+            services::boards::duplicate_board,
             services::boards::save_board,
             services::boards::load_board,
             services::boards::delete_board,
             services::boards::import_board_image,
             services::boards::save_board_thumbnail,
             services::boards::export_board_png,
+            services::boards::export_board_png_to_path,
             services::docs::list_docs,
             services::docs::create_doc,
             services::docs::save_doc,
@@ -233,6 +293,26 @@ fn main() {
             services::docs::list_trashed_docs,
             services::docs::restore_doc,
             services::docs::delete_doc_permanently,
+            services::docs::list_doc_folders,
+            services::docs::create_doc_folder,
+            services::docs::rename_doc_folder,
+            services::docs::move_doc_folder,
+            services::docs::delete_doc_folder,
+            services::docs::set_doc_folder,
+            services::docs::create_doc_version,
+            services::docs::list_doc_versions,
+            services::docs::load_doc_version,
+            services::docs::restore_doc_version,
+            services::docs::list_doc_comments,
+            services::docs::add_doc_comment,
+            services::docs::resolve_doc_comment,
+            services::docs::reopen_doc_comment,
+            services::docs::delete_doc_comment,
+            services::docs::set_doc_page_setup,
+            services::docs_search::index_doc_content,
+            services::docs_search::remove_doc_from_index,
+            services::docs_search::list_indexed_doc_ids,
+            services::docs_search::search_docs,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
 

@@ -7,8 +7,8 @@
 // id that's already guaranteed to exist.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
-import { BoardCommand, BoardDocument, BoardImage } from "../utils/boardTypes";
-import { applyCommand, invertCommand } from "../handlers/boardHandlers";
+import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGradientBackground, BoardGridBackground, BoardItem } from "../utils/boardTypes";
+import { applyCommand, invertCommand, resolveBackgroundMode, resolveBoardGradient, resolveBoardGrid } from "../handlers/boardHandlers";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
@@ -16,16 +16,34 @@ export interface UseBoardStoreResult {
   doc: BoardDocument | null;
   loading: boolean;
   loadError: string | null;
-  addImage: (image: BoardImage) => void;
-  editImage: (before: BoardImage, after: BoardImage) => void;
-  deleteImage: (image: BoardImage) => void;
-  // Replaces several images at once as a single undo step - multi-selection drag, "Arrange in a
-  // row". `before`/`after` must be the same images (matched by id) before/after the batch op.
-  batchEditImages: (before: BoardImage[], after: BoardImage[]) => void;
+  // Named after images for historical reasons (images came first) but generic over BoardItem -
+  // works identically for a BoardText item, same as boardHandlers.ts's own geometry helpers these
+  // ultimately dispatch to.
+  addImage: (item: BoardItem) => void;
+  editImage: (before: BoardItem, after: BoardItem) => void;
+  deleteImage: (item: BoardItem) => void;
+  // Replaces several items at once as a single undo step - multi-selection drag, "Arrange in a
+  // row". `before`/`after` must be the same items (matched by id) before/after the batch op.
+  batchEditImages: (before: BoardItem[], after: BoardItem[]) => void;
+  // Adds/removes several items at once as ONE undo step - "Duplicate" on a multi-selection, and
+  // bulk delete. Distinct from calling addImage/deleteImage in a loop, which would create one undo
+  // step per item.
+  addItems: (items: BoardItem[]) => void;
+  deleteItems: (items: BoardItem[]) => void;
   // Full replacement order for the whole images array - drag-to-reorder in the layers list.
-  reorderImages: (newOrder: BoardImage[]) => void;
+  reorderImages: (newOrder: BoardItem[]) => void;
   // `null` = transparent - see BoardDocument's own doc comment.
   setBackgroundColor: (color: string | null) => void;
+  // Which of the three background renderers is active - see BoardBackgroundMode's own doc comment.
+  // Switching modes never touches backgroundColor/backgroundGrid/backgroundImage - each is
+  // remembered independently so flipping back to a previously-used mode restores it as last left.
+  setBackgroundMode: (mode: BoardBackgroundMode) => void;
+  setBackgroundGrid: (grid: BoardGridBackground) => void;
+  setBackgroundGradient: (gradient: BoardGradientBackground) => void;
+  // Asset filename already imported into this board's assets/ folder (see BoardEditor.tsx's
+  // handleChooseBackgroundImage), or null to clear it - this setter doesn't do any importing
+  // itself, same division of responsibility as addImage/BoardEditor's own handleAddImages.
+  setBackgroundImage: (assetFileName: string | null) => void;
   setCanvasSize: (width: number, height: number) => void;
   // Mat/frame border around the whole board - see BoardDocument's own doc comment. Purely a
   // rendering-time inset (boardHandlers.ts's paddedCanvasSize), so this alone is enough to update
@@ -77,7 +95,15 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
         // (not instead of) every consumer's own defensive guard (e.g. boardHandlers.ts's
         // resolveBoardPadding) - a missing `padding` already reached the zoom-percentage readout
         // as NaN once because only *some* consumers guarded it; belt and suspenders now.
-        setDoc({ padding: 0, ...JSON.parse(json) });
+        const parsed = JSON.parse(json);
+        // BoardText didn't exist when older boards were saved, so every entry in their `images`
+        // array is an image with no `kind` field at all - normalized to "image" here, once, so
+        // every other reader in the app can treat `kind` as always present rather than re-deriving
+        // "no kind = image" itself. A `kind: "text"` entry (impossible before this feature existed)
+        // passes through unchanged. `parsed`/`item` are untyped (JSON.parse's own `any`) precisely
+        // because this is the one place on-disk data may not yet match BoardItem's shape.
+        const images: BoardItem[] = (parsed.images ?? []).map((item: any) => (item.kind ? item : { ...item, kind: "image" as const }));
+        setDoc({ padding: 0, ...parsed, images });
       } catch (err) {
         console.error("Failed to load board:", err);
         if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
@@ -130,10 +156,10 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     [scheduleAutosave]
   );
 
-  const addImage = useCallback((image: BoardImage) => dispatch({ type: "add", image }), [dispatch]);
-  const deleteImage = useCallback((image: BoardImage) => dispatch({ type: "delete", image }), [dispatch]);
+  const addImage = useCallback((item: BoardItem) => dispatch({ type: "add", item }), [dispatch]);
+  const deleteImage = useCallback((item: BoardItem) => dispatch({ type: "delete", item }), [dispatch]);
   const editImage = useCallback(
-    (before: BoardImage, after: BoardImage) => {
+    (before: BoardItem, after: BoardItem) => {
       if (before.id !== after.id) return;
       dispatch({ type: "edit", before, after });
     },
@@ -141,15 +167,31 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
   );
 
   const batchEditImages = useCallback(
-    (before: BoardImage[], after: BoardImage[]) => {
+    (before: BoardItem[], after: BoardItem[]) => {
       if (before.length === 0 || after.length === 0) return;
       dispatch({ type: "batch-edit", before, after });
     },
     [dispatch]
   );
 
+  const addItems = useCallback(
+    (items: BoardItem[]) => {
+      if (items.length === 0) return;
+      dispatch({ type: "add-batch", items });
+    },
+    [dispatch]
+  );
+
+  const deleteItems = useCallback(
+    (items: BoardItem[]) => {
+      if (items.length === 0) return;
+      dispatch({ type: "delete-batch", items });
+    },
+    [dispatch]
+  );
+
   const reorderImages = useCallback(
-    (newOrder: BoardImage[]) => {
+    (newOrder: BoardItem[]) => {
       const current = docRef.current;
       if (!current) return;
       dispatch({ type: "reorder", before: current.images, after: newOrder });
@@ -162,6 +204,42 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
       const current = docRef.current;
       if (!current || current.backgroundColor === color) return;
       dispatch({ type: "background", before: current.backgroundColor, after: color });
+    },
+    [dispatch]
+  );
+
+  const setBackgroundMode = useCallback(
+    (mode: BoardBackgroundMode) => {
+      const current = docRef.current;
+      if (!current || resolveBackgroundMode(current) === mode) return;
+      dispatch({ type: "background-mode", before: resolveBackgroundMode(current), after: mode });
+    },
+    [dispatch]
+  );
+
+  const setBackgroundGrid = useCallback(
+    (grid: BoardGridBackground) => {
+      const current = docRef.current;
+      if (!current) return;
+      dispatch({ type: "background-grid", before: resolveBoardGrid(current), after: grid });
+    },
+    [dispatch]
+  );
+
+  const setBackgroundGradient = useCallback(
+    (gradient: BoardGradientBackground) => {
+      const current = docRef.current;
+      if (!current) return;
+      dispatch({ type: "background-gradient", before: resolveBoardGradient(current), after: gradient });
+    },
+    [dispatch]
+  );
+
+  const setBackgroundImage = useCallback(
+    (assetFileName: string | null) => {
+      const current = docRef.current;
+      if (!current || (current.backgroundImage ?? null) === assetFileName) return;
+      dispatch({ type: "background-image", before: current.backgroundImage ?? null, after: assetFileName });
     },
     [dispatch]
   );
@@ -227,8 +305,14 @@ export default function useBoardStore(boardId: string | undefined): UseBoardStor
     editImage,
     deleteImage,
     batchEditImages,
+    addItems,
+    deleteItems,
     reorderImages,
     setBackgroundColor,
+    setBackgroundMode,
+    setBackgroundGrid,
+    setBackgroundGradient,
+    setBackgroundImage,
     setCanvasSize,
     setPadding,
     renameBoard,

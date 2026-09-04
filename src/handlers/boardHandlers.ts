@@ -6,7 +6,7 @@
 // no shared code, per the Board feature's "build from scratch" requirement (the single-image
 // editor's tools don't fit this feature's per-image padding/border/margin/radius needs).
 
-import { BoardCommand, BoardDocument, BoardImage } from "../utils/boardTypes";
+import { BoardBackgroundMode, BoardBlur, BoardCommand, BoardDocument, BoardGradientBackground, BoardGridBackground, BoardImage, BoardItem, BoardShape, BoardText } from "../utils/boardTypes";
 
 // ---- Geometry helpers -----------------------------------------------------------------------
 
@@ -114,6 +114,328 @@ function renderBoardImage(ctx: CanvasRenderingContext2D, image: BoardImage, img:
   ctx.restore();
 }
 
+// Greedy word-wrap: splits on explicit newlines first (a deliberate paragraph break the user
+// typed), then wraps each paragraph's words to fit `maxWidth`, measured against whatever font is
+// already set on `ctx` - callers must set ctx.font before calling this. A single word wider than
+// maxWidth is still placed on its own line rather than split mid-word (this is a text box, not a
+// terminal - breaking a word is worse than letting one line overflow slightly).
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    const words = paragraph.split(" ");
+    let current = "";
+    for (const word of words) {
+      const candidate = current ? `${current} ${word}` : word;
+      if (maxWidth > 0 && current && ctx.measureText(candidate).width > maxWidth) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = candidate;
+      }
+    }
+    lines.push(current);
+  }
+  return lines;
+}
+
+// Lazily-created, module-level scratch canvas used only for text measurement (never drawn to the
+// screen or attached to the DOM) - measureBoardTextContentHeight below needs a 2D context to call
+// ctx.measureText/wrapText against, and creating a fresh <canvas> per measurement would be wasteful
+// given this runs on every keystroke while editing (see BoardCanvas.tsx's text-edit overlay).
+let measureCanvas: HTMLCanvasElement | null = null;
+function getMeasureContext(): CanvasRenderingContext2D | null {
+  if (typeof document === "undefined") return null;
+  if (!measureCanvas) measureCanvas = document.createElement("canvas");
+  return measureCanvas.getContext("2d");
+}
+
+// The height a text item's content actually needs at its CURRENT width - same wrapText/lineHeight
+// math renderBoardText itself uses (font set identically, contentWidth computed identically), so
+// what this predicts always matches what actually gets drawn. Returns item.height unchanged if a
+// measurement context isn't available (SSR/non-browser) or the item has no usable content width -
+// never smaller than a single line, so an empty text box still gets a sane minimum.
+export function measureBoardTextContentHeight(item: BoardText): number {
+  const ctx = getMeasureContext();
+  const lineHeight = item.fontSize * 1.25;
+  if (!ctx) return item.height;
+  const contentWidth = Math.max(0, item.width - item.padding * 2);
+  if (contentWidth <= 0) return item.height;
+  ctx.font = `${item.fontStyle} ${item.fontWeight} ${item.fontSize}px ${item.fontFamily}`;
+  const lineCount = Math.max(1, wrapText(ctx, item.text, contentWidth).length);
+  return Math.ceil(lineCount * lineHeight + item.padding * 2);
+}
+
+// Grows (never shrinks) a text item's height to fit its own content - called after every edit that
+// could make wrapped content taller (typing, a bigger font size, a font/weight/style change, more
+// padding, a narrower width from a resize). Grow-only, not a true auto-fit both ways, so a user who
+// deliberately made a box taller than its content (for breathing room, or because they're about to
+// type more) never has that undone by an unrelated style tweak - see BoardStylePanel.tsx's
+// setTextField and BoardCanvas.tsx's text-edit overlay, the two places content/style actually
+// change, for where this gets applied.
+export function growTextItemToFitContent(item: BoardText): BoardText {
+  const needed = measureBoardTextContentHeight(item);
+  return needed > item.height ? { ...item, height: needed } : item;
+}
+
+// Draws one text item's background box (if any) and its word-wrapped content, clipped to the box
+// so an overflowing paragraph is cropped rather than spilling onto whatever's next to it - the
+// text-editing UI (BoardStylePanel) has no live "does this fit" preview, so silently cropping is
+// safer than an unreadable overlap. `padding` insets the text from the box on every side, same
+// convention renderBoardImage's own borderWidth+padding inset uses for the photo inside its frame.
+function renderBoardText(ctx: CanvasRenderingContext2D, item: BoardText): void {
+  ctx.save();
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
+  ctx.translate(cx, cy);
+  ctx.rotate(item.rotation);
+  ctx.translate(-cx, -cy);
+  ctx.globalAlpha = item.opacity;
+
+  if (item.backgroundColor) {
+    roundedRectPath(ctx, item.x, item.y, item.width, item.height, item.cornerRadius);
+    ctx.fillStyle = item.backgroundColor;
+    ctx.fill();
+  }
+
+  const contentX = item.x + item.padding;
+  const contentY = item.y + item.padding;
+  const contentWidth = Math.max(0, item.width - item.padding * 2);
+  const contentHeight = Math.max(0, item.height - item.padding * 2);
+
+  if (contentWidth > 0 && contentHeight > 0 && item.text) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(contentX, contentY, contentWidth, contentHeight);
+    ctx.clip();
+
+    ctx.fillStyle = item.color;
+    ctx.font = `${item.fontStyle} ${item.fontWeight} ${item.fontSize}px ${item.fontFamily}`;
+    ctx.textBaseline = "top";
+    ctx.textAlign = item.textAlign;
+
+    const anchorX = item.textAlign === "center" ? contentX + contentWidth / 2 : item.textAlign === "right" ? contentX + contentWidth : contentX;
+    const lineHeight = item.fontSize * 1.25;
+    wrapText(ctx, item.text, contentWidth).forEach((line, i) => {
+      ctx.fillText(line, anchorX, contentY + i * lineHeight);
+    });
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+
+// Traces a regular N-sided polygon's path, first vertex pointing straight up (the natural
+// "sitting flat on its base" orientation for an odd `sides` like a triangle/pentagon - rotate the
+// item itself to point it elsewhere, same convention line/arrow already use). `rx`/`ry` are
+// independent per axis rather than one shared radius, so a non-square box STRETCHES the polygon to
+// fill it - same "fills its box, doesn't just inscribe a fixed-aspect shape and leave dead space
+// on the wider axis" reasoning ctx.ellipse's own two radii already give BoardBlur/the "ellipse"
+// shapeType for free.
+function regularPolygonPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, rx: number, ry: number, sides: number): void {
+  const n = Math.max(3, Math.round(sides));
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const angle = -Math.PI / 2 + (i * 2 * Math.PI) / n;
+    const x = cx + Math.cos(angle) * rx;
+    const y = cy + Math.sin(angle) * ry;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+// Traces an N-pointed star's path - alternates an outer vertex (full rx/ry) with an inner vertex
+// (rx/ry scaled by `innerRatio`) every half-step, same up-pointing/box-filling reasoning as
+// regularPolygonPath above.
+function starPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, rx: number, ry: number, points: number, innerRatio: number): void {
+  const n = Math.max(3, Math.round(points));
+  const ratio = Math.min(0.95, Math.max(0.05, innerRatio));
+  ctx.beginPath();
+  for (let i = 0; i < n * 2; i++) {
+    const angle = -Math.PI / 2 + (i * Math.PI) / n;
+    const r = i % 2 === 0 ? 1 : ratio;
+    const x = cx + Math.cos(angle) * rx * r;
+    const y = cy + Math.sin(angle) * ry * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+// Traces a classic 7-point block-arrow polygon (a shaft rectangle plus a triangular head) filling
+// the item's box left-to-right, in LOCAL space - points elsewhere once the item itself is rotated,
+// same convention as every other directional shape here.
+function blockArrowPath(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number): void {
+  const midY = y + height / 2;
+  const shaftTop = midY - height * 0.25;
+  const shaftBottom = midY + height * 0.25;
+  const headX = x + width * 0.6;
+  ctx.beginPath();
+  ctx.moveTo(x, shaftTop);
+  ctx.lineTo(headX, shaftTop);
+  ctx.lineTo(headX, y);
+  ctx.lineTo(x + width, midY);
+  ctx.lineTo(headX, y + height);
+  ctx.lineTo(headX, shaftBottom);
+  ctx.lineTo(x, shaftBottom);
+  ctx.closePath();
+}
+
+// Sets (or clears) the dash pattern for a shape's stroke - shared by every shapeType's stroke, not
+// just line/arrow, so a dashed/dotted outline works equally on a rectangle, a star, anything with a
+// stroke at all. Pattern lengths scale with strokeWidth (a heavier stroke wants proportionally
+// longer dashes/gaps to still read as dashes rather than a blur), floored so a hairline stroke still
+// gets a visible pattern instead of collapsing to a solid-looking line. Dotted relies on
+// renderBoardShape's own lineCap: "round" (set once, for every shapeType) to turn each near-zero-
+// length dash into an actual round dot rather than a tiny square.
+function applyShapeStrokeDash(ctx: CanvasRenderingContext2D, strokeStyle: BoardShape["strokeStyle"], strokeWidth: number): void {
+  if (strokeStyle === "dashed") ctx.setLineDash([Math.max(6, strokeWidth * 3), Math.max(4, strokeWidth * 2)]);
+  else if (strokeStyle === "dotted") ctx.setLineDash([0.01, Math.max(6, strokeWidth * 2.2)]);
+  else ctx.setLineDash([]);
+}
+
+// Draws one shape item - see BoardShape's own doc comment in boardTypes.ts for why "line"/"arrow"
+// reuse the exact same rotatable border-box every other kind does (a straight horizontal segment
+// along the box's own local midline) rather than a dedicated two-point model, and why every other
+// shapeType inscribes/stretches into that same box rather than each having its own geometry model.
+function renderBoardShape(ctx: CanvasRenderingContext2D, item: BoardShape): void {
+  ctx.save();
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
+  ctx.translate(cx, cy);
+  ctx.rotate(item.rotation);
+  ctx.translate(-cx, -cy);
+  ctx.globalAlpha = item.opacity;
+  ctx.strokeStyle = item.strokeColor;
+  ctx.lineWidth = item.strokeWidth;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  applyShapeStrokeDash(ctx, item.strokeStyle, item.strokeWidth);
+
+  if (item.shapeType === "line" || item.shapeType === "arrow") {
+    // A single straight segment along the box's own vertical center, left edge to right edge - see
+    // this function's own doc comment above.
+    const midY = item.y + item.height / 2;
+    const startX = item.x;
+    const endX = item.x + item.width;
+    ctx.beginPath();
+    ctx.moveTo(startX, midY);
+    ctx.lineTo(endX, midY);
+    if (item.strokeWidth > 0) ctx.stroke();
+
+    if (item.shapeType === "arrow") {
+      // Arrowhead size scales with stroke width (a thicker line reads a proportionally bigger
+      // head) but is floored so a hairline stroke still gets a legible triangle, and capped so a
+      // very heavy stroke on a short line doesn't grow a head wider than the line itself. Filled,
+      // not stroked, so the dash pattern above never touches it even when the line itself is
+      // dashed/dotted.
+      const headLength = Math.max(10, Math.min(item.width * 0.4, item.strokeWidth * 3.5));
+      const headWidth = headLength * 0.7;
+      ctx.beginPath();
+      ctx.moveTo(endX, midY);
+      ctx.lineTo(endX - headLength, midY - headWidth / 2);
+      ctx.lineTo(endX - headLength, midY + headWidth / 2);
+      ctx.closePath();
+      ctx.fillStyle = item.strokeColor;
+      ctx.fill();
+    }
+  } else {
+    if (item.shapeType === "ellipse") {
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, item.width / 2, item.height / 2, 0, 0, Math.PI * 2);
+    } else if (item.shapeType === "polygon") {
+      regularPolygonPath(ctx, cx, cy, item.width / 2, item.height / 2, item.sides ?? 5);
+    } else if (item.shapeType === "star") {
+      starPath(ctx, cx, cy, item.width / 2, item.height / 2, item.points ?? 5, item.innerRadiusRatio ?? 0.45);
+    } else if (item.shapeType === "block-arrow") {
+      blockArrowPath(ctx, item.x, item.y, item.width, item.height);
+    } else {
+      roundedRectPath(ctx, item.x, item.y, item.width, item.height, item.cornerRadius);
+    }
+    if (item.fillColor) {
+      ctx.fillStyle = item.fillColor;
+      ctx.fill();
+    }
+    if (item.strokeWidth > 0) ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+// Draws nothing of its own - re-samples whatever's already been composited onto `canvasSource` (in
+// z-order, so only what's BENEATH this item in the stack) through a blurred, clipped copy of
+// itself. `canvasSource` is the very canvas `ctx` is drawing into (renderBoardToCanvas passes its
+// own `canvas` argument straight through) - drawImage reading from the same canvas it's drawing to
+// is well-defined (the source is a snapshot of what's been rasterized so far) and is exactly what
+// "blur what's underneath" needs.
+//
+// The clip path is set up under this item's own rotate/translate transform (so a rotated blur
+// region gets a correspondingly rotated - or elliptical - outline), but the actual drawImage below
+// deliberately runs under a RESET (identity) transform. That's not an oversight: canvas blur is
+// isotropic, so rotating the *sampled* content would just reveal blurred pixels from a different
+// part of the board (whatever rotation carried into view) rather than blurring what's actually
+// under the clip window - the rotation belongs only to the clip shape, never to the sampling.
+function renderBoardBlur(ctx: CanvasRenderingContext2D, canvasSource: HTMLCanvasElement, item: BoardBlur): void {
+  if (item.strength <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = item.opacity;
+
+  // Captured BEFORE this item's own rotate below, deliberately - getTransform().a is only the pure
+  // doc-space -> device-pixel scale renderBoardToCanvas's caller set up (1 for the live editing
+  // canvas, smaller for a thumbnail/export render) while no rotation is mixed into the matrix yet.
+  // Reading it any later would return `scale * cos(item.rotation)` instead (a rotated item's own
+  // rotate() call mixes into a/b/c/d too, not just e/f) - at 90° that's ~0, silently killing the
+  // blur entirely. item.strength is authored in doc-space px, so it needs exactly this factor to
+  // come out looking the same at any zoom or export size.
+  const deviceScale = ctx.getTransform().a;
+
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
+  ctx.translate(cx, cy);
+  ctx.rotate(item.rotation);
+  ctx.translate(-cx, -cy);
+
+  ctx.beginPath();
+  if (item.shape === "ellipse") {
+    ctx.ellipse(cx, cy, item.width / 2, item.height / 2, 0, 0, Math.PI * 2);
+  } else {
+    roundedRectPath(ctx, item.x, item.y, item.width, item.height, item.shape === "rounded" ? item.cornerRadius : 0);
+  }
+  ctx.clip();
+
+  // Clip regions persist across later transform changes (they're resolved against the CTM active
+  // at clip() time, not re-evaluated afterward) - so resetting here doesn't affect the shape above,
+  // only where/how the source gets sampled.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+  if (item.mode === "pixelate") {
+    // Mosaic effect: draw the WHOLE composited-so-far canvas down to a tiny offscreen buffer (one
+    // pixel per block), then blow that back up with smoothing off - each source block collapses to
+    // a single flat-colored cell. Cheaper to downscale the whole canvas than just this item's own
+    // region (no need to compute/clip a sub-rect in source space), and the clip already set up
+    // above restricts what actually ends up visible either way.
+    const blockSize = Math.max(2, item.strength) * deviceScale;
+    const smallWidth = Math.max(1, Math.round(canvasSource.width / blockSize));
+    const smallHeight = Math.max(1, Math.round(canvasSource.height / blockSize));
+    const tiny = document.createElement("canvas");
+    tiny.width = smallWidth;
+    tiny.height = smallHeight;
+    const tinyCtx = tiny.getContext("2d");
+    if (tinyCtx) {
+      tinyCtx.drawImage(canvasSource, 0, 0, smallWidth, smallHeight);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(tiny, 0, 0, smallWidth, smallHeight, 0, 0, canvasSource.width, canvasSource.height);
+      ctx.imageSmoothingEnabled = true;
+    }
+  } else {
+    ctx.filter = `blur(${item.strength * deviceScale}px)`;
+    ctx.drawImage(canvasSource, 0, 0);
+    ctx.filter = "none";
+  }
+
+  ctx.restore();
+}
+
 // Resolves doc.padding defensively (Number.isFinite guard - same reasoning safeGap used to have
 // for the old gridlineWidth field: a board saved before `padding` existed loads it as `undefined`,
 // which must never reach arithmetic as NaN - this exact bug already slipped through once, into the
@@ -130,14 +452,100 @@ export function paddedCanvasSize(doc: BoardDocument): { width: number; height: n
   return { width: doc.canvasWidth + padding * 2, height: doc.canvasHeight + padding * 2, padding };
 }
 
-// Renders the full board: background fill (covering the padded mat border too), then every image
-// in array order (last = topmost), inset by paddedCanvasSize's padding so image coordinates stay
-// in the document's own unpadded space throughout (BoardImage.x/y never account for padding -
-// callers doing hit-testing/pointer math against the same buffer must subtract padding back out,
-// see BoardCanvas.tsx's pointerToCanvasSpace). `canvas` must already be sized to
+// ---- Background --------------------------------------------------------------------------------
+//
+// Three interchangeable renderers, switched on doc.backgroundMode (BoardBackgroundMode) - a solid
+// fill (the original/default), a repeating gridline pattern (spacing/line color/optional base
+// fill), or a full-bleed photo. All three cover the FULL padded buffer, including the mat/frame
+// border area - same as the original solid-fill behavior this replaced, so switching modes never
+// changes what area gets covered, only what's drawn into it.
+
+// Plain 6-digit hex (no alpha) for lineColor/baseColor - both are edited via a plain HTML
+// <input type="color">, which silently rejects/ignores an 8-digit #rrggbbaa value, so an alpha
+// channel here would be uneditable from the background panel even though it'd render fine.
+export const DEFAULT_BOARD_GRID: BoardGridBackground = { spacing: 40, lineColor: "#d9d9d9", baseColor: "#ffffff" };
+
+// Same defensive-default reasoning as resolveBoardPadding above: a board that's never touched the
+// grid background (backgroundMode always something else, or this whole feature didn't exist yet
+// when it was saved) simply has no backgroundGrid on disk. Guarded on spacing specifically since
+// that's the one field a bad/zero value would turn into an infinite or divide-by-zero draw loop.
+export function resolveBoardGrid(doc: BoardDocument): BoardGridBackground {
+  const grid = doc.backgroundGrid;
+  if (!grid || !Number.isFinite(grid.spacing) || grid.spacing <= 0) return DEFAULT_BOARD_GRID;
+  return grid;
+}
+
+// Same reasoning as resolveBoardPadding/resolveBoardGrid - an old board's JSON simply predates this
+// field, so "absent" must resolve to the one behavior every existing board already had: a plain
+// color fill.
+export function resolveBackgroundMode(doc: BoardDocument): BoardBackgroundMode {
+  return doc.backgroundMode ?? "color";
+}
+
+export const DEFAULT_BOARD_GRADIENT: BoardGradientBackground = { from: "#6366f1", to: "#ec4899", angleDeg: 135 };
+
+// Same defensive-default reasoning as resolveBoardGrid - a board that's never touched Gradient mode
+// simply has no backgroundGradient on disk.
+export function resolveBoardGradient(doc: BoardDocument): BoardGradientBackground {
+  return doc.backgroundGradient ?? DEFAULT_BOARD_GRADIENT;
+}
+
+// CSS linear-gradient's own angle convention (0deg = bottom-to-top, 90deg = left-to-right, clockwise
+// from there) rather than canvas's own two-point createLinearGradient call, which this converts
+// into - picked because it's the convention a color-picker/angle-slider UI already reads naturally.
+function drawGradientBackground(ctx: CanvasRenderingContext2D, width: number, height: number, gradient: BoardGradientBackground): void {
+  const radians = ((gradient.angleDeg - 90) * Math.PI) / 180;
+  const cx = width / 2;
+  const cy = height / 2;
+  // Half-diagonal ensures the gradient's two stops always land outside the canvas regardless of
+  // angle, so the fill never looks clipped/banded at a corner.
+  const halfLength = Math.hypot(width, height) / 2;
+  const x0 = cx - Math.cos(radians) * halfLength;
+  const y0 = cy - Math.sin(radians) * halfLength;
+  const x1 = cx + Math.cos(radians) * halfLength;
+  const y1 = cy + Math.sin(radians) * halfLength;
+  const linear = ctx.createLinearGradient(x0, y0, x1, y1);
+  linear.addColorStop(0, gradient.from);
+  linear.addColorStop(1, gradient.to);
+  ctx.fillStyle = linear;
+  ctx.fillRect(0, 0, width, height);
+}
+
+function drawGridBackground(ctx: CanvasRenderingContext2D, width: number, height: number, grid: BoardGridBackground): void {
+  if (grid.baseColor) {
+    ctx.fillStyle = grid.baseColor;
+    ctx.fillRect(0, 0, width, height);
+  }
+  ctx.save();
+  ctx.strokeStyle = grid.lineColor;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  // +0.5 lands each 1px line on a pixel boundary rather than straddling two (the standard canvas
+  // crisp-hairline trick) - without it every line renders as a blurry 2px band instead of a sharp
+  // 1px one.
+  for (let x = 0; x <= width; x += grid.spacing) {
+    ctx.moveTo(x + 0.5, 0);
+    ctx.lineTo(x + 0.5, height);
+  }
+  for (let y = 0; y <= height; y += grid.spacing) {
+    ctx.moveTo(0, y + 0.5);
+    ctx.lineTo(width, y + 0.5);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Renders the full board: background (see the three-renderer comment above), then every item
+// (image, text, or blur) in array order (last = topmost), inset by paddedCanvasSize's padding so
+// item coordinates stay in the document's own unpadded space throughout (BoardItem.x/y never
+// account for padding - callers
+// doing hit-testing/pointer math against the same buffer must subtract padding back out, see
+// BoardCanvas.tsx's pointerToCanvasSpace). `canvas` must already be sized to
 // `paddedCanvasSize(doc).width * scale` / `.height * scale` by the caller (same split of
 // responsibility as imageEditHandlers.ts's renderComposedCanvas) - `imageBitmaps` maps a
-// BoardImage's assetFileName to its decoded HTMLImageElement.
+// BoardImage's assetFileName to its decoded HTMLImageElement, and doubles as the source for
+// doc.backgroundImage's own decoded bitmap (same map, same assets/ folder, no separate cache
+// needed - a background image is decoded/cached exactly like a placed one).
 export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocument, imageBitmaps: Map<string, HTMLImageElement>, scale = 1): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -145,30 +553,52 @@ export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocumen
 
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  if (doc.backgroundColor) {
+
+  const mode = resolveBackgroundMode(doc);
+  if (mode === "grid") {
+    drawGridBackground(ctx, width, height, resolveBoardGrid(doc));
+  } else if (mode === "gradient") {
+    drawGradientBackground(ctx, width, height, resolveBoardGradient(doc));
+  } else if (mode === "image" && doc.backgroundImage) {
+    const bg = imageBitmaps.get(doc.backgroundImage);
+    // Left blank (transparent) until decoded - same "frame renders immediately, photo pops in
+    // once ready" split renderBoardImage already accepts for placed images.
+    if (bg) {
+      const { sx, sy, sw, sh } = coverFitRect(bg.naturalWidth, bg.naturalHeight, width, height);
+      ctx.drawImage(bg, sx, sy, sw, sh, 0, 0, width, height);
+    }
+  } else if (doc.backgroundColor) {
     ctx.fillStyle = doc.backgroundColor;
     ctx.fillRect(0, 0, width, height);
   }
 
   ctx.save();
   ctx.translate(padding, padding);
-  for (const image of doc.images) {
-    renderBoardImage(ctx, image, imageBitmaps.get(image.assetFileName) ?? null);
+  for (const item of doc.images) {
+    if (item.kind === "text") renderBoardText(ctx, item);
+    else if (item.kind === "blur") renderBoardBlur(ctx, canvas, item);
+    else if (item.kind === "shape") renderBoardShape(ctx, item);
+    else renderBoardImage(ctx, item, imageBitmaps.get(item.assetFileName) ?? null);
   }
   ctx.restore();
 }
 
 // ---- Hit-testing / interaction -----------------------------------------------------------------
 
-// Click-to-select hit test, topmost (last-drawn) image first.
-export function hitTestBoardImage(images: BoardImage[], x: number, y: number): BoardImage | null {
-  for (let i = images.length - 1; i >= 0; i--) {
-    const image = images[i];
-    const cx = image.x + image.width / 2;
-    const cy = image.y + image.height / 2;
-    const local = unrotatePoint(x, y, cx, cy, image.rotation);
-    if (local.x >= image.x && local.x <= image.x + image.width && local.y >= image.y && local.y <= image.y + image.height) {
-      return image;
+// Click-to-select hit test, topmost (last-drawn) item first - works identically for an image or a
+// text item since both are BoardItem's shared border-box geometry (see BoardItemBase's own doc
+// comment in boardTypes.ts). Skips locked items entirely - see BoardItemBase.locked's own doc
+// comment for why a locked item is meant to be unreachable by clicking the canvas at all (only
+// BoardLayerPanel, which selects by id, can still reach it).
+export function hitTestBoardItem(items: BoardItem[], x: number, y: number): BoardItem | null {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.locked) continue;
+    const cx = item.x + item.width / 2;
+    const cy = item.y + item.height / 2;
+    const local = unrotatePoint(x, y, cx, cy, item.rotation);
+    if (local.x >= item.x && local.x <= item.x + item.width && local.y >= item.y && local.y <= item.y + item.height) {
+      return item;
     }
   }
   return null;
@@ -176,41 +606,44 @@ export function hitTestBoardImage(images: BoardImage[], x: number, y: number): B
 
 export type ResizeCorner = "nw" | "ne" | "sw" | "se";
 
-// On-screen (canvas-space) positions of an image's four resize-handle corners, accounting for its
+// On-screen (canvas-space) positions of an item's four resize-handle corners, accounting for its
 // current rotation - what BoardCanvas draws handle chrome at and hit-tests drag starts against.
-export function resizeHandlePoints(image: BoardImage): Record<ResizeCorner, { x: number; y: number }> {
-  const cx = image.x + image.width / 2;
-  const cy = image.y + image.height / 2;
+export function resizeHandlePoints(item: BoardItem): Record<ResizeCorner, { x: number; y: number }> {
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
   const local: Record<ResizeCorner, { x: number; y: number }> = {
-    nw: { x: image.x, y: image.y },
-    ne: { x: image.x + image.width, y: image.y },
-    sw: { x: image.x, y: image.y + image.height },
-    se: { x: image.x + image.width, y: image.y + image.height },
+    nw: { x: item.x, y: item.y },
+    ne: { x: item.x + item.width, y: item.y },
+    sw: { x: item.x, y: item.y + item.height },
+    se: { x: item.x + item.width, y: item.y + item.height },
   };
   return {
-    nw: rotatePoint(local.nw.x, local.nw.y, cx, cy, image.rotation),
-    ne: rotatePoint(local.ne.x, local.ne.y, cx, cy, image.rotation),
-    sw: rotatePoint(local.sw.x, local.sw.y, cx, cy, image.rotation),
-    se: rotatePoint(local.se.x, local.se.y, cx, cy, image.rotation),
+    nw: rotatePoint(local.nw.x, local.nw.y, cx, cy, item.rotation),
+    ne: rotatePoint(local.ne.x, local.ne.y, cx, cy, item.rotation),
+    sw: rotatePoint(local.sw.x, local.sw.y, cx, cy, item.rotation),
+    se: rotatePoint(local.se.x, local.se.y, cx, cy, item.rotation),
   };
 }
 
 // Canvas-space position of the rotate handle - a fixed offset above the box's local top edge,
 // rotated along with the box, so it always sits just outside whichever edge is currently "up".
-export function rotateHandlePoint(image: BoardImage, offset = 28): { x: number; y: number } {
-  const cx = image.x + image.width / 2;
-  const cy = image.y + image.height / 2;
-  return rotatePoint(cx, image.y - offset, cx, cy, image.rotation);
+export function rotateHandlePoint(item: BoardItem, offset = 28): { x: number; y: number } {
+  const cx = item.x + item.width / 2;
+  const cy = item.y + item.height / 2;
+  return rotatePoint(cx, item.y - offset, cx, cy, item.rotation);
 }
 
-export function applyMove(image: BoardImage, dx: number, dy: number): BoardImage {
-  return { ...image, x: image.x + dx, y: image.y + dy, updatedAt: Date.now() };
+// Generic over T so a BoardImage stays a BoardImage and a BoardText stays a BoardText through the
+// operation (a plain BoardItem param/return would collapse the result back to the union, forcing
+// every caller to re-narrow by `.kind` even when they already know which one they started with).
+export function applyMove<T extends BoardItem>(item: T, dx: number, dy: number): T {
+  return { ...item, x: item.x + dx, y: item.y + dy, updatedAt: Date.now() };
 }
 
 // Resizes by dragging one corner, keeping the *opposite* corner fixed - pointer coordinates are
 // first brought into the box's own local (unrotated) frame so this works the same regardless of
 // the box's current rotation. `minSize` prevents the box collapsing to zero/negative.
-export function applyResize(image: BoardImage, corner: ResizeCorner, pointerX: number, pointerY: number, minSize = 24): BoardImage {
+export function applyResize<T extends BoardItem>(image: T, corner: ResizeCorner, pointerX: number, pointerY: number, minSize = 24): T {
   const cx = image.x + image.width / 2;
   const cy = image.y + image.height / 2;
   const local = unrotatePoint(pointerX, pointerY, cx, cy, image.rotation);
@@ -225,11 +658,75 @@ export function applyResize(image: BoardImage, corner: ResizeCorner, pointerX: n
   return { ...image, x, y, width: Math.max(minSize, right - x), height: Math.max(minSize, bottom - y), updatedAt: Date.now() };
 }
 
-export function applyRotate(image: BoardImage, pointerX: number, pointerY: number): BoardImage {
+export function applyRotate<T extends BoardItem>(image: T, pointerX: number, pointerY: number): T {
   const cx = image.x + image.width / 2;
   const cy = image.y + image.height / 2;
   const rotation = Math.atan2(pointerY - cy, pointerX - cx) + Math.PI / 2;
   return { ...image, rotation, updatedAt: Date.now() };
+}
+
+// ---- Group resize/rotate (multi-selection) ---------------------------------------------------
+//
+// Single-item resize/rotate above (applyResize/applyRotate) reshape that one item's own box. A
+// multi-selection needs a different operation entirely - resizing/rotating the SELECTION as one
+// shape, the same convention every design tool with a multi-select uses. These three are what
+// BoardCanvas.tsx's group drag branch (selectedIds.size > 1) calls instead of the single-item ones.
+
+export interface GroupBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// Axis-aligned bounding box of the WHOLE selection, computed from each item's own ROTATED corners
+// (resizeHandlePoints already does the rotation math) rather than its raw x/y/width/height - a
+// tilted item's true on-screen footprint is bigger than its unrotated box, and the group's handles
+// need to actually enclose what's visibly selected.
+export function groupBoundingBox(items: BoardItem[]): GroupBounds {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const item of items) {
+    for (const corner of Object.values(resizeHandlePoints(item))) {
+      minX = Math.min(minX, corner.x);
+      minY = Math.min(minY, corner.y);
+      maxX = Math.max(maxX, corner.x);
+      maxY = Math.max(maxY, corner.y);
+    }
+  }
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+// Scales every item's position AND size around a fixed anchor (the bounding-box corner OPPOSITE
+// whichever handle is being dragged) by the same factor on each axis - each item's own `rotation`
+// is left untouched, only its box moves/resizes. A fully rotation-aware group resize (re-deriving
+// each rotated child's true footprint under the new scale) is a substantially harder affine-
+// transform problem for comparatively little practical gain over this simpler, still-correct-for-
+// the-common-case version.
+export function applyGroupResize(items: BoardItem[], anchorX: number, anchorY: number, scaleX: number, scaleY: number): BoardItem[] {
+  const now = Date.now();
+  return items.map((item) => ({
+    ...item,
+    x: anchorX + (item.x - anchorX) * scaleX,
+    y: anchorY + (item.y - anchorY) * scaleY,
+    width: Math.max(8, item.width * Math.abs(scaleX)),
+    height: Math.max(8, item.height * Math.abs(scaleY)),
+    updatedAt: now,
+  }));
+}
+
+// Rotates the WHOLE selection as one rigid body around a shared center: every item's own rotation
+// increases by the same `deltaAngle`, AND every item's position orbits that same center by the same
+// angle. Without the orbit this would just spin each item in place independently - "rotate" for a
+// multi-selection means swinging the group around together, the same convention Figma/etc. use.
+export function applyGroupRotate(items: BoardItem[], centerX: number, centerY: number, deltaAngle: number): BoardItem[] {
+  const now = Date.now();
+  return items.map((item) => {
+    const center = rotatePoint(item.x + item.width / 2, item.y + item.height / 2, centerX, centerY, deltaAngle);
+    return { ...item, x: center.x - item.width / 2, y: center.y - item.height / 2, rotation: item.rotation + deltaAngle, updatedAt: now };
+  });
 }
 
 // ---- Auto-layout ("arrange side by side") ---------------------------------------------------
@@ -300,25 +797,366 @@ export function layoutImagesInRow(images: BoardImage[], maxWidth: number, gap: n
   return { images: placed, canvasWidth: maxRowRight + g, canvasHeight: y + tallestInRow + g };
 }
 
+// A single common "footprint" size for every image in an auto-layout that deliberately normalizes
+// size (grid/circle/fan - unlike layoutImagesInRow, which preserves each image's own aspect ratio
+// at a shared row height). Geometric mean of each image's current width/height, averaged across the
+// batch, then rounded - keeps the new layout's overall scale in the same ballpark as whatever the
+// images were before, rather than snapping to an arbitrary fixed constant that'd feel disconnected
+// from a board someone already has images placed on.
+function commonFootprint(images: BoardImage[]): number {
+  const avg = images.reduce((sum, img) => sum + Math.sqrt(Math.max(1, img.width) * Math.max(1, img.height)), 0) / images.length;
+  return Math.max(60, Math.round(avg));
+}
+
+// Lays every image into a uniform square grid (Instagram-style) - equal-size cells regardless of
+// each photo's own aspect ratio, relying on renderBoardImage's existing cover-fit to crop each
+// photo to fill its cell rather than letterboxing it. Columns = ceil(sqrt(n)), which keeps the
+// overall shape roughly square for any image count. Rotation resets to 0, same reasoning
+// layoutImagesInRow gives for why a tidy arrangement and per-image tilt don't mix.
+export function layoutImagesInGrid(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const columns = Math.max(1, Math.ceil(Math.sqrt(images.length)));
+  const rows = Math.ceil(images.length / columns);
+  const now = Date.now();
+
+  const placed = images.map((image, i) => {
+    const col = i % columns;
+    const row = Math.floor(i / columns);
+    return { ...image, x: g + col * (cell + g), y: g + row * (cell + g), width: cell, height: cell, rotation: 0, updatedAt: now };
+  });
+
+  return { images: placed, canvasWidth: columns * cell + (columns + 1) * g, canvasHeight: rows * cell + (rows + 1) * g };
+}
+
+// Evenly spaces every image, same uniform size as layoutImagesInGrid, around the circumference of
+// a ring - a clean rosette/wreath look. Radius is derived from how much circumference `images.length`
+// cells of size `cell` (plus a gap between each) actually need, so the ring never looks over- or
+// under-crowded regardless of image count; MIN_RADIUS_FACTOR keeps 2-3 images from collapsing to a
+// tiny, huddled circle. Every image stays upright (rotation 0) rather than rotated to face outward -
+// reads as a deliberate wreath rather than a spinning pinwheel. Each tile's own cornerRadius is set
+// to exactly half its (square) side, which renderBoardImage's roundedRectPath already clamps to
+// min(radius, w/2, h/2) - so this turns every tile into a true circular photo, matching the ring
+// shape they're arranged in, rather than square photos merely positioned along a circular path.
+const MIN_RADIUS_FACTOR = 1.6;
+
+function ringRadius(count: number, cell: number, gap: number): number {
+  const circumferenceNeeded = count * (cell + gap);
+  return Math.max((cell / 2) * MIN_RADIUS_FACTOR, circumferenceNeeded / (2 * Math.PI));
+}
+
+export function layoutImagesInCircle(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const radius = ringRadius(images.length, cell, g);
+  const canvasSize = radius * 2 + cell + g * 2;
+  const center = canvasSize / 2;
+  const now = Date.now();
+
+  const placed = images.map((image, i) => {
+    // Starts at 12 o'clock (angle = -90deg) and goes clockwise, matching a clock face - an
+    // arbitrary but predictable starting point rather than 3 o'clock (angle 0), which would put
+    // the first image at an unremarkable side position instead of "up top."
+    const angle = (i / images.length) * Math.PI * 2 - Math.PI / 2;
+    const cx = center + radius * Math.cos(angle);
+    const cy = center + radius * Math.sin(angle);
+    return { ...image, x: cx - cell / 2, y: cy - cell / 2, width: cell, height: cell, cornerRadius: cell / 2, rotation: 0, updatedAt: now };
+  });
+
+  return { images: placed, canvasWidth: canvasSize, canvasHeight: canvasSize };
+}
+
+// Same wreath as layoutImagesInCircle, except one image (`heroId` if it's actually in this batch,
+// else the first image) sits large in the middle and everyone else forms the ring around it - a
+// "featured photo" layout. The ring's radius is widened (heroCell/2 + gap on top of the usual
+// ringRadius) whenever that's larger than what the ring images alone would need, so the hero's own
+// footprint never overlaps the ring - relevant for small rings (2-3 photos) where the plain
+// circumference-based radius would otherwise land inside the hero.
+export function layoutImagesInCircleWithCenter(images: BoardImage[], gap: number, heroId?: string): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  if (images.length === 1) return layoutImagesInGrid(images, gap); // nothing to ring around a lone image
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+
+  const heroIndex = Math.max(0, images.findIndex((img) => img.id === heroId));
+  const hero = images[heroIndex];
+  const ringImages = images.filter((_, i) => i !== heroIndex);
+
+  const ringCell = commonFootprint(ringImages);
+  const heroCell = commonFootprint([hero]) * 1.8;
+  const radius = Math.max(ringRadius(ringImages.length, ringCell, g), heroCell / 2 + g + ringCell / 2);
+  const canvasSize = radius * 2 + ringCell + g * 2;
+  const center = canvasSize / 2;
+  const now = Date.now();
+
+  // Both hero and ring get their own cornerRadius = half their (square) side - same "true circle,
+  // not just a circular path" reasoning as layoutImagesInCircle above, applied at each tile's own
+  // size so the larger hero circle and the smaller ring circles both render perfectly round.
+  const placedHero: BoardImage = {
+    ...hero,
+    x: center - heroCell / 2,
+    y: center - heroCell / 2,
+    width: heroCell,
+    height: heroCell,
+    cornerRadius: heroCell / 2,
+    rotation: 0,
+    updatedAt: now,
+  };
+  const placedRing = ringImages.map((image, i) => {
+    const angle = (i / ringImages.length) * Math.PI * 2 - Math.PI / 2;
+    const cx = center + radius * Math.cos(angle);
+    const cy = center + radius * Math.sin(angle);
+    return { ...image, x: cx - ringCell / 2, y: cy - ringCell / 2, width: ringCell, height: ringCell, cornerRadius: ringCell / 2, rotation: 0, updatedAt: now };
+  });
+
+  // Hero drawn first (bottom of z-order) so every ring image's border/shadow reads as sitting
+  // slightly on top of it if the two ever touch - a hero that visually "hosts" the ring rather
+  // than the reverse.
+  return { images: [placedHero, ...placedRing], canvasWidth: canvasSize, canvasHeight: canvasSize };
+}
+
+// Loose, overlapping "photos scattered on a table" layout - each image at a common size, heavily
+// overlapping its neighbor (OVERLAP_FACTOR), with a deterministic per-slot tilt/vertical-offset
+// pulled from a small repeating pattern rather than real randomness: re-running this on the exact
+// same images always produces the exact same board (this file's own "pure functions only" rule at
+// top - randomness would make the result unreproducible and, worse, different on every undo/redo
+// replay). Later images sit on top (z-order = array order, last = topmost), so the fan reads
+// left-to-right the same way a hand of cards does.
+const FAN_TILT_DEGREES = [-8, 5, -6, 7, -4, 8, -5, 6];
+const FAN_VERTICAL_OFFSET_FACTOR = [0.18, -0.12, 0.22, -0.2, 0.1, -0.16, 0.24, -0.1];
+const OVERLAP_FACTOR = 0.55;
+
+export function layoutImagesInFan(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const step = cell * OVERLAP_FACTOR;
+  const maxVerticalOffset = cell * Math.max(...FAN_VERTICAL_OFFSET_FACTOR.map(Math.abs));
+  // A tilted square's axis-aligned bounding box is wider/taller than the square itself
+  // (cell * (|cos| + |sin|)) - without accounting for that, a corner of the first/last/tallest-
+  // tilted image would poke past canvasWidth/canvasHeight and get clipped, since the canvas element
+  // is sized exactly to those dimensions (see renderBoardToCanvas/paddedCanvasSize). Computed once
+  // from the whole fixed tilt set (not per-image) since `cell` is common to every image here.
+  const maxTiltMargin = Math.max(
+    ...FAN_TILT_DEGREES.map((deg) => {
+      const rad = (deg * Math.PI) / 180;
+      return (cell * (Math.abs(Math.cos(rad)) + Math.abs(Math.sin(rad))) - cell) / 2;
+    })
+  );
+  const now = Date.now();
+
+  const placed = images.map((image, i) => {
+    const tilt = (FAN_TILT_DEGREES[i % FAN_TILT_DEGREES.length] * Math.PI) / 180;
+    const verticalOffset = cell * FAN_VERTICAL_OFFSET_FACTOR[i % FAN_VERTICAL_OFFSET_FACTOR.length];
+    return {
+      ...image,
+      x: g + maxTiltMargin + i * step,
+      y: g + maxTiltMargin + maxVerticalOffset + verticalOffset,
+      width: cell,
+      height: cell,
+      rotation: tilt,
+      updatedAt: now,
+    };
+  });
+
+  const canvasWidth = g * 2 + maxTiltMargin * 2 + (images.length - 1) * step + cell;
+  const canvasHeight = g * 2 + maxTiltMargin * 2 + maxVerticalOffset * 2 + cell;
+  return { images: placed, canvasWidth, canvasHeight };
+}
+
+// Pinterest-style column layout: unlike every other auto-layout above, this one does NOT normalize
+// every image to a common square footprint - it keeps each photo's own aspect ratio (same
+// commonFootprint-free approach layoutImagesInRow uses, just packed into columns instead of one
+// row) and lets column heights differ. Columns = ceil(sqrt(n)), matching layoutImagesInGrid's own
+// column-count choice, so switching between Grid and Masonry on the same board doesn't jump
+// between wildly different densities. Column WIDTH still comes from commonFootprint (a shared
+// target width every image is scaled to, aspect preserved) - only height varies per image.
+export function layoutImagesInMasonry(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const colWidth = commonFootprint(images);
+  const columns = Math.max(1, Math.ceil(Math.sqrt(images.length)));
+  // Running bottom edge of each column, in board space (already includes the leading gap) - the
+  // classic masonry/Pinterest packing rule: each new tile goes into whichever column is currently
+  // shortest, so the columns fill up roughly evenly regardless of how tall any individual photo is.
+  const columnBottoms = new Array(columns).fill(g);
+  const now = Date.now();
+
+  const placed = images.map((image) => {
+    const aspect = image.height / Math.max(1, image.width);
+    const height = colWidth * aspect;
+    let col = 0;
+    for (let c = 1; c < columns; c++) {
+      if (columnBottoms[c] < columnBottoms[col]) col = c;
+    }
+    const x = g + col * (colWidth + g);
+    const y = columnBottoms[col];
+    columnBottoms[col] = y + height + g;
+    return { ...image, x, y, width: colWidth, height, rotation: 0, updatedAt: now };
+  });
+
+  return { images: placed, canvasWidth: columns * colWidth + (columns + 1) * g, canvasHeight: Math.max(...columnBottoms) };
+}
+
+// A structured, orderly stepped overlap along a diagonal - the "tidy" counterpart to Fan's loose
+// scatter: same uniform square footprint per tile (commonFootprint, no forced cornerRadius - this
+// one stays rectangular, not round), but no rotation and no per-slot offset pattern, just a
+// constant step down and to the right. Later tiles sit on top, reading as a stack of photos nudged
+// into a staircase rather than dropped.
+const CASCADE_OVERLAP_FACTOR = 0.35;
+
+export function layoutImagesInCascade(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const step = cell * CASCADE_OVERLAP_FACTOR;
+  const now = Date.now();
+
+  const placed = images.map((image, i) => ({ ...image, x: g + i * step, y: g + i * step, width: cell, height: cell, rotation: 0, updatedAt: now }));
+
+  const span = g * 2 + (images.length - 1) * step + cell;
+  return { images: placed, canvasWidth: span, canvasHeight: span };
+}
+
+// Sunflower/phyllotaxis spiral (Vogel's model): r(i) = c*sqrt(i), theta(i) = i*GOLDEN_ANGLE. Unlike
+// a naive spiral (constant angle step per ring, which visibly bands into arms), the golden-angle
+// increment is famously the one value that keeps every point's neighbors evenly spaced all the way
+// from center to edge - the same packing nature uses for sunflower seeds and pinecone scales. Each
+// tile gets the same "true circle" cornerRadius treatment as layoutImagesInCircle - a spiral of
+// square photos would read as a grid gone crooked; round tiles read as the deliberate bubbles this
+// is going for.
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5)); // ≈137.5°, radians
+
+export function layoutImagesInSpiral(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const n = images.length;
+  // In Vogel's model each point "owns" an average area of pi*c^2 (the disc packing is uniform-
+  // density by construction), so the average nearest-neighbor spacing works out to c*sqrt(pi) -
+  // solved here for c so that spacing matches (cell + gap) regardless of how many images there are,
+  // the same reasoning ringRadius uses for layoutImagesInCircle's own sizing.
+  const c = (cell + g) / Math.sqrt(Math.PI);
+  const maxRadius = c * Math.sqrt(n);
+  const canvasSize = maxRadius * 2 + cell + g * 2;
+  const center = canvasSize / 2;
+  const now = Date.now();
+
+  const placed = images.map((image, i) => {
+    // i+1, not i: keeps the very first tile off dead-center (r=0), so it reads as the spiral's
+    // innermost coil rather than a stray photo someone forgot to place.
+    const r = c * Math.sqrt(i + 1);
+    const angle = i * GOLDEN_ANGLE;
+    const cx = center + r * Math.cos(angle);
+    const cy = center + r * Math.sin(angle);
+    return { ...image, x: cx - cell / 2, y: cy - cell / 2, width: cell, height: cell, cornerRadius: cell / 2, rotation: 0, updatedAt: now };
+  });
+
+  return { images: placed, canvasWidth: canvasSize, canvasHeight: canvasSize };
+}
+
+// Parametric heart curve (x=16sin^3 t, y=13cos t - 5cos 2t - 2cos 3t - cos 4t is the textbook
+// formula; y is negated here since it's derived assuming math's y-up convention and this file's
+// document space is y-down - without the flip the cusp would land at the top, an upside-down
+// heart). HEART_GEOMETRY is this curve's own bounding box and total arc length, sampled once at
+// module load (a fixed, images-independent property of the curve itself) so layoutImagesInHeart
+// below can normalize any image count onto it without re-deriving the curve's shape every call.
+function rawHeartPoint(t: number): { x: number; y: number } {
+  const x = 16 * Math.sin(t) ** 3;
+  const y = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+  return { x, y };
+}
+
+const HEART_SAMPLE_COUNT = 720;
+
+function computeHeartGeometry(): { minX: number; maxX: number; minY: number; maxY: number; perimeter: number } {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let perimeter = 0;
+  let prev = rawHeartPoint(0);
+  for (let i = 1; i <= HEART_SAMPLE_COUNT; i++) {
+    const point = rawHeartPoint((i / HEART_SAMPLE_COUNT) * Math.PI * 2);
+    minX = Math.min(minX, point.x);
+    maxX = Math.max(maxX, point.x);
+    minY = Math.min(minY, point.y);
+    maxY = Math.max(maxY, point.y);
+    perimeter += Math.hypot(point.x - prev.x, point.y - prev.y);
+    prev = point;
+  }
+  return { minX, maxX, minY, maxY, perimeter };
+}
+
+const HEART_GEOMETRY = computeHeartGeometry();
+
+export function layoutImagesInHeart(images: BoardImage[], gap: number): AutoLayoutResult {
+  if (images.length === 0) return { images, canvasWidth: 0, canvasHeight: 0 };
+  const g = Number.isFinite(gap) ? Math.max(0, gap) : 0;
+  const cell = commonFootprint(images);
+  const heartWidth = HEART_GEOMETRY.maxX - HEART_GEOMETRY.minX;
+  // Scale so `images.length` cells (plus a gap between each) fill the curve's own perimeter - same
+  // "size the shape to the batch, not the other way round" approach ringRadius uses for Circle.
+  // Floored at a minimum width (4 cells across) so 2-3 images still land on a recognizably
+  // heart-shaped path with visible gaps between them, rather than collapsing the whole curve down
+  // to a tiny cluster - the same reasoning MIN_RADIUS_FACTOR protects Circle's small-n case with.
+  const minScale = (4 * cell) / heartWidth;
+  const scale = Math.max(minScale, (images.length * (cell + g)) / HEART_GEOMETRY.perimeter);
+  const offsetX = g + cell / 2 - HEART_GEOMETRY.minX * scale;
+  const offsetY = g + cell / 2 - HEART_GEOMETRY.minY * scale;
+  const now = Date.now();
+
+  const placed = images.map((image, i) => {
+    // Evenly spaced by curve PARAMETER t, not by arc length - the heart's parametrization isn't
+    // uniform-speed, so tiles land slightly denser near the bottom cusp and sparser at the top
+    // lobes. A true arc-length resampling would fix that, but the parameter-uniform version is
+    // already unmistakably heart-shaped and far simpler - not worth the extra math for this.
+    const t = (i / images.length) * Math.PI * 2;
+    const raw = rawHeartPoint(t);
+    const cx = raw.x * scale + offsetX;
+    const cy = raw.y * scale + offsetY;
+    return { ...image, x: cx - cell / 2, y: cy - cell / 2, width: cell, height: cell, cornerRadius: cell / 2, rotation: 0, updatedAt: now };
+  });
+
+  const canvasWidth = heartWidth * scale + cell + g * 2;
+  const canvasHeight = (HEART_GEOMETRY.maxY - HEART_GEOMETRY.minY) * scale + cell + g * 2;
+  return { images: placed, canvasWidth, canvasHeight };
+}
+
 // ---- Document mutation (pure) --------------------------------------------------------------------
 
 export function applyCommand(doc: BoardDocument, command: BoardCommand): BoardDocument {
   const updatedAt = new Date().toISOString();
   switch (command.type) {
     case "add":
-      return { ...doc, images: [...doc.images, command.image], updatedAt };
+      return { ...doc, images: [...doc.images, command.item], updatedAt };
     case "delete":
-      return { ...doc, images: doc.images.filter((img) => img.id !== command.image.id), updatedAt };
+      return { ...doc, images: doc.images.filter((img) => img.id !== command.item.id), updatedAt };
     case "edit":
       return { ...doc, images: doc.images.map((img) => (img.id === command.after.id ? command.after : img)), updatedAt };
     case "batch-edit": {
       const afterById = new Map(command.after.map((img) => [img.id, img]));
       return { ...doc, images: doc.images.map((img) => afterById.get(img.id) ?? img), updatedAt };
     }
+    case "add-batch":
+      return { ...doc, images: [...doc.images, ...command.items], updatedAt };
+    case "delete-batch": {
+      const removedIds = new Set(command.items.map((item) => item.id));
+      return { ...doc, images: doc.images.filter((img) => !removedIds.has(img.id)), updatedAt };
+    }
     case "reorder":
       return { ...doc, images: command.after, updatedAt };
     case "background":
       return { ...doc, backgroundColor: command.after, updatedAt };
+    case "background-mode":
+      return { ...doc, backgroundMode: command.after, updatedAt };
+    case "background-grid":
+      return { ...doc, backgroundGrid: command.after, updatedAt };
+    case "background-image":
+      return { ...doc, backgroundImage: command.after, updatedAt };
+    case "background-gradient":
+      return { ...doc, backgroundGradient: command.after, updatedAt };
     case "canvas-size":
       return { ...doc, canvasWidth: command.after.width, canvasHeight: command.after.height, updatedAt };
     case "padding":
@@ -329,17 +1167,29 @@ export function applyCommand(doc: BoardDocument, command: BoardCommand): BoardDo
 export function invertCommand(command: BoardCommand): BoardCommand {
   switch (command.type) {
     case "add":
-      return { type: "delete", image: command.image };
+      return { type: "delete", item: command.item };
     case "delete":
-      return { type: "add", image: command.image };
+      return { type: "add", item: command.item };
     case "edit":
       return { type: "edit", before: command.after, after: command.before };
     case "batch-edit":
       return { type: "batch-edit", before: command.after, after: command.before };
+    case "add-batch":
+      return { type: "delete-batch", items: command.items };
+    case "delete-batch":
+      return { type: "add-batch", items: command.items };
     case "reorder":
       return { type: "reorder", before: command.after, after: command.before };
     case "background":
       return { type: "background", before: command.after, after: command.before };
+    case "background-mode":
+      return { type: "background-mode", before: command.after, after: command.before };
+    case "background-grid":
+      return { type: "background-grid", before: command.after, after: command.before };
+    case "background-image":
+      return { type: "background-image", before: command.after, after: command.before };
+    case "background-gradient":
+      return { type: "background-gradient", before: command.after, after: command.before };
     case "canvas-size":
       return { type: "canvas-size", before: command.after, after: command.before };
     case "padding":

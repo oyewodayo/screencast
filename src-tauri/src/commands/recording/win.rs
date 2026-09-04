@@ -160,13 +160,31 @@ pub async fn recording_with_output_sva(
 
     args.extend(gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?);
 
-    // Camera inputs (if any) must be added before the audio input below - add_overlay_args's
-    // filter_complex references them as [1:v]..[N:v], immediately following the screen capture
-    // at index 0, so nothing else can be inserted between the screen input and the camera inputs.
+    // Camera inputs (if any) must be added before the audio input below - both add_overlay_args's
+    // filter_complex and the separate-capture filter_complex just below reference them as
+    // [1:v].. (or [1:v]..[N:v] for the baked-in case), immediately following the screen capture at
+    // index 0, so nothing else can be inserted between the screen input and the camera inputs.
     let has_camera_overlay = !form_data.video_devices.is_empty();
-    if has_camera_overlay {
+    // Opt-in (FormData.separate_webcam_capture) alternative to the baked-in overlay above -
+    // records the camera as its OWN uncomposited file alongside the main recording instead of
+    // burning it into a single frame, so the editor's PiP layer can reposition/resize/reshape it
+    // after the fact (something no amount of post-processing can do once pixels are already
+    // merged). Gated to exactly one camera: N-camera PiP editing (multiple independently
+    // positionable bubbles) isn't built on the editor side, so a multi-camera selection here just
+    // falls back to the existing baked-in overlay rather than silently dropping every camera past
+    // the first.
+    let separate_webcam_capture = has_camera_overlay && form_data.separate_webcam_capture && form_data.video_devices.len() == 1;
+    if has_camera_overlay && !separate_webcam_capture {
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
         add_overlay_args(&mut args, form_data);
+    } else if separate_webcam_capture {
+        log::debug!("Recording webcam separately for PiP editing");
+        let overlay_size = map_overlay_size(&form_data.overlay_size);
+        args.extend(vec![
+            "-f".to_string(), "dshow".to_string(),
+            "-video_size".to_string(), overlay_size,
+            "-i".to_string(), format!("video={}", form_data.video_devices[0]),
+        ]);
     }
 
     // Audio is now always its own standalone input - previously it was bundled into the single
@@ -176,11 +194,14 @@ pub async fn recording_with_output_sva(
         "-i".to_string(), format!("audio={}", form_data.audio_device),
     ]);
 
-    // Downscale the raw desktop capture - only when there's no camera overlay, whose own
-    // filter_complex (add_overlay_args, above) already ends with this same downscale as its
-    // final stage. ffmpeg rejects a -vf here alongside a -filter_complex already producing video.
+    // Downscale the raw desktop capture - only when there's no BAKED-IN camera overlay, whose own
+    // filter_complex (add_overlay_args, above) already ends with this same downscale as its final
+    // stage. ffmpeg rejects a -vf here alongside a -filter_complex already producing video - the
+    // separate-capture case below builds its own filter_complex for exactly this reason too.
     if !has_camera_overlay {
         args.extend(desktop_scale_args());
+    } else if separate_webcam_capture {
+        args.extend(vec!["-filter_complex".to_string(), format!("[0:v]scale='min({},iw)':-2[scr]", MAX_RECORDING_WIDTH)]);
     }
 
     // Add codec flags based on file extension. Used to be its own inline copy of this match
@@ -188,6 +209,12 @@ pub async fn recording_with_output_sva(
     // policy) - now unified with it since both needed the same fix (missing -b:a on mkv/webm
     // meant those fell back to noticeably-more-compressed default bitrates), so keeping two
     // copies in sync stopped being worth it.
+    if separate_webcam_capture {
+        // [scr] (the scaled screen) plus the mic audio input (index 2, since the raw camera sits
+        // at index 1) - explicit -map is required once a -filter_complex is in play, unlike the
+        // plain-desktop-capture branch above where ffmpeg's own default stream selection is enough.
+        args.extend(vec!["-map".to_string(), "[scr]".to_string(), "-map".to_string(), "2:a".to_string()]);
+    }
     args.extend(codec_args_for_ext(&form_data.file_ext));
     // Evens out quiet/inconsistent mic levels - see AUDIO_ENHANCE_FILTER's doc comment.
     args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
@@ -198,6 +225,26 @@ pub async fn recording_with_output_sva(
 
     // Add output file
     args.push(output_file.clone());
+
+    // Second output, same ffmpeg process: the raw camera stream (input index 1), video-only (no
+    // audio - the mic already went to the primary output above, and doubling it here would just
+    // mix the same track twice if this ever got composited back in). Always .mp4 regardless of
+    // the user's chosen file_ext for the main recording - this is an internal editor artifact, not
+    // the deliverable, so it doesn't need to match. A simple, fast preset is enough: this is a
+    // small-resolution (overlay_size) source, not the full desktop capture.
+    if separate_webcam_capture {
+        let webcam_output = output_path.with_file_name(format!(
+            "{}_webcam.mp4",
+            output_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording")
+        ));
+        args.extend(vec![
+            "-map".to_string(), "1:v".to_string(),
+            "-c:v".to_string(), "libx264".to_string(),
+            "-preset".to_string(), "veryfast".to_string(),
+            "-crf".to_string(), "23".to_string(),
+            path_to_str(&webcam_output)?.to_string(),
+        ]);
+    }
 
     log::debug!("FFmpeg args: {:?}", args);
 

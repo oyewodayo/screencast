@@ -8,18 +8,25 @@ import { listen } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
 import { WebviewWindow, appWindow } from '@tauri-apps/api/window';
 import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
-import { formatFileName } from "../utils/Formater";
+import { formatFileName, truncateFileName } from "../utils/Formater";
+import SidebarFileIcon from "../components/SidebarFileIcon";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import useVideoEditStore from "../hooks/useVideoEditStore";
 import useImageEditStore from "../hooks/useImageEditStore";
 import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
+import PipOverlayLayer from "../components/video/PipOverlayLayer";
 import ClipCropOverlay from "../components/video/ClipCropOverlay";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
 import BulkConversionDialog, { BulkConversionSummary } from "../components/BulkConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
+import ImageFolderGallery from "../components/ImageFolderGallery";
+import VideoFolderGallery from "../components/VideoFolderGallery";
+import PdfFolderGallery from "../components/PdfFolderGallery";
+import DocumentFolderGallery from "../components/DocumentFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
+import { BoardEditorHandle } from "../components/board/BoardEditor";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
@@ -52,9 +59,16 @@ import {
   IoAddCircleOutline,
   IoBuildOutline,
   IoPin,
+  IoPinOutline,
+  IoCreateOutline,
+  IoSwapHorizontalOutline,
+  IoLocateOutline,
   IoRefresh,
   IoSearch,
   IoClose,
+  IoSwapVerticalOutline,
+  IoEyeOffOutline,
+  IoEyeOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 
@@ -72,6 +86,12 @@ const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.R
 // a FileCategory (getFileCategory never returns it; it's a distinct data source, not an
 // extension-based filter over `files`), so it gets its own type rather than being folded in.
 type SidebarTab = FileCategory | "trash";
+
+// Categories with a folder-click grid view (ImageFolderGallery/VideoFolderGallery/
+// PdfFolderGallery/DocumentFolderGallery) - audio doesn't have one yet. Centralized so adding a
+// category's gallery later is a one-line change here instead of hunting down every
+// activeFileCategory === "x" || activeFileCategory === "y" check this gates.
+const GALLERY_CATEGORIES: readonly SidebarTab[] = ["image", "video", "pdf", "document"];
 
 interface TrashEntry {
   trashed_name: string;
@@ -226,6 +246,21 @@ const Dashboard = () => {
   // meaningful for the screen-capture record types (sva/sa/s); RecordingDocker only shows the
   // toggle for those.
   const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(() => loadSettings().defaultIncludeSystemAudio);
+  // Opt-in, off by default every session (not persisted like includeSystemAudio above - this is a
+  // new, less-proven capture path, so it shouldn't silently carry forward as someone's default).
+  // When on (and exactly one camera is selected - see start_recording's own doc comment on why
+  // more than one isn't supported), recording_with_output_sva writes the webcam as its own
+  // second, uncomposited file alongside the main recording instead of baking it into a single
+  // overlay - lets the editor's new PiP layer reposition/resize/reshape it after the fact, which
+  // baked-in footage never could be. Recording with this off is byte-for-byte the same as before
+  // this feature existed.
+  const [separateWebcamCapture, setSeparateWebcamCapture] = useState<boolean>(false);
+  // Opt-in, off by default every session (not persisted, same reasoning as separateWebcamCapture
+  // above - a new, less-proven capture path). When on, start_recording installs a Windows mouse
+  // hook (services/click_tracker.rs) for the duration of the recording and writes every click's
+  // time+position to a "<name>.clicks.json" sidecar - the editor's own "auto zoom on click" tool
+  // reads this back to suggest where to punch in. Recording with this off starts no hook at all.
+  const [trackClicks, setTrackClicks] = useState<boolean>(false);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
@@ -245,6 +280,12 @@ const Dashboard = () => {
   // Which Board screen (if any) is showing in the main content pane - null means Board mode is
   // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
   const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
+  // Imperative handle onto whichever BoardEditor is currently mounted (see BoardEditorHandle) -
+  // lets the sidebar's "Add to board" menu item and bulk action bar reach into it and reuse its
+  // image-import pipeline, the same way videoPlayerRef lets the sidebar reach into VideoPlayer.
+  // null whenever boardScreen isn't in "editor" mode (BoardWorkspace renders BoardHome instead,
+  // which never attaches anything to this ref).
+  const boardEditorRef = useRef<BoardEditorHandle>(null);
   // Which Docs screen (if any) is showing in the main content pane - same null-means-off pattern
   // as boardScreen. See handleOpenDocs.
   const [docsScreen, setDocsScreen] = useState<DocsScreen | null>(null);
@@ -277,6 +318,25 @@ const Dashboard = () => {
       else next.add(folder);
       return next;
     });
+  };
+  // Sidebar declutter/ordering controls for the active category's file list - both in-memory
+  // only, same lifetime as collapsedFolders above. Hiding empty folders only affects folders with
+  // zero files in the *active* category (the "No {category} files" ones) — it never hides a
+  // folder while searching (isFolderEmpty-style filtering already takes over then) and the root
+  // is never eligible to be hidden.
+  const [hideEmptyFolders, setHideEmptyFolders] = useState<boolean>(false);
+  const [fileSortMode, setFileSortMode] = useState<"name-asc" | "name-desc" | "type">("name-asc");
+  const sortFileList = (fileList: FileEntry[]): FileEntry[] => {
+    const sorted = [...fileList];
+    if (fileSortMode === "name-desc") sorted.sort((a, b) => b.name.localeCompare(a.name));
+    else if (fileSortMode === "type") {
+      sorted.sort((a, b) => {
+        const extA = a.name.split(".").pop()?.toLowerCase() ?? "";
+        const extB = b.name.split(".").pop()?.toLowerCase() ?? "";
+        return extA.localeCompare(extB) || a.name.localeCompare(b.name);
+      });
+    } else sorted.sort((a, b) => a.name.localeCompare(b.name));
+    return sorted;
   };
   // Drag-and-drop move: the file(s) currently being dragged (more than one if the dragged file
   // was part of the active multi-selection below), and whichever folder header the pointer is
@@ -329,6 +389,12 @@ const Dashboard = () => {
   const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(new Set());
   const [bulkMoveMenuOpen, setBulkMoveMenuOpen] = useState<boolean>(false);
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
+  // Folder relative-path whose images are shown as a thumbnail grid in the main board - set by
+  // clicking an Image-tab folder header in the sidebar (see the folder header onClick below), and
+  // cleared whenever the active category tab changes so a stale gallery can't linger into another
+  // tab's empty state. Independent of selectedFile: opening a thumbnail sets selectedFile without
+  // clearing this, so the board's "Back to <folder>" button (below) can return to the grid.
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   // Lifted here (single call site - useVideoEditStore is a stateful hook, unsafe to call from
   // more than one component) so both the video-tools timeline (via BottomDocker/FileToolsDocker/
   // VideoTimelineDocker) and the text-overlay preview layer mounted alongside VideoPlayer below
@@ -337,14 +403,18 @@ const Dashboard = () => {
   const editStore = useVideoEditStore(
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
+  // The assembled/output timeline's own total length - a clip's own contribution is
+  // (end-start)/speed, not just (end-start), once it has a speed edit (Clip.speed's own doc
+  // comment, videoEditTypes.ts): a sped-up clip plays back in LESS output time than its source
+  // range spans. Fed to VideoOverlayLayer/PipOverlayLayer below so a freshly-placed overlay's own
+  // default end time clamps against the timeline's REAL length instead of a stale, too-long value
+  // that ignores every sped-up clip already on it.
+  const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + Math.max(0, (c.end - c.start) / (c.speed ?? 1)), 0);
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
-  // load_image_edit_state invoke. HEIC/HEIF are excluded too - they render as a "Convert to
-  // view" prompt instead of ImageEditor (see the main content pane below), so loading edit state
-  // for them would just be a wasted invoke that's also doomed to fail decoding the source photo.
-  const isImageFileSelected =
-    !!selectedFile &&
-    getFileCategory(selectedFile.name) === "image" &&
-    !["heic", "heif"].includes(getFileExtension(selectedFile.name));
+  // load_image_edit_state invoke. HEIC/HEIF included - selectedFile.path is already a decoded
+  // PNG for them by the time this reads it (see resolveImageDisplayUrl/loadFileForPlayback), so
+  // there's nothing left to fail decoding.
+  const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
@@ -358,12 +428,20 @@ const Dashboard = () => {
   // in Dashboard state, passed to both the timeline docker and the sibling player" shape as
   // currentOutputTime just above.
   const [activeClipEffects, setActiveClipEffects] = useState<ActiveClipEffects | null>(null);
+  // Live status of VideoPlayer's own noise-reduction Web Audio graph (see its
+  // onNoiseReductionStatusChange prop) - relayed straight through to VideoTimelineDocker
+  // (noiseReductionStatus) so NoiseReductionPopover can show it, same round-trip shape as
+  // activeClipEffects just above, just travelling the other direction (player -> timeline docker
+  // instead of timeline docker -> player).
+  const [noiseReductionStatus, setNoiseReductionStatus] = useState<"idle" | "calibrating" | "active">("idle");
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [isPlacingText, setIsPlacingText] = useState<boolean>(false);
   const [selectedImageOverlayId, setSelectedImageOverlayId] = useState<string | null>(null);
   const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
   const [selectedBlurOverlayId, setSelectedBlurOverlayId] = useState<string | null>(null);
   const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
+  const [selectedPipOverlayId, setSelectedPipOverlayId] = useState<string | null>(null);
+  const [isPlacingPip, setIsPlacingPip] = useState<boolean>(false);
   // Arms the on-canvas crop tool (ClipCropOverlay, mounted as a sibling to VideoOverlayLayer just
   // below) - unlike the placement tools above, there's no "consumed" step, it just shows/hides a
   // drag window over whichever clip activeClipEffects currently points at. Deliberately NOT reset
@@ -414,14 +492,62 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // point it at a different file entirely without touching selectedFile itself.
   const previewSourcePathRef = useRef<string | null>(null);
 
-  const resolvePreviewAssetUrl = async (sourcePath: string): Promise<string> => {
+  // useCallback'd (stable identity across renders, not just a stable cache Map) because these
+  // three resolvers are passed as props into ImageFolderGallery, whose own thumbnail-resolving
+  // effect depends on resolveThumbnailUrl's identity (see that file). Without this, every
+  // Dashboard re-render - including one triggered by nothing more than a gallery selection click,
+  // since selectedFilePaths lives here - handed the gallery a brand-new function reference, which
+  // re-triggered that effect and re-resolved every already-cached thumbnail on every click. That
+  // was the actual "selection is lagging/hanging" bug: not the selection logic itself, but a full
+  // thumbnail-resolution storm firing on every click as a side effect of it.
+  const resolvePreviewAssetUrl = useCallback(async (sourcePath: string): Promise<string> => {
     const cached = previewAssetUrlCacheRef.current.get(sourcePath);
     if (cached) return cached;
     const absolutePath = await invoke<string>("convert_file_path_to_url", { filepath: sourcePath });
     const url = convertFileSrc(absolutePath);
     previewAssetUrlCacheRef.current.set(sourcePath, url);
     return url;
-  };
+  }, []);
+
+  // Full-resolution display URL for an image file - the single-image viewer's resolver (also used
+  // by the gallery's "Copy image" action, which should copy full quality, not a thumbnail). Same
+  // as resolvePreviewAssetUrl above except HEIC/HEIF (WebView2 has no decoder for it at all) first
+  // gets silently decoded to a cached PNG on the backend (get_heic_preview, content-addressed by
+  // path+mtime - see conversion.rs) so it just displays with no "Convert" step and nothing added
+  // to the library. get_heic_preview itself is nearly free on a cache hit (a single file-exists
+  // check), so it's fine to call on every resolve rather than adding a second JS-side cache here.
+  //
+  // Deliberately NOT what the gallery grid (ImageFolderGallery.tsx) uses for its tiles - see
+  // resolveImageThumbnailUrl below for why a full decode per grid tile turned out to be a real
+  // problem, not just a slower one.
+  const resolveImageDisplayUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
+    if (!["heic", "heif"].includes(getFileExtension(file.name))) return resolvePreviewAssetUrl(file.path);
+    const previewPath = await invoke<string>("get_heic_preview", { inputPath: file.path });
+    return resolvePreviewAssetUrl(previewPath);
+  }, [resolvePreviewAssetUrl]);
+
+  // Small (~480px) display URL for an image gallery grid tile - get_image_thumbnail generates and
+  // caches a properly downscaled preview on the backend (HEIC/HEIF via the bundled
+  // heif-thumbnailer, everything else via the `image` crate) instead of handing the tile a
+  // full-resolution decode. The grid used to just call resolveImageDisplayUrl above for every
+  // tile: fine for one image, but a folder of 100+ multi-megapixel photos meant the browser's
+  // image cache couldn't hold every decoded bitmap at once, so scrolling away and back forced a
+  // re-decode of whatever got evicted - visible as thumbnails "reloading" while scrolling, on top
+  // of the initial load already being far slower than a grid of small tiles should be.
+  const resolveImageThumbnailUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
+    const thumbPath = await invoke<string>("get_image_thumbnail", { inputPath: file.path });
+    return resolvePreviewAssetUrl(thumbPath);
+  }, [resolvePreviewAssetUrl]);
+
+  // Poster-frame thumbnail for a video gallery grid tile (VideoFolderGallery.tsx) - the video
+  // counterpart to resolveImageThumbnailUrl above, backed by get_video_thumbnail's own
+  // content-addressed cache on the Rust side (a single ffmpeg frame extraction, ~1s into the
+  // clip). Routed through the same shared thumbnailLimiter as every other gallery/sidebar
+  // thumbnail request by the callers of this function, not here - this just resolves one URL.
+  const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
+    const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: file.path });
+    return resolvePreviewAssetUrl(thumbPath);
+  }, [resolvePreviewAssetUrl]);
 
   // The video-tools timeline's own seek, extended to know *which file* it's seeking within -
   // once a clip can be dragged in from a different file than the one currently open, "seek to
@@ -1268,13 +1394,13 @@ const setScreen = () => {
 	const recordingHotkeyRef = useRef({
 		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 		fileName, fileExt, recordType, audioDevice, videoDevices,
-		overlayShape, overlayPosition, overlaySize, includeSystemAudio,
+		overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
 	});
 	useEffect(() => {
 		recordingHotkeyRef.current = {
 			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 			fileName, fileExt, recordType, audioDevice, videoDevices,
-			overlayShape, overlayPosition, overlaySize, includeSystemAudio,
+			overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
 		};
 	});
 
@@ -1298,6 +1424,8 @@ const setScreen = () => {
 			overlay_size: s.overlaySize,
 			window_title: '',
 			include_system_audio: s.includeSystemAudio,
+			separate_webcam_capture: s.separateWebcamCapture,
+			track_clicks: s.trackClicks,
 		});
 	}, []);
 
@@ -1341,15 +1469,12 @@ const setScreen = () => {
   // anywhere" picker below — both just need a raw filesystem path turned into a playable URL.
 	const loadFileForPlayback = async (filePath: string, fileName: string) => {
 	try {
-		// Get the absolute file path from Rust
-		const absolutePath = await invoke<string>("convert_file_path_to_url", {
-		filepath: filePath
-		});
-
-		console.log('Absolute file path:', absolutePath);
-
-		// Convert to asset protocol URL using Tauri's helper
-		const fileUrl = convertFileSrc(absolutePath);
+		// Images (including HEIC/HEIF, auto-decoded to a cached PNG - see resolveImageDisplayUrl)
+		// resolve through their own path; everything else is the plain convert_file_path_to_url +
+		// convertFileSrc round-trip.
+		const fileUrl = getFileCategory(fileName) === "image"
+			? await resolveImageDisplayUrl({ name: fileName, path: filePath })
+			: convertFileSrc(await invoke<string>("convert_file_path_to_url", { filepath: filePath }));
 
 		console.log('Converted file URL:', fileUrl);
 
@@ -1394,9 +1519,23 @@ const setScreen = () => {
 		await loadFileForPlayback(newPath, newFileName);
 	};
 
-	// Small icon shown next to a file name in the home-screen "From your library" preview list.
+	// Small icon shown next to a file name in the home-screen "From your library" preview list, the
+	// sidebar file list, and the "Now open" banner.
 	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
 		FILE_CATEGORY_TABS.find((tab) => tab.category === category)?.icon ?? <IoDocumentText size={18} />;
+
+	// A distinct color per category, matching categoryIcon 1:1 - gives the sidebar's otherwise
+	// text-only file rows a quick, scannable visual cue for "what kind of file is this" at a
+	// glance, the same job the old per-row emoji (formatFileName's icon) used to do less legibly.
+	const CATEGORY_ICON_COLOR: Record<FileCategory, string> = {
+		video: "text-violet-500 dark:text-violet-400",
+		audio: "text-pink-500 dark:text-pink-400",
+		image: "text-emerald-500 dark:text-emerald-400",
+		pdf: "text-red-500 dark:text-red-400",
+		document: "text-blue-500 dark:text-blue-400",
+	};
+	const categoryIconColorClassName = (category: FileCategory | null): string =>
+		category ? CATEGORY_ICON_COLOR[category] : "text-neutral-400 dark:text-neutral-500";
 
 	// What to surface on the empty home screen so it isn't just a blank void. Pinned files (in pin
 	// order — see utils/homeScreenFiles.ts's newest-pin-first toggling) always come first, but they
@@ -1427,13 +1566,23 @@ const setScreen = () => {
 
 	// Cycles to the previous/next image relative to whatever's currently selected, wrapping
 	// around at either end (matches how most image viewers handle prev/next at the boundaries).
+	//
+	// `images` is `getFlatFilesForCategory`'s raw order - whatever list_briefcast_files' own
+	// std::fs::read_dir happened to return (no sort applied on either side), which is an NTFS
+	// directory-enumeration order, not a guaranteed name/date order. Confirmed directly (both the
+	// on-screen "Next (→)" button and the keyboard Down/Right arrows, which call this with the
+	// exact same direction=1) that walking that raw order forward from a file lands on what a
+	// user reading the gallery grid perceives as the PREVIOUS tile, not the next one - so `next`/
+	// `previous` here are named for what they mean to the caller (Next button, Right/Down arrow =
+	// "forward"), and the sign flip below is what makes that match raw array order rather than
+	// fight it.
 	const navigateImage = (direction: 1 | -1) => {
 		if (!selectedFile) return;
 		const images = getFlatFilesForCategory("image");
 		if (images.length === 0) return;
 		const currentIndex = images.findIndex((file) => file.path === selectedFile.sourcePath);
 		if (currentIndex === -1) return;
-		const nextIndex = (currentIndex + direction + images.length) % images.length;
+		const nextIndex = (currentIndex - direction + images.length) % images.length;
 		const next = images[nextIndex];
 		loadFileForPlayback(next.path, next.name);
 	};
@@ -1584,6 +1733,51 @@ const setScreen = () => {
 		return () => document.removeEventListener("keydown", handleKeyDown);
 	}, [selectedFile, files, audioShuffle, dockerMode]);
 
+	// Escape clears the current multi-selection - the sidebar's checkbox multi-select and the
+	// image gallery's Ctrl/Shift-click selection (ImageFolderGallery.tsx) are the same
+	// selectedFilePaths Set, so this one shortcut covers both. Only attached while there's
+	// actually a selection to clear, and skipped while focus is in a text field (the search box,
+	// an inline rename, a new-folder name) so it doesn't steal Escape from whatever that field's
+	// own handler - or its default browser behavior - would otherwise do with it.
+	useEffect(() => {
+		if (selectedFilePaths.size === 0) return;
+
+		const handleEscape = (e: KeyboardEvent) => {
+			if (e.key !== "Escape") return;
+			const target = e.target as HTMLElement | null;
+			if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+			setSelectedFilePaths(new Set());
+		};
+
+		document.addEventListener("keydown", handleEscape);
+		return () => document.removeEventListener("keydown", handleEscape);
+	}, [selectedFilePaths.size]);
+
+	// Closes a file row's 3-dot menu (and its Move-to/Link-notes submenus) on a click anywhere
+	// else, or on Escape - previously it only closed via its own toggle button or by picking an
+	// action, so clicking away (or even just wanting out without picking anything) left it stuck
+	// open. pointerdown, not click, so a press that's opening a *different* row's menu doesn't get
+	// eaten by this one closing first (same reasoning as ImageFolderGallery.tsx's own outside-click
+	// handler for its context menu) - and it never fires for the toggle button's own click in the
+	// first place, since that handler already calls stopPropagation.
+	useEffect(() => {
+		if (!openMenu) return;
+
+		const close = (e: Event) => {
+			if (e instanceof KeyboardEvent && e.key !== "Escape") return;
+			setOpenMenu(null);
+			setMoveMenuOpenFor(null);
+			setLinkDocsMenuOpenFor(null);
+		};
+
+		document.addEventListener("pointerdown", close);
+		document.addEventListener("keydown", close);
+		return () => {
+			document.removeEventListener("pointerdown", close);
+			document.removeEventListener("keydown", close);
+		};
+	}, [openMenu]);
+
 	// Opens a native OS file picker scoped to nowhere in particular — unlike the sidebar (which
 	// only ever lists files under the app's own Briefcast folder), this lets the user view/play
 	// any video, audio, image, or PDF already sitting anywhere else on their system. Selecting
@@ -1614,12 +1808,81 @@ const setScreen = () => {
 	const folderDisplayName = (folder: string): string => (folder === "" ? "Briefcast" : folder.split("/").pop()!);
 	const folderDepth = (folder: string): number => (folder === "" ? 0 : folder.split("/").length);
 
+	// Memoized for the same reason resolvePreviewAssetUrl etc. are useCallback'd above: passed as
+	// the `files`/`folderOptions` props into ImageFolderGallery/VideoFolderGallery, which use
+	// `files`'s identity as a dependency of their own thumbnail-resolving effect. Recomputing a
+	// fresh array here on every Dashboard render (as this used to do inline in the JSX below)
+	// handed the gallery a new array reference on every render regardless of whether the underlying
+	// file list had actually changed - including on every selection click - which re-triggered that
+	// effect needlessly.
+	const selectedFolderImages = useMemo(
+		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "image") : []),
+		[files, selectedFolder]
+	);
+	const selectedFolderVideos = useMemo(
+		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "video") : []),
+		[files, selectedFolder]
+	);
+	const selectedFolderPdfs = useMemo(
+		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "pdf") : []),
+		[files, selectedFolder]
+	);
+	const selectedFolderDocuments = useMemo(
+		() => (selectedFolder !== null ? (files[selectedFolder] || []).filter((file) => getFileCategory(file.name) === "document") : []),
+		[files, selectedFolder]
+	);
+	// Not category-specific despite living alongside the memos above - every folder in the
+	// library, for any gallery's "Move to" list.
+	const folderOptions = useMemo(
+		() => Object.keys(files).sort((a, b) => a.localeCompare(b)).map((key) => ({ key, label: folderDisplayName(key) })),
+		[files]
+	);
+
 	const findFileFolder = (path: string): string | null => {
 		for (const [folder, list] of Object.entries(files)) {
 			if (list.some((f) => f.path === path)) return folder;
 		}
 		return null;
 	};
+
+	// Set right before a scroll-into-view should happen, then consumed (and reset to null) by the
+	// effect below - not read directly, just a trigger. A plain function call can't do this itself
+	// because the target row may not exist in the DOM yet (its category tab might not be active,
+	// its folder might be collapsed) until the state changes below actually re-render the sidebar.
+	const [pendingScrollToPath, setPendingScrollToPath] = useState<string | null>(null);
+
+	// Jumps the sidebar to wherever the currently open file actually lives - switches to its
+	// category tab and expands its folder if either is hiding it, then scrolls its row into view.
+	// See the "now open" sticky banner below for the one caller.
+	const handleJumpToOpenFile = () => {
+		if (!selectedFile) return;
+		const category = getFileCategory(selectedFile.name);
+		if (category && category !== activeFileCategory) {
+			setActiveFileCategory(category);
+			setSelectedFilePaths(new Set());
+			setSelectedFolder(null);
+		}
+		const folder = findFileFolder(selectedFile.sourcePath);
+		if (folder !== null && collapsedFolders.has(folder)) {
+			setCollapsedFolders((prev) => {
+				const next = new Set(prev);
+				next.delete(folder);
+				return next;
+			});
+		}
+		setPendingScrollToPath(selectedFile.sourcePath);
+	};
+
+	// Runs after whichever of the category/collapse-state changes above actually needed to happen
+	// has committed and re-rendered the sidebar, so the target row is guaranteed to exist in the
+	// DOM by the time this queries for it - a plain setTimeout/rAF after the click would be racing
+	// that render instead of waiting on it.
+	useEffect(() => {
+		if (!pendingScrollToPath) return;
+		const row = document.querySelector(`[data-file-path="${CSS.escape(pendingScrollToPath)}"]`);
+		row?.scrollIntoView({ behavior: "smooth", block: "center" });
+		setPendingScrollToPath(null);
+	}, [pendingScrollToPath, activeFileCategory, collapsedFolders]);
 
 	// True only if the filesystem folder is completely empty — no files of any type, no
 	// subfolders — not merely "no files in the currently active category". Root can never be
@@ -1670,10 +1933,20 @@ const setScreen = () => {
 		const name = newFolderValue.trim();
 		setCreatingFolderIn(null);
 		if (parent === null || !name) return;
+		// The backend only rejects a duplicate name within the same parent directory - nothing stops
+		// two folders sharing a name elsewhere in the tree (e.g. "MSC Research" under two different
+		// parents), and since the sidebar only ever shows a folder's last path segment, that pair
+		// would otherwise render identically with no indication anything's ambiguous. Non-blocking:
+		// this only warns after creation succeeds, it never prevents it.
+		const collidesElsewhere = Object.keys(files).some((existingFolder) => folderDisplayName(existingFolder) === name && existingFolder !== `${parent}/${name}` && existingFolder !== name);
 		try {
 			await invoke<string>("create_folder", { parentPath: parent, name });
 			await handleDirectoryFiles();
-			setMessage(`Created folder: ${name}`);
+			setMessage(
+				collidesElsewhere
+					? `Created folder: ${name} (note: another folder is already named "${name}" elsewhere - hover a folder to see its full path)`
+					: `Created folder: ${name}`
+			);
 		} catch (error) {
 			console.error("Error creating folder:", error);
 			setError(`Failed to create folder: ${error}`);
@@ -1738,6 +2011,52 @@ const setScreen = () => {
 		} catch (error) {
 			console.error("Error moving files:", error);
 			setError(`Failed to move files: ${error}`);
+		}
+	};
+
+	// Routes a batch of already-in-the-library files (a sidebar row's "Add to board" menu item, the
+	// bulk action bar's own button, or - separately - a sidebar drag onto the canvas, which
+	// BoardEditor handles itself via the libraryDraggingFiles prop rather than this function) into
+	// whichever board is currently open, via boardEditorRef's imperative handle. Silently drops any
+	// non-image file rather than erroring - both call sites already only show the option for image
+	// files/the image tab, so this filter is a safety net, not the primary gate.
+	const handleAddFilesToBoard = async (fileList: FileEntry[]): Promise<void> => {
+		setOpenMenu(null);
+		const imagePaths = fileList.filter((file) => getFileCategory(file.name) === "image").map((file) => file.path);
+		if (imagePaths.length === 0 || !boardEditorRef.current) return;
+		await boardEditorRef.current.addImagesFromPaths(imagePaths);
+		setSelectedFilePaths(new Set());
+	};
+
+	// Bulk counterpart to handleDeleteFile above - same move_to_trash-per-file/Promise.allSettled/
+	// combined-message shape handleMoveFiles uses for a bulk move. Shared by the sidebar's own
+	// bulk action bar and the image gallery's selection panel (ImageFolderGallery.tsx).
+	const handleBulkDeleteFiles = async (fileList: FileEntry[]) => {
+		if (fileList.length === 0) return;
+		try {
+			const results = await Promise.allSettled(fileList.map((file) => invoke("move_to_trash", { path: file.path })));
+			results.forEach((result, i) => {
+				if (result.status === "fulfilled") {
+					if (selectedFile?.sourcePath === fileList[i].path) setSelectedFile(null);
+					const { pinned, recent } = forgetFile(fileList[i].path);
+					setPinnedPaths(pinned);
+					setRecentPaths(recent);
+				}
+			});
+			await handleDirectoryFiles();
+			setSelectedFilePaths(new Set());
+			const failedCount = results.filter((r) => r.status === "rejected").length;
+			if (failedCount > 0) {
+				const firstError = results.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason;
+				setError(`Moved ${fileList.length - failedCount} of ${fileList.length} file(s) to trash — ${failedCount} failed: ${firstError}`);
+			} else if (fileList.length === 1) {
+				setMessage(`Moved to trash: ${formatFileName(fileList[0].name)}`);
+			} else {
+				setMessage(`Moved ${fileList.length} files to trash`);
+			}
+		} catch (error) {
+			console.error("Error deleting files:", error);
+			setError(`Failed to delete files: ${error}`);
 		}
 	};
 
@@ -1928,14 +2247,19 @@ const setScreen = () => {
 	const filteredEntries = Object.entries(files)
 		.map(([folder, fileList]) => [
 			folder,
-			fileList.filter(
-				(file) => getFileCategory(file.name) === activeFileCategory && (!isSearchingFiles || file.name.toLowerCase().includes(normalizedSearchQuery))
+			sortFileList(
+				fileList.filter(
+					(file) => getFileCategory(file.name) === activeFileCategory && (!isSearchingFiles || file.name.toLowerCase().includes(normalizedSearchQuery))
+				)
 			),
 		] as [string, FileEntry[]])
 		// A folder with zero matches is only worth hiding while actively searching - normally
 		// every real folder stays visible (even empty ones, per this file's own comment above)
-		// so it's still usable as a create-subfolder/move/drop target.
+		// so it's still usable as a create-subfolder/move/drop target. hideEmptyFolders is the
+		// opt-in exception: user has explicitly asked to declutter, so folders with nothing in
+		// the active category are dropped too (root exempted - it's never hidden).
 		.filter(([, fileList]) => !isSearchingFiles || fileList.length > 0)
+		.filter(([folder, fileList]) => !hideEmptyFolders || fileList.length > 0 || folder === "")
 		.sort(([a], [b]) => a.localeCompare(b));
 	const filteredTrashItems = isSearchingFiles
 		? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery))
@@ -1981,6 +2305,7 @@ const setScreen = () => {
                       onClick={() => {
                         setActiveFileCategory(category);
                         setSelectedFilePaths(new Set());
+                        setSelectedFolder(null);
                       }}
                       className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
                         activeFileCategory === category
@@ -2054,6 +2379,32 @@ const setScreen = () => {
                         className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
                       >
                         <MdCreateNewFolder size={16} />
+                      </button>
+                    )}
+                    {activeFileCategory !== "trash" && (
+                      <button
+                        type="button"
+                        title={`Sort: ${fileSortMode === "name-asc" ? "Name (A-Z)" : fileSortMode === "name-desc" ? "Name (Z-A)" : "Type"} - click to cycle`}
+                        onClick={() =>
+                          setFileSortMode((prev) => (prev === "name-asc" ? "name-desc" : prev === "name-desc" ? "type" : "name-asc"))
+                        }
+                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                      >
+                        <IoSwapVerticalOutline size={15} />
+                      </button>
+                    )}
+                    {activeFileCategory !== "trash" && (
+                      <button
+                        type="button"
+                        title={hideEmptyFolders ? `Show folders with no ${activeFileCategory} files` : `Hide folders with no ${activeFileCategory} files`}
+                        onClick={() => setHideEmptyFolders((prev) => !prev)}
+                        className={`p-1 rounded transition-colors ${
+                          hideEmptyFolders
+                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        }`}
+                      >
+                        {hideEmptyFolders ? <IoEyeOffOutline size={15} /> : <IoEyeOutline size={15} />}
                       </button>
                     )}
                     {activeFileCategory !== "trash" && (
@@ -2174,6 +2525,7 @@ const setScreen = () => {
                               .map((destFolder) => (
                                 <button
                                   key={destFolder || "__root__"}
+                                  title={destFolder || "Briefcast"}
                                   className="w-full text-left px-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
                                   onClick={() => handleMoveFiles(getSelectedFileEntries(), destFolder)}
                                 >
@@ -2192,6 +2544,25 @@ const setScreen = () => {
                           Convert
                         </button>
                       )}
+                      {/* Only when a board is actually open - see BoardEditorHandle/boardEditorRef.
+                          Image tab only, matching FILE_CATEGORY_EXTENSIONS.image being the only
+                          thing Board can place on its canvas. */}
+                      {boardScreen?.mode === "editor" && activeFileCategory === "image" && (
+                        <button
+                          type="button"
+                          onClick={() => void handleAddFilesToBoard(getSelectedFileEntries())}
+                          className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                        >
+                          Add to board
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleBulkDeleteFiles(getSelectedFileEntries())}
+                        className="text-xs font-medium text-red-600 dark:text-red-400 hover:underline"
+                      >
+                        Delete
+                      </button>
                       <button
                         type="button"
                         onClick={() => setSelectedFilePaths(new Set())}
@@ -2212,6 +2583,36 @@ const setScreen = () => {
                 <div
                   className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto overscroll-contain flex-1 text-neutral-800 dark:text-neutral-200"
                 >
+                {/* "Now open" banner - pinned to the top of this scrolling list (not the whole
+                    sidebar; the search box/tabs/Files header above it never scroll away in the
+                    first place) so it's always reachable no matter how deep the currently open
+                    file's row has scrolled off screen in a long library. Clicking it switches to
+                    that file's category tab and expands its folder if either is hiding its row
+                    (see handleJumpToOpenFile), then scrolls straight to it - the file itself is
+                    already visually marked once found (the existing bg-blue-50/text-blue-600
+                    "currently open" row styling below), so this doesn't add a second, redundant
+                    highlight on arrival. */}
+                {selectedFile && (
+                  <button
+                    type="button"
+                    onClick={handleJumpToOpenFile}
+                    title={`Locate "${selectedFile.name}" in the sidebar`}
+                    className="sticky top-0 z-10 -mx-3 -mt-3 mb-2 flex w-[calc(100%+1.5rem)] items-center gap-2 border-b border-blue-200 bg-blue-50/95 px-3 py-2 text-left backdrop-blur-sm transition-colors hover:bg-blue-100 dark:border-blue-500/30 dark:bg-blue-500/15 dark:hover:bg-blue-500/25"
+                  >
+                    <span className="shrink-0 text-blue-500 dark:text-blue-400">
+                      {categoryIcon(getFileCategory(selectedFile.name))}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="mb-0.5 block text-[10px] font-semibold uppercase leading-none tracking-wide text-blue-400 dark:text-blue-500/80">
+                        Now open
+                      </span>
+                      <span className="block truncate text-xs font-medium leading-tight text-blue-700 dark:text-blue-300">
+                        {truncateFileName(selectedFile.name)}
+                      </span>
+                    </span>
+                    <IoLocateOutline size={14} className="shrink-0 text-blue-400 dark:text-blue-500" />
+                  </button>
+                )}
                 {activeFileCategory === "trash" ? (
                   filteredTrashItems.length === 0 ? (
                     <p>{isSearchingFiles ? "No matching trash items" : "Trash is empty"}</p>
@@ -2297,9 +2698,30 @@ const setScreen = () => {
                         style={{ paddingLeft: 4 + folderDepth(folder) * 10 }}
                       >
                         <h4
-                          className="text-xs font-semibold text-gray-500 dark:text-neutral-400 flex items-center gap-1 min-w-0 truncate cursor-pointer"
-                          title={collapsedFolders.has(folder) ? `Expand ${folderDisplayName(folder)}` : `Collapse ${folderDisplayName(folder)}`}
-                          onClick={() => toggleFolderCollapsed(folder)}
+                          className={`text-xs font-semibold flex items-center gap-1 min-w-0 truncate cursor-pointer ${
+                            GALLERY_CATEGORIES.includes(activeFileCategory) && selectedFolder === folder
+                              ? "text-blue-600 dark:text-blue-400"
+                              : "text-gray-500 dark:text-neutral-400"
+                          }`}
+                          // Full relative path here (not just folderDisplayName's leaf segment) so
+                          // two folders sharing a name at different nesting depths - e.g. two
+                          // "MSC Research" folders - are distinguishable on hover instead of both
+                          // showing an identical tooltip.
+                          title={`${collapsedFolders.has(folder) ? "Expand" : "Collapse"} "${folder || "Briefcast"}"`}
+                          onClick={() => {
+                            toggleFolderCollapsed(folder);
+                            // Gallery categories only (see GALLERY_CATEGORIES): clicking a folder
+                            // also loads its files as a thumbnail grid in the main board (see
+                            // selectedFolder above) - the audio tab doesn't have a gallery view yet,
+                            // so this is a no-op for it beyond the existing
+                            // expand/collapse.
+                            if (GALLERY_CATEGORIES.includes(activeFileCategory)) {
+                              setSelectedFolder(folder);
+                              setSelectedFile(null);
+                              setBoardScreen(null);
+                              setDocsScreen(null);
+                            }
+                          }}
                         >
                           <IoChevronForward size={10} className={`shrink-0 transition-transform ${collapsedFolders.has(folder) ? "" : "rotate-90"}`} />
                           <IoFolderOutline size={12} className="shrink-0" />
@@ -2353,10 +2775,11 @@ const setScreen = () => {
                           No {activeFileCategory} files
                         </p>
                       ) : (
-                        <ul className="mt-1" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
+                        <ul className="mt-1 space-y-0.5" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
                           {fileList.map((file) => (
                             <li
                               key={file.path}
+                              data-file-path={file.path}
                               draggable
                               onDragStart={(e) => {
                                 setDraggingFiles(filesToActOn(file));
@@ -2366,7 +2789,7 @@ const setScreen = () => {
                                 setDraggingFiles(null);
                                 setDragOverFolder(null);
                               }}
-                              className={`flex items-center justify-between gap-1 min-w-0 group cursor-pointer hover:bg-gray-50 dark:hover:bg-neutral-800 ${
+                              className={`flex items-center gap-1.5 min-w-0 group cursor-pointer -mx-1 px-1 py-1 rounded-md hover:bg-gray-50 dark:hover:bg-neutral-800 ${
                                 selectedFile?.sourcePath === file.path ? 'bg-blue-50 dark:bg-blue-500/10' : ''
                               } ${draggingFiles?.some((f) => f.path === file.path) ? 'opacity-40' : ''}`}
                             >
@@ -2376,9 +2799,17 @@ const setScreen = () => {
                                 onClick={(e) => e.stopPropagation()}
                                 onChange={() => toggleFileSelected(file.path)}
                                 title="Select for bulk move"
-                                className={`shrink-0 mr-1.5 accent-blue-500 transition-opacity ${
+                                className={`shrink-0 accent-blue-500 transition-opacity ${
                                   selectedFilePaths.size > 0 || selectedFilePaths.has(file.path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
                                 }`}
+                              />
+                              <SidebarFileIcon
+                                name={file.name}
+                                path={file.path}
+                                isImage={getFileCategory(file.name) === "image"}
+                                resolveThumbnailUrl={resolveImageThumbnailUrl}
+                                fallbackIcon={categoryIcon(getFileCategory(file.name))}
+                                fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
                               />
                               {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
                               {renamingFile === file.path ? (
@@ -2404,7 +2835,7 @@ const setScreen = () => {
                                   onPointerMove={handleSidebarFilePointerMove}
                                   onPointerUp={handleSidebarFilePointerUp(file)}
                                 >
-                                  {formatFileName(file.name)}
+                                  {truncateFileName(file.name)}
                                 </div>
                               )}
 
@@ -2427,7 +2858,11 @@ const setScreen = () => {
                               {/* Three vertical dots menu */}
                               <div className="relative">
                                 <button
-                                  className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-200 dark:hover:bg-neutral-700 transition-opacity"
+                                  className={`p-1 rounded-md transition-colors ${
+                                    openMenu === file.path
+                                      ? 'opacity-100 bg-gray-200 dark:bg-neutral-700'
+                                      : 'opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-neutral-700'
+                                  }`}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     setOpenMenu(openMenu === file.path ? null : file.path);
@@ -2440,149 +2875,198 @@ const setScreen = () => {
                                   </svg>
                                 </button>
 
-                                {/* Popup Menu */}
+                                {/* Popup Menu - see the "Closes a file row's 3-dot menu" effect
+                                    above for outside-click/Escape handling. onPointerDown here
+                                    stops that same document-level listener from treating a click
+                                    *inside* this menu (e.g. expanding "Move to") as a click
+                                    outside it - mirrors ImageFolderGallery.tsx's own context menu. */}
                                 {openMenu === file.path && (
-                                  <div className="absolute right-0 top-full mt-1 w-36 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg z-20">
-                                    <button
-                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleTogglePin(file);
-                                      }}
+                                  <>
+                                    <style>{`
+                                      @keyframes sidebarFileMenuIn {
+                                        from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+                                        to { opacity: 1; transform: translateY(0) scale(1); }
+                                      }
+                                    `}</style>
+                                    <div
+                                      onPointerDown={(e) => e.stopPropagation()}
+                                      style={{ animation: "sidebarFileMenuIn 140ms cubic-bezier(0.16, 1, 0.3, 1)" }}
+                                      className="absolute right-0 top-full mt-1.5 w-48 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 overflow-hidden z-20 py-1"
                                     >
-                                      {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
-                                    </button>
-                                    <button
-                                      className="w-full flex items-center justify-between px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        void handleLinkNotes(file);
-                                      }}
-                                    >
-                                      Link notes
-                                      {linkedDocsByPath.has(file.path) && (linkedDocsByPath.get(file.path)!.length >= 2) && (
-                                        <IoChevronForward
-                                          size={12}
-                                          className={`transition-transform ${linkDocsMenuOpenFor === file.path ? 'rotate-90' : ''}`}
-                                        />
-                                      )}
-                                    </button>
-                                    {linkDocsMenuOpenFor === file.path && (
-                                      <div className="border-t border-gray-200 dark:border-neutral-700 max-h-40 overflow-y-auto py-0.5">
-                                        {(linkedDocsByPath.get(file.path) ?? []).map((doc) => (
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleTogglePin(file);
+                                        }}
+                                      >
+                                        {pinnedPaths.includes(file.path) ? (
+                                          <IoPin size={15} className="shrink-0 text-blue-500 dark:text-blue-400" />
+                                        ) : (
+                                          <IoPinOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        )}
+                                        <span className="flex-1 text-left">
+                                          {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
+                                        </span>
+                                      </button>
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          void handleLinkNotes(file);
+                                        }}
+                                      >
+                                        <MdOutlineDescription size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">Link notes</span>
+                                        {linkedDocsByPath.has(file.path) && (linkedDocsByPath.get(file.path)!.length >= 2) && (
+                                          <IoChevronForward
+                                            size={12}
+                                            className={`shrink-0 text-neutral-400 dark:text-neutral-500 transition-transform ${linkDocsMenuOpenFor === file.path ? 'rotate-90' : ''}`}
+                                          />
+                                        )}
+                                      </button>
+                                      {linkDocsMenuOpenFor === file.path && (
+                                        <div className="mx-1.5 mb-1 max-h-40 overflow-y-auto rounded-lg bg-gray-50 dark:bg-neutral-900/60 py-0.5">
+                                          {(linkedDocsByPath.get(file.path) ?? []).map((doc) => (
+                                            <button
+                                              key={doc.id}
+                                              className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                setOpenMenu(null);
+                                                setLinkDocsMenuOpenFor(null);
+                                                setSelectedFile(null);
+                                                setDocsScreen({ mode: "editor", docId: doc.id });
+                                              }}
+                                            >
+                                              {doc.title || "Untitled document"}
+                                            </button>
+                                          ))}
                                           <button
-                                            key={doc.id}
                                             className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
                                             onClick={(e) => {
                                               e.stopPropagation();
-                                              setOpenMenu(null);
                                               setLinkDocsMenuOpenFor(null);
-                                              setSelectedFile(null);
-                                              setDocsScreen({ mode: "editor", docId: doc.id });
+                                              void (async () => {
+                                                try {
+                                                  const id = crypto.randomUUID();
+                                                  const title = `Notes for ${file.name}`;
+                                                  const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
+                                                  await invoke("create_doc", { id, title, bytes });
+                                                  await invoke("link_doc_to_file", { id, filePath: file.path });
+                                                  await refreshDocsIndex();
+                                                  setOpenMenu(null);
+                                                  setSelectedFile(null);
+                                                  setDocsScreen({ mode: "editor", docId: id });
+                                                } catch (error) {
+                                                  console.error("Failed to create linked notes:", error);
+                                                  setError(`Failed to create linked notes: ${error}`);
+                                                }
+                                              })();
                                             }}
                                           >
-                                            {doc.title || "Untitled document"}
+                                            + New linked doc
                                           </button>
-                                        ))}
-                                        <button
-                                          className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setLinkDocsMenuOpenFor(null);
-                                            void (async () => {
-                                              try {
-                                                const id = crypto.randomUUID();
-                                                const title = `Notes for ${file.name}`;
-                                                const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
-                                                await invoke("create_doc", { id, title, bytes });
-                                                await invoke("link_doc_to_file", { id, filePath: file.path });
-                                                await refreshDocsIndex();
-                                                setOpenMenu(null);
-                                                setSelectedFile(null);
-                                                setDocsScreen({ mode: "editor", docId: id });
-                                              } catch (error) {
-                                                console.error("Failed to create linked notes:", error);
-                                                setError(`Failed to create linked notes: ${error}`);
-                                              }
-                                            })();
-                                          }}
-                                        >
-                                          + New linked doc
-                                        </button>
-                                      </div>
-                                    )}
-                                    <button
-                                      className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        startRename(file);
-                                      }}
-                                    >
-                                      Rename
-                                    </button>
-                                     {isConvertibleCategory(getFileCategory(file.name)) && (
-                                       <button
-                                          className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setConversionFile(file);
-                                            setOpenMenu(null);
-                                          }}
-                                        >
-                                        Convert
-                                      </button>
-                                     )}
-
-                                    {/* "Move to ▸" — expands in place into the folder list rather
-                                        than as a hover flyout, so it works the same on touch/
-                                        trackpad as a click, with no hover-timing to get wrong. */}
-                                    <button
-                                      className="w-full flex items-center justify-between px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setMoveMenuOpenFor((prev) => (prev === file.path ? null : file.path));
-                                      }}
-                                    >
-                                      {filesToActOn(file).length > 1 ? `Move ${filesToActOn(file).length} items to` : "Move to"}
-                                      <IoChevronForward
-                                        size={12}
-                                        className={`transition-transform ${moveMenuOpenFor === file.path ? 'rotate-90' : ''}`}
-                                      />
-                                    </button>
-                                    {moveMenuOpenFor === file.path && (
-                                      <div className="border-t border-gray-200 dark:border-neutral-700 max-h-40 overflow-y-auto py-0.5">
-                                        {Object.keys(files)
-                                          .sort((a, b) => a.localeCompare(b))
-                                          .map((destFolder) => (
-                                            <button
-                                              key={destFolder || "__root__"}
-                                              disabled={destFolder === folder}
-                                              className={`w-full text-left pl-6 pr-3 py-1.5 text-xs truncate ${
-                                                destFolder === folder
-                                                  ? "text-neutral-300 dark:text-neutral-600 cursor-default"
-                                                  : "hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                              }`}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                if (destFolder !== folder) handleMoveFiles(filesToActOn(file), destFolder);
-                                              }}
-                                            >
-                                              {folderDisplayName(destFolder)}
-                                            </button>
-                                          ))}
-                                      </div>
-                                    )}
-
-                                    <button
-                                        className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700 text-sm text-red-600 dark:text-red-400"
+                                        </div>
+                                      )}
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
                                         onClick={(e) => {
                                           e.stopPropagation();
-                                          handleDeleteFile(file);
+                                          startRename(file);
                                         }}
                                       >
-                                      Delete
-                                    </button>
-                                  </div>
+                                        <IoCreateOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">Rename</span>
+                                      </button>
+                                       {isConvertibleCategory(getFileCategory(file.name)) && (
+                                         <button
+                                            className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setConversionFile(file);
+                                              setOpenMenu(null);
+                                            }}
+                                          >
+                                          <IoSwapHorizontalOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                          <span className="flex-1 text-left">Convert</span>
+                                        </button>
+                                       )}
+
+                                      {/* Only when a board is actually open (boardEditorRef) and
+                                          this is an image - see handleAddFilesToBoard. */}
+                                      {boardScreen?.mode === "editor" && getFileCategory(file.name) === "image" && (
+                                        <button
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void handleAddFilesToBoard(filesToActOn(file));
+                                          }}
+                                        >
+                                          <IoAddCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                          <span className="flex-1 text-left">
+                                            {filesToActOn(file).length > 1 ? `Add ${filesToActOn(file).length} to board` : "Add to board"}
+                                          </span>
+                                        </button>
+                                      )}
+
+                                      {/* "Move to ▸" — expands in place into the folder list rather
+                                          than as a hover flyout, so it works the same on touch/
+                                          trackpad as a click, with no hover-timing to get wrong. */}
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setMoveMenuOpenFor((prev) => (prev === file.path ? null : file.path));
+                                        }}
+                                      >
+                                        <IoFolderOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">
+                                          {filesToActOn(file).length > 1 ? `Move ${filesToActOn(file).length} items to` : "Move to"}
+                                        </span>
+                                        <IoChevronForward
+                                          size={12}
+                                          className={`shrink-0 text-neutral-400 dark:text-neutral-500 transition-transform ${moveMenuOpenFor === file.path ? 'rotate-90' : ''}`}
+                                        />
+                                      </button>
+                                      {moveMenuOpenFor === file.path && (
+                                        <div className="mx-1.5 mb-1 max-h-40 overflow-y-auto rounded-lg bg-gray-50 dark:bg-neutral-900/60 py-0.5">
+                                          {Object.keys(files)
+                                            .sort((a, b) => a.localeCompare(b))
+                                            .map((destFolder) => (
+                                              <button
+                                                key={destFolder || "__root__"}
+                                                title={destFolder || "Briefcast"}
+                                                disabled={destFolder === folder}
+                                                className={`w-full text-left pl-6 pr-3 py-1.5 text-xs truncate ${
+                                                  destFolder === folder
+                                                    ? "text-neutral-300 dark:text-neutral-600 cursor-default"
+                                                    : "hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                                                }`}
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  if (destFolder !== folder) handleMoveFiles(filesToActOn(file), destFolder);
+                                                }}
+                                              >
+                                                {folderDisplayName(destFolder)}
+                                              </button>
+                                            ))}
+                                        </div>
+                                      )}
+
+                                      <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
+                                      <button
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleDeleteFile(file);
+                                          }}
+                                        >
+                                        <IoTrashOutline size={15} className="shrink-0" />
+                                        <span className="flex-1 text-left">Delete</span>
+                                      </button>
+                                    </div>
+                                  </>
                                 )}
                               </div>
                             </li>
@@ -2648,10 +3132,38 @@ const setScreen = () => {
               }}
             />
           )}
-         <div className="flex-1 min-w-0 min-h-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-950">
+         <div className="relative flex-1 min-w-0 min-h-0 flex flex-col bg-gray-100 dark:bg-neutral-950">
 
+          {/* selectedFolder !== null, not a truthy check - the root ("Briefcast") folder's key is
+              "", which is falsy in JS even though it's a perfectly valid, currently-selected
+              folder. A truthy check here silently treated selecting the root folder as "nothing
+              selected" (observed directly: clicking it fell through to the empty state instead of
+              showing a gallery). Same fix applies to the two ternary branches below.
+
+              A real row above the viewer, not an absolute overlay on top of it - it used to float
+              at top-3 left-3 directly over whatever the active viewer rendered there, which for
+              ImageEditor/PdfAnnotator is that viewer's own persistent header (also flush top-left:
+              a tools-toggle icon then the filename) - the two sat in the exact same few pixels, so
+              this button visually swallowed the icon and the start of the filename (observed
+              directly: only the filename's tail end still peeked out past this button's right
+              edge). Stacking it as its own shrink-0 row instead means every viewer's own header,
+              image/pdf included, renders in the space actually left for it. */}
+          {selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
+            <div className="shrink-0 px-3 pt-3">
+              <button
+                type="button"
+                onClick={() => setSelectedFile(null)}
+                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
+              >
+                <IoChevronBack size={14} />
+                Back to {folderDisplayName(selectedFolder)}
+              </button>
+            </div>
+          )}
+
+          <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center">
           {boardScreen ? (
-            <BoardWorkspace screen={boardScreen} onScreenChange={setBoardScreen} />
+            <BoardWorkspace ref={boardEditorRef} screen={boardScreen} onScreenChange={setBoardScreen} libraryDraggingFiles={draggingFiles} />
           ) : docsScreen ? (
             <ErrorBoundary
               key={docsScreen.mode === "editor" ? `editor-${docsScreen.docId}` : "home"}
@@ -2678,27 +3190,11 @@ const setScreen = () => {
                 isFullscreen={isPdfFullscreen}
                 onToggleFullscreen={handleTogglePdfFullscreen}
               />
-            ) : getFileCategory(selectedFile.name) === "image" &&
-              ["heic", "heif"].includes(getFileExtension(selectedFile.name)) ? (
-              // HEIC/HEIF (iPhone's default photo format) has no Chromium/WebView2 decoder, so
-              // handing it to ImageEditor would just fail to decode - route straight to the
-              // existing ffmpeg-backed Convert flow instead (it already turns HEIC into a
-              // previewable jpg/png fine; see convert_image).
-              <div key={selectedFile.path} className="w-full h-full flex flex-col items-center justify-center gap-3 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-300">
-                <IoImage size={48} className="text-neutral-300 dark:text-neutral-600" />
-                <p className="text-sm font-medium max-w-md truncate px-4">{selectedFile.name}</p>
-                <p className="text-xs text-neutral-400 dark:text-neutral-500 max-w-sm text-center px-4">
-                  This is an iPhone HEIC photo - Briefcast can't preview it directly. Convert it to JPEG or PNG to view and edit it.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setConversionFile({ path: selectedFile.sourcePath, name: selectedFile.name })}
-                  className="mt-1 px-4 py-2 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700"
-                >
-                  Convert to view
-                </button>
-              </div>
             ) : getFileCategory(selectedFile.name) === "image" ? (
+              // HEIC/HEIF (iPhone's default photo format) has no Chromium/WebView2 decoder, but
+              // selectedFile.path is already a silently-decoded, cached PNG for those by the time
+              // it gets here (see resolveImageDisplayUrl/loadFileForPlayback) - ImageEditor never
+              // has to know the source was HEIC at all.
               <ImageEditor
                 key={selectedFile.path}
                 sourcePath={selectedFile.sourcePath}
@@ -2782,7 +3278,21 @@ const setScreen = () => {
                           onUpdateBlurOverlayContent={editStore.updateBlurOverlayContent}
                           onDeleteBlurOverlay={editStore.deleteBlurOverlay}
                           onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
-                          totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
+                          totalOutputDuration={totalOutputDuration}
+                        />
+                        <PipOverlayLayer
+                          frameRect={frameRect}
+                          pipOverlays={editStore.pipOverlays}
+                          currentOutputTime={currentOutputTime}
+                          totalOutputDuration={totalOutputDuration}
+                          isPlaying={playerIsPlaying}
+                          selectedPipOverlayId={selectedPipOverlayId}
+                          onSelectPipOverlay={setSelectedPipOverlayId}
+                          isPlacingPip={isPlacingPip}
+                          onPlacementPipConsumed={() => setIsPlacingPip(false)}
+                          onAddPipOverlay={editStore.addPipOverlay}
+                          onUpdatePipOverlayContent={editStore.updatePipOverlayContent}
+                          onDeletePipOverlay={editStore.deletePipOverlay}
                         />
                         {isCroppingClip && activeClipEffects && (
                           // Keyed on the active clip's own id so a clip change mid-drag (playback
@@ -2807,8 +3317,103 @@ const setScreen = () => {
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted}
                 activeClipEffects={activeClipEffects}
+                onNoiseReductionStatusChange={setNoiseReductionStatus}
               />
             )
+          ) : selectedFolder !== null && activeFileCategory === "image" ? (
+            <ImageFolderGallery
+              files={selectedFolderImages}
+              folderLabel={folderDisplayName(selectedFolder)}
+              resolveThumbnailUrl={resolveImageThumbnailUrl}
+              resolveFullUrl={resolveImageDisplayUrl}
+              onOpenImage={(file) => loadFileForPlayback(file.path, file.name)}
+              onDeleteFile={handleDeleteFile}
+              onConvertFile={(file) => setConversionFile(file)}
+              renamingFile={renamingFile}
+              renameValue={renameValue}
+              onRenameValueChange={setRenameValue}
+              onStartRename={startRename}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenamingFile(null)}
+              selectedFilePaths={selectedFilePaths}
+              onToggleFileSelected={toggleFileSelected}
+              onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
+              onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
+              onClearSelection={() => setSelectedFilePaths(new Set())}
+              folderOptions={folderOptions}
+              currentFolder={selectedFolder}
+              onMoveFiles={handleMoveFiles}
+              onBulkDelete={handleBulkDeleteFiles}
+            />
+          ) : selectedFolder !== null && activeFileCategory === "video" ? (
+            <VideoFolderGallery
+              files={selectedFolderVideos}
+              folderLabel={folderDisplayName(selectedFolder)}
+              resolveThumbnailUrl={resolveVideoThumbnailUrl}
+              onOpenVideo={(file) => loadFileForPlayback(file.path, file.name)}
+              onDeleteFile={handleDeleteFile}
+              onConvertFile={(file) => setConversionFile(file)}
+              renamingFile={renamingFile}
+              renameValue={renameValue}
+              onRenameValueChange={setRenameValue}
+              onStartRename={startRename}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenamingFile(null)}
+              selectedFilePaths={selectedFilePaths}
+              onToggleFileSelected={toggleFileSelected}
+              onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
+              onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
+              onClearSelection={() => setSelectedFilePaths(new Set())}
+              folderOptions={folderOptions}
+              currentFolder={selectedFolder}
+              onMoveFiles={handleMoveFiles}
+              onBulkDelete={handleBulkDeleteFiles}
+            />
+          ) : selectedFolder !== null && activeFileCategory === "pdf" ? (
+            <PdfFolderGallery
+              files={selectedFolderPdfs}
+              folderLabel={folderDisplayName(selectedFolder)}
+              resolveAssetUrl={resolvePreviewAssetUrl}
+              onOpenPdf={(file) => loadFileForPlayback(file.path, file.name)}
+              onDeleteFile={handleDeleteFile}
+              renamingFile={renamingFile}
+              renameValue={renameValue}
+              onRenameValueChange={setRenameValue}
+              onStartRename={startRename}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenamingFile(null)}
+              selectedFilePaths={selectedFilePaths}
+              onToggleFileSelected={toggleFileSelected}
+              onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
+              onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
+              onClearSelection={() => setSelectedFilePaths(new Set())}
+              folderOptions={folderOptions}
+              currentFolder={selectedFolder}
+              onMoveFiles={handleMoveFiles}
+              onBulkDelete={handleBulkDeleteFiles}
+            />
+          ) : selectedFolder !== null && activeFileCategory === "document" ? (
+            <DocumentFolderGallery
+              files={selectedFolderDocuments}
+              folderLabel={folderDisplayName(selectedFolder)}
+              onOpenDocument={(file) => loadFileForPlayback(file.path, file.name)}
+              onDeleteFile={handleDeleteFile}
+              renamingFile={renamingFile}
+              renameValue={renameValue}
+              onRenameValueChange={setRenameValue}
+              onStartRename={startRename}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenamingFile(null)}
+              selectedFilePaths={selectedFilePaths}
+              onToggleFileSelected={toggleFileSelected}
+              onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
+              onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
+              onClearSelection={() => setSelectedFilePaths(new Set())}
+              folderOptions={folderOptions}
+              currentFolder={selectedFolder}
+              onMoveFiles={handleMoveFiles}
+              onBulkDelete={handleBulkDeleteFiles}
+            />
           ) : (
             <div className="relative flex flex-col items-center justify-center h-full w-full gap-6 px-8 overflow-hidden">
               {/* Purely decorative - a soft color glow plus a faint graph-paper line grid, sat
@@ -2881,7 +3486,7 @@ const setScreen = () => {
                           {categoryIcon(getFileCategory(file.name))}
                         </span>
                         <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
-                          {formatFileName(file.name)}
+                          {truncateFileName(file.name)}
                         </span>
                         {pinnedPaths.includes(file.path) && (
                           <IoPin size={13} className="ml-auto text-gray-400 dark:text-neutral-500 shrink-0" />
@@ -2893,6 +3498,7 @@ const setScreen = () => {
               )}
             </div>
           )}
+          </div>
         </div>
         </div>
       </div>
@@ -2920,6 +3526,7 @@ const setScreen = () => {
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         onOutputTimeChange={setCurrentOutputTime}
         onActiveClipChange={setActiveClipEffects}
+        noiseReductionStatus={noiseReductionStatus}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={setSelectedOverlayId}
         isPlacingText={isPlacingText}
@@ -2932,6 +3539,10 @@ const setScreen = () => {
         onSelectBlurOverlay={setSelectedBlurOverlayId}
         isPlacingBlur={isPlacingBlur}
         onToggleArmPlaceBlur={() => setIsPlacingBlur((v) => !v)}
+        selectedPipOverlayId={selectedPipOverlayId}
+        onSelectPipOverlay={setSelectedPipOverlayId}
+        isPlacingPip={isPlacingPip}
+        onToggleArmPlacePip={() => setIsPlacingPip((v) => !v)}
         isCroppingClip={isCroppingClip}
         onToggleCroppingClip={() => setIsCroppingClip((v) => !v)}
         selectScreen={selectScreen}
@@ -2947,6 +3558,10 @@ const setScreen = () => {
         setOverlaySize={setOverlaySize}
         includeSystemAudio={includeSystemAudio}
         setIncludeSystemAudio={setIncludeSystemAudio}
+        separateWebcamCapture={separateWebcamCapture}
+        setSeparateWebcamCapture={setSeparateWebcamCapture}
+        trackClicks={trackClicks}
+        setTrackClicks={setTrackClicks}
         selectedScreen={selectedScreen}
         setSelectedScreen={setSelectedScreen}
         windowTitles={windowTitles}

@@ -1,0 +1,26 @@
+/* components/docs/docComments.css
+ *
+ * Styling for docCommentMark.ts's `comment` mark - a plain CSS class (not Tailwind arbitrary-
+ * variant classes on EditorContent) for the same reason docFindReplace.css uses one: the mark
+ * renders as `<span data-comment-id>`, and targeting that attribute selector directly is simpler
+ * than threading a class through renderHTML just to hang Tailwind's `[&_...]` syntax off it.
+ */
+
+span[data-comment-id] {
+  background-color: rgba(250, 204, 21, 0.25);
+  border-bottom: 2px solid rgba(202, 138, 4, 0.6);
+  cursor: pointer;
+}
+
+span[data-comment-id]:hover {
+  background-color: rgba(250, 204, 21, 0.4);
+}
+
+.dark span[data-comment-id] {
+  background-color: rgba(250, 204, 21, 0.15);
+  border-bottom-color: rgba(234, 179, 8, 0.6);
+}
+
+.dark span[data-comment-id]:hover {
+  background-color: rgba(250, 204, 21, 0.28);
+}

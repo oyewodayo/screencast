@@ -10,7 +10,7 @@ edition = "2021"
 tauri-build = { version = "1.5", features = [] }
 
 [dependencies]
-tauri = { version = "1.5", features = [ "window-set-fullscreen", "dialog-open", "global-shortcut-all", "window-hide", "window-set-focus", "window-create", "window-close", "protocol-asset", "window-show", "dialog-message", "shell-open", "window-start-dragging", "dialog", "window-set-ignore-cursor-events", "devtools"] }
+tauri = { version = "1.5", features = [ "dialog-ask", "dialog-save", "window-set-fullscreen", "dialog-open", "global-shortcut-all", "window-hide", "window-set-focus", "window-create", "window-close", "protocol-asset", "window-show", "dialog-message", "shell-open", "window-start-dragging", "dialog", "window-set-ignore-cursor-events", "devtools"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4.38"
@@ -24,6 +24,16 @@ base64 = "0.22"
 # the folder, etc.) - notify-debouncer-mini re-exports a compatible `notify` itself, so it isn't
 # also listed as a direct dependency here.
 notify-debouncer-mini = "0.7"
+# Backs services/docs_search.rs's full-text search index for the Docs feature (DocsHome.tsx's
+# search used to decode every doc's full Yjs bytes into memory on every search keystroke, which
+# doesn't scale past a modest doc count - see that file's own comment). "bundled" statically links
+# SQLite itself rather than requiring one already installed on the machine, which matters a lot for
+# a distributed desktop app - and, usefully, libsqlite3-sys's own build script passes
+# -DSQLITE_ENABLE_FTS5 unconditionally for every bundled build, so the FTS5 virtual-table module
+# the index is built on needs no separate feature flag here. (rusqlite has no feature literally
+# named "fts5" at all, in this or any version - confirmed directly against its own Cargo.toml and
+# libsqlite3-sys's build.rs after cargo's dependency resolution rejected that name outright.)
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Win32 bindings — only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the
@@ -46,3 +56,17 @@ x11rb = { version = "0.13", features = ["randr", "composite"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+# `cargo tauri dev` builds this crate itself at opt-level 0 (fast incremental rebuilds while
+# iterating), but that setting also applied to every DEPENDENCY - including `image`, whose
+# JPEG/HEIC decode-resize-encode path (get_image_thumbnail in commands/conversion.rs) is tight
+# numeric/loop code that unoptimized Rust runs roughly one to two orders of magnitude slower than
+# release - measured directly against briefcast_preview_cache/thumb_v1: consecutive thumbnails
+# landing ~5-8s apart under the shared 4-way thumbnailLimiter, which made a few-hundred-image
+# gallery (e.g. a 477-image folder) look permanently blank rather than just slow to fill in, since
+# it would take on the order of an hour to finish. Bumping just the dependency graph to opt-level 3
+# (this crate's own code, which is what you're actually iterating on, stays unoptimized for fast
+# rebuilds) gets `image`/`rusqlite`/etc. back to near-release decode speed with no change to normal
+# edit-save-reload turnaround.
+[profile.dev.package."*"]
+opt-level = 3

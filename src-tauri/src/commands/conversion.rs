@@ -321,11 +321,18 @@ pub async fn convert_to_mp4(
     Ok(result)
 }
 
-// Deterministic, content-addressed cache location for the "just play, no prompts" preview
-// fallback (see get_playable_preview below) - keyed by the source path plus its modification
-// time, so a file replaced at the same path invalidates and regenerates automatically instead
-// of ever silently reusing a stale preview.
-fn preview_cache_path(input: &PathBuf) -> Result<PathBuf, String> {
+// Deterministic, content-addressed cache location for a "just display/play it, no prompts"
+// preview (see get_playable_preview and get_heic_preview below) - keyed by the source path plus
+// its modification time, so a file replaced at the same path invalidates and regenerates
+// automatically instead of ever silently reusing a stale preview. `namespace` is a subdirectory,
+// not just decoration - it's what lets a *decoder* change (not just a source file change) bust
+// old cached output too: get_heic_preview used to fall back to ffmpeg, whose HEIF tile-grid
+// reconstruction badly under-reconstructed these photos (a cropped fragment, not just lower
+// quality) - every photo previewed before that got fixed left a wrong-but-permanently-cached PNG
+// sitting here under the *same* path+mtime key the corrected decoder would also produce, so nothing
+// short of a namespace change would ever have invalidated it. Bump the namespace's suffix (e.g.
+// "heic_v3") again if a future decoder change needs the same guarantee.
+fn preview_cache_path(input: &PathBuf, namespace: &str, output_ext: &str) -> Result<PathBuf, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -342,7 +349,7 @@ fn preview_cache_path(input: &PathBuf) -> Result<PathBuf, String> {
     modified_secs.hash(&mut hasher);
     let key = hasher.finish();
 
-    Ok(std::env::temp_dir().join("briefcast_preview_cache").join(format!("{:x}.mp4", key)))
+    Ok(std::env::temp_dir().join("briefcast_preview_cache").join(namespace).join(format!("{:x}.{}", key, output_ext)))
 }
 
 // Silent, no-prompt fallback for a file the in-app player can't decode natively - most notably
@@ -372,7 +379,7 @@ pub async fn get_playable_preview(
     input_path: String,
 ) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
-    let cache_path = preview_cache_path(&input)?;
+    let cache_path = preview_cache_path(&input, "video", "mp4")?;
 
     // Already converted (fully, from a previous open) - just hand back the finished file, no
     // need to ever re-run ffmpeg for the same source.
@@ -493,36 +500,42 @@ async fn convert_heic_windows(
 
     // Windows' own HEIC decoder needs the HEVC Video Extensions codec package installed (separate
     // from HEIF Image Extensions, which just handles the container/metadata) - plenty of machines
-    // only have the latter. Rather than fail outright when that codec is missing, fall back to the
-    // bundled ffmpeg's own HEVC decoder directly on the HEIC file. ffmpeg's automatic stream
-    // selection is what produced the original black-image bug for multi-image (Portrait mode/Deep
-    // Fusion) photos - `-map 0:0` pins it to the primary/default-flagged image instead. For a
-    // simple single-image HEIC file (no stream groups) this is a no-op, same stream ffmpeg's
-    // default selection would have picked anyway; for a complex one it trades resolution (ffmpeg's
-    // HEIF tile-grid reconstruction in this build tops out well below the photo's real size) for
-    // at least getting the correct photo instead of a black frame.
+    // only have the latter. Rather than fail outright when that codec is missing, fall back to a
+    // bundled libheif build (services/heif_tool.rs) instead of the app's own ffmpeg - ffmpeg's
+    // HEIF tile-grid reconstruction badly under-reconstructs the tiled grid modern iPhone photos
+    // are stored as (a small, blown-up fragment of the real photo, not just lower resolution -
+    // confirmed against real user photos), where libheif is the reference implementation and gets
+    // it right.
     let result = match native_result {
         Ok(path) => Ok(path),
         Err(native_err) => {
-            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to ffmpeg", input.display());
-            let codec_args: Vec<&str> = match format.as_str() {
-                "png" | "jpeg" | "jpg" | "webp" | "bmp" => vec!["-map", "0:0"],
-                _ => return Err(format!("Unsupported output format: {}", output_format)),
-            };
-            let fallback = run_conversion(
-                app_handle,
-                window,
-                state,
-                &[InputSpec::plain(input.to_string_lossy().to_string())],
-                &input.to_string_lossy(),
-                final_output,
-                &codec_args,
-            )
-            .await;
-            if let Err(ffmpeg_err) = &fallback {
-                log::error!("HEIC ffmpeg fallback also failed for {}: {ffmpeg_err}", input.display());
+            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to bundled libheif", input.display());
+            let fallback: Result<String, String> = async {
+                if format == "png" {
+                    crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), final_output.clone()).await?;
+                    Ok(final_output.to_string_lossy().to_string())
+                } else {
+                    let temp_png = final_output.with_extension("heic_tmp.png");
+                    crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), temp_png.clone()).await?;
+                    let transcode = run_conversion(
+                        app_handle,
+                        window,
+                        state,
+                        &[InputSpec::plain(temp_png.to_string_lossy().to_string())],
+                        &input.to_string_lossy(),
+                        final_output.clone(),
+                        &[],
+                    )
+                    .await;
+                    let _ = std::fs::remove_file(&temp_png);
+                    transcode
+                }
             }
-            fallback.map_err(|ffmpeg_err| format!("{native_err}; fallback conversion also failed: {ffmpeg_err}"))
+            .await;
+            if let Err(heif_err) = &fallback {
+                log::error!("HEIC libheif fallback also failed for {}: {heif_err}", input.display());
+            }
+            fallback.map_err(|heif_err| format!("{native_err}; fallback conversion also failed: {heif_err}"))
         }
     };
 
@@ -551,6 +564,209 @@ async fn convert_heic_windows(
     }
 
     result
+}
+
+// Silent, cached HEIC/HEIF -> PNG preview for on-screen display only, at full resolution - the
+// single-image viewer's counterpart to get_playable_preview above but for photos instead of
+// video (get_image_thumbnail below is the gallery-grid counterpart - deliberately a *different*
+// command, since a grid tile only ever needs a few hundred pixels and paying this function's full
+// decode cost per thumbnail was exactly what made opening a large HEIC folder painfully slow).
+// WebView2 has no HEIC decoder at all, so a plain <img src> just fails to load one. Unlike
+// convert_image/convert_heic_windows (an explicit, user-triggered "Convert" that writes a
+// permanent sibling file into the library), this never touches the source file and never adds
+// anything to the library - it only ever writes into the same content-addressed temp cache
+// get_playable_preview uses, so viewing the same photo again is instant and nothing shows up next
+// to the original in the file list. Frontend calls this once per HEIC/HEIF file (see
+// Dashboard.tsx's resolveImageDisplayUrl) and feeds the returned path through the same
+// convert_file_path_to_url + convertFileSrc round-trip every other preview already uses.
+#[tauri::command]
+pub async fn get_heic_preview(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    input_path: String,
+) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "heic_v2", "png")?;
+
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = (&window, &state); // only used by the non-Windows branch below
+        if let Err(native_err) = crate::services::heic_windows::decode_to_png(input.clone(), cache_path.clone()).await {
+            // Windows' own HEIC decoder needs the HEVC Video Extensions codec package installed
+            // (separate from HEIF Image Extensions) - plenty of machines only have the latter. Same
+            // bundled-libheif fallback as convert_heic_windows above; see its comment for why that
+            // replaced an ffmpeg fallback here.
+            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to bundled libheif", input.display());
+            if let Err(heif_err) = crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), cache_path.clone()).await {
+                log::error!("HEIC libheif fallback also failed for {}: {heif_err}", input.display());
+                return Err(format!("{native_err}; fallback conversion also failed: {heif_err}"));
+            }
+        }
+        path_to_str(&cache_path).map(|s| s.to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, cache_path, &[]).await
+    }
+}
+
+// Long edge, in pixels, of a gallery-grid thumbnail - generous headroom over the CSS tile size
+// (ImageFolderGallery.tsx renders these well under 300px) for high-DPI displays, while staying
+// small enough that decoding one in the browser is cheap and 100+ of them fit comfortably in the
+// renderer's image cache at once (the full-resolution originals didn't - see get_image_thumbnail
+// below).
+const GALLERY_THUMBNAIL_MAX_DIMENSION: u32 = 480;
+
+// Silent, cached, small preview for an image gallery grid tile - counterpart to get_heic_preview
+// above, but deliberately NOT that function at a smaller size: ImageFolderGallery.tsx used to
+// point every grid tile straight at the full-resolution decode (get_heic_preview, or the plain
+// original file for non-HEIC), which is correct for a single enlarged view but wrong for a grid
+// of 100+ tiles - each one is a multi-megapixel decoded bitmap the browser's image cache can't
+// hold all of at once, so scrolling away and back forced a re-decode of whatever got evicted
+// (observed directly: images visibly "reloading" on scroll-up, and the initial load being far
+// slower than it needed to be). This produces something actually sized for a thumbnail instead.
+//
+// HEIC/HEIF goes through the bundled heif-thumbnailer (services/heif_tool.rs) - it renders the
+// small embedded preview HEIC containers already carry (or a fast downscale of the primary image
+// if there isn't one) rather than doing heif-dec's full tile-grid reconstruction, which measured
+// roughly 20x faster per photo in practice. Every other format is decoded and downscaled directly
+// via the `image` crate, in-process - no bundled binary needed for those, and cheaper than
+// shelling out to ffmpeg for something this small.
+#[tauri::command]
+pub async fn get_image_thumbnail(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+    // Unconditional entry log (cache hit or miss) - the only line in this command that always
+    // fires. Every other line here only logs on error, so a request that hangs (concurrencyLimiter
+    // ts's withLimit racing it against a timeout instead of waiting forever - see that file's own
+    // comment) previously left zero trace of ever having reached Rust at all: nothing in this log
+    // to say whether the hang was in here or below the IPC layer entirely. This one line answers
+    // that immediately next time - if it's missing for a stuck request, look at the frontend/IPC
+    // side instead of in here.
+    log::debug!("get_image_thumbnail: {}", input_path);
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "thumb_v1", "jpg")?;
+
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+    }
+
+    let ext = input.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+    #[cfg(windows)]
+    if matches!(ext.as_deref(), Some("heic") | Some("heif")) {
+        if let Err(err) = crate::services::heif_tool::extract_thumbnail(app_handle, input.clone(), cache_path.clone(), GALLERY_THUMBNAIL_MAX_DIMENSION).await {
+            log::error!("HEIC thumbnail failed for {}: {err}", input.display());
+            return Err(err);
+        }
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    #[cfg(not(windows))]
+    let _ = &ext; // HEIC thumbnails aren't specially handled outside Windows yet (see heif_tool.rs)
+
+    let input_for_blocking = input.clone();
+    let cache_for_blocking = cache_path.clone();
+    tauri::async_runtime::spawn_blocking(move || generate_plain_thumbnail(&input_for_blocking, &cache_for_blocking))
+        .await
+        .map_err(|e| format!("Thumbnail task panicked: {e}"))?
+        .map_err(|err| {
+            log::error!("Image thumbnail failed for {}: {err}", input.display());
+            err
+        })?;
+
+    path_to_str(&cache_path).map(|s| s.to_string())
+}
+
+fn generate_plain_thumbnail(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+    let img = image::open(input).map_err(|e| format!("Failed to open image: {e}"))?;
+    img.thumbnail(GALLERY_THUMBNAIL_MAX_DIMENSION, GALLERY_THUMBNAIL_MAX_DIMENSION)
+        .save(output)
+        .map_err(|e| format!("Failed to save thumbnail: {e}"))
+}
+
+// Silent, cached poster-frame thumbnail for a video gallery grid tile - the video counterpart to
+// get_image_thumbnail above. Extracts a single downscaled frame via the bundled ffmpeg, 1 second
+// in rather than frame 0 (a screen recording's very first frame is very often solid black/blank
+// before anything's actually happened on screen) - with a fallback to frame 0 if that seek fails,
+// which happens for clips shorter than a second. Cached the same way every other gallery
+// thumbnail is (content-addressed by path+mtime - see preview_cache_path), so revisiting a video
+// folder is instant after the first pass.
+#[tauri::command]
+pub async fn get_video_thumbnail(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "video_thumb_v1", "jpg")?;
+
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+    }
+
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    if let Err(err) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:01").await {
+        log::warn!("Video thumbnail seek to 1s failed for {}: {err}; retrying at frame 0", input.display());
+        if let Err(err2) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:00").await {
+            let combined = format!("{err}; retry at frame 0 also failed: {err2}");
+            log::error!("Video thumbnail failed for {}: {combined}", input.display());
+            return Err(combined);
+        }
+    }
+
+    path_to_str(&cache_path).map(|s| s.to_string())
+}
+
+// -ss before -i is ffmpeg's fast (keyframe-seeking, not frame-accurate) seek - plenty precise for
+// a thumbnail and far quicker than decoding from the start, which matters here since this runs
+// once per video in a folder that can hold hundreds of them (bounded by the same shared
+// thumbnailLimiter the frontend routes every gallery/sidebar thumbnail request through).
+async fn extract_video_frame(ffmpeg_path: &PathBuf, input: &PathBuf, output: &PathBuf, seek: &str) -> Result<(), String> {
+    let ffmpeg_path = ffmpeg_path.clone();
+    let input = input.clone();
+    let output = output.clone();
+    let seek = seek.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.args(["-y", "-ss", &seek]);
+        cmd.arg("-i").arg(path_to_str(&input)?);
+        cmd.args(["-frames:v", "1", "-update", "1", "-vf", "scale=480:-1", "-q:v", "4"]);
+        cmd.arg(path_to_str(&output)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            // ffmpeg's stderr always opens with its full version/build-config banner before
+            // anything about THIS run - keeping only the last few non-empty lines is what
+            // actually explains the failure (e.g. "Invalid data found when processing input"),
+            // instead of a wall of --enable-* flags every single error gets buried under.
+            let tail: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).rev().take(3).collect();
+            let reason: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+            return Err(format!("ffmpeg frame extraction failed: {}", if reason.is_empty() { "unknown error".to_string() } else { reason }));
+        }
+        if !output.exists() {
+            return Err("ffmpeg exited successfully but produced no output file".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Video thumbnail task panicked: {e}"))?
 }
 
 // Convert an audio file between mp3/wav/aac/flac/ogg/m4a. -vn drops any video stream before
@@ -618,6 +834,12 @@ pub struct ClipColorFilter {
 pub struct ClipKenBurns {
     pub preset: String,
     pub intensity: Option<f64>,
+    // Where "zoom-in"/"zoom-out" center their crop window - fraction of the source frame, None
+    // means the frame's own center (0.5, 0.5). Ignored by "pan-left"/"pan-right". See
+    // ClipKenBurns's own doc comment (videoEditTypes.ts) for why this exists (centering an
+    // auto-zoom punch-in on a recorded click position instead of the frame's middle).
+    pub target_x: Option<f64>,
+    pub target_y: Option<f64>,
 }
 
 // A free-form crop window into this segment's own frame - see crop_chain. NOT locked to the
@@ -655,6 +877,18 @@ pub struct KeepSegment {
     pub ken_burns: Option<ClipKenBurns>,
     pub transition_in: Option<ClipTransitionIn>,
     pub crop: Option<ClipCrop>,
+    // Horizontal mirror, applied first (before crop/Ken Burns) so crop/pan coordinates always
+    // describe the already-mirrored frame the same way the live preview's own CSS transform order
+    // does (VideoPlayer.tsx). None/false means the pre-existing unmirrored look.
+    pub flip_horizontal: Option<bool>,
+    // Playback-rate multiplier for just this segment - None/1 means unchanged. See Clip.speed's
+    // own doc comment (videoEditTypes.ts) for the full "this changes the segment's own OUTPUT
+    // duration" story; segment_speed() below is what actually clamps/defaults this.
+    pub speed: Option<f64>,
+    // Background-noise reduction strength, 0..1 - None/0 means off. See Clip.noiseReduction's own
+    // doc comment (videoEditTypes.ts) for why this has no live-preview equivalent; segment_noise_
+    // reduction_db() below is what actually clamps/maps this to afftdn's own `nr` dB parameter.
+    pub noise_reduction: Option<f64>,
 }
 
 // One text or image overlay, already fully rendered client-side to a transparent PNG matching
@@ -674,7 +908,13 @@ pub struct OverlayImage {
     pub y: i64,
     pub start_time: f64,
     pub end_time: f64,
-    pub fade: bool,
+    // Mirrors OverlayAnimation (videoEditTypes.ts) minus "pop" - the frontend maps "pop" to "fade"
+    // before sending (see exportEdited's own comment), since a true scale-up/overshoot animation
+    // needs a time-varying overlay *size*, not just x/y or alpha, which is a bigger lift than the
+    // x/y-expression approach overlay_position_expr below uses for slide-*. Sanitized against
+    // ALLOWED_OVERLAY_ANIMATIONS the same way transition_type already is (sanitize_transition_name)
+    // - interpolated directly into the filter_complex string, so this is a real security boundary.
+    pub animation: String,
 }
 
 // A blurred region burned into the output video for its own [start_time,end_time) window - unlike
@@ -723,6 +963,93 @@ pub struct OverlayAudio {
     pub fade_out: f64,
 }
 
+// A picture-in-picture video layer - e.g. a webcam recorded separately from the screen (see
+// FormData.separate_webcam_capture, recording.rs) and composited back on top of the primary clip
+// track here instead of being permanently baked in. Unlike OverlayImage, there's real per-frame
+// video content to read (not a single pre-rendered PNG), so this gets its own `-i` input (the
+// FULL source file - trim_start/start_time/end_time below scope which window of it is actually
+// used, the same trim-then-composite shape `segments` itself uses) rather than joining the image/
+// blur temp-file pipeline. `x`/`y`/`width`/`height` are already resolved to real output-video
+// pixels by the frontend, same as OverlayImage's own x/y.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipOverlay {
+    pub source_path: String,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub shape: String, // "circle" | "rounded" | "rectangle" - sanitized via sanitize_pip_shape
+    pub corner_radius: Option<f64>, // fraction of `height`, "rounded" only
+    pub trim_start: f64,
+    pub start_time: f64,
+    pub end_time: f64,
+    // 0.0 when the frontend's own "play this clip's own audio" toggle is off (see
+    // PipOverlay.muted, videoEditTypes.ts) - collapsed to a single number the same way
+    // effective_video_volume already folds audio_muted into the primary track's own volume,
+    // rather than carrying a separate bool here too.
+    pub volume: f64,
+}
+
+const ALLOWED_PIP_SHAPES: &[&str] = &["circle", "rounded", "rectangle"];
+
+fn sanitize_pip_shape(shape: &str) -> &str {
+    ALLOWED_PIP_SHAPES.iter().find(|&&s| s == shape).copied().unwrap_or("rectangle")
+}
+
+// One PiP overlay's filter-graph fragment: trims this overlay's own [trim_start, trim_start+
+// duration) window out of its (already `-i`'d, full-length) source, scales it to fill exactly
+// `width`x`height` - `force_original_aspect_ratio=increase` then `crop` is the standard ffmpeg
+// "cover" recipe, matching the live preview's own CSS `object-fit: cover` exactly rather than
+// stretching or letterboxing - then masks it into shape and composites it onto `current_label`.
+// Circle/rounded reuse the same geq-based geometric-mask technique recording.rs's own
+// build_camera_overlay_filter_complex already uses for the baked-in overlay this feature is the
+// editable alternative to (kept as a separate copy here rather than a shared function - the two
+// commands build genuinely different surrounding graphs, and geq expressions are short enough that
+// sharing would cost more in indirection than it'd save).
+fn pip_overlay_chain(pip: &PipOverlay, input_index: usize, stage_index: usize, current_label: &str, out_label: &str) -> String {
+    let duration = (pip.end_time - pip.start_time).max(0.01);
+    let trim_end = pip.trim_start + duration;
+    let cover = format!(
+        "trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}",
+        ts = pip.trim_start, te = trim_end, w = pip.width, h = pip.height
+    );
+    let shape = sanitize_pip_shape(&pip.shape);
+    let video_label = format!("pip{}v", stage_index);
+
+    let mut chain = String::new();
+    let composited_label = match shape {
+        "rectangle" => {
+            chain.push_str(&format!("[{}:v]{}[{}];", input_index, cover, video_label));
+            video_label
+        }
+        _ => {
+            let mask_expr = if shape == "rounded" {
+                let r = ((pip.corner_radius.unwrap_or(0.08).max(0.0).min(0.5)) * pip.height as f64).round() as i64;
+                format!("if(gte(X,{r})*gte(Y,{r})*gte(W-{r}-X,0)*gte(H-{r}-Y,0),255,0)", r = r)
+            } else {
+                "if(gt((X-W/2)^2+(Y-H/2)^2,(W/2)^2),0,255)".to_string()
+            };
+            let alpha_label = format!("pip{}a", stage_index);
+            let masked_label = format!("pip{}m", stage_index);
+            // Reads the raw `-i`'d input twice (once per branch below) rather than an explicit
+            // `split` - ffmpeg fans out a raw demuxed/decoded input stream reference on its own,
+            // the same "{input}...{input}..." idiom overlay_stage_filter (recording.rs) already
+            // relies on for exactly this shape-masking technique.
+            chain.push_str(&format!("[{idx}:v]{cover},geq=lum_expr='{mask_expr}',format=yuva420p[{alpha}];", idx = input_index, cover = cover, mask_expr = mask_expr, alpha = alpha_label));
+            chain.push_str(&format!("[{idx}:v]{cover}[{video}];", idx = input_index, cover = cover, video = video_label));
+            chain.push_str(&format!("[{video}][{alpha}]alphamerge[{masked}];", video = video_label, alpha = alpha_label, masked = masked_label));
+            masked_label
+        }
+    };
+
+    chain.push_str(&format!(
+        "[{current}][{composited}]overlay=x={x}:y={y}:enable='between(t,{start:.3},{end:.3})'[{out}];",
+        current = current_label, composited = composited_label, x = pip.x, y = pip.y, start = pip.start_time, end = pip.end_time, out = out_label
+    ));
+    chain
+}
+
 // Per-segment color grade fragment, chained directly onto that segment's own trim step (before
 // concat). Formulas are deliberately simple/approximate (not colorimetrically "correct") - a
 // quick preset gallery, not a grading tool - and are meant to visually match their CSS-preview
@@ -764,7 +1091,15 @@ fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64) -> 
             } else {
                 format!("({z:.4}-({z:.4}-1)*min(t/{d:.3},1))")
             };
-            format!(",crop=w='iw/{p}':h='ih/{p}':x='(iw-ow)/2':y='(ih-oh)/2',scale={out_w}:{out_h}")
+            // clip(...) rather than the plain "(iw-ow)/2" center every zoom used before targetX/
+            // targetY existed - ow/oh are themselves time-varying here (they're `iw/p`/`ih/p`
+            // above), so keeping the window fully on-frame at every instant needs a real clamp,
+            // not just a fixed offset. Defaults (0.5, 0.5) reduce to exactly the old centered math.
+            let tx = kb.target_x.unwrap_or(0.5).max(0.0).min(1.0);
+            let ty = kb.target_y.unwrap_or(0.5).max(0.0).min(1.0);
+            format!(
+                ",crop=w='iw/{p}':h='ih/{p}':x='clip({tx:.4}*iw-ow/2,0,iw-ow)':y='clip({ty:.4}*ih-oh/2,0,ih-oh)',scale={out_w}:{out_h}"
+            )
         }
         "pan-left" | "pan-right" => {
             let z = 1.0 + 0.15 * amount;
@@ -806,8 +1141,55 @@ fn crop_chain(c: &ClipCrop) -> String {
 // actually rescales back to out_w:out_h - concat needs every segment at matching dimensions
 // regardless of which effects it has, so at least one of them always has to; see crop_chain's own
 // doc comment for why that's never both.
+// This segment's own playback-speed multiplier, clamped defensively to the same 0.25..4 range the
+// clip-effects UI itself offers (ClipEffectsPopover's MIN_SPEED/MAX_SPEED) - a value outside that
+// couldn't have come from that slider, but clamping here (rather than trusting it) means a stale/
+// hand-edited sidecar can't push the setpts/atempo math into something degenerate.
+fn segment_speed(seg: &KeepSegment) -> f64 {
+    seg.speed.unwrap_or(1.0).max(0.25).min(4.0)
+}
+
+// This segment's own noise-reduction strength (0..1, clamped defensively same as segment_speed's
+// own comment explains) mapped to afftdn's `nr` parameter - its dB range is documented as
+// 0.01..97, but anything past ~40dB starts eating into the wanted signal along with the noise for
+// typical screen-recording mic input, so this maps onto the gentler 4..40 subrange rather than
+// afftdn's full range. None/0 returns None (no filter at all) rather than "afftdn=nr=4" - keeps a
+// clip that's never touched this feature byte-for-byte identical to before it existed, and skips
+// an unnecessary filter stage in the common case.
+fn segment_noise_reduction_db(seg: &KeepSegment) -> Option<f64> {
+    let strength = seg.noise_reduction.unwrap_or(0.0).max(0.0).min(1.0);
+    if strength <= 0.0 {
+        None
+    } else {
+        Some(4.0 + strength * 36.0)
+    }
+}
+
+// Decomposes an arbitrary speed factor into a chain of ffmpeg `atempo` filters, each within the
+// single-instance range libavfilter enforces (0.5..2.0) - `atempo=4.0` alone is rejected outright
+// at that value, so a larger speed-up/slow-down needs several chained instances instead (e.g. 4x
+// is two atempo=2.0 stages back to back). segment_speed's own 0.25..4 clamp never actually needs
+// more than two stages, but this loop isn't hardcoded to that in case that range ever widens.
+fn atempo_chain(speed: f64) -> String {
+    let mut remaining = speed.max(0.05);
+    let mut stages: Vec<f64> = Vec::new();
+    while remaining > 2.0 {
+        stages.push(2.0);
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 {
+        stages.push(0.5);
+        remaining /= 0.5;
+    }
+    stages.push(remaining);
+    stages.iter().map(|s| format!("atempo={:.4}", s)).collect::<Vec<_>>().join(",")
+}
+
 fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>) -> String {
     let mut extra = String::new();
+    if seg.flip_horizontal.unwrap_or(false) {
+        extra.push_str(",hflip");
+    }
     if let Some(cf) = &seg.color_filter {
         if cf.preset != "none" {
             extra.push_str(&color_filter_chain(cf));
@@ -820,7 +1202,14 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         }
     }
     if let (Some(kb), Some(w), Some(h)) = (&seg.ken_burns, out_w, out_h) {
-        extra.push_str(&ken_burns_chain(kb, seg.end - seg.start, w, h));
+        // Divided by speed: Ken Burns' own crop expression reads `t` from the SAME filter chain
+        // this is appended to, which by the time this runs has already had the segment's own
+        // setpts=(PTS-STARTPTS)/speed applied (see the three trim-step call sites) - `t` there is
+        // already OUTPUT time, not source time, so the progress fraction t/duration needs an
+        // OUTPUT duration to reach exactly 1.0 at the segment's own end regardless of speed. The
+        // live preview needs no equivalent adjustment - its own progress calc (VideoPlayer.tsx) is
+        // a source-time ratio that's already speed-invariant by construction, see its own comment.
+        extra.push_str(&ken_burns_chain(kb, (seg.end - seg.start) / segment_speed(seg), w, h));
     }
     extra
 }
@@ -841,6 +1230,63 @@ const ALLOWED_TRANSITIONS: &[&str] = &["fade", "fadeblack", "wipeleft", "wiperig
 
 fn sanitize_transition_name(name: &str) -> &str {
     ALLOWED_TRANSITIONS.iter().find(|&&t| t == name).copied().unwrap_or("fade")
+}
+
+// Mirrors OverlayImage.animation's own doc comment - "pop" is deliberately absent (frontend maps
+// it to "fade" before it ever reaches here). Same security-boundary reasoning as
+// ALLOWED_TRANSITIONS: this string is interpolated directly into the filter_complex below.
+const ALLOWED_OVERLAY_ANIMATIONS: &[&str] = &["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"];
+
+fn sanitize_overlay_animation(name: &str) -> &str {
+    ALLOWED_OVERLAY_ANIMATIONS.iter().find(|&&a| a == name).copied().unwrap_or("none")
+}
+
+// Matches the live preview's own slide timing exactly (overlayAnimationStyle, VideoOverlayLayer.tsx)
+// so a slide overlay looks the same in the exported file as it did on screen: `ramp` is how long the
+// entry/exit glide takes (clamped to half the overlay's own duration so a very short overlay still
+// finishes entering before it starts leaving), and `progress` is 0 right at either edge of
+// [start_time,end_time), ramping to 1 once "fully arrived" - `remaining = 1-progress` is then how far
+// from settled the overlay still is, which is what actually drives how far it's offset from its
+// resting (ov.x, ov.y) position. ffmpeg's `clip(x,min,max)` and `min(a,b)` eval functions reproduce
+// the same clamp/min the preview's own plain JS math uses.
+const OVERLAY_ANIMATION_RAMP_SEC: f64 = 0.4;
+const OVERLAY_SLIDE_DISTANCE_FRACTION: f64 = 0.12;
+
+fn overlay_slide_remaining_expr(start_time: f64, end_time: f64) -> String {
+    let ramp = OVERLAY_ANIMATION_RAMP_SEC.min((end_time - start_time) / 2.0).max(0.001);
+    format!(
+        "(1-clip(min((t-{start:.3})/{ramp:.4},({end:.3}-t)/{ramp:.4}),0,1))",
+        start = start_time, end = end_time, ramp = ramp
+    )
+}
+
+// The overlay filter's own x/y, as ffmpeg expression strings - a plain integer for "none"/"fade"
+// (unchanged from before slide support existed), or a `main_w`/`main_h`-relative expression that
+// glides in from the corresponding off-screen edge and back out for "slide-*", built with the exact
+// same distance-from-resting-position idiom overlayAnimationStyle's own `remaining * distance` uses
+// (VideoOverlayLayer.tsx) - `main_w`/`main_h` are the overlay filter's own built-in variables for the
+// base video's pixel dimensions, evaluated per-frame, so no separate output-resolution lookup is
+// needed here the way ken_burns_chain needs one.
+fn overlay_position_expr(ov: &OverlayImage, animation: &str) -> (String, String) {
+    match animation {
+        "slide-left" => (
+            format!("({x})-(main_w*{frac})*{remaining}", x = ov.x, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+            ov.y.to_string(),
+        ),
+        "slide-right" => (
+            format!("({x})+(main_w*{frac})*{remaining}", x = ov.x, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+            ov.y.to_string(),
+        ),
+        "slide-up" => (
+            ov.x.to_string(),
+            format!("({y})-(main_h*{frac})*{remaining}", y = ov.y, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+        ),
+        "slide-down" => (
+            ov.x.to_string(),
+            format!("({y})+(main_h*{frac})*{remaining}", y = ov.y, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+        ),
+        _ => (ov.x.to_string(), ov.y.to_string()),
+    }
 }
 
 fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
@@ -895,6 +1341,21 @@ fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
 // segment with either effect set would take the (already forced, since has_clip_effects) filter-
 // graph export path but have that one effect silently skipped - an uncropped/unpanned file, no
 // error, no indication anything was dropped.
+// Export quality presets - (libx264 preset, CRF) pairs. "standard" is the exact pair every export
+// used unconditionally before this existed, so a caller that doesn't pass `quality` at all (or
+// passes an unrecognized value) gets today's already-proven behavior, not a silent change.
+// "high"'s slower preset spends more encode time finding smaller/cleaner bitrate allocations for
+// the same visual quality; "small"'s faster preset trades some of that quality back for a shorter
+// export - both directions users of a screen-recording tool routinely want (a quick draft to share
+// immediately vs. a final archival-quality copy).
+fn resolve_export_quality(quality: Option<&str>) -> (&'static str, &'static str) {
+    match quality.unwrap_or("standard") {
+        "high" => ("slow", "18"),
+        "small" => ("veryfast", "28"),
+        _ => ("medium", "23"),
+    }
+}
+
 fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
     let mut cmd = Command::new(ffprobe_path);
     cmd.args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", source_path]);
@@ -914,16 +1375,28 @@ fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(
 // track of the same duration (`anullsrc`, a filter *source*, needs no `-i` input of its own) so
 // concat/xfade/acrossfade downstream always have a real audio stream to work with regardless of
 // whether the source did.
-fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, out_label: &str) -> String {
+fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, speed: f64, noise_reduction_db: Option<f64>, out_label: &str) -> String {
     if has_audio {
+        // atempo_chain (not a bare "atempo={speed}") since ffmpeg rejects a single atempo instance
+        // outside 0.5..2.0 - see its own doc comment. A speed of 1 still resolves to exactly
+        // "atempo=1.0000", functionally a no-op, so this needs no separate branch for that case.
+        // afftdn runs AFTER atempo - it's a per-frame spectral filter, order relative to tempo
+        // doesn't change its own output, so there's no reason to special-case which comes first.
+        let denoise = match noise_reduction_db {
+            Some(db) => format!(",afftdn=nr={:.2}", db),
+            None => String::new(),
+        };
         format!(
-            "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS[{out}];",
-            idx = input_index, out = out_label
+            "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo}{denoise}[{out}];",
+            idx = input_index, tempo = atempo_chain(speed), out = out_label
         )
     } else {
+        // Divided by speed to match the video stream's own now-speed-adjusted duration (see the
+        // trim/setpts call sites above) - concat/xfade both require the audio and video branches of
+        // the same segment to agree on how long it lasts.
         format!(
             "anullsrc=channel_layout=stereo:sample_rate=44100:duration={dur:.3}[{out}];",
-            dur = (end - start).max(0.01), out = out_label
+            dur = ((end - start) / speed).max(0.01), out = out_label
         )
     }
 }
@@ -948,9 +1421,11 @@ fn write_temp_overlay_png(data_base64: &str, index: usize) -> Result<PathBuf, St
 // convert_to_mp4/convert_video/convert_audio above, there is no `preserve_original` parameter
 // here at all, because there is no "false" branch to have.
 //
-// `output_base_path` only names/locates the output - it's the file the timeline was opened on,
-// which is not necessarily the source of any particular segment once clips have been dragged in
-// from elsewhere (see DockerFile/DockerFile.path in VideoTimelineDocker.tsx).
+// `output_base_path` only names/locates the DEFAULT output location (still used for the progress
+// event's own progress_key regardless) - it's the file the timeline was opened on, which is not
+// necessarily the source of any particular segment once clips have been dragged in from elsewhere
+// (see DockerFile/DockerFile.path in VideoTimelineDocker.tsx). `output_path`, when set, overrides
+// where the actual file gets written - see its own doc comment below.
 //
 // A single kept segment with no overlays (plain trim, no cuts, no drag-ins, nothing composited)
 // uses fast, low-artifact `-ss`/`-to` range extraction on that one input and no filter graph at
@@ -969,6 +1444,9 @@ pub async fn export_trimmed_video(
     overlays: Vec<OverlayImage>,
     blur_overlays: Vec<OverlayBlur>,
     audio_overlays: Vec<OverlayAudio>,
+    // Always sent by the frontend (possibly empty), unlike video_width/quality/output_path below -
+    // no #[serde(default)] here since a bare fn parameter can't carry one the way a struct field can.
+    pip_overlays: Vec<PipOverlay>,
     audio_muted: bool,
     audio_volume: f64,
     // The primary file's native pixel resolution, already resolved by the frontend (same value
@@ -978,21 +1456,35 @@ pub async fn export_trimmed_video(
     // exportEdited already uses for overlay rendering when videoPixelSize itself is null.
     video_width: Option<i64>,
     video_height: Option<i64>,
+    // "standard" (unrecognized/omitted falls back to this too - see resolve_export_quality),
+    // "high", or "small" - the encode speed/CRF trade-off the Save button's quality picker offers.
+    quality: Option<String>,
+    // Overrides the default "<output_base_path's name> (edited).<ext>" location - set when the
+    // user picks a destination via the Save button's "Choose location…" option. Still runs through
+    // unique_output_path (run_conversion) the same as the default location does, so a second export
+    // to the exact same custom path doesn't clobber the first.
+    output_path: Option<String>,
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
     }
+    let (quality_preset, quality_crf) = resolve_export_quality(quality.as_deref());
 
     // The primary video's OWN audio level (distinct from any audio overlay's own volume/muted,
     // which are separate mixed-in tracks) - 0.0 when muted, otherwise whatever the editor's track
     // volume slider was set to.
     let effective_video_volume = if audio_muted { 0.0 } else { audio_volume.max(0.0) };
 
-    let base = PathBuf::from(&output_base_path);
-    let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext = base.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
-    let parent = base.parent().map(PathBuf::from).unwrap_or_default();
-    let output = parent.join(format!("{} (edited).{}", stem, ext));
+    let output = match output_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let base = PathBuf::from(&output_base_path);
+            let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let ext = base.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
+            let parent = base.parent().map(PathBuf::from).unwrap_or_default();
+            parent.join(format!("{} (edited).{}", stem, ext))
+        }
+    };
 
     let mut inputs: Vec<InputSpec> = segments.iter().map(|s| InputSpec::plain(s.source_path.clone())).collect();
 
@@ -1065,13 +1557,24 @@ pub async fn export_trimmed_video(
         inputs.push(InputSpec::plain(audio_ov.source_path.clone()));
     }
 
+    // PiP sources come last (after audio overlays) so audio_input_base's own formula further down
+    // - segments.len() + overlays.len() + blur_mask_count - doesn't need to change to account for
+    // them. Each gets the FULL source file as its own `-i` (no -loop/-t pre_args, unlike the image/
+    // blur PNGs above) since pip_overlay_chain's own `trim=` does the windowing instead.
+    let pip_input_base = inputs.len();
+    for pip in &pip_overlays {
+        inputs.push(InputSpec::plain(pip.source_path.clone()));
+    }
+
     let has_video_overlays = !overlays.is_empty();
     let has_blur_overlays = !blur_overlays.is_empty();
     let has_audio_overlays = !audio_overlays.is_empty();
+    let has_pip_overlays = !pip_overlays.is_empty();
     // Any clip-level effect also needs the full filter graph - the fast -ss/-to path below has no
     // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
     let has_clip_effects = segments.iter().any(|s| {
         s.color_filter.as_ref().map_or(false, |cf| cf.preset != "none") || s.ken_burns.is_some() || s.transition_in.is_some() || s.crop.is_some()
+            || s.flip_horizontal.unwrap_or(false) || (s.speed.unwrap_or(1.0) - 1.0).abs() > 0.001
     });
     // Any segment beyond the first requesting a transition - gates the pairwise xfade/acrossfade
     // fold below instead of the plain all-at-once `concat=n=N` the multi-segment branch has always
@@ -1079,7 +1582,7 @@ pub async fn export_trimmed_video(
     // before this feature existed.
     let has_transitions = segments.iter().skip(1).any(|s| s.transition_in.is_some());
 
-    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_blur_overlays && !has_audio_overlays && !has_clip_effects {
+    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_blur_overlays && !has_audio_overlays && !has_pip_overlays && !has_clip_effects {
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
         let seg = &segments[0];
@@ -1087,8 +1590,8 @@ pub async fn export_trimmed_video(
             "-ss".into(), format!("{:.3}", seg.start),
             "-to".into(), format!("{:.3}", seg.end),
             "-c:v".into(), "libx264".into(),
-            "-preset".into(), "medium".into(),
-            "-crf".into(), "23".into(),
+            "-preset".into(), quality_preset.into(),
+            "-crf".into(), quality_crf.into(),
             "-c:a".into(), "aac".into(),
             "-b:a".into(), "128k".into(),
             "-movflags".into(), "+faststart".into(),
@@ -1158,11 +1661,12 @@ pub async fn export_trimmed_video(
         if segments.len() == 1 {
             let seg = &segments[0];
             let extra = segment_effect_chain(seg, video_width, video_height);
+            let speed = segment_speed(seg);
             filter.push_str(&format!(
-                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{2}[base];",
-                seg.start, seg.end, extra
+                "[0:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{2:.4}{3}[base];",
+                seg.start, seg.end, speed, extra
             ));
-            filter.push_str(&audio_trim_chain(segment_has_audio[0], 0, seg.start, seg.end, "outa"));
+            filter.push_str(&audio_trim_chain(segment_has_audio[0], 0, seg.start, seg.end, speed, segment_noise_reduction_db(seg), "outa"));
         } else if !has_transitions {
             // Same segment-major trim+concat pattern as before this function grew overlay support
             // - concat's inputs must interleave [v0][a0][v1][a1]..., not group all video labels
@@ -1172,11 +1676,12 @@ pub async fn export_trimmed_video(
             let mut concat_inputs = String::new();
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height);
+                let speed = segment_speed(seg);
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3}[v{2}];",
-                    seg.start, seg.end, i, extra
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{4:.4}{3}[v{2}];",
+                    seg.start, seg.end, i, extra, speed
                 ));
-                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, &format!("a{}", i)));
+                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, segment_noise_reduction_db(seg), &format!("a{}", i)));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
             }
             filter.push_str(&format!("{}concat=n={}:v=1:a=1[base][outa];", concat_inputs, segments.len()));
@@ -1196,23 +1701,26 @@ pub async fn export_trimmed_video(
 
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height);
+                let speed = segment_speed(seg);
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3},fps={4:.3}[v{2}];",
-                    seg.start, seg.end, i, extra, target_fps
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{5:.4}{3},fps={4:.3}[v{2}];",
+                    seg.start, seg.end, i, extra, target_fps, speed
                 ));
-                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, &format!("a{}", i)));
+                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, segment_noise_reduction_db(seg), &format!("a{}", i)));
             }
 
             // Folds left-to-right: `accumulated` tracks the CURRENT duration of whatever
             // [cur_v]/[cur_a] point at right now, since xfade's own `offset` is relative to its
             // first input's timeline (not the original segment's own duration) once more than one
-            // fold has already happened.
+            // fold has already happened. Divided by speed - xfade/acrossfade operate on the
+            // already-setpts'd (OUTPUT-time) streams built above, so every duration/offset here
+            // needs to be in that same OUTPUT-time space, not raw source seconds.
             let mut cur_v = "v0".to_string();
             let mut cur_a = "a0".to_string();
-            let mut accumulated = segments[0].end - segments[0].start;
+            let mut accumulated = (segments[0].end - segments[0].start) / segment_speed(&segments[0]);
             for i in 1..segments.len() {
                 let seg = &segments[i];
-                let seg_dur = seg.end - seg.start;
+                let seg_dur = (seg.end - seg.start) / segment_speed(seg);
                 let next_v = format!("fold{}v", i);
                 let next_a = format!("fold{}a", i);
                 let use_transition = seg.transition_in.as_ref().map_or(false, |tr| tr.duration > 0.0);
@@ -1302,14 +1810,16 @@ pub async fn export_trimmed_video(
 
         // Chains each overlay onto whatever the blur pass above left [current_label] pointing at
         // (still "base" if there were no blur regions) in turn, the last one landing on [outv]. A
-        // still PNG is "faded" via ffmpeg's own fade filter for overlays with animation:"fade" set
-        // in the editor - alpha=1 fades the alpha channel itself rather than to black, which is
-        // exactly what a transparent-background overlay needs - before being composited via
-        // `overlay` gated to that overlay's own [start,end) window on the output timeline either way.
+        // still PNG is "faded" via ffmpeg's own fade filter for animation:"fade" - alpha=1 fades the
+        // alpha channel itself rather than to black, which is exactly what a transparent-background
+        // overlay needs - or, for animation:"slide-*", composited at a time-varying x/y instead (see
+        // overlay_position_expr) - before being composited via `overlay` gated to that overlay's own
+        // [start,end) window on the output timeline either way.
         let overlay_input_base = segments.len();
         for (i, ov) in overlays.iter().enumerate() {
             let source_label = format!("{}:v", overlay_input_base + i);
-            let composited_label = if ov.fade {
+            let animation = sanitize_overlay_animation(&ov.animation);
+            let composited_label = if animation == "fade" {
                 let faded_label = format!("ovfade{}", i);
                 let fade_out_start = (ov.end_time - 0.4).max(ov.start_time);
                 filter.push_str(&format!(
@@ -1320,18 +1830,34 @@ pub async fn export_trimmed_video(
             } else {
                 source_label
             };
+            let (x_expr, y_expr) = overlay_position_expr(ov, animation);
             let next_label = if i + 1 == overlays.len() { "outv".to_string() } else { format!("ov{}", i) };
             filter.push_str(&format!(
-                "[{}][{}]overlay=x={}:y={}:enable='between(t,{:.3},{:.3})'[{}];",
-                current_label, composited_label, ov.x, ov.y, ov.start_time, ov.end_time, next_label
+                "[{}][{}]overlay=x='{}':y='{}':enable='between(t,{:.3},{:.3})'[{}];",
+                current_label, composited_label, x_expr, y_expr, ov.start_time, ov.end_time, next_label
             ));
             current_label = next_label;
         }
+
+        // PiP layers composite last (on top of blur AND text/image, matching the live preview's
+        // own DOM order - PipOverlayLayer is mounted after VideoOverlayLayer, see Dashboard.tsx) -
+        // each stage always writes to its own "pipNout" intermediate label, never "outv" directly
+        // (unlike the text/image loop just above, which can), since that loop may have already
+        // claimed "outv" for itself and a second filter stage can't also output to the same label.
+        // The shared fallback right below (`current_label != "outv"`) is what actually renames
+        // whatever this leaves current_label pointing at.
+        for (i, pip) in pip_overlays.iter().enumerate() {
+            let out_label = format!("pip{}out", i);
+            filter.push_str(&pip_overlay_chain(pip, pip_input_base + i, i, &current_label, &out_label));
+            current_label = out_label;
+        }
+
         // Whatever [current_label] is pointing at (the plain trim/concat [base], or the last blur/
-        // image/text stage that actually ran) needs to end up named [outv] for the -map below -
-        // covers all four combinations of "any blur regions" x "any text/image overlays" with one
-        // check, rather than the single `!has_video_overlays` special case this used to be before
-        // blur support existed (back when [base] was the only possible "nothing chained" label).
+        // image/text/pip stage that actually ran) needs to end up named [outv] for the -map below -
+        // covers every combination of "any blur regions" x "any text/image overlays" x "any PiP
+        // layers" with one check, rather than the single `!has_video_overlays` special case this
+        // used to be before blur/pip support existed (back when [base] was the only possible
+        // "nothing chained" label).
         if current_label != "outv" {
             filter.push_str(&format!("[{}]copy[outv];", current_label));
         }
@@ -1348,14 +1874,35 @@ pub async fn export_trimmed_video(
             "outa"
         };
 
-        // Mixes each audio overlay into base_audio_label - amix's `normalize=0` is the detail that
-        // matters here: amix auto-attenuates every input by 1/inputs by default, which would
-        // quietly turn the original video's own audio down just because background music was
-        // added. normalize=0 keeps each track at whatever level its own `volume=` filter below
-        // already set (the track volume above for the original track, whatever the user picked for
-        // each overlay) - "30% volume" means 30%, not 30% further divided by however many tracks
-        // happen to be mixed in.
-        let audio_label = if has_audio_overlays {
+        // Which pip overlays actually contribute audio - the frontend already collapses its own
+        // "play this clip's own audio" toggle into volume=0 when off (see PipOverlay.muted,
+        // videoEditTypes.ts), so a plain volume>0 check covers that; probe_has_audio additionally
+        // guards against a pip source with NO audio stream at all (e.g. the webcam sidecar
+        // FormData.separate_webcam_capture itself produces, which is video-only by design - see
+        // win.rs) - without this, a stray `[idx:a]` on a video-only input would reject the whole
+        // filtergraph with "Stream specifier ':a' ... matches no streams", the same failure mode
+        // probe_has_audio already exists to prevent for segments.
+        let pip_audio_input_index: Vec<Option<usize>> = pip_overlays
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if p.volume > 0.001 && probe_has_audio(&ffprobe_path, &p.source_path) {
+                    Some(pip_input_base + i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let has_pip_audio = pip_audio_input_index.iter().any(|idx| idx.is_some());
+
+        // Mixes each audio overlay (and any audible pip layer) into base_audio_label - amix's
+        // `normalize=0` is the detail that matters here: amix auto-attenuates every input by
+        // 1/inputs by default, which would quietly turn the original video's own audio down just
+        // because background music was added. normalize=0 keeps each track at whatever level its
+        // own `volume=` filter below already set (the track volume above for the original track,
+        // whatever the user picked for each overlay) - "30% volume" means 30%, not 30% further
+        // divided by however many tracks happen to be mixed in.
+        let audio_label = if has_audio_overlays || has_pip_audio {
             // Inputs so far, in push order: segments, then image overlay PNGs, then blur mask PNGs
             // (see blur_mask_input_index above) - audio overlay sources were appended right after
             // all of those, so this has to account for all three groups, not just the first two.
@@ -1381,10 +1928,26 @@ pub async fn export_trimmed_video(
                 filter.push_str(&format!("{},adelay={:.0}:all=1[{}];", chain, delay_ms, track_label));
                 mix_inputs.push_str(&format!("[{}]", track_label));
             }
+            // Same atrim+volume+adelay shape as the audio-overlay loop above, minus fade in/out
+            // (pip has no fade controls of its own) - skips any pip pip_audio_input_index marked
+            // None (muted, or a source with no audio stream at all).
+            let mut pip_audio_count = 0;
+            for (i, pip) in pip_overlays.iter().enumerate() {
+                let Some(input_index) = pip_audio_input_index[i] else { continue };
+                let trim_end = pip.trim_start + (pip.end_time - pip.start_time);
+                let delay_ms = (pip.start_time * 1000.0).round().max(0.0);
+                let track_label = format!("pipa{}", i);
+                filter.push_str(&format!(
+                    "[{idx}:a]atrim=start={ts:.3}:end={te:.3},asetpts=PTS-STARTPTS,volume={vol:.3},adelay={delay:.0}:all=1[{label}];",
+                    idx = input_index, ts = pip.trim_start, te = trim_end, vol = pip.volume, delay = delay_ms, label = track_label
+                ));
+                mix_inputs.push_str(&format!("[{}]", track_label));
+                pip_audio_count += 1;
+            }
             filter.push_str(&format!(
                 "{}amix=inputs={}:duration=first:dropout_transition=0:normalize=0[outa_mixed];",
                 mix_inputs,
-                audio_overlays.len() + 1
+                audio_overlays.len() + pip_audio_count + 1
             ));
             "outa_mixed".to_string()
         } else {
@@ -1400,8 +1963,8 @@ pub async fn export_trimmed_video(
             "-map".into(), "[outv]".into(),
             "-map".into(), format!("[{}]", audio_label),
             "-c:v".into(), "libx264".into(),
-            "-preset".into(), "medium".into(),
-            "-crf".into(), "23".into(),
+            "-preset".into(), quality_preset.into(),
+            "-crf".into(), quality_crf.into(),
             "-c:a".into(), "aac".into(),
             "-b:a".into(), "128k".into(),
             "-movflags".into(), "+faststart".into(),
@@ -1690,4 +2253,82 @@ pub async fn convert_video(
     }
 
     Ok(result)
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SilentRange {
+    pub start: f64,
+    pub end: f64,
+}
+
+// Runs ffmpeg's own `silencedetect` audio filter over the WHOLE source file (never scoped to one
+// clip's own [start,end) - the frontend intersects these against whichever clip's current trim
+// window is in play instead, see removeSilentRanges/videoEditHandlers.ts, so the same detection
+// result stays valid even if that clip gets trimmed differently afterward). `-f null -` discards
+// the re-encoded output entirely - only silencedetect's own stderr log lines are ever read.
+#[tauri::command]
+pub async fn detect_silence(
+    app_handle: AppHandle,
+    input_path: String,
+    // dB threshold below which audio counts as "silent", and the minimum duration (seconds) a
+    // silent stretch must last to be reported - both mirror ffmpeg's own `silencedetect` filter
+    // options 1:1. Defaults (-30dB, 0.5s) are deliberately conservative: they catch genuine dead
+    // air/pauses without flagging brief natural gaps between words as separate silent ranges.
+    noise_db: Option<f64>,
+    min_duration: Option<f64>,
+) -> Result<Vec<SilentRange>, String> {
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let input = PathBuf::from(&input_path);
+    if !input.exists() {
+        return Err(format!("Input file does not exist: {}", input_path));
+    }
+    let noise_db = noise_db.unwrap_or(-30.0);
+    let min_duration = min_duration.unwrap_or(0.5).max(0.05);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-i").arg(&input_path);
+        cmd.args(["-af", &format!("silencedetect=noise={noise_db}dB:d={min_duration}"), "-f", "null", "-"]);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let output = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        // silencedetect writes to stderr regardless of the overall exit status (a `-f null -`
+        // "encode" succeeds as long as the input decodes at all) - parsed either way, since the
+        // only real failure mode here is ffmpeg being unable to read the file at all, which the
+        // exists() check above already rules out for the common case.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(parse_silence_ranges(&stderr))
+    })
+    .await
+    .map_err(|e| format!("Silence detection task panicked: {}", e))?
+}
+
+// Parses ffmpeg silencedetect's own stderr log lines:
+//   [silencedetect @ 0x...] silence_start: 12.345
+//   [silencedetect @ 0x...] silence_end: 15.678 | silence_duration: 3.333
+// into paired (start,end) ranges. A trailing silence_start with no matching silence_end (the file
+// ends while still silent) is dropped rather than guessed at - callers only ever want ranges with
+// a real, detected end.
+fn parse_silence_ranges(stderr: &str) -> Vec<SilentRange> {
+    let mut ranges = Vec::new();
+    let mut pending_start: Option<f64> = None;
+    for line in stderr.lines() {
+        if let Some(rest) = line.split("silence_start:").nth(1) {
+            if let Ok(start) = rest.trim().split_whitespace().next().unwrap_or("").parse::<f64>() {
+                pending_start = Some(start);
+            }
+        } else if let Some(rest) = line.split("silence_end:").nth(1) {
+            let end_str = rest.split('|').next().unwrap_or("").trim();
+            if let (Some(start), Ok(end)) = (pending_start.take(), end_str.parse::<f64>()) {
+                if end > start {
+                    ranges.push(SilentRange { start, end });
+                }
+            }
+        }
+    }
+    ranges
 }

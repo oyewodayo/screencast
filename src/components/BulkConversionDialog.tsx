@@ -18,6 +18,19 @@ interface BulkFile {
 
 type PerFileStatus = "pending" | "converting" | "done" | "error";
 
+// Rounds to whole seconds before splitting into h/m/s - the per-file timeline list already shows
+// sub-second granularity isn't meaningful here (network-free, local disk conversion), and "in 47s"
+// reads better than "in 46.8s".
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.round(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 interface PerFileResult {
   status: PerFileStatus;
   newPath?: string;
@@ -50,6 +63,8 @@ const BulkConversionDialog: React.FC<{
   const [phase, setPhase] = useState<"configuring" | "converting" | "done">("configuring");
   const [results, setResults] = useState<Record<string, PerFileResult>>({});
   const [currentIndex, setCurrentIndex] = useState<number>(-1);
+  const [durationMs, setDurationMs] = useState<number | null>(null);
+  const startTimeRef = useRef<number>(0);
 
   // Checked between files in the loop below - cancelConversion() only kills whatever ffmpeg
   // process is running *right now*, it can't reach into an in-flight `await` and stop the loop
@@ -60,6 +75,8 @@ const BulkConversionDialog: React.FC<{
     if (!profile || !category) return;
     cancelRequestedRef.current = false;
     setPhase("converting");
+    setDurationMs(null);
+    startTimeRef.current = Date.now();
     setResults(Object.fromEntries(files.map((f) => [f.path, { status: "pending" as PerFileStatus }])));
 
     for (let i = 0; i < files.length; i++) {
@@ -87,6 +104,7 @@ const BulkConversionDialog: React.FC<{
     }
 
     setCurrentIndex(-1);
+    setDurationMs(Date.now() - startTimeRef.current);
     setPhase("done");
   };
 
@@ -173,7 +191,7 @@ const BulkConversionDialog: React.FC<{
               <span>
                 {phase === "converting"
                   ? `Converting ${currentIndex + 1} of ${files.length}...`
-                  : `Done - ${doneCount} converted${errorCount > 0 ? `, ${errorCount} failed` : ""}`}
+                  : `Done - ${doneCount} converted${errorCount > 0 ? `, ${errorCount} failed` : ""}${durationMs !== null ? ` in ${formatDuration(durationMs)}` : ""}`}
               </span>
               <span>
                 {doneCount + errorCount}/{files.length}

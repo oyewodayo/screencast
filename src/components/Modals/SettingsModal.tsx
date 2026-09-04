@@ -66,7 +66,7 @@ const HOME_BACKGROUND_OPTIONS: { value: AppSettings["homeBackgroundStyle"]; labe
   { value: "plain", label: "Plain" },
 ];
 
-type SectionKey = "appearance" | "recording" | "storage" | "annotation" | "files" | "pdf";
+type SectionKey = "appearance" | "recording" | "storage" | "annotation" | "files" | "pdf" | "help";
 const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "appearance", label: "Appearance" },
   { key: "recording", label: "Recording" },
@@ -74,7 +74,29 @@ const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "annotation", label: "Annotation" },
   { key: "files", label: "Files" },
   { key: "pdf", label: "PDF Annotator" },
+  { key: "help", label: "Help & Shortcuts" },
 ];
+
+// One row of the keyboard-shortcuts reference in the Help section below - keys as shown here are
+// always the Windows/Linux form ("Ctrl+..."); the section adds a single blanket note about Cmd on
+// macOS rather than repeating it per row (matches how Tauri's own global shortcuts are registered:
+// "CommandOrControl+..." resolves to Ctrl or Cmd depending on the OS automatically).
+const ShortcutRow: React.FC<{ keys: string; description: string }> = ({ keys, description }) => (
+  <div className="flex items-center justify-between gap-4">
+    <span className="text-sm text-neutral-700 dark:text-neutral-300">{description}</span>
+    <kbd className="shrink-0 px-2 py-1 rounded-md text-xs font-mono bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-300">
+      {keys}
+    </kbd>
+  </div>
+);
+
+const BulletList: React.FC<{ items: React.ReactNode[] }> = ({ items }) => (
+  <ul className="list-disc pl-4 space-y-1.5 text-sm text-neutral-700 dark:text-neutral-300 marker:text-neutral-300 dark:marker:text-neutral-600">
+    {items.map((item, i) => (
+      <li key={i}>{item}</li>
+    ))}
+  </ul>
+);
 
 // Both the picked-folder path (change location) and the OS default path (reset) already come from
 // Rust as a real, OS-native path string - joining "Briefcast" onto it for the confirm preview
@@ -583,6 +605,82 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   </div>
                 </Field>
               </Section>
+            )}
+
+            {activeSection === "help" && (
+              <>
+                <Section title="Keyboard shortcuts">
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1 mb-1">
+                    Shown in their Windows/Linux form - use Cmd instead of Ctrl on macOS. Each one works from
+                    anywhere, not just while Briefcast is the focused window.
+                  </p>
+                  <ShortcutRow keys="Ctrl+Shift+R" description="Start or stop recording, using your current recording settings" />
+                  <ShortcutRow keys="Ctrl+Shift+H" description="Show/hide the floating recording overlay (while recording)" />
+                  <ShortcutRow keys="Ctrl+Shift+B" description="Show/hide the recording panel buttons - handy right before presenting" />
+                  <ShortcutRow keys="Ctrl+Shift+D" description="Toggle the annotation tool's draw mode (see Annotation settings)" />
+                </Section>
+
+                <Section title="File selection">
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1 mb-1">
+                    Unlike the shortcuts above, these only work while Briefcast is the focused window. The
+                    Ctrl/Shift-click gestures are specific to the image gallery grid (Image tab &gt; a folder); the
+                    sidebar's own file list selects via its checkboxes instead.
+                  </p>
+                  <ShortcutRow keys="Ctrl/Cmd+Click" description="Add or remove one photo from the current selection, in the image gallery" />
+                  <ShortcutRow keys="Shift+Click" description="Select every photo between your last click and this one, in the image gallery" />
+                  <ShortcutRow keys="Esc" description="Clear the current file selection - sidebar or image gallery" />
+                </Section>
+
+                <Section title="Recording & screenshots">
+                  <BulletList items={[
+                    <>Record screen, webcam, and mic in any combination - Screen+Video+Audio, Screen+Audio, Video+Audio, Screen only, Video only, or Audio only.</>,
+                    <>Pause and resume a recording without losing your place - paused time is never included in the finished video.</>,
+                    <>Take a Full Screen, Monitor, or Window screenshot from the same target picker recording uses.</>,
+                    <>Overlay one or more webcams onto a screen recording - choose their shape, corner position, and size.</>,
+                    <>Capture system audio ("what you hear") alongside your mic (Windows only).</>,
+                  ]} />
+                </Section>
+
+                <Section title="File library">
+                  <BulletList items={[
+                    <>The sidebar lists every file by type (video/audio/image/PDF/document) - drag and drop to import from outside Briefcast.</>,
+                    <>Deleted files go to Trash first, not straight to permanent deletion - restore them or empty Trash from Settings &gt; Files, which also auto-purges anything older than your configured retention period.</>,
+                    <>Convert one file or many at once: video to MP4/MOV/MKV/AVI/WebM, audio to MP3/WAV/AAC/FLAC/OGG/M4A, images to PNG/JPEG/WebP/BMP - with an option to keep the original.</>,
+                  ]} />
+                </Section>
+
+                <Section title="Editing a recording">
+                  <BulletList items={[
+                    <>Trim, split, and reorder clips on a timeline.</>,
+                    <>Add text, image, and blur overlays, plus extra audio tracks.</>,
+                    <>Apply color-filter presets, Ken Burns pan/zoom, and transitions between clips.</>,
+                  ]} />
+                </Section>
+
+                <Section title="Docs">
+                  <BulletList items={[
+                    <>A rich-text note editor - headings, text/highlight color, alignment, tables, and inline images.</>,
+                    <>Import Word (.docx) files; export to Word, Markdown, plain text, or print/save as PDF.</>,
+                    <>Link a note to a specific recording in your library.</>,
+                  ]} />
+                </Section>
+
+                <Section title="Board">
+                  <BulletList items={[
+                    <>Arrange several images into one composed layout, then export it as a new flattened image.</>,
+                    <>Style each image's border, padding, corner rounding, and background independently.</>,
+                    <>Boards are saved projects - reopen and keep editing one any time.</>,
+                  ]} />
+                </Section>
+
+                <Section title="PDF annotator">
+                  <BulletList items={[
+                    <>Pen, highlighter, text notes, and eraser, with adjustable color and stroke width.</>,
+                    <>Zoom, page thumbnails, table of contents, single/two-page view, and a fullscreen presentation mode.</>,
+                    <>Export a flattened, standalone annotated PDF.</>,
+                  ]} />
+                </Section>
+              </>
             )}
           </div>
         </div>

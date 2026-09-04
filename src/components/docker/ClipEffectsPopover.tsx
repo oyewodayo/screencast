@@ -7,6 +7,10 @@
 // driven popover (opened from the toolbar's Effects button once a clip is selected on the
 // timeline), not the "armed placement" pattern text/image/blur tools use - these effects apply to
 // footage you've already selected, not something you click-to-place on the video preview.
+// Crop and Speed each have their own standalone toolbar button/popover (ClipCropOverlay's
+// arm/disarm toggle and SpeedPopover, respectively) rather than living in here - both have enough
+// of their own subfeatures to earn a dedicated surface instead of being one more section buried
+// inside "Clip effects".
 import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
@@ -14,7 +18,7 @@ import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType } from "../../u
 import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 
-export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop">>;
+export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "flipHorizontal">>;
 
 const DEFAULT_COLOR_INTENSITY = 0.7;
 const DEFAULT_KEN_BURNS_INTENSITY = 0.5;
@@ -26,12 +30,6 @@ interface ClipEffectsPopoverProps {
   anchor: { left: number; top: number };
   onUpdate: (patch: ClipEffectsPatch) => void;
   onClose: () => void;
-  // Crop itself is edited directly on the video preview (ClipCropOverlay, armed/disarmed from
-  // VideoTimelineDocker's own toolbar Crop button) - this popover only shows whether a crop is
-  // active (None) and offers the same arm/disarm toggle for discoverability, it doesn't own any
-  // crop UI of its own.
-  isCropping: boolean;
-  onToggleCropping: () => void;
 }
 
 const PresetRow: React.FC<{ children: React.ReactNode }> = ({ children }) => <div className="flex flex-wrap gap-1">{children}</div>;
@@ -48,7 +46,7 @@ const PresetButton: React.FC<{ active: boolean; onClick: () => void; children: R
   </button>
 );
 
-const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, anchor, onUpdate, onClose, isCropping, onToggleCropping }) => {
+const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, anchor, onUpdate, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
 
   useEffect(() => {
@@ -149,18 +147,6 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
             <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(kenBurnsIntensity * 100)}%</span>
           </label>
         )}
-      </div>
-
-      <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
-        <span className="text-[10px] uppercase tracking-wide text-white/40">Crop</span>
-        <PresetRow>
-          <PresetButton active={!clip.crop} onClick={() => onUpdate({ crop: undefined })}>
-            None
-          </PresetButton>
-          <PresetButton active={isCropping} onClick={onToggleCropping}>
-            {isCropping ? "Editing on preview…" : "Edit on preview"}
-          </PresetButton>
-        </PresetRow>
       </div>
 
       {hasPrecedingClip && (

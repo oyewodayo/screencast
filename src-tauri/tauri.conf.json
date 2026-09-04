@@ -26,8 +26,10 @@
       },
       "dialog": {
         "all": false,
+        "ask": true,
         "message": true,
-        "open": true
+        "open": true,
+        "save": true
       },
       "notification": {
         "all": false
@@ -100,7 +102,8 @@
       "active": true,
       "targets": "all",
       "resources": [
-        "binaries/ffmpeg/*"
+        "binaries/ffmpeg/*",
+        "binaries/heif/*"
       ],
       "identifier": "com.briefscan.app",
       "icon": [

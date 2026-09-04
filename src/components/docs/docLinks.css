@@ -1,0 +1,24 @@
+/* components/docs/docLinks.css
+ *
+ * Link color/underline for the live editor - a plain CSS rule (not a Tailwind arbitrary-variant on
+ * EditorContent) since it needs the `[data-underline-off]` attribute selector docLinkExtension.ts's
+ * `underlineOff` attribute renders, which Tailwind's own arbitrary-variant syntax can express but
+ * less readably than a dedicated rule here.
+ *
+ * Underline is a plain CSS default (not forced with !important) specifically so it stays removable:
+ * DocsEditor.tsx's Underline toolbar button toggles the `data-underline-off` attribute itself when
+ * the selection is on a link, which is what actually turns this rule off per-link.
+ */
+
+.ProseMirror a {
+  color: #1155cc;
+  text-decoration: underline;
+}
+
+.ProseMirror a[data-underline-off] {
+  text-decoration: none;
+}
+
+.dark .ProseMirror a {
+  color: #8ab4f8;
+}

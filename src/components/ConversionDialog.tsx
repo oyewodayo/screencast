@@ -13,6 +13,36 @@ interface ConversionProgress {
   message: string;
 }
 
+// Only convertImage gets a timeout below - video/audio conversions legitimately run for minutes
+// on a large file and already stream real progress via the conversion-progress event, so a stuck
+// one is visible as "no progress event for a while", not silence. Image conversion has no such
+// signal (run_conversion's own comment: these "finish effectively instantly" since there's no
+// multi-frame progress to report) and its HEIC path (heic_windows.rs's decode_to_png) calls
+// WinRT's .get() with no timeout of its own - a hang there is indistinguishable from a slow one
+// until this fires. Same failure mode concurrencyLimiter.ts's withLimit now guards against for
+// thumbnails; BulkConversionDialog.tsx's sequential convert loop has no limiter to route through
+// (see that file's own comment on why), so it needs this protection directly instead - without it,
+// one bad HEIC file hangs that file's `await` forever and every subsequent file in the batch never
+// even starts. The backend invoke itself can't be cancelled (no such API), so a timed-out call's
+// promise still resolves/rejects later into the void - this just stops the caller waiting on it.
+const IMAGE_CONVERSION_TIMEOUT_MS = 45000;
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 // React hook for conversion — one thin invoke wrapper per convertible category, sharing progress/
 // cancel state. Which one a given file actually needs is decided by CONVERSION_PROFILES below,
 // not by anything in here.
@@ -101,12 +131,16 @@ export const useMediaConversion = () => {
     setConversionProgress(null);
 
     try {
-      const result = await invoke<string>('convert_image', {
-        inputPath,
-        outputFormat,
-        outputPath: outputPath || null,
-        preserveOriginal
-      });
+      const result = await withTimeout(
+        invoke<string>('convert_image', {
+          inputPath,
+          outputFormat,
+          outputPath: outputPath || null,
+          preserveOriginal
+        }),
+        IMAGE_CONVERSION_TIMEOUT_MS,
+        `Timed out converting image after ${IMAGE_CONVERSION_TIMEOUT_MS}ms`
+      );
       return result;
     } catch (error) {
       console.error('Conversion failed:', error);

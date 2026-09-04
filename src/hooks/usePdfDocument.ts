@@ -8,7 +8,11 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 let workerConfigured = false;
 
-function ensureWorkerConfigured(): void {
+// Exported for PdfFolderGallery.tsx, which loads its own separate PDFDocumentProxy per file
+// (rather than going through this hook) but still needs pdf.js's worker pointed somewhere before
+// calling getDocument() itself. Idempotent (the module-level flag guards re-assignment), so
+// either caller can call this first with no coordination needed.
+export function ensureWorkerConfigured(): void {
   if (workerConfigured) return;
   GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
   workerConfigured = true;

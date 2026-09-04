@@ -1,0 +1,101 @@
+/* components/board/boardFonts.css
+ *
+ * Self-hosted @font-face faces for BoardText's font picker (see utils/boardFonts.ts) - bundled as
+ * local woff2 files (public/fonts/, all OFL-licensed, sourced from Google Fonts) rather than
+ * relying on whatever happens to be installed on the host OS, so picking "Poppins" looks like
+ * Poppins on every machine this app runs on, not just ones that happen to have it installed
+ * already (unlike every OTHER entry in BOARD_FONT_OPTIONS, which are plain OS font names with no
+ * face declared here at all).
+ *
+ * Inter / Montserrat / Playfair Display / Space Grotesk each ship as ONE variable-weight woff2
+ * file, reused across both the 400 and 700 @font-face blocks below - this mirrors Google Fonts'
+ * own generated CSS exactly; the browser's variable-font engine renders the correct weight from
+ * whichever @font-face block matched the request, it isn't two copies of the same weight. Poppins
+ * ships as two genuinely separate static files, and Bebas Neue only ever had the one weight.
+ *
+ * A face declared here is NOT actually fetched just because this file loaded - per spec, a browser
+ * only downloads a font once something on the page actually renders text in it. For DOM text
+ * that "just works" the first time it's needed; for <canvas> text (ctx.fillText, which is how
+ * every BoardText item is drawn - see boardHandlers.ts's renderBoardText) it does NOT - a font
+ * that isn't already loaded silently falls back to the generic tail of its own font-family list
+ * for that one draw call and never retries on its own. See utils/boardFonts.ts's
+ * preloadBoardFonts, which BoardCanvas.tsx calls on mount to force every face below to load up
+ * front, then redraws once they're ready.
+ */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/Inter.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/Inter.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Poppins";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/Poppins-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Poppins";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/Poppins-Bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Montserrat";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/Montserrat.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Montserrat";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/Montserrat.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Playfair Display";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/PlayfairDisplay.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Playfair Display";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/PlayfairDisplay.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/SpaceGrotesk.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/SpaceGrotesk.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Bebas Neue";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/BebasNeue-Regular.woff2") format("woff2");
+}

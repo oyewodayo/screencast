@@ -72,6 +72,9 @@ interface FileToolsDockerProps {
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
+  // through to VideoTimelineDocker - see its own prop doc comment.
+  noiseReductionStatus?: "idle" | "calibrating" | "active";
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // VideoTimelineDocker - see its own prop doc comments.
   selectedOverlayId?: string | null;
@@ -90,6 +93,11 @@ interface FileToolsDockerProps {
   onSelectBlurOverlay?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
+  // Video-only: PiP-overlay selection/placement state, same threading as the overlay props above.
+  selectedPipOverlayId?: string | null;
+  onSelectPipOverlay?: (id: string | null) => void;
+  isPlacingPip?: boolean;
+  onToggleArmPlacePip?: () => void;
   // Video-only: on-canvas crop-tool arm state, same threading as the overlay props above.
   isCroppingClip?: boolean;
   onToggleCroppingClip?: () => void;
@@ -118,6 +126,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onTimelineInsertHandled,
   onOutputTimeChange,
   onActiveClipChange,
+  noiseReductionStatus,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -130,6 +139,10 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onSelectBlurOverlay,
   isPlacingBlur,
   onToggleArmPlaceBlur,
+  selectedPipOverlayId,
+  onSelectPipOverlay,
+  isPlacingPip,
+  onToggleArmPlacePip,
   isCroppingClip,
   onToggleCroppingClip,
 }) => {
@@ -156,6 +169,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onTimelineInsertHandled={onTimelineInsertHandled}
         onOutputTimeChange={onOutputTimeChange}
         onActiveClipChange={onActiveClipChange}
+        noiseReductionStatus={noiseReductionStatus}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={onSelectOverlay}
         isPlacingText={isPlacingText}
@@ -168,6 +182,10 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onSelectBlurOverlay={onSelectBlurOverlay}
         isPlacingBlur={isPlacingBlur}
         onToggleArmPlaceBlur={onToggleArmPlaceBlur}
+        selectedPipOverlayId={selectedPipOverlayId}
+        onSelectPipOverlay={onSelectPipOverlay}
+        isPlacingPip={isPlacingPip}
+        onToggleArmPlacePip={onToggleArmPlacePip}
         isCroppingClip={isCroppingClip}
         onToggleCroppingClip={onToggleCroppingClip}
       />

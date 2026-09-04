@@ -24,6 +24,17 @@ interface RecordingDockerProps {
   onToggleIncludeSystemAudio: () => void;
   // WASAPI loopback is Windows-only - see BottomDocker.tsx's own doc comment on this same prop.
   isSystemAudioSupported: boolean;
+  // Records the (single) selected webcam as its own separate file instead of baking it into the
+  // screen recording - see Dashboard.tsx's own doc comment on this state and
+  // recording_with_output_sva (win.rs) for why it only applies to record_type "sva" with exactly
+  // one camera selected.
+  separateWebcamCapture: boolean;
+  onToggleSeparateWebcamCapture: () => void;
+  // Records click position/timing to a sidecar JSON for the editor's own "auto zoom on click"
+  // tool - Windows-only (services/click_tracker.rs), offered for the same screen-capture record
+  // types as includeSystemAudio above.
+  trackClicks: boolean;
+  onToggleTrackClicks: () => void;
   isRecording: boolean;
   isPaused: boolean;
   onScreenshotClick: () => void;
@@ -55,6 +66,10 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   includeSystemAudio,
   onToggleIncludeSystemAudio,
   isSystemAudioSupported,
+  separateWebcamCapture,
+  onToggleSeparateWebcamCapture,
+  trackClicks,
+  onToggleTrackClicks,
   isRecording,
   isPaused,
   onScreenshotClick,
@@ -185,6 +200,30 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
           </div>
         )}
 
+        {/* Same screen-capturing record types click_tracker.rs's own gate uses (start_recording,
+            recording.rs) - "va"/"v"/"a" never touch the screen at all, so there's nothing to click
+            "on" in a meaningful sense for them. */}
+        {(recordType === "sva" || recordType === "sv" || recordType === "sa" || recordType === "s") && (
+          <div>
+            <div className="docker-field-label p-1 text-sm">&nbsp;</div>
+            <label
+              title={
+                isSystemAudioSupported
+                  ? "Records where and when you click during the recording, so the editor can suggest zooming in on each one afterward."
+                  : "Click tracking is Windows-only for now - not available on this platform."
+              }
+              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
+                isSystemAudioSupported
+                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
+                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
+              }`}
+            >
+              <input type="checkbox" checked={trackClicks && isSystemAudioSupported} disabled={!isSystemAudioSupported} onChange={onToggleTrackClicks} />
+              Track clicks (auto-zoom)
+            </label>
+          </div>
+        )}
+
         <div className="flex items-end gap-1">
           <div>
             <div className="docker-field-label p-1 text-sm">Video device(s)</div>
@@ -214,6 +253,34 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             <IoRefresh />
           </button>
         </div>
+
+        {/* Only meaningful for "sva" with exactly one camera - see recording_with_output_sva's own
+            doc comment (win.rs) for why more than one camera isn't supported here. */}
+        {recordType === "sva" && videoDevices.length >= 1 && (
+          <div>
+            <div className="docker-field-label p-1 text-sm">&nbsp;</div>
+            <label
+              title={
+                videoDevices.length === 1
+                  ? "Records the webcam as its own separate file instead of baking it into the screen recording, so you can reposition/resize/reshape it later in the editor's picture-in-picture layer."
+                  : "Only supported with exactly one camera selected."
+              }
+              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
+                videoDevices.length === 1
+                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
+                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
+              }`}
+            >
+              <input
+                type="checkbox"
+                checked={separateWebcamCapture && videoDevices.length === 1}
+                disabled={videoDevices.length !== 1}
+                onChange={onToggleSeparateWebcamCapture}
+              />
+              Record webcam separately (PiP editing)
+            </label>
+          </div>
+        )}
       </div>
 
       <div className="docker-actions-row flex items-end gap-2">

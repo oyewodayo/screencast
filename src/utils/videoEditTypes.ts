@@ -32,6 +32,14 @@ export type KenBurnsPreset = "zoom-in" | "zoom-out" | "pan-left" | "pan-right";
 export interface ClipKenBurns {
   preset: KenBurnsPreset;
   intensity?: number; // 0..1, undefined means 0.5 (moderate) - how far the zoom/pan travels
+  // Where a "zoom-in"/"zoom-out" preset centers its crop window - fraction of the source frame,
+  // undefined means the frame's own center (0.5, 0.5), the pre-existing look. Ignored by
+  // "pan-left"/"pan-right", which have their own fixed direction. Lets the "auto zoom on click"
+  // tool (applyAutoZoomAtClicks, videoEditHandlers.ts) center a punch-in on where a click actually
+  // landed instead of the frame's middle - both preview (kenBurnsTransform, videoColorFilters.ts)
+  // and export (ken_burns_chain, conversion.rs) read this the same way a plain zoom does.
+  targetX?: number;
+  targetY?: number;
 }
 
 // A free-form crop window into this clip's own frame - independent x/y/width/height (fractions of
@@ -91,6 +99,31 @@ export interface Clip {
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
   crop?: ClipCrop;
+  // Horizontal mirror of the clip's own frame - applied first, before crop/Ken Burns, in both the
+  // live preview (VideoPlayer's CSS transform) and export (conversion.rs's segment_effect_chain),
+  // so crop/pan coordinates always describe the already-mirrored frame identically in both places.
+  // Undefined/false means the pre-existing unmirrored look.
+  flipHorizontal?: boolean;
+  // Playback-rate multiplier for JUST this clip's own [start,end) source range - 0.25..4, undefined
+  // means 1 (unchanged, the pre-existing look). Unlike every other field on this type, this changes
+  // how long the clip occupies on the OUTPUT timeline: (end-start)/speed seconds, not (end-start) -
+  // a 10s source range at 2x speed plays back in 5 output seconds. That ripples into everywhere a
+  // clip's own duration is read as "how long this plays for" rather than "how much source it
+  // covers" - VideoTimelineDocker.tsx's own outputStarts/clipDurations, the resize-drag pixel<->
+  // source-seconds conversion, and currentOutputTime's own source-time-elapsed-within-clip mapping
+  // all divide/multiply by this explicitly (grep `.speed` in that file for every site). Export
+  // applies it via `setpts=PTS/speed` on the video and an atempo chain on the audio (see
+  // atempo_chain, conversion.rs, for why that's a *chain* and not a single filter) - both BEFORE
+  // any Ken Burns/transition timing on that segment, so their own duration math already operates in
+  // OUTPUT time and needs no separate speed-awareness of its own.
+  speed?: number;
+  // Background-noise reduction strength, 0..1 - undefined/0 means off, the pre-existing look.
+  // Unlike color/Ken Burns/crop, this has no live-preview equivalent: it's an FFT denoiser
+  // (afftdn) that only ever runs at export time (conversion.rs's audio_trim_chain) - there's no
+  // cheap way to run the same filter over the live <video> element's audio in the browser, so
+  // NoiseReductionPopover shows a "preview plays the original audio" note rather than pretending
+  // this is previewable the way speed/crop are.
+  noiseReduction?: number;
 }
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
@@ -257,6 +290,43 @@ export interface AudioOverlay {
   updatedAt: number;
 }
 
+// A picture-in-picture video layer - e.g. a webcam recording captured separately from the screen
+// (see FormData.separate_webcam_capture, recording.rs) and composited back on top of the primary
+// clip track. Unlike TextOverlay/ImageOverlay/BlurOverlay, this has real moving-picture content of
+// its own that can't be pre-rendered to a flat PNG the way those are for export (videoOverlayRender.ts) -
+// both the live preview (a real <video> element, see VideoOverlayLayer.tsx) and export
+// (export_trimmed_video's own PipOverlay struct, conversion.rs) instead composite the actual video
+// frames directly, same technique recording.rs's build_camera_overlay_filter_complex already uses
+// for the baked-in overlay this feature is the editable alternative to. Same trimStart/
+// sourceDuration shape as AudioOverlay (a real source file, not an abstract stretchable box).
+export type PipShape = "circle" | "rounded" | "rectangle";
+export interface PipOverlay {
+  id: string;
+  sourcePath: string;
+  // Normalized 0..1 fractions of the video frame, same basis as ImageOverlay's own x/y/width/height.
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  shape: PipShape;
+  cornerRadius?: number; // fraction of frame height, "rounded" only - undefined means a modest default
+  trimStart: number;
+  sourceDuration: number;
+  startTime: number;
+  endTime: number;
+  // Muted by default - a PiP is commonly a webcam recorded via FormData.separate_webcam_capture,
+  // which never has an audio track at all (the mic already goes to the main track in that case -
+  // see win.rs's own comment), so silence is the safer default; an arbitrary picked video with its
+  // own real audio can turn this on. makePipOverlay (videoEditHandlers.ts) always sets `muted`
+  // explicitly (true) rather than leaving it undefined, unlike AudioOverlay's own muted field
+  // (there, undefined/false both mean audible) - so this being undefined should never actually
+  // happen for a pip created through the normal add flow.
+  volume: number; // 0..1, defaults to 1
+  muted?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 // What export_trimmed_video (Rust) actually consumes - plain, ordered [start,end) ranges, each
 // naming its own source file. Kept as a separate type from Clip (rather than reusing Clip
 // directly) so call sites are explicit about which shape they need; the id is UI-only and never
@@ -269,6 +339,9 @@ export interface KeepSegment {
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
   crop?: ClipCrop;
+  flipHorizontal?: boolean;
+  speed?: number;
+  noiseReduction?: number;
 }
 
 export interface VideoEditState {
@@ -281,6 +354,7 @@ export interface VideoEditState {
   imageOverlays: ImageOverlay[];
   blurOverlays: BlurOverlay[];
   audioOverlays: AudioOverlay[];
+  pipOverlays: PipOverlay[];
   // The primary video's OWN audio level - distinct from any AudioOverlay's own volume/muted (those
   // are separate mixed-in tracks; this is the original soundtrack that was always there). A plain
   // pair of fields rather than an array item like the overlays above, matching the "one track"
@@ -300,6 +374,7 @@ export interface EditableFields {
   imageOverlays: ImageOverlay[];
   blurOverlays: BlurOverlay[];
   audioOverlays: AudioOverlay[];
+  pipOverlays: PipOverlay[];
   videoAudioMuted: boolean;
   videoAudioVolume: number;
 }
@@ -314,6 +389,8 @@ export interface VideoEditCommand {
   after: EditableFields;
   label:
     | "trim"
+    | "trim-silence"
+    | "auto-zoom"
     | "split"
     | "delete"
     | "reorder"
@@ -331,6 +408,9 @@ export interface VideoEditCommand {
     | "add-audio"
     | "edit-audio"
     | "delete-audio"
+    | "add-pip"
+    | "edit-pip"
+    | "delete-pip"
     | "edit-track-audio";
 }
 
@@ -342,6 +422,7 @@ export function createEmptyState(sourcePath: string, duration: number): VideoEdi
     imageOverlays: [],
     blurOverlays: [],
     audioOverlays: [],
+    pipOverlays: [],
     videoAudioMuted: false,
     videoAudioVolume: 1,
     updatedAt: new Date().toISOString(),

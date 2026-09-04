@@ -3,7 +3,7 @@
 // Pure functions only, mirroring pdfAnnotationHandlers.ts's style: no React, callers pass in
 // everything they need explicitly. useVideoEditStore is the only caller.
 
-import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, PipOverlay, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
 const MIN_OVERLAY_DURATION = 0.1;
@@ -32,7 +32,7 @@ function sanitizeCrop(crop: ClipCrop | undefined): ClipCrop | undefined {
 // the same order as `clips` - that order is exactly the desired playback/output order, so this is
 // a type-only projection, not a sort or a merge.
 export function toKeepSegments(clips: Clip[]): KeepSegment[] {
-  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn, crop }) => ({
+  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn, crop, flipHorizontal, speed, noiseReduction }) => ({
     sourcePath,
     start,
     end,
@@ -40,6 +40,9 @@ export function toKeepSegments(clips: Clip[]): KeepSegment[] {
     kenBurns,
     transitionIn,
     crop: sanitizeCrop(crop),
+    flipHorizontal,
+    speed,
+    noiseReduction,
   }));
 }
 
@@ -64,13 +67,142 @@ export function splitClipAt(clips: Clip[], index: number, sourceTime: number): C
   return [
     ...clips.slice(0, index),
     // First half keeps transitionIn (still the same pairing with whatever precedes it) plus the
-    // look/motion effects - both halves keep colorFilter/kenBurns/crop (splitting a graded/panned/
-    // cropped clip shouldn't silently reset its look), but only the first half is actually
-    // adjacent to the clip that used to precede the whole thing.
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn, crop: clip.crop },
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, crop: clip.crop },
+    // look/motion effects - both halves keep colorFilter/kenBurns/crop/flipHorizontal/speed
+    // (splitting a graded/panned/cropped/mirrored/sped-up clip shouldn't silently reset its look),
+    // but only the first half is actually adjacent to the clip that used to precede the whole thing.
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed },
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed },
     ...clips.slice(index + 1),
   ];
+}
+
+// Splits `clipId`'s own [start,end) into the pieces that remain once every range in
+// `silentRanges` is cut out - a batch version of splitClipAt+deleteClipAt for the "remove every
+// detected dead-air gap in this clip" gesture (see detect_silence, conversion.rs, and the Trim
+// Silence toolbar button), so N gaps removed at once lands as ONE undo command instead of up to
+// 2*N. Ranges are clamped/intersected against the clip's own [start,end) here (not just trusted
+// from the caller) since detect_silence analyzes the WHOLE source file, not just this clip's own
+// trim window. Every kept piece carries the original clip's own colorFilter/kenBurns/crop/
+// flipHorizontal forward (same reasoning as splitClipAt); only the FIRST piece keeps transitionIn,
+// for the same reason splitClipAt's own first half does. A piece shorter than MIN_CLIP_LENGTH
+// (silence detection landing a hair off a clip's own edge) is dropped rather than kept as a
+// sliver; a clip that ends up entirely silent is simply removed.
+export function removeSilentRanges(clips: Clip[], clipId: string, silentRanges: { start: number; end: number }[]): Clip[] {
+  const index = clips.findIndex((c) => c.id === clipId);
+  if (index === -1) return clips;
+  const clip = clips[index];
+
+  const sorted = silentRanges
+    .map((r) => ({ start: Math.max(clip.start, r.start), end: Math.min(clip.end, r.end) }))
+    .filter((r) => r.end - r.start > 0)
+    .sort((a, b) => a.start - b.start);
+  if (sorted.length === 0) return clips;
+
+  const kept: { start: number; end: number }[] = [];
+  let cursor = clip.start;
+  for (const range of sorted) {
+    if (range.start > cursor) kept.push({ start: cursor, end: range.start });
+    cursor = Math.max(cursor, range.end);
+  }
+  if (clip.end > cursor) kept.push({ start: cursor, end: clip.end });
+
+  const keptClips: Clip[] = kept
+    .filter((k) => k.end - k.start >= MIN_CLIP_LENGTH)
+    .map((k, i) => ({
+      id: crypto.randomUUID(),
+      sourcePath: clip.sourcePath,
+      start: k.start,
+      end: k.end,
+      colorFilter: clip.colorFilter,
+      kenBurns: clip.kenBurns,
+      crop: clip.crop,
+      flipHorizontal: clip.flipHorizontal,
+      speed: clip.speed,
+      transitionIn: i === 0 ? clip.transitionIn : undefined,
+    }));
+
+  return [...clips.slice(0, index), ...keptClips, ...clips.slice(index + 1)];
+}
+
+// One recorded click, already resolved to this clip's own SOURCE-time coordinate space (same
+// space Clip.start/end occupy) and frame-relative x/y (see load_click_sidecar, recording.rs, and
+// ClickEvent's own doc comment there for how these get produced during recording).
+export interface AutoZoomClick {
+  time: number;
+  x: number;
+  y: number;
+}
+
+// Bracketing durations for the punch-in/punch-out pair generated around each click - tuned once
+// here (not user-adjustable in v1) to read as a deliberate "zoom in on this, hold, zoom back out"
+// beat: LEAD_IN ramps up to the peak zoom by shortly after the click itself (the ramp is still
+// finishing as the click lands, which reads better than already being fully zoomed in before
+// anything happened), HOLD is how long it stays near peak, LEAD_OUT ramps back to normal.
+const AUTO_ZOOM_LEAD_IN_SEC = 0.8;
+const AUTO_ZOOM_HOLD_SEC = 1.5;
+const AUTO_ZOOM_LEAD_OUT_SEC = 0.8;
+const AUTO_ZOOM_INTENSITY = 0.6;
+
+// Splits `clipId`'s own [start,end) around each click that falls inside it, inserting a zoom-in-
+// then-zoom-out pair of Ken Burns segments centered on that click's own position for each one - the
+// "auto zoom on click" toolbar action's actual splice logic, batched into ONE undo command the same
+// "batch cuts land as one command, not 2*N" reasoning removeSilentRanges above already established
+// (see its own doc comment). Clicks too close together to each get their own non-overlapping zoom
+// window are skipped entirely (not merged, not truncated) - simpler than trying to blend two
+// overlapping zooms into one, and a skipped click still gets its own zoom on a later call once
+// earlier ones have been removed to make room.
+export function applyAutoZoomAtClicks(clips: Clip[], clipId: string, clicks: AutoZoomClick[]): Clip[] {
+  const index = clips.findIndex((c) => c.id === clipId);
+  if (index === -1) return clips;
+  const clip = clips[index];
+
+  const sorted = clicks.filter((c) => c.time > clip.start && c.time < clip.end).sort((a, b) => a.time - b.time);
+  if (sorted.length === 0) return clips;
+
+  const pieces: Clip[] = [];
+  let cursor = clip.start;
+  for (const click of sorted) {
+    const zoomStart = Math.max(cursor, click.time - AUTO_ZOOM_LEAD_IN_SEC);
+    const peak = click.time + AUTO_ZOOM_HOLD_SEC;
+    const zoomEnd = Math.min(clip.end, peak + AUTO_ZOOM_LEAD_OUT_SEC);
+    if (zoomStart < cursor || peak - zoomStart < MIN_CLIP_LENGTH || zoomEnd - peak < MIN_CLIP_LENGTH) continue;
+
+    if (zoomStart > cursor) {
+      pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: zoomStart, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed });
+    }
+    pieces.push({
+      id: crypto.randomUUID(),
+      sourcePath: clip.sourcePath,
+      start: zoomStart,
+      end: peak,
+      colorFilter: clip.colorFilter,
+      crop: clip.crop,
+      flipHorizontal: clip.flipHorizontal,
+      speed: clip.speed,
+      kenBurns: { preset: "zoom-in", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y },
+    });
+    pieces.push({
+      id: crypto.randomUUID(),
+      sourcePath: clip.sourcePath,
+      start: peak,
+      end: zoomEnd,
+      colorFilter: clip.colorFilter,
+      crop: clip.crop,
+      flipHorizontal: clip.flipHorizontal,
+      speed: clip.speed,
+      kenBurns: { preset: "zoom-out", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y },
+    });
+    cursor = zoomEnd;
+  }
+  if (clip.end > cursor) {
+    pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: clip.end, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed });
+  }
+  if (pieces.length === 0) return clips;
+  // First piece keeps the original clip's own transitionIn (still adjacent to whatever preceded
+  // the whole thing) - same reasoning splitClipAt/removeSilentRanges already established.
+  pieces[0].transitionIn = clip.transitionIn;
+
+  return [...clips.slice(0, index), ...pieces, ...clips.slice(index + 1)];
 }
 
 // Removes the clip at `index` outright - what was that stretch of source video is simply no
@@ -123,7 +255,7 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
 // transition) - same "one function, Partial<T> patch" shape as updateOverlay, but standalone
 // since Clip (unlike every overlay type) has no updatedAt for anything to read back, so it can't
 // reuse updateOverlay<T extends {id,updatedAt}> as-is.
-export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop">>): Clip[] {
+export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction">>): Clip[] {
   return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
 
@@ -298,6 +430,58 @@ export function resizeAudioOverlayTime(overlays: AudioOverlay[], id: string, edg
     }
     // End edge: can't extend past whatever's left of the source after the current trim window
     // (trimStart + duration can't exceed sourceDuration), or past the assembled timeline's own end.
+    const trimEnd = o.trimStart + (o.endTime - o.startTime);
+    const roomInSource = o.sourceDuration - trimEnd;
+    const maxEnd = Math.min(maxOutputEnd, o.endTime + Math.max(0, roomInSource));
+    const clampedEnd = Math.min(maxEnd, Math.max(time, o.startTime + MIN_OVERLAY_DURATION));
+    return { ...o, endTime: clampedEnd, updatedAt: Date.now() };
+  });
+}
+
+export function makePipOverlay(
+  sourcePath: string,
+  sourceDuration: number,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  startTime: number,
+  endTime: number
+): PipOverlay {
+  const now = Date.now();
+  return {
+    id: crypto.randomUUID(),
+    sourcePath,
+    sourceDuration,
+    x,
+    y,
+    width,
+    height,
+    shape: "circle",
+    trimStart: 0,
+    startTime,
+    endTime,
+    volume: 1,
+    muted: true,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+// Drags one edge of a PiP overlay's time range - same trim-into-source reasoning as
+// resizeAudioOverlayTime above (a PipOverlay is a real video source too, not an abstract
+// stretchable box like text/image/blur), copied rather than shared with it since the two types
+// have no common base beyond id/startTime/endTime/trimStart/sourceDuration, which duplicateTimedOverlay's
+// own generic constraint already shows isn't quite worth abstracting over for just this one method.
+export function resizePipOverlayTime(overlays: PipOverlay[], id: string, edge: "start" | "end", maxOutputEnd: number, time: number): PipOverlay[] {
+  return overlays.map((o) => {
+    if (o.id !== id) return o;
+    if (edge === "start") {
+      const minStart = o.startTime - o.trimStart;
+      const clampedStart = Math.max(minStart, Math.min(time, o.endTime - MIN_OVERLAY_DURATION));
+      const trimStart = o.trimStart + (clampedStart - o.startTime);
+      return { ...o, startTime: clampedStart, trimStart, updatedAt: Date.now() };
+    }
     const trimEnd = o.trimStart + (o.endTime - o.startTime);
     const roomInSource = o.sourceDuration - trimEnd;
     const maxEnd = Math.min(maxOutputEnd, o.endTime + Math.max(0, roomInSource));

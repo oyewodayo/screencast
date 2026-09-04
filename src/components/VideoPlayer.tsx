@@ -110,6 +110,13 @@ interface VideoPlayerProps {
   // unaware otherwise, just applying whatever small descriptor it's handed straight to the
   // <video> element's own CSS.
   activeClipEffects?: ActiveClipEffects | null;
+  // Live status of the noise-reduction Web Audio graph below - "calibrating" while the worklet
+  // module is loading and/or its noise profile is being learned, "active" once real subtraction
+  // is running, "idle" whenever activeClipEffects?.noiseReduction is unset/0 (including before
+  // the feature has ever been touched at all this session). NoiseReductionPopover (mounted by a
+  // sibling, VideoTimelineDocker) surfaces this as its spinner - same "report state upward for a
+  // sibling to consume" shape as onActiveClipChange itself.
+  onNoiseReductionStatusChange?: (status: "idle" | "calibrating" | "active") => void;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -139,7 +146,7 @@ export interface VideoPlayerHandle {
   previewCropLive: (crop: ClipCrop | null) => void;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -151,6 +158,64 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Non-null exactly while ClipCropOverlay has an in-progress drag - see previewCropLive below and
   // VideoPlayerHandle's own doc comment on it.
   const liveCropOverrideRef = useRef<ClipCrop | null>(null);
+
+  // AudioContext backing live noise-reduction preview - created eagerly on mount (see the pre-warm
+  // effect below) rather than lazily on first use, specifically so the worklet module is already
+  // loaded and registered by the time any clip's noiseReduction first turns on. That matters
+  // because createMediaElementSource(video) - the operation that actually reroutes this element's
+  // audio through the graph - can only be safely followed by a gap-free connect() once the
+  // AudioWorkletNode it needs to connect THROUGH can be constructed synchronously; constructing it
+  // requires addModule() to have already resolved. Doing that resolve-wait BEFORE ever touching the
+  // element's audio (rather than after, as an earlier version of this did) is what avoids a real,
+  // user-reported stall: detaching an already-playing element's native audio path and only
+  // reconnecting it once an async module load finishes left a gap the media pipeline's AV-sync
+  // clock could stall on, which read as "clicking the clip stopped playback".
+  const noiseCtxRef = useRef<AudioContext | null>(null);
+  const noiseWorkletReadyRef = useRef<Promise<void> | null>(null);
+  // The graph itself (source/node), set only once addModule has resolved AND a clip has actually
+  // asked for noise reduction - null until then, so a session that never touches the feature never
+  // pays for a MediaElementAudioSourceNode at all (the AudioContext/worklet-load above is cheap and
+  // touches nothing about this element's audio by itself; only createMediaElementSource does).
+  // Kept for the rest of this mount once created (a clip's own strength dropping back to 0 just
+  // tells the worklet to bypass, see its own "strength <= 0" passthrough branch) - never torn down
+  // mid-session, only on unmount.
+  const noiseGraphRef = useRef<{ ctx: AudioContext; node: AudioWorkletNode } | null>(null);
+  // True from the moment graph attachment (awaiting noiseWorkletReadyRef, then
+  // createMediaElementSource+connect) starts until it either succeeds (noiseGraphRef.current gets
+  // set) or fails - guards against a second concurrent attempt if the effect below re-fires (the
+  // user nudging the strength slider again) while the first attempt is still in flight: since
+  // createMediaElementSource may only ever be called ONCE per <video> element, a second call while
+  // the first is still pending would throw.
+  const noiseGraphSetupInProgressRef = useRef(false);
+  // Set once on unmount so a still-in-flight attachment doesn't try to wire up a node after the
+  // fact.
+  const noiseGraphUnmountedRef = useRef(false);
+  // Which clip id the worklet's current noise profile was learned from, so the effect below only
+  // sends {type:'recalibrate'} when the ACTIVE CLIP actually changes, not on every strength tweak.
+  const lastCalibratedClipIdRef = useRef<string | null>(null);
+  const onNoiseReductionStatusChangeRef = useRef(onNoiseReductionStatusChange);
+  onNoiseReductionStatusChangeRef.current = onNoiseReductionStatusChange;
+
+  // Pre-warm: kicks off the AudioContext + worklet module load immediately on mount, well before
+  // any clip has actually asked for noise reduction - see noiseCtxRef's own doc comment for why.
+  // Constructing an AudioContext and loading a module into it touches nothing about this <video>
+  // element's own audio output, so this is free/invisible for the (common) case where noise
+  // reduction is never used at all this session.
+  useEffect(() => {
+    const ctx = new AudioContext();
+    noiseCtxRef.current = ctx;
+    noiseWorkletReadyRef.current = ctx.audioWorklet
+      .addModule("/audio-worklets/noise-reduction-processor.js")
+      .catch((err) => {
+        console.error("Failed to pre-load noise-reduction worklet - noise reduction preview will stay unavailable:", err);
+        throw err;
+      });
+    return () => {
+      noiseGraphUnmountedRef.current = true;
+      noiseGraphRef.current?.node.disconnect();
+      ctx.close().catch(() => {});
+    };
+  }, []);
 
   // The one function allowed to write video.style.transform for crop/Ken Burns (see the effect
   // further down) - factored out so previewCropLive can also call it directly, outside of React's
@@ -164,18 +229,23 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const effects = activeClipEffectsRef.current;
     const crop = liveCropOverrideRef.current ?? effects?.crop;
     const kb = effects?.kenBurns;
+    // Mirrors the raw frame first (rightmost/innermost - see cropStaticTransform's own comment on
+    // CSS transform composition order), matching conversion.rs's segment_effect_chain, which runs
+    // `hflip` before crop/Ken Burns so crop/pan coordinates describe the already-mirrored frame the
+    // same way in both preview and export.
+    const flipTransform = effects?.flipHorizontal ? 'scaleX(-1)' : '';
     if (!crop && !kb) {
-      video.style.transform = '';
+      video.style.transform = flipTransform;
       return;
     }
     const cropTransform = crop ? cropStaticTransform(crop) : '';
     if (!kb) {
-      video.style.transform = cropTransform;
+      video.style.transform = `${cropTransform} ${flipTransform}`.trim();
       return;
     }
     const duration = Math.max(0.01, effects!.sourceEnd - effects!.sourceStart);
     const progress = Math.max(0, Math.min(1, (video.currentTime - effects!.sourceStart) / duration));
-    video.style.transform = `${cropTransform} ${kenBurnsTransform(kb, progress)}`.trim();
+    video.style.transform = `${cropTransform} ${kenBurnsTransform(kb, progress)} ${flipTransform}`.trim();
   };
 
   useImperativeHandle(ref, () => ({
@@ -490,6 +560,101 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     video.style.filter = cf && cf.preset !== 'none' ? cssFilterForColorPreset(cf) : '';
   }, [activeClipEffects?.colorFilter]);
 
+  // Live-preview playback rate for the active clip's own speed edit - export counterpart is
+  // setpts/atempo_chain (conversion.rs). Resets to 1 when a clip has none set, the same "cleared,
+  // not left stale" reasoning the color-filter effect above follows. The manual playback-speed
+  // buttons below (playbackSpeedIncrease/Reduce/Normal) still write this same property directly for
+  // a temporary preview-only override on top of whichever clip is active; this baseline just
+  // re-asserts itself the next time the active clip's own speed value actually changes.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.playbackRate = activeClipEffects?.speed ?? 1;
+  }, [activeClipEffects?.speed]);
+
+  // Live noise-reduction preview - wires this <video> element's audio through a Web Audio graph
+  // (MediaElementAudioSourceNode -> AudioWorkletNode running noise-reduction-processor.js ->
+  // destination) the first time any clip's noiseReduction is actually turned on, then reuses that
+  // same graph for the rest of this mount (see noiseGraphRef's own doc comment for why - a clip's
+  // own strength dropping back to 0 just tells the worklet to bypass, never tears the graph down).
+  // Export counterpart is afftdn (conversion.rs) - same algorithm family (FFT magnitude-domain
+  // noise-profile subtraction), not the same code, so preview and export are perceptually
+  // consistent without needing to be bit-identical.
+  useEffect(() => {
+    const strength = activeClipEffects?.noiseReduction ?? 0;
+    const clipId = activeClipEffects?.id ?? null;
+
+    if (strength <= 0) {
+      onNoiseReductionStatusChangeRef.current?.("idle");
+      if (noiseGraphRef.current) {
+        const { ctx, node } = noiseGraphRef.current;
+        node.parameters.get("strength")?.setTargetAtTime(0, ctx.currentTime, 0.05);
+      }
+      return;
+    }
+
+    const needsRecalibration = clipId !== lastCalibratedClipIdRef.current;
+    lastCalibratedClipIdRef.current = clipId;
+
+    if (noiseGraphRef.current) {
+      const { ctx, node } = noiseGraphRef.current;
+      node.parameters.get("strength")?.setTargetAtTime(strength, ctx.currentTime, 0.05);
+      if (needsRecalibration) {
+        onNoiseReductionStatusChangeRef.current?.("calibrating");
+        node.port.postMessage({ type: "recalibrate" });
+      } else {
+        onNoiseReductionStatusChangeRef.current?.("active");
+      }
+      return;
+    }
+
+    // No graph yet - either this is the very first activation this mount, or an earlier
+    // activation's attachment is still in flight (see noiseGraphSetupInProgressRef's own doc
+    // comment). Either way this IS "calibrating" from the UI's point of view.
+    onNoiseReductionStatusChangeRef.current?.("calibrating");
+    if (noiseGraphSetupInProgressRef.current) return;
+
+    const video = videoRef.current;
+    const ctx = noiseCtxRef.current;
+    if (!video || !ctx || !noiseWorkletReadyRef.current) return;
+    noiseGraphSetupInProgressRef.current = true;
+
+    noiseWorkletReadyRef.current
+      .then(() => {
+        if (noiseGraphUnmountedRef.current) return;
+        // Everything that touches this element's live audio routing happens together, in this one
+        // synchronous block, with no further `await` in between - createMediaElementSource(video)
+        // detaches the element's native audio path the instant it's called, and the worklet module
+        // is already guaranteed loaded (this whole callback only runs after that promise resolved),
+        // so the AudioWorkletNode can be constructed and both connect() calls made on the very next
+        // lines. That's what avoids the gap an earlier version of this had (async module-load
+        // happening AFTER the detach), which could stall the element's own AV-sync clock and read
+        // as "clicking the clip stopped playback".
+        const source = ctx.createMediaElementSource(video);
+        const node = new AudioWorkletNode(ctx, "noise-reduction-processor");
+        node.port.onmessage = (e) => {
+          if (e.data?.type === "calibrating") onNoiseReductionStatusChangeRef.current?.("calibrating");
+          else if (e.data?.type === "calibrated") onNoiseReductionStatusChangeRef.current?.("active");
+        };
+        // Reads the CURRENT value (via the same ref applyCropAndKenBurns already relies on for
+        // the same reason) rather than the `strength` this effect run closed over - a re-run (the
+        // slider moving again) could in principle have happened in the brief window before this
+        // resolved.
+        node.parameters.get("strength")?.setValueAtTime(activeClipEffectsRef.current?.noiseReduction ?? 0, ctx.currentTime);
+        source.connect(node);
+        node.connect(ctx.destination);
+        noiseGraphRef.current = { ctx, node };
+        if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      })
+      .catch(() => {
+        // Already logged by the pre-warm effect itself - the video's audio was never touched
+        // (createMediaElementSource is only called after this promise resolves, never before), so
+        // it just continues playing on its normal native path, unprocessed.
+        onNoiseReductionStatusChangeRef.current?.("idle");
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeClipEffects?.id, activeClipEffects?.noiseReduction]);
+
   // Live-preview crop + Ken Burns, combined into the one thing that's ever allowed to write
   // video.style.transform (two separate effects each writing it independently would race and
   // clobber each other) - applyCropAndKenBurns above does the actual writing, reusable here AND
@@ -519,7 +684,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       video.style.transform = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop]);
+  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);

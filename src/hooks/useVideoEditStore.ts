@@ -2,10 +2,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { listen } from "@tauri-apps/api/event";
-import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
+import { ask } from "@tauri-apps/api/dialog";
+import { appWindow } from "@tauri-apps/api/window";
+import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
+  applyAutoZoomAtClicks as applyAutoZoomAtClicksHandler,
+  AutoZoomClick,
   bringOverlayToFront,
   deleteClipAt as deleteClipAtHandler,
   deleteOverlay,
@@ -15,12 +19,15 @@ import {
   makeAudioOverlay,
   makeBlurOverlay,
   makeImageOverlay,
+  makePipOverlay,
   makeTextOverlay,
   moveOverlayTime,
+  removeSilentRanges as removeSilentRangesHandler,
   reorderClip as reorderClipHandler,
   resizeAudioOverlayTime,
   resizeClipEdge as resizeClipEdgeHandler,
   resizeOverlayTime,
+  resizePipOverlayTime,
   sendOverlayToBack,
   splitClipAt,
   toKeepSegments,
@@ -56,6 +63,27 @@ async function fetchDuration(path: string): Promise<number | null> {
   }
 }
 
+// Mirrors export_trimmed_video's own `quality`/`output_path` params (conversion.rs) - both
+// optional so a caller that passes nothing gets the exact same default behavior as before this
+// existed (resolve_export_quality's own "standard" fallback, and the default "<name> (edited).ext"
+// location next to the source).
+export type ExportQuality = "standard" | "high" | "small";
+export interface ExportOptions {
+  quality?: ExportQuality;
+  outputPath?: string;
+}
+
+// export_trimmed_video's OverlayImage.animation accepts everything OverlayAnimation does except
+// "pop" - a true scale-up/overshoot animation needs a time-varying overlay *size* in the ffmpeg
+// filter graph, not just the x/y-expression approach slide-* uses (see overlay_position_expr,
+// conversion.rs), so it isn't burned in yet. Falls back to "fade" rather than "none" so a "pop"
+// overlay still gets *some* motion in the exported file instead of appearing as a static hard cut.
+function exportOverlayAnimation(animation: OverlayAnimation | undefined): string {
+  if (!animation || animation === "none") return "none";
+  if (animation === "pop") return "fade";
+  return animation;
+}
+
 type TextOverlayContentPatch = Partial<
   Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize">
 >;
@@ -64,7 +92,8 @@ type ImageOverlayContentPatch = Partial<
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop">>;
+type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "volume" | "muted">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -134,6 +163,17 @@ export interface UseVideoEditStoreResult {
   moveAudioOverlayTime: (id: string, newStartTime: number) => void;
   deleteAudioOverlay: (id: string) => void;
   duplicateAudioOverlay: (id: string) => string;
+  // Picture-in-picture video layers (e.g. a separately-recorded webcam - see FormData.
+  // separate_webcam_capture, recording.rs) - same "real source file, trims into it" shape as audio
+  // overlays above, plus frame-relative geometry/shape like image overlays. See PipOverlay's own
+  // doc comment (videoEditTypes.ts) for why this can't reuse ImageOverlay's PNG-based rendering.
+  pipOverlays: PipOverlay[];
+  addPipOverlay: (sourcePath: string, sourceDuration: number, x: number, y: number, width: number, height: number, startTime: number, endTime: number) => string;
+  updatePipOverlayContent: (id: string, patch: PipOverlayContentPatch) => void;
+  resizePipOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
+  movePipOverlayTime: (id: string, newStartTime: number) => void;
+  deletePipOverlay: (id: string) => void;
+  duplicatePipOverlay: (id: string) => string;
   // The primary video's OWN audio level - see VideoEditState.videoAudioMuted's own doc comment for
   // why this is distinct from any AudioOverlay's own volume/muted. Read by VideoPlayer.tsx (stacked
   // multiplicatively on top of its own local listening volume) and export_trimmed_video.
@@ -157,6 +197,14 @@ export interface UseVideoEditStoreResult {
   // generic patch fn" shape as updateTextOverlayContent, just for a clip's own non-geometric
   // fields (see updateClip, videoEditHandlers.ts).
   updateClipEffects: (id: string, patch: ClipEffectsPatch) => void;
+  // Applies the result of a detect_silence scan (conversion.rs) to one clip, splitting out and
+  // dropping every detected dead-air range in a single undo step - see removeSilentRanges,
+  // videoEditHandlers.ts, for the actual splice logic.
+  trimSilenceForClip: (clipId: string, silentRanges: { start: number; end: number }[]) => void;
+  // Applies the "auto zoom on click" tool's own splice logic to one clip, inserting a zoom-in/
+  // zoom-out Ken Burns pair around each click in a single undo step - see applyAutoZoomAtClicks,
+  // videoEditHandlers.ts.
+  applyAutoZoomAtClicks: (clipId: string, clicks: AutoZoomClick[]) => void;
   // Inserts a whole new clip - from the Briefcast library or an external file dropped onto the
   // timeline - at `atIndex`, fetching its duration first if not already known. Resolves once the
   // clip has actually been added (or been skipped, if the duration lookup failed).
@@ -171,7 +219,10 @@ export interface UseVideoEditStoreResult {
   // videoPixelSize (the primary file's native resolution) is required to render text/image
   // overlays for burn-in - pass null (no overlays possible, e.g. audio-only export path) to skip
   // rendering them and export a plain trim, same as before overlays existed.
-  exportEdited: (videoPixelSize: { width: number; height: number } | null) => Promise<{ path: string; name: string } | null>;
+  exportEdited: (
+    videoPixelSize: { width: number; height: number } | null,
+    options?: ExportOptions
+  ) => Promise<{ path: string; name: string } | null>;
 }
 
 // Non-destructive edit state (an ordered, reorderable, multi-source-capable list of clips) for
@@ -196,6 +247,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   const stateRef = useRef<VideoEditState | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sourceDurationsRef = useRef<Record<string, number>>({});
+  // Mirrors isExporting for the close-guard effect below, which needs the CURRENT value at the
+  // moment the user tries to close the window, not whatever was true when that effect last
+  // re-subscribed - same "ref alongside state" reasoning as activeClipEffectsRef (VideoPlayer.tsx).
+  const isExportingRef = useRef(false);
+  isExportingRef.current = isExporting;
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
@@ -261,6 +317,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 imageOverlays: parsed.imageOverlays ?? [],
                 blurOverlays: parsed.blurOverlays ?? [],
                 audioOverlays: parsed.audioOverlays ?? [],
+                pipOverlays: parsed.pipOverlays ?? [],
                 videoAudioMuted: parsed.videoAudioMuted ?? false,
                 videoAudioVolume: parsed.videoAudioVolume ?? 1,
               });
@@ -294,16 +351,23 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourcePath]);
 
-  const flushSave = useCallback(() => {
+  // Returns the save's own promise (rather than firing-and-forgetting it, like most callers here
+  // only need) so the close-guard effect below can actually AWAIT it finishing before letting the
+  // window close - a bare setTimeout-scheduled invoke() has no way to block window teardown, so
+  // without this a close right after an edit could tear down the webview before the IPC call ever
+  // reached Rust.
+  const flushSave = useCallback((): Promise<void> => {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
     }
     const current = stateRef.current;
-    if (!sourcePath || !current) return;
-    invoke("save_video_edit_state", { videoPath: sourcePath, json: JSON.stringify(current) }).catch((err) =>
-      console.error("Failed to save video edit state:", err)
-    );
+    if (!sourcePath || !current) return Promise.resolve();
+    return invoke("save_video_edit_state", { videoPath: sourcePath, json: JSON.stringify(current) })
+      .then(() => undefined)
+      .catch((err) => {
+        console.error("Failed to save video edit state:", err);
+      });
   }, [sourcePath]);
 
   const scheduleAutosave = useCallback(() => {
@@ -313,7 +377,49 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
 
   // Flush any pending save when switching files or unmounting so a trailing edit isn't lost.
   useEffect(() => {
-    return () => flushSave();
+    return () => {
+      void flushSave();
+    };
+  }, [sourcePath, flushSave]);
+
+  // Guards the whole app window closing while this file's editor is open - mirrors
+  // useDocsEditStore's own onCloseRequested guard (save-on-quit), plus a video-specific check the
+  // docs editor has no equivalent of: closing mid-export would kill the ffmpeg child process
+  // mid-write (see cancel_conversion), leaving a truncated "(edited)" file on disk with no
+  // indication anything went wrong. Registered only while a file is actually open, same as the
+  // docs editor's own version, so closing from anywhere else in the app is unaffected.
+  useEffect(() => {
+    if (!sourcePath) return;
+    let ownClose = false; // true once *we* called appWindow.close() - let that one through untouched
+    let pendingClose: Promise<void> | null = null; // dedupes a rapid double-click on the close button
+
+    const unlistenPromise = appWindow.onCloseRequested(async (event) => {
+      if (ownClose) return;
+      event.preventDefault();
+      if (pendingClose) {
+        await pendingClose;
+        return;
+      }
+      pendingClose = (async () => {
+        if (isExportingRef.current) {
+          const shouldCancelAndClose = await ask(
+            "A video export is still in progress. Closing now will cancel it, and the exported file will be incomplete.",
+            { title: "Export in progress", type: "warning" }
+          );
+          if (!shouldCancelAndClose) return; // leave the window open - nothing else to do
+          await invoke("cancel_conversion").catch(() => {}); // best-effort; proceeding to close either way
+        }
+        await flushSave();
+        ownClose = true;
+        await appWindow.close();
+      })();
+      await pendingClose;
+      pendingClose = null; // lets a later close attempt (the user declined this one) re-prompt cleanly
+    });
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
   }, [sourcePath, flushSave]);
 
   const setDuration = useCallback(
@@ -346,6 +452,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     imageOverlays: current.imageOverlays,
     blurOverlays: current.blurOverlays,
     audioOverlays: current.audioOverlays,
+    pipOverlays: current.pipOverlays,
     videoAudioMuted: current.videoAudioMuted,
     videoAudioVolume: current.videoAudioVolume,
     ...patch,
@@ -369,6 +476,28 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const clips = deleteClipAtHandler(current.clips, index);
       if (clips === current.clips) return;
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "delete");
+    },
+    [pushCommand]
+  );
+
+  const trimSilenceForClip = useCallback(
+    (clipId: string, silentRanges: { start: number; end: number }[]) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = removeSilentRangesHandler(current.clips, clipId, silentRanges);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "trim-silence");
+    },
+    [pushCommand]
+  );
+
+  const applyAutoZoomAtClicks = useCallback(
+    (clipId: string, clicks: AutoZoomClick[]) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = applyAutoZoomAtClicksHandler(current.clips, clipId, clicks);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "auto-zoom");
     },
     [pushCommand]
   );
@@ -412,7 +541,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // VideoTimelineDocker derives as `totalOutputDuration` from its (possibly live-drag) render
   // clips, recomputed here from the last *committed* clips since overlay time edits are a
   // separate operation from an in-progress clip resize, never concurrent with one.
-  const totalOutputDuration = (clips: Clip[]): number => clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0);
+  // (end-start)/speed, not just (end-start), once a clip has a speed edit (Clip.speed's own doc
+  // comment, videoEditTypes.ts) - a sped-up clip plays back in LESS output time than its source
+  // range spans, so summing raw source ranges here would over-clamp every overlay's own end time
+  // against a timeline length longer than the real one.
+  const totalOutputDuration = (clips: Clip[]): number => clips.reduce((sum, c) => sum + Math.max(0, (c.end - c.start) / (c.speed ?? 1)), 0);
 
   const addTextOverlay = useCallback(
     (x: number, y: number, width: number, fontSize: number, startTime: number, endTime: number): string => {
@@ -725,6 +858,72 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const addPipOverlay = useCallback(
+    (sourcePath: string, sourceDuration: number, x: number, y: number, width: number, height: number, startTime: number, endTime: number): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const overlay = makePipOverlay(sourcePath, sourceDuration, x, y, width, height, startTime, endTime);
+      const pipOverlays = addOverlay(current.pipOverlays, overlay);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "add-pip");
+      return overlay.id;
+    },
+    [pushCommand]
+  );
+
+  const updatePipOverlayContent = useCallback(
+    (id: string, patch: PipOverlayContentPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const pipOverlays = updateOverlay<PipOverlay>(current.pipOverlays, id, patch);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "edit-pip");
+    },
+    [pushCommand]
+  );
+
+  const resizePipOverlayTimeCb = useCallback(
+    (id: string, edge: "start" | "end", time: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const pipOverlays = resizePipOverlayTime(current.pipOverlays, id, edge, totalOutputDuration(current.clips), time);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "edit-pip");
+    },
+    [pushCommand]
+  );
+
+  const movePipOverlayTime = useCallback(
+    (id: string, newStartTime: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const pipOverlays = moveOverlayTime(current.pipOverlays, id, newStartTime, totalOutputDuration(current.clips));
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "edit-pip");
+    },
+    [pushCommand]
+  );
+
+  const deletePipOverlay = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const pipOverlays = deleteOverlay(current.pipOverlays, id);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "delete-pip");
+    },
+    [pushCommand]
+  );
+
+  const duplicatePipOverlay = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const original = current.pipOverlays.find((o) => o.id === id);
+      if (!original) return "";
+      const copy = duplicateTimedOverlay(original, totalOutputDuration(current.clips));
+      const pipOverlays = addOverlay(current.pipOverlays, copy);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "add-pip");
+      return copy.id;
+    },
+    [pushCommand]
+  );
+
   const setVideoAudioMuted = useCallback(
     (muted: boolean) => {
       const current = stateRef.current;
@@ -747,10 +946,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   const insertClipAt = useCallback(
     async (newClipSourcePath: string, atIndex: number) => {
       const current = stateRef.current;
-      // Temporary diagnostic, see the matching log in VideoTimelineDocker's handleTrackDrop -
       // `current == null` here means the edit store hasn't finished loading/seeding yet (a real
       // possible race right after opening a file), which would silently swallow every insert.
-      console.log("[useVideoEditStore] insertClipAt called", { newClipSourcePath, atIndex, hasState: !!current });
       if (!current) return;
       // Captured before the await below - if the user switches to a different video while a
       // duration lookup is in flight, sourcePathRef.current no longer matches this by the time we
@@ -762,7 +959,6 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       let duration = getSourceDuration(newClipSourcePath);
       if (duration == null) {
         duration = await fetchDuration(newClipSourcePath);
-        console.log("[useVideoEditStore] fetched duration for inserted clip", { newClipSourcePath, duration });
         if (duration == null) return; // couldn't read this file - nothing to insert
         if (sourcePathRef.current !== requestedForSourcePath) return; // switched files mid-lookup
         registerSourceDuration(newClipSourcePath, duration);
@@ -827,27 +1023,26 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // Overlays whose own render comes back null (empty text, zero-size box, an image that failed to
   // decode) are just skipped rather than failing the whole export.
   const exportEdited = useCallback(
-    async (videoPixelSize: { width: number; height: number } | null): Promise<{ path: string; name: string } | null> => {
+    async (
+      videoPixelSize: { width: number; height: number } | null,
+      options?: ExportOptions
+    ): Promise<{ path: string; name: string } | null> => {
       const current = stateRef.current;
       if (!sourcePath || !current || current.clips.length === 0) return null;
       setIsExporting(true);
       setExportError(null);
       try {
-        const overlays: { dataBase64: string; x: number; y: number; startTime: number; endTime: number; fade: boolean }[] = [];
+        const overlays: { dataBase64: string; x: number; y: number; startTime: number; endTime: number; animation: string }[] = [];
         if (videoPixelSize) {
           const { width: pxW, height: pxH } = videoPixelSize;
           for (const o of current.textOverlays) {
             const rendered = renderTextOverlayToPng(o, pxW, pxH);
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: o.animation === "fade" });
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation) });
           }
           for (const o of current.imageOverlays) {
             // eslint-disable-next-line no-await-in-loop
             const rendered = await renderImageOverlayToPng(o, pxW, pxH);
-            // "slide" and "pop" have no export-side equivalent yet (would need a time-varying
-            // ffmpeg overlay x/y or scale expression, not just the alpha fade filter this "fade"
-            // flag already drives) - preview-only for now, same as every other overlay aesthetic
-            // was before its own burn-in support was added.
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, fade: o.animation === "fade" });
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation) });
           }
         }
 
@@ -878,6 +1073,30 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             })
           : [];
 
+        // No client-side rendering step for PiP either (unlike text/image) - there's no picture to
+        // pre-render (it depends on the pip source's own decoded frames at each instant, the same
+        // reason a plain-rectangle blur region needs none), so this just resolves position/size to
+        // real output pixels and lets Rust build the trim+scale+mask+overlay filter chain directly
+        // (see pip_overlay_chain, conversion.rs).
+        const pipOverlays = videoPixelSize
+          ? current.pipOverlays.map((o) => ({
+              sourcePath: o.sourcePath,
+              x: Math.round(o.x * videoPixelSize.width),
+              y: Math.round(o.y * videoPixelSize.height),
+              width: Math.round(o.width * videoPixelSize.width),
+              height: Math.round(o.height * videoPixelSize.height),
+              shape: o.shape,
+              cornerRadius: o.cornerRadius,
+              trimStart: o.trimStart,
+              startTime: o.startTime,
+              endTime: o.endTime,
+              // Collapsed to a single 0..1 number for Rust (no separate muted flag) - same
+              // "0.0 when muted, otherwise the real level" convention effective_video_volume
+              // already uses (conversion.rs) for the primary track's own mute/volume pair.
+              volume: (o.muted ?? true) ? 0 : o.volume,
+            }))
+          : [];
+
         // No client-side rendering step for audio (unlike text/image, which render to a PNG first)
         // - these just pass straight through to Rust, which reads the original source file
         // directly and builds the amix/afade/adelay filter chain itself (see export_trimmed_video).
@@ -893,19 +1112,22 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             fadeOut: o.fadeOutSec ?? 0,
           }));
 
-        const outputPath = await invoke<string>("export_trimmed_video", {
+        const resultPath = await invoke<string>("export_trimmed_video", {
           outputBasePath: sourcePath,
           segments: toKeepSegments(current.clips),
           overlays,
           blurOverlays,
           audioOverlays,
+          pipOverlays,
           audioMuted: current.videoAudioMuted,
           audioVolume: current.videoAudioVolume,
           videoWidth: videoPixelSize?.width ?? null,
           videoHeight: videoPixelSize?.height ?? null,
+          quality: options?.quality ?? null,
+          outputPath: options?.outputPath ?? null,
         });
-        const name = outputPath.split(/[\\/]/).pop() ?? outputPath;
-        return { path: outputPath, name };
+        const name = resultPath.split(/[\\/]/).pop() ?? resultPath;
+        return { path: resultPath, name };
       } catch (err) {
         setExportError(err instanceof Error ? err.message : String(err));
         return null;
@@ -924,6 +1146,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     imageOverlays: state?.imageOverlays ?? [],
     blurOverlays: state?.blurOverlays ?? [],
     audioOverlays: state?.audioOverlays ?? [],
+    pipOverlays: state?.pipOverlays ?? [],
     addTextOverlay,
     updateTextOverlayContent,
     resizeTextOverlayTime,
@@ -952,6 +1175,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     moveAudioOverlayTime,
     deleteAudioOverlay,
     duplicateAudioOverlay,
+    addPipOverlay,
+    updatePipOverlayContent,
+    resizePipOverlayTime: resizePipOverlayTimeCb,
+    movePipOverlayTime,
+    deletePipOverlay,
+    duplicatePipOverlay,
     videoAudioMuted: state?.videoAudioMuted ?? false,
     videoAudioVolume: state?.videoAudioVolume ?? 1,
     setVideoAudioMuted,
@@ -963,6 +1192,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     reorderClip,
     resizeClipEdge,
     updateClipEffects,
+    trimSilenceForClip,
+    applyAutoZoomAtClicks,
     insertClipAt,
     undo,
     redo,

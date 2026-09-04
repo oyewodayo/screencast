@@ -94,6 +94,43 @@ pub fn create_board(id: String, name: String, json: String) -> Result<BoardSumma
         .map(|mut s| { s.name = name; s })
 }
 
+// Recursive plain-file copy (board.json, assets/, thumbnail.png) - std::fs has no built-in
+// directory copy, so this is the manual equivalent of `cp -r`. Used only by duplicate_board below.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("Failed to create folder: {}", e))?;
+    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read folder: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read folder entry: {}", e))?;
+        let file_type = entry.file_type().map_err(|e| format!("Failed to read entry type: {}", e))?;
+        let dest_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            fs::copy(entry.path(), &dest_path).map_err(|e| format!("Failed to copy file: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+// Copies an existing board's whole project folder (board.json, assets/, thumbnail.png) verbatim
+// into a new id - deliberately does NOT touch board.json's id/name/timestamps fields itself. Same
+// "this file only ever peeks at a few top-level fields, the document shape is FE-owned" philosophy
+// as the rest of this module (see its own top comment): the frontend calls load_board/save_board
+// right after this to patch those fields in with its own JS Date().toISOString() convention,
+// rather than this file learning to parse and rewrite JSON it doesn't otherwise need to understand.
+// `new_id` is frontend-generated (crypto.randomUUID()), same convention create_board's `id` uses.
+#[command]
+pub fn duplicate_board(source_id: String, new_id: String) -> Result<(), String> {
+    let source_dir = board_dir(&source_id)?;
+    if !source_dir.is_dir() {
+        return Err("Source board does not exist".to_string());
+    }
+    let dest_dir = board_dir(&new_id)?;
+    if dest_dir.exists() {
+        return Err("A board with that id already exists".to_string());
+    }
+    copy_dir_recursive(&source_dir, &dest_dir)
+}
+
 #[command]
 pub fn save_board(id: String, json: String) -> Result<(), String> {
     let dir = board_dir(&id)?;
@@ -152,13 +189,18 @@ pub fn save_board_thumbnail(board_id: String, bytes: Vec<u8>) -> Result<(), Stri
     fs::rename(&tmp, &target).map_err(|e| format!("Failed to save thumbnail: {}", e))
 }
 
-// Writes a flattened export directly into the Briefcast root (not a source-file's sibling - a
-// board has no single source file) so it shows up in the sidebar's Image tab immediately via the
-// existing file watcher. Timestamp-suffixed so repeat exports of the same board never collide.
+// Writes a flattened export into a "Board" subfolder of the Briefcast root (not a source-file's
+// sibling - a board has no single source file, and not the root itself - that quickly buried
+// exports among every other loose image once someone exported a few boards) so every board export
+// lands in one place, easy to find, and still shows up in the sidebar's Image tab immediately via
+// the existing file watcher. Singular "Board", not "Boards" (BOARDS_DIR_NAME) - the latter is this
+// module's own internal project storage, excluded from the sidebar entirely (see its own doc
+// comment); this is a normal, browsable library folder, just like any the user creates themselves.
+// Timestamp-suffixed so repeat exports of the same board never collide.
 #[command]
 pub fn export_board_png(board_name: String, bytes: Vec<u8>) -> Result<String, String> {
-    let root = briefcast_dir()?;
-    fs::create_dir_all(&root).map_err(|e| format!("Failed to create Briefcast folder: {}", e))?;
+    let root = briefcast_dir()?.join("Board");
+    fs::create_dir_all(&root).map_err(|e| format!("Failed to create Board folder: {}", e))?;
 
     let safe_name: String = board_name
         .chars()
@@ -173,4 +215,23 @@ pub fn export_board_png(board_name: String, bytes: Vec<u8>) -> Result<String, St
     fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write export: {}", e))?;
     fs::rename(&tmp, &output).map_err(|e| format!("Failed to save export: {}", e))?;
     Ok(output.to_string_lossy().to_string())
+}
+
+// "Save As" counterpart to export_board_png above - writes to an EXACT destination path the
+// frontend already resolved via its own native save-file dialog (@tauri-apps/api/dialog's `save`),
+// rather than always landing in briefcast_dir()/Board/. Deliberately doesn't touch briefcast_dir()
+// at all: the whole point of Save As is picking a location outside (or inside, if the user chooses)
+// the library, so nothing here should assume one. Same write-then-rename crash-safety convention as
+// every other save in this file.
+#[command]
+pub fn export_board_png_to_path(dest_path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let dest = PathBuf::from(&dest_path);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create destination folder: {}", e))?;
+    }
+    let file_name = dest.file_name().ok_or("Invalid destination path")?.to_string_lossy();
+    let tmp = dest.with_file_name(format!("{}.tmp", file_name));
+    fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write export: {}", e))?;
+    fs::rename(&tmp, &dest).map_err(|e| format!("Failed to save export: {}", e))?;
+    Ok(())
 }

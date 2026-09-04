@@ -48,6 +48,44 @@ pub fn get_ffprobe_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Failed to resolve ffprobe at {}", resource_path))
 }
 
+// Bundled libheif CLI decoder (binaries/heif/) - the fallback HEIC/HEIF decode path used when
+// Windows' own WIC decoder can't (see services/heif_tool.rs). Windows-only, mirroring
+// get_ffmpeg_path's shape rather than its cross-platform support - there's no macOS/Linux binary
+// bundled because that fallback path is never reached on those platforms in the first place (see
+// main.rs's cfg-gating of the heic_windows/heif_tool modules).
+pub fn get_heif_decoder_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let resource_path = "binaries/heif/heif-dec.exe";
+
+    app_handle
+        .path_resolver()
+        .resolve_resource(resource_path)
+        .ok_or_else(|| format!("Failed to resolve heif-dec at {}", resource_path))
+}
+
+// Same bundle as get_heif_decoder_path (shares its DLLs), but for gallery-grid thumbnails - see
+// services/heif_tool.rs's extract_thumbnail for why this is a different tool from heif-dec: it
+// renders/extracts the small embedded preview HEIC containers already carry instead of doing a
+// full tile-grid reconstruction, which is dramatically faster (~0.4s vs ~9s per photo, measured)
+// for something that's only ever displayed a few hundred pixels wide anyway.
+//
+// Deliberately derived from get_heif_decoder_path's own resolved path rather than a second,
+// independent resolve_resource("binaries/heif/heif-thumbnailer.exe") call: that second call was
+// observed failing to find a real, verified-present file after this binary was added to the
+// already-registered binaries/heif/ resource glob with no accompanying Rust source change - dev
+// mode's resource resolution apparently doesn't always notice a bare file addition to a directory
+// it already resolved once. Piggybacking on the proven-working heif-dec.exe resolution and just
+// swapping the file name sidesteps that entirely, and is arguably more correct anyway: the two
+// tools are always co-located by construction (README's bundling instructions), so "wherever
+// heif-dec.exe actually resolved to" is a more reliable source of truth than a second lookup.
+pub fn get_heif_thumbnailer_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let decoder_path = get_heif_decoder_path(app_handle)?;
+    let thumbnailer_path = decoder_path.with_file_name("heif-thumbnailer.exe");
+    if !thumbnailer_path.exists() {
+        return Err(format!("heif-thumbnailer.exe not found next to heif-dec.exe at {}", thumbnailer_path.display()));
+    }
+    Ok(thumbnailer_path)
+}
+
 
 #[derive(Debug, serde::Serialize)]
 pub struct FileEntry {
