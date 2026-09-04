@@ -24,6 +24,12 @@ interface RecordingDockerProps {
   onToggleIncludeSystemAudio: () => void;
   // WASAPI loopback is Windows-only - see BottomDocker.tsx's own doc comment on this same prop.
   isSystemAudioSupported: boolean;
+  // Records the (single) selected webcam as its own separate file instead of baking it into the
+  // screen recording - see Dashboard.tsx's own doc comment on this state and
+  // recording_with_output_sva (win.rs) for why it only applies to record_type "sva" with exactly
+  // one camera selected.
+  separateWebcamCapture: boolean;
+  onToggleSeparateWebcamCapture: () => void;
   isRecording: boolean;
   isPaused: boolean;
   onScreenshotClick: () => void;
@@ -55,6 +61,8 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   includeSystemAudio,
   onToggleIncludeSystemAudio,
   isSystemAudioSupported,
+  separateWebcamCapture,
+  onToggleSeparateWebcamCapture,
   isRecording,
   isPaused,
   onScreenshotClick,
@@ -214,6 +222,34 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             <IoRefresh />
           </button>
         </div>
+
+        {/* Only meaningful for "sva" with exactly one camera - see recording_with_output_sva's own
+            doc comment (win.rs) for why more than one camera isn't supported here. */}
+        {recordType === "sva" && videoDevices.length >= 1 && (
+          <div>
+            <div className="docker-field-label p-1 text-sm">&nbsp;</div>
+            <label
+              title={
+                videoDevices.length === 1
+                  ? "Records the webcam as its own separate file instead of baking it into the screen recording, so you can reposition/resize/reshape it later in the editor's picture-in-picture layer."
+                  : "Only supported with exactly one camera selected."
+              }
+              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
+                videoDevices.length === 1
+                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
+                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
+              }`}
+            >
+              <input
+                type="checkbox"
+                checked={separateWebcamCapture && videoDevices.length === 1}
+                disabled={videoDevices.length !== 1}
+                onChange={onToggleSeparateWebcamCapture}
+              />
+              Record webcam separately (PiP editing)
+            </label>
+          </div>
+        )}
       </div>
 
       <div className="docker-actions-row flex items-end gap-2">

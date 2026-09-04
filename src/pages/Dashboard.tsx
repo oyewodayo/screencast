@@ -14,6 +14,7 @@ import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import useVideoEditStore from "../hooks/useVideoEditStore";
 import useImageEditStore from "../hooks/useImageEditStore";
 import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
+import PipOverlayLayer from "../components/video/PipOverlayLayer";
 import ClipCropOverlay from "../components/video/ClipCropOverlay";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
@@ -245,6 +246,15 @@ const Dashboard = () => {
   // meaningful for the screen-capture record types (sva/sa/s); RecordingDocker only shows the
   // toggle for those.
   const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(() => loadSettings().defaultIncludeSystemAudio);
+  // Opt-in, off by default every session (not persisted like includeSystemAudio above - this is a
+  // new, less-proven capture path, so it shouldn't silently carry forward as someone's default).
+  // When on (and exactly one camera is selected - see start_recording's own doc comment on why
+  // more than one isn't supported), recording_with_output_sva writes the webcam as its own
+  // second, uncomposited file alongside the main recording instead of baking it into a single
+  // overlay - lets the editor's new PiP layer reposition/resize/reshape it after the fact, which
+  // baked-in footage never could be. Recording with this off is byte-for-byte the same as before
+  // this feature existed.
+  const [separateWebcamCapture, setSeparateWebcamCapture] = useState<boolean>(false);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
@@ -411,6 +421,8 @@ const Dashboard = () => {
   const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
   const [selectedBlurOverlayId, setSelectedBlurOverlayId] = useState<string | null>(null);
   const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
+  const [selectedPipOverlayId, setSelectedPipOverlayId] = useState<string | null>(null);
+  const [isPlacingPip, setIsPlacingPip] = useState<boolean>(false);
   // Arms the on-canvas crop tool (ClipCropOverlay, mounted as a sibling to VideoOverlayLayer just
   // below) - unlike the placement tools above, there's no "consumed" step, it just shows/hides a
   // drag window over whichever clip activeClipEffects currently points at. Deliberately NOT reset
@@ -1363,13 +1375,13 @@ const setScreen = () => {
 	const recordingHotkeyRef = useRef({
 		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 		fileName, fileExt, recordType, audioDevice, videoDevices,
-		overlayShape, overlayPosition, overlaySize, includeSystemAudio,
+		overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture,
 	});
 	useEffect(() => {
 		recordingHotkeyRef.current = {
 			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 			fileName, fileExt, recordType, audioDevice, videoDevices,
-			overlayShape, overlayPosition, overlaySize, includeSystemAudio,
+			overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture,
 		};
 	});
 
@@ -1393,6 +1405,7 @@ const setScreen = () => {
 			overlay_size: s.overlaySize,
 			window_title: '',
 			include_system_audio: s.includeSystemAudio,
+			separate_webcam_capture: s.separateWebcamCapture,
 		});
 	}, []);
 
@@ -3247,6 +3260,20 @@ const setScreen = () => {
                           onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
                           totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
                         />
+                        <PipOverlayLayer
+                          frameRect={frameRect}
+                          pipOverlays={editStore.pipOverlays}
+                          currentOutputTime={currentOutputTime}
+                          totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
+                          isPlaying={playerIsPlaying}
+                          selectedPipOverlayId={selectedPipOverlayId}
+                          onSelectPipOverlay={setSelectedPipOverlayId}
+                          isPlacingPip={isPlacingPip}
+                          onPlacementPipConsumed={() => setIsPlacingPip(false)}
+                          onAddPipOverlay={editStore.addPipOverlay}
+                          onUpdatePipOverlayContent={editStore.updatePipOverlayContent}
+                          onDeletePipOverlay={editStore.deletePipOverlay}
+                        />
                         {isCroppingClip && activeClipEffects && (
                           // Keyed on the active clip's own id so a clip change mid-drag (playback
                           // crossing a cut while the user is still holding a handle down - rare,
@@ -3490,6 +3517,10 @@ const setScreen = () => {
         onSelectBlurOverlay={setSelectedBlurOverlayId}
         isPlacingBlur={isPlacingBlur}
         onToggleArmPlaceBlur={() => setIsPlacingBlur((v) => !v)}
+        selectedPipOverlayId={selectedPipOverlayId}
+        onSelectPipOverlay={setSelectedPipOverlayId}
+        isPlacingPip={isPlacingPip}
+        onToggleArmPlacePip={() => setIsPlacingPip((v) => !v)}
         isCroppingClip={isCroppingClip}
         onToggleCroppingClip={() => setIsCroppingClip((v) => !v)}
         selectScreen={selectScreen}
@@ -3505,6 +3536,8 @@ const setScreen = () => {
         setOverlaySize={setOverlaySize}
         includeSystemAudio={includeSystemAudio}
         setIncludeSystemAudio={setIncludeSystemAudio}
+        separateWebcamCapture={separateWebcamCapture}
+        setSeparateWebcamCapture={setSeparateWebcamCapture}
         selectedScreen={selectedScreen}
         setSelectedScreen={setSelectedScreen}
         windowTitles={windowTitles}

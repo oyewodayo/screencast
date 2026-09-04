@@ -86,6 +86,11 @@ pub struct FormData{
     // start_recording's handling of this field and services/loopback_audio.rs.
     #[serde(default)]
     include_system_audio: bool,
+    // Opt-in (default false via #[serde(default)], so an older/unaware caller reproduces today's
+    // behavior exactly) - see recording_with_output_sva's own doc comment (win.rs) for what this
+    // actually changes and why it's gated to exactly one camera on record_type "sva" only.
+    #[serde(default)]
+    separate_webcam_capture: bool,
 }
 
 // What a "screen" capture should actually point ffmpeg at, resolved once from FormData.screen_size

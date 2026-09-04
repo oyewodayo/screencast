@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/api/dialog";
 import { appWindow } from "@tauri-apps/api/window";
-import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, OverlayAnimation, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
@@ -17,12 +17,15 @@ import {
   makeAudioOverlay,
   makeBlurOverlay,
   makeImageOverlay,
+  makePipOverlay,
   makeTextOverlay,
   moveOverlayTime,
+  removeSilentRanges as removeSilentRangesHandler,
   reorderClip as reorderClipHandler,
   resizeAudioOverlayTime,
   resizeClipEdge as resizeClipEdgeHandler,
   resizeOverlayTime,
+  resizePipOverlayTime,
   sendOverlayToBack,
   splitClipAt,
   toKeepSegments,
@@ -87,6 +90,7 @@ type ImageOverlayContentPatch = Partial<
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
+type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "volume" | "muted">>;
 type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal">>;
 
 export interface UseVideoEditStoreResult {
@@ -157,6 +161,17 @@ export interface UseVideoEditStoreResult {
   moveAudioOverlayTime: (id: string, newStartTime: number) => void;
   deleteAudioOverlay: (id: string) => void;
   duplicateAudioOverlay: (id: string) => string;
+  // Picture-in-picture video layers (e.g. a separately-recorded webcam - see FormData.
+  // separate_webcam_capture, recording.rs) - same "real source file, trims into it" shape as audio
+  // overlays above, plus frame-relative geometry/shape like image overlays. See PipOverlay's own
+  // doc comment (videoEditTypes.ts) for why this can't reuse ImageOverlay's PNG-based rendering.
+  pipOverlays: PipOverlay[];
+  addPipOverlay: (sourcePath: string, sourceDuration: number, x: number, y: number, width: number, height: number, startTime: number, endTime: number) => string;
+  updatePipOverlayContent: (id: string, patch: PipOverlayContentPatch) => void;
+  resizePipOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
+  movePipOverlayTime: (id: string, newStartTime: number) => void;
+  deletePipOverlay: (id: string) => void;
+  duplicatePipOverlay: (id: string) => string;
   // The primary video's OWN audio level - see VideoEditState.videoAudioMuted's own doc comment for
   // why this is distinct from any AudioOverlay's own volume/muted. Read by VideoPlayer.tsx (stacked
   // multiplicatively on top of its own local listening volume) and export_trimmed_video.
@@ -180,6 +195,10 @@ export interface UseVideoEditStoreResult {
   // generic patch fn" shape as updateTextOverlayContent, just for a clip's own non-geometric
   // fields (see updateClip, videoEditHandlers.ts).
   updateClipEffects: (id: string, patch: ClipEffectsPatch) => void;
+  // Applies the result of a detect_silence scan (conversion.rs) to one clip, splitting out and
+  // dropping every detected dead-air range in a single undo step - see removeSilentRanges,
+  // videoEditHandlers.ts, for the actual splice logic.
+  trimSilenceForClip: (clipId: string, silentRanges: { start: number; end: number }[]) => void;
   // Inserts a whole new clip - from the Briefcast library or an external file dropped onto the
   // timeline - at `atIndex`, fetching its duration first if not already known. Resolves once the
   // clip has actually been added (or been skipped, if the duration lookup failed).
@@ -292,6 +311,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 imageOverlays: parsed.imageOverlays ?? [],
                 blurOverlays: parsed.blurOverlays ?? [],
                 audioOverlays: parsed.audioOverlays ?? [],
+                pipOverlays: parsed.pipOverlays ?? [],
                 videoAudioMuted: parsed.videoAudioMuted ?? false,
                 videoAudioVolume: parsed.videoAudioVolume ?? 1,
               });
@@ -426,6 +446,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     imageOverlays: current.imageOverlays,
     blurOverlays: current.blurOverlays,
     audioOverlays: current.audioOverlays,
+    pipOverlays: current.pipOverlays,
     videoAudioMuted: current.videoAudioMuted,
     videoAudioVolume: current.videoAudioVolume,
     ...patch,
@@ -449,6 +470,17 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const clips = deleteClipAtHandler(current.clips, index);
       if (clips === current.clips) return;
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "delete");
+    },
+    [pushCommand]
+  );
+
+  const trimSilenceForClip = useCallback(
+    (clipId: string, silentRanges: { start: number; end: number }[]) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = removeSilentRangesHandler(current.clips, clipId, silentRanges);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "trim-silence");
     },
     [pushCommand]
   );
@@ -805,6 +837,72 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const addPipOverlay = useCallback(
+    (sourcePath: string, sourceDuration: number, x: number, y: number, width: number, height: number, startTime: number, endTime: number): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const overlay = makePipOverlay(sourcePath, sourceDuration, x, y, width, height, startTime, endTime);
+      const pipOverlays = addOverlay(current.pipOverlays, overlay);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "add-pip");
+      return overlay.id;
+    },
+    [pushCommand]
+  );
+
+  const updatePipOverlayContent = useCallback(
+    (id: string, patch: PipOverlayContentPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const pipOverlays = updateOverlay<PipOverlay>(current.pipOverlays, id, patch);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "edit-pip");
+    },
+    [pushCommand]
+  );
+
+  const resizePipOverlayTimeCb = useCallback(
+    (id: string, edge: "start" | "end", time: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const pipOverlays = resizePipOverlayTime(current.pipOverlays, id, edge, totalOutputDuration(current.clips), time);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "edit-pip");
+    },
+    [pushCommand]
+  );
+
+  const movePipOverlayTime = useCallback(
+    (id: string, newStartTime: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const pipOverlays = moveOverlayTime(current.pipOverlays, id, newStartTime, totalOutputDuration(current.clips));
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "edit-pip");
+    },
+    [pushCommand]
+  );
+
+  const deletePipOverlay = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const pipOverlays = deleteOverlay(current.pipOverlays, id);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "delete-pip");
+    },
+    [pushCommand]
+  );
+
+  const duplicatePipOverlay = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const original = current.pipOverlays.find((o) => o.id === id);
+      if (!original) return "";
+      const copy = duplicateTimedOverlay(original, totalOutputDuration(current.clips));
+      const pipOverlays = addOverlay(current.pipOverlays, copy);
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "add-pip");
+      return copy.id;
+    },
+    [pushCommand]
+  );
+
   const setVideoAudioMuted = useCallback(
     (muted: boolean) => {
       const current = stateRef.current;
@@ -954,6 +1052,30 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             })
           : [];
 
+        // No client-side rendering step for PiP either (unlike text/image) - there's no picture to
+        // pre-render (it depends on the pip source's own decoded frames at each instant, the same
+        // reason a plain-rectangle blur region needs none), so this just resolves position/size to
+        // real output pixels and lets Rust build the trim+scale+mask+overlay filter chain directly
+        // (see pip_overlay_chain, conversion.rs).
+        const pipOverlays = videoPixelSize
+          ? current.pipOverlays.map((o) => ({
+              sourcePath: o.sourcePath,
+              x: Math.round(o.x * videoPixelSize.width),
+              y: Math.round(o.y * videoPixelSize.height),
+              width: Math.round(o.width * videoPixelSize.width),
+              height: Math.round(o.height * videoPixelSize.height),
+              shape: o.shape,
+              cornerRadius: o.cornerRadius,
+              trimStart: o.trimStart,
+              startTime: o.startTime,
+              endTime: o.endTime,
+              // Collapsed to a single 0..1 number for Rust (no separate muted flag) - same
+              // "0.0 when muted, otherwise the real level" convention effective_video_volume
+              // already uses (conversion.rs) for the primary track's own mute/volume pair.
+              volume: (o.muted ?? true) ? 0 : o.volume,
+            }))
+          : [];
+
         // No client-side rendering step for audio (unlike text/image, which render to a PNG first)
         // - these just pass straight through to Rust, which reads the original source file
         // directly and builds the amix/afade/adelay filter chain itself (see export_trimmed_video).
@@ -975,6 +1097,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           overlays,
           blurOverlays,
           audioOverlays,
+          pipOverlays,
           audioMuted: current.videoAudioMuted,
           audioVolume: current.videoAudioVolume,
           videoWidth: videoPixelSize?.width ?? null,
@@ -1002,6 +1125,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     imageOverlays: state?.imageOverlays ?? [],
     blurOverlays: state?.blurOverlays ?? [],
     audioOverlays: state?.audioOverlays ?? [],
+    pipOverlays: state?.pipOverlays ?? [],
     addTextOverlay,
     updateTextOverlayContent,
     resizeTextOverlayTime,
@@ -1030,6 +1154,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     moveAudioOverlayTime,
     deleteAudioOverlay,
     duplicateAudioOverlay,
+    addPipOverlay,
+    updatePipOverlayContent,
+    resizePipOverlayTime: resizePipOverlayTimeCb,
+    movePipOverlayTime,
+    deletePipOverlay,
+    duplicatePipOverlay,
     videoAudioMuted: state?.videoAudioMuted ?? false,
     videoAudioVolume: state?.videoAudioVolume ?? 1,
     setVideoAudioMuted,
@@ -1041,6 +1171,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     reorderClip,
     resizeClipEdge,
     updateClipEffects,
+    trimSilenceForClip,
     insertClipAt,
     undo,
     redo,

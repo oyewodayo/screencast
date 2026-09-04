@@ -90,6 +90,11 @@ interface FileToolsDockerProps {
   onSelectBlurOverlay?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
+  // Video-only: PiP-overlay selection/placement state, same threading as the overlay props above.
+  selectedPipOverlayId?: string | null;
+  onSelectPipOverlay?: (id: string | null) => void;
+  isPlacingPip?: boolean;
+  onToggleArmPlacePip?: () => void;
   // Video-only: on-canvas crop-tool arm state, same threading as the overlay props above.
   isCroppingClip?: boolean;
   onToggleCroppingClip?: () => void;
@@ -130,6 +135,10 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onSelectBlurOverlay,
   isPlacingBlur,
   onToggleArmPlaceBlur,
+  selectedPipOverlayId,
+  onSelectPipOverlay,
+  isPlacingPip,
+  onToggleArmPlacePip,
   isCroppingClip,
   onToggleCroppingClip,
 }) => {
@@ -168,6 +177,10 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onSelectBlurOverlay={onSelectBlurOverlay}
         isPlacingBlur={isPlacingBlur}
         onToggleArmPlaceBlur={onToggleArmPlaceBlur}
+        selectedPipOverlayId={selectedPipOverlayId}
+        onSelectPipOverlay={onSelectPipOverlay}
+        isPlacingPip={isPlacingPip}
+        onToggleArmPlacePip={onToggleArmPlacePip}
         isCroppingClip={isCroppingClip}
         onToggleCroppingClip={onToggleCroppingClip}
       />

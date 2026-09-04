@@ -3,7 +3,7 @@
 // Pure functions only, mirroring pdfAnnotationHandlers.ts's style: no React, callers pass in
 // everything they need explicitly. useVideoEditStore is the only caller.
 
-import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, PipOverlay, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
 const MIN_OVERLAY_DURATION = 0.1;
@@ -65,13 +65,60 @@ export function splitClipAt(clips: Clip[], index: number, sourceTime: number): C
   return [
     ...clips.slice(0, index),
     // First half keeps transitionIn (still the same pairing with whatever precedes it) plus the
-    // look/motion effects - both halves keep colorFilter/kenBurns/crop (splitting a graded/panned/
-    // cropped clip shouldn't silently reset its look), but only the first half is actually
-    // adjacent to the clip that used to precede the whole thing.
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn, crop: clip.crop },
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, crop: clip.crop },
+    // look/motion effects - both halves keep colorFilter/kenBurns/crop/flipHorizontal (splitting a
+    // graded/panned/cropped/mirrored clip shouldn't silently reset its look), but only the first
+    // half is actually adjacent to the clip that used to precede the whole thing.
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn, crop: clip.crop, flipHorizontal: clip.flipHorizontal },
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, crop: clip.crop, flipHorizontal: clip.flipHorizontal },
     ...clips.slice(index + 1),
   ];
+}
+
+// Splits `clipId`'s own [start,end) into the pieces that remain once every range in
+// `silentRanges` is cut out - a batch version of splitClipAt+deleteClipAt for the "remove every
+// detected dead-air gap in this clip" gesture (see detect_silence, conversion.rs, and the Trim
+// Silence toolbar button), so N gaps removed at once lands as ONE undo command instead of up to
+// 2*N. Ranges are clamped/intersected against the clip's own [start,end) here (not just trusted
+// from the caller) since detect_silence analyzes the WHOLE source file, not just this clip's own
+// trim window. Every kept piece carries the original clip's own colorFilter/kenBurns/crop/
+// flipHorizontal forward (same reasoning as splitClipAt); only the FIRST piece keeps transitionIn,
+// for the same reason splitClipAt's own first half does. A piece shorter than MIN_CLIP_LENGTH
+// (silence detection landing a hair off a clip's own edge) is dropped rather than kept as a
+// sliver; a clip that ends up entirely silent is simply removed.
+export function removeSilentRanges(clips: Clip[], clipId: string, silentRanges: { start: number; end: number }[]): Clip[] {
+  const index = clips.findIndex((c) => c.id === clipId);
+  if (index === -1) return clips;
+  const clip = clips[index];
+
+  const sorted = silentRanges
+    .map((r) => ({ start: Math.max(clip.start, r.start), end: Math.min(clip.end, r.end) }))
+    .filter((r) => r.end - r.start > 0)
+    .sort((a, b) => a.start - b.start);
+  if (sorted.length === 0) return clips;
+
+  const kept: { start: number; end: number }[] = [];
+  let cursor = clip.start;
+  for (const range of sorted) {
+    if (range.start > cursor) kept.push({ start: cursor, end: range.start });
+    cursor = Math.max(cursor, range.end);
+  }
+  if (clip.end > cursor) kept.push({ start: cursor, end: clip.end });
+
+  const keptClips: Clip[] = kept
+    .filter((k) => k.end - k.start >= MIN_CLIP_LENGTH)
+    .map((k, i) => ({
+      id: crypto.randomUUID(),
+      sourcePath: clip.sourcePath,
+      start: k.start,
+      end: k.end,
+      colorFilter: clip.colorFilter,
+      kenBurns: clip.kenBurns,
+      crop: clip.crop,
+      flipHorizontal: clip.flipHorizontal,
+      transitionIn: i === 0 ? clip.transitionIn : undefined,
+    }));
+
+  return [...clips.slice(0, index), ...keptClips, ...clips.slice(index + 1)];
 }
 
 // Removes the clip at `index` outright - what was that stretch of source video is simply no
@@ -299,6 +346,58 @@ export function resizeAudioOverlayTime(overlays: AudioOverlay[], id: string, edg
     }
     // End edge: can't extend past whatever's left of the source after the current trim window
     // (trimStart + duration can't exceed sourceDuration), or past the assembled timeline's own end.
+    const trimEnd = o.trimStart + (o.endTime - o.startTime);
+    const roomInSource = o.sourceDuration - trimEnd;
+    const maxEnd = Math.min(maxOutputEnd, o.endTime + Math.max(0, roomInSource));
+    const clampedEnd = Math.min(maxEnd, Math.max(time, o.startTime + MIN_OVERLAY_DURATION));
+    return { ...o, endTime: clampedEnd, updatedAt: Date.now() };
+  });
+}
+
+export function makePipOverlay(
+  sourcePath: string,
+  sourceDuration: number,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  startTime: number,
+  endTime: number
+): PipOverlay {
+  const now = Date.now();
+  return {
+    id: crypto.randomUUID(),
+    sourcePath,
+    sourceDuration,
+    x,
+    y,
+    width,
+    height,
+    shape: "circle",
+    trimStart: 0,
+    startTime,
+    endTime,
+    volume: 1,
+    muted: true,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+// Drags one edge of a PiP overlay's time range - same trim-into-source reasoning as
+// resizeAudioOverlayTime above (a PipOverlay is a real video source too, not an abstract
+// stretchable box like text/image/blur), copied rather than shared with it since the two types
+// have no common base beyond id/startTime/endTime/trimStart/sourceDuration, which duplicateTimedOverlay's
+// own generic constraint already shows isn't quite worth abstracting over for just this one method.
+export function resizePipOverlayTime(overlays: PipOverlay[], id: string, edge: "start" | "end", maxOutputEnd: number, time: number): PipOverlay[] {
+  return overlays.map((o) => {
+    if (o.id !== id) return o;
+    if (edge === "start") {
+      const minStart = o.startTime - o.trimStart;
+      const clampedStart = Math.max(minStart, Math.min(time, o.endTime - MIN_OVERLAY_DURATION));
+      const trimStart = o.trimStart + (clampedStart - o.startTime);
+      return { ...o, startTime: clampedStart, trimStart, updatedAt: Date.now() };
+    }
     const trimEnd = o.trimStart + (o.endTime - o.startTime);
     const roomInSource = o.sourceDuration - trimEnd;
     const maxEnd = Math.min(maxOutputEnd, o.endTime + Math.max(0, roomInSource));

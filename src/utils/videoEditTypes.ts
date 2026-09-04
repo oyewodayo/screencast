@@ -262,6 +262,43 @@ export interface AudioOverlay {
   updatedAt: number;
 }
 
+// A picture-in-picture video layer - e.g. a webcam recording captured separately from the screen
+// (see FormData.separate_webcam_capture, recording.rs) and composited back on top of the primary
+// clip track. Unlike TextOverlay/ImageOverlay/BlurOverlay, this has real moving-picture content of
+// its own that can't be pre-rendered to a flat PNG the way those are for export (videoOverlayRender.ts) -
+// both the live preview (a real <video> element, see VideoOverlayLayer.tsx) and export
+// (export_trimmed_video's own PipOverlay struct, conversion.rs) instead composite the actual video
+// frames directly, same technique recording.rs's build_camera_overlay_filter_complex already uses
+// for the baked-in overlay this feature is the editable alternative to. Same trimStart/
+// sourceDuration shape as AudioOverlay (a real source file, not an abstract stretchable box).
+export type PipShape = "circle" | "rounded" | "rectangle";
+export interface PipOverlay {
+  id: string;
+  sourcePath: string;
+  // Normalized 0..1 fractions of the video frame, same basis as ImageOverlay's own x/y/width/height.
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  shape: PipShape;
+  cornerRadius?: number; // fraction of frame height, "rounded" only - undefined means a modest default
+  trimStart: number;
+  sourceDuration: number;
+  startTime: number;
+  endTime: number;
+  // Muted by default - a PiP is commonly a webcam recorded via FormData.separate_webcam_capture,
+  // which never has an audio track at all (the mic already goes to the main track in that case -
+  // see win.rs's own comment), so silence is the safer default; an arbitrary picked video with its
+  // own real audio can turn this on. makePipOverlay (videoEditHandlers.ts) always sets `muted`
+  // explicitly (true) rather than leaving it undefined, unlike AudioOverlay's own muted field
+  // (there, undefined/false both mean audible) - so this being undefined should never actually
+  // happen for a pip created through the normal add flow.
+  volume: number; // 0..1, defaults to 1
+  muted?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 // What export_trimmed_video (Rust) actually consumes - plain, ordered [start,end) ranges, each
 // naming its own source file. Kept as a separate type from Clip (rather than reusing Clip
 // directly) so call sites are explicit about which shape they need; the id is UI-only and never
@@ -287,6 +324,7 @@ export interface VideoEditState {
   imageOverlays: ImageOverlay[];
   blurOverlays: BlurOverlay[];
   audioOverlays: AudioOverlay[];
+  pipOverlays: PipOverlay[];
   // The primary video's OWN audio level - distinct from any AudioOverlay's own volume/muted (those
   // are separate mixed-in tracks; this is the original soundtrack that was always there). A plain
   // pair of fields rather than an array item like the overlays above, matching the "one track"
@@ -306,6 +344,7 @@ export interface EditableFields {
   imageOverlays: ImageOverlay[];
   blurOverlays: BlurOverlay[];
   audioOverlays: AudioOverlay[];
+  pipOverlays: PipOverlay[];
   videoAudioMuted: boolean;
   videoAudioVolume: number;
 }
@@ -320,6 +359,7 @@ export interface VideoEditCommand {
   after: EditableFields;
   label:
     | "trim"
+    | "trim-silence"
     | "split"
     | "delete"
     | "reorder"
@@ -337,6 +377,9 @@ export interface VideoEditCommand {
     | "add-audio"
     | "edit-audio"
     | "delete-audio"
+    | "add-pip"
+    | "edit-pip"
+    | "delete-pip"
     | "edit-track-audio";
 }
 
@@ -348,6 +391,7 @@ export function createEmptyState(sourcePath: string, duration: number): VideoEdi
     imageOverlays: [],
     blurOverlays: [],
     audioOverlays: [],
+    pipOverlays: [],
     videoAudioMuted: false,
     videoAudioVolume: 1,
     updatedAt: new Date().toISOString(),

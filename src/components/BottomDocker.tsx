@@ -69,6 +69,11 @@ interface Props {
   onSelectBlurOverlay?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
+  // Video-only: PiP-overlay selection/placement state, same threading as the overlay props above.
+  selectedPipOverlayId?: string | null;
+  onSelectPipOverlay?: (id: string | null) => void;
+  isPlacingPip?: boolean;
+  onToggleArmPlacePip?: () => void;
   // Video-only: on-canvas crop-tool arm state, same threading as the overlay props above.
   isCroppingClip?: boolean;
   onToggleCroppingClip?: () => void;
@@ -97,6 +102,8 @@ interface Props {
   setOverlaySize: React.Dispatch<React.SetStateAction<string>>; // ADD THIS
   includeSystemAudio: boolean;
   setIncludeSystemAudio: React.Dispatch<React.SetStateAction<boolean>>;
+  separateWebcamCapture: boolean;
+  setSeparateWebcamCapture: React.Dispatch<React.SetStateAction<boolean>>;
   isMonitoring: boolean;
   setIsMonitoring: Dispatch<SetStateAction<boolean>>;
   windowTitles?: any[];
@@ -111,6 +118,7 @@ interface Props {
     overlay_position: string;
     overlay_size: string;
     include_system_audio: boolean;
+    separate_webcam_capture: boolean;
   }) => void;
   handleStopRecording: () => void;
   isRecording: boolean;
@@ -174,6 +182,10 @@ const BottomDocker = ({
   onSelectBlurOverlay,
   isPlacingBlur,
   onToggleArmPlaceBlur,
+  selectedPipOverlayId,
+  onSelectPipOverlay,
+  isPlacingPip,
+  onToggleArmPlacePip,
   isCroppingClip,
   onToggleCroppingClip,
   handleFolderSettings,
@@ -201,6 +213,8 @@ const BottomDocker = ({
   setOverlaySize, // ADD THIS
   includeSystemAudio,
   setIncludeSystemAudio,
+  separateWebcamCapture,
+  setSeparateWebcamCapture,
   handleStartRecording,
   handleStopRecording,
   isPaused,
@@ -418,9 +432,9 @@ const BottomDocker = ({
       // reuses the same field for its overlay's on-screen label.
       window_title: effectiveScreenSize !== 'fullscreen' ? effectiveSelectedScreen : '',
       include_system_audio: includeSystemAudio,
+      separate_webcam_capture: separateWebcamCapture,
     };
 
-    console.log(formData)
     handleStartRecording(formData);
     setModalOpenScreen(false)
 
@@ -550,6 +564,10 @@ const BottomDocker = ({
             onSelectBlurOverlay={onSelectBlurOverlay}
             isPlacingBlur={isPlacingBlur}
             onToggleArmPlaceBlur={onToggleArmPlaceBlur}
+            selectedPipOverlayId={selectedPipOverlayId}
+            onSelectPipOverlay={onSelectPipOverlay}
+            isPlacingPip={isPlacingPip}
+            onToggleArmPlacePip={onToggleArmPlacePip}
             isCroppingClip={isCroppingClip}
             onToggleCroppingClip={onToggleCroppingClip}
           />
@@ -572,6 +590,8 @@ const BottomDocker = ({
             includeSystemAudio={includeSystemAudio}
             onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
             isSystemAudioSupported={isSystemAudioSupported}
+            separateWebcamCapture={separateWebcamCapture}
+            onToggleSeparateWebcamCapture={() => setSeparateWebcamCapture((prev) => !prev)}
             isRecording={isRecording}
             isPaused={isPaused}
             onScreenshotClick={handleScreenshotClick}

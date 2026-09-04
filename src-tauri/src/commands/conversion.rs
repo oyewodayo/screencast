@@ -949,6 +949,93 @@ pub struct OverlayAudio {
     pub fade_out: f64,
 }
 
+// A picture-in-picture video layer - e.g. a webcam recorded separately from the screen (see
+// FormData.separate_webcam_capture, recording.rs) and composited back on top of the primary clip
+// track here instead of being permanently baked in. Unlike OverlayImage, there's real per-frame
+// video content to read (not a single pre-rendered PNG), so this gets its own `-i` input (the
+// FULL source file - trim_start/start_time/end_time below scope which window of it is actually
+// used, the same trim-then-composite shape `segments` itself uses) rather than joining the image/
+// blur temp-file pipeline. `x`/`y`/`width`/`height` are already resolved to real output-video
+// pixels by the frontend, same as OverlayImage's own x/y.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipOverlay {
+    pub source_path: String,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub shape: String, // "circle" | "rounded" | "rectangle" - sanitized via sanitize_pip_shape
+    pub corner_radius: Option<f64>, // fraction of `height`, "rounded" only
+    pub trim_start: f64,
+    pub start_time: f64,
+    pub end_time: f64,
+    // 0.0 when the frontend's own "play this clip's own audio" toggle is off (see
+    // PipOverlay.muted, videoEditTypes.ts) - collapsed to a single number the same way
+    // effective_video_volume already folds audio_muted into the primary track's own volume,
+    // rather than carrying a separate bool here too.
+    pub volume: f64,
+}
+
+const ALLOWED_PIP_SHAPES: &[&str] = &["circle", "rounded", "rectangle"];
+
+fn sanitize_pip_shape(shape: &str) -> &str {
+    ALLOWED_PIP_SHAPES.iter().find(|&&s| s == shape).copied().unwrap_or("rectangle")
+}
+
+// One PiP overlay's filter-graph fragment: trims this overlay's own [trim_start, trim_start+
+// duration) window out of its (already `-i`'d, full-length) source, scales it to fill exactly
+// `width`x`height` - `force_original_aspect_ratio=increase` then `crop` is the standard ffmpeg
+// "cover" recipe, matching the live preview's own CSS `object-fit: cover` exactly rather than
+// stretching or letterboxing - then masks it into shape and composites it onto `current_label`.
+// Circle/rounded reuse the same geq-based geometric-mask technique recording.rs's own
+// build_camera_overlay_filter_complex already uses for the baked-in overlay this feature is the
+// editable alternative to (kept as a separate copy here rather than a shared function - the two
+// commands build genuinely different surrounding graphs, and geq expressions are short enough that
+// sharing would cost more in indirection than it'd save).
+fn pip_overlay_chain(pip: &PipOverlay, input_index: usize, stage_index: usize, current_label: &str, out_label: &str) -> String {
+    let duration = (pip.end_time - pip.start_time).max(0.01);
+    let trim_end = pip.trim_start + duration;
+    let cover = format!(
+        "trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}",
+        ts = pip.trim_start, te = trim_end, w = pip.width, h = pip.height
+    );
+    let shape = sanitize_pip_shape(&pip.shape);
+    let video_label = format!("pip{}v", stage_index);
+
+    let mut chain = String::new();
+    let composited_label = match shape {
+        "rectangle" => {
+            chain.push_str(&format!("[{}:v]{}[{}];", input_index, cover, video_label));
+            video_label
+        }
+        _ => {
+            let mask_expr = if shape == "rounded" {
+                let r = ((pip.corner_radius.unwrap_or(0.08).max(0.0).min(0.5)) * pip.height as f64).round() as i64;
+                format!("if(gte(X,{r})*gte(Y,{r})*gte(W-{r}-X,0)*gte(H-{r}-Y,0),255,0)", r = r)
+            } else {
+                "if(gt((X-W/2)^2+(Y-H/2)^2,(W/2)^2),0,255)".to_string()
+            };
+            let alpha_label = format!("pip{}a", stage_index);
+            let masked_label = format!("pip{}m", stage_index);
+            // Reads the raw `-i`'d input twice (once per branch below) rather than an explicit
+            // `split` - ffmpeg fans out a raw demuxed/decoded input stream reference on its own,
+            // the same "{input}...{input}..." idiom overlay_stage_filter (recording.rs) already
+            // relies on for exactly this shape-masking technique.
+            chain.push_str(&format!("[{idx}:v]{cover},geq=lum_expr='{mask_expr}',format=yuva420p[{alpha}];", idx = input_index, cover = cover, mask_expr = mask_expr, alpha = alpha_label));
+            chain.push_str(&format!("[{idx}:v]{cover}[{video}];", idx = input_index, cover = cover, video = video_label));
+            chain.push_str(&format!("[{video}][{alpha}]alphamerge[{masked}];", video = video_label, alpha = alpha_label, masked = masked_label));
+            masked_label
+        }
+    };
+
+    chain.push_str(&format!(
+        "[{current}][{composited}]overlay=x={x}:y={y}:enable='between(t,{start:.3},{end:.3})'[{out}];",
+        current = current_label, composited = composited_label, x = pip.x, y = pip.y, start = pip.start_time, end = pip.end_time, out = out_label
+    ));
+    chain
+}
+
 // Per-segment color grade fragment, chained directly onto that segment's own trim step (before
 // concat). Formulas are deliberately simple/approximate (not colorimetrically "correct") - a
 // quick preset gallery, not a grading tool - and are meant to visually match their CSS-preview
@@ -1272,6 +1359,9 @@ pub async fn export_trimmed_video(
     overlays: Vec<OverlayImage>,
     blur_overlays: Vec<OverlayBlur>,
     audio_overlays: Vec<OverlayAudio>,
+    // Always sent by the frontend (possibly empty), unlike video_width/quality/output_path below -
+    // no #[serde(default)] here since a bare fn parameter can't carry one the way a struct field can.
+    pip_overlays: Vec<PipOverlay>,
     audio_muted: bool,
     audio_volume: f64,
     // The primary file's native pixel resolution, already resolved by the frontend (same value
@@ -1382,9 +1472,19 @@ pub async fn export_trimmed_video(
         inputs.push(InputSpec::plain(audio_ov.source_path.clone()));
     }
 
+    // PiP sources come last (after audio overlays) so audio_input_base's own formula further down
+    // - segments.len() + overlays.len() + blur_mask_count - doesn't need to change to account for
+    // them. Each gets the FULL source file as its own `-i` (no -loop/-t pre_args, unlike the image/
+    // blur PNGs above) since pip_overlay_chain's own `trim=` does the windowing instead.
+    let pip_input_base = inputs.len();
+    for pip in &pip_overlays {
+        inputs.push(InputSpec::plain(pip.source_path.clone()));
+    }
+
     let has_video_overlays = !overlays.is_empty();
     let has_blur_overlays = !blur_overlays.is_empty();
     let has_audio_overlays = !audio_overlays.is_empty();
+    let has_pip_overlays = !pip_overlays.is_empty();
     // Any clip-level effect also needs the full filter graph - the fast -ss/-to path below has no
     // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
     let has_clip_effects = segments.iter().any(|s| {
@@ -1397,7 +1497,7 @@ pub async fn export_trimmed_video(
     // before this feature existed.
     let has_transitions = segments.iter().skip(1).any(|s| s.transition_in.is_some());
 
-    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_blur_overlays && !has_audio_overlays && !has_clip_effects {
+    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_blur_overlays && !has_audio_overlays && !has_pip_overlays && !has_clip_effects {
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
         let seg = &segments[0];
@@ -1648,11 +1748,26 @@ pub async fn export_trimmed_video(
             ));
             current_label = next_label;
         }
+
+        // PiP layers composite last (on top of blur AND text/image, matching the live preview's
+        // own DOM order - PipOverlayLayer is mounted after VideoOverlayLayer, see Dashboard.tsx) -
+        // each stage always writes to its own "pipNout" intermediate label, never "outv" directly
+        // (unlike the text/image loop just above, which can), since that loop may have already
+        // claimed "outv" for itself and a second filter stage can't also output to the same label.
+        // The shared fallback right below (`current_label != "outv"`) is what actually renames
+        // whatever this leaves current_label pointing at.
+        for (i, pip) in pip_overlays.iter().enumerate() {
+            let out_label = format!("pip{}out", i);
+            filter.push_str(&pip_overlay_chain(pip, pip_input_base + i, i, &current_label, &out_label));
+            current_label = out_label;
+        }
+
         // Whatever [current_label] is pointing at (the plain trim/concat [base], or the last blur/
-        // image/text stage that actually ran) needs to end up named [outv] for the -map below -
-        // covers all four combinations of "any blur regions" x "any text/image overlays" with one
-        // check, rather than the single `!has_video_overlays` special case this used to be before
-        // blur support existed (back when [base] was the only possible "nothing chained" label).
+        // image/text/pip stage that actually ran) needs to end up named [outv] for the -map below -
+        // covers every combination of "any blur regions" x "any text/image overlays" x "any PiP
+        // layers" with one check, rather than the single `!has_video_overlays` special case this
+        // used to be before blur/pip support existed (back when [base] was the only possible
+        // "nothing chained" label).
         if current_label != "outv" {
             filter.push_str(&format!("[{}]copy[outv];", current_label));
         }
@@ -1669,14 +1784,35 @@ pub async fn export_trimmed_video(
             "outa"
         };
 
-        // Mixes each audio overlay into base_audio_label - amix's `normalize=0` is the detail that
-        // matters here: amix auto-attenuates every input by 1/inputs by default, which would
-        // quietly turn the original video's own audio down just because background music was
-        // added. normalize=0 keeps each track at whatever level its own `volume=` filter below
-        // already set (the track volume above for the original track, whatever the user picked for
-        // each overlay) - "30% volume" means 30%, not 30% further divided by however many tracks
-        // happen to be mixed in.
-        let audio_label = if has_audio_overlays {
+        // Which pip overlays actually contribute audio - the frontend already collapses its own
+        // "play this clip's own audio" toggle into volume=0 when off (see PipOverlay.muted,
+        // videoEditTypes.ts), so a plain volume>0 check covers that; probe_has_audio additionally
+        // guards against a pip source with NO audio stream at all (e.g. the webcam sidecar
+        // FormData.separate_webcam_capture itself produces, which is video-only by design - see
+        // win.rs) - without this, a stray `[idx:a]` on a video-only input would reject the whole
+        // filtergraph with "Stream specifier ':a' ... matches no streams", the same failure mode
+        // probe_has_audio already exists to prevent for segments.
+        let pip_audio_input_index: Vec<Option<usize>> = pip_overlays
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if p.volume > 0.001 && probe_has_audio(&ffprobe_path, &p.source_path) {
+                    Some(pip_input_base + i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let has_pip_audio = pip_audio_input_index.iter().any(|idx| idx.is_some());
+
+        // Mixes each audio overlay (and any audible pip layer) into base_audio_label - amix's
+        // `normalize=0` is the detail that matters here: amix auto-attenuates every input by
+        // 1/inputs by default, which would quietly turn the original video's own audio down just
+        // because background music was added. normalize=0 keeps each track at whatever level its
+        // own `volume=` filter below already set (the track volume above for the original track,
+        // whatever the user picked for each overlay) - "30% volume" means 30%, not 30% further
+        // divided by however many tracks happen to be mixed in.
+        let audio_label = if has_audio_overlays || has_pip_audio {
             // Inputs so far, in push order: segments, then image overlay PNGs, then blur mask PNGs
             // (see blur_mask_input_index above) - audio overlay sources were appended right after
             // all of those, so this has to account for all three groups, not just the first two.
@@ -1702,10 +1838,26 @@ pub async fn export_trimmed_video(
                 filter.push_str(&format!("{},adelay={:.0}:all=1[{}];", chain, delay_ms, track_label));
                 mix_inputs.push_str(&format!("[{}]", track_label));
             }
+            // Same atrim+volume+adelay shape as the audio-overlay loop above, minus fade in/out
+            // (pip has no fade controls of its own) - skips any pip pip_audio_input_index marked
+            // None (muted, or a source with no audio stream at all).
+            let mut pip_audio_count = 0;
+            for (i, pip) in pip_overlays.iter().enumerate() {
+                let Some(input_index) = pip_audio_input_index[i] else { continue };
+                let trim_end = pip.trim_start + (pip.end_time - pip.start_time);
+                let delay_ms = (pip.start_time * 1000.0).round().max(0.0);
+                let track_label = format!("pipa{}", i);
+                filter.push_str(&format!(
+                    "[{idx}:a]atrim=start={ts:.3}:end={te:.3},asetpts=PTS-STARTPTS,volume={vol:.3},adelay={delay:.0}:all=1[{label}];",
+                    idx = input_index, ts = pip.trim_start, te = trim_end, vol = pip.volume, delay = delay_ms, label = track_label
+                ));
+                mix_inputs.push_str(&format!("[{}]", track_label));
+                pip_audio_count += 1;
+            }
             filter.push_str(&format!(
                 "{}amix=inputs={}:duration=first:dropout_transition=0:normalize=0[outa_mixed];",
                 mix_inputs,
-                audio_overlays.len() + 1
+                audio_overlays.len() + pip_audio_count + 1
             ));
             "outa_mixed".to_string()
         } else {
@@ -2011,4 +2163,82 @@ pub async fn convert_video(
     }
 
     Ok(result)
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SilentRange {
+    pub start: f64,
+    pub end: f64,
+}
+
+// Runs ffmpeg's own `silencedetect` audio filter over the WHOLE source file (never scoped to one
+// clip's own [start,end) - the frontend intersects these against whichever clip's current trim
+// window is in play instead, see removeSilentRanges/videoEditHandlers.ts, so the same detection
+// result stays valid even if that clip gets trimmed differently afterward). `-f null -` discards
+// the re-encoded output entirely - only silencedetect's own stderr log lines are ever read.
+#[tauri::command]
+pub async fn detect_silence(
+    app_handle: AppHandle,
+    input_path: String,
+    // dB threshold below which audio counts as "silent", and the minimum duration (seconds) a
+    // silent stretch must last to be reported - both mirror ffmpeg's own `silencedetect` filter
+    // options 1:1. Defaults (-30dB, 0.5s) are deliberately conservative: they catch genuine dead
+    // air/pauses without flagging brief natural gaps between words as separate silent ranges.
+    noise_db: Option<f64>,
+    min_duration: Option<f64>,
+) -> Result<Vec<SilentRange>, String> {
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let input = PathBuf::from(&input_path);
+    if !input.exists() {
+        return Err(format!("Input file does not exist: {}", input_path));
+    }
+    let noise_db = noise_db.unwrap_or(-30.0);
+    let min_duration = min_duration.unwrap_or(0.5).max(0.05);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-i").arg(&input_path);
+        cmd.args(["-af", &format!("silencedetect=noise={noise_db}dB:d={min_duration}"), "-f", "null", "-"]);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let output = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        // silencedetect writes to stderr regardless of the overall exit status (a `-f null -`
+        // "encode" succeeds as long as the input decodes at all) - parsed either way, since the
+        // only real failure mode here is ffmpeg being unable to read the file at all, which the
+        // exists() check above already rules out for the common case.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(parse_silence_ranges(&stderr))
+    })
+    .await
+    .map_err(|e| format!("Silence detection task panicked: {}", e))?
+}
+
+// Parses ffmpeg silencedetect's own stderr log lines:
+//   [silencedetect @ 0x...] silence_start: 12.345
+//   [silencedetect @ 0x...] silence_end: 15.678 | silence_duration: 3.333
+// into paired (start,end) ranges. A trailing silence_start with no matching silence_end (the file
+// ends while still silent) is dropped rather than guessed at - callers only ever want ranges with
+// a real, detected end.
+fn parse_silence_ranges(stderr: &str) -> Vec<SilentRange> {
+    let mut ranges = Vec::new();
+    let mut pending_start: Option<f64> = None;
+    for line in stderr.lines() {
+        if let Some(rest) = line.split("silence_start:").nth(1) {
+            if let Ok(start) = rest.trim().split_whitespace().next().unwrap_or("").parse::<f64>() {
+                pending_start = Some(start);
+            }
+        } else if let Some(rest) = line.split("silence_end:").nth(1) {
+            let end_str = rest.split('|').next().unwrap_or("").trim();
+            if let (Some(start), Ok(end)) = (pending_start.take(), end_str.parse::<f64>()) {
+                if end > start {
+                    ranges.push(SilentRange { start, end });
+                }
+            }
+        }
+    }
+    ranges
 }

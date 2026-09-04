@@ -227,6 +227,7 @@ fn main() {
             commands::conversion::get_video_thumbnail,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
+            commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,
 
