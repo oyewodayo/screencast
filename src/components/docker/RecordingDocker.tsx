@@ -30,6 +30,11 @@ interface RecordingDockerProps {
   // one camera selected.
   separateWebcamCapture: boolean;
   onToggleSeparateWebcamCapture: () => void;
+  // Records click position/timing to a sidecar JSON for the editor's own "auto zoom on click"
+  // tool - Windows-only (services/click_tracker.rs), offered for the same screen-capture record
+  // types as includeSystemAudio above.
+  trackClicks: boolean;
+  onToggleTrackClicks: () => void;
   isRecording: boolean;
   isPaused: boolean;
   onScreenshotClick: () => void;
@@ -63,6 +68,8 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   isSystemAudioSupported,
   separateWebcamCapture,
   onToggleSeparateWebcamCapture,
+  trackClicks,
+  onToggleTrackClicks,
   isRecording,
   isPaused,
   onScreenshotClick,
@@ -189,6 +196,30 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
                 onChange={onToggleIncludeSystemAudio}
               />
               System audio
+            </label>
+          </div>
+        )}
+
+        {/* Same screen-capturing record types click_tracker.rs's own gate uses (start_recording,
+            recording.rs) - "va"/"v"/"a" never touch the screen at all, so there's nothing to click
+            "on" in a meaningful sense for them. */}
+        {(recordType === "sva" || recordType === "sv" || recordType === "sa" || recordType === "s") && (
+          <div>
+            <div className="docker-field-label p-1 text-sm">&nbsp;</div>
+            <label
+              title={
+                isSystemAudioSupported
+                  ? "Records where and when you click during the recording, so the editor can suggest zooming in on each one afterward."
+                  : "Click tracking is Windows-only for now - not available on this platform."
+              }
+              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
+                isSystemAudioSupported
+                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
+                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
+              }`}
+            >
+              <input type="checkbox" checked={trackClicks && isSystemAudioSupported} disabled={!isSystemAudioSupported} onChange={onToggleTrackClicks} />
+              Track clicks (auto-zoom)
             </label>
           </div>
         )}

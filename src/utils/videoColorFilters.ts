@@ -73,9 +73,24 @@ export function kenBurnsTransform(kb: ClipKenBurns, progress: number): string {
   const maxPanPct = 6 * amount;
   switch (kb.preset) {
     case "zoom-in":
-      return `scale(${1 + (maxZoom - 1) * clampedProgress})`;
-    case "zoom-out":
-      return `scale(${maxZoom - (maxZoom - 1) * clampedProgress})`;
+    case "zoom-out": {
+      const zoom = kb.preset === "zoom-in" ? 1 + (maxZoom - 1) * clampedProgress : maxZoom - (maxZoom - 1) * clampedProgress;
+      // Standard "zoom toward a point" CSS recipe: scale() alone always zooms from the element's
+      // own center (its default transform-origin, left untouched rather than reassigned - crop's
+      // own translate/scale math, composed alongside this in the same transform string, assumes a
+      // center origin too, so changing it here would silently detune crop for any clip that has
+      // both effects set). Translating by (0.5-target)*(zoom-1) - a FIXED percentage of the
+      // element's own untransformed size, per the CSS spec, unaffected by the scale() it's chained
+      // with - shifts the enlarged content so `target` ends up back where it started instead of
+      // drifting toward the frame's own center as zoom grows. (0.5, 0.5) - the default when no
+      // click position set this - makes both translate terms 0, reducing to the exact pre-existing
+      // centered-zoom look.
+      const targetX = kb.targetX ?? 0.5;
+      const targetY = kb.targetY ?? 0.5;
+      const dx = (0.5 - targetX) * (zoom - 1) * 100;
+      const dy = (0.5 - targetY) * (zoom - 1) * 100;
+      return `translate(${dx}%, ${dy}%) scale(${zoom})`;
+    }
     case "pan-left":
       return `scale(${1 + 0.08 * amount}) translateX(${maxPanPct * (0.5 - clampedProgress)}%)`;
     case "pan-right":

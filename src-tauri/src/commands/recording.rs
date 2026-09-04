@@ -61,6 +61,11 @@ pub struct AppState {
     loopback_capture: Arc<Mutex<Option<crate::services::loopback_audio::LoopbackCapture>>>,
     #[cfg(target_os = "windows")]
     recording_has_own_audio: Arc<Mutex<bool>>,
+    // Click-tracking session for the recording currently in progress, if FormData.track_clicks
+    // asked for one - Windows-only, see services/click_tracker.rs's own doc comment. stop_recording
+    // stops it and writes its collected clicks to a sidecar JSON file next to the finished video.
+    #[cfg(target_os = "windows")]
+    click_capture: Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -91,6 +96,11 @@ pub struct FormData{
     // actually changes and why it's gated to exactly one camera on record_type "sva" only.
     #[serde(default)]
     separate_webcam_capture: bool,
+    // Opt-in (default false), Windows-only - see services/click_tracker.rs and start_recording's
+    // own handling of this field. Only meaningful for the screen-capture modes (sva/sv/sa/s), same
+    // as include_system_audio above.
+    #[serde(default)]
+    track_clicks: bool,
 }
 
 // What a "screen" capture should actually point ffmpeg at, resolved once from FormData.screen_size
@@ -126,6 +136,55 @@ pub(crate) fn resolve_capture_target(app_handle: &AppHandle, form_data: &FormDat
     }
 
     CaptureTarget::FullScreen
+}
+
+// Resolves a CaptureTarget to real SCREEN-coordinate pixel bounds - what services/click_tracker.rs
+// needs to normalize a raw mouse-hook click position against, since gdigrab captures exactly this
+// same region (see gdigrab_input_args, win.rs) and the editor's own overlay positions are all
+// normalized fractions of "the captured frame", not raw screen pixels. FullScreen resolves against
+// the virtual screen's own bounds (every monitor combined, with a possibly-negative origin if a
+// monitor sits left of/above the primary) since that's what a plain "-i desktop" with no offset/
+// crop actually grabs - not just the primary monitor.
+#[cfg(target_os = "windows")]
+fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
+    match target {
+        CaptureTarget::FullScreen => {
+            let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+            let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+            let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+            Some((x, y, width, height))
+        }
+        CaptureTarget::Monitor { x, y, width, height } => Some((*x, *y, *width, *height)),
+        CaptureTarget::Window { title } => crate::commands::window_capture::win::get_window_rect_by_title(title).ok(),
+    }
+}
+
+// Where a recording's own click-tracking data lives, if it has any - shared between stop_recording
+// (which writes it) and load_click_sidecar below (which the editor calls to read it back). Mirrors
+// the ".system_audio.wav"/"_webcam.mp4" sibling-file convention this same module already uses for
+// other per-recording artifacts, rather than video_edits.rs's own ".edits.json" (append-to-whole-
+// filename) convention - the two sidecar families were established independently and neither
+// needs to match the other, just be internally consistent.
+fn click_sidecar_path(video_path: &Path) -> PathBuf {
+    let stem = video_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
+    video_path.with_file_name(format!("{}.clicks.json", stem))
+}
+
+// Reads back whatever click_sidecar_path holds for `video_path`, if anything - None (not an
+// error) when the video was never recorded with track_clicks on, same "no sidecar yet is normal,
+// not a failure" convention load_video_edit_state (video_edits.rs) already uses.
+#[tauri::command]
+pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let sidecar = click_sidecar_path(&PathBuf::from(&video_path));
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&sidecar).map(Some).map_err(|e| format!("Failed to read click-tracking sidecar: {}", e))
 }
 
 // ffmpeg's stderr always leads with its multi-hundred-character build banner (version, compile
@@ -564,6 +623,22 @@ pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  fo
                 Err(e) => warn!("Failed to start system-audio capture, recording will proceed without it: {}", e),
             }
         }
+
+        // Click tracking for the editor's own "auto zoom on click" feature - see
+        // services/click_tracker.rs. Same "any screen-capturing mode" gate as system audio above,
+        // and started here (rather than inside each platform::recording_with_output_* fn) so it
+        // doesn't need duplicating across every one of them for a concern that has nothing to do
+        // with which ffmpeg args a given mode builds.
+        let wants_click_tracking = form_data.track_clicks && matches!(form_data.record_type.as_str(), "sva" | "sv" | "sa" | "s");
+        if wants_click_tracking {
+            match capture_region_bounds(&resolve_capture_target(&app_handle, &form_data)) {
+                Some((x, y, width, height)) => match crate::services::click_tracker::ClickCapture::start((x, y), (width, height)) {
+                    Ok(capture) => *state.click_capture.lock().await = Some(capture),
+                    Err(e) => warn!("Failed to start click tracking, recording will proceed without it: {}", e),
+                },
+                None => warn!("Failed to resolve the capture region's own bounds, recording will proceed without click tracking"),
+            }
+        }
     }
 
     match form_data.record_type.as_str() {
@@ -707,6 +782,32 @@ pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -
         }
         Err(_) => {
             return Err("Recording failed: no output file was created. The selected screen, camera, or microphone may be unavailable, or recording may have been stopped before it could start.".to_string());
+        }
+    }
+
+    // Stop click tracking (if this recording had it running) and write whatever it collected to a
+    // sidecar JSON next to the finished video - the editor's own "auto zoom on click" feature reads
+    // this back (see detect_silence's own sidecar-free precedent; this one needs a file rather than
+    // an on-demand Rust command since the clicks only ever existed during the recording itself,
+    // nothing to re-derive from the finished video file afterward). Only written once the file's
+    // already confirmed non-empty above, so a failed recording doesn't leave an orphaned sidecar
+    // pointing at a video that was just deleted.
+    #[cfg(target_os = "windows")]
+    {
+        let click_capture = state.click_capture.lock().await.take();
+        if let Some(capture) = click_capture {
+            let clicks = capture.stop();
+            if !clicks.is_empty() {
+                let clicks_path = click_sidecar_path(&output_path);
+                match serde_json::to_string(&clicks) {
+                    Ok(json) => {
+                        if let Err(e) = fs::write(&clicks_path, json) {
+                            warn!("Failed to write click-tracking sidecar: {}", e);
+                        }
+                    }
+                    Err(e) => warn!("Failed to serialize click-tracking data: {}", e),
+                }
+            }
         }
     }
 

@@ -32,6 +32,14 @@ export type KenBurnsPreset = "zoom-in" | "zoom-out" | "pan-left" | "pan-right";
 export interface ClipKenBurns {
   preset: KenBurnsPreset;
   intensity?: number; // 0..1, undefined means 0.5 (moderate) - how far the zoom/pan travels
+  // Where a "zoom-in"/"zoom-out" preset centers its crop window - fraction of the source frame,
+  // undefined means the frame's own center (0.5, 0.5), the pre-existing look. Ignored by
+  // "pan-left"/"pan-right", which have their own fixed direction. Lets the "auto zoom on click"
+  // tool (applyAutoZoomAtClicks, videoEditHandlers.ts) center a punch-in on where a click actually
+  // landed instead of the frame's middle - both preview (kenBurnsTransform, videoColorFilters.ts)
+  // and export (ken_burns_chain, conversion.rs) read this the same way a plain zoom does.
+  targetX?: number;
+  targetY?: number;
 }
 
 // A free-form crop window into this clip's own frame - independent x/y/width/height (fractions of
@@ -360,6 +368,7 @@ export interface VideoEditCommand {
   label:
     | "trim"
     | "trim-silence"
+    | "auto-zoom"
     | "split"
     | "delete"
     | "reorder"

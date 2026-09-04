@@ -8,6 +8,8 @@ import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, OverlayA
 import {
   applyCommand,
   addOverlay,
+  applyAutoZoomAtClicks as applyAutoZoomAtClicksHandler,
+  AutoZoomClick,
   bringOverlayToFront,
   deleteClipAt as deleteClipAtHandler,
   deleteOverlay,
@@ -199,6 +201,10 @@ export interface UseVideoEditStoreResult {
   // dropping every detected dead-air range in a single undo step - see removeSilentRanges,
   // videoEditHandlers.ts, for the actual splice logic.
   trimSilenceForClip: (clipId: string, silentRanges: { start: number; end: number }[]) => void;
+  // Applies the "auto zoom on click" tool's own splice logic to one clip, inserting a zoom-in/
+  // zoom-out Ken Burns pair around each click in a single undo step - see applyAutoZoomAtClicks,
+  // videoEditHandlers.ts.
+  applyAutoZoomAtClicks: (clipId: string, clicks: AutoZoomClick[]) => void;
   // Inserts a whole new clip - from the Briefcast library or an external file dropped onto the
   // timeline - at `atIndex`, fetching its duration first if not already known. Resolves once the
   // clip has actually been added (or been skipped, if the duration lookup failed).
@@ -481,6 +487,17 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const clips = removeSilentRangesHandler(current.clips, clipId, silentRanges);
       if (clips === current.clips) return;
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "trim-silence");
+    },
+    [pushCommand]
+  );
+
+  const applyAutoZoomAtClicks = useCallback(
+    (clipId: string, clicks: AutoZoomClick[]) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = applyAutoZoomAtClicksHandler(current.clips, clipId, clicks);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "auto-zoom");
     },
     [pushCommand]
   );
@@ -1172,6 +1189,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     resizeClipEdge,
     updateClipEffects,
     trimSilenceForClip,
+    applyAutoZoomAtClicks,
     insertClipAt,
     undo,
     redo,

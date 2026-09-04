@@ -104,6 +104,8 @@ interface Props {
   setIncludeSystemAudio: React.Dispatch<React.SetStateAction<boolean>>;
   separateWebcamCapture: boolean;
   setSeparateWebcamCapture: React.Dispatch<React.SetStateAction<boolean>>;
+  trackClicks: boolean;
+  setTrackClicks: React.Dispatch<React.SetStateAction<boolean>>;
   isMonitoring: boolean;
   setIsMonitoring: Dispatch<SetStateAction<boolean>>;
   windowTitles?: any[];
@@ -119,6 +121,7 @@ interface Props {
     overlay_size: string;
     include_system_audio: boolean;
     separate_webcam_capture: boolean;
+    track_clicks: boolean;
   }) => void;
   handleStopRecording: () => void;
   isRecording: boolean;
@@ -215,6 +218,8 @@ const BottomDocker = ({
   setIncludeSystemAudio,
   separateWebcamCapture,
   setSeparateWebcamCapture,
+  trackClicks,
+  setTrackClicks,
   handleStartRecording,
   handleStopRecording,
   isPaused,
@@ -433,6 +438,7 @@ const BottomDocker = ({
       window_title: effectiveScreenSize !== 'fullscreen' ? effectiveSelectedScreen : '',
       include_system_audio: includeSystemAudio,
       separate_webcam_capture: separateWebcamCapture,
+      track_clicks: trackClicks,
     };
 
     handleStartRecording(formData);
@@ -592,6 +598,8 @@ const BottomDocker = ({
             isSystemAudioSupported={isSystemAudioSupported}
             separateWebcamCapture={separateWebcamCapture}
             onToggleSeparateWebcamCapture={() => setSeparateWebcamCapture((prev) => !prev)}
+            trackClicks={trackClicks}
+            onToggleTrackClicks={() => setTrackClicks((prev) => !prev)}
             isRecording={isRecording}
             isPaused={isPaused}
             onScreenshotClick={handleScreenshotClick}

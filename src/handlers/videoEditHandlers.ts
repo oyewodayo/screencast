@@ -121,6 +121,85 @@ export function removeSilentRanges(clips: Clip[], clipId: string, silentRanges: 
   return [...clips.slice(0, index), ...keptClips, ...clips.slice(index + 1)];
 }
 
+// One recorded click, already resolved to this clip's own SOURCE-time coordinate space (same
+// space Clip.start/end occupy) and frame-relative x/y (see load_click_sidecar, recording.rs, and
+// ClickEvent's own doc comment there for how these get produced during recording).
+export interface AutoZoomClick {
+  time: number;
+  x: number;
+  y: number;
+}
+
+// Bracketing durations for the punch-in/punch-out pair generated around each click - tuned once
+// here (not user-adjustable in v1) to read as a deliberate "zoom in on this, hold, zoom back out"
+// beat: LEAD_IN ramps up to the peak zoom by shortly after the click itself (the ramp is still
+// finishing as the click lands, which reads better than already being fully zoomed in before
+// anything happened), HOLD is how long it stays near peak, LEAD_OUT ramps back to normal.
+const AUTO_ZOOM_LEAD_IN_SEC = 0.8;
+const AUTO_ZOOM_HOLD_SEC = 1.5;
+const AUTO_ZOOM_LEAD_OUT_SEC = 0.8;
+const AUTO_ZOOM_INTENSITY = 0.6;
+
+// Splits `clipId`'s own [start,end) around each click that falls inside it, inserting a zoom-in-
+// then-zoom-out pair of Ken Burns segments centered on that click's own position for each one - the
+// "auto zoom on click" toolbar action's actual splice logic, batched into ONE undo command the same
+// "batch cuts land as one command, not 2*N" reasoning removeSilentRanges above already established
+// (see its own doc comment). Clicks too close together to each get their own non-overlapping zoom
+// window are skipped entirely (not merged, not truncated) - simpler than trying to blend two
+// overlapping zooms into one, and a skipped click still gets its own zoom on a later call once
+// earlier ones have been removed to make room.
+export function applyAutoZoomAtClicks(clips: Clip[], clipId: string, clicks: AutoZoomClick[]): Clip[] {
+  const index = clips.findIndex((c) => c.id === clipId);
+  if (index === -1) return clips;
+  const clip = clips[index];
+
+  const sorted = clicks.filter((c) => c.time > clip.start && c.time < clip.end).sort((a, b) => a.time - b.time);
+  if (sorted.length === 0) return clips;
+
+  const pieces: Clip[] = [];
+  let cursor = clip.start;
+  for (const click of sorted) {
+    const zoomStart = Math.max(cursor, click.time - AUTO_ZOOM_LEAD_IN_SEC);
+    const peak = click.time + AUTO_ZOOM_HOLD_SEC;
+    const zoomEnd = Math.min(clip.end, peak + AUTO_ZOOM_LEAD_OUT_SEC);
+    if (zoomStart < cursor || peak - zoomStart < MIN_CLIP_LENGTH || zoomEnd - peak < MIN_CLIP_LENGTH) continue;
+
+    if (zoomStart > cursor) {
+      pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: zoomStart, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal });
+    }
+    pieces.push({
+      id: crypto.randomUUID(),
+      sourcePath: clip.sourcePath,
+      start: zoomStart,
+      end: peak,
+      colorFilter: clip.colorFilter,
+      crop: clip.crop,
+      flipHorizontal: clip.flipHorizontal,
+      kenBurns: { preset: "zoom-in", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y },
+    });
+    pieces.push({
+      id: crypto.randomUUID(),
+      sourcePath: clip.sourcePath,
+      start: peak,
+      end: zoomEnd,
+      colorFilter: clip.colorFilter,
+      crop: clip.crop,
+      flipHorizontal: clip.flipHorizontal,
+      kenBurns: { preset: "zoom-out", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y },
+    });
+    cursor = zoomEnd;
+  }
+  if (clip.end > cursor) {
+    pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: clip.end, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal });
+  }
+  if (pieces.length === 0) return clips;
+  // First piece keeps the original clip's own transitionIn (still adjacent to whatever preceded
+  // the whole thing) - same reasoning splitClipAt/removeSilentRanges already established.
+  pieces[0].transitionIn = clip.transitionIn;
+
+  return [...clips.slice(0, index), ...pieces, ...clips.slice(index + 1)];
+}
+
 // Removes the clip at `index` outright - what was that stretch of source video is simply no
 // longer represented anywhere in the array, no separate "deleted range" bookkeeping needed.
 export function deleteClipAt(clips: Clip[], index: number): Clip[] {

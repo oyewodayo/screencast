@@ -31,6 +31,12 @@ mod services {
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
     #[cfg(target_os = "windows")]
     pub mod loopback_audio;
+    // A Win32 low-level mouse hook, Windows-only for the same reason loopback_audio above is
+    // (SetWindowsHookExW/WH_MOUSE_LL has no cross-platform equivalent this app's existing `windows`
+    // crate dependency could reuse) - see the module's own doc comment for why this needed no new
+    // Cargo dependency at all.
+    #[cfg(target_os = "windows")]
+    pub mod click_tracker;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
     // ffmpeg build mis-decodes multi-image HEIC files (Portrait mode, Deep Fusion, etc.) as a
@@ -201,6 +207,7 @@ fn main() {
             commands::recording::get_connected_devices,
             commands::recording::start_recording,
             commands::recording::stop_recording,
+            commands::recording::load_click_sidecar,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,

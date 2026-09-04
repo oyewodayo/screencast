@@ -4,6 +4,7 @@ import RecordingOverlayWindow from "./components/RecordingOverlayWindow";
 import ScreenshotOverlayWindow from "./components/ScreenshotOverlayWindow";
 import AnnotationOverlayWindow from "./components/AnnotationOverlayWindow";
 import Dashboard from "./pages/Dashboard";
+import ErrorBoundary from "./components/ErrorBoundary";
 import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
 
 // WebView2 (like any Chromium-based browser) reloads the whole page on Ctrl+R/Cmd+R/F5 by
@@ -32,17 +33,26 @@ function App() {
   useBlockPageReload();
 
   return (
-    <Router>
-      <Routes>
-        <Route path="/" element={<Dashboard />} />
+    // Top-level catch-all - Dashboard.tsx already wraps its own Docs subtree in one of these, but
+    // nothing previously covered the video editor, PDF viewer, board, or recording flows, so a bug
+    // in any of those (e.g. the PiP-overlay volume crash this was added after) unmounted the whole
+    // window with no way back, since useBlockPageReload above deliberately disables the keyboard
+    // reload a browser tab would otherwise fall back on. onReset does a real reload (bypasses that
+    // same block, since it's not a keyboard event) rather than just clearing local error state,
+    // which would leave the same crashed subtree to immediately re-render and crash again.
+    <ErrorBoundary fallbackTitle="Briefcast ran into a problem" onReset={() => window.location.reload()}>
+      <Router>
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
 
-        <Route path="/recording-overlay" element={<RecordingOverlayWindow />} />
-        <Route path="/screenshot-overlay" element={<ScreenshotOverlayWindow />} />
-        <Route path="/annotation-overlay" element={<AnnotationOverlayWindow />} />
-        {/* <Route path="/file-modal" element={<FileModal />} /> */}
-        {/* <Route path="/settings" element={} /> */}
-      </Routes>
-    </Router>
+          <Route path="/recording-overlay" element={<RecordingOverlayWindow />} />
+          <Route path="/screenshot-overlay" element={<ScreenshotOverlayWindow />} />
+          <Route path="/annotation-overlay" element={<AnnotationOverlayWindow />} />
+          {/* <Route path="/file-modal" element={<FileModal />} /> */}
+          {/* <Route path="/settings" element={} /> */}
+        </Routes>
+      </Router>
+    </ErrorBoundary>
   );
 }
 

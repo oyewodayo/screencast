@@ -834,6 +834,12 @@ pub struct ClipColorFilter {
 pub struct ClipKenBurns {
     pub preset: String,
     pub intensity: Option<f64>,
+    // Where "zoom-in"/"zoom-out" center their crop window - fraction of the source frame, None
+    // means the frame's own center (0.5, 0.5). Ignored by "pan-left"/"pan-right". See
+    // ClipKenBurns's own doc comment (videoEditTypes.ts) for why this exists (centering an
+    // auto-zoom punch-in on a recorded click position instead of the frame's middle).
+    pub target_x: Option<f64>,
+    pub target_y: Option<f64>,
 }
 
 // A free-form crop window into this segment's own frame - see crop_chain. NOT locked to the
@@ -1077,7 +1083,15 @@ fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64) -> 
             } else {
                 format!("({z:.4}-({z:.4}-1)*min(t/{d:.3},1))")
             };
-            format!(",crop=w='iw/{p}':h='ih/{p}':x='(iw-ow)/2':y='(ih-oh)/2',scale={out_w}:{out_h}")
+            // clip(...) rather than the plain "(iw-ow)/2" center every zoom used before targetX/
+            // targetY existed - ow/oh are themselves time-varying here (they're `iw/p`/`ih/p`
+            // above), so keeping the window fully on-frame at every instant needs a real clamp,
+            // not just a fixed offset. Defaults (0.5, 0.5) reduce to exactly the old centered math.
+            let tx = kb.target_x.unwrap_or(0.5).max(0.0).min(1.0);
+            let ty = kb.target_y.unwrap_or(0.5).max(0.0).min(1.0);
+            format!(
+                ",crop=w='iw/{p}':h='ih/{p}':x='clip({tx:.4}*iw-ow/2,0,iw-ow)':y='clip({ty:.4}*ih-oh/2,0,ih-oh)',scale={out_w}:{out_h}"
+            )
         }
         "pan-left" | "pan-right" => {
             let z = 1.0 + 0.15 * amount;

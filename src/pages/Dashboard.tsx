@@ -255,6 +255,12 @@ const Dashboard = () => {
   // baked-in footage never could be. Recording with this off is byte-for-byte the same as before
   // this feature existed.
   const [separateWebcamCapture, setSeparateWebcamCapture] = useState<boolean>(false);
+  // Opt-in, off by default every session (not persisted, same reasoning as separateWebcamCapture
+  // above - a new, less-proven capture path). When on, start_recording installs a Windows mouse
+  // hook (services/click_tracker.rs) for the duration of the recording and writes every click's
+  // time+position to a "<name>.clicks.json" sidecar - the editor's own "auto zoom on click" tool
+  // reads this back to suggest where to punch in. Recording with this off starts no hook at all.
+  const [trackClicks, setTrackClicks] = useState<boolean>(false);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
@@ -1375,13 +1381,13 @@ const setScreen = () => {
 	const recordingHotkeyRef = useRef({
 		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 		fileName, fileExt, recordType, audioDevice, videoDevices,
-		overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture,
+		overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
 	});
 	useEffect(() => {
 		recordingHotkeyRef.current = {
 			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 			fileName, fileExt, recordType, audioDevice, videoDevices,
-			overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture,
+			overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
 		};
 	});
 
@@ -1406,6 +1412,7 @@ const setScreen = () => {
 			window_title: '',
 			include_system_audio: s.includeSystemAudio,
 			separate_webcam_capture: s.separateWebcamCapture,
+			track_clicks: s.trackClicks,
 		});
 	}, []);
 
@@ -3538,6 +3545,8 @@ const setScreen = () => {
         setIncludeSystemAudio={setIncludeSystemAudio}
         separateWebcamCapture={separateWebcamCapture}
         setSeparateWebcamCapture={setSeparateWebcamCapture}
+        trackClicks={trackClicks}
+        setTrackClicks={setTrackClicks}
         selectedScreen={selectedScreen}
         setSelectedScreen={setSelectedScreen}
         windowTitles={windowTitles}

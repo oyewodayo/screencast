@@ -32,6 +32,7 @@ import {
   IoPause,
   IoAddCircleOutline,
   IoImageOutline,
+  IoLocateOutline,
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
@@ -44,6 +45,7 @@ import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover from "./ClipEffectsPopover";
 import ExportOptionsPopover from "./ExportOptionsPopover";
 import SilenceDetectionPopover, { SilenceDetectionState } from "./SilenceDetectionPopover";
+import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 
 const MIN_PX_PER_SEC = 8;
@@ -566,6 +568,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [silenceAnchor, setSilenceAnchor] = useState<{ left: number; top: number } | null>(null);
   const [silenceState, setSilenceState] = useState<SilenceDetectionState>({ status: "loading" });
   const silenceButtonRef = useRef<HTMLButtonElement>(null);
+
+  // Auto Zoom toolbar button - same shape/gating as Trim Silence above, reading load_click_sidecar
+  // (recording.rs) instead of running detect_silence.
+  const [autoZoomAnchor, setAutoZoomAnchor] = useState<{ left: number; top: number } | null>(null);
+  const [autoZoomState, setAutoZoomState] = useState<AutoZoomState>({ status: "loading" });
+  const autoZoomButtonRef = useRef<HTMLButtonElement>(null);
 
   // Live drag state for resizing a single clip's start/end edge - delta-based (pixels moved since
   // the drag began, converted to a time delta) rather than re-deriving from click position, so it
@@ -1455,6 +1463,38 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     setSilenceAnchor(null);
   };
 
+  // Reads back whatever click_tracker.rs recorded for the selected clip's own source file (see
+  // load_click_sidecar, recording.rs) - None means that recording was never made with "Track
+  // clicks" on, not an error. ClickEvent's own fields (conversion.rs) arrive as elapsedSecs -
+  // seconds since the hook was installed, which lines up with this clip's own SOURCE time (both
+  // are "seconds from the start of the recording") as long as this clip's sourcePath is still the
+  // original recording the sidecar belongs to.
+  const handleDetectAutoZoom = async () => {
+    if (!selectedClip) return;
+    const rect = autoZoomButtonRef.current?.getBoundingClientRect();
+    if (rect) setAutoZoomAnchor({ left: rect.left, top: rect.bottom + 4 });
+    setAutoZoomState({ status: "loading" });
+    try {
+      const json = await invoke<string | null>("load_click_sidecar", { videoPath: selectedClip.sourcePath });
+      if (!json) {
+        setAutoZoomState({ status: "empty", reason: "no-sidecar" });
+        return;
+      }
+      const allClicks: { elapsedSecs: number; xFraction: number; yFraction: number }[] = JSON.parse(json);
+      const withinClip = allClicks
+        .filter((c) => c.elapsedSecs > selectedClip.start && c.elapsedSecs < selectedClip.end)
+        .map((c) => ({ time: c.elapsedSecs, x: c.xFraction, y: c.yFraction }));
+      setAutoZoomState(withinClip.length > 0 ? { status: "results", clicks: withinClip } : { status: "empty", reason: "no-clicks-in-range" });
+    } catch (err) {
+      setAutoZoomState({ status: "error", message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+  const handleApplyAutoZoom = () => {
+    if (!selectedClip || autoZoomState.status !== "results") return;
+    editStore.applyAutoZoomAtClicks(selectedClip.id, autoZoomState.clicks);
+    setAutoZoomAnchor(null);
+  };
+
   // Drag-in: a file dropped on the track, from either the Briefcast sidebar (draggingLibraryFile,
   // native HTML5 onDrop right below - reliable here since this drag never leaves the webview) or
   // Explorer (pendingTimelineInsert, routed here by Dashboard once its cursor-position polling
@@ -1739,6 +1779,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             }`}
           >
             <MdGraphicEq size={15} />
+          </button>
+          <button
+            ref={autoZoomButtonRef}
+            type="button"
+            title={selectedClipId ? "Zoom in automatically on recorded clicks in this clip" : "Select a clip to auto zoom"}
+            disabled={!selectedClipId}
+            onClick={() => {
+              if (autoZoomAnchor) {
+                setAutoZoomAnchor(null);
+                return;
+              }
+              void handleDetectAutoZoom();
+            }}
+            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+              autoZoomAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoLocateOutline size={15} />
           </button>
           <ActionButton
             title={isPlacingText ? "Click the video preview to place text" : "Add text overlay"}
@@ -2458,6 +2516,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
       {silenceAnchor && (
         <SilenceDetectionPopover anchor={silenceAnchor} state={silenceState} onRemove={handleRemoveSilence} onClose={() => setSilenceAnchor(null)} />
+      )}
+
+      {autoZoomAnchor && (
+        <AutoZoomPopover anchor={autoZoomAnchor} state={autoZoomState} onApply={handleApplyAutoZoom} onClose={() => setAutoZoomAnchor(null)} />
       )}
 
       {selectedClipId &&
