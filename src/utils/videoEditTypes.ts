@@ -104,6 +104,19 @@ export interface Clip {
   // so crop/pan coordinates always describe the already-mirrored frame identically in both places.
   // Undefined/false means the pre-existing unmirrored look.
   flipHorizontal?: boolean;
+  // Playback-rate multiplier for JUST this clip's own [start,end) source range - 0.25..4, undefined
+  // means 1 (unchanged, the pre-existing look). Unlike every other field on this type, this changes
+  // how long the clip occupies on the OUTPUT timeline: (end-start)/speed seconds, not (end-start) -
+  // a 10s source range at 2x speed plays back in 5 output seconds. That ripples into everywhere a
+  // clip's own duration is read as "how long this plays for" rather than "how much source it
+  // covers" - VideoTimelineDocker.tsx's own outputStarts/clipDurations, the resize-drag pixel<->
+  // source-seconds conversion, and currentOutputTime's own source-time-elapsed-within-clip mapping
+  // all divide/multiply by this explicitly (grep `.speed` in that file for every site). Export
+  // applies it via `setpts=PTS/speed` on the video and an atempo chain on the audio (see
+  // atempo_chain, conversion.rs, for why that's a *chain* and not a single filter) - both BEFORE
+  // any Ken Burns/transition timing on that segment, so their own duration math already operates in
+  // OUTPUT time and needs no separate speed-awareness of its own.
+  speed?: number;
 }
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
@@ -320,6 +333,7 @@ export interface KeepSegment {
   transitionIn?: ClipTransitionIn;
   crop?: ClipCrop;
   flipHorizontal?: boolean;
+  speed?: number;
 }
 
 export interface VideoEditState {

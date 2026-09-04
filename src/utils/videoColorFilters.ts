@@ -146,4 +146,5 @@ export interface ActiveClipEffects {
   kenBurns?: ClipKenBurns;
   crop?: ClipCrop;
   flipHorizontal?: boolean;
+  speed?: number;
 }

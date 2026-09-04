@@ -403,6 +403,13 @@ const Dashboard = () => {
   const editStore = useVideoEditStore(
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
+  // The assembled/output timeline's own total length - a clip's own contribution is
+  // (end-start)/speed, not just (end-start), once it has a speed edit (Clip.speed's own doc
+  // comment, videoEditTypes.ts): a sped-up clip plays back in LESS output time than its source
+  // range spans. Fed to VideoOverlayLayer/PipOverlayLayer below so a freshly-placed overlay's own
+  // default end time clamps against the timeline's REAL length instead of a stale, too-long value
+  // that ignores every sped-up clip already on it.
+  const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + Math.max(0, (c.end - c.start) / (c.speed ?? 1)), 0);
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
   // load_image_edit_state invoke. HEIC/HEIF included - selectedFile.path is already a decoded
   // PNG for them by the time this reads it (see resolveImageDisplayUrl/loadFileForPlayback), so
@@ -3265,13 +3272,13 @@ const setScreen = () => {
                           onUpdateBlurOverlayContent={editStore.updateBlurOverlayContent}
                           onDeleteBlurOverlay={editStore.deleteBlurOverlay}
                           onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
-                          totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
+                          totalOutputDuration={totalOutputDuration}
                         />
                         <PipOverlayLayer
                           frameRect={frameRect}
                           pipOverlays={editStore.pipOverlays}
                           currentOutputTime={currentOutputTime}
-                          totalOutputDuration={editStore.clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0)}
+                          totalOutputDuration={totalOutputDuration}
                           isPlaying={playerIsPlaying}
                           selectedPipOverlayId={selectedPipOverlayId}
                           onSelectPipOverlay={setSelectedPipOverlayId}

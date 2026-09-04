@@ -33,6 +33,7 @@ import {
   IoAddCircleOutline,
   IoImageOutline,
   IoLocateOutline,
+  IoSpeedometerOutline,
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
@@ -43,6 +44,7 @@ import { overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandl
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover from "./ClipEffectsPopover";
+import SpeedPopover from "./SpeedPopover";
 import ExportOptionsPopover from "./ExportOptionsPopover";
 import SilenceDetectionPopover, { SilenceDetectionState } from "./SilenceDetectionPopover";
 import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
@@ -553,6 +555,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     setEffectsPopoverAnchor(null);
   }, [selectedClipId]);
 
+  // Speed popover - split out of ClipEffectsPopover into its own standalone toolbar button/popover
+  // (same "select a clip first" gating, closed the same way on selection change) since speed has
+  // enough of its own subfeatures to earn a dedicated surface rather than being one more section
+  // buried inside "Clip effects", the same reasoning Crop already got its own toolbar button for.
+  const [speedPopoverAnchor, setSpeedPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
+  const speedButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    setSpeedPopoverAnchor(null);
+  }, [selectedClipId]);
+
   // Save button's quality/destination options (ExportOptionsPopover) - both default to exactly
   // the behavior export_trimmed_video already had before this existed: "standard" quality, and a
   // null customOutputPath meaning "next to the source file" (see handleSave below).
@@ -592,6 +604,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // drag start - null when the playhead isn't currently inside this clip's own range, meaning
     // there's nothing meaningful to snap to. See beginResizeDrag for how it's derived.
     playheadSourceTime: number | null;
+    // Captured once at drag start (not re-read from the clip mid-drag, which never changes its own
+    // speed during a resize anyway) - handleResizeDragMove needs this to convert a mouse delta
+    // (always in OUTPUT pixels/seconds, via the shared pxPerSec scale) into the SOURCE-seconds
+    // adjustment clip.start/end actually need.
+    speed: number;
   }>(null);
 
   // Reordering runs on plain pointer events, not the HTML5 drag-and-drop API - Tauri's window
@@ -628,7 +645,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       )
     : baseClips;
 
-  const clipDurations = renderClips.map((c) => Math.max(0, c.end - c.start));
+  // A clip's OWN output-timeline duration - (end-start)/speed, not just (end-start) - once it has
+  // a speed edit (Clip.speed's own doc comment, videoEditTypes.ts): a 10s source range at 2x speed
+  // plays back in 5 output seconds. Every position/width derived from this (outputStarts,
+  // totalOutputDuration, totalWidth, every clip block/handle's own left/width style) automatically
+  // reflects that just by being computed from this array, but currentOutputTime's own
+  // source-time-elapsed-within-clip mapping and the resize-drag pixel<->source-seconds conversion
+  // below both need their OWN explicit /speed or *speed - grep this file for `.speed` for every site.
+  const clipDurations = renderClips.map((c) => Math.max(0, (c.end - c.start) / (c.speed ?? 1)));
   const outputStarts: number[] = [];
   {
     let acc = 0;
@@ -1184,9 +1208,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const clipAtOutputTime = (outputTime: number): { index: number; sourceTime: number } => {
     for (let i = 0; i < renderClips.length; i++) {
       const start = outputStarts[i];
-      const dur = clipDurations[i];
+      const dur = clipDurations[i]; // an OUTPUT duration - see its own doc comment
       if (outputTime <= start + dur || i === renderClips.length - 1) {
-        return { index: i, sourceTime: renderClips[i].start + Math.max(0, Math.min(outputTime - start, dur)) };
+        // outputTime - start is an OUTPUT-time delta into this clip; * speed converts it to the
+        // SOURCE-time delta actually needed to seek the underlying <video> (whose own currentTime
+        // is always source time) - a plain 1:1 add here would seek proportionally too little into
+        // a sped-up clip's own source range (too much for a slowed-down one).
+        const speed = renderClips[i].speed ?? 1;
+        return { index: i, sourceTime: renderClips[i].start + Math.max(0, Math.min(outputTime - start, dur)) * speed };
       }
     }
     return { index: 0, sourceTime: 0 };
@@ -1240,19 +1269,29 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // range never moves as a result of trimming its OWN start/end (see outputStarts' own doc
     // comment: a clip's output position depends only on clips BEFORE it), so it's safe to read
     // straight off the ambient outputStarts/clipDurations here rather than re-deriving anything.
+    const speed = clip.speed ?? 1;
     const clipOutputStart = outputStarts[index];
     const clipOutputEnd = clipOutputStart + clipDurations[index];
+    // (currentOutputTime - clipOutputStart) is an OUTPUT-time delta - * speed converts it to the
+    // SOURCE-time delta clip.start actually needs, same reasoning clipAtOutputTime's own comment
+    // gives for the identical conversion.
     const playheadSourceTime =
-      currentOutputTime >= clipOutputStart && currentOutputTime < clipOutputEnd ? clip.start + (currentOutputTime - clipOutputStart) : null;
-    setResizeDrag({ id: clip.id, edge, startClientX: e.clientX, startValue, oppositeBound, maxEnd, liveValue: startValue, playheadSourceTime });
+      currentOutputTime >= clipOutputStart && currentOutputTime < clipOutputEnd ? clip.start + (currentOutputTime - clipOutputStart) * speed : null;
+    setResizeDrag({ id: clip.id, edge, startClientX: e.clientX, startValue, oppositeBound, maxEnd, liveValue: startValue, playheadSourceTime, speed });
   };
   const handleResizeDragMove = (e: React.PointerEvent) => {
     if (!resizeDrag) return;
     e.stopPropagation();
-    const deltaSec = (e.clientX - resizeDrag.startClientX) / pxPerSec;
+    // The raw pixel delta is always in OUTPUT pixels (pxPerSec is the shared output-time<->pixel
+    // scale) - * speed converts the resulting seconds into the SOURCE-seconds adjustment
+    // clip.start/end actually need, same reasoning clipAtOutputTime's own comment gives. Passing
+    // pxPerSec/speed (rather than the plain scale) into snapToTargets keeps its own "N screen
+    // pixels" snap threshold correct in this now-source-time-scaled space instead of snapping N*
+    // speed pixels early/late for a sped-up/slowed-down clip's own trim handle.
+    const deltaSec = ((e.clientX - resizeDrag.startClientX) / pxPerSec) * resizeDrag.speed;
     const raw =
       resizeDrag.playheadSourceTime != null
-        ? snapToTargets(resizeDrag.startValue + deltaSec, [resizeDrag.playheadSourceTime], pxPerSec)
+        ? snapToTargets(resizeDrag.startValue + deltaSec, [resizeDrag.playheadSourceTime], pxPerSec / resizeDrag.speed)
         : resizeDrag.startValue + deltaSec;
     const clamped =
       resizeDrag.edge === "start"
@@ -1301,9 +1340,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       editStore.reorderClip(index, overIndex);
     } else {
       setSelectedClipId(clip.id);
-      activeClipIndexRef.current = index;
-      lastAppliedTimeRef.current = clip.start;
-      onSeek(clip.sourcePath, clip.start);
+      // Selecting a clip only jumps the playhead to its start while playback is paused - same
+      // reasoning as endPipOverlayDrag's own comment just below: yanking the playhead back to a
+      // clip's start on a plain click mid-playback reads as "clicking the timeline restarts the
+      // video", not as a deliberate seek.
+      if (!isPlaying) {
+        activeClipIndexRef.current = index;
+        lastAppliedTimeRef.current = clip.start;
+        onSeek(clip.sourcePath, clip.start);
+      }
     }
   };
 
@@ -1602,7 +1647,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const currentOutputTime =
     renderClips.length > 0
       ? outputStarts[activeIndexForDisplay] +
-        Math.max(0, Math.min(currentTime - renderClips[activeIndexForDisplay].start, clipDurations[activeIndexForDisplay]))
+        Math.max(
+          0,
+          Math.min(
+            // (currentTime - clip.start) is a SOURCE-time delta (currentTime is the underlying
+            // <video>'s own currentTime) - divide by speed to convert it into the OUTPUT-time
+            // delta clipDurations[...] (now itself an output duration, see its own doc comment)
+            // is expressed in, or a sped-up clip's own playhead position would read as running
+            // past its output duration long before source playback actually finishes.
+            (currentTime - renderClips[activeIndexForDisplay].start) / (renderClips[activeIndexForDisplay].speed ?? 1),
+            clipDurations[activeIndexForDisplay]
+          )
+        )
       : 0;
   const playheadLeft = currentOutputTime * pxPerSec;
 
@@ -1634,11 +1690,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             kenBurns: activeClip.kenBurns,
             crop: activeClip.crop,
             flipHorizontal: activeClip.flipHorizontal,
+            speed: activeClip.speed,
           }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal]);
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -1736,6 +1793,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoCropOutline size={15} className={isCroppingClip ? "text-blue-400" : undefined} />
           </ActionButton>
+          <button
+            ref={speedButtonRef}
+            type="button"
+            title={selectedClipId ? "Clip speed" : "Select a clip to change its speed"}
+            disabled={!selectedClipId}
+            onClick={() => {
+              if (speedPopoverAnchor) {
+                setSpeedPopoverAnchor(null);
+                return;
+              }
+              const rect = speedButtonRef.current?.getBoundingClientRect();
+              if (rect) setSpeedPopoverAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+              speedPopoverAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoSpeedometerOutline size={15} className={selectedClip?.speed && selectedClip.speed !== 1 ? "text-blue-400" : undefined} />
+          </button>
           <ActionButton
             title={selectedClipId ? "Mirror clip horizontally" : "Select a clip to mirror"}
             onClick={() => selectedClip && editStore.updateClipEffects(selectedClip.id, { flipHorizontal: !selectedClip.flipHorizontal })}
@@ -2535,8 +2611,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               anchor={effectsPopoverAnchor}
               onUpdate={(patch) => editStore.updateClipEffects(clip.id, patch)}
               onClose={() => setEffectsPopoverAnchor(null)}
-              isCropping={isCroppingClip}
-              onToggleCropping={() => onToggleCroppingClip?.()}
+            />
+          );
+        })()}
+
+      {selectedClipId &&
+        speedPopoverAnchor &&
+        (() => {
+          const clip = editStore.clips.find((c) => c.id === selectedClipId);
+          if (!clip) return null;
+          return (
+            <SpeedPopover
+              speed={clip.speed ?? 1}
+              sourceDuration={clip.end - clip.start}
+              anchor={speedPopoverAnchor}
+              onUpdate={(speed) => editStore.updateClipEffects(clip.id, { speed })}
+              onClose={() => setSpeedPopoverAnchor(null)}
             />
           );
         })()}

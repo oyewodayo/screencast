@@ -93,7 +93,7 @@ type ImageOverlayContentPatch = Partial<
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
 type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "volume" | "muted">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -541,7 +541,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // VideoTimelineDocker derives as `totalOutputDuration` from its (possibly live-drag) render
   // clips, recomputed here from the last *committed* clips since overlay time edits are a
   // separate operation from an in-progress clip resize, never concurrent with one.
-  const totalOutputDuration = (clips: Clip[]): number => clips.reduce((sum, c) => sum + Math.max(0, c.end - c.start), 0);
+  // (end-start)/speed, not just (end-start), once a clip has a speed edit (Clip.speed's own doc
+  // comment, videoEditTypes.ts) - a sped-up clip plays back in LESS output time than its source
+  // range spans, so summing raw source ranges here would over-clamp every overlay's own end time
+  // against a timeline length longer than the real one.
+  const totalOutputDuration = (clips: Clip[]): number => clips.reduce((sum, c) => sum + Math.max(0, (c.end - c.start) / (c.speed ?? 1)), 0);
 
   const addTextOverlay = useCallback(
     (x: number, y: number, width: number, fontSize: number, startTime: number, endTime: number): string => {

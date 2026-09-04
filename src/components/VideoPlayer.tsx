@@ -495,6 +495,18 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     video.style.filter = cf && cf.preset !== 'none' ? cssFilterForColorPreset(cf) : '';
   }, [activeClipEffects?.colorFilter]);
 
+  // Live-preview playback rate for the active clip's own speed edit - export counterpart is
+  // setpts/atempo_chain (conversion.rs). Resets to 1 when a clip has none set, the same "cleared,
+  // not left stale" reasoning the color-filter effect above follows. The manual playback-speed
+  // buttons below (playbackSpeedIncrease/Reduce/Normal) still write this same property directly for
+  // a temporary preview-only override on top of whichever clip is active; this baseline just
+  // re-asserts itself the next time the active clip's own speed value actually changes.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.playbackRate = activeClipEffects?.speed ?? 1;
+  }, [activeClipEffects?.speed]);
+
   // Live-preview crop + Ken Burns, combined into the one thing that's ever allowed to write
   // video.style.transform (two separate effects each writing it independently would race and
   // clobber each other) - applyCropAndKenBurns above does the actual writing, reusable here AND

@@ -881,6 +881,10 @@ pub struct KeepSegment {
     // describe the already-mirrored frame the same way the live preview's own CSS transform order
     // does (VideoPlayer.tsx). None/false means the pre-existing unmirrored look.
     pub flip_horizontal: Option<bool>,
+    // Playback-rate multiplier for just this segment - None/1 means unchanged. See Clip.speed's
+    // own doc comment (videoEditTypes.ts) for the full "this changes the segment's own OUTPUT
+    // duration" story; segment_speed() below is what actually clamps/defaults this.
+    pub speed: Option<f64>,
 }
 
 // One text or image overlay, already fully rendered client-side to a transparent PNG matching
@@ -1133,6 +1137,34 @@ fn crop_chain(c: &ClipCrop) -> String {
 // actually rescales back to out_w:out_h - concat needs every segment at matching dimensions
 // regardless of which effects it has, so at least one of them always has to; see crop_chain's own
 // doc comment for why that's never both.
+// This segment's own playback-speed multiplier, clamped defensively to the same 0.25..4 range the
+// clip-effects UI itself offers (ClipEffectsPopover's MIN_SPEED/MAX_SPEED) - a value outside that
+// couldn't have come from that slider, but clamping here (rather than trusting it) means a stale/
+// hand-edited sidecar can't push the setpts/atempo math into something degenerate.
+fn segment_speed(seg: &KeepSegment) -> f64 {
+    seg.speed.unwrap_or(1.0).max(0.25).min(4.0)
+}
+
+// Decomposes an arbitrary speed factor into a chain of ffmpeg `atempo` filters, each within the
+// single-instance range libavfilter enforces (0.5..2.0) - `atempo=4.0` alone is rejected outright
+// at that value, so a larger speed-up/slow-down needs several chained instances instead (e.g. 4x
+// is two atempo=2.0 stages back to back). segment_speed's own 0.25..4 clamp never actually needs
+// more than two stages, but this loop isn't hardcoded to that in case that range ever widens.
+fn atempo_chain(speed: f64) -> String {
+    let mut remaining = speed.max(0.05);
+    let mut stages: Vec<f64> = Vec::new();
+    while remaining > 2.0 {
+        stages.push(2.0);
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 {
+        stages.push(0.5);
+        remaining /= 0.5;
+    }
+    stages.push(remaining);
+    stages.iter().map(|s| format!("atempo={:.4}", s)).collect::<Vec<_>>().join(",")
+}
+
 fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>) -> String {
     let mut extra = String::new();
     if seg.flip_horizontal.unwrap_or(false) {
@@ -1150,7 +1182,14 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         }
     }
     if let (Some(kb), Some(w), Some(h)) = (&seg.ken_burns, out_w, out_h) {
-        extra.push_str(&ken_burns_chain(kb, seg.end - seg.start, w, h));
+        // Divided by speed: Ken Burns' own crop expression reads `t` from the SAME filter chain
+        // this is appended to, which by the time this runs has already had the segment's own
+        // setpts=(PTS-STARTPTS)/speed applied (see the three trim-step call sites) - `t` there is
+        // already OUTPUT time, not source time, so the progress fraction t/duration needs an
+        // OUTPUT duration to reach exactly 1.0 at the segment's own end regardless of speed. The
+        // live preview needs no equivalent adjustment - its own progress calc (VideoPlayer.tsx) is
+        // a source-time ratio that's already speed-invariant by construction, see its own comment.
+        extra.push_str(&ken_burns_chain(kb, (seg.end - seg.start) / segment_speed(seg), w, h));
     }
     extra
 }
@@ -1316,16 +1355,22 @@ fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(
 // track of the same duration (`anullsrc`, a filter *source*, needs no `-i` input of its own) so
 // concat/xfade/acrossfade downstream always have a real audio stream to work with regardless of
 // whether the source did.
-fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, out_label: &str) -> String {
+fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, speed: f64, out_label: &str) -> String {
     if has_audio {
+        // atempo_chain (not a bare "atempo={speed}") since ffmpeg rejects a single atempo instance
+        // outside 0.5..2.0 - see its own doc comment. A speed of 1 still resolves to exactly
+        // "atempo=1.0000", functionally a no-op, so this needs no separate branch for that case.
         format!(
-            "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS[{out}];",
-            idx = input_index, out = out_label
+            "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo}[{out}];",
+            idx = input_index, tempo = atempo_chain(speed), out = out_label
         )
     } else {
+        // Divided by speed to match the video stream's own now-speed-adjusted duration (see the
+        // trim/setpts call sites above) - concat/xfade both require the audio and video branches of
+        // the same segment to agree on how long it lasts.
         format!(
             "anullsrc=channel_layout=stereo:sample_rate=44100:duration={dur:.3}[{out}];",
-            dur = (end - start).max(0.01), out = out_label
+            dur = ((end - start) / speed).max(0.01), out = out_label
         )
     }
 }
@@ -1503,7 +1548,7 @@ pub async fn export_trimmed_video(
     // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
     let has_clip_effects = segments.iter().any(|s| {
         s.color_filter.as_ref().map_or(false, |cf| cf.preset != "none") || s.ken_burns.is_some() || s.transition_in.is_some() || s.crop.is_some()
-            || s.flip_horizontal.unwrap_or(false)
+            || s.flip_horizontal.unwrap_or(false) || (s.speed.unwrap_or(1.0) - 1.0).abs() > 0.001
     });
     // Any segment beyond the first requesting a transition - gates the pairwise xfade/acrossfade
     // fold below instead of the plain all-at-once `concat=n=N` the multi-segment branch has always
@@ -1590,11 +1635,12 @@ pub async fn export_trimmed_video(
         if segments.len() == 1 {
             let seg = &segments[0];
             let extra = segment_effect_chain(seg, video_width, video_height);
+            let speed = segment_speed(seg);
             filter.push_str(&format!(
-                "[0:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{2}[base];",
-                seg.start, seg.end, extra
+                "[0:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{2:.4}{3}[base];",
+                seg.start, seg.end, speed, extra
             ));
-            filter.push_str(&audio_trim_chain(segment_has_audio[0], 0, seg.start, seg.end, "outa"));
+            filter.push_str(&audio_trim_chain(segment_has_audio[0], 0, seg.start, seg.end, speed, "outa"));
         } else if !has_transitions {
             // Same segment-major trim+concat pattern as before this function grew overlay support
             // - concat's inputs must interleave [v0][a0][v1][a1]..., not group all video labels
@@ -1604,11 +1650,12 @@ pub async fn export_trimmed_video(
             let mut concat_inputs = String::new();
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height);
+                let speed = segment_speed(seg);
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3}[v{2}];",
-                    seg.start, seg.end, i, extra
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{4:.4}{3}[v{2}];",
+                    seg.start, seg.end, i, extra, speed
                 ));
-                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, &format!("a{}", i)));
+                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, &format!("a{}", i)));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
             }
             filter.push_str(&format!("{}concat=n={}:v=1:a=1[base][outa];", concat_inputs, segments.len()));
@@ -1628,23 +1675,26 @@ pub async fn export_trimmed_video(
 
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height);
+                let speed = segment_speed(seg);
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=PTS-STARTPTS{3},fps={4:.3}[v{2}];",
-                    seg.start, seg.end, i, extra, target_fps
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{5:.4}{3},fps={4:.3}[v{2}];",
+                    seg.start, seg.end, i, extra, target_fps, speed
                 ));
-                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, &format!("a{}", i)));
+                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, &format!("a{}", i)));
             }
 
             // Folds left-to-right: `accumulated` tracks the CURRENT duration of whatever
             // [cur_v]/[cur_a] point at right now, since xfade's own `offset` is relative to its
             // first input's timeline (not the original segment's own duration) once more than one
-            // fold has already happened.
+            // fold has already happened. Divided by speed - xfade/acrossfade operate on the
+            // already-setpts'd (OUTPUT-time) streams built above, so every duration/offset here
+            // needs to be in that same OUTPUT-time space, not raw source seconds.
             let mut cur_v = "v0".to_string();
             let mut cur_a = "a0".to_string();
-            let mut accumulated = segments[0].end - segments[0].start;
+            let mut accumulated = (segments[0].end - segments[0].start) / segment_speed(&segments[0]);
             for i in 1..segments.len() {
                 let seg = &segments[i];
-                let seg_dur = seg.end - seg.start;
+                let seg_dur = (seg.end - seg.start) / segment_speed(seg);
                 let next_v = format!("fold{}v", i);
                 let next_a = format!("fold{}a", i);
                 let use_transition = seg.transition_in.as_ref().map_or(false, |tr| tr.duration > 0.0);

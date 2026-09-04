@@ -32,7 +32,7 @@ function sanitizeCrop(crop: ClipCrop | undefined): ClipCrop | undefined {
 // the same order as `clips` - that order is exactly the desired playback/output order, so this is
 // a type-only projection, not a sort or a merge.
 export function toKeepSegments(clips: Clip[]): KeepSegment[] {
-  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn, crop, flipHorizontal }) => ({
+  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn, crop, flipHorizontal, speed }) => ({
     sourcePath,
     start,
     end,
@@ -41,6 +41,7 @@ export function toKeepSegments(clips: Clip[]): KeepSegment[] {
     transitionIn,
     crop: sanitizeCrop(crop),
     flipHorizontal,
+    speed,
   }));
 }
 
@@ -65,11 +66,11 @@ export function splitClipAt(clips: Clip[], index: number, sourceTime: number): C
   return [
     ...clips.slice(0, index),
     // First half keeps transitionIn (still the same pairing with whatever precedes it) plus the
-    // look/motion effects - both halves keep colorFilter/kenBurns/crop/flipHorizontal (splitting a
-    // graded/panned/cropped/mirrored clip shouldn't silently reset its look), but only the first
-    // half is actually adjacent to the clip that used to precede the whole thing.
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn, crop: clip.crop, flipHorizontal: clip.flipHorizontal },
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, crop: clip.crop, flipHorizontal: clip.flipHorizontal },
+    // look/motion effects - both halves keep colorFilter/kenBurns/crop/flipHorizontal/speed
+    // (splitting a graded/panned/cropped/mirrored/sped-up clip shouldn't silently reset its look),
+    // but only the first half is actually adjacent to the clip that used to precede the whole thing.
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed },
+    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed },
     ...clips.slice(index + 1),
   ];
 }
@@ -115,6 +116,7 @@ export function removeSilentRanges(clips: Clip[], clipId: string, silentRanges: 
       kenBurns: clip.kenBurns,
       crop: clip.crop,
       flipHorizontal: clip.flipHorizontal,
+      speed: clip.speed,
       transitionIn: i === 0 ? clip.transitionIn : undefined,
     }));
 
@@ -165,7 +167,7 @@ export function applyAutoZoomAtClicks(clips: Clip[], clipId: string, clicks: Aut
     if (zoomStart < cursor || peak - zoomStart < MIN_CLIP_LENGTH || zoomEnd - peak < MIN_CLIP_LENGTH) continue;
 
     if (zoomStart > cursor) {
-      pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: zoomStart, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal });
+      pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: zoomStart, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed });
     }
     pieces.push({
       id: crypto.randomUUID(),
@@ -175,6 +177,7 @@ export function applyAutoZoomAtClicks(clips: Clip[], clipId: string, clicks: Aut
       colorFilter: clip.colorFilter,
       crop: clip.crop,
       flipHorizontal: clip.flipHorizontal,
+      speed: clip.speed,
       kenBurns: { preset: "zoom-in", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y },
     });
     pieces.push({
@@ -185,12 +188,13 @@ export function applyAutoZoomAtClicks(clips: Clip[], clipId: string, clicks: Aut
       colorFilter: clip.colorFilter,
       crop: clip.crop,
       flipHorizontal: clip.flipHorizontal,
+      speed: clip.speed,
       kenBurns: { preset: "zoom-out", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y },
     });
     cursor = zoomEnd;
   }
   if (clip.end > cursor) {
-    pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: clip.end, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal });
+    pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: clip.end, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed });
   }
   if (pieces.length === 0) return clips;
   // First piece keeps the original clip's own transitionIn (still adjacent to whatever preceded
@@ -250,7 +254,7 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
 // transition) - same "one function, Partial<T> patch" shape as updateOverlay, but standalone
 // since Clip (unlike every overlay type) has no updatedAt for anything to read back, so it can't
 // reuse updateOverlay<T extends {id,updatedAt}> as-is.
-export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal">>): Clip[] {
+export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed">>): Clip[] {
   return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
 
