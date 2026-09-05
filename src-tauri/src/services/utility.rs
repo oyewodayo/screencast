@@ -99,6 +99,7 @@ pub fn get_heif_thumbnailer_path(app_handle: &AppHandle) -> Result<PathBuf, Stri
 pub struct FileEntry {
     name: String,
     path: String,
+    size: u64,
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -503,9 +504,11 @@ fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<File
 
                 if is_media_file(&ext) {
                     if let Some(file_name) = entry_path.file_name() {
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                         files.push(FileEntry {
                             name: file_name.to_string_lossy().to_string(),
                             path: entry_path.display().to_string(),
+                            size,
                         });
                     }
                 }

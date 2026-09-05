@@ -175,6 +175,7 @@ const ANNOTATION_FADE_GRACE_MS = 3000;
 interface FileEntry {
     name: string;
     path: string;
+    size: number;
 }
 
 interface FileMap {
@@ -1129,7 +1130,7 @@ const setScreen = () => {
 		}
 	};
 
-	const handleDeleteFile = async (file: FileEntry) => {
+	const handleDeleteFile = async (file: { name: string; path: string }) => {
 		try {
 			await invoke("move_to_trash", { path: file.path });
 			if (selectedFile?.sourcePath === file.path) setSelectedFile(null);
@@ -2208,7 +2209,7 @@ const setScreen = () => {
 	// rename field — also fixes a latent staleness bug the inline rename used to have on its own:
 	// renaming the file currently open in the player left `selectedFile` pointing at a path that
 	// no longer existed on disk until the next unrelated refresh happened to fix it.
-	const renameFile = async (file: FileEntry, newName: string): Promise<void> => {
+	const renameFile = async (file: { name: string; path: string }, newName: string): Promise<void> => {
 		if (!newName || newName === file.name) return;
 		try {
 			const newPath = await invoke<string>('rename_file', { oldPath: file.path, newName });

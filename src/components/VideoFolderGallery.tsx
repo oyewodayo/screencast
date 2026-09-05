@@ -20,12 +20,13 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoPlay, IoTrashOutline, IoVideocam } from "react-icons/io5";
-import { truncateFileName } from "../utils/Formater";
+import { formatFileSize, truncateFileName } from "../utils/Formater";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
 
 interface GalleryFile {
   name: string;
   path: string;
+  size: number;
 }
 
 interface VideoFolderGalleryProps {
@@ -168,8 +169,11 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
     );
   }
 
+  // pb tracks --docker-height (published by BottomDocker's ResizeObserver, see player.css for the
+  // sibling usage) so the last grid row can always scroll clear of the fixed bottom icon bar
+  // instead of rendering underneath it.
   return (
-    <div className="relative w-full h-full overflow-y-auto p-4">
+    <div className="relative w-full h-full overflow-y-auto overscroll-contain p-4 pb-[var(--docker-height,64px)]">
       {actionStatus && (
         <div className="absolute top-2 right-3 z-20 px-2.5 py-1 rounded-md bg-neutral-900/90 text-white text-xs shadow-lg">
           {actionStatus}
@@ -268,9 +272,14 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
                 className="mx-1 my-1 min-w-0 border border-blue-400 rounded px-1 text-[11px] bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
               />
             ) : (
-              <span className="text-[11px] text-gray-600 dark:text-neutral-300 truncate px-1.5 py-1">
-                {truncateFileName(file.name)}
-              </span>
+              <div className="flex items-center justify-between gap-1 px-1.5 py-1">
+                <span className="text-[11px] text-gray-600 dark:text-neutral-300 truncate min-w-0">
+                  {truncateFileName(file.name)}
+                </span>
+                <span className="text-[10px] text-gray-400 dark:text-neutral-500 shrink-0 whitespace-nowrap">
+                  {formatFileSize(file.size)}
+                </span>
+              </div>
             )}
           </div>
         ))}
