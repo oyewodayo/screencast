@@ -95,6 +95,17 @@ function snapToTargets(value: number, targets: number[], pxPerSec: number): numb
 // handleTransportPlayClick to decide "are we sitting at the very end of the sequence".
 const SEEK_TOLERANCE_SEC = 0.25;
 
+// Module-level (not a useRef) so it survives this component unmounting - which happens every time
+// the tools/timeline panel is closed (BottomDocker swaps back to the recording docker) and
+// reopened, not just when a different file is opened. A useRef here was the original bug: it
+// reset to null on every one of those remounts, so the bootstrap effect below saw "never
+// bootstrapped" and force-seeked back to clip 0 every single time the panel was reopened, even on
+// a video that was already mid-playback - the "opening the timeline restarts the video" report.
+// Keyed by file path so switching files still bootstraps normally; a small, session-lifetime
+// cache (a few bytes per file ever opened) is an acceptable tradeoff for not needing to lift this
+// state through Dashboard/BottomDocker just to keep it alive across the panel toggle.
+const bootstrappedClipIdByFile = new Map<string, string>();
+
 const formatTimestamp = (totalSeconds: number): string => {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = Math.floor(totalSeconds % 60);
@@ -1592,11 +1603,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // than trusting wherever the native <video> defaults to (source time 0, or wherever the user
   // last happened to be). Keyed on the first clip's *id* rather than its start/end, so resizing
   // that same clip's own edges mid-edit doesn't yank playback back to the start every time.
-  const bootstrappedFirstClipIdRef = useRef<string | null>(null);
+  // Tracked in bootstrappedClipIdByFile (module-level, keyed by file.path) rather than a useRef -
+  // see that declaration's own comment for why a ref here previously reset on every reopen of
+  // this panel and force-seeked an already-playing video back to the start each time.
   useEffect(() => {
     const first = baseClips[0];
-    if (!first || first.id === "__pending__" || bootstrappedFirstClipIdRef.current === first.id) return;
-    bootstrappedFirstClipIdRef.current = first.id;
+    if (!first || first.id === "__pending__" || bootstrappedClipIdByFile.get(file.path) === first.id) return;
+    bootstrappedClipIdByFile.set(file.path, first.id);
     activeClipIndexRef.current = 0;
     lastAppliedTimeRef.current = first.start;
     onSeek(first.sourcePath, first.start);

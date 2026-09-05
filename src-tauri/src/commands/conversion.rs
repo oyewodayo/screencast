@@ -1435,7 +1435,15 @@ async fn run_whisper_cli(
     let model_path = model_path.clone();
     let wav_path = wav_path.clone();
     let output_stem = output_stem.clone();
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    // Leaves one logical core free rather than claiming every one of them - using all of them
+    // starves everything else on the machine of CPU for the whole transcription (measured: a
+    // couple of minutes even for under a minute of audio), including the UI thread rendering the
+    // very progress this is meant to report and, in dev builds, the separate Vite dev-server
+    // process - a real, reproduced symptom (window frame responsive, content area just never
+    // repainting) that this one-core margin is meant to prevent.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(4);
     tauri::async_runtime::spawn_blocking(move || {
         let mut cmd = Command::new(&whisper_path);
         #[cfg(windows)]
