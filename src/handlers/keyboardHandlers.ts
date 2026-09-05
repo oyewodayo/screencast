@@ -10,6 +10,12 @@ interface KeyboardHandlers {
   toggleCaptions?: () => void;
   playbackSpeedIncrease?: () => void;
   playbackSpeedReduce?: () => void;
+  // Short, precise position nudges (the arrow-key convention every mainstream player - YouTube,
+  // VLC, QuickTime - uses). Deliberately separate from the on-screen skip-forward/back buttons,
+  // which jump a coarser, user-configurable amount (default 30s) for a different purpose:
+  // arrows are for frame-accurate scrubbing, the buttons are for skipping past whole sections.
+  seekBackward?: () => void;
+  seekForward?: () => void;
   onPlaybackRateChange?: (rate: number) => void;
   onVolumeChange?: (volume: number) => void;
 }
@@ -64,7 +70,7 @@ export const createKeyboardHandler = (
       case "ArrowLeft":
         if (!enableArrowSeek) break;
         e.preventDefault();
-        handlers.playbackSpeedReduce?.();
+        handlers.seekBackward?.();
         break;
       case "j":
         e.preventDefault();
@@ -73,7 +79,7 @@ export const createKeyboardHandler = (
       case "ArrowRight":
         if (!enableArrowSeek) break;
         e.preventDefault();
-        handlers.playbackSpeedIncrease?.();
+        handlers.seekForward?.();
         break;
       case "l":
         e.preventDefault();

@@ -62,7 +62,15 @@ interface KeyboardHandlerActions {
   toggleCaptions: () => void;
   playbackSpeedIncrease: () => void;
   playbackSpeedReduce: () => void;
+  seekBackward: () => void;
+  seekForward: () => void;
 }
+
+// Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
+// keypress. Intentionally not tied to `currentSkipTime` (the on-screen skip buttons' own,
+// user-adjustable amount): that control is for jumping past whole sections, this one is for
+// frame-accurate scrubbing while trimming/reviewing a recording.
+const ARROW_SEEK_SECONDS = 5;
 interface VideoPlayerProps {
   src?: string;
   title?: string;
@@ -518,6 +526,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     setCurrentPlaySpeed(`${newRate}x`);
   };
 
+  const seekBackward = (): void => {
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
+    skipTime(videoRef.current, -ARROW_SEEK_SECONDS);
+  };
+
+  const seekForward = (): void => {
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
+    skipTime(videoRef.current, ARROW_SEEK_SECONDS);
+  };
+
   const playbackSpeedNormal = (): void => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
@@ -806,10 +824,6 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     }
   };
 
-  const handleScreenControls = (): void => {
-    // Implementation for screen controls
-  };
-
   // Timeline and progress updates
   const updateTimeline = (): void => {
     if (isDraggingTimelineRef.current) {
@@ -880,7 +894,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       toggleMute,
       toggleCaptions,
       playbackSpeedIncrease,
-      playbackSpeedReduce
+      playbackSpeedReduce,
+      seekBackward,
+      seekForward
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -999,7 +1015,6 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		onMouseLeave={hide}
 		onTouchStart={show}
 		onTouchMove={show}
-		onClick={handleScreenControls} 
 		className="flex flex-row relative w-full h-screen">
 
 		{showAlert && (
