@@ -24,7 +24,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use wasapi::{deinitialize, initialize_mta, Direction, DeviceEnumerator, SampleType, StreamMode, WaveFormat};
+use wasapi::{
+    deinitialize, initialize_mta, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat,
+};
 
 const SAMPLE_RATE: usize = 44100;
 const CHANNELS: usize = 2;
@@ -77,10 +79,19 @@ pub fn start(wav_path: PathBuf) -> Result<LoopbackCapture, String> {
         .spawn(move || capture_loop(thread_wav_path, thread_stop_flag, thread_pause_flag))
         .map_err(|e| format!("Failed to start system-audio capture thread: {}", e))?;
 
-    Ok(LoopbackCapture { stop_flag, pause_flag, handle, wav_path })
+    Ok(LoopbackCapture {
+        stop_flag,
+        pause_flag,
+        handle,
+        wav_path,
+    })
 }
 
-fn capture_loop(wav_path: PathBuf, stop_flag: Arc<AtomicBool>, pause_flag: Arc<AtomicBool>) -> Result<(), String> {
+fn capture_loop(
+    wav_path: PathBuf,
+    stop_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
+) -> Result<(), String> {
     // COM apartment state is per-thread and must be torn down on the same thread that set it up
     // - this whole function runs on the dedicated thread spawn() above created for exactly that.
     let _ = initialize_mta();
@@ -89,8 +100,13 @@ fn capture_loop(wav_path: PathBuf, stop_flag: Arc<AtomicBool>, pause_flag: Arc<A
     result
 }
 
-fn run_capture(wav_path: &Path, stop_flag: &Arc<AtomicBool>, pause_flag: &Arc<AtomicBool>) -> Result<(), String> {
-    let enumerator = DeviceEnumerator::new().map_err(|e| format!("Failed to enumerate audio devices: {}", e))?;
+fn run_capture(
+    wav_path: &Path,
+    stop_flag: &Arc<AtomicBool>,
+    pause_flag: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let enumerator =
+        DeviceEnumerator::new().map_err(|e| format!("Failed to enumerate audio devices: {}", e))?;
 
     // The trick: open the default *render* (playback) device, but initialize its AudioClient for
     // Capture use below. That Render-device-used-as-Capture mismatch is precisely what puts
@@ -99,11 +115,21 @@ fn run_capture(wav_path: &Path, stop_flag: &Arc<AtomicBool>, pause_flag: &Arc<At
     let device = enumerator
         .get_default_device(&Direction::Render)
         .map_err(|e| format!("Failed to get the default playback device: {}", e))?;
-    let mut audio_client = device
-        .get_iaudioclient()
-        .map_err(|e| format!("Failed to open the playback device for loopback capture: {}", e))?;
+    let mut audio_client = device.get_iaudioclient().map_err(|e| {
+        format!(
+            "Failed to open the playback device for loopback capture: {}",
+            e
+        )
+    })?;
 
-    let desired_format = WaveFormat::new(BITS_PER_SAMPLE, BITS_PER_SAMPLE, &SampleType::Int, SAMPLE_RATE, CHANNELS, None);
+    let desired_format = WaveFormat::new(
+        BITS_PER_SAMPLE,
+        BITS_PER_SAMPLE,
+        &SampleType::Int,
+        SAMPLE_RATE,
+        CHANNELS,
+        None,
+    );
     let blockalign = desired_format.get_blockalign() as usize;
 
     let (_default_period, min_period) = audio_client
@@ -113,7 +139,10 @@ fn run_capture(wav_path: &Path, stop_flag: &Arc<AtomicBool>, pause_flag: &Arc<At
     // autoconvert: true means the audio engine handles resampling/reformatting from whatever the
     // device's own native mix format actually is down to our fixed 16-bit/44.1kHz/stereo target,
     // so this doesn't need to query (or care about) the device's native format at all.
-    let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: min_period };
+    let mode = StreamMode::EventsShared {
+        autoconvert: true,
+        buffer_duration_hns: min_period,
+    };
     audio_client
         .initialize_client(&desired_format, &Direction::Capture, &mode)
         .map_err(|e| format!("Failed to initialize system-audio loopback capture: {}", e))?;
@@ -131,8 +160,8 @@ fn run_capture(wav_path: &Path, stop_flag: &Arc<AtomicBool>, pause_flag: &Arc<At
         bits_per_sample: BITS_PER_SAMPLE as u16,
         sample_format: SampleFormat::Int,
     };
-    let mut writer =
-        WavWriter::create(wav_path, spec).map_err(|e| format!("Failed to create the system-audio WAV file: {}", e))?;
+    let mut writer = WavWriter::create(wav_path, spec)
+        .map_err(|e| format!("Failed to create the system-audio WAV file: {}", e))?;
 
     let mut sample_queue: VecDeque<u8> = VecDeque::with_capacity(blockalign * 1024 * 8);
 
@@ -187,7 +216,9 @@ fn run_capture(wav_path: &Path, stop_flag: &Arc<AtomicBool>, pause_flag: &Arc<At
     }
 
     let _ = audio_client.stop_stream();
-    writer.finalize().map_err(|e| format!("Failed to finalize the system-audio WAV file: {}", e))?;
+    writer
+        .finalize()
+        .map_err(|e| format!("Failed to finalize the system-audio WAV file: {}", e))?;
 
     Ok(())
 }

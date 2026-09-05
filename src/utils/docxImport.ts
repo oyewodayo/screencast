@@ -13,7 +13,7 @@ import * as Y from "yjs";
 import { getSchema } from "@tiptap/core";
 import { DOMParser as ProseMirrorDOMParser, Fragment, type Node as ProseMirrorNode, type MarkType } from "@tiptap/pm/model";
 import { prosemirrorToYDoc } from "y-prosemirror";
-import { invoke, convertFileSrc } from "@tauri-apps/api/tauri";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { getDocContentExtensions } from "./docSchemaExtensions";
 import { EXTENSION_BY_MIME } from "./docImagePaste";
 import { resolveDocxParagraphStyles, type ParagraphStyle } from "./docxStyleResolver";

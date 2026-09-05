@@ -66,7 +66,8 @@ struct Atoms {
 }
 
 fn connect() -> Result<(RustConnection, usize), String> {
-    x11rb::connect(None).map_err(|e| format!("Failed to connect to the X server (is DISPLAY set?): {}", e))
+    x11rb::connect(None)
+        .map_err(|e| format!("Failed to connect to the X server (is DISPLAY set?): {}", e))
 }
 
 fn intern(conn: &RustConnection, name: &str) -> Result<u32, String> {
@@ -111,7 +112,14 @@ fn window_exe_path(conn: &RustConnection, atoms: &Atoms, window: Window) -> Stri
 // ICCCM WM_NAME property if a window (usually an older/simpler app) doesn't set it.
 fn window_title(conn: &RustConnection, atoms: &Atoms, window: Window) -> String {
     if let Ok(Ok(reply)) = conn
-        .get_property(false, window, atoms.net_wm_name, atoms.utf8_string, 0, u32::MAX)
+        .get_property(
+            false,
+            window,
+            atoms.net_wm_name,
+            atoms.utf8_string,
+            0,
+            u32::MAX,
+        )
         .map(|c| c.reply())
     {
         if !reply.value.is_empty() {
@@ -119,7 +127,14 @@ fn window_title(conn: &RustConnection, atoms: &Atoms, window: Window) -> String 
         }
     }
     if let Ok(Ok(reply)) = conn
-        .get_property(false, window, AtomEnum::WM_NAME, AtomEnum::STRING, 0, u32::MAX)
+        .get_property(
+            false,
+            window,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            0,
+            u32::MAX,
+        )
         .map(|c| c.reply())
     {
         if !reply.value.is_empty() {
@@ -135,7 +150,14 @@ fn window_title(conn: &RustConnection, atoms: &Atoms, window: Window) -> String 
 // top-level window that exists.
 fn client_list(conn: &RustConnection, atoms: &Atoms, root: Window) -> Result<Vec<Window>, String> {
     let reply = conn
-        .get_property(false, root, atoms.net_client_list, AtomEnum::WINDOW, 0, u32::MAX)
+        .get_property(
+            false,
+            root,
+            atoms.net_client_list,
+            AtomEnum::WINDOW,
+            0,
+            u32::MAX,
+        )
         .map_err(|e| format!("Failed to request _NET_CLIENT_LIST: {}", e))?
         .reply()
         .map_err(|e| {
@@ -146,7 +168,10 @@ fn client_list(conn: &RustConnection, atoms: &Atoms, root: Window) -> Result<Vec
             )
         })?;
 
-    Ok(reply.value32().map(|iter| iter.collect()).unwrap_or_default())
+    Ok(reply
+        .value32()
+        .map(|iter| iter.collect())
+        .unwrap_or_default())
 }
 
 fn open_windows_with_titles() -> Result<Vec<(Window, String)>, String> {
@@ -205,7 +230,9 @@ pub fn get_monitors() -> Result<Vec<MonitorInfo>, String> {
     Ok(monitors)
 }
 
-pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) -> Result<Vec<WindowInfo>, String> {
+pub async fn capture_window_screenshots_by_title(
+    _app_handle: tauri::AppHandle,
+) -> Result<Vec<WindowInfo>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let (conn, screen_num) = connect()?;
         let root = conn.setup().roots[screen_num].root;
@@ -249,7 +276,11 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
             let image_path = match capture_window(&conn, *window, &output_path) {
                 Ok(_) => output_path.to_string_lossy().to_string(),
                 Err(e) => {
-                    log::debug!("Failed to capture '{}': {} - listing without a thumbnail", title, e);
+                    log::debug!(
+                        "Failed to capture '{}': {} - listing without a thumbnail",
+                        title,
+                        e
+                    );
                     let _ = std::fs::remove_file(&output_path);
                     String::new()
                 }
@@ -266,7 +297,10 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
         log::debug!(
             "Listed {} windows ({} with thumbnails)",
             window_infos.len(),
-            window_infos.iter().filter(|w| !w.image_path.is_empty()).count()
+            window_infos
+                .iter()
+                .filter(|w| !w.image_path.is_empty())
+                .count()
         );
         Ok(window_infos)
     })
@@ -278,7 +312,11 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
 // this works even for a partially-obscured window, not just whatever's currently on top — the
 // same reason win.rs uses PrintWindow instead of a plain screen-region grab) and reads that
 // pixmap's pixels back with GetImage.
-fn capture_window(conn: &RustConnection, window: Window, output_path: &std::path::Path) -> Result<(), String> {
+fn capture_window(
+    conn: &RustConnection,
+    window: Window,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
     conn.composite_redirect_window(window, Redirect::AUTOMATIC)
         .map_err(|e| format!("redirect_window request failed: {}", e))?;
 
@@ -289,7 +327,11 @@ fn capture_window(conn: &RustConnection, window: Window, output_path: &std::path
     let name_result = conn
         .composite_name_window_pixmap(window, pixmap)
         .map_err(|e| format!("name_window_pixmap request failed: {}", e))
-        .and_then(|cookie| cookie.check().map_err(|e| format!("name_window_pixmap failed (no compositor running?): {}", e)));
+        .and_then(|cookie| {
+            cookie
+                .check()
+                .map_err(|e| format!("name_window_pixmap failed (no compositor running?): {}", e))
+        });
 
     if let Err(e) = name_result {
         let _ = conn.composite_unredirect_window(window, Redirect::AUTOMATIC);
@@ -308,12 +350,26 @@ fn capture_window(conn: &RustConnection, window: Window, output_path: &std::path
         }
 
         let image_reply = conn
-            .get_image(ImageFormat::Z_PIXMAP, pixmap, 0, 0, geometry.width, geometry.height, !0)
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                pixmap,
+                0,
+                0,
+                geometry.width,
+                geometry.height,
+                !0,
+            )
             .map_err(|e| format!("get_image request failed: {}", e))?
             .reply()
             .map_err(|e| format!("get_image failed: {}", e))?;
 
-        pixels_to_png(&image_reply.data, geometry.width as u32, geometry.height as u32, conn.setup().image_byte_order, output_path)
+        pixels_to_png(
+            &image_reply.data,
+            geometry.width as u32,
+            geometry.height as u32,
+            conn.setup().image_byte_order,
+            output_path,
+        )
     })();
 
     let _ = conn.free_pixmap(pixmap);
@@ -326,7 +382,13 @@ fn capture_window(conn: &RustConnection, window: Window, output_path: &std::path
 // desktop (little-endian X servers, which is effectively all of them outside some ARM/big-endian
 // setups) — image_byte_order flips the interpretation for that uncommon big-endian case rather
 // than assuming one fixed order unconditionally.
-fn pixels_to_png(data: &[u8], width: u32, height: u32, byte_order: ImageOrder, output_path: &std::path::Path) -> Result<(), String> {
+fn pixels_to_png(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    byte_order: ImageOrder,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
     let msb_first = byte_order == ImageOrder::MSB_FIRST;
     let mut img = RgbaImage::new(width, height);
 
@@ -345,7 +407,8 @@ fn pixels_to_png(data: &[u8], width: u32, height: u32, byte_order: ImageOrder, o
         }
     }
 
-    img.save(output_path).map_err(|e| format!("Failed to save image: {}", e))
+    img.save(output_path)
+        .map_err(|e| format!("Failed to save image: {}", e))
 }
 
 pub fn get_windows_titles() -> Vec<String> {
@@ -375,7 +438,8 @@ pub async fn activate_and_open_window(title: &str) -> Result<(), String> {
         // minimized) via a standard _NET_ACTIVE_WINDOW client message to the root window — the
         // request every EWMH-compliant WM expects for this, rather than trying to manipulate
         // window state directly the way a WM itself would.
-        let event = ClientMessageEvent::new(32, target, atoms.net_active_window, [1u32, 0, 0, 0, 0]);
+        let event =
+            ClientMessageEvent::new(32, target, atoms.net_active_window, [1u32, 0, 0, 0, 0]);
         conn.send_event(
             false,
             root,
@@ -383,7 +447,8 @@ pub async fn activate_and_open_window(title: &str) -> Result<(), String> {
             event,
         )
         .map_err(|e| format!("Failed to send activate request: {}", e))?;
-        conn.flush().map_err(|e| format!("Failed to flush X connection: {}", e))?;
+        conn.flush()
+            .map_err(|e| format!("Failed to flush X connection: {}", e))?;
 
         Ok(())
     })
@@ -449,7 +514,10 @@ pub async fn start_monitoring_windows() -> Result<(), String> {
         }
     });
 
-    *slot = Some(MonitorHandle { running, join_handle });
+    *slot = Some(MonitorHandle {
+        running,
+        join_handle,
+    });
     log::info!("Monitoring started");
     Ok(())
 }
@@ -480,10 +548,13 @@ fn monitor_loop(running: Arc<std::sync::atomic::AtomicBool>) -> Result<(), Strin
     let root = conn.setup().roots[screen_num].root;
     let atoms = atoms(&conn)?;
 
-    conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE))
-        .map_err(|e| format!("Failed to request PropertyChangeMask on root window: {}", e))?
-        .check()
-        .map_err(|e| format!("Failed to select PropertyChangeMask on root window: {}", e))?;
+    conn.change_window_attributes(
+        root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )
+    .map_err(|e| format!("Failed to request PropertyChangeMask on root window: {}", e))?
+    .check()
+    .map_err(|e| format!("Failed to select PropertyChangeMask on root window: {}", e))?;
 
     while running.load(Ordering::Relaxed) {
         while let Ok(Some(event)) = conn.poll_for_event() {
@@ -513,7 +584,10 @@ fn monitor_loop(running: Arc<std::sync::atomic::AtomicBool>) -> Result<(), Strin
 }
 
 pub async fn get_window_titles() -> Result<WindowTitles, String> {
-    let is_active = monitor_thread_slot().lock().map(|s| s.is_some()).unwrap_or(false);
+    let is_active = monitor_thread_slot()
+        .lock()
+        .map(|s| s.is_some())
+        .unwrap_or(false);
     if !is_active {
         return Err("Monitoring is not active".to_string());
     }

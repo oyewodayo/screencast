@@ -1,13 +1,13 @@
 // Dashboard.tsx
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as Y from "yjs";
-import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import BottomDocker from "../components/BottomDocker";
 import { listen } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
-import { WebviewWindow, appWindow } from '@tauri-apps/api/window';
-import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
+import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
 import { formatFileName, truncateFileName } from "../utils/Formater";
 import SidebarFileIcon from "../components/SidebarFileIcon";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
@@ -71,6 +71,7 @@ import {
   IoEyeOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
+const appWindow = getCurrentWebviewWindow()
 
 type RAMInfo = [number, number];
 
@@ -125,7 +126,7 @@ const OPEN_FILE_DIALOG_FILTERS = [
 const OVERLAY_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+H';
 
 const toggleOverlayVisibility = async () => {
-  const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+  const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
   if (!overlayWindow) return;
   if (await overlayWindow.isVisible()) {
     await overlayWindow.hide();
@@ -639,7 +640,7 @@ useEffect(() => {
       }
       
       // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
-      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
       if (overlayWindow) {
         await overlayWindow.hide();
       }
@@ -821,7 +822,7 @@ const setScreen = () => {
   // (and its listener) already exists long before any particular capture request does.
   const openScreenshotOverlay = async (formData: any) => {
     try {
-      const overlayWindow = WebviewWindow.getByLabel('screenshot-overlay');
+      const overlayWindow = await WebviewWindow.getByLabel('screenshot-overlay');
       if (!overlayWindow) {
         setError('Screenshot overlay window is not available');
         return;
@@ -869,7 +870,7 @@ const setScreen = () => {
         // Create the overlay window, but don't show it - it stays hidden until the user
         // asks for it via the toggle shortcut below, rather than popping up unasked-for
         // every time a recording starts.
-        let overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+        let overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
 
         if (!overlayWindow) {
           overlayWindow = new WebviewWindow('recording-overlay', {
@@ -936,7 +937,7 @@ const setScreen = () => {
     setPausedAccumulatedMs(0);
 
     // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
-    const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+    const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
     if (overlayWindow) {
       await overlayWindow.hide();
     }
@@ -966,7 +967,7 @@ const setScreen = () => {
       setPauseStartedAt(now);
       setMessage("Recording paused");
 
-      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
       overlayWindow?.emit('recording-state-update', {
         isRecording: true,
         recordType,
@@ -993,7 +994,7 @@ const setScreen = () => {
       setPausedAccumulatedMs(newAccumulatedMs);
       setMessage("Recording resumed");
 
-      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
       overlayWindow?.emit('recording-state-update', {
         isRecording: true,
         recordType,
@@ -1243,7 +1244,7 @@ const setScreen = () => {
 	// are also always sequenced show-before-ignore when turning draw mode on, since setting that
 	// style before a window has ever been shown is what didn't reliably stick on Windows.
 	const toggleAnnotationDrawMode = useCallback(async (forceOff = false) => {
-		const overlay = WebviewWindow.getByLabel('annotation-overlay');
+		const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 		if (!overlay) return;
 		const next = forceOff ? false : !annotationDrawModeRef.current;
 		annotationDrawModeRef.current = next;
@@ -1292,7 +1293,7 @@ const setScreen = () => {
 				if (await isRegistered(ANNOTATION_TOGGLE_SHORTCUT)) {
 					await unregister(ANNOTATION_TOGGLE_SHORTCUT);
 				}
-				const overlay = WebviewWindow.getByLabel('annotation-overlay');
+				const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 				if (overlay) await overlay.hide();
 				return;
 			}
@@ -1791,7 +1792,7 @@ const setScreen = () => {
 			if (!getFileCategory(name)) {
 				await showMessageDialog(`"${name}" isn't a supported file type (video, audio, image, PDF, or document).`, {
 					title: 'Unsupported file',
-					type: 'warning',
+					kind: 'warning',
 				});
 				return;
 			}
@@ -2145,9 +2146,12 @@ const setScreen = () => {
 	};
 
 	useEffect(() => {
-		const unlistenPromise = appWindow.onFileDropEvent(async (event) => {
-			console.log("[Dashboard] onFileDropEvent", event.payload.type, event.payload.type !== "cancel" ? event.payload.paths : undefined);
-			if (event.payload.type === "hover") {
+		const unlistenPromise = appWindow.onDragDropEvent(async (event) => {
+			console.log("[Dashboard] onDragDropEvent", event.payload.type, event.payload.type === "drop" ? event.payload.paths : undefined);
+			if (event.payload.type === "enter" || event.payload.type === "over") {
+				// v1's single "hover" type (fired repeatedly for the whole drag) is split into "enter"
+				// (once, with paths) and "over" (repeatedly, position only) in v2 - both are treated the
+				// same here since this handler only ever needed the position, not the paths, until drop.
 				// Only the most recently *requested* hover's resolution is ever applied - hover events
 				// can arrive faster than the position round-trip resolves, and an out-of-order stale
 				// result landing last would leave dragOverTimelineXRef pointing at an old position.
@@ -2166,7 +2170,7 @@ const setScreen = () => {
 				const destFolder = dragOverFolderRef.current ?? "";
 				setDragOverFolder(null);
 				handleImportFiles(event.payload.paths, destFolder);
-			} else if (event.payload.type === "cancel") {
+			} else if (event.payload.type === "leave") {
 				setDragOverFolder(null);
 				dragOverTimelineXRef.current = null;
 			}

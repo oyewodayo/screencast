@@ -2,59 +2,38 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
-    "devPath": "http://localhost:1420",
-    "distDir": "../dist"
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
   },
-  "package": {
-    "productName": "Briefcast",
-    "version": "0.0.0"
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "binaries/ffmpeg/*",
+      "binaries/heif/*"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   },
-  "tauri": {
-    "allowlist": {
-      "all": false,
-      "fs": {
-        "all": false,
-        "scope": ["$VIDEO/Briefcast/**", "$TEMP/**"]
+  "productName": "Briefcast",
+  "mainBinaryName": "Briefcast",
+  "version": "0.0.0",
+  "identifier": "com.briefscan.app",
+  "plugins": {},
+  "app": {
+    "security": {
+      "assetProtocol": {
+        "scope": [
+          "**"
+        ],
+        "enable": true
       },
-      "protocol": {
-        "all": false,
-        "asset": true,
-        "assetScope": ["**"]
-      },
-      "path": {
-        "all": false
-      },
-      "dialog": {
-        "all": false,
-        "ask": true,
-        "message": true,
-        "open": true,
-        "save": true
-      },
-      "notification": {
-        "all": false
-      },
-      "globalShortcut": {
-        "all": true
-      },
-      "window": {
-        "all": false,
-        "create": true,
-        "close": true,
-        "hide": true,
-        "show": true,
-        "setFocus": true,
-        "startDragging": true,
-        "setFullscreen": true,
-        "setIgnoreCursorEvents": true
-      },
-      "os": {
-        "all": false
-      },
-      "shell": {
-        "all": false,
-        "open": true
-      }
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; media-src 'self' asset: http://asset.localhost https://asset.localhost; frame-src 'self' asset: http://asset.localhost https://asset.localhost; connect-src ipc: http://ipc.localhost 'self' asset: http://asset.localhost https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
     },
     "windows": [
       {
@@ -93,26 +72,6 @@
         "visible": false,
         "focus": false
       }
-
-    ],
-    "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost data:; media-src 'self' asset: https://asset.localhost; frame-src 'self' asset: https://asset.localhost; connect-src 'self' asset: https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
-    },
-    "bundle": {
-      "active": true,
-      "targets": "all",
-      "resources": [
-        "binaries/ffmpeg/*",
-        "binaries/heif/*"
-      ],
-      "identifier": "com.briefscan.app",
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.icns",
-        "icons/icon.ico"
-      ]
-    }
+    ]
   }
 }

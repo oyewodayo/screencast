@@ -11,7 +11,7 @@
 // Each render targets a canvas sized to just the overlay's own box (not the whole video frame) -
 // far cheaper than a full-frame canvas per overlay, and ffmpeg positions it via the returned
 // xPx/yPx either way.
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { BlurOverlay, ImageOverlay, TextOverlay, TextOverlayCornerStyle } from "./videoEditTypes";
 import { TEXT_FONT_FAMILY, measureTextBlock } from "../handlers/pdfAnnotationHandlers";
 

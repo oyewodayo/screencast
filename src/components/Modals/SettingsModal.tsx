@@ -1,8 +1,8 @@
 // components/Modals/SettingsModal.tsx
 import React, { useEffect, useState } from "react";
 import { IoClose, IoSettingsOutline, IoSunny, IoMoon, IoContrast, IoRefresh } from "react-icons/io5";
-import { open as openFileDialog } from "@tauri-apps/api/dialog";
-import { invoke } from "@tauri-apps/api/tauri";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 import { AppSettings, DEFAULT_SETTINGS, loadSettings, saveSettings } from "../../utils/appSettings";
 import { ThemePreference, useTheme } from "../../contexts/ThemeContext";
 

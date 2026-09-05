@@ -3,7 +3,11 @@
 // Mirrors pdf_annotations.rs exactly - same sidecar-json-plus-flattened-export shape, just for
 // the standalone image editor instead of PDF annotation. See that file's own comments for the
 // rationale behind write-then-rename and the "<name> (edited)" sibling-file convention.
-use std::{ffi::OsString, fs, path::{Path, PathBuf}};
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+};
 use tauri::command;
 
 // Sidecar lives next to the source image as "<name>.<ext>.imageedit.json" - appends to the
@@ -55,7 +59,10 @@ pub fn save_edited_image(image_path: String, bytes: Vec<u8>) -> Result<String, S
         return Err(format!("Image does not exist: {}", image_path));
     }
 
-    let stem = image.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = image
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     let parent = image.parent().map(PathBuf::from).unwrap_or_default();
     let output = parent.join(format!("{} (edited).png", stem));
 

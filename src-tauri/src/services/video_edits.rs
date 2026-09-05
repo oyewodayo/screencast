@@ -3,7 +3,11 @@
 // Non-destructive video edit state (trim/split/delete), persisted next to the source video as a
 // JSON sidecar - never as a duplicated copy of the media itself. Mirrors pdf_annotations.rs
 // exactly: same sidecar-append naming convention, same write-tmp-then-rename atomicity.
-use std::{ffi::OsString, fs, path::{Path, PathBuf}};
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+};
 use tauri::command;
 
 fn sidecar_path_for(video_path: &Path) -> PathBuf {

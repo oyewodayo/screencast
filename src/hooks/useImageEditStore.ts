@@ -5,7 +5,7 @@
 // image instead of a multi-page document. See imageEditTypes.ts/imageEditHandlers.ts for the
 // object/command model this operates on.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import {
   GeometrySnapshot,
   ImageAdjustments,

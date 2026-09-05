@@ -1,16 +1,16 @@
 // conversion.rs
-use std::collections::HashMap;
-use tauri::{AppHandle, Window, State};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Stdio, Command};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tauri::async_runtime::Mutex;
-use std::io::{BufRead, BufReader};
+use tauri::{AppHandle, Emitter, State, Window};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-use crate::services::utility::{path_to_str, get_ffmpeg_path, get_ffprobe_path};
+use crate::services::utility::{get_ffmpeg_path, get_ffprobe_path, path_to_str};
 
 #[cfg(windows)]
 use crate::commands::recording::hide_console_window;
@@ -74,7 +74,10 @@ fn unique_output_path(path: PathBuf) -> PathBuf {
     }
 
     let parent = path.parent().map(PathBuf::from).unwrap_or_default();
-    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     let ext = path.extension().map(|s| s.to_string_lossy().to_string());
 
     for n in 1.. {
@@ -91,7 +94,6 @@ fn unique_output_path(path: PathBuf) -> PathBuf {
     unreachable!()
 }
 
-
 // One `-i` worth of input - `pre_args` is whatever ffmpeg input-level flags need to appear
 // *before* that `-i` (input-level options only take effect on the input they immediately
 // precede, unlike output-level options like `-c:v`). Every existing caller just needs a plain
@@ -105,7 +107,10 @@ struct InputSpec {
 
 impl InputSpec {
     fn plain(path: String) -> Self {
-        Self { path, pre_args: Vec::new() }
+        Self {
+            path,
+            pre_args: Vec::new(),
+        }
     }
 }
 
@@ -137,13 +142,16 @@ async fn run_conversion(
 
     let output = unique_output_path(output);
 
-    let _ = window.emit("conversion-progress", ConversionProgress {
-        input_path: progress_key.to_string(),
-        output_path: output.to_string_lossy().to_string(),
-        progress: 0.0,
-        status: ConversionStatus::Starting,
-        message: "Starting conversion...".to_string(),
-    });
+    let _ = window.emit(
+        "conversion-progress",
+        ConversionProgress {
+            input_path: progress_key.to_string(),
+            output_path: output.to_string_lossy().to_string(),
+            progress: 0.0,
+            status: ConversionStatus::Starting,
+            message: "Starting conversion...".to_string(),
+        },
+    );
 
     let mut cmd = Command::new(&ffmpeg_path);
     #[cfg(windows)]
@@ -168,7 +176,8 @@ async fn run_conversion(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to start conversion: {}", e))?;
 
     let pid = child.id();
@@ -177,10 +186,8 @@ async fn run_conversion(
         *active_process = Some(pid);
     }
 
-    let stderr = child.stderr.take()
-        .ok_or("Failed to capture stderr")?;
-    let stdout = child.stdout.take()
-        .ok_or("Failed to capture stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
 
     // Total duration comes from ffmpeg's initial "Duration: HH:MM:SS.ms" line on stderr;
     // current position comes from the structured -progress stream on stdout. Shared so the
@@ -227,23 +234,36 @@ async fn run_conversion(
                 Err(_) => continue,
             };
 
-            let Some(us_str) = line.strip_prefix("out_time_us=") else { continue };
-            let Ok(current_us) = us_str.trim().parse::<i64>() else { continue };
-            if current_us < 0 { continue }
+            let Some(us_str) = line.strip_prefix("out_time_us=") else {
+                continue;
+            };
+            let Ok(current_us) = us_str.trim().parse::<i64>() else {
+                continue;
+            };
+            if current_us < 0 {
+                continue;
+            }
 
-            let Some(total_duration) = *duration.lock().unwrap() else { continue };
-            if total_duration <= 0.0 { continue }
+            let Some(total_duration) = *duration.lock().unwrap() else {
+                continue;
+            };
+            if total_duration <= 0.0 {
+                continue;
+            }
 
             let current_time = current_us as f64 / 1_000_000.0;
             let progress = (current_time / total_duration * 100.0).clamp(0.0, 99.0);
 
-            let _ = window_clone.emit("conversion-progress", ConversionProgress {
-                input_path: progress_key_clone.clone(),
-                output_path: output_path_clone.clone(),
-                progress,
-                status: ConversionStatus::Processing,
-                message: format!("Converting... {:.1}%", progress),
-            });
+            let _ = window_clone.emit(
+                "conversion-progress",
+                ConversionProgress {
+                    input_path: progress_key_clone.clone(),
+                    output_path: output_path_clone.clone(),
+                    progress,
+                    status: ConversionStatus::Processing,
+                    message: format!("Converting... {:.1}%", progress),
+                },
+            );
         }
     });
 
@@ -260,13 +280,16 @@ async fn run_conversion(
     }
 
     if result.success() {
-        let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: progress_key.to_string(),
-            output_path: output.to_string_lossy().to_string(),
-            progress: 100.0,
-            status: ConversionStatus::Completed,
-            message: "Conversion completed successfully".to_string(),
-        });
+        let _ = window.emit(
+            "conversion-progress",
+            ConversionProgress {
+                input_path: progress_key.to_string(),
+                output_path: output.to_string_lossy().to_string(),
+                progress: 100.0,
+                status: ConversionStatus::Completed,
+                message: "Conversion completed successfully".to_string(),
+            },
+        );
 
         Ok(output.to_string_lossy().to_string())
     } else {
@@ -276,13 +299,16 @@ async fn run_conversion(
             crate::commands::recording::extract_ffmpeg_error(&stderr_output)
         );
 
-        let _ = window.emit("conversion-progress", ConversionProgress {
-            input_path: progress_key.to_string(),
-            output_path: output.to_string_lossy().to_string(),
-            progress: 0.0,
-            status: ConversionStatus::Failed,
-            message: error_msg.clone(),
-        });
+        let _ = window.emit(
+            "conversion-progress",
+            ConversionProgress {
+                input_path: progress_key.to_string(),
+                output_path: output.to_string_lossy().to_string(),
+                progress: 0.0,
+                status: ConversionStatus::Failed,
+                message: error_msg.clone(),
+            },
+        );
 
         Err(error_msg)
     }
@@ -304,15 +330,30 @@ pub async fn convert_to_mp4(
     };
 
     let codec_args = [
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
     ];
 
-    let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
+    let result = run_conversion(
+        &app_handle,
+        &window,
+        &state,
+        &[InputSpec::plain(input_path.clone())],
+        &input_path,
+        output,
+        &codec_args,
+    )
+    .await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -332,11 +373,16 @@ pub async fn convert_to_mp4(
 // sitting here under the *same* path+mtime key the corrected decoder would also produce, so nothing
 // short of a namespace change would ever have invalidated it. Bump the namespace's suffix (e.g.
 // "heic_v3") again if a future decoder change needs the same guarantee.
-fn preview_cache_path(input: &PathBuf, namespace: &str, output_ext: &str) -> Result<PathBuf, String> {
+fn preview_cache_path(
+    input: &PathBuf,
+    namespace: &str,
+    output_ext: &str,
+) -> Result<PathBuf, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let metadata = std::fs::metadata(input).map_err(|e| format!("Failed to read input file: {}", e))?;
+    let metadata =
+        std::fs::metadata(input).map_err(|e| format!("Failed to read input file: {}", e))?;
     let modified_secs = metadata
         .modified()
         .ok()
@@ -349,7 +395,10 @@ fn preview_cache_path(input: &PathBuf, namespace: &str, output_ext: &str) -> Res
     modified_secs.hash(&mut hasher);
     let key = hasher.finish();
 
-    Ok(std::env::temp_dir().join("briefcast_preview_cache").join(namespace).join(format!("{:x}.{}", key, output_ext)))
+    Ok(std::env::temp_dir()
+        .join("briefcast_preview_cache")
+        .join(namespace)
+        .join(format!("{:x}.{}", key, output_ext)))
 }
 
 // Silent, no-prompt fallback for a file the in-app player can't decode natively - most notably
@@ -388,19 +437,35 @@ pub async fn get_playable_preview(
     }
 
     if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
     }
 
     let codec_args = [
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
     ];
 
-    run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, cache_path, &codec_args).await
+    run_conversion(
+        &app_handle,
+        &window,
+        &state,
+        &[InputSpec::plain(input_path.clone())],
+        &input_path,
+        cache_path,
+        &codec_args,
+    )
+    .await
 }
 
 // Convert a still image (screenshot) between png/jpeg/webp/bmp. No audio/video codec args
@@ -434,13 +499,34 @@ pub async fn convert_image(
     // source, not in what ffmpeg would have encoded it to.
     #[cfg(windows)]
     {
-        let input_ext = input.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+        let input_ext = input
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
         if matches!(input_ext.as_deref(), Some("heic") | Some("heif")) {
-            return convert_heic_windows(&app_handle, &window, &state, &input, output, &output_format, preserve_original).await;
+            return convert_heic_windows(
+                &app_handle,
+                &window,
+                &state,
+                &input,
+                output,
+                &output_format,
+                preserve_original,
+            )
+            .await;
         }
     }
 
-    let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
+    let result = run_conversion(
+        &app_handle,
+        &window,
+        &state,
+        &[InputSpec::plain(input_path.clone())],
+        &input_path,
+        output,
+        &codec_args,
+    )
+    .await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -464,20 +550,24 @@ async fn convert_heic_windows(
     output_format: &str,
     preserve_original: bool,
 ) -> Result<String, String> {
-    let _ = window.emit("conversion-progress", ConversionProgress {
-        input_path: input.to_string_lossy().to_string(),
-        output_path: output.to_string_lossy().to_string(),
-        progress: 0.0,
-        status: ConversionStatus::Starting,
-        message: "Decoding HEIC photo...".to_string(),
-    });
+    let _ = window.emit(
+        "conversion-progress",
+        ConversionProgress {
+            input_path: input.to_string_lossy().to_string(),
+            output_path: output.to_string_lossy().to_string(),
+            progress: 0.0,
+            status: ConversionStatus::Starting,
+            message: "Decoding HEIC photo...".to_string(),
+        },
+    );
 
     let format = output_format.to_lowercase();
     let final_output = unique_output_path(output);
 
     let native_result: Result<String, String> = async {
         if format == "png" {
-            crate::services::heic_windows::decode_to_png(input.clone(), final_output.clone()).await?;
+            crate::services::heic_windows::decode_to_png(input.clone(), final_output.clone())
+                .await?;
             Ok(final_output.to_string_lossy().to_string())
         } else {
             let temp_png = final_output.with_extension("heic_tmp.png");
@@ -509,14 +599,27 @@ async fn convert_heic_windows(
     let result = match native_result {
         Ok(path) => Ok(path),
         Err(native_err) => {
-            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to bundled libheif", input.display());
+            log::warn!(
+                "HEIC native decode failed for {}: {native_err}; falling back to bundled libheif",
+                input.display()
+            );
             let fallback: Result<String, String> = async {
                 if format == "png" {
-                    crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), final_output.clone()).await?;
+                    crate::services::heif_tool::decode_to_png(
+                        app_handle.clone(),
+                        input.clone(),
+                        final_output.clone(),
+                    )
+                    .await?;
                     Ok(final_output.to_string_lossy().to_string())
                 } else {
                     let temp_png = final_output.with_extension("heic_tmp.png");
-                    crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), temp_png.clone()).await?;
+                    crate::services::heif_tool::decode_to_png(
+                        app_handle.clone(),
+                        input.clone(),
+                        temp_png.clone(),
+                    )
+                    .await?;
                     let transcode = run_conversion(
                         app_handle,
                         window,
@@ -533,33 +636,44 @@ async fn convert_heic_windows(
             }
             .await;
             if let Err(heif_err) = &fallback {
-                log::error!("HEIC libheif fallback also failed for {}: {heif_err}", input.display());
+                log::error!(
+                    "HEIC libheif fallback also failed for {}: {heif_err}",
+                    input.display()
+                );
             }
-            fallback.map_err(|heif_err| format!("{native_err}; fallback conversion also failed: {heif_err}"))
+            fallback.map_err(|heif_err| {
+                format!("{native_err}; fallback conversion also failed: {heif_err}")
+            })
         }
     };
 
     match &result {
         Ok(path) => {
-            let _ = window.emit("conversion-progress", ConversionProgress {
-                input_path: input.to_string_lossy().to_string(),
-                output_path: path.clone(),
-                progress: 100.0,
-                status: ConversionStatus::Completed,
-                message: "Conversion completed".to_string(),
-            });
+            let _ = window.emit(
+                "conversion-progress",
+                ConversionProgress {
+                    input_path: input.to_string_lossy().to_string(),
+                    output_path: path.clone(),
+                    progress: 100.0,
+                    status: ConversionStatus::Completed,
+                    message: "Conversion completed".to_string(),
+                },
+            );
             if !preserve_original {
                 let _ = std::fs::remove_file(input);
             }
         }
         Err(err) => {
-            let _ = window.emit("conversion-progress", ConversionProgress {
-                input_path: input.to_string_lossy().to_string(),
-                output_path: String::new(),
-                progress: 0.0,
-                status: ConversionStatus::Failed,
-                message: err.clone(),
-            });
+            let _ = window.emit(
+                "conversion-progress",
+                ConversionProgress {
+                    input_path: input.to_string_lossy().to_string(),
+                    output_path: String::new(),
+                    progress: 0.0,
+                    status: ConversionStatus::Failed,
+                    message: err.clone(),
+                },
+            );
         }
     }
 
@@ -594,21 +708,38 @@ pub async fn get_heic_preview(
     }
 
     if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
     }
 
     #[cfg(windows)]
     {
         let _ = (&window, &state); // only used by the non-Windows branch below
-        if let Err(native_err) = crate::services::heic_windows::decode_to_png(input.clone(), cache_path.clone()).await {
+        if let Err(native_err) =
+            crate::services::heic_windows::decode_to_png(input.clone(), cache_path.clone()).await
+        {
             // Windows' own HEIC decoder needs the HEVC Video Extensions codec package installed
             // (separate from HEIF Image Extensions) - plenty of machines only have the latter. Same
             // bundled-libheif fallback as convert_heic_windows above; see its comment for why that
             // replaced an ffmpeg fallback here.
-            log::warn!("HEIC native decode failed for {}: {native_err}; falling back to bundled libheif", input.display());
-            if let Err(heif_err) = crate::services::heif_tool::decode_to_png(app_handle.clone(), input.clone(), cache_path.clone()).await {
-                log::error!("HEIC libheif fallback also failed for {}: {heif_err}", input.display());
-                return Err(format!("{native_err}; fallback conversion also failed: {heif_err}"));
+            log::warn!(
+                "HEIC native decode failed for {}: {native_err}; falling back to bundled libheif",
+                input.display()
+            );
+            if let Err(heif_err) = crate::services::heif_tool::decode_to_png(
+                app_handle.clone(),
+                input.clone(),
+                cache_path.clone(),
+            )
+            .await
+            {
+                log::error!(
+                    "HEIC libheif fallback also failed for {}: {heif_err}",
+                    input.display()
+                );
+                return Err(format!(
+                    "{native_err}; fallback conversion also failed: {heif_err}"
+                ));
             }
         }
         path_to_str(&cache_path).map(|s| s.to_string())
@@ -616,7 +747,16 @@ pub async fn get_heic_preview(
 
     #[cfg(not(windows))]
     {
-        run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, cache_path, &[]).await
+        run_conversion(
+            &app_handle,
+            &window,
+            &state,
+            &[InputSpec::plain(input_path.clone())],
+            &input_path,
+            cache_path,
+            &[],
+        )
+        .await
     }
 }
 
@@ -643,7 +783,10 @@ const GALLERY_THUMBNAIL_MAX_DIMENSION: u32 = 480;
 // via the `image` crate, in-process - no bundled binary needed for those, and cheaper than
 // shelling out to ffmpeg for something this small.
 #[tauri::command]
-pub async fn get_image_thumbnail(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+pub async fn get_image_thumbnail(
+    app_handle: AppHandle,
+    input_path: String,
+) -> Result<String, String> {
     // Unconditional entry log (cache hit or miss) - the only line in this command that always
     // fires. Every other line here only logs on error, so a request that hangs (concurrencyLimiter
     // ts's withLimit racing it against a timeout instead of waiting forever - see that file's own
@@ -660,13 +803,24 @@ pub async fn get_image_thumbnail(app_handle: AppHandle, input_path: String) -> R
     }
 
     if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
     }
 
-    let ext = input.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+    let ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
     #[cfg(windows)]
     if matches!(ext.as_deref(), Some("heic") | Some("heif")) {
-        if let Err(err) = crate::services::heif_tool::extract_thumbnail(app_handle, input.clone(), cache_path.clone(), GALLERY_THUMBNAIL_MAX_DIMENSION).await {
+        if let Err(err) = crate::services::heif_tool::extract_thumbnail(
+            app_handle,
+            input.clone(),
+            cache_path.clone(),
+            GALLERY_THUMBNAIL_MAX_DIMENSION,
+        )
+        .await
+        {
             log::error!("HEIC thumbnail failed for {}: {err}", input.display());
             return Err(err);
         }
@@ -677,22 +831,27 @@ pub async fn get_image_thumbnail(app_handle: AppHandle, input_path: String) -> R
 
     let input_for_blocking = input.clone();
     let cache_for_blocking = cache_path.clone();
-    tauri::async_runtime::spawn_blocking(move || generate_plain_thumbnail(&input_for_blocking, &cache_for_blocking))
-        .await
-        .map_err(|e| format!("Thumbnail task panicked: {e}"))?
-        .map_err(|err| {
-            log::error!("Image thumbnail failed for {}: {err}", input.display());
-            err
-        })?;
+    tauri::async_runtime::spawn_blocking(move || {
+        generate_plain_thumbnail(&input_for_blocking, &cache_for_blocking)
+    })
+    .await
+    .map_err(|e| format!("Thumbnail task panicked: {e}"))?
+    .map_err(|err| {
+        log::error!("Image thumbnail failed for {}: {err}", input.display());
+        err
+    })?;
 
     path_to_str(&cache_path).map(|s| s.to_string())
 }
 
 fn generate_plain_thumbnail(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
     let img = image::open(input).map_err(|e| format!("Failed to open image: {e}"))?;
-    img.thumbnail(GALLERY_THUMBNAIL_MAX_DIMENSION, GALLERY_THUMBNAIL_MAX_DIMENSION)
-        .save(output)
-        .map_err(|e| format!("Failed to save thumbnail: {e}"))
+    img.thumbnail(
+        GALLERY_THUMBNAIL_MAX_DIMENSION,
+        GALLERY_THUMBNAIL_MAX_DIMENSION,
+    )
+    .save(output)
+    .map_err(|e| format!("Failed to save thumbnail: {e}"))
 }
 
 // Silent, cached poster-frame thumbnail for a video gallery grid tile - the video counterpart to
@@ -703,7 +862,10 @@ fn generate_plain_thumbnail(input: &PathBuf, output: &PathBuf) -> Result<(), Str
 // thumbnail is (content-addressed by path+mtime - see preview_cache_path), so revisiting a video
 // folder is instant after the first pass.
 #[tauri::command]
-pub async fn get_video_thumbnail(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+pub async fn get_video_thumbnail(
+    app_handle: AppHandle,
+    input_path: String,
+) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
     let cache_path = preview_cache_path(&input, "video_thumb_v1", "jpg")?;
 
@@ -712,13 +874,18 @@ pub async fn get_video_thumbnail(app_handle: AppHandle, input_path: String) -> R
     }
 
     if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
     }
 
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
     if let Err(err) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:01").await {
-        log::warn!("Video thumbnail seek to 1s failed for {}: {err}; retrying at frame 0", input.display());
-        if let Err(err2) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:00").await {
+        log::warn!(
+            "Video thumbnail seek to 1s failed for {}: {err}; retrying at frame 0",
+            input.display()
+        );
+        if let Err(err2) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:00").await
+        {
             let combined = format!("{err}; retry at frame 0 also failed: {err2}");
             log::error!("Video thumbnail failed for {}: {combined}", input.display());
             return Err(combined);
@@ -732,7 +899,12 @@ pub async fn get_video_thumbnail(app_handle: AppHandle, input_path: String) -> R
 // a thumbnail and far quicker than decoding from the start, which matters here since this runs
 // once per video in a folder that can hold hundreds of them (bounded by the same shared
 // thumbnailLimiter the frontend routes every gallery/sidebar thumbnail request through).
-async fn extract_video_frame(ffmpeg_path: &PathBuf, input: &PathBuf, output: &PathBuf, seek: &str) -> Result<(), String> {
+async fn extract_video_frame(
+    ffmpeg_path: &PathBuf,
+    input: &PathBuf,
+    output: &PathBuf,
+    seek: &str,
+) -> Result<(), String> {
     let ffmpeg_path = ffmpeg_path.clone();
     let input = input.clone();
     let output = output.clone();
@@ -743,22 +915,46 @@ async fn extract_video_frame(ffmpeg_path: &PathBuf, input: &PathBuf, output: &Pa
         hide_console_window(&mut cmd);
         cmd.args(["-y", "-ss", &seek]);
         cmd.arg("-i").arg(path_to_str(&input)?);
-        cmd.args(["-frames:v", "1", "-update", "1", "-vf", "scale=480:-1", "-q:v", "4"]);
+        cmd.args([
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-vf",
+            "scale=480:-1",
+            "-q:v",
+            "4",
+        ]);
         cmd.arg(path_to_str(&output)?);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        let result = cmd
+            .output()
+            .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
             // ffmpeg's stderr always opens with its full version/build-config banner before
             // anything about THIS run - keeping only the last few non-empty lines is what
             // actually explains the failure (e.g. "Invalid data found when processing input"),
             // instead of a wall of --enable-* flags every single error gets buried under.
-            let tail: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).rev().take(3).collect();
+            let tail: Vec<&str> = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .rev()
+                .take(3)
+                .collect();
             let reason: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
-            return Err(format!("ffmpeg frame extraction failed: {}", if reason.is_empty() { "unknown error".to_string() } else { reason }));
+            return Err(format!(
+                "ffmpeg frame extraction failed: {}",
+                if reason.is_empty() {
+                    "unknown error".to_string()
+                } else {
+                    reason
+                }
+            ));
         }
         if !output.exists() {
             return Err("ffmpeg exited successfully but produced no output file".to_string());
@@ -799,7 +995,16 @@ pub async fn convert_audio(
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
+    let result = run_conversion(
+        &app_handle,
+        &window,
+        &state,
+        &[InputSpec::plain(input_path.clone())],
+        &input_path,
+        output,
+        &codec_args,
+    )
+    .await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -864,7 +1069,7 @@ pub struct ClipCrop {
 pub struct ClipTransitionIn {
     #[serde(rename = "type")]
     pub transition_type: String, // "crossfade" - only variant in v1
-    pub duration: f64,           // seconds
+    pub duration: f64, // seconds
 }
 
 #[derive(Debug, Deserialize)]
@@ -994,7 +1199,11 @@ pub struct PipOverlay {
 const ALLOWED_PIP_SHAPES: &[&str] = &["circle", "rounded", "rectangle"];
 
 fn sanitize_pip_shape(shape: &str) -> &str {
-    ALLOWED_PIP_SHAPES.iter().find(|&&s| s == shape).copied().unwrap_or("rectangle")
+    ALLOWED_PIP_SHAPES
+        .iter()
+        .find(|&&s| s == shape)
+        .copied()
+        .unwrap_or("rectangle")
 }
 
 // One PiP overlay's filter-graph fragment: trims this overlay's own [trim_start, trim_start+
@@ -1007,7 +1216,13 @@ fn sanitize_pip_shape(shape: &str) -> &str {
 // editable alternative to (kept as a separate copy here rather than a shared function - the two
 // commands build genuinely different surrounding graphs, and geq expressions are short enough that
 // sharing would cost more in indirection than it'd save).
-fn pip_overlay_chain(pip: &PipOverlay, input_index: usize, stage_index: usize, current_label: &str, out_label: &str) -> String {
+fn pip_overlay_chain(
+    pip: &PipOverlay,
+    input_index: usize,
+    stage_index: usize,
+    current_label: &str,
+    out_label: &str,
+) -> String {
     let duration = (pip.end_time - pip.start_time).max(0.01);
     let trim_end = pip.trim_start + duration;
     let cover = format!(
@@ -1025,8 +1240,12 @@ fn pip_overlay_chain(pip: &PipOverlay, input_index: usize, stage_index: usize, c
         }
         _ => {
             let mask_expr = if shape == "rounded" {
-                let r = ((pip.corner_radius.unwrap_or(0.08).max(0.0).min(0.5)) * pip.height as f64).round() as i64;
-                format!("if(gte(X,{r})*gte(Y,{r})*gte(W-{r}-X,0)*gte(H-{r}-Y,0),255,0)", r = r)
+                let r = ((pip.corner_radius.unwrap_or(0.08).max(0.0).min(0.5)) * pip.height as f64)
+                    .round() as i64;
+                format!(
+                    "if(gte(X,{r})*gte(Y,{r})*gte(W-{r}-X,0)*gte(H-{r}-Y,0),255,0)",
+                    r = r
+                )
             } else {
                 "if(gt((X-W/2)^2+(Y-H/2)^2,(W/2)^2),0,255)".to_string()
             };
@@ -1036,9 +1255,25 @@ fn pip_overlay_chain(pip: &PipOverlay, input_index: usize, stage_index: usize, c
             // `split` - ffmpeg fans out a raw demuxed/decoded input stream reference on its own,
             // the same "{input}...{input}..." idiom overlay_stage_filter (recording.rs) already
             // relies on for exactly this shape-masking technique.
-            chain.push_str(&format!("[{idx}:v]{cover},geq=lum_expr='{mask_expr}',format=yuva420p[{alpha}];", idx = input_index, cover = cover, mask_expr = mask_expr, alpha = alpha_label));
-            chain.push_str(&format!("[{idx}:v]{cover}[{video}];", idx = input_index, cover = cover, video = video_label));
-            chain.push_str(&format!("[{video}][{alpha}]alphamerge[{masked}];", video = video_label, alpha = alpha_label, masked = masked_label));
+            chain.push_str(&format!(
+                "[{idx}:v]{cover},geq=lum_expr='{mask_expr}',format=yuva420p[{alpha}];",
+                idx = input_index,
+                cover = cover,
+                mask_expr = mask_expr,
+                alpha = alpha_label
+            ));
+            chain.push_str(&format!(
+                "[{idx}:v]{cover}[{video}];",
+                idx = input_index,
+                cover = cover,
+                video = video_label
+            ));
+            chain.push_str(&format!(
+                "[{video}][{alpha}]alphamerge[{masked}];",
+                video = video_label,
+                alpha = alpha_label,
+                masked = masked_label
+            ));
             masked_label
         }
     };
@@ -1103,7 +1338,11 @@ fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64) -> 
         }
         "pan-left" | "pan-right" => {
             let z = 1.0 + 0.15 * amount;
-            let dir = if kb.preset == "pan-right" { format!("min(t/{d:.3},1)") } else { format!("1-min(t/{d:.3},1)") };
+            let dir = if kb.preset == "pan-right" {
+                format!("min(t/{d:.3},1)")
+            } else {
+                format!("1-min(t/{d:.3},1)")
+            };
             format!(",crop=w='iw/{z:.4}':h='ih/{z:.4}':x='(iw-ow)*({dir})':y='(ih-oh)/2',scale={out_w}:{out_h}")
         }
         _ => String::new(),
@@ -1182,7 +1421,11 @@ fn atempo_chain(speed: f64) -> String {
         remaining /= 0.5;
     }
     stages.push(remaining);
-    stages.iter().map(|s| format!("atempo={:.4}", s)).collect::<Vec<_>>().join(",")
+    stages
+        .iter()
+        .map(|s| format!("atempo={:.4}", s))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>) -> String {
@@ -1209,7 +1452,12 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         // OUTPUT duration to reach exactly 1.0 at the segment's own end regardless of speed. The
         // live preview needs no equivalent adjustment - its own progress calc (VideoPlayer.tsx) is
         // a source-time ratio that's already speed-invariant by construction, see its own comment.
-        extra.push_str(&ken_burns_chain(kb, (seg.end - seg.start) / segment_speed(seg), w, h));
+        extra.push_str(&ken_burns_chain(
+            kb,
+            (seg.end - seg.start) / segment_speed(seg),
+            w,
+            h,
+        ));
     }
     extra
 }
@@ -1226,19 +1474,46 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
 // has_transitions fold), so this is a real security boundary, not just UI validation - an
 // unrecognized value (a hand-edited sidecar, a future frontend/backend version mismatch) falls
 // back to "fade" rather than ever reaching the format! call unchecked.
-const ALLOWED_TRANSITIONS: &[&str] = &["fade", "fadeblack", "wipeleft", "wiperight", "slideleft", "slideright", "circleopen", "zoomin", "pixelize", "radial", "dissolve"];
+const ALLOWED_TRANSITIONS: &[&str] = &[
+    "fade",
+    "fadeblack",
+    "wipeleft",
+    "wiperight",
+    "slideleft",
+    "slideright",
+    "circleopen",
+    "zoomin",
+    "pixelize",
+    "radial",
+    "dissolve",
+];
 
 fn sanitize_transition_name(name: &str) -> &str {
-    ALLOWED_TRANSITIONS.iter().find(|&&t| t == name).copied().unwrap_or("fade")
+    ALLOWED_TRANSITIONS
+        .iter()
+        .find(|&&t| t == name)
+        .copied()
+        .unwrap_or("fade")
 }
 
 // Mirrors OverlayImage.animation's own doc comment - "pop" is deliberately absent (frontend maps
 // it to "fade" before it ever reaches here). Same security-boundary reasoning as
 // ALLOWED_TRANSITIONS: this string is interpolated directly into the filter_complex below.
-const ALLOWED_OVERLAY_ANIMATIONS: &[&str] = &["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"];
+const ALLOWED_OVERLAY_ANIMATIONS: &[&str] = &[
+    "none",
+    "fade",
+    "slide-left",
+    "slide-right",
+    "slide-up",
+    "slide-down",
+];
 
 fn sanitize_overlay_animation(name: &str) -> &str {
-    ALLOWED_OVERLAY_ANIMATIONS.iter().find(|&&a| a == name).copied().unwrap_or("none")
+    ALLOWED_OVERLAY_ANIMATIONS
+        .iter()
+        .find(|&&a| a == name)
+        .copied()
+        .unwrap_or("none")
 }
 
 // Matches the live preview's own slide timing exactly (overlayAnimationStyle, VideoOverlayLayer.tsx)
@@ -1253,10 +1528,14 @@ const OVERLAY_ANIMATION_RAMP_SEC: f64 = 0.4;
 const OVERLAY_SLIDE_DISTANCE_FRACTION: f64 = 0.12;
 
 fn overlay_slide_remaining_expr(start_time: f64, end_time: f64) -> String {
-    let ramp = OVERLAY_ANIMATION_RAMP_SEC.min((end_time - start_time) / 2.0).max(0.001);
+    let ramp = OVERLAY_ANIMATION_RAMP_SEC
+        .min((end_time - start_time) / 2.0)
+        .max(0.001);
     format!(
         "(1-clip(min((t-{start:.3})/{ramp:.4},({end:.3}-t)/{ramp:.4}),0,1))",
-        start = start_time, end = end_time, ramp = ramp
+        start = start_time,
+        end = end_time,
+        ramp = ramp
     )
 }
 
@@ -1270,20 +1549,40 @@ fn overlay_slide_remaining_expr(start_time: f64, end_time: f64) -> String {
 fn overlay_position_expr(ov: &OverlayImage, animation: &str) -> (String, String) {
     match animation {
         "slide-left" => (
-            format!("({x})-(main_w*{frac})*{remaining}", x = ov.x, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+            format!(
+                "({x})-(main_w*{frac})*{remaining}",
+                x = ov.x,
+                frac = OVERLAY_SLIDE_DISTANCE_FRACTION,
+                remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)
+            ),
             ov.y.to_string(),
         ),
         "slide-right" => (
-            format!("({x})+(main_w*{frac})*{remaining}", x = ov.x, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+            format!(
+                "({x})+(main_w*{frac})*{remaining}",
+                x = ov.x,
+                frac = OVERLAY_SLIDE_DISTANCE_FRACTION,
+                remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)
+            ),
             ov.y.to_string(),
         ),
         "slide-up" => (
             ov.x.to_string(),
-            format!("({y})-(main_h*{frac})*{remaining}", y = ov.y, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+            format!(
+                "({y})-(main_h*{frac})*{remaining}",
+                y = ov.y,
+                frac = OVERLAY_SLIDE_DISTANCE_FRACTION,
+                remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)
+            ),
         ),
         "slide-down" => (
             ov.x.to_string(),
-            format!("({y})+(main_h*{frac})*{remaining}", y = ov.y, frac = OVERLAY_SLIDE_DISTANCE_FRACTION, remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)),
+            format!(
+                "({y})+(main_h*{frac})*{remaining}",
+                y = ov.y,
+                frac = OVERLAY_SLIDE_DISTANCE_FRACTION,
+                remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)
+            ),
         ),
         _ => (ov.x.to_string(), ov.y.to_string()),
     }
@@ -1292,7 +1591,17 @@ fn overlay_position_expr(ov: &OverlayImage, animation: &str) -> (String, String)
 fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
     const FALLBACK_FPS: f64 = 30.0;
     let mut cmd = Command::new(ffprobe_path);
-    cmd.args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", source_path]);
+    cmd.args([
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=r_frame_rate",
+        "-of",
+        "csv=p=0",
+        source_path,
+    ]);
     #[cfg(windows)]
     hide_console_window(&mut cmd);
     let output = match cmd.output() {
@@ -1323,7 +1632,17 @@ fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
 // audio" behavior rather than silently dropping a real track.
 fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
     let mut cmd = Command::new(ffprobe_path);
-    cmd.args(["-v", "quiet", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", source_path]);
+    cmd.args([
+        "-v",
+        "quiet",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        source_path,
+    ]);
     #[cfg(windows)]
     hide_console_window(&mut cmd);
     let output = match cmd.output() {
@@ -1358,7 +1677,17 @@ fn resolve_export_quality(quality: Option<&str>) -> (&'static str, &'static str)
 
 fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
     let mut cmd = Command::new(ffprobe_path);
-    cmd.args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", source_path]);
+    cmd.args([
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        source_path,
+    ]);
     #[cfg(windows)]
     hide_console_window(&mut cmd);
     let output = cmd.output().ok()?;
@@ -1375,7 +1704,15 @@ fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(
 // track of the same duration (`anullsrc`, a filter *source*, needs no `-i` input of its own) so
 // concat/xfade/acrossfade downstream always have a real audio stream to work with regardless of
 // whether the source did.
-fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, speed: f64, noise_reduction_db: Option<f64>, out_label: &str) -> String {
+fn audio_trim_chain(
+    has_audio: bool,
+    input_index: usize,
+    start: f64,
+    end: f64,
+    speed: f64,
+    noise_reduction_db: Option<f64>,
+    out_label: &str,
+) -> String {
     if has_audio {
         // atempo_chain (not a bare "atempo={speed}") since ffmpeg rejects a single atempo instance
         // outside 0.5..2.0 - see its own doc comment. A speed of 1 still resolves to exactly
@@ -1396,7 +1733,8 @@ fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, s
         // the same segment to agree on how long it lasts.
         format!(
             "anullsrc=channel_layout=stereo:sample_rate=44100:duration={dur:.3}[{out}];",
-            dur = ((end - start) / speed).max(0.01), out = out_label
+            dur = ((end - start) / speed).max(0.01),
+            out = out_label
         )
     }
 }
@@ -1407,9 +1745,16 @@ fn audio_trim_chain(has_audio: bool, input_index: usize, start: f64, end: f64, s
 // without the caller needing to know which.
 fn write_temp_overlay_png(data_base64: &str, index: usize) -> Result<PathBuf, String> {
     let payload = data_base64.rsplit(',').next().unwrap_or(data_base64);
-    let bytes = BASE64.decode(payload).map_err(|e| format!("Failed to decode overlay image: {}", e))?;
-    let path = std::env::temp_dir().join(format!("briefcast_overlay_{}_{}.png", std::process::id(), index));
-    std::fs::write(&path, &bytes).map_err(|e| format!("Failed to write overlay temp file: {}", e))?;
+    let bytes = BASE64
+        .decode(payload)
+        .map_err(|e| format!("Failed to decode overlay image: {}", e))?;
+    let path = std::env::temp_dir().join(format!(
+        "briefcast_overlay_{}_{}.png",
+        std::process::id(),
+        index
+    ));
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("Failed to write overlay temp file: {}", e))?;
     Ok(path)
 }
 
@@ -1473,20 +1818,33 @@ pub async fn export_trimmed_video(
     // The primary video's OWN audio level (distinct from any audio overlay's own volume/muted,
     // which are separate mixed-in tracks) - 0.0 when muted, otherwise whatever the editor's track
     // volume slider was set to.
-    let effective_video_volume = if audio_muted { 0.0 } else { audio_volume.max(0.0) };
+    let effective_video_volume = if audio_muted {
+        0.0
+    } else {
+        audio_volume.max(0.0)
+    };
 
     let output = match output_path {
         Some(p) => PathBuf::from(p),
         None => {
             let base = PathBuf::from(&output_base_path);
-            let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            let ext = base.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
+            let stem = base
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let ext = base
+                .extension()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "mp4".to_string());
             let parent = base.parent().map(PathBuf::from).unwrap_or_default();
             parent.join(format!("{} (edited).{}", stem, ext))
         }
     };
 
-    let mut inputs: Vec<InputSpec> = segments.iter().map(|s| InputSpec::plain(s.source_path.clone())).collect();
+    let mut inputs: Vec<InputSpec> = segments
+        .iter()
+        .map(|s| InputSpec::plain(s.source_path.clone()))
+        .collect();
 
     // Written to temp files up front (ffmpeg needs real file paths, not data URLs) and cleaned up
     // unconditionally once the export attempt finishes below, success or failure.
@@ -1513,7 +1871,12 @@ pub async fn export_trimmed_video(
         // visible, so the input stream itself doesn't need to be time-shifted to line up.
         inputs.push(InputSpec {
             path: path.to_string_lossy().to_string(),
-            pre_args: vec!["-loop".into(), "1".into(), "-t".into(), format!("{:.3}", total_duration.max(0.01))],
+            pre_args: vec![
+                "-loop".into(),
+                "1".into(),
+                "-t".into(),
+                format!("{:.3}", total_duration.max(0.01)),
+            ],
         });
     }
 
@@ -1540,14 +1903,22 @@ pub async fn export_trimmed_video(
                 let input_index = inputs.len();
                 inputs.push(InputSpec {
                     path: path.to_string_lossy().to_string(),
-                    pre_args: vec!["-loop".into(), "1".into(), "-t".into(), format!("{:.3}", total_duration.max(0.01))],
+                    pre_args: vec![
+                        "-loop".into(),
+                        "1".into(),
+                        "-t".into(),
+                        format!("{:.3}", total_duration.max(0.01)),
+                    ],
                 });
                 blur_mask_input_index.push(Some(input_index));
             }
             None => blur_mask_input_index.push(None),
         }
     }
-    let blur_mask_count = blur_mask_input_index.iter().filter(|idx| idx.is_some()).count();
+    let blur_mask_count = blur_mask_input_index
+        .iter()
+        .filter(|idx| idx.is_some())
+        .count();
 
     // Audio overlays need no temp file and no -loop/-t pre_args at all, unlike the PNGs above -
     // there's no client-side rendering step for audio (see OverlayAudio's own doc comment), so
@@ -1573,8 +1944,14 @@ pub async fn export_trimmed_video(
     // Any clip-level effect also needs the full filter graph - the fast -ss/-to path below has no
     // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
     let has_clip_effects = segments.iter().any(|s| {
-        s.color_filter.as_ref().map_or(false, |cf| cf.preset != "none") || s.ken_burns.is_some() || s.transition_in.is_some() || s.crop.is_some()
-            || s.flip_horizontal.unwrap_or(false) || (s.speed.unwrap_or(1.0) - 1.0).abs() > 0.001
+        s.color_filter
+            .as_ref()
+            .map_or(false, |cf| cf.preset != "none")
+            || s.ken_burns.is_some()
+            || s.transition_in.is_some()
+            || s.crop.is_some()
+            || s.flip_horizontal.unwrap_or(false)
+            || (s.speed.unwrap_or(1.0) - 1.0).abs() > 0.001
     });
     // Any segment beyond the first requesting a transition - gates the pairwise xfade/acrossfade
     // fold below instead of the plain all-at-once `concat=n=N` the multi-segment branch has always
@@ -1582,19 +1959,33 @@ pub async fn export_trimmed_video(
     // before this feature existed.
     let has_transitions = segments.iter().skip(1).any(|s| s.transition_in.is_some());
 
-    let owned_args: Vec<String> = if segments.len() == 1 && !has_video_overlays && !has_blur_overlays && !has_audio_overlays && !has_pip_overlays && !has_clip_effects {
+    let owned_args: Vec<String> = if segments.len() == 1
+        && !has_video_overlays
+        && !has_blur_overlays
+        && !has_audio_overlays
+        && !has_pip_overlays
+        && !has_clip_effects
+    {
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
         let seg = &segments[0];
         let mut args = vec![
-            "-ss".into(), format!("{:.3}", seg.start),
-            "-to".into(), format!("{:.3}", seg.end),
-            "-c:v".into(), "libx264".into(),
-            "-preset".into(), quality_preset.into(),
-            "-crf".into(), quality_crf.into(),
-            "-c:a".into(), "aac".into(),
-            "-b:a".into(), "128k".into(),
-            "-movflags".into(), "+faststart".into(),
+            "-ss".into(),
+            format!("{:.3}", seg.start),
+            "-to".into(),
+            format!("{:.3}", seg.end),
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            quality_preset.into(),
+            "-crf".into(),
+            quality_crf.into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "128k".into(),
+            "-movflags".into(),
+            "+faststart".into(),
         ];
         if (effective_video_volume - 1.0).abs() > 0.001 {
             args.push("-af".into());
@@ -1617,25 +2008,34 @@ pub async fn export_trimmed_video(
         // another.
         let unique_source_paths: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
-            segments.iter().map(|s| s.source_path.clone()).filter(|p| seen.insert(p.clone())).collect()
+            segments
+                .iter()
+                .map(|s| s.source_path.clone())
+                .filter(|p| seen.insert(p.clone()))
+                .collect()
         };
         let audio_probe_handles: Vec<_> = unique_source_paths
             .iter()
             .map(|path| {
                 let ffprobe_path = ffprobe_path.clone();
                 let path = path.clone();
-                tauri::async_runtime::spawn_blocking(move || (path.clone(), probe_has_audio(&ffprobe_path, &path)))
+                tauri::async_runtime::spawn_blocking(move || {
+                    (path.clone(), probe_has_audio(&ffprobe_path, &path))
+                })
             })
             .collect();
         // Falls back to a real probe only when the frontend didn't already resolve this AND some
         // segment actually needs it (crop/Ken Burns) - see probe_video_dimensions' own doc comment.
-        let dimensions_probe_handle = if (video_width.is_none() || video_height.is_none()) && has_clip_effects {
-            let ffprobe_path = ffprobe_path.clone();
-            let first_source = segments[0].source_path.clone();
-            Some(tauri::async_runtime::spawn_blocking(move || probe_video_dimensions(&ffprobe_path, &first_source)))
-        } else {
-            None
-        };
+        let dimensions_probe_handle =
+            if (video_width.is_none() || video_height.is_none()) && has_clip_effects {
+                let ffprobe_path = ffprobe_path.clone();
+                let first_source = segments[0].source_path.clone();
+                Some(tauri::async_runtime::spawn_blocking(move || {
+                    probe_video_dimensions(&ffprobe_path, &first_source)
+                }))
+            } else {
+                None
+            };
 
         let mut has_audio_by_path: HashMap<String, bool> = HashMap::new();
         for handle in audio_probe_handles {
@@ -1646,9 +2046,13 @@ pub async fn export_trimmed_video(
                 has_audio_by_path.insert(path, has_audio);
             }
         }
-        let segment_has_audio: Vec<bool> = segments.iter().map(|s| *has_audio_by_path.get(&s.source_path).unwrap_or(&true)).collect();
+        let segment_has_audio: Vec<bool> = segments
+            .iter()
+            .map(|s| *has_audio_by_path.get(&s.source_path).unwrap_or(&true))
+            .collect();
 
-        let (video_width, video_height): (Option<i64>, Option<i64>) = match dimensions_probe_handle {
+        let (video_width, video_height): (Option<i64>, Option<i64>) = match dimensions_probe_handle
+        {
             Some(handle) => match handle.await.ok().flatten() {
                 Some((w, h)) => (Some(w), Some(h)),
                 None => (video_width, video_height),
@@ -1666,7 +2070,15 @@ pub async fn export_trimmed_video(
                 "[0:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{2:.4}{3}[base];",
                 seg.start, seg.end, speed, extra
             ));
-            filter.push_str(&audio_trim_chain(segment_has_audio[0], 0, seg.start, seg.end, speed, segment_noise_reduction_db(seg), "outa"));
+            filter.push_str(&audio_trim_chain(
+                segment_has_audio[0],
+                0,
+                seg.start,
+                seg.end,
+                speed,
+                segment_noise_reduction_db(seg),
+                "outa",
+            ));
         } else if !has_transitions {
             // Same segment-major trim+concat pattern as before this function grew overlay support
             // - concat's inputs must interleave [v0][a0][v1][a1]..., not group all video labels
@@ -1681,10 +2093,22 @@ pub async fn export_trimmed_video(
                     "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{4:.4}{3}[v{2}];",
                     seg.start, seg.end, i, extra, speed
                 ));
-                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, segment_noise_reduction_db(seg), &format!("a{}", i)));
+                filter.push_str(&audio_trim_chain(
+                    segment_has_audio[i],
+                    i,
+                    seg.start,
+                    seg.end,
+                    speed,
+                    segment_noise_reduction_db(seg),
+                    &format!("a{}", i),
+                ));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
             }
-            filter.push_str(&format!("{}concat=n={}:v=1:a=1[base][outa];", concat_inputs, segments.len()));
+            filter.push_str(&format!(
+                "{}concat=n={}:v=1:a=1[base][outa];",
+                concat_inputs,
+                segments.len()
+            ));
         } else {
             // At least one segment (beyond the first) has a crossfade transition - fold pairwise
             // left-to-right instead of one all-at-once concat, so each transitioned boundary can
@@ -1706,7 +2130,15 @@ pub async fn export_trimmed_video(
                     "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{5:.4}{3},fps={4:.3}[v{2}];",
                     seg.start, seg.end, i, extra, target_fps, speed
                 ));
-                filter.push_str(&audio_trim_chain(segment_has_audio[i], i, seg.start, seg.end, speed, segment_noise_reduction_db(seg), &format!("a{}", i)));
+                filter.push_str(&audio_trim_chain(
+                    segment_has_audio[i],
+                    i,
+                    seg.start,
+                    seg.end,
+                    speed,
+                    segment_noise_reduction_db(seg),
+                    &format!("a{}", i),
+                ));
             }
 
             // Folds left-to-right: `accumulated` tracks the CURRENT duration of whatever
@@ -1717,13 +2149,17 @@ pub async fn export_trimmed_video(
             // needs to be in that same OUTPUT-time space, not raw source seconds.
             let mut cur_v = "v0".to_string();
             let mut cur_a = "a0".to_string();
-            let mut accumulated = (segments[0].end - segments[0].start) / segment_speed(&segments[0]);
+            let mut accumulated =
+                (segments[0].end - segments[0].start) / segment_speed(&segments[0]);
             for i in 1..segments.len() {
                 let seg = &segments[i];
                 let seg_dur = (seg.end - seg.start) / segment_speed(seg);
                 let next_v = format!("fold{}v", i);
                 let next_a = format!("fold{}a", i);
-                let use_transition = seg.transition_in.as_ref().map_or(false, |tr| tr.duration > 0.0);
+                let use_transition = seg
+                    .transition_in
+                    .as_ref()
+                    .map_or(false, |tr| tr.duration > 0.0);
                 if use_transition {
                     let tr = seg.transition_in.as_ref().unwrap();
                     let transition_name = sanitize_transition_name(&tr.transition_type);
@@ -1731,7 +2167,11 @@ pub async fn export_trimmed_video(
                     // own duration - an unclamped duration could push `offset` negative (transition
                     // longer than everything accumulated so far) or overlap more of the next
                     // segment than actually exists.
-                    let d = tr.duration.min(accumulated * 0.9).min(seg_dur * 0.9).max(0.05);
+                    let d = tr
+                        .duration
+                        .min(accumulated * 0.9)
+                        .min(seg_dur * 0.9)
+                        .max(0.05);
                     let offset = (accumulated - d).max(0.0);
                     // acrossfade has no equivalent "transition style" concept of its own (audio has
                     // no visual wipe/circle/pixelize shape to speak of) - every visual transition
@@ -1741,7 +2181,9 @@ pub async fn export_trimmed_video(
                     ));
                     accumulated += seg_dur - d;
                 } else {
-                    filter.push_str(&format!("[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"));
+                    filter.push_str(&format!(
+                        "[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"
+                    ));
                     accumulated += seg_dur;
                 }
                 cur_v = next_v;
@@ -1766,11 +2208,16 @@ pub async fn export_trimmed_video(
             // get an absurdly large radius relative to itself and vice versa; clamped both for
             // sane performance (boxblur's cost scales with radius) and so intensity:1 still reads
             // as "blurred", not "solid color", on a very tall region.
-            let radius = ((bv.intensity.max(0.0).min(1.0)) * (bv.height as f64) * 0.08).round().clamp(1.0, 60.0) as i64;
+            let radius = ((bv.intensity.max(0.0).min(1.0)) * (bv.height as f64) * 0.08)
+                .round()
+                .clamp(1.0, 60.0) as i64;
             let src_label = format!("bb{}src", i);
             let bg_label = format!("bb{}bg", i);
             let out_label = format!("bb{}out", i);
-            filter.push_str(&format!("[{}]split=2[{}][{}];", current_label, src_label, bg_label));
+            filter.push_str(&format!(
+                "[{}]split=2[{}][{}];",
+                current_label, src_label, bg_label
+            ));
 
             // A plain axis-aligned rectangle (blur_mask_input_index[i] is None) needs nothing past
             // the bare crop+boxblur - ffmpeg's crop already produces exactly that shape. Anything
@@ -1795,8 +2242,14 @@ pub async fn export_trimmed_video(
                         "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1,format=rgba[{}];",
                         src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, cropped_label
                     ));
-                    filter.push_str(&format!("[{}:v]format=gray[{}];", mask_input, mask_gray_label));
-                    filter.push_str(&format!("[{}][{}]alphamerge[{}];", cropped_label, mask_gray_label, masked_label));
+                    filter.push_str(&format!(
+                        "[{}:v]format=gray[{}];",
+                        mask_input, mask_gray_label
+                    ));
+                    filter.push_str(&format!(
+                        "[{}][{}]alphamerge[{}];",
+                        cropped_label, mask_gray_label, masked_label
+                    ));
                     masked_label
                 }
             };
@@ -1831,10 +2284,20 @@ pub async fn export_trimmed_video(
                 source_label
             };
             let (x_expr, y_expr) = overlay_position_expr(ov, animation);
-            let next_label = if i + 1 == overlays.len() { "outv".to_string() } else { format!("ov{}", i) };
+            let next_label = if i + 1 == overlays.len() {
+                "outv".to_string()
+            } else {
+                format!("ov{}", i)
+            };
             filter.push_str(&format!(
                 "[{}][{}]overlay=x='{}':y='{}':enable='between(t,{:.3},{:.3})'[{}];",
-                current_label, composited_label, x_expr, y_expr, ov.start_time, ov.end_time, next_label
+                current_label,
+                composited_label,
+                x_expr,
+                y_expr,
+                ov.start_time,
+                ov.end_time,
+                next_label
             ));
             current_label = next_label;
         }
@@ -1848,7 +2311,13 @@ pub async fn export_trimmed_video(
         // whatever this leaves current_label pointing at.
         for (i, pip) in pip_overlays.iter().enumerate() {
             let out_label = format!("pip{}out", i);
-            filter.push_str(&pip_overlay_chain(pip, pip_input_base + i, i, &current_label, &out_label));
+            filter.push_str(&pip_overlay_chain(
+                pip,
+                pip_input_base + i,
+                i,
+                &current_label,
+                &out_label,
+            ));
             current_label = out_label;
         }
 
@@ -1868,7 +2337,10 @@ pub async fn export_trimmed_video(
         // Skipped entirely (base_audio_label just stays "outa") when the volume is untouched, so a
         // video nobody's adjusted this for doesn't grow an extra no-op filter node.
         let base_audio_label = if (effective_video_volume - 1.0).abs() > 0.001 {
-            filter.push_str(&format!("[outa]volume={:.3}[outa_vol];", effective_video_volume));
+            filter.push_str(&format!(
+                "[outa]volume={:.3}[outa_vol];",
+                effective_video_volume
+            ));
             "outa_vol"
         } else {
             "outa"
@@ -1921,11 +2393,17 @@ pub async fn export_trimmed_video(
                 if audio_ov.fade_out > 0.0 {
                     let track_duration = audio_ov.end_time - audio_ov.start_time;
                     let fade_out_start = (track_duration - audio_ov.fade_out).max(0.0);
-                    chain.push_str(&format!(",afade=t=out:st={:.3}:d={:.3}", fade_out_start, audio_ov.fade_out));
+                    chain.push_str(&format!(
+                        ",afade=t=out:st={:.3}:d={:.3}",
+                        fade_out_start, audio_ov.fade_out
+                    ));
                 }
                 let delay_ms = (audio_ov.start_time * 1000.0).round().max(0.0);
                 let track_label = format!("aov{}", i);
-                filter.push_str(&format!("{},adelay={:.0}:all=1[{}];", chain, delay_ms, track_label));
+                filter.push_str(&format!(
+                    "{},adelay={:.0}:all=1[{}];",
+                    chain, delay_ms, track_label
+                ));
                 mix_inputs.push_str(&format!("[{}]", track_label));
             }
             // Same atrim+volume+adelay shape as the audio-overlay loop above, minus fade in/out
@@ -1933,7 +2411,9 @@ pub async fn export_trimmed_video(
             // None (muted, or a source with no audio stream at all).
             let mut pip_audio_count = 0;
             for (i, pip) in pip_overlays.iter().enumerate() {
-                let Some(input_index) = pip_audio_input_index[i] else { continue };
+                let Some(input_index) = pip_audio_input_index[i] else {
+                    continue;
+                };
                 let trim_end = pip.trim_start + (pip.end_time - pip.start_time);
                 let delay_ms = (pip.start_time * 1000.0).round().max(0.0);
                 let track_label = format!("pipa{}", i);
@@ -1959,20 +2439,38 @@ pub async fn export_trimmed_video(
         let filter = filter.trim_end_matches(';').to_string();
 
         vec![
-            "-filter_complex".into(), filter,
-            "-map".into(), "[outv]".into(),
-            "-map".into(), format!("[{}]", audio_label),
-            "-c:v".into(), "libx264".into(),
-            "-preset".into(), quality_preset.into(),
-            "-crf".into(), quality_crf.into(),
-            "-c:a".into(), "aac".into(),
-            "-b:a".into(), "128k".into(),
-            "-movflags".into(), "+faststart".into(),
+            "-filter_complex".into(),
+            filter,
+            "-map".into(),
+            "[outv]".into(),
+            "-map".into(),
+            format!("[{}]", audio_label),
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            quality_preset.into(),
+            "-crf".into(),
+            quality_crf.into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "128k".into(),
+            "-movflags".into(),
+            "+faststart".into(),
         ]
     };
     let codec_args: Vec<&str> = owned_args.iter().map(|s| s.as_str()).collect();
 
-    let result = run_conversion(&app_handle, &window, &state, &inputs, &output_base_path, output, &codec_args).await;
+    let result = run_conversion(
+        &app_handle,
+        &window,
+        &state,
+        &inputs,
+        &output_base_path,
+        output,
+        &codec_args,
+    )
+    .await;
 
     for temp_path in &temp_overlay_paths {
         let _ = std::fs::remove_file(temp_path);
@@ -1983,11 +2481,9 @@ pub async fn export_trimmed_video(
 
 // Cancel ongoing conversion
 #[tauri::command]
-pub async fn cancel_conversion(
-    state: State<'_, ConversionState>
-) -> Result<(), String> {
+pub async fn cancel_conversion(state: State<'_, ConversionState>) -> Result<(), String> {
     let mut active_process = state.active_process.lock().await;
-    
+
     if let Some(pid) = active_process.take() {
         #[cfg(windows)]
         {
@@ -1997,7 +2493,7 @@ pub async fn cancel_conversion(
             cmd.output()
                 .map_err(|e| format!("Failed to cancel conversion: {}", e))?;
         }
-        
+
         #[cfg(not(windows))]
         {
             Command::new("kill")
@@ -2005,7 +2501,7 @@ pub async fn cancel_conversion(
                 .output()
                 .map_err(|e| format!("Failed to cancel conversion: {}", e))?;
         }
-        
+
         Ok(())
     } else {
         Err("No active conversion to cancel".to_string())
@@ -2027,14 +2523,17 @@ pub async fn batch_convert_to_mp4(
 
     for (index, input_path) in input_paths.iter().enumerate() {
         let progress = (index as f64 / total_files as f64) * 100.0;
-        
+
         // Emit batch progress
-        let _ = window.emit("batch-conversion-progress", serde_json::json!({
-            "current_file": input_path,
-            "current_index": index,
-            "total_files": total_files,
-            "overall_progress": progress,
-        }));
+        let _ = window.emit(
+            "batch-conversion-progress",
+            serde_json::json!({
+                "current_file": input_path,
+                "current_index": index,
+                "total_files": total_files,
+                "overall_progress": progress,
+            }),
+        );
 
         // Determine output path for this file
         let output_path = match output_dir.as_ref() {
@@ -2064,7 +2563,9 @@ pub async fn batch_convert_to_mp4(
             input_path.clone(),
             output_path,
             preserve_original,
-        ).await {
+        )
+        .await
+        {
             Ok(output_path) => results.push(output_path),
             Err(e) => {
                 log::warn!("Failed to convert {}: {}", input_path, e);
@@ -2089,8 +2590,13 @@ pub async fn batch_convert_to_mp4(
 #[tauri::command]
 pub async fn read_image_data_url(path: String) -> Result<String, String> {
     let file_path = PathBuf::from(&path);
-    let bytes = std::fs::read(&file_path).map_err(|e| format!("Failed to read image file: {}", e))?;
-    let mime = match file_path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) {
+    let bytes =
+        std::fs::read(&file_path).map_err(|e| format!("Failed to read image file: {}", e))?;
+    let mime = match file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+    {
         Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg",
         Some(ext) if ext == "gif" => "image/gif",
         Some(ext) if ext == "webp" => "image/webp",
@@ -2126,31 +2632,36 @@ pub async fn get_conversion_info(
 
     let mut cmd = Command::new(&ffprobe_path);
     cmd.args([
-        "-v", "quiet",
-        "-print_format", "json",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
         "-show_format",
         "-show_streams",
         path_to_str(&input)?,
     ]);
     #[cfg(windows)]
     hide_console_window(&mut cmd);
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
 
     let mut info = HashMap::new();
     info.insert("input_path".to_string(), input_path);
 
-    let file_size = input.metadata()
-        .map(|m| m.len() / 1_000_000)
-        .unwrap_or(0);
+    let file_size = input.metadata().map(|m| m.len() / 1_000_000).unwrap_or(0);
     info.insert("input_size".to_string(), format!("{} MB", file_size));
 
-    info.insert("output_path".to_string(),
-        input.with_extension("mp4").to_string_lossy().to_string()
+    info.insert(
+        "output_path".to_string(),
+        input.with_extension("mp4").to_string_lossy().to_string(),
     );
 
     if let Ok(probe) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-        if let Some(duration) = probe["format"]["duration"].as_str().and_then(|d| d.parse::<f64>().ok()) {
+        if let Some(duration) = probe["format"]["duration"]
+            .as_str()
+            .and_then(|d| d.parse::<f64>().ok())
+        {
             info.insert("duration".to_string(), format!("{:.1}s", duration));
         }
 
@@ -2217,36 +2728,45 @@ pub async fn convert_video(
 
     let codec_args: Vec<&str> = match output_format.to_lowercase().as_str() {
         "mp4" => vec![
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
         ],
         "mov" => vec![
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
         ],
-        "mkv" => vec![
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-c:a", "aac",
-        ],
-        "avi" => vec![
-            "-c:v", "libx264",
-            "-c:a", "mp3",
-        ],
-        "webm" => vec![
-            "-c:v", "libvpx",
-            "-c:a", "libvorbis",
-        ],
+        "mkv" => vec!["-c:v", "libx264", "-preset", "medium", "-c:a", "aac"],
+        "avi" => vec!["-c:v", "libx264", "-c:a", "mp3"],
+        "webm" => vec!["-c:v", "libvpx", "-c:a", "libvorbis"],
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
 
-    let result = run_conversion(&app_handle, &window, &state, &[InputSpec::plain(input_path.clone())], &input_path, output, &codec_args).await?;
+    let result = run_conversion(
+        &app_handle,
+        &window,
+        &state,
+        &[InputSpec::plain(input_path.clone())],
+        &input_path,
+        output,
+        &codec_args,
+    )
+    .await?;
 
     if !preserve_original {
         let _ = std::fs::remove_file(&input);
@@ -2291,11 +2811,19 @@ pub async fn detect_silence(
         #[cfg(windows)]
         hide_console_window(&mut cmd);
         cmd.arg("-i").arg(&input_path);
-        cmd.args(["-af", &format!("silencedetect=noise={noise_db}dB:d={min_duration}"), "-f", "null", "-"]);
+        cmd.args([
+            "-af",
+            &format!("silencedetect=noise={noise_db}dB:d={min_duration}"),
+            "-f",
+            "null",
+            "-",
+        ]);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        let output = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
         // silencedetect writes to stderr regardless of the overall exit status (a `-f null -`
         // "encode" succeeds as long as the input decodes at all) - parsed either way, since the
         // only real failure mode here is ffmpeg being unable to read the file at all, which the
@@ -2318,7 +2846,13 @@ fn parse_silence_ranges(stderr: &str) -> Vec<SilentRange> {
     let mut pending_start: Option<f64> = None;
     for line in stderr.lines() {
         if let Some(rest) = line.split("silence_start:").nth(1) {
-            if let Ok(start) = rest.trim().split_whitespace().next().unwrap_or("").parse::<f64>() {
+            if let Ok(start) = rest
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .parse::<f64>()
+            {
                 pending_start = Some(start);
             }
         } else if let Some(rest) = line.split("silence_end:").nth(1) {
@@ -2464,20 +2998,32 @@ mod tests {
 
     #[test]
     fn color_filter_chain_none_preset_is_a_noop() {
-        let cf = ClipColorFilter { preset: "none".to_string(), intensity: 0.7 };
+        let cf = ClipColorFilter {
+            preset: "none".to_string(),
+            intensity: 0.7,
+        };
         assert_eq!(color_filter_chain(&cf), "");
     }
 
     #[test]
     fn color_filter_chain_bw_at_full_intensity_fully_desaturates() {
-        let cf = ClipColorFilter { preset: "bw".to_string(), intensity: 1.0 };
+        let cf = ClipColorFilter {
+            preset: "bw".to_string(),
+            intensity: 1.0,
+        };
         assert_eq!(color_filter_chain(&cf), ",eq=saturation=0.000");
     }
 
     #[test]
     fn color_filter_chain_clamps_out_of_range_intensity() {
-        let over = ClipColorFilter { preset: "bw".to_string(), intensity: 5.0 };
-        let under = ClipColorFilter { preset: "bw".to_string(), intensity: -5.0 };
+        let over = ClipColorFilter {
+            preset: "bw".to_string(),
+            intensity: 5.0,
+        };
+        let under = ClipColorFilter {
+            preset: "bw".to_string(),
+            intensity: -5.0,
+        };
         assert_eq!(color_filter_chain(&over), ",eq=saturation=0.000"); // clamped to 1.0
         assert_eq!(color_filter_chain(&under), ",eq=saturation=1.000"); // clamped to 0.0
     }
@@ -2486,29 +3032,61 @@ mod tests {
     fn crop_chain_clamps_position_so_the_window_never_crosses_the_far_edge() {
         // x=0.9 with width=0.5 would crop past the right edge (0.9+0.5 > 1.0) - x must clamp to
         // 1.0-width=0.5, not the raw 0.9 the caller passed.
-        let c = ClipCrop { x: 0.9, y: 0.0, width: 0.5, height: 0.5 };
-        assert_eq!(crop_chain(&c), ",crop=w='iw*0.5000':h='ih*0.5000':x='iw*0.5000':y='ih*0.0000'");
+        let c = ClipCrop {
+            x: 0.9,
+            y: 0.0,
+            width: 0.5,
+            height: 0.5,
+        };
+        assert_eq!(
+            crop_chain(&c),
+            ",crop=w='iw*0.5000':h='ih*0.5000':x='iw*0.5000':y='ih*0.0000'"
+        );
     }
 
     #[test]
     fn crop_chain_rejects_a_degenerate_near_zero_area_crop() {
-        let c = ClipCrop { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        let c = ClipCrop {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        };
         // width/height floor at 0.05, never truly 0.
-        assert_eq!(crop_chain(&c), ",crop=w='iw*0.0500':h='ih*0.0500':x='iw*0.0000':y='ih*0.0000'");
+        assert_eq!(
+            crop_chain(&c),
+            ",crop=w='iw*0.0500':h='ih*0.0500':x='iw*0.0000':y='ih*0.0000'"
+        );
     }
 
     #[test]
     fn ken_burns_chain_unrecognized_preset_is_a_noop() {
-        let kb = ClipKenBurns { preset: "sparkle".to_string(), intensity: None, target_x: None, target_y: None };
+        let kb = ClipKenBurns {
+            preset: "sparkle".to_string(),
+            intensity: None,
+            target_x: None,
+            target_y: None,
+        };
         assert_eq!(ken_burns_chain(&kb, 5.0, 1920, 1080), "");
     }
 
     #[test]
     fn ken_burns_chain_zoom_in_ends_at_the_scaled_output_resolution() {
-        let kb = ClipKenBurns { preset: "zoom-in".to_string(), intensity: Some(1.0), target_x: None, target_y: None };
+        let kb = ClipKenBurns {
+            preset: "zoom-in".to_string(),
+            intensity: Some(1.0),
+            target_x: None,
+            target_y: None,
+        };
         let chain = ken_burns_chain(&kb, 5.0, 1920, 1080);
-        assert!(chain.starts_with(",crop="), "expected a crop expression, got: {chain}");
-        assert!(chain.ends_with(",scale=1920:1080"), "expected a trailing scale to output resolution, got: {chain}");
+        assert!(
+            chain.starts_with(",crop="),
+            "expected a crop expression, got: {chain}"
+        );
+        assert!(
+            chain.ends_with(",scale=1920:1080"),
+            "expected a trailing scale to output resolution, got: {chain}"
+        );
     }
 
     // ---- segment_effect_chain - ordering matters (mirrored in VideoPlayer.tsx's own preview) -----
@@ -2517,20 +3095,41 @@ mod tests {
     fn segment_effect_chain_applies_hflip_before_color_before_crop() {
         let mut seg = base_segment();
         seg.flip_horizontal = Some(true);
-        seg.color_filter = Some(ClipColorFilter { preset: "bw".to_string(), intensity: 1.0 });
-        seg.crop = Some(ClipCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        seg.color_filter = Some(ClipColorFilter {
+            preset: "bw".to_string(),
+            intensity: 1.0,
+        });
+        seg.crop = Some(ClipCrop {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        });
         let chain = segment_effect_chain(&seg, Some(1920), Some(1080));
         let hflip_pos = chain.find("hflip").expect("hflip missing");
         let color_pos = chain.find("eq=saturation").expect("color filter missing");
         let crop_pos = chain.find("crop=").expect("crop missing");
-        assert!(hflip_pos < color_pos && color_pos < crop_pos, "wrong order: {chain}");
+        assert!(
+            hflip_pos < color_pos && color_pos < crop_pos,
+            "wrong order: {chain}"
+        );
     }
 
     #[test]
     fn segment_effect_chain_skips_the_extra_scale_when_ken_burns_will_scale_anyway() {
         let mut seg = base_segment();
-        seg.crop = Some(ClipCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
-        seg.ken_burns = Some(ClipKenBurns { preset: "zoom-in".to_string(), intensity: Some(0.5), target_x: None, target_y: None });
+        seg.crop = Some(ClipCrop {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        });
+        seg.ken_burns = Some(ClipKenBurns {
+            preset: "zoom-in".to_string(),
+            intensity: Some(0.5),
+            target_x: None,
+            target_y: None,
+        });
         let chain = segment_effect_chain(&seg, Some(1920), Some(1080));
         // Exactly one scale=1920:1080 (Ken Burns' own trailing one), not two.
         assert_eq!(chain.matches("scale=1920:1080").count(), 1);
@@ -2538,7 +3137,10 @@ mod tests {
 
     #[test]
     fn segment_effect_chain_with_no_effects_is_empty() {
-        assert_eq!(segment_effect_chain(&base_segment(), Some(1920), Some(1080)), "");
+        assert_eq!(
+            segment_effect_chain(&base_segment(), Some(1920), Some(1080)),
+            ""
+        );
     }
 
     // ---- audio_trim_chain -----------------------------------------------------------------------
@@ -2547,13 +3149,19 @@ mod tests {
     fn audio_trim_chain_no_audio_synthesizes_silence_of_the_right_output_duration() {
         // 10 source seconds at 2x speed -> 5 output seconds.
         let chain = audio_trim_chain(false, 0, 0.0, 10.0, 2.0, None, "outa");
-        assert_eq!(chain, "anullsrc=channel_layout=stereo:sample_rate=44100:duration=5.000[outa];");
+        assert_eq!(
+            chain,
+            "anullsrc=channel_layout=stereo:sample_rate=44100:duration=5.000[outa];"
+        );
     }
 
     #[test]
     fn audio_trim_chain_with_audio_includes_tempo_but_no_denoise_when_off() {
         let chain = audio_trim_chain(true, 0, 1.0, 5.0, 1.0, None, "outa");
-        assert_eq!(chain, "[0:a]atrim=start=1.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000[outa];");
+        assert_eq!(
+            chain,
+            "[0:a]atrim=start=1.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000[outa];"
+        );
     }
 
     #[test]
@@ -2566,17 +3174,40 @@ mod tests {
 
     #[test]
     fn overlay_position_expr_none_and_fade_are_static_coordinates() {
-        let ov = OverlayImage { data_base64: String::new(), x: 100, y: 200, start_time: 0.0, end_time: 5.0, animation: "none".to_string() };
-        assert_eq!(overlay_position_expr(&ov, "none"), ("100".to_string(), "200".to_string()));
-        assert_eq!(overlay_position_expr(&ov, "fade"), ("100".to_string(), "200".to_string()));
+        let ov = OverlayImage {
+            data_base64: String::new(),
+            x: 100,
+            y: 200,
+            start_time: 0.0,
+            end_time: 5.0,
+            animation: "none".to_string(),
+        };
+        assert_eq!(
+            overlay_position_expr(&ov, "none"),
+            ("100".to_string(), "200".to_string())
+        );
+        assert_eq!(
+            overlay_position_expr(&ov, "fade"),
+            ("100".to_string(), "200".to_string())
+        );
     }
 
     #[test]
     fn overlay_position_expr_slide_left_only_animates_x() {
-        let ov = OverlayImage { data_base64: String::new(), x: 100, y: 200, start_time: 0.0, end_time: 5.0, animation: "slide-left".to_string() };
+        let ov = OverlayImage {
+            data_base64: String::new(),
+            x: 100,
+            y: 200,
+            start_time: 0.0,
+            end_time: 5.0,
+            animation: "slide-left".to_string(),
+        };
         let (x, y) = overlay_position_expr(&ov, "slide-left");
         assert_eq!(y, "200"); // y untouched
-        assert!(x.contains("main_w"), "expected an x expression referencing main_w, got: {x}");
+        assert!(
+            x.contains("main_w"),
+            "expected an x expression referencing main_w, got: {x}"
+        );
     }
 
     // ---- parse_duration / parse_silence_ranges - real ffmpeg stderr text shapes ------------------

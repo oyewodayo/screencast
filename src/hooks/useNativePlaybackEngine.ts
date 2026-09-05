@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, RefObject } from 'react';
-import { invoke } from '@tauri-apps/api/tauri';
+import { invoke } from '@tauri-apps/api/core';
 
 // Mirrors the Rust side's serde-serialized shapes exactly (src-tauri/src/commands/native_playback.rs).
 interface PlaybackSessionInfo {

@@ -5,8 +5,8 @@
 // collaboration. Much shorter than BoardEditor since there's no canvas/selection/image logic here
 // - just a title field, a formatting toolbar, and the editable content area.
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
-import { open as openFileDialog } from "@tauri-apps/api/dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { useEditor, EditorContent } from "@tiptap/react";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";

@@ -1,6 +1,6 @@
 // components/docker/FileToolsDocker.tsx
 import React, { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import {
   IoFolderOpenOutline,
   IoTrashOutline,

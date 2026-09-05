@@ -26,10 +26,10 @@
 use std::path::Path;
 use windows::core::{Interface, HSTRING};
 use windows::Graphics::Imaging::{
-    BitmapDecoder, BitmapEncoder, BitmapPixelFormat, BitmapAlphaMode, BitmapTransform,
-    ExifOrientationMode, ColorManagementMode, IBitmapFrameWithSoftwareBitmap,
+    BitmapAlphaMode, BitmapDecoder, BitmapEncoder, BitmapPixelFormat, BitmapTransform,
+    ColorManagementMode, ExifOrientationMode, IBitmapFrameWithSoftwareBitmap,
 };
-use windows::Storage::{StorageFile, StorageFolder, FileAccessMode, CreationCollisionOption};
+use windows::Storage::{CreationCollisionOption, FileAccessMode, StorageFile, StorageFolder};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 // Guarantees CoUninitialize runs even if a ? short-circuits out of decode_to_png_blocking early -
@@ -79,7 +79,8 @@ fn decode_to_png_blocking(input_path: &Path, output_path: &Path) -> Result<(), S
     let frame: IBitmapFrameWithSoftwareBitmap = decoder
         .cast()
         .map_err(|e| format!("Failed to access decoded HEIC frame: {e}"))?;
-    let transform = BitmapTransform::new().map_err(|e| format!("Failed to create bitmap transform: {e}"))?;
+    let transform =
+        BitmapTransform::new().map_err(|e| format!("Failed to create bitmap transform: {e}"))?;
     // If this fails with something like "No suitable transform was found to encode or decode the
     // content" (0xC00D5212), it means the HEIF Image Extensions package (container/metadata - the
     // thing that let CreateAsync above succeed) is installed but the separate HEVC Video
@@ -99,12 +100,17 @@ fn decode_to_png_blocking(input_path: &Path, output_path: &Path) -> Result<(), S
         .map_err(|e| format!("Failed to render HEIC photo: {e}"))?;
 
     let out_folder = StorageFolder::GetFolderFromPathAsync(&HSTRING::from(
-        output_dir.to_str().ok_or_else(|| "Output directory is not valid UTF-8".to_string())?,
+        output_dir
+            .to_str()
+            .ok_or_else(|| "Output directory is not valid UTF-8".to_string())?,
     ))
     .and_then(|op| op.get())
     .map_err(|e| format!("Failed to open output folder: {e}"))?;
     let out_file = out_folder
-        .CreateFileAsync(&HSTRING::from(output_name), CreationCollisionOption::ReplaceExisting)
+        .CreateFileAsync(
+            &HSTRING::from(output_name),
+            CreationCollisionOption::ReplaceExisting,
+        )
         .and_then(|op| op.get())
         .map_err(|e| format!("Failed to create output file: {e}"))?;
     let out_stream = out_file
@@ -112,7 +118,8 @@ fn decode_to_png_blocking(input_path: &Path, output_path: &Path) -> Result<(), S
         .and_then(|op| op.get())
         .map_err(|e| format!("Failed to open output file for writing: {e}"))?;
 
-    let png_id = BitmapEncoder::PngEncoderId().map_err(|e| format!("Failed to resolve PNG encoder: {e}"))?;
+    let png_id =
+        BitmapEncoder::PngEncoderId().map_err(|e| format!("Failed to resolve PNG encoder: {e}"))?;
     let encoder = BitmapEncoder::CreateAsync(png_id, &out_stream)
         .and_then(|op| op.get())
         .map_err(|e| format!("Failed to create PNG encoder: {e}"))?;
@@ -129,7 +136,10 @@ fn decode_to_png_blocking(input_path: &Path, output_path: &Path) -> Result<(), S
 
 // Runs the COM/WinRT work on a dedicated blocking-pool thread - COM apartment state and the
 // `.get()` blocking waits below don't belong on an async worker thread.
-pub async fn decode_to_png(input_path: std::path::PathBuf, output_path: std::path::PathBuf) -> Result<(), String> {
+pub async fn decode_to_png(
+    input_path: std::path::PathBuf,
+    output_path: std::path::PathBuf,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || decode_to_png_blocking(&input_path, &output_path))
         .await
         .map_err(|e| format!("HEIC decode task panicked: {e}"))?

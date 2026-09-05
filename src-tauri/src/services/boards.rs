@@ -13,9 +13,9 @@
 //   thumbnail.png   - small preview PNG for the board-picker grid (see save_board_thumbnail)
 //
 // Write-then-rename on every save, same crash-safety convention as image_annotations.rs.
+use super::utility::briefcast_dir;
 use std::{fs, path::PathBuf};
 use tauri::command;
-use super::utility::briefcast_dir;
 
 // Also used by utility.rs's scan_directory to exclude this folder from the normal file list, the
 // same way ".trash" is already excluded - board project files/assets must never show up as loose
@@ -55,8 +55,16 @@ fn read_summary(dir: &PathBuf, id: &str) -> Option<BoardSummary> {
     let created_at = value.get("createdAt")?.as_str()?.to_string();
     let updated_at = value.get("updatedAt")?.as_str()?.to_string();
     let thumbnail = dir.join("thumbnail.png");
-    let thumbnail_path = thumbnail.is_file().then(|| thumbnail.to_string_lossy().to_string());
-    Some(BoardSummary { id: id.to_string(), name, created_at, updated_at, thumbnail_path })
+    let thumbnail_path = thumbnail
+        .is_file()
+        .then(|| thumbnail.to_string_lossy().to_string());
+    Some(BoardSummary {
+        id: id.to_string(),
+        name,
+        created_at,
+        updated_at,
+        thumbnail_path,
+    })
 }
 
 #[command]
@@ -64,13 +72,16 @@ pub fn list_boards() -> Result<Vec<BoardSummary>, String> {
     let root = boards_root()?;
     let mut summaries: Vec<BoardSummary> = Vec::new();
 
-    let entries = fs::read_dir(&root).map_err(|e| format!("Failed to read Boards folder: {}", e))?;
+    let entries =
+        fs::read_dir(&root).map_err(|e| format!("Failed to read Boards folder: {}", e))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let Some(id) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         // A board folder that fails to parse (e.g. mid-write, or corrupted) is skipped rather
         // than failing the whole list - one bad board shouldn't hide every other one.
         if let Some(summary) = read_summary(&path, id) {
@@ -88,10 +99,15 @@ pub fn create_board(id: String, name: String, json: String) -> Result<BoardSumma
     if dir.exists() {
         return Err("A board with that id already exists".to_string());
     }
-    fs::create_dir_all(dir.join("assets")).map_err(|e| format!("Failed to create board folder: {}", e))?;
+    fs::create_dir_all(dir.join("assets"))
+        .map_err(|e| format!("Failed to create board folder: {}", e))?;
     save_board(id.clone(), json)?;
-    read_summary(&dir, &id).ok_or_else(|| "Failed to read back newly created board".to_string())
-        .map(|mut s| { s.name = name; s })
+    read_summary(&dir, &id)
+        .ok_or_else(|| "Failed to read back newly created board".to_string())
+        .map(|mut s| {
+            s.name = name;
+            s
+        })
 }
 
 // Recursive plain-file copy (board.json, assets/, thumbnail.png) - std::fs has no built-in
@@ -100,12 +116,15 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     fs::create_dir_all(dst).map_err(|e| format!("Failed to create folder: {}", e))?;
     for entry in fs::read_dir(src).map_err(|e| format!("Failed to read folder: {}", e))? {
         let entry = entry.map_err(|e| format!("Failed to read folder entry: {}", e))?;
-        let file_type = entry.file_type().map_err(|e| format!("Failed to read entry type: {}", e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to read entry type: {}", e))?;
         let dest_path = dst.join(entry.file_name());
         if file_type.is_dir() {
             copy_dir_recursive(&entry.path(), &dest_path)?;
         } else {
-            fs::copy(entry.path(), &dest_path).map_err(|e| format!("Failed to copy file: {}", e))?;
+            fs::copy(entry.path(), &dest_path)
+                .map_err(|e| format!("Failed to copy file: {}", e))?;
         }
     }
     Ok(())
@@ -162,10 +181,15 @@ pub fn delete_board(id: String) -> Result<(), String> {
 // crypto.randomUUID() (it already needs one for the new BoardImage) rather than generating one
 // here, which would need a new uuid crate dependency for no real benefit.
 #[command]
-pub fn import_board_image(board_id: String, source_path: String, asset_id: String) -> Result<String, String> {
+pub fn import_board_image(
+    board_id: String,
+    source_path: String,
+    asset_id: String,
+) -> Result<String, String> {
     let dir = board_dir(&board_id)?;
     let assets_dir = dir.join("assets");
-    fs::create_dir_all(&assets_dir).map_err(|e| format!("Failed to create assets folder: {}", e))?;
+    fs::create_dir_all(&assets_dir)
+        .map_err(|e| format!("Failed to create assets folder: {}", e))?;
 
     let source = PathBuf::from(&source_path);
     if !source.is_file() {
@@ -204,9 +228,19 @@ pub fn export_board_png(board_name: String, bytes: Vec<u8>) -> Result<String, St
 
     let safe_name: String = board_name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let safe_name = if safe_name.trim().is_empty() { "Board".to_string() } else { safe_name };
+    let safe_name = if safe_name.trim().is_empty() {
+        "Board".to_string()
+    } else {
+        safe_name
+    };
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
     let output = root.join(format!("{} {}.png", safe_name, stamp));
 
@@ -227,9 +261,13 @@ pub fn export_board_png(board_name: String, bytes: Vec<u8>) -> Result<String, St
 pub fn export_board_png_to_path(dest_path: String, bytes: Vec<u8>) -> Result<(), String> {
     let dest = PathBuf::from(&dest_path);
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create destination folder: {}", e))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create destination folder: {}", e))?;
     }
-    let file_name = dest.file_name().ok_or("Invalid destination path")?.to_string_lossy();
+    let file_name = dest
+        .file_name()
+        .ok_or("Invalid destination path")?
+        .to_string_lossy();
     let tmp = dest.with_file_name(format!("{}.tmp", file_name));
     fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write export: {}", e))?;
     fs::rename(&tmp, &dest).map_err(|e| format!("Failed to save export: {}", e))?;

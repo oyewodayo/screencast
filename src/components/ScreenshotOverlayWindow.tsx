@@ -18,9 +18,10 @@
 // loaded and listening long before any particular capture request exists.
 import { useEffect, useRef, useState } from 'react';
 import { IoCameraOutline, IoClose } from 'react-icons/io5';
-import { appWindow } from '@tauri-apps/api/window';
-import { invoke } from '@tauri-apps/api/tauri';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { invoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
+const appWindow = getCurrentWebviewWindow()
 
 // However this overlay got shown (a mouse click, or a keyboard Enter/Space used to activate the
 // "Take Screenshot" button), a trailing key event can land on this window the instant it gains

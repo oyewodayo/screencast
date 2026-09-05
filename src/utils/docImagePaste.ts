@@ -9,7 +9,7 @@
 import { Extension } from "@tiptap/core";
 import { Plugin } from "@tiptap/pm/state";
 import type { EditorView } from "@tiptap/pm/view";
-import { invoke, convertFileSrc } from "@tauri-apps/api/tauri";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 
 // Kept in sync with docs.rs's save_doc_image ALLOWED whitelist - "image/jpg" is a non-standard
 // MIME some tools still emit for a JPEG, mapped alongside the standard "image/jpeg". Exported so

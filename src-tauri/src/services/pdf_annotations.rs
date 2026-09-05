@@ -1,5 +1,9 @@
 // pdf_annotations.rs
-use std::{ffi::OsString, fs, path::{Path, PathBuf}};
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+};
 use tauri::command;
 
 // Sidecar lives next to the source PDF as "<name>.pdf.annotations.json". Appends to the
@@ -26,7 +30,7 @@ pub fn save_pdf_annotations(pdf_path: String, json: String) -> Result<(), String
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write annotations: {}", e))?;
     fs::rename(&tmp, &sidecar).map_err(|e| format!("Failed to save annotations: {}", e))?;
 
-    Ok(()) 
+    Ok(())
 }
 
 #[command]
@@ -51,7 +55,10 @@ pub fn save_exported_pdf(pdf_path: String, bytes: Vec<u8>) -> Result<String, Str
         return Err(format!("PDF does not exist: {}", pdf_path));
     }
 
-    let stem = pdf.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = pdf
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     let parent = pdf.parent().map(PathBuf::from).unwrap_or_default();
     let output = parent.join(format!("{} (annotated).pdf", stem));
 

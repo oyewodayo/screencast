@@ -19,9 +19,23 @@ pub const ANNOTATION_OVERLAY_LABEL: &str = "annotation-overlay";
 // rearranging monitors while the overlay is already alive isn't handled - a rare edge case, worth
 // revisiting only if it turns out to matter in practice (the fix would just be re-running this
 // bounds computation and re-applying set_position/set_size to the existing window).
+//
+// `async` + `spawn_blocking` (rather than building the window inline, as this did pre-Tauri-v2):
+// under Tauri v2's IPC bridge, this command's invocation was observed to run ON the main/UI
+// thread itself (confirmed live - creating the window succeeded, but the invoke's own response
+// then never made it back to the frontend, and every subsequent invoke on the same window hung
+// identically). `WebviewWindowBuilder::build()` needs to marshal actual window creation onto the
+// main thread and wait for it - calling that from a command already executing on the main thread
+// is a self-deadlock (it can't service its own dispatched work until the current call returns,
+// but it's blocked waiting for that same work). Moving the actual build/position/size calls onto
+// a real background thread via `spawn_blocking` guarantees `.build()` is never called from the
+// main thread, regardless of which thread ends up invoking this command.
 #[tauri::command]
-pub fn ensure_annotation_overlay(app_handle: AppHandle) -> Result<(), String> {
-    if app_handle.get_window(ANNOTATION_OVERLAY_LABEL).is_some() {
+pub async fn ensure_annotation_overlay(app_handle: AppHandle) -> Result<(), String> {
+    if app_handle
+        .get_webview_window(ANNOTATION_OVERLAY_LABEL)
+        .is_some()
+    {
         return Ok(());
     }
 
@@ -40,47 +54,52 @@ pub fn ensure_annotation_overlay(app_handle: AppHandle) -> Result<(), String> {
     let total_width = (max_x - min_x).max(1) as u32;
     let total_height = (max_y - min_y).max(1) as u32;
 
-    let window = tauri::WindowBuilder::new(
-        &app_handle,
-        ANNOTATION_OVERLAY_LABEL,
-        tauri::WindowUrl::App("/annotation-overlay".into()),
-    )
-    .title("Annotation")
-    .transparent(true)
-    .decorations(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .resizable(false)
-    .minimizable(false)
-    .focused(false)
-    .visible(false)
-    .build()
-    .map_err(|e| format!("Failed to create annotation overlay window: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let window = tauri::WebviewWindowBuilder::new(
+            &app_handle,
+            ANNOTATION_OVERLAY_LABEL,
+            tauri::WebviewUrl::App("/annotation-overlay".into()),
+        )
+        .title("Annotation")
+        .transparent(true)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .minimizable(false)
+        .focused(false)
+        .visible(false)
+        .build()
+        .map_err(|e| format!("Failed to create annotation overlay window: {}", e))?;
 
-    // WindowBuilder's own position()/inner_size() take logical units, which would need a DPI
-    // conversion that isn't well-defined across monitors with different scale factors. Setting
-    // physical position/size directly after build sidesteps that entirely - these bounds already
-    // came from get_monitors in physical pixels (the same units gdigrab/x11grab screen capture
-    // already relies on it for).
-    window
-        .set_position(Position::Physical(PhysicalPosition { x: min_x, y: min_y }))
-        .map_err(|e| format!("Failed to position annotation overlay: {}", e))?;
-    window
-        .set_size(Size::Physical(PhysicalSize {
-            width: total_width,
-            height: total_height,
-        }))
-        .map_err(|e| format!("Failed to size annotation overlay: {}", e))?;
+        // WindowBuilder's own position()/inner_size() take logical units, which would need a DPI
+        // conversion that isn't well-defined across monitors with different scale factors. Setting
+        // physical position/size directly after build sidesteps that entirely - these bounds
+        // already came from get_monitors in physical pixels (the same units gdigrab/x11grab screen
+        // capture already relies on it for).
+        window
+            .set_position(Position::Physical(PhysicalPosition { x: min_x, y: min_y }))
+            .map_err(|e| format!("Failed to position annotation overlay: {}", e))?;
+        window
+            .set_size(Size::Physical(PhysicalSize {
+                width: total_width,
+                height: total_height,
+            }))
+            .map_err(|e| format!("Failed to size annotation overlay: {}", e))?;
 
-    // Deliberately left hidden (and click-through is NOT set here) - this window is only ever
-    // shown for the brief, user-initiated span while draw mode is actually on (see Dashboard.tsx's
-    // toggleAnnotationDrawMode, which shows/hides it and applies ignore-cursor-events together, in
-    // that order). An earlier version called set_ignore_cursor_events(true) here and then showed
-    // the window immediately at every app launch so it could sit idle-but-click-through in the
-    // background - on Windows, setting that style before the window is ever shown doesn't reliably
-    // take effect, which meant the click-through never actually applied and this invisible,
-    // always-on-top, all-monitors-spanning window silently ate every click on the whole desktop
-    // from the moment the app started. Staying hidden until deliberately toggled on means a window
-    // that fails to go click-through can never do that again - hidden blocks nothing, regardless.
-    Ok(())
+        // Deliberately left hidden (and click-through is NOT set here) - this window is only ever
+        // shown for the brief, user-initiated span while draw mode is actually on (see
+        // Dashboard.tsx's toggleAnnotationDrawMode, which shows/hides it and applies
+        // ignore-cursor-events together, in that order). An earlier version called
+        // set_ignore_cursor_events(true) here and then showed the window immediately at every app
+        // launch so it could sit idle-but-click-through in the background - on Windows, setting
+        // that style before the window is ever shown doesn't reliably take effect, which meant the
+        // click-through never actually applied and this invisible, always-on-top, all-monitors-
+        // spanning window silently ate every click on the whole desktop from the moment the app
+        // started. Staying hidden until deliberately toggled on means a window that fails to go
+        // click-through can never do that again - hidden blocks nothing, regardless.
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Annotation overlay creation task panicked: {}", e))?
 }

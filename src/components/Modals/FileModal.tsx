@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { invoke } from '@tauri-apps/api/tauri';
+import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
-import { appWindow } from '@tauri-apps/api/window';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import {
   IoCheckmarkCircle,
   IoDocumentTextOutline,
@@ -10,7 +10,8 @@ import {
   IoServerOutline,
   IoFolderOpenOutline,
 } from 'react-icons/io5';
-import { open } from '@tauri-apps/api/shell';
+import { open } from '@tauri-apps/plugin-shell';
+const appWindow = getCurrentWebviewWindow()
 
 interface FileModalProps {
   filePath: string;

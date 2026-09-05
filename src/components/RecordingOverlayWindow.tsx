@@ -2,10 +2,11 @@
 import { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
 import { IoMicCircle, IoPauseCircle, IoPlayCircle, IoScanSharp, IoStopSharp, IoVideocam } from 'react-icons/io5'
-import { appWindow } from '@tauri-apps/api/window';
-import { listen } from '@tauri-apps/api/event';
-import { invoke } from '@tauri-apps/api/tauri';
-import { message } from '@tauri-apps/api/dialog';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { listen, emit } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
+import { message } from '@tauri-apps/plugin-dialog';
+const appWindow = getCurrentWebviewWindow()
 
 const RecordingOverlayWindow = () => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -42,10 +43,9 @@ const RecordingOverlayWindow = () => {
             await invoke("stop_recording");
         } catch (error) {
             console.error("Error stopping recording:", error);
-            await message(String(error), { title: 'Recording failed', type: 'error' });
+            await message(String(error), { title: 'Recording failed', kind: 'error' });
         }
 
-        const { emit } = await import('@tauri-apps/api/event');
         await emit('recording-stopped');
         await appWindow.hide();
     };
@@ -56,11 +56,10 @@ const RecordingOverlayWindow = () => {
             const now = Date.now();
             setIsPaused(true);
             setPauseStartedAt(now);
-            const { emit } = await import('@tauri-apps/api/event');
             await emit('recording-pause-changed', { isPaused: true, pauseStartedAt: now, pausedAccumulatedMs });
         } catch (error) {
             console.error("Error pausing recording:", error);
-            await message(String(error), { title: 'Failed to pause recording', type: 'error' });
+            await message(String(error), { title: 'Failed to pause recording', kind: 'error' });
         }
     };
 
@@ -72,11 +71,10 @@ const RecordingOverlayWindow = () => {
             setIsPaused(false);
             setPauseStartedAt(null);
             setPausedAccumulatedMs(newAccumulatedMs);
-            const { emit } = await import('@tauri-apps/api/event');
             await emit('recording-pause-changed', { isPaused: false, pauseStartedAt: null, pausedAccumulatedMs: newAccumulatedMs });
         } catch (error) {
             console.error("Error resuming recording:", error);
-            await message(String(error), { title: 'Failed to resume recording', type: 'error' });
+            await message(String(error), { title: 'Failed to resume recording', kind: 'error' });
         }
     };
 

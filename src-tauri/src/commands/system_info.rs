@@ -66,7 +66,8 @@ mod linux {
         }
 
         let total_kb = total_kb.ok_or_else(|| "MemTotal not found in /proc/meminfo".to_string())?;
-        let available_kb = available_kb.ok_or_else(|| "MemAvailable not found in /proc/meminfo".to_string())?;
+        let available_kb =
+            available_kb.ok_or_else(|| "MemAvailable not found in /proc/meminfo".to_string())?;
 
         Ok((total_kb / 1024, available_kb / 1024))
     }
@@ -98,7 +99,10 @@ mod macos {
             + extract_stat(&vm_stat, "Pages inactive")
             + extract_stat(&vm_stat, "Pages speculative");
 
-        Ok((total_bytes / (1024 * 1024), (free_pages * page_size) / (1024 * 1024)))
+        Ok((
+            total_bytes / (1024 * 1024),
+            (free_pages * page_size) / (1024 * 1024),
+        ))
     }
 
     fn run(args: &[&str]) -> Result<String, String> {

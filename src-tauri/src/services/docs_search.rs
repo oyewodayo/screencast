@@ -28,9 +28,12 @@ fn db_path() -> Result<PathBuf, String> {
 }
 
 fn open_db() -> Result<Connection, String> {
-    let conn = Connection::open(db_path()?).map_err(|e| format!("Failed to open search index: {}", e))?;
-    conn.execute_batch("CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(id UNINDEXED, title, body);")
-        .map_err(|e| format!("Failed to initialize search index: {}", e))?;
+    let conn =
+        Connection::open(db_path()?).map_err(|e| format!("Failed to open search index: {}", e))?;
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(id UNINDEXED, title, body);",
+    )
+    .map_err(|e| format!("Failed to initialize search index: {}", e))?;
     Ok(conn)
 }
 
@@ -40,12 +43,18 @@ fn open_db() -> Result<Connection, String> {
 #[command]
 pub fn index_doc_content(id: String, title: String, body: String) -> Result<(), String> {
     let mut conn = open_db()?;
-    let tx = conn.transaction().map_err(|e| format!("Failed to index document: {}", e))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("Failed to index document: {}", e))?;
     tx.execute("DELETE FROM docs_fts WHERE id = ?1", params![id])
         .map_err(|e| format!("Failed to index document: {}", e))?;
-    tx.execute("INSERT INTO docs_fts (id, title, body) VALUES (?1, ?2, ?3)", params![id, title, body])
-        .map_err(|e| format!("Failed to index document: {}", e))?;
-    tx.commit().map_err(|e| format!("Failed to index document: {}", e))
+    tx.execute(
+        "INSERT INTO docs_fts (id, title, body) VALUES (?1, ?2, ?3)",
+        params![id, title, body],
+    )
+    .map_err(|e| format!("Failed to index document: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("Failed to index document: {}", e))
 }
 
 // Called when a doc is soft-deleted (docs.rs's delete_doc) so a trashed doc - already excluded
@@ -69,11 +78,14 @@ pub fn remove_doc_from_index(id: String) -> Result<(), String> {
 #[command]
 pub fn list_indexed_doc_ids() -> Result<Vec<String>, String> {
     let conn = open_db()?;
-    let mut stmt = conn.prepare("SELECT id FROM docs_fts").map_err(|e| format!("Failed to read search index: {}", e))?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM docs_fts")
+        .map_err(|e| format!("Failed to read search index: {}", e))?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| format!("Failed to read search index: {}", e))?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Failed to read search index: {}", e))
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read search index: {}", e))
 }
 
 // FTS5's query syntax treats several characters ("*^:-()) specially - a raw user query containing
@@ -86,7 +98,11 @@ pub fn list_indexed_doc_ids() -> Result<Vec<String>, String> {
 fn sanitize_fts_query(query: &str) -> String {
     query
         .split_whitespace()
-        .map(|term| term.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+        .map(|term| {
+            term.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        })
         .filter(|term| !term.is_empty())
         .map(|term| format!("{}*", term))
         .collect::<Vec<_>>()
@@ -109,5 +125,6 @@ pub fn search_docs(query: String) -> Result<Vec<String>, String> {
     let rows = stmt
         .query_map(params![sanitized], |row| row.get::<_, String>(0))
         .map_err(|e| format!("Failed to search documents: {}", e))?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Failed to search documents: {}", e))
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to search documents: {}", e))
 }

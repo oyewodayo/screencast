@@ -2,8 +2,8 @@ import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "re
 import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
-import { message } from "@tauri-apps/api/dialog";
-import { invoke } from "@tauri-apps/api/tauri";
+import { message } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 import ActiveRecordingState, { RecordSource, SOURCE_FLAGS } from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
@@ -487,7 +487,7 @@ const BottomDocker = ({
   }
 
   const videoFormatInfo = async() =>{
-    return await message("Avi or Mkv format is highly rocommended to record video. However, you can remuxe or convert to other format when you are done recording.", { title: 'Video format', type: 'info' });
+    return await message("Avi or Mkv format is highly rocommended to record video. However, you can remuxe or convert to other format when you are done recording.", { title: 'Video format', kind: 'info' });
   }
 
   return (

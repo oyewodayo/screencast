@@ -1,7 +1,7 @@
 // components/PdfAnnotator.tsx
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { IoContract } from "react-icons/io5";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import usePdfDocument from "../hooks/usePdfDocument";
 import useAnnotationStore from "../hooks/useAnnotationStore";
 import usePageRenderCache from "../hooks/usePageRenderCache";

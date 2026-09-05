@@ -10,7 +10,7 @@
 import { Extension } from "@tiptap/core";
 import Suggestion, { SuggestionKeyDownProps, SuggestionProps } from "@tiptap/suggestion";
 import { createRoot, Root } from "react-dom/client";
-import { open as openFileDialog } from "@tauri-apps/api/dialog";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   MdTitle,
   MdFormatListBulleted,

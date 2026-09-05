@@ -12,9 +12,9 @@
 // Docs/folders.json, rather than real nested directories - see DocFolder's own comment for why.
 //
 // Write-then-rename on every save, same crash-safety convention as boards.rs/image_annotations.rs.
+use super::utility::briefcast_dir;
 use std::{fs, path::PathBuf};
 use tauri::command;
-use super::utility::briefcast_dir;
 
 // Also used by utility.rs's scan_directory to exclude this folder from the normal file list, same
 // reasoning as boards.rs's BOARDS_DIR_NAME - doc project files must never show up as loose entries
@@ -90,9 +90,17 @@ struct DocMeta {
     // these are read, same default-lets-old-docs-deserialize convention as folder_id/linked_to.
     #[serde(rename = "pageSize", default, skip_serializing_if = "Option::is_none")]
     page_size: Option<String>,
-    #[serde(rename = "headerText", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "headerText",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     header_text: Option<String>,
-    #[serde(rename = "footerText", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "footerText",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     footer_text: Option<String>,
 }
 
@@ -114,13 +122,16 @@ fn folders_path() -> Result<PathBuf, String> {
 
 fn read_folders() -> Result<Vec<DocFolder>, String> {
     let path = folders_path()?;
-    let Ok(json) = fs::read_to_string(&path) else { return Ok(Vec::new()) };
+    let Ok(json) = fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
     serde_json::from_str(&json).map_err(|e| format!("Failed to parse folders: {}", e))
 }
 
 fn write_folders(folders: &[DocFolder]) -> Result<(), String> {
     let path = folders_path()?;
-    let json = serde_json::to_string(folders).map_err(|e| format!("Failed to encode folders: {}", e))?;
+    let json =
+        serde_json::to_string(folders).map_err(|e| format!("Failed to encode folders: {}", e))?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write folders: {}", e))?;
     fs::rename(&tmp, &path).map_err(|e| format!("Failed to save folders: {}", e))
@@ -136,7 +147,10 @@ fn is_ancestor_or_self(folders: &[DocFolder], candidate: &str, ancestor_of: &str
         if id == candidate {
             return true;
         }
-        current = folders.iter().find(|f| f.id == id).and_then(|f| f.parent_id.clone());
+        current = folders
+            .iter()
+            .find(|f| f.id == id)
+            .and_then(|f| f.parent_id.clone());
     }
     false
 }
@@ -149,7 +163,11 @@ pub fn list_doc_folders() -> Result<Vec<DocFolder>, String> {
 // id is frontend-generated (crypto.randomUUID()), same convention as create_doc's own id param -
 // there's no existing UUID-generation dependency on the Rust side to reuse for one call site.
 #[command]
-pub fn create_doc_folder(id: String, name: String, parent_id: Option<String>) -> Result<DocFolder, String> {
+pub fn create_doc_folder(
+    id: String,
+    name: String,
+    parent_id: Option<String>,
+) -> Result<DocFolder, String> {
     let mut folders = read_folders()?;
     if folders.iter().any(|f| f.id == id) {
         return Err("A folder with that id already exists".to_string());
@@ -173,7 +191,10 @@ pub fn create_doc_folder(id: String, name: String, parent_id: Option<String>) ->
 #[command]
 pub fn rename_doc_folder(id: String, name: String) -> Result<DocFolder, String> {
     let mut folders = read_folders()?;
-    let folder = folders.iter_mut().find(|f| f.id == id).ok_or_else(|| "Folder not found".to_string())?;
+    let folder = folders
+        .iter_mut()
+        .find(|f| f.id == id)
+        .ok_or_else(|| "Folder not found".to_string())?;
     folder.name = name;
     let result = folder.clone();
     write_folders(&folders)?;
@@ -188,10 +209,15 @@ pub fn move_doc_folder(id: String, new_parent_id: Option<String>) -> Result<DocF
             return Err("Parent folder does not exist".to_string());
         }
         if is_ancestor_or_self(&folders, &id, pid) {
-            return Err("Cannot move a folder into itself or one of its own subfolders".to_string());
+            return Err(
+                "Cannot move a folder into itself or one of its own subfolders".to_string(),
+            );
         }
     }
-    let folder = folders.iter_mut().find(|f| f.id == id).ok_or_else(|| "Folder not found".to_string())?;
+    let folder = folders
+        .iter_mut()
+        .find(|f| f.id == id)
+        .ok_or_else(|| "Folder not found".to_string())?;
     folder.parent_id = new_parent_id;
     let result = folder.clone();
     write_folders(&folders)?;
@@ -232,12 +258,18 @@ pub fn delete_doc_folder(id: String) -> Result<(), String> {
         if !path.is_dir() {
             continue;
         }
-        let Some(entry_id) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(entry_id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if entry_id == DOCS_TRASH_DIR_NAME {
             continue;
         }
         if let Some(mut meta) = read_meta(&path) {
-            if meta.folder_id.as_ref().is_some_and(|fid| doomed.contains(fid)) {
+            if meta
+                .folder_id
+                .as_ref()
+                .is_some_and(|fid| doomed.contains(fid))
+            {
                 meta.folder_id = None;
                 write_meta(&path, &meta)?;
             }
@@ -301,7 +333,8 @@ fn read_meta(dir: &PathBuf) -> Option<DocMeta> {
 }
 
 fn write_meta(dir: &PathBuf, meta: &DocMeta) -> Result<(), String> {
-    let json = serde_json::to_string(meta).map_err(|e| format!("Failed to encode metadata: {}", e))?;
+    let json =
+        serde_json::to_string(meta).map_err(|e| format!("Failed to encode metadata: {}", e))?;
     let target = dir.join("meta.json");
     let tmp = dir.join("meta.json.tmp");
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write metadata: {}", e))?;
@@ -310,7 +343,15 @@ fn write_meta(dir: &PathBuf, meta: &DocMeta) -> Result<(), String> {
 
 fn read_summary(dir: &PathBuf, id: &str) -> Option<DocSummary> {
     let meta = read_meta(dir)?;
-    Some(DocSummary { id: id.to_string(), title: meta.title, created_at: meta.created_at, updated_at: meta.updated_at, linked_to: meta.linked_to, deleted_at: meta.deleted_at, folder_id: meta.folder_id })
+    Some(DocSummary {
+        id: id.to_string(),
+        title: meta.title,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        linked_to: meta.linked_to,
+        deleted_at: meta.deleted_at,
+        folder_id: meta.folder_id,
+    })
 }
 
 #[command]
@@ -324,7 +365,9 @@ pub fn list_docs() -> Result<Vec<DocSummary>, String> {
         if !path.is_dir() {
             continue;
         }
-        let Some(id) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         // Docs/.trash/ sits alongside real doc folders (see docs_trash_root()) - never surface a
         // trashed doc, or the trash folder itself, in the normal list.
         if id == DOCS_TRASH_DIR_NAME {
@@ -342,7 +385,12 @@ pub fn list_docs() -> Result<Vec<DocSummary>, String> {
 }
 
 #[command]
-pub fn create_doc(id: String, title: String, bytes: Vec<u8>, folder_id: Option<String>) -> Result<DocSummary, String> {
+pub fn create_doc(
+    id: String,
+    title: String,
+    bytes: Vec<u8>,
+    folder_id: Option<String>,
+) -> Result<DocSummary, String> {
     let dir = doc_dir(&id)?;
     if dir.exists() {
         return Err("A document with that id already exists".to_string());
@@ -374,7 +422,15 @@ pub fn create_doc(id: String, title: String, bytes: Vec<u8>, folder_id: Option<S
     fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write document: {}", e))?;
     fs::rename(&tmp, &target).map_err(|e| format!("Failed to save document: {}", e))?;
 
-    Ok(DocSummary { id, title: meta.title, created_at: meta.created_at, updated_at: meta.updated_at, linked_to: meta.linked_to, deleted_at: meta.deleted_at, folder_id: meta.folder_id })
+    Ok(DocSummary {
+        id,
+        title: meta.title,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        linked_to: meta.linked_to,
+        deleted_at: meta.deleted_at,
+        folder_id: meta.folder_id,
+    })
 }
 
 #[command]
@@ -391,20 +447,37 @@ pub fn save_doc(id: String, bytes: Vec<u8>, title: String) -> Result<(), String>
     // ever changes content/title, never the doc's link/trash/folder state or its page setup.
     let now = chrono::Local::now().to_rfc3339();
     let existing = read_meta(&dir);
-    let created_at = existing.as_ref().map(|m| m.created_at.clone()).unwrap_or_else(|| now.clone());
+    let created_at = existing
+        .as_ref()
+        .map(|m| m.created_at.clone())
+        .unwrap_or_else(|| now.clone());
     let linked_to = existing.as_ref().and_then(|m| m.linked_to.clone());
     let deleted_at = existing.as_ref().and_then(|m| m.deleted_at.clone());
     let folder_id = existing.as_ref().and_then(|m| m.folder_id.clone());
     let page_size = existing.as_ref().and_then(|m| m.page_size.clone());
     let header_text = existing.as_ref().and_then(|m| m.header_text.clone());
     let footer_text = existing.and_then(|m| m.footer_text);
-    write_meta(&dir, &DocMeta { title, created_at, updated_at: now, linked_to, deleted_at, folder_id, page_size, header_text, footer_text })
+    write_meta(
+        &dir,
+        &DocMeta {
+            title,
+            created_at,
+            updated_at: now,
+            linked_to,
+            deleted_at,
+            folder_id,
+            page_size,
+            header_text,
+            footer_text,
+        },
+    )
 }
 
 #[command]
 pub fn load_doc(id: String) -> Result<LoadedDoc, String> {
     let dir = doc_dir(&id)?;
-    let bytes = fs::read(dir.join("doc.bin")).map_err(|e| format!("Failed to load document: {}", e))?;
+    let bytes =
+        fs::read(dir.join("doc.bin")).map_err(|e| format!("Failed to load document: {}", e))?;
     let meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     Ok(LoadedDoc {
         bytes,
@@ -442,7 +515,11 @@ pub fn set_doc_page_setup(
     meta.header_text = header_text;
     meta.footer_text = footer_text;
     write_meta(&dir, &meta)?;
-    Ok(DocPageSetup { page_size: meta.page_size, header_text: meta.header_text, footer_text: meta.footer_text })
+    Ok(DocPageSetup {
+        page_size: meta.page_size,
+        header_text: meta.header_text,
+        footer_text: meta.footer_text,
+    })
 }
 
 // Soft delete: moves the doc's whole folder into Docs/.trash/<id> rather than removing it, same
@@ -465,13 +542,16 @@ pub fn list_trashed_docs() -> Result<Vec<DocSummary>, String> {
     let root = docs_trash_root()?;
     let mut summaries: Vec<DocSummary> = Vec::new();
 
-    let entries = fs::read_dir(&root).map_err(|e| format!("Failed to read Docs trash folder: {}", e))?;
+    let entries =
+        fs::read_dir(&root).map_err(|e| format!("Failed to read Docs trash folder: {}", e))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let Some(id) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if let Some(summary) = read_summary(&path, id) {
             summaries.push(summary);
         }
@@ -480,7 +560,12 @@ pub fn list_trashed_docs() -> Result<Vec<DocSummary>, String> {
     // Most-recently-deleted first - deleted_at is always Some(...) for anything in this folder
     // (set by delete_doc right before the move), empty string is just a defensive fallback for
     // sort stability if that were somehow ever not true.
-    summaries.sort_by(|a, b| b.deleted_at.clone().unwrap_or_default().cmp(&a.deleted_at.clone().unwrap_or_default()));
+    summaries.sort_by(|a, b| {
+        b.deleted_at
+            .clone()
+            .unwrap_or_default()
+            .cmp(&a.deleted_at.clone().unwrap_or_default())
+    });
     Ok(summaries)
 }
 
@@ -495,19 +580,29 @@ pub fn restore_doc(id: String) -> Result<DocSummary, String> {
         return Err("A document with that id already exists outside the trash".to_string());
     }
 
-    let mut meta = read_meta(&trash_dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
+    let mut meta =
+        read_meta(&trash_dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.deleted_at = None;
     write_meta(&trash_dir, &meta)?;
 
     fs::rename(&trash_dir, &dir).map_err(|e| format!("Failed to restore document: {}", e))?;
-    Ok(DocSummary { id, title: meta.title, created_at: meta.created_at, updated_at: meta.updated_at, linked_to: meta.linked_to, deleted_at: meta.deleted_at, folder_id: meta.folder_id })
+    Ok(DocSummary {
+        id,
+        title: meta.title,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        linked_to: meta.linked_to,
+        deleted_at: meta.deleted_at,
+        folder_id: meta.folder_id,
+    })
 }
 
 // The real, unrecoverable delete - only ever called on a doc already sitting in the trash.
 #[command]
 pub fn delete_doc_permanently(id: String) -> Result<(), String> {
     let trash_dir = docs_trash_root()?.join(&id);
-    fs::remove_dir_all(&trash_dir).map_err(|e| format!("Failed to permanently delete document: {}", e))
+    fs::remove_dir_all(&trash_dir)
+        .map_err(|e| format!("Failed to permanently delete document: {}", e))
 }
 
 // Points this doc at a recording/file elsewhere in the library ("notes for this screencast"). One
@@ -519,7 +614,15 @@ pub fn link_doc_to_file(id: String, file_path: String) -> Result<DocSummary, Str
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.linked_to = Some(file_path);
     write_meta(&dir, &meta)?;
-    Ok(DocSummary { id, title: meta.title, created_at: meta.created_at, updated_at: meta.updated_at, linked_to: meta.linked_to, deleted_at: meta.deleted_at, folder_id: meta.folder_id })
+    Ok(DocSummary {
+        id,
+        title: meta.title,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        linked_to: meta.linked_to,
+        deleted_at: meta.deleted_at,
+        folder_id: meta.folder_id,
+    })
 }
 
 #[command]
@@ -528,7 +631,15 @@ pub fn unlink_doc(id: String) -> Result<DocSummary, String> {
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.linked_to = None;
     write_meta(&dir, &meta)?;
-    Ok(DocSummary { id, title: meta.title, created_at: meta.created_at, updated_at: meta.updated_at, linked_to: meta.linked_to, deleted_at: meta.deleted_at, folder_id: meta.folder_id })
+    Ok(DocSummary {
+        id,
+        title: meta.title,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        linked_to: meta.linked_to,
+        deleted_at: meta.deleted_at,
+        folder_id: meta.folder_id,
+    })
 }
 
 // Reverse lookup for a given file path - which doc(s) are "notes for" it. A full scan over every
@@ -545,7 +656,9 @@ pub fn find_docs_linked_to(file_path: String) -> Result<Vec<DocSummary>, String>
         if !path.is_dir() {
             continue;
         }
-        let Some(id) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if id == DOCS_TRASH_DIR_NAME {
             continue;
         }
@@ -597,9 +710,19 @@ fn build_export_path(doc_title: &str, extension: &str) -> Result<PathBuf, String
 
     let safe_name: String = doc_title
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let safe_name = if safe_name.trim().is_empty() { "Document".to_string() } else { safe_name };
+    let safe_name = if safe_name.trim().is_empty() {
+        "Document".to_string()
+    } else {
+        safe_name
+    };
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
     Ok(root.join(format!("{} {}.{}", safe_name, stamp, extension)))
 }
@@ -619,7 +742,11 @@ pub fn export_doc(doc_title: String, extension: String, content: String) -> Resu
 }
 
 #[command]
-pub fn export_doc_binary(doc_title: String, extension: String, bytes: Vec<u8>) -> Result<String, String> {
+pub fn export_doc_binary(
+    doc_title: String,
+    extension: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
     if extension != "docx" {
         return Err(format!("Unsupported export extension: {}", extension));
     }
@@ -637,7 +764,12 @@ pub fn export_doc_binary(doc_title: String, extension: String, bytes: Vec<u8>) -
 // in-memory File/Blob, not a path on disk) and returns the full absolute path rather than just a
 // filename, so the frontend doesn't need to duplicate docs_root()-equivalent path-joining in JS.
 #[command]
-pub fn save_doc_image(id: String, asset_id: String, extension: String, bytes: Vec<u8>) -> Result<String, String> {
+pub fn save_doc_image(
+    id: String,
+    asset_id: String,
+    extension: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
     // extension comes from a clipboard MIME type, not a real file extension - whitelist rather
     // than trust it verbatim.
     const ALLOWED: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
@@ -647,7 +779,8 @@ pub fn save_doc_image(id: String, asset_id: String, extension: String, bytes: Ve
 
     let dir = doc_dir(&id)?;
     let assets_dir = dir.join("assets");
-    fs::create_dir_all(&assets_dir).map_err(|e| format!("Failed to create assets folder: {}", e))?;
+    fs::create_dir_all(&assets_dir)
+        .map_err(|e| format!("Failed to create assets folder: {}", e))?;
 
     let target = assets_dir.join(format!("{}.{}", asset_id, extension));
     let tmp = assets_dir.join(format!("{}.{}.tmp", asset_id, extension));
@@ -679,7 +812,10 @@ fn version_summary_from_millis(millis: i64) -> DocVersionSummary {
     let created_at = chrono::DateTime::from_timestamp_millis(millis)
         .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
         .unwrap_or_default();
-    DocVersionSummary { id: millis.to_string(), created_at }
+    DocVersionSummary {
+        id: millis.to_string(),
+        created_at,
+    }
 }
 
 // Every *.bin file's stem in `dir`, parsed back to millis and sorted newest-first - the single
@@ -687,13 +823,18 @@ fn version_summary_from_millis(millis: i64) -> DocVersionSummary {
 // "oldest beyond the retention limit" can never disagree between the two.
 fn list_version_files(dir: &PathBuf) -> Result<Vec<(i64, PathBuf)>, String> {
     let mut versions: Vec<(i64, PathBuf)> = Vec::new();
-    let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read versions folder: {}", e))?;
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("Failed to read versions folder: {}", e))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("bin") {
             continue;
         }
-        let Some(millis) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<i64>().ok()) else {
+        let Some(millis) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<i64>().ok())
+        else {
             continue;
         };
         versions.push((millis, path));
@@ -710,7 +851,10 @@ fn write_version(dir: &PathBuf, bytes: &[u8]) -> Result<Option<DocVersionSummary
     let mut versions = list_version_files(dir)?;
 
     if let Some((_, newest_path)) = versions.first() {
-        if fs::read(newest_path).map(|existing| existing == bytes).unwrap_or(false) {
+        if fs::read(newest_path)
+            .map(|existing| existing == bytes)
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
     }
@@ -745,7 +889,10 @@ pub fn create_doc_version(id: String, bytes: Vec<u8>) -> Result<Option<DocVersio
 #[command]
 pub fn list_doc_versions(id: String) -> Result<Vec<DocVersionSummary>, String> {
     let versions = list_version_files(&versions_dir(&id)?)?;
-    Ok(versions.into_iter().map(|(millis, _)| version_summary_from_millis(millis)).collect())
+    Ok(versions
+        .into_iter()
+        .map(|(millis, _)| version_summary_from_millis(millis))
+        .collect())
 }
 
 // version_id is untrusted input reaching straight from a Tauri command argument - reject anything
@@ -773,9 +920,11 @@ pub fn restore_doc_version(id: String, version_id: String) -> Result<Vec<u8>, St
     let dir = doc_dir(&id)?;
     let versions = versions_dir(&id)?;
     let target_path = version_file_path(&versions, &version_id)?;
-    let restored_bytes = fs::read(&target_path).map_err(|e| format!("Failed to load version: {}", e))?;
+    let restored_bytes =
+        fs::read(&target_path).map_err(|e| format!("Failed to load version: {}", e))?;
 
-    let current_bytes = fs::read(dir.join("doc.bin")).map_err(|e| format!("Failed to read current document: {}", e))?;
+    let current_bytes = fs::read(dir.join("doc.bin"))
+        .map_err(|e| format!("Failed to read current document: {}", e))?;
     write_version(&versions, &current_bytes)?;
 
     let doc_target = dir.join("doc.bin");
@@ -820,13 +969,16 @@ fn comments_path(id: &str) -> Result<PathBuf, String> {
 
 fn read_comments(id: &str) -> Result<Vec<DocComment>, String> {
     let path = comments_path(id)?;
-    let Ok(json) = fs::read_to_string(&path) else { return Ok(Vec::new()) };
+    let Ok(json) = fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
     serde_json::from_str(&json).map_err(|e| format!("Failed to parse comments: {}", e))
 }
 
 fn write_comments(id: &str, comments: &[DocComment]) -> Result<(), String> {
     let path = comments_path(id)?;
-    let json = serde_json::to_string(comments).map_err(|e| format!("Failed to encode comments: {}", e))?;
+    let json =
+        serde_json::to_string(comments).map_err(|e| format!("Failed to encode comments: {}", e))?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write comments: {}", e))?;
     fs::rename(&tmp, &path).map_err(|e| format!("Failed to save comments: {}", e))
@@ -841,7 +993,12 @@ pub fn list_doc_comments(id: String) -> Result<Vec<DocComment>, String> {
 // mark's own attribute value applied to the selection at the same moment this is called, so the
 // two ids start out equal, though only mark_id is ever looked up against the live document again.
 #[command]
-pub fn add_doc_comment(id: String, comment_id: String, mark_id: String, text: String) -> Result<DocComment, String> {
+pub fn add_doc_comment(
+    id: String,
+    comment_id: String,
+    mark_id: String,
+    text: String,
+) -> Result<DocComment, String> {
     let mut comments = read_comments(&id)?;
     let comment = DocComment {
         id: comment_id,
@@ -858,7 +1015,10 @@ pub fn add_doc_comment(id: String, comment_id: String, mark_id: String, text: St
 #[command]
 pub fn resolve_doc_comment(id: String, comment_id: String) -> Result<DocComment, String> {
     let mut comments = read_comments(&id)?;
-    let comment = comments.iter_mut().find(|c| c.id == comment_id).ok_or_else(|| "Comment not found".to_string())?;
+    let comment = comments
+        .iter_mut()
+        .find(|c| c.id == comment_id)
+        .ok_or_else(|| "Comment not found".to_string())?;
     comment.resolved_at = Some(chrono::Local::now().to_rfc3339());
     let result = comment.clone();
     write_comments(&id, &comments)?;
@@ -868,7 +1028,10 @@ pub fn resolve_doc_comment(id: String, comment_id: String) -> Result<DocComment,
 #[command]
 pub fn reopen_doc_comment(id: String, comment_id: String) -> Result<DocComment, String> {
     let mut comments = read_comments(&id)?;
-    let comment = comments.iter_mut().find(|c| c.id == comment_id).ok_or_else(|| "Comment not found".to_string())?;
+    let comment = comments
+        .iter_mut()
+        .find(|c| c.id == comment_id)
+        .ok_or_else(|| "Comment not found".to_string())?;
     comment.resolved_at = None;
     let result = comment.clone();
     write_comments(&id, &comments)?;

@@ -48,15 +48,25 @@ fn x11_display() -> String {
 fn x11grab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
     match target {
         CaptureTarget::FullScreen => Ok(vec!["-i".to_string(), x11_display()]),
-        CaptureTarget::Monitor { x, y, width, height } => Ok(vec![
-            "-video_size".to_string(), format!("{}x{}", width, height),
-            "-i".to_string(), format!("{}+{},{}", x11_display(), x, y),
+        CaptureTarget::Monitor {
+            x,
+            y,
+            width,
+            height,
+        } => Ok(vec![
+            "-video_size".to_string(),
+            format!("{}x{}", width, height),
+            "-i".to_string(),
+            format!("{}+{},{}", x11_display(), x, y),
         ]),
         CaptureTarget::Window { title } => {
-            let (x, y, width, height) = crate::commands::window_capture::linux::get_window_rect_by_title(title)?;
+            let (x, y, width, height) =
+                crate::commands::window_capture::linux::get_window_rect_by_title(title)?;
             Ok(vec![
-                "-video_size".to_string(), format!("{}x{}", width, height),
-                "-i".to_string(), format!("{}+{},{}", x11_display(), x, y),
+                "-video_size".to_string(),
+                format!("{}x{}", width, height),
+                "-i".to_string(),
+                format!("{}+{},{}", x11_display(), x, y),
             ])
         }
     }
@@ -70,7 +80,12 @@ fn list_pulse_sources() -> Result<Vec<String>, String> {
     let output = Command::new("pactl")
         .args(["list", "short", "sources"])
         .output()
-        .map_err(|e| format!("Failed to list audio sources (is PulseAudio/pipewire-pulse installed?): {}", e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to list audio sources (is PulseAudio/pipewire-pulse installed?): {}",
+                e
+            )
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let sources: Vec<String> = stdout
@@ -92,13 +107,16 @@ fn list_pulse_sources() -> Result<Vec<String>, String> {
 // pulling in a new dependency for on a code path nobody's been able to test yet.
 fn list_v4l2_devices() -> Result<Vec<(String, String)>, String> {
     let sysfs = PathBuf::from("/sys/class/video4linux");
-    let entries = fs::read_dir(&sysfs).map_err(|e| format!("Failed to list video devices: {}", e))?;
+    let entries =
+        fs::read_dir(&sysfs).map_err(|e| format!("Failed to list video devices: {}", e))?;
 
     let mut devices = Vec::new();
     for entry in entries.flatten() {
         let dir_name = entry.file_name().to_string_lossy().to_string();
         let name_path = entry.path().join("name");
-        let Ok(name) = fs::read_to_string(&name_path) else { continue };
+        let Ok(name) = fs::read_to_string(&name_path) else {
+            continue;
+        };
         devices.push((format!("/dev/{}", dir_name), name.trim().to_string()));
     }
 
@@ -106,7 +124,10 @@ fn list_v4l2_devices() -> Result<Vec<(String, String)>, String> {
 }
 
 fn find_v4l2_path(devices: &[(String, String)], name: &str) -> Option<String> {
-    devices.iter().find(|(_, n)| n == name).map(|(path, _)| path.clone())
+    devices
+        .iter()
+        .find(|(_, n)| n == name)
+        .map(|(path, _)| path.clone())
 }
 
 pub fn get_connected_devices(_app_handle: &AppHandle) -> (Vec<String>, Vec<String>) {
@@ -135,9 +156,12 @@ fn add_camera_overlay_args(args: &mut Vec<String>, form_data: &FormData) -> Resu
     for device in &form_data.video_devices {
         let camera_path = require_v4l2_path(device)?;
         args.extend(vec![
-            "-f".to_string(), "v4l2".to_string(),
-            "-video_size".to_string(), overlay_size.clone(),
-            "-i".to_string(), camera_path,
+            "-f".to_string(),
+            "v4l2".to_string(),
+            "-video_size".to_string(),
+            overlay_size.clone(),
+            "-i".to_string(),
+            camera_path,
         ]);
     }
 
@@ -161,10 +185,14 @@ pub async fn recording_with_output_sva(
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     let mut args: Vec<String> = vec![
-        "-f".to_string(), "x11grab".to_string(),
-        "-framerate".to_string(), "30".to_string(),
+        "-f".to_string(),
+        "x11grab".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
     ];
-    args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
+    args.extend(x11grab_input_args(&resolve_capture_target(
+        app_handle, form_data,
+    ))?);
 
     let has_camera_overlay = !form_data.video_devices.is_empty();
     if has_camera_overlay {
@@ -184,15 +212,21 @@ pub async fn recording_with_output_sva(
         }
         let audio_input_index = 1 + form_data.video_devices.len();
         args.extend(vec![
-            "-f".to_string(), "pulse".to_string(),
-            "-i".to_string(), form_data.audio_device.clone(),
-            "-map".to_string(), "[vout]".to_string(),
-            "-map".to_string(), format!("{}:a", audio_input_index),
+            "-f".to_string(),
+            "pulse".to_string(),
+            "-i".to_string(),
+            form_data.audio_device.clone(),
+            "-map".to_string(),
+            "[vout]".to_string(),
+            "-map".to_string(),
+            format!("{}:a", audio_input_index),
         ]);
     } else {
         args.extend(vec![
-            "-f".to_string(), "pulse".to_string(),
-            "-i".to_string(), form_data.audio_device.clone(),
+            "-f".to_string(),
+            "pulse".to_string(),
+            "-i".to_string(),
+            form_data.audio_device.clone(),
         ]);
     }
 
@@ -214,10 +248,14 @@ pub async fn recording_with_output_sv(
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     let mut args: Vec<String> = vec![
-        "-f".to_string(), "x11grab".to_string(),
-        "-framerate".to_string(), "30".to_string(),
+        "-f".to_string(),
+        "x11grab".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
     ];
-    args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
+    args.extend(x11grab_input_args(&resolve_capture_target(
+        app_handle, form_data,
+    ))?);
 
     if !form_data.video_devices.is_empty() {
         add_camera_overlay_args(&mut args, form_data)?;
@@ -239,13 +277,19 @@ pub async fn recording_with_output_sa(
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     let mut args: Vec<String> = vec![
-        "-f".to_string(), "x11grab".to_string(),
-        "-framerate".to_string(), "30".to_string(),
+        "-f".to_string(),
+        "x11grab".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
     ];
-    args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
+    args.extend(x11grab_input_args(&resolve_capture_target(
+        app_handle, form_data,
+    ))?);
     args.extend(vec![
-        "-f".to_string(), "pulse".to_string(),
-        "-i".to_string(), form_data.audio_device.clone(),
+        "-f".to_string(),
+        "pulse".to_string(),
+        "-i".to_string(),
+        form_data.audio_device.clone(),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ]);
@@ -267,9 +311,12 @@ pub async fn recording_with_output_v(
     let camera_path = require_v4l2_path(&video_device)?;
 
     let args: Vec<String> = vec![
-        "-f".to_string(), "v4l2".to_string(),
-        "-i".to_string(), camera_path,
-        "-c:v".to_string(), "mpeg4".to_string(),
+        "-f".to_string(),
+        "v4l2".to_string(),
+        "-i".to_string(),
+        camera_path,
+        "-c:v".to_string(),
+        "mpeg4".to_string(),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ];
@@ -287,8 +334,10 @@ pub async fn recording_with_output_a(
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     let args: Vec<String> = vec![
-        "-f".to_string(), "pulse".to_string(),
-        "-i".to_string(), form_data.audio_device.clone(),
+        "-f".to_string(),
+        "pulse".to_string(),
+        "-i".to_string(),
+        form_data.audio_device.clone(),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ];
@@ -312,11 +361,16 @@ pub async fn recording_with_output_va(
     // inputs, one video-only stream and one audio-only stream, which ffmpeg's default stream
     // selection maps unambiguously since each type has exactly one candidate.
     let args: Vec<String> = vec![
-        "-f".to_string(), "v4l2".to_string(),
-        "-i".to_string(), camera_path,
-        "-f".to_string(), "pulse".to_string(),
-        "-i".to_string(), form_data.audio_device.clone(),
-        "-c:v".to_string(), "mpeg4".to_string(),
+        "-f".to_string(),
+        "v4l2".to_string(),
+        "-i".to_string(),
+        camera_path,
+        "-f".to_string(),
+        "pulse".to_string(),
+        "-i".to_string(),
+        form_data.audio_device.clone(),
+        "-c:v".to_string(),
+        "mpeg4".to_string(),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ];
@@ -334,10 +388,14 @@ pub async fn recording_with_output_s(
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     let mut args: Vec<String> = vec![
-        "-f".to_string(), "x11grab".to_string(),
-        "-framerate".to_string(), "30".to_string(),
+        "-f".to_string(),
+        "x11grab".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
     ];
-    args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
+    args.extend(x11grab_input_args(&resolve_capture_target(
+        app_handle, form_data,
+    ))?);
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
 
@@ -349,7 +407,11 @@ pub async fn recording_with_output_s(
 // track, nothing for stop_recording to stop. Replaces what used to be recording_with_output_c, a
 // continuous screen recording started/stopped exactly like every other mode despite the
 // "Screenshot" label the frontend showed for this record type — the same bug win.rs had.
-pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+pub async fn take_screenshot(
+    app_handle: &AppHandle,
+    output_path: &PathBuf,
+    form_data: &FormData,
+) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let output_path = output_path.clone();
     let input_args = x11grab_input_args(&resolve_capture_target(app_handle, form_data))?;
@@ -358,7 +420,8 @@ pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form
         let mut args: Vec<String> = vec!["-f".to_string(), "x11grab".to_string()];
         args.extend(input_args);
         args.extend(vec![
-            "-frames:v".to_string(), "1".to_string(),
+            "-frames:v".to_string(),
+            "1".to_string(),
             "-y".to_string(),
             path_to_str(&output_path)?.to_string(),
         ]);
@@ -370,7 +433,10 @@ pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Screenshot capture failed: {}", extract_ffmpeg_error(&stderr)));
+            return Err(format!(
+                "Screenshot capture failed: {}",
+                extract_ffmpeg_error(&stderr)
+            ));
         }
 
         Ok(format!("Screenshot saved to {}", output_path.display()))
@@ -389,7 +455,11 @@ pub(crate) fn suspend_process(pid: u32) -> Result<(), String> {
         .args(["-STOP", &pid.to_string()])
         .status()
         .map_err(|e| format!("Failed to pause recording: {}", e))
-        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to pause recording: kill -STOP exited with an error".to_string()))
+        .and_then(|status| {
+            status.success().then_some(()).ok_or_else(|| {
+                "Failed to pause recording: kill -STOP exited with an error".to_string()
+            })
+        })
 }
 
 pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
@@ -397,5 +467,9 @@ pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
         .args(["-CONT", &pid.to_string()])
         .status()
         .map_err(|e| format!("Failed to resume recording: {}", e))
-        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to resume recording: kill -CONT exited with an error".to_string()))
+        .and_then(|status| {
+            status.success().then_some(()).ok_or_else(|| {
+                "Failed to resume recording: kill -CONT exited with an error".to_string()
+            })
+        })
 }

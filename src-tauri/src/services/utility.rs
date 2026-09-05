@@ -1,9 +1,15 @@
 //utility.rs
-use std::{collections::HashMap, env, fs, path::{Path, PathBuf}, process::Command};
-use tauri::{command, AppHandle};
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+use tauri::{command, path::BaseDirectory, AppHandle, Manager};
 
 pub fn path_to_str(path: &Path) -> Result<&str, String> {
-    path.to_str().ok_or_else(|| format!("Path is not valid UTF-8: {:?}", path))
+    path.to_str()
+        .ok_or_else(|| format!("Path is not valid UTF-8: {:?}", path))
 }
 
 // Lets the frontend adapt the UI to real backend capability gaps - e.g. hiding the Window
@@ -27,9 +33,9 @@ pub fn get_ffmpeg_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
     let resource_path = format!("binaries/ffmpeg/{}", binary_name);
 
     app_handle
-        .path_resolver()
-        .resolve_resource(&resource_path)
-        .ok_or_else(|| format!("Failed to resolve ffmpeg at {}", resource_path))
+        .path()
+        .resolve(&resource_path, BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve ffmpeg at {}: {}", resource_path, e))
 }
 
 // Centralized ffprobe path resolution, mirroring get_ffmpeg_path
@@ -43,9 +49,9 @@ pub fn get_ffprobe_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
     let resource_path = format!("binaries/ffmpeg/{}", binary_name);
 
     app_handle
-        .path_resolver()
-        .resolve_resource(&resource_path)
-        .ok_or_else(|| format!("Failed to resolve ffprobe at {}", resource_path))
+        .path()
+        .resolve(&resource_path, BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve ffprobe at {}: {}", resource_path, e))
 }
 
 // Bundled libheif CLI decoder (binaries/heif/) - the fallback HEIC/HEIF decode path used when
@@ -57,9 +63,9 @@ pub fn get_heif_decoder_path(app_handle: &AppHandle) -> Result<PathBuf, String> 
     let resource_path = "binaries/heif/heif-dec.exe";
 
     app_handle
-        .path_resolver()
-        .resolve_resource(resource_path)
-        .ok_or_else(|| format!("Failed to resolve heif-dec at {}", resource_path))
+        .path()
+        .resolve(resource_path, BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve heif-dec at {}: {}", resource_path, e))
 }
 
 // Same bundle as get_heif_decoder_path (shares its DLLs), but for gallery-grid thumbnails - see
@@ -81,11 +87,13 @@ pub fn get_heif_thumbnailer_path(app_handle: &AppHandle) -> Result<PathBuf, Stri
     let decoder_path = get_heif_decoder_path(app_handle)?;
     let thumbnailer_path = decoder_path.with_file_name("heif-thumbnailer.exe");
     if !thumbnailer_path.exists() {
-        return Err(format!("heif-thumbnailer.exe not found next to heif-dec.exe at {}", thumbnailer_path.display()));
+        return Err(format!(
+            "heif-thumbnailer.exe not found next to heif-dec.exe at {}",
+            thumbnailer_path.display()
+        ));
     }
     Ok(thumbnailer_path)
 }
-
 
 #[derive(Debug, serde::Serialize)]
 pub struct FileEntry {
@@ -99,7 +107,8 @@ fn home_dir() -> Result<PathBuf, String> {
     #[cfg(not(target_os = "windows"))]
     let home = env::var("HOME");
 
-    home.map(PathBuf::from).map_err(|_| "Failed to get user's home directory".to_string())
+    home.map(PathBuf::from)
+        .map_err(|_| "Failed to get user's home directory".to_string())
 }
 
 // Windows/Linux both conventionally keep recordings under ~/Videos; macOS uses ~/Movies instead.
@@ -140,18 +149,26 @@ fn read_custom_briefcast_dir() -> Result<Option<PathBuf>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path).map_err(|e| format!("Failed to read config: {}", e))?;
+    let contents =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read config: {}", e))?;
     let config: AppConfig = serde_json::from_str(&contents).unwrap_or_default();
-    Ok(config.custom_briefcast_dir.filter(|s| !s.is_empty()).map(PathBuf::from))
+    Ok(config
+        .custom_briefcast_dir
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from))
 }
 
 fn write_custom_briefcast_dir(dir: Option<&Path>) -> Result<(), String> {
     let path = config_file_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create config directory: {}", e))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config directory: {}", e))?;
     }
-    let config = AppConfig { custom_briefcast_dir: dir.map(|d| d.display().to_string()) };
-    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("Failed to serialize config: {}", e))?;
+    let config = AppConfig {
+        custom_briefcast_dir: dir.map(|d| d.display().to_string()),
+    };
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
     fs::write(&path, json).map_err(|e| format!("Failed to write config: {}", e))
 }
 
@@ -176,20 +193,25 @@ pub fn briefcast_dir() -> Result<PathBuf, String> {
 // This carries .trash (services/trash.rs) and any per-video .edits.json sidecar along for free,
 // with no special-casing needed - they move as part of whatever folder already contains them.
 fn relocate_briefcast_dir(old_root: &Path, new_root: &Path) -> Result<(), String> {
-    let entries = fs::read_dir(old_root).map_err(|e| format!("Failed to read {}: {}", old_root.display(), e))?;
+    let entries = fs::read_dir(old_root)
+        .map_err(|e| format!("Failed to read {}: {}", old_root.display(), e))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read {}: {}", old_root.display(), e))?;
         let src = entry.path();
         let dest = new_root.join(entry.file_name());
         if dest.exists() {
-            return Err(format!("\"{}\" already exists at the new location", entry.file_name().to_string_lossy()));
+            return Err(format!(
+                "\"{}\" already exists at the new location",
+                entry.file_name().to_string_lossy()
+            ));
         }
         if fs::rename(&src, &dest).is_ok() {
             continue;
         }
         copy_then_remove(&src, &dest)?;
     }
-    fs::remove_dir_all(old_root).map_err(|e| format!("Failed to remove the old Briefcast folder: {}", e))?;
+    fs::remove_dir_all(old_root)
+        .map_err(|e| format!("Failed to remove the old Briefcast folder: {}", e))?;
 
     // Every file/folder now genuinely lives under new_root, but nothing above touched the
     // *contents* of any sidecar JSON (video_edits.rs's .edits.json, trash.rs's manifest.json) -
@@ -211,7 +233,8 @@ fn relocate_briefcast_dir(old_root: &Path, new_root: &Path) -> Result<(), String
 // renamed/moved by hand outside the app, etc.) - called once from the frontend on startup as a
 // cheap best-effort safety net, not just right after a move.
 fn repair_stale_file_references_in(root: &Path) -> u32 {
-    let mut files_by_name: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    let mut files_by_name: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
     index_files_by_name(root, &mut files_by_name);
 
     let mut repaired_count = 0u32;
@@ -220,7 +243,9 @@ fn repair_stale_file_references_in(root: &Path) -> u32 {
 }
 
 fn index_files_by_name(dir: &Path, index: &mut std::collections::HashMap<String, PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -235,7 +260,11 @@ fn index_files_by_name(dir: &Path, index: &mut std::collections::HashMap<String,
     }
 }
 
-fn repair_value_paths(value: &mut serde_json::Value, index: &std::collections::HashMap<String, PathBuf>, fixed_any: &mut bool) {
+fn repair_value_paths(
+    value: &mut serde_json::Value,
+    index: &std::collections::HashMap<String, PathBuf>,
+    fixed_any: &mut bool,
+) {
     match value {
         serde_json::Value::String(s) => {
             let candidate = Path::new(s.as_str());
@@ -262,8 +291,14 @@ fn repair_value_paths(value: &mut serde_json::Value, index: &std::collections::H
     }
 }
 
-fn repair_sidecars_in_tree(dir: &Path, index: &std::collections::HashMap<String, PathBuf>, repaired_count: &mut u32) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+fn repair_sidecars_in_tree(
+    dir: &Path,
+    index: &std::collections::HashMap<String, PathBuf>,
+    repaired_count: &mut u32,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -278,8 +313,12 @@ fn repair_sidecars_in_tree(dir: &Path, index: &std::collections::HashMap<String,
         if !is_sidecar {
             continue;
         }
-        let Ok(contents) = fs::read_to_string(&path) else { continue };
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&contents) else { continue };
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
         let mut fixed_any = false;
         repair_value_paths(&mut value, index, &mut fixed_any);
         if fixed_any {
@@ -303,8 +342,11 @@ pub fn repair_stale_file_references() -> Result<u32, String> {
 
 fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), String> {
     if src.is_dir() {
-        fs::create_dir_all(dest).map_err(|e| format!("Failed to create \"{}\": {}", dest.display(), e))?;
-        for entry in fs::read_dir(src).map_err(|e| format!("Failed to read {}: {}", src.display(), e))? {
+        fs::create_dir_all(dest)
+            .map_err(|e| format!("Failed to create \"{}\": {}", dest.display(), e))?;
+        for entry in
+            fs::read_dir(src).map_err(|e| format!("Failed to read {}: {}", src.display(), e))?
+        {
             let entry = entry.map_err(|e| format!("Failed to read {}: {}", src.display(), e))?;
             copy_then_remove(&entry.path(), &dest.join(entry.file_name()))?;
         }
@@ -353,16 +395,23 @@ pub fn set_briefcast_dir(new_parent_dir: String, app_handle: AppHandle) -> Resul
         return Err("The new location can't be inside the current Briefcast folder".to_string());
     }
     if old_root.exists() && old_root.starts_with(&new_root) {
-        return Err("The new location can't be a parent of the current Briefcast folder".to_string());
+        return Err(
+            "The new location can't be a parent of the current Briefcast folder".to_string(),
+        );
     }
 
     if new_root.exists() {
-        let has_entries = fs::read_dir(&new_root).map(|mut d| d.next().is_some()).unwrap_or(false);
+        let has_entries = fs::read_dir(&new_root)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
         if has_entries {
-            return Err("A non-empty \"Briefcast\" folder already exists at that location".to_string());
+            return Err(
+                "A non-empty \"Briefcast\" folder already exists at that location".to_string(),
+            );
         }
     } else {
-        fs::create_dir_all(&new_root).map_err(|e| format!("Failed to create the new Briefcast folder: {}", e))?;
+        fs::create_dir_all(&new_root)
+            .map_err(|e| format!("Failed to create the new Briefcast folder: {}", e))?;
     }
 
     if old_root.exists() {
@@ -385,12 +434,18 @@ pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
     }
 
     if new_root.exists() {
-        let has_entries = fs::read_dir(&new_root).map(|mut d| d.next().is_some()).unwrap_or(false);
+        let has_entries = fs::read_dir(&new_root)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
         if has_entries {
-            return Err("A non-empty \"Briefcast\" folder already exists at the default location".to_string());
+            return Err(
+                "A non-empty \"Briefcast\" folder already exists at the default location"
+                    .to_string(),
+            );
         }
     } else {
-        fs::create_dir_all(&new_root).map_err(|e| format!("Failed to create the default Briefcast folder: {}", e))?;
+        fs::create_dir_all(&new_root)
+            .map_err(|e| format!("Failed to create the default Briefcast folder: {}", e))?;
     }
 
     if old_root.exists() {
@@ -403,11 +458,11 @@ pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
 }
 
 #[command]
-pub fn list_briefcast_files()->HashMap<String, Vec<FileEntry>>{
+pub fn list_briefcast_files() -> HashMap<String, Vec<FileEntry>> {
     let mut result = HashMap::new();
 
     if let Ok(folder_path) = briefcast_dir() {
-        if folder_path.exists() && folder_path.is_dir(){
+        if folder_path.exists() && folder_path.is_dir() {
             scan_directory(&folder_path, &folder_path, &mut result);
         }
     }
@@ -421,35 +476,41 @@ pub fn list_briefcast_files()->HashMap<String, Vec<FileEntry>>{
 // without reconstructing an OS path first.
 fn relative_key(root: &Path, dir: &Path) -> String {
     dir.strip_prefix(root)
-        .map(|rel| rel.iter().map(|c| c.to_string_lossy().to_string()).collect::<Vec<_>>().join("/"))
+        .map(|rel| {
+            rel.iter()
+                .map(|c| c.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
         .unwrap_or_default()
 }
 
-fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<FileEntry>>){
-    let Ok(entries) = fs::read_dir(dir) else { return };
+fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<FileEntry>>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     let key = relative_key(root, dir);
 
     let mut files = Vec::new();
     let mut subdirs = Vec::new();
 
-    for entry in entries.flatten(){
+    for entry in entries.flatten() {
         let entry_path = entry.path();
 
-        if entry_path.is_file(){
-            if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()){
+        if entry_path.is_file() {
+            if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()) {
                 let ext = ext.to_lowercase();
 
-                if is_media_file(&ext){
-                    if let Some(file_name) = entry_path.file_name(){
-                        files.push(FileEntry{
+                if is_media_file(&ext) {
+                    if let Some(file_name) = entry_path.file_name() {
+                        files.push(FileEntry {
                             name: file_name.to_string_lossy().to_string(),
                             path: entry_path.display().to_string(),
                         });
                     }
                 }
             }
-        }
-         else if entry_path.is_dir() {
+        } else if entry_path.is_dir() {
             // Trashed files (.trash, see services/trash.rs), board projects/assets (Boards, see
             // services/boards.rs), and doc projects (Docs, see services/docs.rs) all live here but
             // must never surface in the normal file list — that's the whole point of each being
@@ -462,7 +523,7 @@ fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<File
                 continue;
             }
             subdirs.push(entry_path);
-         }
+        }
     }
 
     files.sort_by(|a, b| b.name.cmp(&a.name));
@@ -498,7 +559,12 @@ fn resolve_relative(root: &Path, relative: &str) -> Result<PathBuf, String> {
 
 fn validate_folder_name(name: &str) -> Result<&str, String> {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') || trimmed == "." || trimmed == ".." {
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed == "."
+        || trimmed == ".."
+    {
         return Err("Invalid folder name".to_string());
     }
     Ok(trimmed)
@@ -523,7 +589,11 @@ pub fn create_folder(parent_path: String, name: String) -> Result<String, String
     }
     fs::create_dir_all(&new_dir).map_err(|e| format!("Failed to create folder: {}", e))?;
 
-    Ok(if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) })
+    Ok(if parent_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", parent_path, name)
+    })
 }
 
 // Deletes a folder, but only if it's genuinely empty (no files, no subfolders — checked via a
@@ -617,7 +687,7 @@ pub fn import_file(source_path: String, dest_folder_path: String) -> Result<Stri
     path_to_str(&dest_path).map(|s| s.to_string())
 }
 
-fn is_media_file(ext: &str)->bool{
+fn is_media_file(ext: &str) -> bool {
     matches!(
         ext,
         "jpg" | "jpeg" | "png" | "gif"  | "bmp" | "tiff" | "heic" | "heif" |
@@ -706,7 +776,11 @@ pub async fn open_file_with_default_app(filepath: String) -> Result<(), String> 
 
 #[command]
 pub fn rename_file(old_path: String, new_name: String) -> Result<String, String> {
-    if new_name.trim().is_empty() || new_name.contains('/') || new_name.contains('\\') || new_name.contains("..") {
+    if new_name.trim().is_empty()
+        || new_name.contains('/')
+        || new_name.contains('\\')
+        || new_name.contains("..")
+    {
         return Err("Invalid file name".to_string());
     }
 
@@ -720,7 +794,11 @@ pub fn rename_file(old_path: String, new_name: String) -> Result<String, String>
 
     // Preserve the original extension if the new name doesn't already specify one.
     let new_file_name = match old.extension().and_then(|e| e.to_str()) {
-        Some(ext) if !new_name.to_lowercase().ends_with(&format!(".{}", ext.to_lowercase())) => {
+        Some(ext)
+            if !new_name
+                .to_lowercase()
+                .ends_with(&format!(".{}", ext.to_lowercase())) =>
+        {
             format!("{}.{}", new_name, ext)
         }
         _ => new_name,
@@ -739,33 +817,33 @@ pub fn rename_file(old_path: String, new_name: String) -> Result<String, String>
 
 #[tauri::command]
 pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
-    use std::path::PathBuf;
     use std::fs;
-    
+    use std::path::PathBuf;
+
     let path = PathBuf::from(&filepath);
-    
+
     if !path.exists() {
         return Err(format!("File does not exist: {}", filepath));
     }
-    
+
     // Get the absolute path
-    let absolute_path = fs::canonicalize(&path)
-        .map_err(|e| format!("Failed to get absolute path: {}", e))?;
-    
+    let absolute_path =
+        fs::canonicalize(&path).map_err(|e| format!("Failed to get absolute path: {}", e))?;
+
     // Convert to string
     let path_str = absolute_path.to_string_lossy().to_string();
-    
+
     // Remove Windows extended-length path prefix if present
     let clean_path = if path_str.starts_with(r"\\?\") {
         path_str.trim_start_matches(r"\\?\").to_string()
     } else {
         path_str
     };
-    
+
     println!("Original path: {}", filepath);
     println!("Canonicalized: {}", absolute_path.display());
     println!("Clean path: {}", clean_path);
-    
+
     // Return the clean absolute path - we'll convert it on the frontend
     Ok(clean_path)
 }
@@ -783,14 +861,17 @@ pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
 // mixed with Tauri's own JS-side window.innerPosition()/scaleFactor() - a first version did mix
 // them (native GetCursorPos + JS-side window geometry) and produced consistently wrong
 // coordinates (confirmed: a drop over the visible timeline resolved to a DOM element in the
-// sidebar instead) on a display with 250% scaling. Root cause: tauri 1.8.3 itself depends on an
-// older `windows` crate (0.39) than this file's own direct dependency (0.57) - both HWND types
-// are structurally identical (a bare `isize`) so window.hwnd().0 can be reused directly to build
-// this crate's own HWND, but the two dependency graphs clearly disagree somewhere on the DPI
-// virtualization applied to a plain cross-process GetCursorPos call vs. what WebView2 itself
-// sees. Asking Win32 for the window's own client-area origin (ClientToScreen) and DPI
-// (GetDpiForWindow) *in the same call*, instead of trusting a second source to agree, sidesteps
-// having to figure out exactly which of the two disagreed.
+// sidebar instead) on a display with 250% scaling. Root cause: tauri itself depends on its own
+// `windows` crate version (0.61, as of the v2 upgrade - was 0.39 under tauri 1.8.3) which can
+// differ from this file's own direct dependency (pinned at 0.57) - the two crate versions don't
+// always agree on HWND's inner representation (older versions wrap a bare `isize`; 0.61 wraps a
+// `*mut c_void` instead), so window.hwnd().0 needs an explicit `as isize` to rebuild this crate's
+// own HWND from it rather than assuming the two are interchangeable as-is. Separately, the two
+// dependency graphs also disagree somewhere on the DPI virtualization applied to a plain
+// cross-process GetCursorPos call vs. what WebView2 itself sees. Asking Win32 for the window's own
+// client-area origin (ClientToScreen) and DPI (GetDpiForWindow) *in the same call*, instead of
+// trusting a second source to agree, sidesteps having to figure out exactly which of the two
+// disagreed.
 #[cfg(target_os = "windows")]
 #[tauri::command]
 pub fn get_cursor_position_in_window(window: tauri::Window) -> Result<(f64, f64), String> {
@@ -799,7 +880,12 @@ pub fn get_cursor_position_in_window(window: tauri::Window) -> Result<(f64, f64)
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
-    let hwnd = HWND(window.hwnd().map_err(|e| format!("Failed to get window handle: {}", e))?.0);
+    let hwnd = HWND(
+        window
+            .hwnd()
+            .map_err(|e| format!("Failed to get window handle: {}", e))?
+            .0 as isize,
+    );
 
     // (0, 0) in client coordinates -> the client area's top-left corner in screen coordinates.
     let mut origin = POINT::default();

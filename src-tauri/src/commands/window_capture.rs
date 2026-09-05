@@ -8,19 +8,19 @@
 use serde::Serialize;
 use std::fs;
 
-#[cfg(target_os = "windows")]
-pub mod win;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
-
 #[cfg(target_os = "windows")]
-use win as platform;
+pub mod win;
+
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
+#[cfg(target_os = "windows")]
+use win as platform;
 
 #[derive(Serialize, Debug, Clone)]
 pub struct WindowTitles {
@@ -80,7 +80,13 @@ pub fn get_monitors(app_handle: tauri::AppHandle) -> Result<Vec<MonitorInfo>, St
 // win.rs's get_window_rect_by_title - but the same risk applies to any window that's simply
 // been dragged partway off-screen, on any platform). Shared rather than duplicated per platform
 // since the geometry math itself has nothing OS-specific about it.
-pub(crate) fn clamp_rect_to_desktop(monitors: &[MonitorInfo], x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+pub(crate) fn clamp_rect_to_desktop(
+    monitors: &[MonitorInfo],
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32, i32, i32) {
     if monitors.is_empty() {
         return (x, y, width.max(1), height.max(1));
     }
