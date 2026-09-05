@@ -41,7 +41,10 @@ mod services {
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
     // ffmpeg build mis-decodes multi-image HEIC files (Portrait mode, Deep Fusion, etc.) as a
     // black frame instead of the actual photo. macOS's WebKit-based webview decodes HEIC directly
-    // in <img> tags, so this problem - and this module - is Windows-only.
+    // in <img> tags, which is why get_heic_preview (the live-viewing path) doesn't need a non-
+    // Windows fix - but convert_image/get_image_thumbnail have the exact same ffmpeg bug on macOS
+    // and Linux too (see heic_unix.rs below), so this module's use is Windows-only, not the
+    // underlying problem.
     #[cfg(target_os = "windows")]
     pub mod heic_windows;
     // Fallback HEIC/HEIF decoder for when heic_windows above fails (most commonly: the machine
@@ -53,6 +56,12 @@ mod services {
     // fallback path is ever reached from.
     #[cfg(target_os = "windows")]
     pub mod heif_tool;
+    // macOS/Linux counterpart to heic_windows.rs + heif_tool.rs above - same underlying problem
+    // (ffmpeg mis-decodes multi-image HEIC), same libheif-backed fix, just via a system-installed
+    // `heif-convert`/`heif-thumbnailer` instead of a bundled Windows binary - see the module's own
+    // doc comment for why bundling isn't the right call here.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub mod heic_unix;
 }
 use simplelog::{
     ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,

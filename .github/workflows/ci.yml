@@ -5,13 +5,6 @@ on:
     branches: [main]
   pull_request:
 
-# Windows only, matching this app's actual primary dev/target platform - the per-OS native code
-# under src-tauri/src/commands/{recording,window_capture}/{macos,linux}.rs is #[cfg(target_os)]-
-# gated and can't be compiled/tested here either way (see .claude/skills/run-briefcast/SKILL.md's
-# own note on this). Frontend and Rust unit tests are both pure-logic-only in this initial pass
-# (see the "Pure functions only" handler files and conversion.rs's own #[cfg(test)] module) so
-# platform shouldn't actually matter for what's covered yet - a Linux/macOS matrix is a reasonable
-# future addition once there's native-code coverage to actually gain from it.
 jobs:
   frontend:
     runs-on: windows-latest
@@ -45,4 +38,53 @@ jobs:
       # Not `tauri build`/`--features custom-protocol` - that needs the bundled ffmpeg/heif binary
       # resources and the full Tauri bundling toolchain, neither of which this test suite (pure
       # unit tests only, see conversion.rs's own #[cfg(test)] module) actually needs.
+      - run: cargo test
+
+  # Linux/macOS counterparts to the Windows-only `rust` job above - added alongside the new
+  # services/heic_unix.rs (macOS/Linux HEIC decode via a system-installed libheif). This is also
+  # the FIRST time this crate has ever been compiled on either platform - the platform-specific
+  # modules under commands/{recording,window_capture}/{linux,macos}.rs were written to be portable
+  # but never actually build-verified before now. A failure here that's unrelated to HEIC (i.e. in
+  # those existing platform modules, not heic_unix.rs) is a real, separate finding - report it
+  # rather than assuming this workflow file did something wrong.
+  rust-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      # Provides heif-convert/heif-thumbnailer/heif-enc - see heic_unix.rs's own doc comment for
+      # why this app shells out to a system install rather than bundling/linking libheif itself.
+      - run: sudo apt-get update && sudo apt-get install -y libheif-examples
+      - run: cargo test
+
+  rust-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - run: brew install libheif
       - run: cargo test

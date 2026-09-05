@@ -517,6 +517,29 @@ pub async fn convert_image(
         }
     }
 
+    // macOS/Linux counterpart to the Windows block above - same bug (ffmpeg mis-decodes modern
+    // multi-image HEIC), same fix (libheif via heic_unix.rs), just one tier instead of two since
+    // there's no OS-built-in decoder to try first here the way Windows has WIC.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let input_ext = input
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        if matches!(input_ext.as_deref(), Some("heic") | Some("heif")) {
+            return convert_heic_unix(
+                &app_handle,
+                &window,
+                &state,
+                &input,
+                output,
+                &output_format,
+                preserve_original,
+            )
+            .await;
+        }
+    }
+
     let result = run_conversion(
         &app_handle,
         &window,
@@ -680,6 +703,89 @@ async fn convert_heic_windows(
     result
 }
 
+// macOS/Linux counterpart to convert_heic_windows above - same shape (decode to PNG first, then
+// hand off to the normal ffmpeg image2 pipeline unless PNG is what was actually asked for), just a
+// single tier since there's no OS-built-in HEIC decoder to try before falling back to libheif here.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn convert_heic_unix(
+    app_handle: &AppHandle,
+    window: &Window,
+    state: &State<'_, ConversionState>,
+    input: &PathBuf,
+    output: PathBuf,
+    output_format: &str,
+    preserve_original: bool,
+) -> Result<String, String> {
+    let _ = window.emit(
+        "conversion-progress",
+        ConversionProgress {
+            input_path: input.to_string_lossy().to_string(),
+            output_path: output.to_string_lossy().to_string(),
+            progress: 0.0,
+            status: ConversionStatus::Starting,
+            message: "Decoding HEIC photo...".to_string(),
+        },
+    );
+
+    let format = output_format.to_lowercase();
+    let final_output = unique_output_path(output);
+
+    let result: Result<String, String> = async {
+        if format == "png" {
+            crate::services::heic_unix::decode_to_png(input.clone(), final_output.clone()).await?;
+            Ok(final_output.to_string_lossy().to_string())
+        } else {
+            let temp_png = final_output.with_extension("heic_tmp.png");
+            crate::services::heic_unix::decode_to_png(input.clone(), temp_png.clone()).await?;
+            let transcode = run_conversion(
+                app_handle,
+                window,
+                state,
+                &[InputSpec::plain(temp_png.to_string_lossy().to_string())],
+                &input.to_string_lossy(),
+                final_output.clone(),
+                &[],
+            )
+            .await;
+            let _ = std::fs::remove_file(&temp_png);
+            transcode
+        }
+    }
+    .await;
+
+    match &result {
+        Ok(path) => {
+            let _ = window.emit(
+                "conversion-progress",
+                ConversionProgress {
+                    input_path: input.to_string_lossy().to_string(),
+                    output_path: path.clone(),
+                    progress: 100.0,
+                    status: ConversionStatus::Completed,
+                    message: "Conversion completed".to_string(),
+                },
+            );
+            if !preserve_original {
+                let _ = std::fs::remove_file(input);
+            }
+        }
+        Err(err) => {
+            let _ = window.emit(
+                "conversion-progress",
+                ConversionProgress {
+                    input_path: input.to_string_lossy().to_string(),
+                    output_path: String::new(),
+                    progress: 0.0,
+                    status: ConversionStatus::Failed,
+                    message: err.clone(),
+                },
+            );
+        }
+    }
+
+    result
+}
+
 // Silent, cached HEIC/HEIF -> PNG preview for on-screen display only, at full resolution - the
 // single-image viewer's counterpart to get_playable_preview above but for photos instead of
 // video (get_image_thumbnail below is the gallery-grid counterpart - deliberately a *different*
@@ -745,18 +851,34 @@ pub async fn get_heic_preview(
         path_to_str(&cache_path).map(|s| s.to_string())
     }
 
+    // macOS/Linux: try libheif first (see heic_unix.rs) - ffmpeg's own HEIF tile-grid
+    // reconstruction is the same known-bad path documented on the Windows side above. Falls back
+    // to ffmpeg only if libheif isn't installed, since this is a silent/cached background preview
+    // rather than an explicit user action - producing a possibly-low-quality preview beats a hard
+    // error here (unlike convert_image/convert_heic_unix, where a failed conversion should surface
+    // clearly rather than silently write a degraded file into the library).
     #[cfg(not(windows))]
     {
-        run_conversion(
-            &app_handle,
-            &window,
-            &state,
-            &[InputSpec::plain(input_path.clone())],
-            &input_path,
-            cache_path,
-            &[],
-        )
-        .await
+        if let Err(err) =
+            crate::services::heic_unix::decode_to_png(input.clone(), cache_path.clone()).await
+        {
+            log::warn!(
+                "HEIC libheif decode failed for {}: {err}; falling back to ffmpeg (may be low quality for multi-image HEIC)",
+                input.display()
+            );
+            run_conversion(
+                &app_handle,
+                &window,
+                &state,
+                &[InputSpec::plain(input_path.clone())],
+                &input_path,
+                cache_path,
+                &[],
+            )
+            .await
+        } else {
+            path_to_str(&cache_path).map(|s| s.to_string())
+        }
     }
 }
 
@@ -807,6 +929,9 @@ pub async fn get_image_thumbnail(
             .map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
     }
 
+    #[cfg(not(windows))]
+    let _ = &app_handle; // only used by heif_tool on Windows - heic_unix needs no AppHandle
+
     let ext = input
         .extension()
         .and_then(|e| e.to_str())
@@ -826,8 +951,23 @@ pub async fn get_image_thumbnail(
         }
         return path_to_str(&cache_path).map(|s| s.to_string());
     }
+    // macOS/Linux counterpart to the Windows block above - see heic_unix.rs. No ffmpeg fallback
+    // here (unlike get_heic_preview) since a gallery thumbnail is cheap to retry and a silently
+    // wrong/blank tile is worse than a clear per-file error surfaced to the frontend.
     #[cfg(not(windows))]
-    let _ = &ext; // HEIC thumbnails aren't specially handled outside Windows yet (see heif_tool.rs)
+    if matches!(ext.as_deref(), Some("heic") | Some("heif")) {
+        if let Err(err) = crate::services::heic_unix::extract_thumbnail(
+            input.clone(),
+            cache_path.clone(),
+            GALLERY_THUMBNAIL_MAX_DIMENSION,
+        )
+        .await
+        {
+            log::error!("HEIC thumbnail failed for {}: {err}", input.display());
+            return Err(err);
+        }
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
 
     let input_for_blocking = input.clone();
     let cache_for_blocking = cache_path.clone();
@@ -3286,5 +3426,59 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("briefcast_test_free_{}", std::process::id()));
         let target = dir.join("brand_new.mp4"); // dir deliberately never created - can't exist
         assert_eq!(unique_output_path(target.clone()), target);
+    }
+
+    // Real round-trip against libheif's own CLI tools (not a pure-function unit test like the
+    // ones above) - encodes a tiny synthetic image to HEIC with heif-enc, then decodes it back via
+    // heic_unix::decode_to_png, and checks a valid same-size PNG comes out. This is the one part
+    // of the macOS/Linux HEIC gap that CI can fully prove correctness for (not just compilation) -
+    // see heic_unix.rs's own doc comment for why this needs a system-installed libheif rather than
+    // a bundled one, and the CI workflow for the exact install step this test relies on.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn heic_unix_decode_round_trip_produces_a_valid_png() {
+        use image::{GenericImageView, Rgb, RgbImage};
+
+        let dir = std::env::temp_dir().join(format!("briefcast_test_heic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Dimensions/content don't matter for proving the decode round-trip works - heif-enc just
+        // needs *some* valid source image.
+        let source_png = dir.join("source.png");
+        let mut img = RgbImage::new(16, 16);
+        for pixel in img.pixels_mut() {
+            *pixel = Rgb([200, 100, 50]);
+        }
+        img.save(&source_png)
+            .expect("failed to write synthetic source PNG");
+
+        let heic_path = dir.join("source.heic");
+        let encode = std::process::Command::new("heif-enc")
+            .arg(&source_png)
+            .arg("-o")
+            .arg(&heic_path)
+            .output()
+            .expect(
+                "heif-enc not found - install libheif's example tools to run this test locally \
+                 (see heic_unix.rs's own doc comment for the exact package per OS)",
+            );
+        assert!(
+            encode.status.success(),
+            "heif-enc failed: {}",
+            String::from_utf8_lossy(&encode.stderr)
+        );
+        assert!(heic_path.exists(), "heif-enc produced no output file");
+
+        let decoded_png = dir.join("decoded.png");
+        tauri::async_runtime::block_on(crate::services::heic_unix::decode_to_png(
+            heic_path.clone(),
+            decoded_png.clone(),
+        ))
+        .expect("heic_unix::decode_to_png failed");
+
+        let decoded = image::open(&decoded_png).expect("decoded output is not a valid image");
+        assert_eq!(decoded.dimensions(), (16, 16));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
