@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { MdOutlineOpacity, MdSpeed } from 'react-icons/md';
+import { MdClosedCaption, MdOutlineOpacity, MdSpeed } from 'react-icons/md';
 import { IoPlayCircleOutline, IoChevronForward, IoCheckmark } from 'react-icons/io5';
 
 // Define the props interface
@@ -10,6 +10,16 @@ interface PlaytimeSettingsProps {
   onPlaybackSpeedChange: (speed: string) => void;
   opacity: number;
   onOpacityChange: (opacity: number) => void;
+  // Whether a sibling .vtt/.srt file next to the video is picked up automatically on open (see
+  // VideoPlayer's own auto-detect effect) - exposed here since that behavior is otherwise silent
+  // and undiscoverable, and some users may not want the app scanning for one at all.
+  autoDetectCaptions: boolean;
+  onAutoDetectCaptionsChange: () => void;
+  hasCaptions: boolean;
+  onLoadCaptionsFile: () => void;
+  onGenerateCaptions: () => void;
+  isGeneratingCaptions: boolean;
+  captionsGenerationProgress: number | null;
 }
 
 const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
@@ -18,13 +28,21 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   playbackSpeed,
   onPlaybackSpeedChange,
   opacity,
-  onOpacityChange
+  onOpacityChange,
+  autoDetectCaptions,
+  onAutoDetectCaptionsChange,
+  hasCaptions,
+  onLoadCaptionsFile,
+  onGenerateCaptions,
+  isGeneratingCaptions,
+  captionsGenerationProgress
 }) => {
   // A native <select>'s open dropdown list is rendered by the OS, not the page, so it can't pick
   // up this app's styling (that's what was showing as a plain, unstyled white popup) - this
   // in-menu accordion replaces it with rows built from the same .settings-row styling as the rest
   // of this flyout.
   const [showSpeedOptions, setShowSpeedOptions] = useState<boolean>(false);
+  const [showCaptionsOptions, setShowCaptionsOptions] = useState<boolean>(false);
 
   const handleOpacity = (event: React.ChangeEvent<HTMLInputElement>): void => {
     onOpacityChange(parseFloat(event.target.value));
@@ -106,6 +124,38 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
           className="settings-slider"
         />
       </div>
+
+      <div className="settings-divider" />
+
+      {/* Captions */}
+      <button className="settings-row" onClick={() => setShowCaptionsOptions((prev) => !prev)}>
+        <span className="settings-row-label">
+          <MdClosedCaption />
+          Captions
+        </span>
+        <span className="settings-row-value">
+          {isGeneratingCaptions ? `${Math.round(captionsGenerationProgress ?? 0)}%` : hasCaptions ? 'On' : 'Off'}
+          <IoChevronForward className={`settings-chevron ${showCaptionsOptions ? 'settings-chevron-open' : ''}`} />
+        </span>
+      </button>
+
+      {showCaptionsOptions && (
+        <div className="settings-submenu">
+          <button className="settings-row settings-submenu-item" onClick={onAutoDetectCaptionsChange}>
+            <span>Auto-detect from file</span>
+            <label className="switch" onClick={(e) => e.stopPropagation()}>
+              <input type="checkbox" checked={autoDetectCaptions} onChange={onAutoDetectCaptionsChange} name="captions-autodetect" />
+              <span className="slider round"></span>
+            </label>
+          </button>
+          <button className="settings-row settings-submenu-item" onClick={onLoadCaptionsFile} disabled={isGeneratingCaptions}>
+            <span>Load caption file…</span>
+          </button>
+          <button className="settings-row settings-submenu-item" onClick={onGenerateCaptions} disabled={isGeneratingCaptions}>
+            <span>{isGeneratingCaptions ? `Generating… ${Math.round(captionsGenerationProgress ?? 0)}%` : 'Generate from audio (offline)'}</span>
+          </button>
+        </div>
+      )}
     </div>
   )
 }

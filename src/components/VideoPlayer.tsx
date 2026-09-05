@@ -376,6 +376,38 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [showCaptionsSourceMenu, setShowCaptionsSourceMenu] = useState<boolean>(false);
   const captionsBtnRef = useRef<HTMLButtonElement>(null);
   const captionsMenuRef = useRef<HTMLDivElement>(null);
+  // Set by a popover's click-outside handler (settings, captions source menu) when the dismissing
+  // click landed on the <video> itself - consumed by the video's own onClick (handleVideoClick)
+  // so that one click either closes a popover or toggles play/pause, never both. A ref rather than
+  // state since it only needs to survive from one native event to the very next one, not trigger
+  // a render.
+  const suppressNextVideoClickRef = useRef<boolean>(false);
+  // Whether a sibling .vtt/.srt file is picked up automatically on open (see the auto-detect
+  // effect below) - a plain localStorage flag rather than a prop threaded down from Dashboard/
+  // AppSettings, since this component is fully remounted per file (see autoplayNext's own doc
+  // comment above for why that matters): reading it fresh from localStorage on each mount is what
+  // lets the preference survive across files without needing that remount-safe plumbing for just
+  // this one flag. Defaults on (matches this feature's existing behavior before this toggle
+  // existed) unless the user has explicitly turned it off before.
+  const [autoDetectCaptions, setAutoDetectCaptions] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('briefcast:captionsAutoDetect') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const toggleAutoDetectCaptions = (): void => {
+    setAutoDetectCaptions((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('briefcast:captionsAutoDetect', String(next));
+      } catch {
+        // Private/locked-down storage - the toggle still works for this session, just won't
+        // persist across a restart.
+      }
+      return next;
+    });
+  };
   // True only while a "Generate from audio" transcription is actually running - real model
   // inference (see generate_captions, conversion.rs), so unlike everything else captions-related
   // in this component, this can take anywhere from a few seconds to a minute or more.
@@ -513,13 +545,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // wins over a stray .srt of the same name rather than being silently shadowed by it. Entirely
   // silent either way: read_file_bytes rejecting (file doesn't exist) just means there's nothing to
   // auto-load, not an error - the CC button's own file picker (toggleCaptions) is still there for
-  // a subtitle file that doesn't happen to live right next to the video.
+  // a subtitle file that doesn't happen to live right next to the video. Gated on
+  // autoDetectCaptions (Settings > Captions) - off skips the scan entirely, not just the result.
   useEffect(() => {
     if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
     setCaptionsUrl(null);
     setCaptionsVisible(false);
     setCaptionsGenerationError(null);
-    if (mediaType !== 'video' || !filePath) return;
+    if (mediaType !== 'video' || !filePath || !autoDetectCaptions) return;
 
     let cancelled = false;
     const basePath = filePath.replace(/\.[^./\\]+$/, '');
@@ -544,6 +577,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => {
       cancelled = true;
     };
+    // autoDetectCaptions is deliberately not a dependency - it's read fresh whenever this effect
+    // re-runs for mediaType/filePath anyway (closures always see the latest render's value), which
+    // is exactly "apply the current setting to newly-opened files". Adding it as a dependency
+    // would instead make toggling it live wipe out whatever's showing for the CURRENT file,
+    // including a caption the user loaded manually via the CC button - which the auto-detect
+    // setting has no business touching.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mediaType, filePath]);
 
   // The <track> element has no reactive "visible" prop - its `default` attribute only picks the
@@ -659,6 +699,18 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         cancelAnimationFrame(animationFrameRef.current);
       }
     }
+  };
+
+  // Wraps togglePauseAndPlay for the <video> element's own onClick - suppresses exactly one
+  // toggle right after a popover (settings, captions source menu) was just dismissed by that same
+  // click, so dismissing a popover by clicking the video reads as "closed the popover", not also
+  // "and now it paused/resumed".
+  const handleVideoClick = (): void => {
+    if (suppressNextVideoClickRef.current) {
+      suppressNextVideoClickRef.current = false;
+      return;
+    }
+    togglePauseAndPlay();
   };
 
   const toggleMute = (): void => {
@@ -1069,7 +1121,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
   // Close the settings flyout on any click outside it (its own gear button included, so that
   // click doesn't immediately re-close what toggleSettings just opened) - previously it only ever
-  // closed by clicking the gear again.
+  // closed by clicking the gear again. Also arms suppressNextVideoClickRef when the outside click
+  // landed on the <video> itself, so that same click doesn't also toggle play/pause (see the
+  // video's own onClick below) - without this, dismissing the flyout by clicking the video paused
+  // or resumed playback as an unwanted side effect of what the user experienced as just "closing
+  // the popover".
   useEffect(() => {
     if (!showSettings) return;
 
@@ -1078,6 +1134,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (settingsMenuRef.current?.contains(target)) return;
       if (settingsBtnRef.current?.contains(target)) return;
       setShowSettings(false);
+      suppressNextVideoClickRef.current = true;
     };
 
     document.addEventListener('mousedown', handleClickOutside);
@@ -1093,6 +1150,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (captionsMenuRef.current?.contains(target)) return;
       if (captionsBtnRef.current?.contains(target)) return;
       setShowCaptionsSourceMenu(false);
+      suppressNextVideoClickRef.current = true;
     };
 
     document.addEventListener('mousedown', handleClickOutside);
@@ -1447,16 +1505,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							{showCaptionsSourceMenu && (
 								<div
 									ref={captionsMenuRef}
-									className="origin-bottom-right absolute bottom-full right-0 mb-1 w-52 rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 overflow-hidden"
+									className="origin-bottom-right absolute bottom-full right-0 mb-1 w-64 rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 divide-y divide-gray-100 dark:divide-neutral-700 overflow-hidden"
 								>
 									<button
-										className="block w-full px-3 py-2 text-sm text-left hover:bg-gray-100 dark:hover:bg-neutral-700"
+										className="block w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700"
 										onClick={() => void pickCaptionsFile()}
 									>
 										Load caption file…
 									</button>
 									<button
-										className="block w-full px-3 py-2 text-sm text-left hover:bg-gray-100 dark:hover:bg-neutral-700"
+										className="block w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700"
 										onClick={() => void generateCaptionsFromAudio()}
 									>
 										Generate from audio (offline)
@@ -1489,6 +1547,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							}}
 							opacity={videoOpacity}
 							onOpacityChange={setVideoOpacity}
+							autoDetectCaptions={autoDetectCaptions}
+							onAutoDetectCaptionsChange={toggleAutoDetectCaptions}
+							hasCaptions={!!captionsUrl}
+							onLoadCaptionsFile={() => { setShowSettings(false); void pickCaptionsFile(); }}
+							onGenerateCaptions={() => { setShowSettings(false); void generateCaptionsFromAudio(); }}
+							isGeneratingCaptions={isGeneratingCaptions}
+							captionsGenerationProgress={captionsGenerationProgress}
 							/>
 							</div>
 						)}
@@ -1511,7 +1576,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					<video
 						ref={videoRef}
 						loop={loop}
-						onClick={togglePauseAndPlay}
+						onClick={handleVideoClick}
 						onError={handleVideoError}
 						onLoadedMetadata={() => {
 							if (videoRef.current) {
