@@ -1105,6 +1105,415 @@ async fn extract_video_frame(
     .map_err(|e| format!("Video thumbnail task panicked: {e}"))?
 }
 
+// Fixed per-tile size for the scrub-bar hover-preview sprite sheet (see get_video_scrub_sprite) -
+// matches the 16:9 aspect ratio the frontend's hover-preview box (.preview-img-wrap in player.css)
+// already renders at, just at a real decode resolution instead of a CSS box size.
+const SCRUB_SPRITE_TILE_WIDTH: u32 = 160;
+const SCRUB_SPRITE_TILE_HEIGHT: u32 = 90;
+// Aim for one tile roughly every 5s of footage - granular enough that scrubbing feels responsive
+// - but keep the grid bounded on both ends: a very short clip still gets a useful number of
+// tiles (MIN), and a very long recording can't force ffmpeg to decode+encode an enormous sprite
+// or the frontend to size an oversized <img> (MAX).
+const SCRUB_SPRITE_TARGET_INTERVAL_SECS: f64 = 5.0;
+const SCRUB_SPRITE_MIN_TILES: u32 = 10;
+const SCRUB_SPRITE_MAX_TILES: u32 = 100;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrubSprite {
+    pub sprite_path: String,
+    pub columns: u32,
+    pub rows: u32,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub count: u32,
+    // Seconds of footage each tile represents - the frontend divides a hover position's time by
+    // this to pick which tile to show.
+    pub interval: f64,
+}
+
+// Pre-generated, cached hover-preview sprite for the scrub bar - one ffmpeg call builds a single
+// grid image of downsampled frames spanning the whole video, so hovering the timeline afterwards
+// is an instant CSS crop (VideoPlayer.tsx's handleTimelineHover) rather than a per-hover decode.
+// Cached the same content-addressed way get_video_thumbnail is (path+mtime, see
+// preview_cache_path), alongside a small JSON sidecar recording the grid layout that produced it -
+// needed because that layout depends on this specific video's duration and has to be reproduced
+// exactly on a cache hit for the frontend's tile math to stay correct, and re-probing duration
+// on every hit just to recompute it would be wasted work the sidecar avoids entirely.
+#[tauri::command]
+pub async fn get_video_scrub_sprite(
+    app_handle: AppHandle,
+    input_path: String,
+) -> Result<ScrubSprite, String> {
+    let input = PathBuf::from(&input_path);
+    let sprite_cache_path = preview_cache_path(&input, "scrub_sprite_v1", "jpg")?;
+    let meta_cache_path = preview_cache_path(&input, "scrub_sprite_v1", "json")?;
+
+    if sprite_cache_path.exists() {
+        if let Ok(bytes) = std::fs::read(&meta_cache_path) {
+            if let Ok(cached) = serde_json::from_slice::<ScrubSprite>(&bytes) {
+                return Ok(ScrubSprite {
+                    sprite_path: path_to_str(&sprite_cache_path)?.to_string(),
+                    ..cached
+                });
+            }
+        }
+        // Sprite image exists but its metadata sidecar is missing/unreadable - fall through and
+        // regenerate both together rather than risk the frontend slicing tiles with a guessed
+        // layout that doesn't match what's actually in the cached image.
+    }
+
+    if let Some(parent) = sprite_cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create scrub-sprite cache directory: {}", e))?;
+    }
+
+    let ffprobe_path = get_ffprobe_path(&app_handle)?;
+    let duration = probe_duration_secs(&ffprobe_path, &input)?;
+    if duration <= 0.0 {
+        return Err("Video has no measurable duration".to_string());
+    }
+
+    let target = ((duration / SCRUB_SPRITE_TARGET_INTERVAL_SECS).round() as u32)
+        .clamp(SCRUB_SPRITE_MIN_TILES, SCRUB_SPRITE_MAX_TILES)
+        .min((duration.floor() as u32).max(1));
+    let columns = (target as f64).sqrt().ceil() as u32;
+    let rows = ((target as f64) / (columns as f64)).ceil() as u32;
+    // The tile filter below always consumes exactly columns*rows input frames to emit its one
+    // output grid - using that (rather than `target`) as the authoritative count keeps this
+    // metadata truthful even though it can be a few tiles more than `target` asked for (the last
+    // couple of cells then just repeat the final frame, an imperceptible edge case for a hover
+    // preview).
+    let count = columns * rows;
+    let interval = duration / count as f64;
+
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    generate_scrub_sprite(&ffmpeg_path, &input, &sprite_cache_path, interval, columns, rows).await?;
+
+    let sprite = ScrubSprite {
+        sprite_path: path_to_str(&sprite_cache_path)?.to_string(),
+        columns,
+        rows,
+        tile_width: SCRUB_SPRITE_TILE_WIDTH,
+        tile_height: SCRUB_SPRITE_TILE_HEIGHT,
+        count,
+        interval,
+    };
+    std::fs::write(
+        &meta_cache_path,
+        serde_json::to_vec(&sprite).map_err(|e| format!("Failed to serialize scrub-sprite metadata: {}", e))?,
+    )
+    .map_err(|e| format!("Failed to write scrub-sprite metadata: {}", e))?;
+
+    Ok(sprite)
+}
+
+fn probe_duration_secs(ffprobe_path: &PathBuf, input: &PathBuf) -> Result<f64, String> {
+    let mut cmd = Command::new(ffprobe_path);
+    cmd.args([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        path_to_str(input)?,
+    ]);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Failed to parse ffprobe output: {}", e))?;
+    probe["format"]["duration"]
+        .as_str()
+        .and_then(|d| d.parse::<f64>().ok())
+        .ok_or_else(|| "ffprobe returned no duration for this file".to_string())
+}
+
+// Single ffmpeg call: samples one frame every `interval` seconds (fps=1/interval), downsizes each
+// to the fixed tile size, then tiles them into one columns x rows grid image - see
+// get_video_scrub_sprite's own doc comment for why a sprite sheet instead of per-tile files.
+async fn generate_scrub_sprite(
+    ffmpeg_path: &PathBuf,
+    input: &PathBuf,
+    output: &PathBuf,
+    interval: f64,
+    columns: u32,
+    rows: u32,
+) -> Result<(), String> {
+    let ffmpeg_path = ffmpeg_path.clone();
+    let input = input.clone();
+    let output = output.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-y");
+        cmd.arg("-i").arg(path_to_str(&input)?);
+        cmd.args([
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-vf",
+            &format!(
+                "fps=1/{interval},scale={tw}:{th},tile={cols}x{rows}",
+                interval = interval,
+                tw = SCRUB_SPRITE_TILE_WIDTH,
+                th = SCRUB_SPRITE_TILE_HEIGHT,
+                cols = columns,
+                rows = rows
+            ),
+            "-q:v",
+            "4",
+        ]);
+        cmd.arg(path_to_str(&output)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let result = cmd
+            .output()
+            .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let tail: Vec<&str> = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .rev()
+                .take(3)
+                .collect();
+            let reason: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+            return Err(format!(
+                "ffmpeg scrub-sprite generation failed: {}",
+                if reason.is_empty() {
+                    "unknown error".to_string()
+                } else {
+                    reason
+                }
+            ));
+        }
+        if !output.exists() {
+            return Err("ffmpeg exited successfully but produced no scrub-sprite file".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Scrub-sprite task panicked: {e}"))?
+}
+
+// Offline speech-to-text fallback for VideoPlayer's CC button, used only when the user explicitly
+// asks for it (no sibling .vtt/.srt file exists, and they choose "Generate from audio" rather than
+// picking a file themselves) - genuinely slow relative to every other command in this file (real
+// model inference, not a single ffmpeg pass), so this is entirely opt-in, never run automatically
+// on open the way get_video_scrub_sprite is. Returns the VTT text directly (not a cached file
+// path): unlike every other generated preview here, this can't be served via asset:// - Tauri's
+// asset protocol doesn't know the .vtt MIME type and serves it as text/html, which <track> silently
+// refuses to parse (see VideoPlayer.tsx's loadCaptionsSrc, which wraps whatever text this returns
+// in a Blob URL with the correct type instead). Still cached to disk content-addressed by the
+// VIDEO's own path+mtime (see preview_cache_path) so re-opening the same file is instant instead
+// of re-transcribing.
+#[tauri::command]
+pub async fn generate_captions(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "captions_generated_v1", "vtt")?;
+
+    if cache_path.exists() {
+        return std::fs::read_to_string(&cache_path)
+            .map_err(|e| format!("Failed to read cached captions: {}", e));
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create captions cache directory: {}", e))?;
+    }
+
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let whisper_path = crate::services::utility::get_whisper_cli_path(&app_handle)?;
+    let model_path = crate::services::utility::get_whisper_model_path(&app_handle)?;
+    if !whisper_path.exists() {
+        return Err(format!(
+            "whisper-cli not found at {} - see README's Getting Started for how to obtain it",
+            whisper_path.display()
+        ));
+    }
+    if !model_path.exists() {
+        return Err(format!(
+            "Speech-to-text model not found at {} - see README's Getting Started for how to obtain it",
+            model_path.display()
+        ));
+    }
+
+    // whisper.cpp needs a plain mono 16kHz WAV, not whatever the source video's own audio track
+    // happens to be encoded as - extracted into the same cache directory as a scratch file,
+    // removed once transcription finishes (success or failure) since it's never needed again.
+    let wav_path = cache_path.with_extension("wav");
+    let extraction = extract_audio_for_whisper(&ffmpeg_path, &input, &wav_path).await;
+    if let Err(err) = extraction {
+        let _ = std::fs::remove_file(&wav_path);
+        return Err(err);
+    }
+
+    // -of wants the output path WITHOUT its extension - whisper-cli appends ".vtt" itself.
+    let output_stem = cache_path.with_extension("");
+    let transcription = run_whisper_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem).await;
+    let _ = std::fs::remove_file(&wav_path); // best-effort - a leftover scratch WAV is harmless either way
+    transcription?;
+
+    std::fs::read_to_string(&cache_path)
+        .map_err(|e| format!("whisper-cli reported success but produced no readable output: {}", e))
+}
+
+async fn extract_audio_for_whisper(
+    ffmpeg_path: &PathBuf,
+    input: &PathBuf,
+    output: &PathBuf,
+) -> Result<(), String> {
+    let ffmpeg_path = ffmpeg_path.clone();
+    let input = input.clone();
+    let output = output.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-y");
+        cmd.arg("-i").arg(path_to_str(&input)?);
+        cmd.args(["-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"]);
+        cmd.arg(path_to_str(&output)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let result = cmd
+            .output()
+            .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let tail: Vec<&str> = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .rev()
+                .take(3)
+                .collect();
+            let reason: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+            return Err(format!(
+                "ffmpeg audio extraction failed: {}",
+                if reason.is_empty() { "unknown error".to_string() } else { reason }
+            ));
+        }
+        if !output.exists() {
+            return Err("ffmpeg exited successfully but produced no audio - the source may have no audio track".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Audio extraction task panicked: {e}"))?
+}
+
+// Spawns whisper-cli and streams its progress back to the frontend as it works, rather than the
+// caller just waiting on a single opaque `.output()` call - real model inference over a whole
+// video's audio track can easily take longer than the video itself plays (measured directly:
+// ~52s of audio took several minutes on ordinary consumer hardware even with every logical core
+// in use), so without this the CC button's spinner gives no sign anything is happening versus
+// having silently hung. -pp turns on whisper.cpp's own "whisper_print_progress_callback: progress
+// = N%" lines (stderr - confirmed by capturing stdout/stderr separately during development;
+// segment transcript lines are the ones on stdout), which the stderr reader thread below parses
+// and re-emits as a "captions-progress" event. -t uses every logical core rather than whisper-cli's
+// own default of 4, which measurably shortens the wait on anything with more than 4.
+async fn run_whisper_cli(
+    app_handle: &AppHandle,
+    whisper_path: &PathBuf,
+    model_path: &PathBuf,
+    wav_path: &PathBuf,
+    output_stem: &PathBuf,
+) -> Result<(), String> {
+    let app_handle = app_handle.clone();
+    let whisper_path = whisper_path.clone();
+    let model_path = model_path.clone();
+    let wav_path = wav_path.clone();
+    let output_stem = output_stem.clone();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&whisper_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-m").arg(path_to_str(&model_path)?);
+        cmd.arg("-f").arg(path_to_str(&wav_path)?);
+        cmd.args(["-ovtt", "-np", "-pp", "-t", &threads.to_string()]);
+        cmd.arg("-of").arg(path_to_str(&output_stem)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to start whisper-cli: {}", e))?;
+
+        // Drained but discarded - whisper-cli writes each transcribed segment here as it goes
+        // (not currently surfaced anywhere), but the pipe still has to be read continuously or a
+        // long transcription fills the OS pipe buffer and the child blocks trying to write to it,
+        // silently hanging the whole command.
+        let stdout = child.stdout.take().ok_or("Failed to capture whisper-cli stdout")?;
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if line.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stderr = child.stderr.take().ok_or("Failed to capture whisper-cli stderr")?;
+        let app_handle_for_stderr = app_handle.clone();
+        let stderr_thread = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let mut full_output = String::new();
+            let progress_re = regex::Regex::new(r"progress\s*=\s*(\d+)%").unwrap();
+
+            for line in reader.lines() {
+                let Ok(line) = line else { continue };
+                full_output.push_str(&line);
+                full_output.push('\n');
+
+                if let Some(caps) = progress_re.captures(&line) {
+                    if let Ok(pct) = caps[1].parse::<f64>() {
+                        let _ = app_handle_for_stderr.emit("captions-progress", pct);
+                    }
+                }
+            }
+
+            full_output
+        });
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed to wait for whisper-cli: {}", e))?;
+        let stderr_output = stderr_thread.join().unwrap_or_default();
+
+        if !status.success() {
+            let tail: Vec<&str> = stderr_output
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .rev()
+                .take(3)
+                .collect();
+            let reason: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+            return Err(format!(
+                "whisper-cli transcription failed: {}",
+                if reason.is_empty() { "unknown error".to_string() } else { reason }
+            ));
+        }
+        let _ = app_handle.emit("captions-progress", 100.0);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Transcription task panicked: {e}"))?
+}
+
 // Convert an audio file between mp3/wav/aac/flac/ogg/m4a. -vn drops any video stream before
 // encoding - many mp3/m4a files carry embedded cover art as an attached-picture "video" stream,
 // which would otherwise get passed through (or rejected outright by formats like wav/flac that

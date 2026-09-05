@@ -356,7 +356,13 @@ video {
     box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
 }
 
-.timeline .preview-img {
+/* Scrub-bar hover preview: a fixed-size window showing one tile of the sprite sheet
+   VideoPlayer.tsx loads as this element's own CSS background-image. background-size is set (in
+   JS) to columns*100%/rows*100%, so the browser scales the sprite to make one tile exactly fill
+   this box on its own - no pixel/scale math needed here, just moving background-position to pick
+   which tile (the standard CSS sprite-sheet technique, the same one YouTube/Vimeo-style scrub
+   previews use). */
+.timeline .preview-img-wrap {
     position: absolute;
     height: 80px;
     aspect-ratio: 16/9;
@@ -366,28 +372,14 @@ video {
     border-radius: 0.25rem;
     border: 2px solid white;
     display: none;
+    overflow: hidden;
+    background-repeat: no-repeat;
+    background-color: #000;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
     pointer-events: none;
 }
 
-.thumbnail-img {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    width: 100%;
-    height: 100%;
-    display: none;
-    object-fit: contain;
-    pointer-events: none;
-}
-
-.timeline-container:hover .thumbnail-img {
-    display: block;
-}
-
-.timeline-container:hover .preview-img {
+.timeline-container:hover .preview-img-wrap {
     display: block;
 }
 
@@ -456,7 +448,7 @@ video {
         width: 60px;
     }
     
-    .timeline .preview-img {
+    .timeline .preview-img-wrap {
         height: 60px;
     }
 }

@@ -95,6 +95,33 @@ pub fn get_heif_thumbnailer_path(app_handle: &AppHandle) -> Result<PathBuf, Stri
     Ok(thumbnailer_path)
 }
 
+// Bundled whisper.cpp CLI (binaries/whisper/) - offline speech-to-text for VideoPlayer's
+// "Generate captions from audio" action, used only when no sibling .vtt/.srt already exists for
+// the video. A plain CLI binary rather than a Rust binding (whisper-rs) deliberately - that would
+// need a C++ toolchain to even build this project, where a bundled binary needs none, exactly the
+// same tradeoff already made for ffmpeg/heif-dec above. Windows-only for now, mirroring
+// get_heif_decoder_path's own shape rather than its cross-platform support.
+pub fn get_whisper_cli_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let resource_path = "binaries/whisper/whisper-cli.exe";
+
+    app_handle
+        .path()
+        .resolve(resource_path, BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve whisper-cli at {}: {}", resource_path, e))
+}
+
+// The one model this app ships (see README's "Getting started" for why base.en specifically -
+// whisper-cli's own default model choice, and a reasonable size/accuracy balance for narrated
+// screen recordings) - co-located with whisper-cli.exe in the same bundled folder.
+pub fn get_whisper_model_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let resource_path = "binaries/whisper/ggml-base.en.bin";
+
+    app_handle
+        .path()
+        .resolve(resource_path, BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve whisper model at {}: {}", resource_path, e))
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct FileEntry {
     name: String,
@@ -914,4 +941,84 @@ pub fn get_cursor_position_in_window(window: tauri::Window) -> Result<(f64, f64)
 #[tauri::command]
 pub fn get_cursor_position_in_window(_window: tauri::Window) -> Result<(f64, f64), String> {
     Err("Cursor position lookup is only implemented on Windows".to_string())
+}
+
+// Root of every generated-preview cache this app writes (image/video gallery thumbnails, HEIC
+// previews, scrub-bar sprites, playable-preview re-encodes) - mirrors the path conversion.rs's own
+// preview_cache_path builds. Duplicated here rather than exported across the commands/services
+// boundary since it's one literal, not real shared logic - keep the two in sync if it ever changes.
+fn preview_cache_root() -> PathBuf {
+    env::temp_dir().join("briefcast_preview_cache")
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheCategoryInfo {
+    pub namespace: String,
+    pub file_count: u64,
+    pub total_bytes: u64,
+}
+
+fn dir_stats(dir: &Path) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    count += 1;
+                    bytes += meta.len();
+                }
+            }
+        }
+    }
+    (count, bytes)
+}
+
+// One row per cache namespace currently on disk - a namespace only exists once something has
+// actually been cached into it, so a fresh install (or an already-cleared cache) just returns an
+// empty list rather than one row per known namespace with zeros. The frontend's Settings > Cache
+// section maps each namespace to a human-readable label itself, keeping this side agnostic of
+// what the namespaces actually mean.
+#[command]
+pub fn get_cache_info() -> Result<Vec<CacheCategoryInfo>, String> {
+    let root = preview_cache_root();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|e| format!("Failed to read cache directory: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read cache directory entry: {}", e))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let namespace = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let (file_count, total_bytes) = dir_stats(&path);
+        result.push(CacheCategoryInfo { namespace, file_count, total_bytes });
+    }
+    result.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+    Ok(result)
+}
+
+// Clears one cache namespace (e.g. "video_thumb_v1"), or the entire preview cache when `namespace`
+// is None. Always safe: every command that populates this cache (get_video_thumbnail,
+// get_image_thumbnail, get_video_scrub_sprite, get_heic_preview, get_playable_preview)
+// regenerates its own entry transparently the next time it's needed - nothing here is ever
+// anything but a derived, disposable copy of a real file elsewhere, so the only cost of clearing
+// is a one-time regeneration, never lost data.
+#[command]
+pub fn clear_preview_cache(namespace: Option<String>) -> Result<(), String> {
+    let root = preview_cache_root();
+    let target = match namespace {
+        Some(ns) => root.join(ns),
+        None => root,
+    };
+    if target.exists() {
+        fs::remove_dir_all(&target).map_err(|e| format!("Failed to clear cache: {}", e))?;
+    }
+    Ok(())
 }

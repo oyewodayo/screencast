@@ -10,7 +10,8 @@
     "targets": "all",
     "resources": [
       "binaries/ffmpeg/*",
-      "binaries/heif/*"
+      "binaries/heif/*",
+      "binaries/whisper/*"
     ],
     "icon": [
       "icons/32x32.png",
@@ -33,7 +34,7 @@
         ],
         "enable": true
       },
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; media-src 'self' asset: http://asset.localhost https://asset.localhost; frame-src 'self' asset: http://asset.localhost https://asset.localhost; connect-src ipc: http://ipc.localhost 'self' asset: http://asset.localhost https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob:; frame-src 'self' asset: http://asset.localhost https://asset.localhost; connect-src ipc: http://ipc.localhost 'self' asset: http://asset.localhost https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
     },
     "windows": [
       {

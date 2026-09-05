@@ -2,6 +2,7 @@ import './player.css';
 import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { IoPause, IoPlay, IoPlayCircleOutline, IoPlayCircle } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
@@ -46,6 +47,42 @@ interface ConversionProgress {
   status: 'starting' | 'processing' | 'completed' | 'failed';
   message: string;
 }
+
+// Mirrors the Rust side's ScrubSprite (src-tauri/src/commands/conversion.rs), returned by
+// get_video_scrub_sprite - a pre-generated grid image of downsampled frames the scrub bar crops
+// per-hover instead of decoding a fresh frame on every mouse move.
+interface ScrubSpriteMeta {
+  url: string;
+  columns: number;
+  rows: number;
+  tileWidth: number;
+  tileHeight: number;
+  count: number;
+  interval: number;
+}
+
+// Converts SRT subtitle text to WebVTT, the only format a native <track> element understands.
+// The two formats are otherwise line-for-line identical - just a "WEBVTT" header, and "," instead
+// of "." as the sub-second separator in timestamps (00:00:01,000 vs 00:00:01.000).
+const srtToVtt = (srtText: string): string => {
+  const body = srtText.replace(/\r\n?/g, '\n').replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  return `WEBVTT\n\n${body}`;
+};
+
+// Reads a subtitle file's raw bytes via the backend (sidesteps the frontend fs allowlist scope the
+// same way docxImport/docImagePaste already do for their own file reads), converts to WebVTT if
+// it's an .srt, and wraps it as a Blob URL with an explicit text/vtt type. A Blob URL - not
+// convertFileSrc - is required here: Tauri's asset:// protocol guesses Content-Type from the file
+// extension, and its MIME table doesn't know .vtt, so it serves one as text/html - which <track>
+// silently refuses to parse as WebVTT (no error event, cues just never load). A Blob lets this set
+// the exact MIME type itself instead of depending on that guess. media-src in tauri.conf.json's
+// CSP was widened to include blob: specifically to allow this.
+const loadCaptionsSrc = async (path: string): Promise<string> => {
+  const bytes = await invoke<number[]>('read_file_bytes', { path });
+  const text = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+  const vttText = path.toLowerCase().endsWith('.srt') ? srtToVtt(text) : text;
+  return URL.createObjectURL(new Blob([vttText], { type: 'text/vtt' }));
+};
 
 type VolumeLevel = 'low' | 'high' | 'muted';
 // PDFs are handled by the dedicated PdfAnnotator component (see Dashboard.tsx routing) —
@@ -326,6 +363,28 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [isTheatherMode, setIsTheatherMode] = useState<boolean>(true);
   const [captionsVisible, setCaptionsVisible] = useState<boolean>(false);
+  // Blob URL for the <track>'s src, once a real subtitle file (auto-detected sibling .vtt/.srt, or
+  // manually picked via the CC button) has actually been loaded and converted - null means there's
+  // genuinely nothing to show yet, distinct from captionsVisible (which only matters once this is
+  // non-null). Kept in a ref too so the unmount-only cleanup effect below can revoke whatever the
+  // LATEST url is without needing it in that effect's own deps.
+  const [captionsUrl, setCaptionsUrl] = useState<string | null>(null);
+  const captionsUrlRef = useRef<string | null>(null);
+  captionsUrlRef.current = captionsUrl;
+  // Shown when the CC button is clicked with nothing loaded yet - lets the user pick between a
+  // file of their own and offline generation, rather than the button jumping straight to one.
+  const [showCaptionsSourceMenu, setShowCaptionsSourceMenu] = useState<boolean>(false);
+  const captionsBtnRef = useRef<HTMLButtonElement>(null);
+  const captionsMenuRef = useRef<HTMLDivElement>(null);
+  // True only while a "Generate from audio" transcription is actually running - real model
+  // inference (see generate_captions, conversion.rs), so unlike everything else captions-related
+  // in this component, this can take anywhere from a few seconds to a minute or more.
+  const [isGeneratingCaptions, setIsGeneratingCaptions] = useState<boolean>(false);
+  // 0-100, from the backend's "captions-progress" event (see generateCaptionsFromAudio) - real
+  // transcription progress, not a guess, so the button can show something more honest than an
+  // indefinite spinner for what can be a multi-minute wait on a long recording.
+  const [captionsGenerationProgress, setCaptionsGenerationProgress] = useState<number | null>(null);
+  const [captionsGenerationError, setCaptionsGenerationError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [showSkipTime, setShowSkipTime] = useState<boolean>(false);
 
@@ -334,6 +393,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [currentTimeElement, setCurrentTimeElement] = useState<string>("0:00");
   const [totalTimeElement, setTotalTimeElement] = useState<string | null>(null);
   const [currentSkipTime, setCurrentSkipTime] = useState<number>(30);
+
+  // Scrub-bar hover-preview sprite (see handleTimelineHover) - null until the backend finishes
+  // generating it, or permanently for a file it can't be built for (audio/image, or ffmpeg
+  // failure), in which case hovering the timeline just shows no preview.
+  const [scrubSprite, setScrubSprite] = useState<ScrubSpriteMeta | null>(null);
+  const previewWrapRef = useRef<HTMLDivElement>(null);
 
   // Settings and preferences
   // Falls back to local state when the caller doesn't pass autoplayNext/onAutoplayNextChange
@@ -382,6 +447,124 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (autoPlay) videoRef.current.play().catch(() => {});
     }
   }, [mediaType, src, autoPlay]);
+
+  // Kick off (or reuse the cache for) the scrub-bar hover-preview sprite as soon as a real video
+  // file is open - fired well ahead of the user ever hovering the timeline, since generating it
+  // takes a real ffmpeg pass. filePath (not `src`, which is an already-loadable asset:// URL) is
+  // what the backend needs to actually read the file. Silently gives up on failure (missing
+  // ffmpeg, unreadable file, etc) - a hover hint is a nice-to-have, never worth surfacing as an
+  // error to the user.
+  useEffect(() => {
+    setScrubSprite(null); // clear the previous file's sprite immediately, don't show a stale one
+    if (mediaType !== 'video' || !filePath) return;
+
+    let cancelled = false;
+    invoke<{
+      spritePath: string;
+      columns: number;
+      rows: number;
+      tileWidth: number;
+      tileHeight: number;
+      count: number;
+      interval: number;
+    }>('get_video_scrub_sprite', { inputPath: filePath })
+      .then((sprite) => {
+        if (cancelled) return;
+        setScrubSprite({
+          url: convertFileSrc(sprite.spritePath),
+          columns: sprite.columns,
+          rows: sprite.rows,
+          tileWidth: sprite.tileWidth,
+          tileHeight: sprite.tileHeight,
+          count: sprite.count,
+          interval: sprite.interval,
+        });
+      })
+      .catch((err) => {
+        console.warn('Scrub-bar preview unavailable for this file:', err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, filePath]);
+
+  // Sets the hover-preview wrapper's background image + tile-grid sizing once per sprite (not per
+  // hover - handleTimelineHover only ever touches backgroundPosition after this). background-size
+  // at columns*100%/rows*100% makes one tile exactly fill this element's own box regardless of its
+  // actual rendered pixel size - the standard CSS sprite-sheet technique, chosen specifically
+  // because it needs no clientHeight/scale math of its own (an earlier transform-based version of
+  // this did, and got thrown off by the wrapper's border under box-sizing:border-box, showing
+  // several tiles at once instead of one).
+  useEffect(() => {
+    const wrap = previewWrapRef.current;
+    if (!wrap) return;
+    if (!scrubSprite) {
+      wrap.style.backgroundImage = '';
+      return;
+    }
+    wrap.style.backgroundImage = `url("${scrubSprite.url}")`;
+    wrap.style.backgroundSize = `${scrubSprite.columns * 100}% ${scrubSprite.rows * 100}%`;
+  }, [scrubSprite]);
+
+  // Opportunistically picks up a same-named subtitle file sitting next to the video (e.g.
+  // "clip.mp4" -> "clip.vtt" or "clip.srt") as soon as it opens - the common case for anyone who
+  // already has captions from another tool. Tries .vtt before .srt so a hand-authored WebVTT file
+  // wins over a stray .srt of the same name rather than being silently shadowed by it. Entirely
+  // silent either way: read_file_bytes rejecting (file doesn't exist) just means there's nothing to
+  // auto-load, not an error - the CC button's own file picker (toggleCaptions) is still there for
+  // a subtitle file that doesn't happen to live right next to the video.
+  useEffect(() => {
+    if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
+    setCaptionsUrl(null);
+    setCaptionsVisible(false);
+    setCaptionsGenerationError(null);
+    if (mediaType !== 'video' || !filePath) return;
+
+    let cancelled = false;
+    const basePath = filePath.replace(/\.[^./\\]+$/, '');
+
+    (async () => {
+      for (const ext of ['.vtt', '.srt']) {
+        try {
+          const url = await loadCaptionsSrc(basePath + ext);
+          if (cancelled) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          setCaptionsUrl(url);
+          return; // found one - .vtt took priority, or .srt is all there was
+        } catch {
+          // no sibling file at this extension (read_file_bytes rejected) - try the next one, or
+          // give up quietly once both are exhausted
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, filePath]);
+
+  // The <track> element has no reactive "visible" prop - its `default` attribute only picks the
+  // INITIAL mode when the track is first added to the text track list, and never again after that.
+  // Actually showing/hiding cues once a track exists requires setting textTracks[0].mode directly.
+  useEffect(() => {
+    const video = videoRef.current;
+    const track = video?.textTracks[0];
+    if (!track) return;
+    track.mode = captionsVisible ? 'showing' : 'hidden';
+  }, [captionsVisible, captionsUrl]);
+
+  // Revokes whatever caption Blob URL is current when this player unmounts entirely (a file
+  // switch already revokes the previous one itself, in the effect above) - reads captionsUrlRef
+  // rather than closing over captionsUrl so this always sees the latest value regardless of which
+  // render's effect instance actually runs on unmount.
+  useEffect(() => {
+    return () => {
+      if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
+    };
+  }, []);
 
   // Tracks the container's live box size for the `overlay` render-prop's letterbox math - window
   // resize, theater mode, and fullscreen all change this without the <video> itself reloading (so
@@ -488,8 +671,60 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     setVolumeLevel(getVolumeLevel(video.volume, video.muted));
   };
 
+  // Once a track is actually loaded, this is a plain visibility toggle. Before that, there's
+  // nothing to toggle - clicking CC instead opens the source menu (load a file, or generate one)
+  // so the button is never a dead end, unlike the stub this replaces (an empty <track src=""> no
+  // button action could ever fill in).
   const toggleCaptions = (): void => {
-    setCaptionsVisible(prev => !prev);
+    if (!captionsUrl) {
+      setShowCaptionsSourceMenu((prev) => !prev);
+      return;
+    }
+    setCaptionsVisible((prev) => !prev);
+  };
+
+  const pickCaptionsFile = async (): Promise<void> => {
+    setShowCaptionsSourceMenu(false);
+    try {
+      const selected = await openFileDialog({ multiple: false, filters: [{ name: 'Subtitles', extensions: ['vtt', 'srt'] }] });
+      if (!selected || Array.isArray(selected)) return; // cancelled
+      const url = await loadCaptionsSrc(selected);
+      if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
+      setCaptionsUrl(url);
+      setCaptionsVisible(true);
+    } catch (err) {
+      console.error('Failed to load captions file:', err);
+    }
+  };
+
+  // Offline speech-to-text (generate_captions, conversion.rs) - genuinely slow (real model
+  // inference over the whole audio track), so this only ever runs when the user explicitly asks
+  // for it here, never automatically. Surfaces a failure inline (missing model/whisper-cli, no
+  // audio track, etc) rather than just console.error - unlike the silent auto-detect/file-picker
+  // paths, the user was just waiting on this, so silence would read as "why isn't this working".
+  const generateCaptionsFromAudio = async (): Promise<void> => {
+    setShowCaptionsSourceMenu(false);
+    if (!filePath) return;
+    setIsGeneratingCaptions(true);
+    setCaptionsGenerationProgress(0);
+    setCaptionsGenerationError(null);
+    const unlisten = await listen<number>('captions-progress', (event) => {
+      setCaptionsGenerationProgress(event.payload);
+    });
+    try {
+      const vttText = await invoke<string>('generate_captions', { inputPath: filePath });
+      const url = URL.createObjectURL(new Blob([vttText], { type: 'text/vtt' }));
+      if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
+      setCaptionsUrl(url);
+      setCaptionsVisible(true);
+    } catch (err) {
+      console.error('Caption generation failed:', err);
+      setCaptionsGenerationError(String(err));
+    } finally {
+      unlisten();
+      setIsGeneratingCaptions(false);
+      setCaptionsGenerationProgress(null);
+    }
   };
 
   const toggleTheaterMode = (): void => {
@@ -790,6 +1025,39 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     window.addEventListener('mouseup', handleWindowMouseUp);
   };
 
+  // Picks which tile shows through the hover-preview wrapper (.preview-img-wrap) by moving its
+  // CSS background-position - written straight to the DOM via a ref rather than React state, the
+  // same "skip a re-render on a mousemove-frequency event" idiom updateTimelineVisual above
+  // already uses. --preview-position is a separate CSS var from --progress-position (the actual
+  // playback thumb) so hovering never moves the real progress indicator.
+  const handleTimelineHover = (e: MouseEvent<HTMLDivElement>): void => {
+    const timeline = timelineContainerRef.current;
+    const video = videoRef.current;
+    if (!timeline || !video || !Number.isFinite(video.duration)) return;
+
+    const rect = timeline.getBoundingClientRect();
+    const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    timeline.style.setProperty('--preview-position', fraction.toString());
+
+    const sprite = scrubSprite;
+    const wrap = previewWrapRef.current;
+    if (!sprite || !wrap || sprite.count === 0) return;
+
+    const hoverTime = fraction * video.duration;
+    const index = Math.min(sprite.count - 1, Math.floor(hoverTime / sprite.interval));
+    const col = index % sprite.columns;
+    const row = Math.floor(index / sprite.columns);
+
+    // Standard CSS sprite-sheet positioning to match the background-size set in the effect above
+    // (columns*100% / rows*100%): background-position percentages are relative to (background size
+    // - element size), which for that background-size lands exactly on tile (col, row) at
+    // col/(columns-1)*100% - 0% whenever there's only one column/row, since division by zero would
+    // otherwise apply.
+    const posX = sprite.columns > 1 ? (col / (sprite.columns - 1)) * 100 : 0;
+    const posY = sprite.rows > 1 ? (row / (sprite.rows - 1)) * 100 : 0;
+    wrap.style.backgroundPosition = `${posX}% ${posY}%`;
+  };
+
   const selectSkipTiming = (value: number): void => {
     setCurrentSkipTime(value);
     setShowSkipTime(false);
@@ -815,6 +1083,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showSettings]);
+
+  // Same click-outside pattern as the settings flyout above, for the captions source menu.
+  useEffect(() => {
+    if (!showCaptionsSourceMenu) return;
+
+    const handleClickOutside = (event: globalThis.MouseEvent): void => {
+      const target = event.target as Node;
+      if (captionsMenuRef.current?.contains(target)) return;
+      if (captionsBtnRef.current?.contains(target)) return;
+      setShowCaptionsSourceMenu(false);
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showCaptionsSourceMenu]);
 
   const handleAutoplay = (): void => {
     if (onAutoplayNextChange) {
@@ -1034,13 +1317,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 			data-volume-level={volumeLevel}>
 			{(mediaType === 'video' || mediaType === 'audio') && (
 				<div>
-					<img className="thumbnail-img" id="thumbnailImg" alt="Video thumbnail" />
-					<div className="pointer-events-auto"></div>
-					
 					<div className="video-controls-container py-2 place-items-center">
-					<div className="timeline-container" id="timelineContainer" ref={timelineContainerRef} onMouseDown={handleTimelineMouseDown}>
+					<div
+						className="timeline-container"
+						id="timelineContainer"
+						ref={timelineContainerRef}
+						onMouseDown={handleTimelineMouseDown}
+						onMouseMove={handleTimelineHover}
+					>
 						<div className="timeline">
-						<img className="preview-img" id="previewImgSrc" alt="Video preview" />
+						<div className="preview-img-wrap" ref={previewWrapRef} />
 						<div className="thumb-indicator"></div>
 						</div>
 					</div>
@@ -1132,9 +1418,58 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							: <IoPlayCircleOutline className='w-[100%] text-2xl text-white' />}
 						</button>
 
-						<button className="captions-btn w-7" onClick={toggleCaptions} title={captionsVisible ? 'Captions on' : 'Captions off'}>
-							<FaClosedCaptioning className={`w-[100%] text-2xl ${captionsVisible ? 'text-red-500' : 'text-white'}`} />
-						</button>
+						<div className="relative">
+							<button
+								ref={captionsBtnRef}
+								className="captions-btn w-7"
+								onClick={toggleCaptions}
+								disabled={isGeneratingCaptions}
+								title={
+									isGeneratingCaptions
+										? `Generating captions from audio… ${Math.round(captionsGenerationProgress ?? 0)}% (can take a while on a long recording)`
+										: !captionsUrl
+										? 'Add captions (load a file, or generate from audio)'
+										: captionsVisible
+										? 'Captions on (click to hide)'
+										: 'Captions off (click to show)'
+								}
+							>
+								{isGeneratingCaptions ? (
+									<div className="flex flex-col items-center gap-0.5">
+										<div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+										<span className="text-[9px] leading-none tabular-nums text-white/80">{Math.round(captionsGenerationProgress ?? 0)}%</span>
+									</div>
+								) : (
+									<FaClosedCaptioning className={`w-[100%] text-2xl ${captionsVisible ? 'text-red-500' : 'text-white'} ${captionsUrl ? '' : 'opacity-50'}`} />
+								)}
+							</button>
+
+							{showCaptionsSourceMenu && (
+								<div
+									ref={captionsMenuRef}
+									className="origin-bottom-right absolute bottom-full right-0 mb-1 w-52 rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 overflow-hidden"
+								>
+									<button
+										className="block w-full px-3 py-2 text-sm text-left hover:bg-gray-100 dark:hover:bg-neutral-700"
+										onClick={() => void pickCaptionsFile()}
+									>
+										Load caption file…
+									</button>
+									<button
+										className="block w-full px-3 py-2 text-sm text-left hover:bg-gray-100 dark:hover:bg-neutral-700"
+										onClick={() => void generateCaptionsFromAudio()}
+									>
+										Generate from audio (offline)
+									</button>
+								</div>
+							)}
+
+							{captionsGenerationError && (
+								<div className="absolute bottom-full right-0 mb-1 w-64 rounded-md px-3 py-2 text-xs text-white bg-red-600 shadow-lg">
+									{captionsGenerationError}
+								</div>
+							)}
+						</div>
 
 						<button ref={settingsBtnRef} className="settings-btn w-7" onClick={toggleSettings} title="Settings">
 							<FaCog className='w-[100%] text-2xl' />
@@ -1188,13 +1523,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							}
 						}}
 					>
-						<track
-							kind="captions"
-							src=""
-							label="English"
-							srcLang="en"
-							default={captionsVisible}
-						/>
+						{captionsUrl && (
+							<track
+								kind="captions"
+								src={captionsUrl}
+								label="English"
+								srcLang="en"
+							/>
+						)}
 					</video>
 					{isRecovering && (
 						<div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none bg-black/40">

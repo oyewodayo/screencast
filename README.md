@@ -186,7 +186,9 @@ Briefcast shells out to `ffmpeg.exe`/`ffprobe.exe`/`ffplay.exe` at
 binaries are gitignored (not committed to this repo, not even via Git LFS), so you need
 to place them yourself before the app can record, convert, or probe anything. HEIC/HEIF
 photo preview needs two more bundled binaries at `src-tauri/binaries/heif/` — same
-gitignored-and-place-yourself deal (see below).
+gitignored-and-place-yourself deal (see below). Auto-generated captions (VideoPlayer's CC
+button, when no subtitle file already exists) need a bundled offline speech-to-text
+engine at `src-tauri/binaries/whisper/` — same deal again.
 
 ## Getting started
 
@@ -218,6 +220,18 @@ pacman -S mingw-w64-x86_64-libheif
 and copy `heif-dec.exe`, `heif-thumbnailer.exe`, and every DLL `ldd heif-dec.exe` (run
 from `/mingw64/bin`) lists under `/mingw64/bin` into `src-tauri/binaries/heif/` (the two
 tools share the same DLLs, so one `ldd` pass covers both).
+
+Auto-generated captions use [whisper.cpp](https://github.com/ggml-org/whisper.cpp) as a
+plain bundled CLI binary - not a Rust crate, so there's no C++ toolchain needed to build
+this project itself. Download the CPU-only Windows build from its
+[releases page](https://github.com/ggml-org/whisper.cpp/releases) (the
+`whisper-bin-x64.zip` asset - avoid the `-blas`/`-cublas` variants, which need matching
+GPU drivers/libraries this app doesn't otherwise depend on) and copy `whisper-cli.exe`
+plus `whisper.dll`, `ggml.dll`, `ggml-base.dll`, and every `ggml-cpu-*.dll` into
+`src-tauri/binaries/whisper/`. Then download a model - `ggml-base.en.bin` from
+[the ggml-org/whisper.cpp model repo on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp)
+is the size/accuracy balance this app defaults to (~141MB; en-only, since Briefcast has no
+language picker for this yet) - into the same folder.
 
 ```bash
 npm run tauri dev
@@ -291,6 +305,7 @@ screencast/
 │   │   └── views/                   # Standalone window (recording-completed popup)
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
 │   ├── binaries/heif/               # Bundled libheif (heif-dec.exe + DLLs) - HEIC/HEIF fallback decode
+│   ├── binaries/whisper/            # Bundled whisper.cpp CLI + DLLs + ggml-base.en.bin model - auto-generated captions
 │   └── tauri.conf.json              # Tauri app/window/permissions configuration
 └── public/                          # Static assets (icons, notification sounds)
 ```
@@ -318,6 +333,13 @@ Same as above but for `src-tauri/binaries/heif/heif-dec.exe` — see
 fallback (when Windows' own HEIC decoder fails), so most HEIC photos will still preview
 fine without it on a machine that already has the OS codec packages installed; only
 photos that need the fallback will error until it's in place.
+
+**"Failed to resolve whisper-cli at ..." when generating captions**
+Same as above but for `src-tauri/binaries/whisper/whisper-cli.exe` — see
+[Getting started](#getting-started) for how to obtain it and the model. This path only
+gets hit when you explicitly choose "Generate captions from audio" and no sibling
+.vtt/.srt file exists for the video — loading an existing subtitle file, or a video with
+no captions requested at all, never touches this.
 
 **No audio/video devices listed**
 Briefcast enumerates DirectShow devices via `ffmpeg -f dshow -list_devices`. Make sure

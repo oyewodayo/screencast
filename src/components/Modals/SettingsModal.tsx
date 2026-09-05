@@ -5,6 +5,7 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { AppSettings, DEFAULT_SETTINGS, loadSettings, saveSettings } from "../../utils/appSettings";
 import { ThemePreference, useTheme } from "../../contexts/ThemeContext";
+import { formatFileSize } from "../../utils/Formater";
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -66,16 +67,37 @@ const HOME_BACKGROUND_OPTIONS: { value: AppSettings["homeBackgroundStyle"]; labe
   { value: "plain", label: "Plain" },
 ];
 
-type SectionKey = "appearance" | "recording" | "storage" | "annotation" | "files" | "pdf" | "help";
+type SectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "help";
 const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "appearance", label: "Appearance" },
   { key: "recording", label: "Recording" },
   { key: "storage", label: "Storage" },
+  { key: "cache", label: "Cache" },
   { key: "annotation", label: "Annotation" },
   { key: "files", label: "Files" },
   { key: "pdf", label: "PDF Annotator" },
   { key: "help", label: "Help & Shortcuts" },
 ];
+
+// Mirrors the Rust side's CacheCategoryInfo (src-tauri/src/services/utility.rs) - one row per
+// preview-cache namespace that currently has anything on disk.
+interface CacheCategoryInfo {
+  namespace: string;
+  fileCount: number;
+  totalBytes: number;
+}
+
+// Human-readable labels for the namespaces get_cache_info can report - see preview_cache_path's
+// own doc comment (conversion.rs) for what actually writes into each one. An unrecognized
+// namespace (a future cache this list hasn't been updated for) still renders fine via the
+// fallback in the render code below, just without a friendly description.
+const CACHE_CATEGORY_INFO: Record<string, { label: string; description: string }> = {
+  thumb_v1: { label: "Image thumbnails", description: "Gallery-grid preview images for photos." },
+  video_thumb_v1: { label: "Video poster frames", description: "Gallery-grid preview frames for videos." },
+  scrub_sprite_v1: { label: "Video scrub-bar previews", description: "Hover-preview thumbnails shown while dragging a video's timeline." },
+  heic_v2: { label: "HEIC/HEIF photo previews", description: "Decoded previews for iPhone-style photos." },
+  video: { label: "Playable-preview conversions", description: "Re-encoded copies of videos the built-in player can't decode natively (e.g. .avi)." },
+};
 
 // One row of the keyboard-shortcuts reference in the Help section below - keys as shown here are
 // always the Windows/Linux form ("Ctrl+..."); the section adds a single blanket note about Cmd on
@@ -115,6 +137,13 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
   const [pendingIsReset, setPendingIsReset] = useState(false);
   const [storageBusy, setStorageBusy] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
+
+  // Generated-preview cache (Settings > Cache) - distinct from the Storage section above, which is
+  // about the Briefcast library folder itself, not this disposable, auto-regenerating derived data.
+  const [cacheInfo, setCacheInfo] = useState<CacheCategoryInfo[] | null>(null);
+  const [cacheBusy, setCacheBusy] = useState<string | null>(null); // namespace being cleared, or "*" for all
+  const [cacheError, setCacheError] = useState<string | null>(null);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
 
   // Audio/video device lists for the "Default audio device"/"Default video device(s)" pickers
   // below - the same devices RecordingDocker itself lists, fetched the same way (BottomDocker.tsx
@@ -241,6 +270,39 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
   };
 
   const hasPendingStorageChange = pendingParentDir != null || pendingIsReset;
+
+  const loadCacheInfo = async (): Promise<void> => {
+    try {
+      setCacheInfo(await invoke<CacheCategoryInfo[]>("get_cache_info"));
+    } catch (err) {
+      console.error("Failed to load cache info:", err);
+    }
+  };
+
+  useEffect(() => {
+    void loadCacheInfo();
+  }, []);
+
+  // Shared by both the per-category "Clear" buttons and "Clear all" - `namespace` omitted clears
+  // everything. No confirmation step for a single category (small, scoped, and - like all of this
+  // cache - regenerates automatically the next time it's needed); "Clear all" still gets one via
+  // confirmClearAll below since it's the one action here with real (if still fully recoverable)
+  // blast radius.
+  const handleClearCache = async (namespace?: string): Promise<void> => {
+    setCacheBusy(namespace ?? "*");
+    setCacheError(null);
+    try {
+      await invoke("clear_preview_cache", { namespace: namespace ?? null });
+      await loadCacheInfo();
+      setConfirmClearAll(false);
+    } catch (err) {
+      setCacheError(String(err));
+    } finally {
+      setCacheBusy(null);
+    }
+  };
+
+  const totalCacheBytes = cacheInfo?.reduce((sum, c) => sum + c.totalBytes, 0) ?? 0;
 
   return (
     <div
@@ -507,6 +569,99 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                 <p className="text-xs text-neutral-400 dark:text-neutral-500">
                   Choosing a new location moves every existing file and folder there — nothing is duplicated or left behind.
                 </p>
+              </Section>
+            )}
+
+            {activeSection === "cache" && (
+              <Section title="Generated preview cache">
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Thumbnails and previews Briefcast generates from your files, kept so they don't have to be
+                  rebuilt every time you browse. Clearing any of this is always safe — it just regenerates the
+                  next time it's needed, and never touches your actual files.
+                </p>
+
+                {cacheError && <p className="text-xs text-red-500">{cacheError}</p>}
+
+                {cacheInfo === null ? (
+                  <p className="text-sm text-neutral-400 dark:text-neutral-500">Loading…</p>
+                ) : cacheInfo.length === 0 ? (
+                  <p className="text-sm text-neutral-400 dark:text-neutral-500">Nothing cached right now.</p>
+                ) : (
+                  <div className="flex flex-col gap-1">
+                    {cacheInfo.map((c) => {
+                      const info = CACHE_CATEGORY_INFO[c.namespace];
+                      return (
+                        <div key={c.namespace} className="flex items-center justify-between gap-4 py-1.5">
+                          <div className="min-w-0">
+                            <div className="text-sm text-neutral-700 dark:text-neutral-300">{info?.label ?? c.namespace}</div>
+                            <div className="text-xs text-neutral-400 dark:text-neutral-500">
+                              {info?.description ? `${info.description} ` : ""}
+                              {c.fileCount} file{c.fileCount === 1 ? "" : "s"}, {formatFileSize(c.totalBytes)}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={cacheBusy !== null}
+                            onClick={() => void handleClearCache(c.namespace)}
+                            className="shrink-0 px-2.5 py-1 rounded-lg text-xs font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200 dark:hover:bg-neutral-700 disabled:opacity-50"
+                          >
+                            {cacheBusy === c.namespace ? "Clearing…" : "Clear"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="pt-2 mt-1 border-t border-neutral-100 dark:border-neutral-800 flex flex-col gap-2">
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">
+                      Total: {formatFileSize(totalCacheBytes)}
+                    </span>
+                    {confirmClearAll ? (
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={cacheBusy !== null}
+                          onClick={() => void handleClearCache()}
+                          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+                        >
+                          {cacheBusy === "*" ? "Clearing…" : "Confirm clear all"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={cacheBusy !== null}
+                          onClick={() => setConfirmClearAll(false)}
+                          className="px-3 py-1.5 rounded-lg text-xs text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={cacheBusy !== null || !cacheInfo?.length}
+                        onClick={() => setConfirmClearAll(true)}
+                        className="px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200 dark:hover:bg-neutral-700 disabled:opacity-50"
+                      >
+                        Clear all cache
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-xs text-neutral-400 dark:text-neutral-500">
+                      After clearing, reload so open galleries and players pick up fresh previews right away.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => window.location.reload()}
+                      className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200 dark:hover:bg-neutral-700"
+                    >
+                      Reload app
+                    </button>
+                  </div>
+                </div>
               </Section>
             )}
 

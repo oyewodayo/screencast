@@ -246,7 +246,7 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
                   alt={file.name}
                   loading="lazy"
                   draggable={false}
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-contain"
                 />
               ) : (
                 <IoVideocam size={22} className="text-gray-300 dark:text-neutral-700" />
