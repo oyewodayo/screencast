@@ -16,6 +16,10 @@ interface KeyboardHandlers {
   // arrows are for frame-accurate scrubbing, the buttons are for skipping past whole sections.
   seekBackward?: () => void;
   seekForward?: () => void;
+  // Comma/period for single-frame stepping is the convention shared by YouTube, video.js, and
+  // most desktop NLEs - always pauses first (see stepFrame's own comment, VideoPlayer.tsx).
+  stepFrameBackward?: () => void;
+  stepFrameForward?: () => void;
   onPlaybackRateChange?: (rate: number) => void;
   onVolumeChange?: (volume: number) => void;
 }
@@ -88,6 +92,14 @@ export const createKeyboardHandler = (
       case "c":
         e.preventDefault();
         handlers.toggleCaptions?.();
+        break;
+      case ",":
+        e.preventDefault();
+        handlers.stepFrameBackward?.();
+        break;
+      case ".":
+        e.preventDefault();
+        handlers.stepFrameForward?.();
         break;
       default:
         break;

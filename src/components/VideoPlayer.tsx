@@ -3,7 +3,7 @@ import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, Chang
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { IoPause, IoPlay, IoPlayCircleOutline, IoPlayCircle } from 'react-icons/io5';
+import { IoPause, IoPlay, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -101,6 +101,8 @@ interface KeyboardHandlerActions {
   playbackSpeedReduce: () => void;
   seekBackward: () => void;
   seekForward: () => void;
+  stepFrameBackward: () => void;
+  stepFrameForward: () => void;
 }
 
 // Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
@@ -362,6 +364,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // UI state
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [isTheatherMode, setIsTheatherMode] = useState<boolean>(true);
+  // User-toggled loop, independent of the `loop` prop (which Dashboard only ever sets for audio's
+  // own "repeat one" mode - see the native <video loop> attribute's combined value below). Local
+  // rather than lifted to Dashboard: nothing outside this player needs to know a single video is
+  // set to repeat, unlike autoplay-next, which Dashboard needs for its own "what plays next" logic.
+  const [isLoopEnabled, setIsLoopEnabled] = useState<boolean>(false);
   const [captionsVisible, setCaptionsVisible] = useState<boolean>(false);
   // Blob URL for the <track>'s src, once a real subtitle file (auto-detected sibling .vtt/.srt, or
   // manually picked via the CC button) has actually been loaded and converted - null means there's
@@ -699,6 +706,31 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         cancelAnimationFrame(animationFrameRef.current);
       }
     }
+  };
+
+  // Steps exactly one frame forward/backward, always pausing first (frame-accuracy while playback
+  // continues isn't meaningful - the frame you land on would already be gone by the time you saw
+  // it). No exact per-video frame rate is available here without an extra ffprobe round-trip per
+  // file, so this uses a fixed 1/30s step - the same approximation most browser-based players
+  // (video.js, Plyr) make for the same reason; close enough to be useful for reviewing/trimming
+  // without needing new backend plumbing just for this.
+  const stepFrame = (direction: 1 | -1): void => {
+    if (mediaType !== 'video') return;
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration)) return;
+    if (!video.paused) {
+      video.pause();
+      setIsPlaying(false);
+      setIsPaused(true);
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    }
+    const FRAME_STEP_SECONDS = 1 / 30;
+    video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + direction * FRAME_STEP_SECONDS));
+  };
+
+  const toggleLoop = (): void => {
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
+    setIsLoopEnabled((prev) => !prev);
   };
 
   // Wraps togglePauseAndPlay for the <video> element's own onClick - suppresses exactly one
@@ -1237,7 +1269,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       playbackSpeedIncrease,
       playbackSpeedReduce,
       seekBackward,
-      seekForward
+      seekForward,
+      stepFrameBackward: () => stepFrame(-1),
+      stepFrameForward: () => stepFrame(1)
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -1468,12 +1502,26 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						<button
 						className="autoplay-btn w-7"
 						onClick={handleAutoplay}
-						title={isAutoPlay ? 'Autoplay is on' : 'Autoplay is off'}
+						title={isAutoPlay ? 'Autoplay next is on' : 'Autoplay next is off'}
 						aria-pressed={isAutoPlay}
 						>
+							{/* A "skip forward" glyph reads as "advance to next" - unlike the filled-circle
+							    IoPlayCircle this replaces, it can't be mistaken for a record/live indicator
+							    (the actual record button, elsewhere in this app, is also a filled circle). */}
 							{isAutoPlay
-							? <IoPlayCircle className='w-[100%] text-2xl text-red-500' />
-							: <IoPlayCircleOutline className='w-[100%] text-2xl text-white' />}
+							? <IoPlaySkipForward className='w-[100%] text-2xl text-red-500' />
+							: <IoPlaySkipForwardOutline className='w-[100%] text-2xl text-white' />}
+						</button>
+
+						<button
+						className="loop-btn w-7"
+						onClick={toggleLoop}
+						title={isLoopEnabled ? 'Loop is on' : 'Loop is off'}
+						aria-pressed={isLoopEnabled}
+						>
+							{isLoopEnabled
+							? <IoRepeat className='w-[100%] text-2xl text-red-500' />
+							: <IoRepeatOutline className='w-[100%] text-2xl text-white' />}
 						</button>
 
 						<div className="relative">
@@ -1575,7 +1623,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 				<>
 					<video
 						ref={videoRef}
-						loop={loop}
+						loop={loop || isLoopEnabled}
 						onClick={handleVideoClick}
 						onError={handleVideoError}
 						onLoadedMetadata={() => {
