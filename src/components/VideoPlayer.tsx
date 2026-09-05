@@ -3,7 +3,7 @@ import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, Chang
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { IoPause, IoPlay, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline } from 'react-icons/io5';
+import { IoPause, IoPlay, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -21,7 +21,8 @@ import {
   setVolume,
   toggleFullscreen,
   togglePictureInPicture,
-  updateTimelineProgress
+  updateTimelineProgress,
+  CAPTIONS_LANGUAGE_OPTIONS
 } from '../utils/videoUtils';
 
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
@@ -60,6 +61,26 @@ interface ScrubSpriteMeta {
   count: number;
   interval: number;
 }
+
+// A user- or silence-detection-placed marker on the timeline - persisted as a `.chapters.json`
+// sidecar next to the video (save_video_chapters/load_video_chapters, video_edits.rs), the same
+// write-tmp-then-rename convention as the timeline editor's own `.edits.json`, just a separate,
+// much smaller file so having chapters never implies the file has been opened in the full editor.
+interface Chapter {
+  id: string;
+  time: number;
+  label: string;
+}
+
+const formatChapterTime = (seconds: number): string => {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+};
 
 // Converts SRT subtitle text to WebVTT, the only format a native <track> element understands.
 // The two formats are otherwise line-for-line identical - just a "WEBVTT" header, and "," instead
@@ -103,6 +124,7 @@ interface KeyboardHandlerActions {
   seekForward: () => void;
   stepFrameBackward: () => void;
   stepFrameForward: () => void;
+  toggleShortcutsOverlay: () => void;
 }
 
 // Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
@@ -369,6 +391,23 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // rather than lifted to Dashboard: nothing outside this player needs to know a single video is
   // set to repeat, unlike autoplay-next, which Dashboard needs for its own "what plays next" logic.
   const [isLoopEnabled, setIsLoopEnabled] = useState<boolean>(false);
+  // Chapter markers - loaded from/persisted to the `.chapters.json` sidecar (see the Chapter
+  // interface's own comment). Empty until loaded, same "nothing yet, not an error" shape as
+  // captionsUrl above.
+  const [chapters, setChapters] = useState<Chapter[]>([]);
+  const [showChaptersMenu, setShowChaptersMenu] = useState<boolean>(false);
+  const [isDetectingChapters, setIsDetectingChapters] = useState<boolean>(false);
+  // Which chapter (if any) the cursor is currently near while hovering the timeline - drives the
+  // small tooltip in handleTimelineHover below. Plain state (not a ref written directly to the
+  // DOM like the sprite-preview position) is fine here: this only changes when the hovered
+  // chapter itself changes, not on every mousemove tick, so it doesn't re-render at anywhere near
+  // that frequency.
+  const [hoveredChapter, setHoveredChapter] = useState<Chapter | null>(null);
+  const chaptersBtnRef = useRef<HTMLButtonElement>(null);
+  const chaptersMenuRef = useRef<HTMLDivElement>(null);
+  // "?" toggles this - see keyboardHandlers.ts's own comment on why a keyboard-only affordance
+  // (no toolbar button) matches the convention this mirrors.
+  const [showShortcutsOverlay, setShowShortcutsOverlay] = useState<boolean>(false);
   const [captionsVisible, setCaptionsVisible] = useState<boolean>(false);
   // Blob URL for the <track>'s src, once a real subtitle file (auto-detected sibling .vtt/.srt, or
   // manually picked via the CC button) has actually been loaded and converted - null means there's
@@ -414,6 +453,25 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       }
       return next;
     });
+  };
+  // Whisper language for "Generate from audio" - "auto" lets whisper.cpp detect it from the
+  // audio itself. Same localStorage persistence approach as autoDetectCaptions above, and for the
+  // same reason (a stable preference across files/restarts, without needing Dashboard/AppSettings
+  // plumbing just for this).
+  const [captionsLanguage, setCaptionsLanguage] = useState<string>(() => {
+    try {
+      return localStorage.getItem('briefcast:captionsLanguage') ?? 'auto';
+    } catch {
+      return 'auto';
+    }
+  });
+  const handleCaptionsLanguageChange = (lang: string): void => {
+    setCaptionsLanguage(lang);
+    try {
+      localStorage.setItem('briefcast:captionsLanguage', lang);
+    } catch {
+      // Private/locked-down storage - still works for this session.
+    }
   };
   // True only while a "Generate from audio" transcription is actually running - real model
   // inference (see generate_captions, conversion.rs), so unlike everything else captions-related
@@ -545,6 +603,26 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     wrap.style.backgroundImage = `url("${scrubSprite.url}")`;
     wrap.style.backgroundSize = `${scrubSprite.columns * 100}% ${scrubSprite.rows * 100}%`;
   }, [scrubSprite]);
+
+  // Loads this video's chapter markers (if any) from its `.chapters.json` sidecar as soon as it
+  // opens - unlike captions, there's no "auto-detect from a differently-named file" case here
+  // (chapters aren't a format anything outside this app produces), so this either finds this
+  // exact video's own sidecar or comes back empty.
+  useEffect(() => {
+    setChapters([]);
+    if (mediaType !== 'video' || !filePath) return;
+    let cancelled = false;
+    invoke<string | null>('load_video_chapters', { videoPath: filePath })
+      .then((json) => {
+        if (cancelled || !json) return;
+        const parsed = JSON.parse(json);
+        if (Array.isArray(parsed)) setChapters(parsed);
+      })
+      .catch((err) => console.warn('Failed to load chapters:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, filePath]);
 
   // Opportunistically picks up a same-named subtitle file sitting next to the video (e.g.
   // "clip.mp4" -> "clip.vtt" or "clip.srt") as soon as it opens - the common case for anyone who
@@ -733,6 +811,89 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     setIsLoopEnabled((prev) => !prev);
   };
 
+  // Persists whatever chapter list is passed in - called with the already-updated array right
+  // after each mutation below, rather than in a useEffect keyed on `chapters`, so a rapid string
+  // of edits (e.g. detectChaptersFromSilence adding several at once) writes the sidecar once with
+  // the final state instead of once per intermediate state.
+  const persistChapters = (next: Chapter[]): void => {
+    if (!filePath) return;
+    invoke('save_video_chapters', { videoPath: filePath, json: JSON.stringify(next) }).catch((err) =>
+      console.error('Failed to save chapters:', err)
+    );
+  };
+
+  const addChapterAtCurrentTime = (): void => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration)) return;
+    const time = video.currentTime;
+    const next = [...chapters, { id: crypto.randomUUID(), time, label: formatChapterTime(time) }].sort(
+      (a, b) => a.time - b.time
+    );
+    setChapters(next);
+    persistChapters(next);
+  };
+
+  const renameChapter = (id: string, label: string): void => {
+    setChapters((prev) => {
+      const next = prev.map((c) => (c.id === id ? { ...c, label } : c));
+      persistChapters(next);
+      return next;
+    });
+  };
+
+  const deleteChapter = (id: string): void => {
+    setChapters((prev) => {
+      const next = prev.filter((c) => c.id !== id);
+      persistChapters(next);
+      return next;
+    });
+  };
+
+  const seekToChapter = (time: number): void => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = time;
+  };
+
+  // Suggests chapters from detect_silence (conversion.rs) - that command reports silence RANGES
+  // (dead air), the inverse of what a chapter boundary means, so a suggested chapter sits at the
+  // END of each silence range (where real content resumes after a pause) rather than its start.
+  // Merges with, rather than replacing, any chapters already placed by hand: existing ones within
+  // MERGE_TOLERANCE_SEC of a suggestion are left alone instead of duplicated.
+  const detectChaptersFromSilence = async (): Promise<void> => {
+    if (!filePath) return;
+    const video = videoRef.current;
+    const duration = video?.duration;
+    setIsDetectingChapters(true);
+    try {
+      const ranges = await invoke<{ start: number; end: number }[]>('detect_silence', {
+        inputPath: filePath,
+        noiseDb: null,
+        minDuration: null,
+      });
+      const MERGE_TOLERANCE_SEC = 3;
+      const END_MARGIN_SEC = 2; // skip a suggestion this close to the very end - nothing left to chapter
+      const candidates = ranges
+        .map((r) => r.end)
+        .filter((t) => !Number.isFinite(duration) || t < (duration as number) - END_MARGIN_SEC);
+
+      setChapters((prev) => {
+        const additions: Chapter[] = [];
+        for (const time of candidates) {
+          const tooClose = [...prev, ...additions].some((c) => Math.abs(c.time - time) < MERGE_TOLERANCE_SEC);
+          if (!tooClose) additions.push({ id: crypto.randomUUID(), time, label: formatChapterTime(time) });
+        }
+        const next = [...prev, ...additions].sort((a, b) => a.time - b.time);
+        persistChapters(next);
+        return next;
+      });
+    } catch (err) {
+      console.error('Silence-based chapter detection failed:', err);
+    } finally {
+      setIsDetectingChapters(false);
+    }
+  };
+
   // Wraps togglePauseAndPlay for the <video> element's own onClick - suppresses exactly one
   // toggle right after a popover (settings, captions source menu) was just dismissed by that same
   // click, so dismissing a popover by clicking the video reads as "closed the popover", not also
@@ -796,7 +957,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       setCaptionsGenerationProgress(event.payload);
     });
     try {
-      const vttText = await invoke<string>('generate_captions', { inputPath: filePath });
+      const vttText = await invoke<string>('generate_captions', { inputPath: filePath, language: captionsLanguage });
       const url = URL.createObjectURL(new Blob([vttText], { type: 'text/vtt' }));
       if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
       setCaptionsUrl(url);
@@ -1122,12 +1283,24 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const rect = timeline.getBoundingClientRect();
     const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     timeline.style.setProperty('--preview-position', fraction.toString());
+    const hoverTime = fraction * video.duration;
+
+    // Shows the chapter tooltip whenever the cursor is merely *near* a marker, not just exactly
+    // on its (very thin, hard to precisely hover) tick - tolerance scales with the video's own
+    // length so a 3-hour recording doesn't make every marker impossible to trigger at typical
+    // pixel-per-second zoom, floored at 1s so short videos don't make it trigger too eagerly.
+    if (chapters.length > 0) {
+      const HOVER_TOLERANCE_SEC = Math.max(1, video.duration * 0.01);
+      const nearest = chapters.find((c) => Math.abs(c.time - hoverTime) <= HOVER_TOLERANCE_SEC) ?? null;
+      setHoveredChapter((prev) => (prev?.id === nearest?.id ? prev : nearest));
+    } else if (hoveredChapter) {
+      setHoveredChapter(null);
+    }
 
     const sprite = scrubSprite;
     const wrap = previewWrapRef.current;
     if (!sprite || !wrap || sprite.count === 0) return;
 
-    const hoverTime = fraction * video.duration;
     const index = Math.min(sprite.count - 1, Math.floor(hoverTime / sprite.interval));
     const col = index % sprite.columns;
     const row = Math.floor(index / sprite.columns);
@@ -1188,6 +1361,22 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showCaptionsSourceMenu]);
+
+  // Same click-outside pattern again, for the chapters menu.
+  useEffect(() => {
+    if (!showChaptersMenu) return;
+
+    const handleClickOutside = (event: globalThis.MouseEvent): void => {
+      const target = event.target as Node;
+      if (chaptersMenuRef.current?.contains(target)) return;
+      if (chaptersBtnRef.current?.contains(target)) return;
+      setShowChaptersMenu(false);
+      suppressNextVideoClickRef.current = true;
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showChaptersMenu]);
 
   const handleAutoplay = (): void => {
     if (onAutoplayNextChange) {
@@ -1271,7 +1460,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       seekBackward,
       seekForward,
       stepFrameBackward: () => stepFrame(-1),
-      stepFrameForward: () => stepFrame(1)
+      stepFrameForward: () => stepFrame(1),
+      toggleShortcutsOverlay: () => setShowShortcutsOverlay((prev) => !prev)
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -1401,6 +1591,51 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 			onClose={() => setShowAlert(false)}
 			/>
 		)}
+
+		{showShortcutsOverlay && (
+			<div
+				className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50"
+				onMouseDown={(e) => {
+					if (e.target === e.currentTarget) setShowShortcutsOverlay(false);
+				}}
+			>
+				<div className="w-[420px] max-h-[80vh] overflow-y-auto rounded-xl bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-100 shadow-2xl p-5">
+					<div className="flex items-center justify-between mb-3">
+						<h2 className="text-sm font-semibold">Keyboard shortcuts</h2>
+						<button
+							className="p-1 rounded-full hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+							onClick={() => setShowShortcutsOverlay(false)}
+							title="Close"
+						>
+							<IoClose size={18} />
+						</button>
+					</div>
+					<div className="flex flex-col gap-3 text-sm">
+						{[
+							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame']] },
+							{ title: 'Volume', rows: [['M', 'Mute / unmute']] },
+							{ title: 'Display', rows: [['F', 'Fullscreen'], ['T', 'Theater mode'], ['I', 'Picture in picture']] },
+							{ title: 'Captions', rows: [['C', 'Toggle captions']] },
+							{ title: 'Help', rows: [['?', 'Show / hide this overlay']] },
+						].map((group) => (
+							<div key={group.title}>
+								<h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500 mb-1.5">{group.title}</h3>
+								<div className="flex flex-col gap-1.5">
+									{group.rows.map(([keys, description]) => (
+										<div key={keys} className="flex items-center justify-between gap-4">
+											<span className="text-neutral-600 dark:text-neutral-300">{description}</span>
+											<kbd className="shrink-0 px-2 py-1 rounded-md text-xs font-mono bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-300">
+												{keys}
+											</kbd>
+										</div>
+									))}
+								</div>
+							</div>
+						))}
+					</div>
+				</div>
+			</div>
+		)}
       
     	<div
         	className={`w-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
@@ -1416,10 +1651,29 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						ref={timelineContainerRef}
 						onMouseDown={handleTimelineMouseDown}
 						onMouseMove={handleTimelineHover}
+						onMouseLeave={() => setHoveredChapter(null)}
 					>
 						<div className="timeline">
 						<div className="preview-img-wrap" ref={previewWrapRef} />
 						<div className="thumb-indicator"></div>
+						{hoveredChapter && videoRef.current && Number.isFinite(videoRef.current.duration) && (
+							<div
+								className="chapter-tooltip"
+								style={{ left: `${(hoveredChapter.time / videoRef.current.duration) * 100}%` }}
+							>
+								{hoveredChapter.label === formatChapterTime(hoveredChapter.time)
+									? hoveredChapter.label
+									: `${formatChapterTime(hoveredChapter.time)} — ${hoveredChapter.label}`}
+							</div>
+						)}
+						{videoRef.current && Number.isFinite(videoRef.current.duration) && chapters.map((chapter) => (
+							<div
+								key={chapter.id}
+								className="chapter-tick"
+								style={{ left: `${(chapter.time / videoRef.current!.duration) * 100}%` }}
+								title={chapter.label}
+							/>
+						))}
 						</div>
 					</div>
 					
@@ -1526,6 +1780,67 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
 						<div className="relative">
 							<button
+								ref={chaptersBtnRef}
+								className="chapters-btn w-7"
+								onClick={() => setShowChaptersMenu((prev) => !prev)}
+								title={chapters.length > 0 ? `${chapters.length} chapter${chapters.length === 1 ? '' : 's'}` : 'Chapters'}
+							>
+								{chapters.length > 0
+								? <IoBookmark className='w-[100%] text-2xl text-red-500' />
+								: <IoBookmarkOutline className='w-[100%] text-2xl text-white' />}
+							</button>
+
+							{showChaptersMenu && (
+								<div
+									ref={chaptersMenuRef}
+									className="origin-bottom-right absolute bottom-full right-0 mb-1 w-72 rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 overflow-hidden"
+								>
+									{chapters.length > 0 && (
+										<div className="max-h-48 overflow-y-auto divide-y divide-gray-100 dark:divide-neutral-700">
+											{chapters.map((chapter) => (
+												<div key={chapter.id} className="flex items-center gap-2 px-3 py-2">
+													<button
+														className="text-xs tabular-nums text-gray-400 dark:text-neutral-500 shrink-0 hover:text-red-500"
+														onClick={() => seekToChapter(chapter.time)}
+														title="Jump to this chapter"
+													>
+														{formatChapterTime(chapter.time)}
+													</button>
+													<input
+														className="flex-1 min-w-0 text-sm bg-transparent border-none outline-none focus:ring-1 focus:ring-red-400 rounded px-1"
+														value={chapter.label}
+														onChange={(e) => renameChapter(chapter.id, e.target.value)}
+													/>
+													<button
+														className="shrink-0 text-gray-400 hover:text-red-500"
+														onClick={() => deleteChapter(chapter.id)}
+														title="Delete chapter"
+													>
+														<IoTrashOutline size={14} />
+													</button>
+												</div>
+											))}
+										</div>
+									)}
+									<button
+										className="flex items-center gap-2 w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+										onClick={addChapterAtCurrentTime}
+									>
+										<IoBookmarkOutline size={14} /> Add chapter at current time
+									</button>
+									<button
+										className="flex items-center gap-2 w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+										onClick={() => void detectChaptersFromSilence()}
+										disabled={isDetectingChapters}
+									>
+										<IoSparklesOutline size={14} /> {isDetectingChapters ? 'Detecting…' : 'Detect from silence'}
+									</button>
+								</div>
+							)}
+						</div>
+
+						<div className="relative">
+							<button
 								ref={captionsBtnRef}
 								className="captions-btn w-7"
 								onClick={toggleCaptions}
@@ -1561,6 +1876,18 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 									>
 										Load caption file…
 									</button>
+									<div className="flex items-center justify-between gap-2 px-3.5 py-2 text-xs text-gray-500 dark:text-neutral-400">
+										<span>Language</span>
+										<select
+											className="text-xs rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 px-1.5 py-1 focus:outline-none"
+											value={captionsLanguage}
+											onChange={(e) => handleCaptionsLanguageChange(e.target.value)}
+										>
+											{CAPTIONS_LANGUAGE_OPTIONS.map(([code, name]) => (
+												<option key={code} value={code}>{name}</option>
+											))}
+										</select>
+									</div>
 									<button
 										className="block w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700"
 										onClick={() => void generateCaptionsFromAudio()}
@@ -1602,6 +1929,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							onGenerateCaptions={() => { setShowSettings(false); void generateCaptionsFromAudio(); }}
 							isGeneratingCaptions={isGeneratingCaptions}
 							captionsGenerationProgress={captionsGenerationProgress}
+							captionsLanguage={captionsLanguage}
+							onCaptionsLanguageChange={handleCaptionsLanguageChange}
 							/>
 							</div>
 						)}

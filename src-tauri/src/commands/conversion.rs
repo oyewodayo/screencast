@@ -1316,9 +1316,19 @@ async fn generate_scrub_sprite(
 // VIDEO's own path+mtime (see preview_cache_path) so re-opening the same file is instant instead
 // of re-transcribing.
 #[tauri::command]
-pub async fn generate_captions(app_handle: AppHandle, input_path: String) -> Result<String, String> {
+pub async fn generate_captions(
+    app_handle: AppHandle,
+    input_path: String,
+    // Whisper language code ("en", "fr", ...), or omitted/"auto" to let whisper.cpp detect it
+    // from the audio itself. Folded into the cache namespace (not just the video's own path+mtime)
+    // so switching languages on the same video regenerates instead of silently returning
+    // whatever language was cached from an earlier run.
+    language: Option<String>,
+) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
-    let cache_path = preview_cache_path(&input, "captions_generated_v1", "vtt")?;
+    let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
+    let namespace = format!("captions_generated_v1_{}", lang);
+    let cache_path = preview_cache_path(&input, &namespace, "vtt")?;
 
     if cache_path.exists() {
         return std::fs::read_to_string(&cache_path)
@@ -1358,7 +1368,7 @@ pub async fn generate_captions(app_handle: AppHandle, input_path: String) -> Res
 
     // -of wants the output path WITHOUT its extension - whisper-cli appends ".vtt" itself.
     let output_stem = cache_path.with_extension("");
-    let transcription = run_whisper_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem).await;
+    let transcription = run_whisper_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem, &lang).await;
     let _ = std::fs::remove_file(&wav_path); // best-effort - a leftover scratch WAV is harmless either way
     transcription?;
 
@@ -1429,12 +1439,14 @@ async fn run_whisper_cli(
     model_path: &PathBuf,
     wav_path: &PathBuf,
     output_stem: &PathBuf,
+    language: &str,
 ) -> Result<(), String> {
     let app_handle = app_handle.clone();
     let whisper_path = whisper_path.clone();
     let model_path = model_path.clone();
     let wav_path = wav_path.clone();
     let output_stem = output_stem.clone();
+    let language = language.to_string();
     // Leaves one logical core free rather than claiming every one of them - using all of them
     // starves everything else on the machine of CPU for the whole transcription (measured: a
     // couple of minutes even for under a minute of audio), including the UI thread rendering the
@@ -1450,7 +1462,7 @@ async fn run_whisper_cli(
         hide_console_window(&mut cmd);
         cmd.arg("-m").arg(path_to_str(&model_path)?);
         cmd.arg("-f").arg(path_to_str(&wav_path)?);
-        cmd.args(["-ovtt", "-np", "-pp", "-t", &threads.to_string()]);
+        cmd.args(["-ovtt", "-np", "-pp", "-t", &threads.to_string(), "-l", &language]);
         cmd.arg("-of").arg(path_to_str(&output_stem)?);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());

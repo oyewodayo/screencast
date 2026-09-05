@@ -20,6 +20,9 @@ interface KeyboardHandlers {
   // most desktop NLEs - always pauses first (see stepFrame's own comment, VideoPlayer.tsx).
   stepFrameBackward?: () => void;
   stepFrameForward?: () => void;
+  // "?" for a shortcuts overlay is the same convention YouTube, Gmail, and most keyboard-driven
+  // web apps share - shown here in the player rather than only buried in Settings > Help.
+  toggleShortcutsOverlay?: () => void;
   onPlaybackRateChange?: (rate: number) => void;
   onVolumeChange?: (volume: number) => void;
 }
@@ -100,6 +103,10 @@ export const createKeyboardHandler = (
       case ".":
         e.preventDefault();
         handlers.stepFrameForward?.();
+        break;
+      case "?":
+        e.preventDefault();
+        handlers.toggleShortcutsOverlay?.();
         break;
       default:
         break;

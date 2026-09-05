@@ -365,6 +365,8 @@ fn main() {
             services::docs_search::search_docs,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
+            services::video_edits::save_video_chapters,
+            services::video_edits::load_video_chapters,
             services::trash::move_to_trash,
             services::trash::list_trash,
             services::trash::restore_from_trash,

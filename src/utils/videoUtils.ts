@@ -291,3 +291,32 @@ export const updateTimelineProgress = (videoElement: HTMLVideoElement | null, ti
     progress: percent
   };
 };
+
+// A curated subset of what whisper.cpp's multilingual model actually supports (~99 languages) -
+// the full list would be unwieldy in a small popover; these are the ones a screen-recording tool's
+// audience is most likely to actually narrate in. "auto" (whisper.cpp's own language-detection
+// mode) covers anything not listed here, just without a guaranteed-correct guess up front. Shared
+// between VideoPlayer.tsx's own captions menu and PlaytimeSettings.tsx's Captions submenu, which
+// both offer the same "Generate from audio" action and must offer the same language choice for it.
+export const CAPTIONS_LANGUAGE_OPTIONS: [string, string][] = [
+  ['auto', 'Auto-detect'],
+  ['en', 'English'],
+  ['es', 'Spanish'],
+  ['fr', 'French'],
+  ['de', 'German'],
+  ['it', 'Italian'],
+  ['pt', 'Portuguese'],
+  ['nl', 'Dutch'],
+  ['ru', 'Russian'],
+  ['zh', 'Chinese'],
+  ['ja', 'Japanese'],
+  ['ko', 'Korean'],
+  ['ar', 'Arabic'],
+  ['hi', 'Hindi'],
+  ['tr', 'Turkish'],
+  ['pl', 'Polish'],
+  ['sv', 'Swedish'],
+  ['vi', 'Vietnamese'],
+  ['id', 'Indonesian'],
+  ['uk', 'Ukrainian'],
+];

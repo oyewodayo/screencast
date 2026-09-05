@@ -228,10 +228,12 @@ this project itself. Download the CPU-only Windows build from its
 `whisper-bin-x64.zip` asset - avoid the `-blas`/`-cublas` variants, which need matching
 GPU drivers/libraries this app doesn't otherwise depend on) and copy `whisper-cli.exe`
 plus `whisper.dll`, `ggml.dll`, `ggml-base.dll`, and every `ggml-cpu-*.dll` into
-`src-tauri/binaries/whisper/`. Then download a model - `ggml-base.en.bin` from
+`src-tauri/binaries/whisper/`. Then download a model - `ggml-base.bin` (the multilingual
+build, **not** `ggml-base.en.bin` - the two are near-identical in size, so there's no
+real tradeoff, and only the multilingual one supports the language picker in the
+"Generate from audio" menu) from
 [the ggml-org/whisper.cpp model repo on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp)
-is the size/accuracy balance this app defaults to (~141MB; en-only, since Briefcast has no
-language picker for this yet) - into the same folder.
+into the same folder (~141MB).
 
 ```bash
 npm run tauri dev
@@ -305,7 +307,7 @@ screencast/
 │   │   └── views/                   # Standalone window (recording-completed popup)
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
 │   ├── binaries/heif/               # Bundled libheif (heif-dec.exe + DLLs) - HEIC/HEIF fallback decode
-│   ├── binaries/whisper/            # Bundled whisper.cpp CLI + DLLs + ggml-base.en.bin model - auto-generated captions
+│   ├── binaries/whisper/            # Bundled whisper.cpp CLI + DLLs + ggml-base.bin (multilingual) model - auto-generated captions
 │   └── tauri.conf.json              # Tauri app/window/permissions configuration
 └── public/                          # Static assets (icons, notification sounds)
 ```

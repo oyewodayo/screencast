@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { MdClosedCaption, MdOutlineOpacity, MdSpeed } from 'react-icons/md';
 import { IoPlayCircleOutline, IoChevronForward, IoCheckmark } from 'react-icons/io5';
+import { CAPTIONS_LANGUAGE_OPTIONS } from '../../utils/videoUtils';
 
 // Define the props interface
 interface PlaytimeSettingsProps {
@@ -20,6 +21,8 @@ interface PlaytimeSettingsProps {
   onGenerateCaptions: () => void;
   isGeneratingCaptions: boolean;
   captionsGenerationProgress: number | null;
+  captionsLanguage: string;
+  onCaptionsLanguageChange: (lang: string) => void;
 }
 
 const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
@@ -35,7 +38,9 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   onLoadCaptionsFile,
   onGenerateCaptions,
   isGeneratingCaptions,
-  captionsGenerationProgress
+  captionsGenerationProgress,
+  captionsLanguage,
+  onCaptionsLanguageChange
 }) => {
   // A native <select>'s open dropdown list is rendered by the OS, not the page, so it can't pick
   // up this app's styling (that's what was showing as a plain, unstyled white popup) - this
@@ -151,6 +156,20 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
           <button className="settings-row settings-submenu-item" onClick={onLoadCaptionsFile} disabled={isGeneratingCaptions}>
             <span>Load caption file…</span>
           </button>
+          <div className="settings-row settings-submenu-item">
+            <span>Generate language</span>
+            <select
+              className="text-xs rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 px-1.5 py-1 focus:outline-none"
+              value={captionsLanguage}
+              onChange={(e) => onCaptionsLanguageChange(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              disabled={isGeneratingCaptions}
+            >
+              {CAPTIONS_LANGUAGE_OPTIONS.map(([code, name]) => (
+                <option key={code} value={code}>{name}</option>
+              ))}
+            </select>
+          </div>
           <button className="settings-row settings-submenu-item" onClick={onGenerateCaptions} disabled={isGeneratingCaptions}>
             <span>{isGeneratingCaptions ? `Generating… ${Math.round(captionsGenerationProgress ?? 0)}%` : 'Generate from audio (offline)'}</span>
           </button>

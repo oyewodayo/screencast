@@ -356,6 +356,40 @@ video {
     box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
 }
 
+/* Chapter marker - a thin tick on the scrub bar, positioned via inline `left` (VideoPlayer.tsx).
+   pointer-events: none so it never intercepts the timeline's own drag-to-seek/hover-preview
+   handlers, which are bound to .timeline-container, not this element - clicking a chapter's own
+   entry in the Chapters menu is the way to jump to it, this is purely a visual marker. */
+.timeline .chapter-tick {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 2px;
+    background-color: rgba(255, 255, 255, 0.9);
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* Chapter hover tooltip - shown (VideoPlayer.tsx's handleTimelineHover) whenever the cursor is
+   merely near a marker, not pixel-precisely on its thin tick. Sits in the gap between the
+   timeline and the scrub-preview thumbnail above it (.preview-img-wrap's own bottom edge is at
+   top: -1rem) rather than a fixed pixel offset, so it stays clear of that thumbnail without the
+   two needing to coordinate on an exact height. */
+.timeline .chapter-tooltip {
+    position: absolute;
+    bottom: 100%;
+    margin-bottom: 2px;
+    transform: translateX(-50%);
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.25rem;
+    background: rgba(0, 0, 0, 0.85);
+    color: #fff;
+    font-size: 11px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 2;
+}
+
 /* Scrub-bar hover preview: a fixed-size window showing one tile of the sprite sheet
    VideoPlayer.tsx loads as this element's own CSS background-image. background-size is set (in
    JS) to columns*100%/rows*100%, so the browser scales the sprite to make one tile exactly fill
