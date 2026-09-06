@@ -11,6 +11,7 @@ import { RxDoubleArrowLeft, RxDoubleArrowRight } from 'react-icons/rx';
 import Alert from './custom/Alert';
 import PlaytimeSettings from './custom/PlaytimeSettings';
 import useAutoHideControls from '../hooks/useAutoHideControls';
+import { getWaveformPeaks } from '../utils/audioWaveform';
 
 // Import utility functions
 import {
@@ -241,6 +242,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // clock could stall on, which read as "clicking the clip stopped playback".
   const noiseCtxRef = useRef<AudioContext | null>(null);
   const noiseWorkletReadyRef = useRef<Promise<void> | null>(null);
+  // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only) - a
+  // completely separate AudioContext/graph from the noise-reduction one above, not a shared one:
+  // noiseCtxRef's own createMediaElementSource call only ever fires when activeClipEffects has a
+  // noiseReduction value, which only the timeline editor (video-only) ever sets, so the two never
+  // actually compete for this element's one-time-only createMediaElementSource call in practice,
+  // and keeping them separate avoids retrofitting that already-working code to share a source.
+  const audioVisualizerCtxRef = useRef<AudioContext | null>(null);
+  const audioAnalyserRef = useRef<AnalyserNode | null>(null);
+  const audioVisualizerSetupRef = useRef(false);
+  const visualizerCanvasRef = useRef<HTMLCanvasElement>(null);
   // The graph itself (source/node), set only once addModule has resolved AND a clip has actually
   // asked for noise reduction - null until then, so a session that never touches the feature never
   // pays for a MediaElementAudioSourceNode at all (the AudioContext/worklet-load above is cheap and
@@ -482,6 +493,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // indefinite spinner for what can be a multi-minute wait on a long recording.
   const [captionsGenerationProgress, setCaptionsGenerationProgress] = useState<number | null>(null);
   const [captionsGenerationError, setCaptionsGenerationError] = useState<string | null>(null);
+  const [thumbnailStatus, setThumbnailStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  // A visible snapshot of the exact frame about to become the thumbnail, plus the timestamp it was
+  // taken at - shown in a confirm/cancel picker (openThumbnailPicker/handleSetThumbnail below)
+  // rather than silently acting on whatever frame happened to be on screen when the button was
+  // clicked, which gave no way to see (or double check) what you were actually about to set.
+  const [thumbnailPreview, setThumbnailPreview] = useState<{ url: string; time: number } | null>(null);
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [showSkipTime, setShowSkipTime] = useState<boolean>(false);
 
@@ -496,6 +513,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // failure), in which case hovering the timeline just shows no preview.
   const [scrubSprite, setScrubSprite] = useState<ScrubSpriteMeta | null>(null);
   const previewWrapRef = useRef<HTMLDivElement>(null);
+  // Audio's own equivalent of the video scrub-sprite above - a real decoded waveform (see
+  // utils/audioWaveform.ts) drawn onto the timeline itself, since there's no video frame to show a
+  // thumbnail of. null until decoded, or permanently for a file with no audio track/a failed decode
+  // (that util already logs its own failures - this just stays empty rather than erroring).
+  const [audioWaveformPeaks, setAudioWaveformPeaks] = useState<number[] | null>(null);
+  const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
+  // Audio's own equivalent of the chapter-hover tooltip / video thumbnail: since there's nothing
+  // visual to preview, hovering the timeline just shows the timestamp under the cursor instead of
+  // the "(nothing)" a bare, permanently-empty .preview-img-wrap used to render for audio files.
+  const [audioHoverTimeLabel, setAudioHoverTimeLabel] = useState<string | null>(null);
 
   // Settings and preferences
   // Falls back to local state when the caller doesn't pass autoplayNext/onAutoplayNextChange
@@ -586,6 +613,120 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     };
   }, [mediaType, filePath]);
 
+  // Audio's counterpart to the effect above - decodes the whole file's peak amplitudes (see
+  // utils/audioWaveform.ts) as soon as an audio file opens, drawn onto the timeline once ready by
+  // the effect further below. filePath, not `src`, for the same reason as the sprite fetch (the
+  // waveform decoder fetches the real file itself, not the already-loadable asset:// URL).
+  useEffect(() => {
+    setAudioWaveformPeaks(null);
+    if (mediaType !== 'audio' || !filePath) return;
+
+    let cancelled = false;
+    getWaveformPeaks(filePath)
+      .then((peaks) => {
+        if (!cancelled) setAudioWaveformPeaks(peaks);
+      })
+      .catch(() => {
+        // Already logged by getWaveformPeaks itself - a file with no audio track (or a failed
+        // decode) just leaves the timeline waveform-less, same degradation the editor's own
+        // ClipWaveform/AudioChipWaveform accept.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, filePath]);
+
+  // Sets up the real-time audio-reactive visualizer graph once, the first time this element is
+  // actually playing audio (mediaType 'audio') - a completely separate AudioContext/graph from the
+  // noise-reduction one above (see audioVisualizerCtxRef's own doc comment for why that's fine).
+  // createMediaElementSource detaches the element's native audio output the instant it's called,
+  // so this resumes the (possibly suspended, per browser autoplay policy) context and reconnects
+  // through the analyser in the same synchronous block - otherwise there'd be an audible gap where
+  // the file kept "playing" but produced no sound at all until some later resume.
+  useEffect(() => {
+    if (mediaType !== 'audio' || audioVisualizerSetupRef.current) return;
+    const video = videoRef.current;
+    if (!video) return;
+    audioVisualizerSetupRef.current = true;
+
+    const ctx = new AudioContext();
+    try {
+      const source = ctx.createMediaElementSource(video);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.8;
+      source.connect(analyser);
+      analyser.connect(ctx.destination);
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      audioVisualizerCtxRef.current = ctx;
+      audioAnalyserRef.current = analyser;
+    } catch (err) {
+      console.error("Failed to set up audio visualizer:", err);
+      ctx.close().catch(() => {});
+    }
+
+    return () => {
+      audioAnalyserRef.current = null;
+      audioVisualizerCtxRef.current = null;
+      audioVisualizerSetupRef.current = false;
+      ctx.close().catch(() => {});
+    };
+  }, [mediaType]);
+
+  // Draws the live waveform while playing; shows a flat idle line otherwise. Measures the canvas
+  // once per play/pause transition rather than every frame (unlike a naive per-frame resize) - a
+  // container resize mid-playback won't be picked up until the next play/pause, an accepted
+  // tradeoff for how rarely this container's size actually changes while listening.
+  useEffect(() => {
+    const canvas = visualizerCanvasRef.current;
+    if (mediaType !== 'audio' || !canvas) return;
+    const ctx2d = canvas.getContext('2d');
+    if (!ctx2d) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const analyser = audioAnalyserRef.current;
+    if (!isPlaying || !analyser) {
+      ctx2d.clearRect(0, 0, width, height);
+      ctx2d.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+      ctx2d.lineWidth = 2;
+      ctx2d.beginPath();
+      ctx2d.moveTo(0, height / 2);
+      ctx2d.lineTo(width, height / 2);
+      ctx2d.stroke();
+      return;
+    }
+
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    let rafId: number;
+    const draw = () => {
+      analyser.getByteTimeDomainData(dataArray);
+      ctx2d.clearRect(0, 0, width, height);
+      ctx2d.lineWidth = 2;
+      ctx2d.strokeStyle = 'rgba(239, 68, 68, 0.9)';
+      ctx2d.beginPath();
+      const sliceWidth = width / bufferLength;
+      let x = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        const v = dataArray[i] / 128.0;
+        const y = (v * height) / 2;
+        if (i === 0) ctx2d.moveTo(x, y);
+        else ctx2d.lineTo(x, y);
+        x += sliceWidth;
+      }
+      ctx2d.stroke();
+      rafId = requestAnimationFrame(draw);
+    };
+    draw();
+    return () => cancelAnimationFrame(rafId);
+  }, [mediaType, isPlaying]);
+
   // Sets the hover-preview wrapper's background image + tile-grid sizing once per sprite (not per
   // hover - handleTimelineHover only ever touches backgroundPosition after this). background-size
   // at columns*100%/rows*100% makes one tile exactly fill this element's own box regardless of its
@@ -603,6 +744,38 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     wrap.style.backgroundImage = `url("${scrubSprite.url}")`;
     wrap.style.backgroundSize = `${scrubSprite.columns * 100}% ${scrubSprite.rows * 100}%`;
   }, [scrubSprite]);
+
+  // Draws the decoded peaks onto the timeline's own waveform canvas - same devicePixelRatio-aware
+  // canvas technique as VideoTimelineDocker's ClipWaveform/AudioChipWaveform (bars centered
+  // vertically, like the latter, since this sits within the thin timeline rather than anchored to
+  // a tall clip block's own bottom edge). Re-runs on `containerSize` (already tracked elsewhere for
+  // the overlay letterbox math) as a proxy for "the timeline's own width may have changed" -
+  // window resize/theater mode/fullscreen all change that without peaks themselves changing.
+  useEffect(() => {
+    const canvas = waveformCanvasRef.current;
+    const timeline = timelineContainerRef.current;
+    if (!canvas || !timeline || !audioWaveformPeaks) return;
+    const widthPx = timeline.getBoundingClientRect().width;
+    const heightPx = canvas.clientHeight;
+    if (widthPx <= 0 || heightPx <= 0) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(widthPx * dpr));
+    canvas.height = Math.max(1, Math.round(heightPx * dpr));
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, widthPx, heightPx);
+
+    const buckets = Math.max(8, Math.floor(widthPx / 2));
+    const barWidth = widthPx / buckets;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    for (let i = 0; i < buckets; i++) {
+      const amp = audioWaveformPeaks[Math.min(audioWaveformPeaks.length - 1, Math.floor((i / buckets) * audioWaveformPeaks.length))] ?? 0;
+      const barHeight = Math.max(1, amp * heightPx);
+      ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
+    }
+  }, [audioWaveformPeaks, containerSize]);
 
   // Loads this video's chapter markers (if any) from its `.chapters.json` sidecar as soon as it
   // opens - unlike captions, there's no "auto-detect from a differently-named file" case here
@@ -853,6 +1026,43 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const video = videoRef.current;
     if (!video) return;
     video.currentTime = time;
+  };
+
+  // Overwrites this video's gallery/sidebar poster (get_video_thumbnail's cache, conversion.rs)
+  // with whatever frame is on screen right now. That command emits video-thumbnail-updated once
+  // it's done - Dashboard.tsx/VideoFolderGallery.tsx listen for that to bust their own already-
+  // resolved thumbnail URL for this path, since the URL string itself doesn't change (same
+  // content-addressed cache path), only its bytes did.
+  // Pauses on whatever frame is currently showing and snapshots it client-side (crossOrigin=
+  // "anonymous" on the <video> above is what makes this canvas draw legal rather than throwing a
+  // tainted-canvas SecurityError) so the confirm dialog shows the user the EXACT frame ffmpeg
+  // would extract at that same currentTime - not a guess, not a re-seek, the real pixels.
+  const openThumbnailPicker = (): void => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration)) return;
+    video.pause();
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    setThumbnailPreview({ url: canvas.toDataURL('image/jpeg', 0.85), time: video.currentTime });
+  };
+
+  const handleSetThumbnail = async (): Promise<void> => {
+    if (!filePath || !thumbnailPreview) return;
+    setThumbnailStatus('saving');
+    try {
+      await invoke('set_video_thumbnail', { inputPath: filePath, time: thumbnailPreview.time });
+      setThumbnailStatus('saved');
+    } catch (err) {
+      console.error('Failed to set thumbnail:', err);
+      setThumbnailStatus('error');
+    } finally {
+      setThumbnailPreview(null);
+      setTimeout(() => setThumbnailStatus('idle'), 2000);
+    }
   };
 
   // Suggests chapters from detect_silence (conversion.rs) - that command reports silence RANGES
@@ -1297,6 +1507,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       setHoveredChapter(null);
     }
 
+    // Audio's stand-in for the video thumbnail: there's no frame to preview, so show the
+    // timestamp under the cursor instead - rounded to whole seconds so this only re-renders
+    // roughly once per second of horizontal cursor movement, not on every pixel of mousemove.
+    if (mediaType === 'audio') {
+      const label = formatDuration(hoverTime);
+      setAudioHoverTimeLabel((prev) => (prev === label ? prev : label));
+    }
+
     const sprite = scrubSprite;
     const wrap = previewWrapRef.current;
     if (!sprite || !wrap || sprite.count === 0) return;
@@ -1651,10 +1869,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						ref={timelineContainerRef}
 						onMouseDown={handleTimelineMouseDown}
 						onMouseMove={handleTimelineHover}
-						onMouseLeave={() => setHoveredChapter(null)}
+						onMouseLeave={() => { setHoveredChapter(null); setAudioHoverTimeLabel(null); }}
 					>
 						<div className="timeline">
-						<div className="preview-img-wrap" ref={previewWrapRef} />
+						{mediaType === 'audio' && <canvas ref={waveformCanvasRef} className="audio-waveform-canvas" />}
+						<div className="preview-img-wrap" ref={previewWrapRef}>
+							{mediaType === 'audio' && audioHoverTimeLabel && (
+								<span className="audio-hover-time">{audioHoverTimeLabel}</span>
+							)}
+						</div>
 						<div className="thumb-indicator"></div>
 						{hoveredChapter && videoRef.current && Number.isFinite(videoRef.current.duration) && (
 							<div
@@ -1931,6 +2154,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							captionsGenerationProgress={captionsGenerationProgress}
 							captionsLanguage={captionsLanguage}
 							onCaptionsLanguageChange={handleCaptionsLanguageChange}
+							onSetThumbnail={() => { setShowSettings(false); openThumbnailPicker(); }}
+							thumbnailStatus={thumbnailStatus}
 							/>
 							</div>
 						)}
@@ -1953,6 +2178,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					<video
 						ref={videoRef}
 						loop={loop || isLoopEnabled}
+						crossOrigin="anonymous"
 						onClick={handleVideoClick}
 						onError={handleVideoError}
 						onLoadedMetadata={() => {
@@ -1974,6 +2200,48 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							/>
 						)}
 					</video>
+					{mediaType === 'audio' && (
+						<canvas ref={visualizerCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
+					)}
+					{thumbnailPreview && (
+						<div
+							className="absolute inset-0 z-30 flex items-center justify-center bg-black/70"
+							onClick={() => setThumbnailPreview(null)}
+						>
+							<div
+								className="flex flex-col items-center gap-3 p-4 rounded-lg bg-neutral-900 ring-1 ring-white/10 shadow-2xl"
+								onClick={(e) => e.stopPropagation()}
+							>
+								<img
+									src={thumbnailPreview.url}
+									alt="Chosen thumbnail frame"
+									className="max-w-[60vw] max-h-[40vh] rounded ring-1 ring-white/10"
+								/>
+								<div className="text-white text-sm">
+									Use this frame ({formatChapterTime(thumbnailPreview.time)}) as the thumbnail?
+								</div>
+								<p className="text-neutral-400 text-xs max-w-[60vw] text-center">
+									This updates the video file itself, so it's also what shows in File Explorer or when you share the file elsewhere.
+								</p>
+								<div className="flex gap-2 mt-1">
+									<button
+										className="px-3.5 py-1.5 rounded-md text-sm text-neutral-300 hover:bg-white/10"
+										onClick={() => setThumbnailPreview(null)}
+										disabled={thumbnailStatus === 'saving'}
+									>
+										Cancel
+									</button>
+									<button
+										className="px-3.5 py-1.5 rounded-md text-sm font-medium bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+										onClick={() => void handleSetThumbnail()}
+										disabled={thumbnailStatus === 'saving'}
+									>
+										{thumbnailStatus === 'saving' ? 'Saving…' : 'Use this frame'}
+									</button>
+								</div>
+							</div>
+						</div>
+					)}
 					{isRecovering && (
 						<div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none bg-black/40">
 							<div className="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />

@@ -1765,7 +1765,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   return (
     <div className="w-full flex flex-col gap-2">
       {/* Hidden capture rig - never shown, just decodes frames for the filmstrip/cover. */}
-      <video ref={hiddenVideoRef} src={playableSrc} muted preload="metadata" style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }} />
+      {/* crossOrigin="anonymous" is required here, not optional - without it, drawing this asset://-
+          sourced video onto captureCanvasRef taints the canvas, and toDataURL() throws
+          ("Tainted canvases may not be exported") on every single capture. That throw happens
+          inside captureFrameAt's "seeked" listener, outside the promise chain, so it was never
+          visible as a rejection anywhere - it just silently killed the filmstrip and cover capture
+          permanently for every video. Same fix already applied to asset://-sourced <img>s
+          elsewhere (imageObjectCache.ts, boardImageCache.ts) - just never carried over to this
+          <video> capture rig. */}
+      <video ref={hiddenVideoRef} src={playableSrc} crossOrigin="anonymous" muted preload="metadata" style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }} />
       <canvas ref={captureCanvasRef} style={{ display: "none" }} />
       {editStore.audioOverlays.map((o) => (
         <audio

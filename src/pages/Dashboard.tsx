@@ -502,11 +502,18 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // re-triggered that effect and re-resolved every already-cached thumbnail on every click. That
   // was the actual "selection is lagging/hanging" bug: not the selection logic itself, but a full
   // thumbnail-resolution storm firing on every click as a side effect of it.
-  const resolvePreviewAssetUrl = useCallback(async (sourcePath: string): Promise<string> => {
-    const cached = previewAssetUrlCacheRef.current.get(sourcePath);
-    if (cached) return cached;
+  // bypassCache is for exactly one case: a video's poster was just overwritten in place
+  // (set_video_thumbnail, conversion.rs) at the SAME cache path it always had, so neither this
+  // Map nor the browser's own HTTP cache has any way to notice the bytes underneath changed - see
+  // the video-thumbnail-updated listener below. The `?t=` it appends only matters for that path;
+  // every normal (non-bypassed) resolve keeps returning the plain, cacheable URL.
+  const resolvePreviewAssetUrl = useCallback(async (sourcePath: string, bypassCache = false): Promise<string> => {
+    if (!bypassCache) {
+      const cached = previewAssetUrlCacheRef.current.get(sourcePath);
+      if (cached) return cached;
+    }
     const absolutePath = await invoke<string>("convert_file_path_to_url", { filepath: sourcePath });
-    const url = convertFileSrc(absolutePath);
+    const url = convertFileSrc(absolutePath) + (bypassCache ? `?t=${Date.now()}` : "");
     previewAssetUrlCacheRef.current.set(sourcePath, url);
     return url;
   }, []);
@@ -546,10 +553,28 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // content-addressed cache on the Rust side (a single ffmpeg frame extraction, ~1s into the
   // clip). Routed through the same shared thumbnailLimiter as every other gallery/sidebar
   // thumbnail request by the callers of this function, not here - this just resolves one URL.
-  const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
+  const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }, bypassCache = false): Promise<string> => {
     const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: file.path });
-    return resolvePreviewAssetUrl(thumbPath);
+    return resolvePreviewAssetUrl(thumbPath, bypassCache);
   }, [resolvePreviewAssetUrl]);
+
+  // VideoPlayer.tsx's "set current frame as thumbnail" overwrites get_video_thumbnail's cached jpg
+  // in place, at the SAME path it always had - so this listens for its completion and clears the
+  // stale cached URL for that video, keyed by re-deriving the same thumbPath (a cache hit, and
+  // thus effectively free) rather than trying to track path->thumbPath mappings separately.
+  // VideoFolderGallery.tsx has its own listener alongside this one, to actually refresh whatever
+  // it's already rendered - this one only clears Dashboard's own cache so that gallery's re-fetch
+  // doesn't just receive the identical stale URL back.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("video-thumbnail-updated", (event) => {
+      invoke<string>("get_video_thumbnail", { inputPath: event.payload })
+        .then((thumbPath) => previewAssetUrlCacheRef.current.delete(thumbPath))
+        .catch((err) => console.error("Failed to invalidate thumbnail cache:", err));
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   // The video-tools timeline's own seek, extended to know *which file* it's seeking within -
   // once a clip can be dragged in from a different file than the one currently open, "seek to

@@ -281,6 +281,7 @@ fn main() {
             commands::conversion::get_heic_preview,
             commands::conversion::get_image_thumbnail,
             commands::conversion::get_video_thumbnail,
+            commands::conversion::set_video_thumbnail,
             commands::conversion::get_video_scrub_sprite,
             commands::conversion::generate_captions,
             commands::conversion::convert_audio,

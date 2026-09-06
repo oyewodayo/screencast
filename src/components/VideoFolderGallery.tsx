@@ -19,6 +19,7 @@
 // selection are one and the same thing, not two parallel selection models.
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
 import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoPlay, IoTrashOutline, IoVideocam } from "react-icons/io5";
 import { formatFileSize, truncateFileName } from "../utils/Formater";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
@@ -33,8 +34,10 @@ interface VideoFolderGalleryProps {
   files: GalleryFile[];
   folderLabel: string;
   // Poster-frame preview for a grid tile - see Dashboard.tsx's resolveVideoThumbnailUrl (a single
-  // ffmpeg frame extraction, cached on the backend by get_video_thumbnail).
-  resolveThumbnailUrl: (file: GalleryFile) => Promise<string>;
+  // ffmpeg frame extraction, cached on the backend by get_video_thumbnail). bypassCache forces a
+  // fresh URL past both Dashboard's own cache and the browser's HTTP cache - only ever passed by
+  // the video-thumbnail-updated listener below, never by the normal per-file resolve effect.
+  resolveThumbnailUrl: (file: GalleryFile, bypassCache?: boolean) => Promise<string>;
   onOpenVideo: (file: GalleryFile) => void;
   onDeleteFile: (file: GalleryFile) => void;
   onConvertFile: (file: GalleryFile) => void;
@@ -122,6 +125,23 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
     // Only re-run when the folder's file list itself changes - thumbUrls updates every time a
     // thumbnail resolves, and including it here would re-trigger this effect on every single one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files, resolveThumbnailUrl]);
+
+  // VideoPlayer.tsx's "set current frame as thumbnail" re-extracts get_video_thumbnail's cached
+  // jpg in place - same path, new bytes - which this effect's own "already have a URL for this
+  // file, skip it" guard above would otherwise never revisit. bypassCache=true is what actually
+  // gets fresh bytes rather than the identical (now-stale) URL Dashboard.tsx already cached.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("video-thumbnail-updated", (event) => {
+      const file = files.find((f) => f.path === event.payload);
+      if (!file) return;
+      resolveThumbnailUrl(file, true)
+        .then((url) => setThumbUrls((prev) => ({ ...prev, [file.path]: url })))
+        .catch((err) => console.error(`Failed to refresh thumbnail for ${file.path}:`, err));
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
   }, [files, resolveThumbnailUrl]);
 
   // Closes the context menu on any click/tap outside it - same pattern VideoOverlayLayer.tsx's

@@ -1035,6 +1035,128 @@ pub async fn get_video_thumbnail(
     path_to_str(&cache_path).map(|s| s.to_string())
 }
 
+// Lets a user pick which frame becomes a video's thumbnail - both inside Briefcast (gallery/
+// sidebar poster, get_video_thumbnail's cache) AND wherever the file itself is shared, by
+// embedding that same frame as the file's attached-picture/cover image (the same mechanism MP3
+// cover art uses) - the thing an app-side cache alone can never affect, since Explorer, WhatsApp,
+// etc. never see Briefcast's cache, only the file's own bytes/metadata.
+//
+// Two ffmpeg passes: extract_video_frame gets the chosen frame as a jpg straight into
+// get_video_thumbnail's own cache slot (so the in-app poster updates for free, no separate write),
+// then embed_cover_art re-muxes that jpg into a new copy of the video with `-c copy` on the real
+// audio/video streams (fast, lossless - only the newly-added still-image stream gets encoded, as
+// mjpeg) and `-disposition:v:1 attached_pic` marking it as cover art. The re-mux writes to a
+// sibling temp file, never in place - ffmpeg cannot read and write the same file at once - and
+// only replaces the original on success, same write-tmp-then-rename convention as every sidecar
+// in this app, just applied to the video file itself here instead of a JSON file next to it.
+//
+// Replacing the original changes its mtime, which orphans (not corrupts - just makes unreachable)
+// every other path+mtime-keyed cache for this file (scrub sprite, captions, whisper transcript) -
+// accepted fallout, identical in kind to what exporting/re-encoding this file already does today;
+// each regenerates transparently on next use. Sidecars (.edits.json/.chapters.json) stay valid
+// since they're keyed by path, not mtime.
+#[tauri::command]
+pub async fn set_video_thumbnail(
+    app_handle: AppHandle,
+    input_path: String,
+    time: f64,
+) -> Result<(), String> {
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "video_thumb_v1", "jpg")?;
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+    }
+
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let seek = format!("{:.3}", time.max(0.0));
+    extract_video_frame(&ffmpeg_path, &input, &cache_path, &seek).await?;
+
+    let ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4")
+        .to_string();
+    let tmp_output = input.with_extension(format!("thumbtmp.{ext}"));
+
+    if let Err(err) = embed_cover_art(&ffmpeg_path, &input, &cache_path, &tmp_output).await {
+        let _ = std::fs::remove_file(&tmp_output);
+        return Err(err);
+    }
+
+    // Windows won't let this rename succeed while another process (most likely this same video,
+    // still open in the player that triggered this) holds the original file open - surfaced as a
+    // clear, actionable error rather than a raw OS error code, with the half-written temp file
+    // cleaned up either way so a retry doesn't trip over it.
+    if let Err(e) = std::fs::rename(&tmp_output, &input) {
+        let _ = std::fs::remove_file(&tmp_output);
+        return Err(format!(
+            "Extracted the new thumbnail, but couldn't update the video file - it may still be open in the player. Try again in a moment. ({e})"
+        ));
+    }
+
+    let _ = app_handle.emit("video-thumbnail-updated", &input_path);
+    Ok(())
+}
+
+// mjpeg-encodes only the newly-added cover-image stream (map 1); -c copy on both mapped streams
+// together would otherwise apply to it too, and ffmpeg can't stream-copy a jpg into a video-track
+// slot. attached_pic is the disposition flag that tells MP4/MOV/MKV muxers (and, in turn, Explorer
+// and any app that reads embedded cover art) "this stream is a poster image, not a played track."
+async fn embed_cover_art(
+    ffmpeg_path: &PathBuf,
+    input: &PathBuf,
+    cover: &PathBuf,
+    output: &PathBuf,
+) -> Result<(), String> {
+    let ffmpeg_path = ffmpeg_path.clone();
+    let input = input.clone();
+    let cover = cover.clone();
+    let output = output.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-y");
+        cmd.arg("-i").arg(path_to_str(&input)?);
+        cmd.arg("-i").arg(path_to_str(&cover)?);
+        cmd.args([
+            "-map", "0", "-map", "1", "-c", "copy", "-c:v:1", "mjpeg", "-disposition:v:1",
+            "attached_pic",
+        ]);
+        cmd.arg(path_to_str(&output)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let result = cmd
+            .output()
+            .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let tail: Vec<&str> = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .rev()
+                .take(4)
+                .collect();
+            let reason: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+            return Err(format!(
+                "Failed to embed thumbnail into the video file: {}",
+                if reason.is_empty() { "unknown ffmpeg error".to_string() } else { reason }
+            ));
+        }
+        if !output.exists() {
+            return Err("ffmpeg exited successfully but produced no output file".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Thumbnail embed task panicked: {e}"))?
+}
+
 // -ss before -i is ffmpeg's fast (keyframe-seeking, not frame-accurate) seek - plenty precise for
 // a thumbnail and far quicker than decoding from the start, which matters here since this runs
 // once per video in a folder that can hold hundreds of them (bounded by the same shared

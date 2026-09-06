@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { MdClosedCaption, MdOutlineOpacity, MdSpeed } from 'react-icons/md';
-import { IoPlayCircleOutline, IoChevronForward, IoCheckmark } from 'react-icons/io5';
+import { IoPlayCircleOutline, IoChevronForward, IoCheckmark, IoImageOutline } from 'react-icons/io5';
 import { CAPTIONS_LANGUAGE_OPTIONS } from '../../utils/videoUtils';
 
 // Define the props interface
@@ -23,6 +23,13 @@ interface PlaytimeSettingsProps {
   captionsGenerationProgress: number | null;
   captionsLanguage: string;
   onCaptionsLanguageChange: (lang: string) => void;
+  // Overwrites this video's gallery/sidebar poster with whatever frame is on screen right now
+  // (VideoPlayer.tsx reads videoRef.current.currentTime at call time - nothing here needs to know
+  // the actual timestamp). thumbnailStatus mirrors captions' own generating/idle pattern above:
+  // 'saving' while the backend re-extracts the frame, 'saved' briefly afterward for feedback,
+  // null the rest of the time.
+  onSetThumbnail: () => void;
+  thumbnailStatus: 'idle' | 'saving' | 'saved' | 'error';
 }
 
 const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
@@ -40,7 +47,9 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   isGeneratingCaptions,
   captionsGenerationProgress,
   captionsLanguage,
-  onCaptionsLanguageChange
+  onCaptionsLanguageChange,
+  onSetThumbnail,
+  thumbnailStatus
 }) => {
   // A native <select>'s open dropdown list is rendered by the OS, not the page, so it can't pick
   // up this app's styling (that's what was showing as a plain, unstyled white popup) - this
@@ -129,6 +138,26 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
           className="settings-slider"
         />
       </div>
+
+      <div className="settings-divider" />
+
+      {/* Thumbnail */}
+      <button
+        className="settings-row"
+        onClick={onSetThumbnail}
+        disabled={thumbnailStatus === 'saving'}
+        title="Embeds this frame as the video file's own cover image, so it's also what shows in File Explorer or when you share the file elsewhere - not just inside Briefcast."
+      >
+        <span className="settings-row-label">
+          <IoImageOutline />
+          {thumbnailStatus === 'saved'
+            ? 'Thumbnail updated'
+            : thumbnailStatus === 'error'
+            ? 'Failed - try again'
+            : 'Set current frame as thumbnail'}
+        </span>
+        {thumbnailStatus === 'saving' && <span className="settings-row-value">Saving…</span>}
+      </button>
 
       <div className="settings-divider" />
 

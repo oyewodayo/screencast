@@ -342,6 +342,23 @@ video {
     background-color: #dc2626;
 }
 
+/* Audio's own scrub-bar visualization (VideoPlayer.tsx draws real decoded peaks onto this via
+   canvas - see the effect keyed on audioWaveformPeaks) - centered on the thin progress line and
+   taller than it, the same "overflow the bar's own box into the padding already reserved around
+   it" approach the chapter tick/tooltip use, so it reads as a proper waveform track rather than
+   being clipped down to the bar's own 3-5px height. pointer-events: none so it never competes
+   with .timeline-container's own drag-to-seek/hover handlers. */
+.timeline .audio-waveform-canvas {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 100%;
+    height: 24px;
+    pointer-events: none;
+    z-index: 0;
+}
+
 .timeline .thumb-indicator {
     --scale: 0;
     position: absolute;
@@ -415,6 +432,21 @@ video {
 
 .timeline-container:hover .preview-img-wrap {
     display: block;
+}
+
+/* Audio has no frame to preview, so this reuses the same box's own black background (already set
+   on .preview-img-wrap above) as a plain timestamp readout instead - see audioHoverTimeLabel,
+   VideoPlayer.tsx. */
+.preview-img-wrap .audio-hover-time {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: #fff;
 }
 
 .timeline-container:hover .timeline::before {
