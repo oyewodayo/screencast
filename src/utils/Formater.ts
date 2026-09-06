@@ -20,6 +20,16 @@ export function truncateFileName(name: string, maxLength: number = 22): string {
 
 
 
+// Human-readable file size for a gallery tile's size label (e.g. "4.2 MB") - binary (1024-based)
+// units to match what Windows/macOS file managers already show for the same file.
+export function formatFileSize(bytes: number): string {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / Math.pow(1024, exponent);
+  return `${exponent === 0 ? value : value.toFixed(1)} ${units[exponent]}`;
+}
+
 export const getFileIcon = (filename: string) => {
   const ext = filename.split(".").pop()?.toLowerCase() || "";
   if (["jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp", "heic", "heif"].includes(ext)) return "🖼️";

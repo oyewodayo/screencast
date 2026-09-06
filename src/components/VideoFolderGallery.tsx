@@ -19,21 +19,25 @@
 // selection are one and the same thing, not two parallel selection models.
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
 import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoPlay, IoTrashOutline, IoVideocam } from "react-icons/io5";
-import { truncateFileName } from "../utils/Formater";
+import { formatFileSize, truncateFileName } from "../utils/Formater";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
 
 interface GalleryFile {
   name: string;
   path: string;
+  size: number;
 }
 
 interface VideoFolderGalleryProps {
   files: GalleryFile[];
   folderLabel: string;
   // Poster-frame preview for a grid tile - see Dashboard.tsx's resolveVideoThumbnailUrl (a single
-  // ffmpeg frame extraction, cached on the backend by get_video_thumbnail).
-  resolveThumbnailUrl: (file: GalleryFile) => Promise<string>;
+  // ffmpeg frame extraction, cached on the backend by get_video_thumbnail). bypassCache forces a
+  // fresh URL past both Dashboard's own cache and the browser's HTTP cache - only ever passed by
+  // the video-thumbnail-updated listener below, never by the normal per-file resolve effect.
+  resolveThumbnailUrl: (file: GalleryFile, bypassCache?: boolean) => Promise<string>;
   onOpenVideo: (file: GalleryFile) => void;
   onDeleteFile: (file: GalleryFile) => void;
   onConvertFile: (file: GalleryFile) => void;
@@ -123,6 +127,23 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files, resolveThumbnailUrl]);
 
+  // VideoPlayer.tsx's "set current frame as thumbnail" re-extracts get_video_thumbnail's cached
+  // jpg in place - same path, new bytes - which this effect's own "already have a URL for this
+  // file, skip it" guard above would otherwise never revisit. bypassCache=true is what actually
+  // gets fresh bytes rather than the identical (now-stale) URL Dashboard.tsx already cached.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("video-thumbnail-updated", (event) => {
+      const file = files.find((f) => f.path === event.payload);
+      if (!file) return;
+      resolveThumbnailUrl(file, true)
+        .then((url) => setThumbUrls((prev) => ({ ...prev, [file.path]: url })))
+        .catch((err) => console.error(`Failed to refresh thumbnail for ${file.path}:`, err));
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [files, resolveThumbnailUrl]);
+
   // Closes the context menu on any click/tap outside it - same pattern VideoOverlayLayer.tsx's
   // own right-click menu uses, including the pointerdown (not click) listener so a press that
   // opens a *different* tile's menu doesn't get eaten by this one closing first.
@@ -168,8 +189,11 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
     );
   }
 
+  // pb tracks --docker-height (published by BottomDocker's ResizeObserver, see player.css for the
+  // sibling usage) so the last grid row can always scroll clear of the fixed bottom icon bar
+  // instead of rendering underneath it.
   return (
-    <div className="relative w-full h-full overflow-y-auto p-4">
+    <div className="relative w-full h-full overflow-y-auto overscroll-contain p-4 pb-[var(--docker-height,64px)]">
       {actionStatus && (
         <div className="absolute top-2 right-3 z-20 px-2.5 py-1 rounded-md bg-neutral-900/90 text-white text-xs shadow-lg">
           {actionStatus}
@@ -242,7 +266,7 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
                   alt={file.name}
                   loading="lazy"
                   draggable={false}
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-contain"
                 />
               ) : (
                 <IoVideocam size={22} className="text-gray-300 dark:text-neutral-700" />
@@ -268,9 +292,14 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
                 className="mx-1 my-1 min-w-0 border border-blue-400 rounded px-1 text-[11px] bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
               />
             ) : (
-              <span className="text-[11px] text-gray-600 dark:text-neutral-300 truncate px-1.5 py-1">
-                {truncateFileName(file.name)}
-              </span>
+              <div className="flex items-center justify-between gap-1 px-1.5 py-1">
+                <span className="text-[11px] text-gray-600 dark:text-neutral-300 truncate min-w-0">
+                  {truncateFileName(file.name)}
+                </span>
+                <span className="text-[10px] text-gray-400 dark:text-neutral-500 shrink-0 whitespace-nowrap">
+                  {formatFileSize(file.size)}
+                </span>
+              </div>
             )}
           </div>
         ))}

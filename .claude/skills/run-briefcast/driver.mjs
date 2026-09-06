@@ -105,11 +105,18 @@ async function cmdLaunch() {
   // to a file (not just an in-memory variable, which a crash would lose) means a crash between
   // launch and quit still leaves a recoverable trail instead of silently discarding the user's
   // real config.
+  //
+  // CONFIG_BACKUP_PATH already existing here means a PRIOR launch's own quit never ran (crashed,
+  // or its process was force-killed instead of going through `quit`) - CONFIG_PATH right now is
+  // almost certainly still that prior session's fixtures-pointing config, not the user's real one.
+  // The real one is what's already sitting in CONFIG_BACKUP_PATH. Overwriting it here with today's
+  // CONFIG_PATH would permanently replace the user's actual config with a copy of the fixtures
+  // config - exactly what happened once already (see git history around this comment) and cost a
+  // real user's ~/.briefcast/config.json before it was recovered from app.log path references.
+  // So: only ever create this backup when none already exists; an existing one is left untouched.
   await mkdir(path.dirname(CONFIG_PATH), { recursive: true });
-  if (existsSync(CONFIG_PATH)) {
+  if (!existsSync(CONFIG_BACKUP_PATH) && existsSync(CONFIG_PATH)) {
     await writeFile(CONFIG_BACKUP_PATH, await readFile(CONFIG_PATH));
-  } else if (existsSync(CONFIG_BACKUP_PATH)) {
-    await rm(CONFIG_BACKUP_PATH);
   }
   await mkdir(FIXTURES_LIBRARY, { recursive: true });
   await writeFile(CONFIG_PATH, JSON.stringify({ custom_briefcast_dir: FIXTURES_LIBRARY }));

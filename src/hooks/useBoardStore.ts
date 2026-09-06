@@ -6,7 +6,7 @@
 // itself - BoardHome's "New board" flow calls create_board directly, then navigates here with an
 // id that's already guaranteed to exist.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { BoardBackgroundMode, BoardCommand, BoardDocument, BoardGradientBackground, BoardGridBackground, BoardItem } from "../utils/boardTypes";
 import { applyCommand, invertCommand, resolveBackgroundMode, resolveBoardGradient, resolveBoardGrid } from "../handlers/boardHandlers";
 

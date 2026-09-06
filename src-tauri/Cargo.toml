@@ -7,10 +7,10 @@ license = "MIT"
 edition = "2021"
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "1.5", features = [ "dialog-ask", "dialog-save", "window-set-fullscreen", "dialog-open", "global-shortcut-all", "window-hide", "window-set-focus", "window-create", "window-close", "protocol-asset", "window-show", "dialog-message", "shell-open", "window-start-dragging", "dialog", "window-set-ignore-cursor-events", "devtools"] }
+tauri = { version = "2", features = [ "protocol-asset", "devtools"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4.38"
@@ -19,6 +19,10 @@ log = "0.4.22"
 simplelog = "0.12.2"
 urlencoding = "2.1"
 base64 = "0.22"
+# Tauri v1 re-exported this as `tauri::regex`; v2 dropped the re-export, so the one call site
+# that used it (commands/recording/win.rs, parsing dshow device names out of ffmpeg's stderr)
+# now needs it as a direct dependency.
+regex = "1"
 # Backs the Briefcast-folder file watcher (services/file_watcher.rs) that keeps the sidebar's file
 # list live when files are added/removed from outside the app (Explorer, another app saving into
 # the folder, etc.) - notify-debouncer-mini re-exports a compatible `notify` itself, so it isn't
@@ -34,6 +38,8 @@ notify-debouncer-mini = "0.7"
 # named "fts5" at all, in this or any version - confirmed directly against its own Cargo.toml and
 # libsqlite3-sys's build.rs after cargo's dependency resolution rejected that name outright.)
 rusqlite = { version = "0.31", features = ["bundled"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
 
 # Win32 bindings — only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the
@@ -53,6 +59,9 @@ hound = "3.5"
 # randr for monitor geometry, composite for window screenshot capture.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["randr", "composite"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

@@ -12,7 +12,7 @@
 // ImageCollageDocker's thumbnail strip to share), but that docker is gone, and nothing else needs
 // to observe or drive it anymore.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { IoBuildOutline, IoCheckmark, IoCopyOutline, IoDownloadOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";

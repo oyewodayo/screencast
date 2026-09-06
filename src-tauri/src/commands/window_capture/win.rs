@@ -4,37 +4,37 @@
 // DWM). Moved here verbatim from the old windows_api.rs — no behavior change. The individual
 // functions are no longer `#[tauri::command]` themselves; the orchestrator (window_capture.rs)
 // now owns the one canonical command per operation and dispatches into these.
-use tauri::async_runtime::Mutex as AsyncMutex;
 use std::sync::Mutex;
-use windows::Win32::System::Threading::{
-    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION
-};
-use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, WPARAM, LRESULT, RECT};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, FindWindowW, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow,
-    SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, SW_RESTORE, WH_SHELL,
-    GetWindowRect
-};
+use tauri::async_runtime::Mutex as AsyncMutex;
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetDC, ReleaseDC, CreateCompatibleDC, CreateCompatibleBitmap,
-    SelectObject, DeleteObject, DeleteDC, GetDIBits,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HMONITOR,
-    EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO
+    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
+    GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, EnumWindows, FindWindowW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, SetWindowsHookExW, ShowWindow,
+    UnhookWindowsHookEx, HHOOK, SW_RESTORE, WH_SHELL,
 };
 // PrintWindow/PRINT_WINDOW_FLAGS live under Storage::Xps in this crate version's metadata,
 // not UI::WindowsAndMessaging where the Win32 docs file them.
-use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
-use windows::core::{PCWSTR, PWSTR};
-use std::fs;
-use std::sync::OnceLock;
+use image::{Rgba, RgbaImage};
+use log::info;
 use std::ffi::OsStr;
+use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use log::info;
-use image::{Rgba, RgbaImage};
+use std::sync::OnceLock;
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 
 use super::{MonitorInfo, WindowInfo, WindowTitles};
 
@@ -192,7 +192,8 @@ fn capture_window_enhanced(hwnd: HWND, output_path: &str) -> Result<(), String> 
             }
         }
 
-        img_buffer.save(output_path)
+        img_buffer
+            .save(output_path)
             .map_err(|e| format!("Failed to save image: {}", e))?;
 
         Ok(())
@@ -270,7 +271,9 @@ fn get_process_exe_path(hwnd: HWND) -> String {
             PROCESS_NAME_FORMAT(0),
             PWSTR(buffer.as_mut_ptr()),
             &mut size,
-        ).is_ok() {
+        )
+        .is_ok()
+        {
             String::from_utf16_lossy(&buffer[..size as usize])
         } else {
             String::new()
@@ -281,16 +284,15 @@ fn get_process_exe_path(hwnd: HWND) -> String {
     }
 }
 
-pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) -> Result<Vec<WindowInfo>, String> {
+pub async fn capture_window_screenshots_by_title(
+    _app_handle: tauri::AppHandle,
+) -> Result<Vec<WindowInfo>, String> {
     let windows = get_all_open_windows_titles();
 
     let cleaned_windows: Vec<(HWND, String)> = windows
         .into_iter()
         .map(|(hwnd, title)| {
-            let clean_title = title
-                .trim_end_matches('\0')
-                .trim()
-                .to_string();
+            let clean_title = title.trim_end_matches('\0').trim().to_string();
             (hwnd, clean_title)
         })
         .filter(|(hwnd, title)| {
@@ -300,7 +302,8 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
                 || title == "Windows Shell Experience Host"
                 || title == "Windows Input Experience"
                 || title == "MSCTFIME UI"
-                || title == "Default IME" {
+                || title == "Default IME"
+            {
                 return false;
             }
 
@@ -326,7 +329,9 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
                     DWMWA_CLOAKED,
                     &mut cloaked as *mut u32 as *mut std::ffi::c_void,
                     std::mem::size_of::<u32>() as u32,
-                ).is_ok() && cloaked != 0;
+                )
+                .is_ok()
+                    && cloaked != 0;
 
                 !is_cloaked
             }
@@ -375,7 +380,11 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
                     }
                 },
                 Err(e) => {
-                    log::debug!("Failed to capture '{}': {} - listing without a thumbnail", title, e);
+                    log::debug!(
+                        "Failed to capture '{}': {} - listing without a thumbnail",
+                        title,
+                        e
+                    );
                     let _ = fs::remove_file(&output_path);
                     String::new()
                 }
@@ -389,7 +398,14 @@ pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) 
             });
         }
 
-        log::debug!("Listed {} windows ({} with thumbnails)", window_infos.len(), window_infos.iter().filter(|w| !w.image_path.is_empty()).count());
+        log::debug!(
+            "Listed {} windows ({} with thumbnails)",
+            window_infos.len(),
+            window_infos
+                .iter()
+                .filter(|w| !w.image_path.is_empty())
+                .count()
+        );
         window_infos
     })
     .await
@@ -422,9 +438,7 @@ pub async fn activate_and_open_window(title: &str) -> Result<(), String> {
     let title = title.to_string();
     tauri::async_runtime::spawn_blocking(move || {
         let wide: Vec<u16> = OsStr::new(&title).encode_wide().chain(Some(0)).collect();
-        let handle = unsafe {
-            FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr()))
-        };
+        let handle = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())) };
 
         if handle.0 == 0 {
             return Err(format!("Window '{}' not found", title));
@@ -466,7 +480,8 @@ pub fn get_window_rect_by_title(title: &str) -> Result<(i32, i32, i32, i32), Str
             DWMWA_EXTENDED_FRAME_BOUNDS,
             &mut rect as *mut RECT as *mut std::ffi::c_void,
             std::mem::size_of::<RECT>() as u32,
-        ).is_ok()
+        )
+        .is_ok()
     };
     if !dwm_ok {
         unsafe {
@@ -475,7 +490,13 @@ pub fn get_window_rect_by_title(title: &str) -> Result<(i32, i32, i32, i32), Str
     }
 
     let monitors = get_monitors().unwrap_or_default();
-    Ok(super::clamp_rect_to_desktop(&monitors, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
+    Ok(super::clamp_rect_to_desktop(
+        &monitors,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+    ))
 }
 
 pub async fn start_monitoring_windows() -> Result<(), String> {
@@ -493,12 +514,7 @@ pub async fn start_monitoring_windows() -> Result<(), String> {
     let thread_id = unsafe { GetCurrentThreadId() };
 
     *hook_guard = Some(unsafe {
-        SetWindowsHookExW(
-            WH_SHELL,
-            Some(shell_proc),
-            None,
-            thread_id
-        ).map_err(|e| e.to_string())?
+        SetWindowsHookExW(WH_SHELL, Some(shell_proc), None, thread_id).map_err(|e| e.to_string())?
     });
 
     info!("Monitoring started");
@@ -540,7 +556,10 @@ unsafe extern "system" fn shell_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
 pub fn get_windows_titles() -> Vec<String> {
     let mut titles = Vec::new();
     unsafe {
-        let _ = EnumWindows(Some(enum_window_titles), LPARAM(&mut titles as *mut _ as isize));
+        let _ = EnumWindows(
+            Some(enum_window_titles),
+            LPARAM(&mut titles as *mut _ as isize),
+        );
     }
     titles
 }
@@ -567,7 +586,7 @@ pub async fn get_window_titles() -> Result<WindowTitles, String> {
     let titles = get_last_two_windows().lock().map_err(|e| e.to_string())?;
     Ok(WindowTitles {
         active: titles[1].clone(),
-        last_active: titles[0].clone()
+        last_active: titles[0].clone(),
     })
 }
 

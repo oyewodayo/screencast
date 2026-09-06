@@ -1,13 +1,13 @@
 // Dashboard.tsx
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as Y from "yjs";
-import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import BottomDocker from "../components/BottomDocker";
 import { listen } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
-import { WebviewWindow, appWindow } from '@tauri-apps/api/window';
-import { register, unregister, isRegistered } from '@tauri-apps/api/globalShortcut';
+import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
 import { formatFileName, truncateFileName } from "../utils/Formater";
 import SidebarFileIcon from "../components/SidebarFileIcon";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
@@ -71,6 +71,7 @@ import {
   IoEyeOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
+const appWindow = getCurrentWebviewWindow()
 
 type RAMInfo = [number, number];
 
@@ -125,7 +126,7 @@ const OPEN_FILE_DIALOG_FILTERS = [
 const OVERLAY_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+H';
 
 const toggleOverlayVisibility = async () => {
-  const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+  const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
   if (!overlayWindow) return;
   if (await overlayWindow.isVisible()) {
     await overlayWindow.hide();
@@ -174,6 +175,7 @@ const ANNOTATION_FADE_GRACE_MS = 3000;
 interface FileEntry {
     name: string;
     path: string;
+    size: number;
 }
 
 interface FileMap {
@@ -500,11 +502,18 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // re-triggered that effect and re-resolved every already-cached thumbnail on every click. That
   // was the actual "selection is lagging/hanging" bug: not the selection logic itself, but a full
   // thumbnail-resolution storm firing on every click as a side effect of it.
-  const resolvePreviewAssetUrl = useCallback(async (sourcePath: string): Promise<string> => {
-    const cached = previewAssetUrlCacheRef.current.get(sourcePath);
-    if (cached) return cached;
+  // bypassCache is for exactly one case: a video's poster was just overwritten in place
+  // (set_video_thumbnail, conversion.rs) at the SAME cache path it always had, so neither this
+  // Map nor the browser's own HTTP cache has any way to notice the bytes underneath changed - see
+  // the video-thumbnail-updated listener below. The `?t=` it appends only matters for that path;
+  // every normal (non-bypassed) resolve keeps returning the plain, cacheable URL.
+  const resolvePreviewAssetUrl = useCallback(async (sourcePath: string, bypassCache = false): Promise<string> => {
+    if (!bypassCache) {
+      const cached = previewAssetUrlCacheRef.current.get(sourcePath);
+      if (cached) return cached;
+    }
     const absolutePath = await invoke<string>("convert_file_path_to_url", { filepath: sourcePath });
-    const url = convertFileSrc(absolutePath);
+    const url = convertFileSrc(absolutePath) + (bypassCache ? `?t=${Date.now()}` : "");
     previewAssetUrlCacheRef.current.set(sourcePath, url);
     return url;
   }, []);
@@ -544,10 +553,28 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // content-addressed cache on the Rust side (a single ffmpeg frame extraction, ~1s into the
   // clip). Routed through the same shared thumbnailLimiter as every other gallery/sidebar
   // thumbnail request by the callers of this function, not here - this just resolves one URL.
-  const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
+  const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }, bypassCache = false): Promise<string> => {
     const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: file.path });
-    return resolvePreviewAssetUrl(thumbPath);
+    return resolvePreviewAssetUrl(thumbPath, bypassCache);
   }, [resolvePreviewAssetUrl]);
+
+  // VideoPlayer.tsx's "set current frame as thumbnail" overwrites get_video_thumbnail's cached jpg
+  // in place, at the SAME path it always had - so this listens for its completion and clears the
+  // stale cached URL for that video, keyed by re-deriving the same thumbPath (a cache hit, and
+  // thus effectively free) rather than trying to track path->thumbPath mappings separately.
+  // VideoFolderGallery.tsx has its own listener alongside this one, to actually refresh whatever
+  // it's already rendered - this one only clears Dashboard's own cache so that gallery's re-fetch
+  // doesn't just receive the identical stale URL back.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("video-thumbnail-updated", (event) => {
+      invoke<string>("get_video_thumbnail", { inputPath: event.payload })
+        .then((thumbPath) => previewAssetUrlCacheRef.current.delete(thumbPath))
+        .catch((err) => console.error("Failed to invalidate thumbnail cache:", err));
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   // The video-tools timeline's own seek, extended to know *which file* it's seeking within -
   // once a clip can be dragged in from a different file than the one currently open, "seek to
@@ -639,7 +666,7 @@ useEffect(() => {
       }
       
       // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
-      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
       if (overlayWindow) {
         await overlayWindow.hide();
       }
@@ -821,7 +848,7 @@ const setScreen = () => {
   // (and its listener) already exists long before any particular capture request does.
   const openScreenshotOverlay = async (formData: any) => {
     try {
-      const overlayWindow = WebviewWindow.getByLabel('screenshot-overlay');
+      const overlayWindow = await WebviewWindow.getByLabel('screenshot-overlay');
       if (!overlayWindow) {
         setError('Screenshot overlay window is not available');
         return;
@@ -869,7 +896,7 @@ const setScreen = () => {
         // Create the overlay window, but don't show it - it stays hidden until the user
         // asks for it via the toggle shortcut below, rather than popping up unasked-for
         // every time a recording starts.
-        let overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+        let overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
 
         if (!overlayWindow) {
           overlayWindow = new WebviewWindow('recording-overlay', {
@@ -936,7 +963,7 @@ const setScreen = () => {
     setPausedAccumulatedMs(0);
 
     // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
-    const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+    const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
     if (overlayWindow) {
       await overlayWindow.hide();
     }
@@ -966,7 +993,7 @@ const setScreen = () => {
       setPauseStartedAt(now);
       setMessage("Recording paused");
 
-      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
       overlayWindow?.emit('recording-state-update', {
         isRecording: true,
         recordType,
@@ -993,7 +1020,7 @@ const setScreen = () => {
       setPausedAccumulatedMs(newAccumulatedMs);
       setMessage("Recording resumed");
 
-      const overlayWindow = WebviewWindow.getByLabel('recording-overlay');
+      const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
       overlayWindow?.emit('recording-state-update', {
         isRecording: true,
         recordType,
@@ -1128,7 +1155,7 @@ const setScreen = () => {
 		}
 	};
 
-	const handleDeleteFile = async (file: FileEntry) => {
+	const handleDeleteFile = async (file: { name: string; path: string }) => {
 		try {
 			await invoke("move_to_trash", { path: file.path });
 			if (selectedFile?.sourcePath === file.path) setSelectedFile(null);
@@ -1243,7 +1270,7 @@ const setScreen = () => {
 	// are also always sequenced show-before-ignore when turning draw mode on, since setting that
 	// style before a window has ever been shown is what didn't reliably stick on Windows.
 	const toggleAnnotationDrawMode = useCallback(async (forceOff = false) => {
-		const overlay = WebviewWindow.getByLabel('annotation-overlay');
+		const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 		if (!overlay) return;
 		const next = forceOff ? false : !annotationDrawModeRef.current;
 		annotationDrawModeRef.current = next;
@@ -1292,7 +1319,7 @@ const setScreen = () => {
 				if (await isRegistered(ANNOTATION_TOGGLE_SHORTCUT)) {
 					await unregister(ANNOTATION_TOGGLE_SHORTCUT);
 				}
-				const overlay = WebviewWindow.getByLabel('annotation-overlay');
+				const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 				if (overlay) await overlay.hide();
 				return;
 			}
@@ -1791,7 +1818,7 @@ const setScreen = () => {
 			if (!getFileCategory(name)) {
 				await showMessageDialog(`"${name}" isn't a supported file type (video, audio, image, PDF, or document).`, {
 					title: 'Unsupported file',
-					type: 'warning',
+					kind: 'warning',
 				});
 				return;
 			}
@@ -2145,9 +2172,12 @@ const setScreen = () => {
 	};
 
 	useEffect(() => {
-		const unlistenPromise = appWindow.onFileDropEvent(async (event) => {
-			console.log("[Dashboard] onFileDropEvent", event.payload.type, event.payload.type !== "cancel" ? event.payload.paths : undefined);
-			if (event.payload.type === "hover") {
+		const unlistenPromise = appWindow.onDragDropEvent(async (event) => {
+			console.log("[Dashboard] onDragDropEvent", event.payload.type, event.payload.type === "drop" ? event.payload.paths : undefined);
+			if (event.payload.type === "enter" || event.payload.type === "over") {
+				// v1's single "hover" type (fired repeatedly for the whole drag) is split into "enter"
+				// (once, with paths) and "over" (repeatedly, position only) in v2 - both are treated the
+				// same here since this handler only ever needed the position, not the paths, until drop.
 				// Only the most recently *requested* hover's resolution is ever applied - hover events
 				// can arrive faster than the position round-trip resolves, and an out-of-order stale
 				// result landing last would leave dragOverTimelineXRef pointing at an old position.
@@ -2166,7 +2196,7 @@ const setScreen = () => {
 				const destFolder = dragOverFolderRef.current ?? "";
 				setDragOverFolder(null);
 				handleImportFiles(event.payload.paths, destFolder);
-			} else if (event.payload.type === "cancel") {
+			} else if (event.payload.type === "leave") {
 				setDragOverFolder(null);
 				dragOverTimelineXRef.current = null;
 			}
@@ -2204,7 +2234,7 @@ const setScreen = () => {
 	// rename field — also fixes a latent staleness bug the inline rename used to have on its own:
 	// renaming the file currently open in the player left `selectedFile` pointing at a path that
 	// no longer existed on disk until the next unrelated refresh happened to fix it.
-	const renameFile = async (file: FileEntry, newName: string): Promise<void> => {
+	const renameFile = async (file: { name: string; path: string }, newName: string): Promise<void> => {
 		if (!newName || newName === file.name) return;
 		try {
 			const newPath = await invoke<string>('rename_file', { oldPath: file.path, newName });
@@ -3527,6 +3557,7 @@ const setScreen = () => {
         onOutputTimeChange={setCurrentOutputTime}
         onActiveClipChange={setActiveClipEffects}
         noiseReductionStatus={noiseReductionStatus}
+        onRecalibrateNoise={() => videoPlayerRef.current?.recalibrateNoiseReduction()}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={setSelectedOverlayId}
         isPlacingText={isPlacingText}

@@ -1,9 +1,9 @@
 // hooks/useVideoEditStore.ts
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ask } from "@tauri-apps/api/dialog";
-import { appWindow } from "@tauri-apps/api/window";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
 import {
   applyCommand,
@@ -35,6 +35,7 @@ import {
   updateOverlay,
 } from "../handlers/videoEditHandlers";
 import { blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderTextOverlayToPng } from "../utils/videoOverlayRender";
+const appWindow = getCurrentWebviewWindow()
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
@@ -404,7 +405,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         if (isExportingRef.current) {
           const shouldCancelAndClose = await ask(
             "A video export is still in progress. Closing now will cancel it, and the exported file will be incomplete.",
-            { title: "Export in progress", type: "warning" }
+            { title: "Export in progress", kind: "warning" }
           );
           if (!shouldCancelAndClose) return; // leave the window open - nothing else to do
           await invoke("cancel_conversion").catch(() => {}); // best-effort; proceeding to close either way

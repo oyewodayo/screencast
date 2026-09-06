@@ -10,11 +10,12 @@
 // event is the single change signal, which also happens to be exactly the hook a future real-time
 // sync provider would tap into, so no rework is needed when that phase arrives.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
-import { appWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import * as Y from "yjs";
 import { DocComment, DocPageSize, DocVersionSummary } from "../utils/docTypes";
 import { extractPlainText } from "../utils/docYjsText";
+const appWindow = getCurrentWebviewWindow()
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 // Confirmed with the user: a periodic snapshot every ~10 minutes while a doc is actively being

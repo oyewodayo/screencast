@@ -22,8 +22,9 @@ use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, HHOOK, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_QUIT,
+    CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN,
+    WM_QUIT,
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -71,7 +72,11 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                     let x = (info.pt.x - origin_x) as f64 / width as f64;
                     let y = (info.pt.y - origin_y) as f64 / height as f64;
                     if (0.0..1.0).contains(&x) && (0.0..1.0).contains(&y) {
-                        ctx.events.push(ClickEvent { elapsed_secs: ctx.start.elapsed().as_secs_f64(), x_fraction: x, y_fraction: y });
+                        ctx.events.push(ClickEvent {
+                            elapsed_secs: ctx.start.elapsed().as_secs_f64(),
+                            x_fraction: x,
+                            y_fraction: y,
+                        });
                     }
                 }
             }
@@ -98,7 +103,12 @@ impl ClickCapture {
 
         let handle = std::thread::spawn(move || -> Vec<ClickEvent> {
             HOOK_CTX.with(|ctx| {
-                *ctx.borrow_mut() = Some(HookContext { start: Instant::now(), origin, size, events: Vec::new() });
+                *ctx.borrow_mut() = Some(HookContext {
+                    start: Instant::now(),
+                    origin,
+                    size,
+                    events: Vec::new(),
+                });
             });
 
             let thread_id = unsafe { GetCurrentThreadId() };
@@ -126,7 +136,12 @@ impl ClickCapture {
                 let _ = UnhookWindowsHookEx(hook);
             }
 
-            HOOK_CTX.with(|ctx| ctx.borrow_mut().take().map(|c| c.events).unwrap_or_default())
+            HOOK_CTX.with(|ctx| {
+                ctx.borrow_mut()
+                    .take()
+                    .map(|c| c.events)
+                    .unwrap_or_default()
+            })
         });
 
         match ready_rx.recv() {

@@ -1,8 +1,8 @@
 // components/docker/VideoTimelineDocker.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/api/dialog";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { BsCursor } from "react-icons/bs";
 import { MdBlurOn, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt } from "react-icons/md";
 import {
@@ -35,6 +35,7 @@ import {
   IoLocateOutline,
   IoSpeedometerOutline,
   IoSyncOutline,
+  IoDownloadOutline,
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
@@ -47,9 +48,11 @@ import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover from "./ClipEffectsPopover";
 import SpeedPopover from "./SpeedPopover";
 import NoiseReductionPopover from "./NoiseReductionPopover";
+import ExtractAudioPopover from "./ExtractAudioPopover";
 import ExportOptionsPopover from "./ExportOptionsPopover";
 import SilenceDetectionPopover, { SilenceDetectionState } from "./SilenceDetectionPopover";
 import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
+import ToolModePopover, { TimelineToolMode } from "./ToolModePopover";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 
 const MIN_PX_PER_SEC = 8;
@@ -95,6 +98,17 @@ function snapToTargets(value: number, targets: number[], pxPerSec: number): numb
 // handleTransportPlayClick to decide "are we sitting at the very end of the sequence".
 const SEEK_TOLERANCE_SEC = 0.25;
 
+// Module-level (not a useRef) so it survives this component unmounting - which happens every time
+// the tools/timeline panel is closed (BottomDocker swaps back to the recording docker) and
+// reopened, not just when a different file is opened. A useRef here was the original bug: it
+// reset to null on every one of those remounts, so the bootstrap effect below saw "never
+// bootstrapped" and force-seeked back to clip 0 every single time the panel was reopened, even on
+// a video that was already mid-playback - the "opening the timeline restarts the video" report.
+// Keyed by file path so switching files still bootstraps normally; a small, session-lifetime
+// cache (a few bytes per file ever opened) is an acceptable tradeoff for not needing to lift this
+// state through Dashboard/BottomDocker just to keep it alive across the panel toggle.
+const bootstrappedClipIdByFile = new Map<string, string>();
+
 const formatTimestamp = (totalSeconds: number): string => {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = Math.floor(totalSeconds % 60);
@@ -117,7 +131,7 @@ const ActionButton: React.FC<{
     title={title}
     onClick={onClick}
     disabled={disabled}
-    className="flex items-center justify-center w-7 h-7 rounded text-neutral-300 hover:bg-neutral-700 disabled:text-neutral-600 disabled:hover:bg-transparent disabled:cursor-default"
+    className="shrink-0 flex items-center justify-center w-7 h-7 rounded text-neutral-300 hover:bg-neutral-700 disabled:text-neutral-600 disabled:hover:bg-transparent disabled:cursor-default"
   >
     {children}
   </button>
@@ -333,6 +347,11 @@ interface VideoTimelineDockerProps {
   // is what needs to show that as a spinner - Dashboard just relays the value it already round-
   // trips through activeClipEffects's own reverse-direction sibling, onActiveClipChange, above.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
+  // Forwards NoiseReductionPopover's "Recalibrate from current playback" click to VideoPlayer's
+  // own imperative recalibrateNoiseReduction() (via videoPlayerRef, held by Dashboard - this
+  // component has no ref to VideoPlayer itself) - same "Dashboard is the only place that can
+  // reach across siblings" shape onLivePreview/onTogglePlayActiveFile already use.
+  onRecalibrateNoise?: () => void;
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
   // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
@@ -399,6 +418,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onOutputTimeChange,
   onActiveClipChange,
   noiseReductionStatus = "idle",
+  onRecalibrateNoise,
   selectedOverlayId = null,
   onSelectOverlay,
   isPlacingText = false,
@@ -552,6 +572,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     );
   }, [pxPerSec]);
 
+  // Which timeline tool is armed - "select" (the pre-existing default: click a clip to select it,
+  // drag past a few px to reorder, drag its edges to trim) or "razor" (click anywhere on a clip to
+  // split it right there, the same standard-NLE modal-tool idea Premiere/Resolve's own razor tool
+  // uses - stays armed across multiple cuts rather than reverting to select after one). Sticky
+  // rather than per-click, matching that same convention. The toolbar's "Select tool" button/
+  // dropdown is what switches this.
+  const [toolMode, setToolMode] = useState<TimelineToolMode>("select");
+  const [toolModeAnchor, setToolModeAnchor] = useState<{ left: number; top: number } | null>(null);
+  const toolModeButtonRef = useRef<HTMLButtonElement>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const selectedClip = selectedClipId ? editStore.clips.find((c) => c.id === selectedClipId) ?? null : null;
   // Effects popover (color grade/Ken Burns/transition) for whichever clip is selected - opened
@@ -577,11 +606,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // Noise reduction popover - same standalone toolbar button/popover shape as Speed just above,
   // for the same reason: an audio-cleanup feature with its own presets/strength control earns its
   // own surface rather than being buried in "Clip effects" (which stays color/Ken Burns/transition
-  // only). Export-only (afftdn, conversion.rs) - there's no live-preview equivalent, unlike speed.
+  // only). Backed by both a live preview (VideoPlayer.tsx's Web Audio worklet) and the real
+  // export-time filter (afftdn, conversion.rs).
   const [noiseReductionPopoverAnchor, setNoiseReductionPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
   const noiseReductionButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     setNoiseReductionPopoverAnchor(null);
+  }, [selectedClipId]);
+
+  // Extract-audio popover - same standalone toolbar button/popover shape as Speed/Reduce noise
+  // above. isExtractingAudio is local (not threaded through editStore's isExporting/exportProgress)
+  // since this is a short, independent operation on one clip's own source file, unrelated to the
+  // Save button's whole-timeline export.
+  const [extractAudioAnchor, setExtractAudioAnchor] = useState<{ left: number; top: number } | null>(null);
+  const extractAudioButtonRef = useRef<HTMLButtonElement>(null);
+  const [isExtractingAudio, setIsExtractingAudio] = useState(false);
+  useEffect(() => {
+    setExtractAudioAnchor(null);
   }, [selectedClipId]);
 
   // Save button's quality/destination options (ExportOptionsPopover) - both default to exactly
@@ -1343,6 +1384,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     e.currentTarget.setPointerCapture(e.pointerId);
     setClipDrag({ index, clip, startClientX: e.clientX, isDragging: false, overIndex: index });
   };
+
+  // Razor mode's own pointerdown on a clip block - splits right where the click landed instead of
+  // starting a drag/select. clipAtOutputTime (not the clip/index this specific block already knows)
+  // is what handleSplit/the playhead-based split button already trust to turn a click position into
+  // the right (index, sourceTime) pair - reusing it here keeps this one splitting rule instead of a
+  // second, subtly different one.
+  const handleRazorClipPointerDown = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    const { index, sourceTime } = clipAtOutputTime(outputTimeFromClientX(e.clientX));
+    editStore.splitAt(index, sourceTime);
+  };
+
+  const handleClipPointerDown = (clip: Clip, index: number) => (e: React.PointerEvent) => {
+    if (toolMode === "razor") {
+      handleRazorClipPointerDown(e);
+      return;
+    }
+    beginClipDrag(clip, index)(e);
+  };
   const handleClipDragMove = (e: React.PointerEvent) => {
     if (!clipDrag) return;
     e.stopPropagation();
@@ -1502,6 +1562,36 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (chosen) setCustomOutputPath(chosen);
   };
 
+  // Extracts the selected clip's own audio (trim + speed + noise reduction, same fields
+  // export_trimmed_video would apply to this clip, via extract_clip_audio - conversion.rs) to a
+  // standalone file the user picks via a native save dialog. Track-level mute/volume folds into a
+  // single `volume` the same way effective_video_volume does for the whole-timeline export, since
+  // a clip has no volume of its own.
+  const handleExtractAudio = async (format: "mp3" | "wav" | "aac") => {
+    if (!selectedClip) return;
+    const stem = selectedClip.sourcePath.replace(/\.[^./\\]+$/, "").split(/[\\/]/).pop() ?? "audio";
+    const chosen = await saveFileDialog({ defaultPath: `${stem} - audio.${format}`, filters: [{ name: format.toUpperCase(), extensions: [format] }] });
+    if (!chosen) return;
+    setIsExtractingAudio(true);
+    try {
+      await invoke("extract_clip_audio", {
+        sourcePath: selectedClip.sourcePath,
+        start: selectedClip.start,
+        end: selectedClip.end,
+        speed: selectedClip.speed ?? 1,
+        noiseReduction: selectedClip.noiseReduction ?? null,
+        volume: editStore.videoAudioMuted ? 0 : editStore.videoAudioVolume,
+        outputFormat: format,
+        outputPath: chosen,
+      });
+      setExtractAudioAnchor(null);
+    } catch (err) {
+      window.alert(`Failed to extract audio: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setIsExtractingAudio(false);
+    }
+  };
+
   // Scans the selected clip's own source file for dead air (detect_silence, conversion.rs), then
   // opens SilenceDetectionPopover to show what it found - nothing is actually cut until the user
   // clicks "Remove" there. Ranges come back in the SOURCE file's own absolute time (detect_silence
@@ -1592,11 +1682,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // than trusting wherever the native <video> defaults to (source time 0, or wherever the user
   // last happened to be). Keyed on the first clip's *id* rather than its start/end, so resizing
   // that same clip's own edges mid-edit doesn't yank playback back to the start every time.
-  const bootstrappedFirstClipIdRef = useRef<string | null>(null);
+  // Tracked in bootstrappedClipIdByFile (module-level, keyed by file.path) rather than a useRef -
+  // see that declaration's own comment for why a ref here previously reset on every reopen of
+  // this panel and force-seeked an already-playing video back to the start each time.
   useEffect(() => {
     const first = baseClips[0];
-    if (!first || first.id === "__pending__" || bootstrappedFirstClipIdRef.current === first.id) return;
-    bootstrappedFirstClipIdRef.current = first.id;
+    if (!first || first.id === "__pending__" || bootstrappedClipIdByFile.get(file.path) === first.id) return;
+    bootstrappedClipIdByFile.set(file.path, first.id);
     activeClipIndexRef.current = 0;
     lastAppliedTimeRef.current = first.start;
     onSeek(first.sourcePath, first.start);
@@ -1752,7 +1844,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   return (
     <div className="w-full flex flex-col gap-2">
       {/* Hidden capture rig - never shown, just decodes frames for the filmstrip/cover. */}
-      <video ref={hiddenVideoRef} src={playableSrc} muted preload="metadata" style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }} />
+      {/* crossOrigin="anonymous" is required here, not optional - without it, drawing this asset://-
+          sourced video onto captureCanvasRef taints the canvas, and toDataURL() throws
+          ("Tainted canvases may not be exported") on every single capture. That throw happens
+          inside captureFrameAt's "seeked" listener, outside the promise chain, so it was never
+          visible as a rejection anywhere - it just silently killed the filmstrip and cover capture
+          permanently for every video. Same fix already applied to asset://-sourced <img>s
+          elsewhere (imageObjectCache.ts, boardImageCache.ts) - just never carried over to this
+          <video> capture rig. */}
+      <video ref={hiddenVideoRef} src={playableSrc} crossOrigin="anonymous" muted preload="metadata" style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }} />
       <canvas ref={captureCanvasRef} style={{ display: "none" }} />
       {editStore.audioOverlays.map((o) => (
         <audio
@@ -1781,20 +1881,42 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       ))}
 
       {/* Toolbar */}
-      <div className="flex items-center justify-between gap-2 px-1 py-1 rounded-md bg-neutral-900 text-neutral-200">
-        <div className="flex items-center gap-0.5">
-          <button type="button" title="Select tool" className="flex items-center gap-0.5 justify-center h-7 px-1.5 rounded bg-neutral-700 text-white">
-            <BsCursor size={13} />
+      <div className="flex items-center justify-between gap-2 px-1 py-1 rounded-md bg-neutral-900 text-neutral-200 min-w-0">
+        {/* Select tool stays fixed (never scrolls away) - only the tool cluster to its right, which
+            keeps growing as features get added, scrolls once the panel is too narrow to fit it all.
+            min-w-0 on every ancestor down to the scroll container itself is required for the
+            overflow-x-auto below to ever actually kick in - a flex child's default min-width:auto
+            otherwise refuses to shrink below its content's own natural width, which would silently
+            defeat this and just widen the whole toolbar (or overflow the panel) instead of scrolling. */}
+        <div className="flex items-center gap-0.5 min-w-0">
+          <button
+            ref={toolModeButtonRef}
+            type="button"
+            title={toolMode === "razor" ? "Razor tool - click a clip to split it there" : "Select tool"}
+            onClick={() => {
+              if (toolModeAnchor) {
+                setToolModeAnchor(null);
+                return;
+              }
+              const rect = toolModeButtonRef.current?.getBoundingClientRect();
+              if (rect) setToolModeAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center gap-0.5 justify-center h-7 px-1.5 rounded text-white ${
+              toolMode === "razor" ? "bg-blue-600" : "bg-neutral-700"
+            }`}
+          >
+            {toolMode === "razor" ? <IoCutOutline size={14} /> : <BsCursor size={13} />}
             <IoChevronDown size={10} />
           </button>
-          <div className="w-px h-5 bg-neutral-700 mx-1" />
+          <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
+          <div className="timeline-toolbar-scroll flex items-center gap-0.5 min-w-0 overflow-x-auto">
           <ActionButton title="Undo" onClick={editStore.undo} disabled={!editStore.canUndo}>
             <IoArrowUndo size={15} />
           </ActionButton>
           <ActionButton title="Redo" onClick={editStore.redo} disabled={!editStore.canRedo}>
             <IoArrowRedo size={15} />
           </ActionButton>
-          <div className="w-px h-5 bg-neutral-700 mx-1" />
+          <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
           <ActionButton title="Split at playhead" onClick={handleSplit} disabled={duration <= 0}>
             <IoCutOutline size={15} />
           </ActionButton>
@@ -1805,7 +1927,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoTrashOutline size={15} />
           </ActionButton>
-          <div className="w-px h-5 bg-neutral-700 mx-1" />
+          <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
           <ActionButton
             title={selectedClipId ? (isCroppingClip ? "Stop cropping" : "Crop clip") : "Select a clip to crop"}
             onClick={() => onToggleCroppingClip?.()}
@@ -1826,7 +1948,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               const rect = speedButtonRef.current?.getBoundingClientRect();
               if (rect) setSpeedPopoverAnchor({ left: rect.left, top: rect.bottom + 4 });
             }}
-            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
               speedPopoverAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
             }`}
           >
@@ -1845,7 +1967,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               const rect = noiseReductionButtonRef.current?.getBoundingClientRect();
               if (rect) setNoiseReductionPopoverAnchor({ left: rect.left, top: rect.bottom + 4 });
             }}
-            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
               noiseReductionPopoverAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
             }`}
           >
@@ -1854,6 +1976,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             ) : (
               <MdOutlineNoiseControlOff size={15} className={selectedClip?.noiseReduction ? "text-blue-400" : undefined} />
             )}
+          </button>
+          <button
+            ref={extractAudioButtonRef}
+            type="button"
+            title={selectedClipId ? "Extract this clip's audio" : "Select a clip to extract its audio"}
+            disabled={!selectedClipId}
+            onClick={() => {
+              if (extractAudioAnchor) {
+                setExtractAudioAnchor(null);
+                return;
+              }
+              const rect = extractAudioButtonRef.current?.getBoundingClientRect();
+              if (rect) setExtractAudioAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+              extractAudioAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoDownloadOutline size={15} />
           </button>
           <ActionButton
             title={selectedClipId ? "Mirror clip horizontally" : "Select a clip to mirror"}
@@ -1875,7 +2016,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               const rect = effectsButtonRef.current?.getBoundingClientRect();
               if (rect) setEffectsPopoverAnchor({ left: rect.left, top: rect.bottom + 4 });
             }}
-            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
               effectsPopoverAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
             }`}
           >
@@ -1893,7 +2034,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               }
               void handleDetectSilence();
             }}
-            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
               silenceAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
             }`}
           >
@@ -1911,7 +2052,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               }
               void handleDetectAutoZoom();
             }}
-            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
               autoZoomAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
             }`}
           >
@@ -1947,9 +2088,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoMusicalNotesOutline size={15} className={isPlacingAudio ? "text-teal-400" : undefined} />
           </ActionButton>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           <div className="flex items-center">
             <button
               type="button"
@@ -2233,13 +2375,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 return (
                   <div
                     key={clip.id}
-                    onPointerDown={isPending ? undefined : beginClipDrag(baseClips[i], i)}
-                    onPointerMove={handleClipDragMove}
-                    onPointerUp={endClipDrag}
-                    onPointerCancel={endClipDrag}
-                    title={isPending ? undefined : `Clip ${i + 1} of ${renderClips.length} — click to select, drag to reorder`}
+                    onPointerDown={isPending ? undefined : handleClipPointerDown(baseClips[i], i)}
+                    onPointerMove={toolMode === "razor" ? undefined : handleClipDragMove}
+                    onPointerUp={toolMode === "razor" ? undefined : endClipDrag}
+                    onPointerCancel={toolMode === "razor" ? undefined : endClipDrag}
+                    title={isPending ? undefined : toolMode === "razor" ? `Clip ${i + 1} of ${renderClips.length} — click to split here` : `Clip ${i + 1} of ${renderClips.length} — click to select, drag to reorder`}
                     className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-black flex ${
-                      isPending ? "" : "cursor-grab active:cursor-grabbing"
+                      isPending ? "" : toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"
                     } ${isSelected ? "border-dashed border-white" : "border-teal-500"} ${isDragging ? "opacity-40" : ""} ${
                       isDragOver ? "ring-2 ring-blue-400" : ""
                     }`}
@@ -2686,9 +2828,21 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               anchor={noiseReductionPopoverAnchor}
               onUpdate={(noiseReduction) => editStore.updateClipEffects(clip.id, { noiseReduction })}
               onClose={() => setNoiseReductionPopoverAnchor(null)}
+              onRecalibrate={onRecalibrateNoise}
             />
           );
         })()}
+
+      {toolModeAnchor && <ToolModePopover mode={toolMode} anchor={toolModeAnchor} onSelect={setToolMode} onClose={() => setToolModeAnchor(null)} />}
+
+      {selectedClipId && extractAudioAnchor && (
+        <ExtractAudioPopover
+          anchor={extractAudioAnchor}
+          isExtracting={isExtractingAudio}
+          onExtract={handleExtractAudio}
+          onClose={() => setExtractAudioAnchor(null)}
+        />
+      )}
 
       {selectedAudioOverlayId &&
         audioPopoverAnchor &&

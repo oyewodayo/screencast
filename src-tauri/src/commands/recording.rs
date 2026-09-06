@@ -6,20 +6,21 @@
 // platform module (win/macos/linux) implements the same set of `recording_with_output_*`
 // functions plus `get_connected_devices`, using whatever ffmpeg input format that OS needs
 // (dshow / avfoundation / x11grab+pulse+v4l2) — see each module for details.
+use chrono::Utc;
+use log::{info, warn};
+use std::ffi::OsStr;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
-use chrono::Utc;
-use tauri::AppHandle;
 use std::sync::Arc;
-use tauri::State;
 use tauri::async_runtime::Mutex;
+use tauri::AppHandle;
+use tauri::Emitter;
 use tauri::Manager;
-use std::fs;
-use log::{info, warn};
-use std::io::Write;
-use std::ffi::OsStr;
+use tauri::State;
 
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
@@ -28,17 +29,17 @@ mod win;
 // pub(crate): window_capture::macos (a sibling module, not a descendant of this one) needs
 // list_avfoundation_devices to enumerate "Capture screen N" devices for its own get_monitors -
 // shared rather than duplicated so the ffmpeg-stderr-parsing logic only exists in one place.
-#[cfg(target_os = "macos")]
-pub(crate) mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
-
-#[cfg(target_os = "windows")]
-use win as platform;
 #[cfg(target_os = "macos")]
-use macos as platform;
+pub(crate) mod macos;
+
 #[cfg(target_os = "linux")]
 use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+#[cfg(target_os = "windows")]
+use win as platform;
 
 #[derive(Default)]
 pub struct AppState {
@@ -69,17 +70,17 @@ pub struct AppState {
 }
 
 #[derive(serde::Deserialize, Debug)]
-pub struct FormData{
-    file_name:String,
-    file_ext:String,
-    record_type:String,
-    audio_device:String,
+pub struct FormData {
+    file_name: String,
+    file_ext: String,
+    record_type: String,
+    audio_device: String,
     #[serde(default)]
-    video_devices:Vec<String>,
-    screen_size:String,
-    overlay_shape:String,
-    overlay_position:String,
-    overlay_size:String,
+    video_devices: Vec<String>,
+    screen_size: String,
+    overlay_shape: String,
+    overlay_position: String,
+    overlay_size: String,
     // The title of the window screen_size names (as "window:<hwnd>") — the hwnd alone isn't
     // enough to actually *capture* that window on Windows (gdigrab targets windows by title, not
     // handle), so the frontend sends this alongside it. #[serde(default)] so a caller that
@@ -109,8 +110,15 @@ pub struct FormData{
 // reimplementing (or, as before this existed, half-implementing) its own parsing of it.
 pub(crate) enum CaptureTarget {
     FullScreen,
-    Monitor { x: i32, y: i32, width: i32, height: i32 },
-    Window { title: String },
+    Monitor {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    Window {
+        title: String,
+    },
 }
 
 // screen_size arrives as "fullscreen", "monitor:<id>", or "window:<hwnd>" (see
@@ -121,18 +129,28 @@ pub(crate) enum CaptureTarget {
 // reject. Falls back to FullScreen (rather than erroring the whole capture out) if a monitor id
 // can't be resolved — a screen recording that captures more than intended beats one that
 // silently doesn't start at all.
-pub(crate) fn resolve_capture_target(app_handle: &AppHandle, form_data: &FormData) -> CaptureTarget {
+pub(crate) fn resolve_capture_target(
+    app_handle: &AppHandle,
+    form_data: &FormData,
+) -> CaptureTarget {
     if let Some(monitor_id) = form_data.screen_size.strip_prefix("monitor:") {
         if let Ok(monitors) = crate::commands::window_capture::get_monitors(app_handle.clone()) {
             if let Some(m) = monitors.iter().find(|m| m.id == monitor_id) {
-                return CaptureTarget::Monitor { x: m.x, y: m.y, width: m.width, height: m.height };
+                return CaptureTarget::Monitor {
+                    x: m.x,
+                    y: m.y,
+                    width: m.width,
+                    height: m.height,
+                };
             }
         }
         return CaptureTarget::FullScreen;
     }
 
     if form_data.screen_size.starts_with("window:") && !form_data.window_title.is_empty() {
-        return CaptureTarget::Window { title: form_data.window_title.clone() };
+        return CaptureTarget::Window {
+            title: form_data.window_title.clone(),
+        };
     }
 
     CaptureTarget::FullScreen
@@ -147,7 +165,10 @@ pub(crate) fn resolve_capture_target(app_handle: &AppHandle, form_data: &FormDat
 // crop actually grabs - not just the primary monitor.
 #[cfg(target_os = "windows")]
 fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32, i32, i32)> {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
     match target {
         CaptureTarget::FullScreen => {
             let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
@@ -159,8 +180,15 @@ fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32, i32, i32)>
             let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
             Some((x, y, width, height))
         }
-        CaptureTarget::Monitor { x, y, width, height } => Some((*x, *y, *width, *height)),
-        CaptureTarget::Window { title } => crate::commands::window_capture::win::get_window_rect_by_title(title).ok(),
+        CaptureTarget::Monitor {
+            x,
+            y,
+            width,
+            height,
+        } => Some((*x, *y, *width, *height)),
+        CaptureTarget::Window { title } => {
+            crate::commands::window_capture::win::get_window_rect_by_title(title).ok()
+        }
     }
 }
 
@@ -171,7 +199,10 @@ fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32, i32, i32)>
 // filename) convention - the two sidecar families were established independently and neither
 // needs to match the other, just be internally consistent.
 fn click_sidecar_path(video_path: &Path) -> PathBuf {
-    let stem = video_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording");
     video_path.with_file_name(format!("{}.clicks.json", stem))
 }
 
@@ -184,7 +215,9 @@ pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> 
     if !sidecar.exists() {
         return Ok(None);
     }
-    fs::read_to_string(&sidecar).map(Some).map_err(|e| format!("Failed to read click-tracking sidecar: {}", e))
+    fs::read_to_string(&sidecar)
+        .map(Some)
+        .map_err(|e| format!("Failed to read click-tracking sidecar: {}", e))
 }
 
 // ffmpeg's stderr always leads with its multi-hundred-character build banner (version, compile
@@ -193,7 +226,11 @@ pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> 
 // under noise the UI can't even fully display. The real reason is reliably among the last few
 // non-empty lines.
 pub(crate) fn extract_ffmpeg_error(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     if lines.is_empty() {
         return "ffmpeg exited with an error and produced no output".to_string();
     }
@@ -256,7 +293,13 @@ fn overlay_pixel_dimensions(shape: &str, size: &str) -> (i32, i32) {
 // EnhancedScreenOptions.tsx can send - top_left/top_center/top_right previously fell through to
 // the bottom_right default below (silently, since nothing ever rendered a preview to notice),
 // same bug class as the "bottom_center" vs "bottom_middle" mismatch fixed above.
-fn overlay_position_expr(anchor: &str, index: usize, count: usize, cam_w: i32, cam_h: i32) -> String {
+fn overlay_position_expr(
+    anchor: &str,
+    index: usize,
+    count: usize,
+    cam_w: i32,
+    cam_h: i32,
+) -> String {
     let _ = cam_h; // width alone (via cam_w) is enough since margins are fixed constants.
     let gap = 20;
     let step = index as i32 * (cam_w + gap);
@@ -281,7 +324,11 @@ fn overlay_position_expr(anchor: &str, index: usize, count: usize, cam_w: i32, c
         _ => format!("W-w-{}-{}", 100, step),
     };
 
-    let y_expr = if y_top { "50".to_string() } else { "H-h-50".to_string() };
+    let y_expr = if y_top {
+        "50".to_string()
+    } else {
+        "H-h-50".to_string()
+    };
 
     format!("overlay=x={}:y={}", x_expr, y_expr)
 }
@@ -334,7 +381,10 @@ fn overlay_stage_filter(
             position_expr = position_expr,
             out_suffix = out_suffix,
         ),
-        _ => format!("{}{}{}{}", prev_label, input_label, position_expr, out_suffix),
+        _ => format!(
+            "{}{}{}{}",
+            prev_label, input_label, position_expr, out_suffix
+        ),
     }
 }
 
@@ -345,7 +395,12 @@ fn overlay_stage_filter(
 // this output's video stream, same as the old last overlay stage did before this one existed).
 // Every overlay stage is labeled now (including what used to be the final, unlabeled one) since
 // the downscale stage needs a named input to read the finished composite from.
-pub fn build_camera_overlay_filter_complex(shape: &str, position: &str, size: &str, camera_count: usize) -> String {
+pub fn build_camera_overlay_filter_complex(
+    shape: &str,
+    position: &str,
+    size: &str,
+    camera_count: usize,
+) -> String {
     let (cam_w, cam_h) = overlay_pixel_dimensions(shape, size);
     let mut stages: Vec<String> = Vec::with_capacity(camera_count + 1);
     let mut prev_label = "[0:v]".to_string();
@@ -367,7 +422,10 @@ pub fn build_camera_overlay_filter_complex(shape: &str, position: &str, size: &s
         prev_label = format!("[{}]", out_label);
     }
 
-    stages.push(format!("{}scale='min({},iw)':-2", prev_label, MAX_RECORDING_WIDTH));
+    stages.push(format!(
+        "{}scale='min({},iw)':-2",
+        prev_label, MAX_RECORDING_WIDTH
+    ));
 
     stages.join("; ")
 }
@@ -382,43 +440,71 @@ pub fn build_camera_overlay_filter_complex(shape: &str, position: &str, size: &s
 pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
     match ext.to_lowercase().as_str() {
         "mp4" => vec![
-            "-c:v".into(), "libx264".into(),
-            "-preset".into(), "ultrafast".into(),
-            "-crf".into(), "23".into(),
-            "-pix_fmt".into(), "yuv420p".into(),
-            "-g".into(), KEYFRAME_INTERVAL.into(),
-            "-c:a".into(), "aac".into(),
-            "-b:a".into(), "192k".into(),
-            "-movflags".into(), "+faststart+frag_keyframe+empty_moov".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "ultrafast".into(),
+            "-crf".into(),
+            "23".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-g".into(),
+            KEYFRAME_INTERVAL.into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+            "-movflags".into(),
+            "+faststart+frag_keyframe+empty_moov".into(),
         ],
         "mkv" => vec![
-            "-c:v".into(), "libx264".into(),
-            "-preset".into(), "ultrafast".into(),
-            "-crf".into(), "23".into(),
-            "-pix_fmt".into(), "yuv420p".into(),
-            "-g".into(), KEYFRAME_INTERVAL.into(),
-            "-c:a".into(), "aac".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "ultrafast".into(),
+            "-crf".into(),
+            "23".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-g".into(),
+            KEYFRAME_INTERVAL.into(),
+            "-c:a".into(),
+            "aac".into(),
             // Without this, ffmpeg's native aac encoder defaults to 128k - noticeably more
             // compressed than the 192k every other lossy-audio branch here already uses. Same
             // fix as the "mp4"/"mov"/"webm"/fallback branches, just closing this one gap.
-            "-b:a".into(), "192k".into(),
+            "-b:a".into(),
+            "192k".into(),
         ],
         "avi" => vec![
-            "-c:v".into(), "libx264".into(),
-            "-preset".into(), "ultrafast".into(),
-            "-pix_fmt".into(), "yuv420p".into(),
-            "-g".into(), KEYFRAME_INTERVAL.into(),
-            "-c:a".into(), "pcm_s16le".into(), // Better audio codec for AVI
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "ultrafast".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-g".into(),
+            KEYFRAME_INTERVAL.into(),
+            "-c:a".into(),
+            "pcm_s16le".into(), // Better audio codec for AVI
         ],
         "mov" => vec![
-            "-c:v".into(), "libx264".into(),
-            "-preset".into(), "ultrafast".into(),
-            "-crf".into(), "23".into(),
-            "-pix_fmt".into(), "yuv420p".into(),
-            "-g".into(), KEYFRAME_INTERVAL.into(),
-            "-c:a".into(), "aac".into(),
-            "-b:a".into(), "192k".into(),
-            "-movflags".into(), "+faststart+frag_keyframe+empty_moov".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "ultrafast".into(),
+            "-crf".into(),
+            "23".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-g".into(),
+            KEYFRAME_INTERVAL.into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+            "-movflags".into(),
+            "+faststart+frag_keyframe+empty_moov".into(),
         ],
         "webm" => vec![
             // gdigrab/avfoundation/x11grab all capture the screen with an alpha channel
@@ -432,31 +518,46 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             // encoder opens fine - this was the actual root cause of ".webm recordings don't
             // play", not a browser/WebView2 codec-support issue: the files were never valid to
             // begin with.
-            "-pix_fmt".into(), "yuv420p".into(),
-            "-c:v".into(), "libvpx".into(), // libvpx (not libvpx-vp9) for wider compatibility
-            "-b:v".into(), "2M".into(),
-            "-c:a".into(), "libvorbis".into(), // libvorbis (not libopus), same reasoning
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-c:v".into(),
+            "libvpx".into(), // libvpx (not libvpx-vp9) for wider compatibility
+            "-b:v".into(),
+            "2M".into(),
+            "-c:a".into(),
+            "libvorbis".into(), // libvorbis (not libopus), same reasoning
             // Without this, libvorbis defaults to its ~112k quality-3 preset - same gap as the
             // unset aac bitrate above, just for the vorbis encoder.
-            "-b:a".into(), "192k".into(),
+            "-b:a".into(),
+            "192k".into(),
             // realtime+cpu-used 5, not good+cpu-used 0 (libvpx's slowest, offline-quality
             // preset) - this is live screen capture, not a file conversion, and needs an encoder
             // that can actually keep up with the incoming framerate. See win.rs's identical fix
             // for the full reasoning (an encoder that can't keep up backs up, and gets force-
             // killed with a large unflushed backlog when the recording stops, corrupting the
             // WebM/Matroska container).
-            "-quality".into(), "realtime".into(),
-            "-cpu-used".into(), "5".into(),
+            "-quality".into(),
+            "realtime".into(),
+            "-cpu-used".into(),
+            "5".into(),
         ],
         _ => vec![
-            "-c:v".into(), "libx264".into(),
-            "-preset".into(), "ultrafast".into(),
-            "-crf".into(), "23".into(),
-            "-pix_fmt".into(), "yuv420p".into(),
-            "-g".into(), KEYFRAME_INTERVAL.into(),
-            "-c:a".into(), "aac".into(),
-            "-b:a".into(), "192k".into(),
-            "-movflags".into(), "+faststart+frag_keyframe+empty_moov".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "ultrafast".into(),
+            "-crf".into(),
+            "23".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-g".into(),
+            KEYFRAME_INTERVAL.into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+            "-movflags".into(),
+            "+faststart+frag_keyframe+empty_moov".into(),
         ],
     }
 }
@@ -468,7 +569,12 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
 // keeps hitting elsewhere.
 pub(crate) fn audio_codec_args_for_ext(ext: &str) -> Vec<String> {
     match ext.to_lowercase().as_str() {
-        "mp3" => vec!["-c:a".into(), "libmp3lame".into(), "-b:a".into(), "192k".into()],
+        "mp3" => vec![
+            "-c:a".into(),
+            "libmp3lame".into(),
+            "-b:a".into(),
+            "192k".into(),
+        ],
         "wav" => vec!["-c:a".into(), "pcm_s16le".into()], // uncompressed - no bitrate to set
         "wma" => vec!["-c:a".into(), "wmav2".into(), "-b:a".into(), "192k".into()],
         // "aac" and any unrecognized extension
@@ -485,7 +591,8 @@ pub(crate) fn audio_codec_args_for_ext(ext: &str) -> Vec<String> {
 // unflushed backlog, corrupt output" failure mode already documented for other slow encoders in
 // this codebase (see win.rs's webm comments). acompressor+volume are cheap per-sample filters
 // with no lookahead buffering, confirmed to run at real-time speed in the same test.
-pub(crate) const AUDIO_ENHANCE_FILTER: &str = "acompressor=threshold=-25dB:ratio=3:attack=5:release=200,volume=6dB";
+pub(crate) const AUDIO_ENHANCE_FILTER: &str =
+    "acompressor=threshold=-25dB:ratio=3:attack=5:release=200,volume=6dB";
 
 // Hides the console window a spawned child would otherwise flash open on Windows (a no-op
 // everywhere else, since spawning a child process never pops up a console on macOS/Linux in the
@@ -544,7 +651,10 @@ pub(crate) async fn spawn_recording(
         *process_state = Some(child);
     }
 
-    Ok(format!("Recording started. File will be saved to {}", output_path.display()))
+    Ok(format!(
+        "Recording started. File will be saved to {}",
+        output_path.display()
+    ))
 }
 
 #[tauri::command]
@@ -553,12 +663,12 @@ pub fn get_connected_devices(app_handle: AppHandle) -> (Vec<String>, Vec<String>
 }
 
 #[tauri::command]
-pub fn get_connected_audios(app_handle: AppHandle)->Vec<String>{
+pub fn get_connected_audios(app_handle: AppHandle) -> Vec<String> {
     get_connected_devices(app_handle).1
 }
 
 #[tauri::command]
-pub fn get_connected_cameras(app_handle: AppHandle)->Vec<String>{
+pub fn get_connected_cameras(app_handle: AppHandle) -> Vec<String> {
     get_connected_devices(app_handle).0
 }
 
@@ -571,7 +681,12 @@ fn resolve_output_path(form_data: &FormData) -> Result<PathBuf, String> {
 
     let briefcast_dir = crate::services::utility::briefcast_dir()?;
 
-    output_file = format!("{}_recording_{}.{}", form_data.record_type.to_uppercase(), current_date, form_data.file_ext);
+    output_file = format!(
+        "{}_recording_{}.{}",
+        form_data.record_type.to_uppercase(),
+        current_date,
+        form_data.file_ext
+    );
 
     if !form_data.file_name.is_empty() {
         output_file = format!("{}.{}", form_data.file_name, form_data.file_ext);
@@ -596,10 +711,17 @@ fn resolve_output_path(form_data: &FormData) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  form_data: FormData) -> Result<String, String> {
-    log::debug!("Form data {:?}",form_data);
+pub async fn start_recording(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    form_data: FormData,
+) -> Result<String, String> {
+    log::debug!("Form data {:?}", form_data);
     #[cfg(target_os = "windows")]
-    log::debug!("Here are the opened windows {:?}", crate::commands::window_capture::win::get_all_open_windows_titles());
+    log::debug!(
+        "Here are the opened windows {:?}",
+        crate::commands::window_capture::win::get_all_open_windows_titles()
+    );
 
     let output_path = resolve_output_path(&form_data)?;
 
@@ -610,17 +732,24 @@ pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  fo
     // with the picture.
     #[cfg(target_os = "windows")]
     {
-        let wants_system_audio =
-            form_data.include_system_audio && matches!(form_data.record_type.as_str(), "sva" | "sa" | "s");
+        let wants_system_audio = form_data.include_system_audio
+            && matches!(form_data.record_type.as_str(), "sva" | "sa" | "s");
         if wants_system_audio {
-            let stem = output_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
+            let stem = output_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("recording");
             let wav_path = output_path.with_file_name(format!("{}.system_audio.wav", stem));
             match crate::services::loopback_audio::start(wav_path) {
                 Ok(capture) => {
                     *state.loopback_capture.lock().await = Some(capture);
-                    *state.recording_has_own_audio.lock().await = form_data.record_type.as_str() != "s";
+                    *state.recording_has_own_audio.lock().await =
+                        form_data.record_type.as_str() != "s";
                 }
-                Err(e) => warn!("Failed to start system-audio capture, recording will proceed without it: {}", e),
+                Err(e) => warn!(
+                    "Failed to start system-audio capture, recording will proceed without it: {}",
+                    e
+                ),
             }
         }
 
@@ -629,7 +758,8 @@ pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  fo
         // and started here (rather than inside each platform::recording_with_output_* fn) so it
         // doesn't need duplicating across every one of them for a concern that has nothing to do
         // with which ffmpeg args a given mode builds.
-        let wants_click_tracking = form_data.track_clicks && matches!(form_data.record_type.as_str(), "sva" | "sv" | "sa" | "s");
+        let wants_click_tracking = form_data.track_clicks
+            && matches!(form_data.record_type.as_str(), "sva" | "sv" | "sa" | "s");
         if wants_click_tracking {
             match capture_region_bounds(&resolve_capture_target(&app_handle, &form_data)) {
                 Some((x, y, width, height)) => match crate::services::click_tracker::ClickCapture::start((x, y), (width, height)) {
@@ -642,14 +772,31 @@ pub async fn start_recording(app_handle: AppHandle,state:State<'_,AppState>,  fo
     }
 
     match form_data.record_type.as_str() {
-        "sva" => platform::recording_with_output_sva(&app_handle, state, &output_path, &form_data).await,
-        "sv" => platform::recording_with_output_sv(&app_handle, state, &output_path, &form_data).await,
-        "sa" => platform::recording_with_output_sa(&app_handle, state, &output_path, &form_data).await,
-        "va" => platform::recording_with_output_va(&app_handle, state, &output_path, &form_data).await,
-        "s" => platform::recording_with_output_s(&app_handle, state, &output_path, &form_data).await,
-        "v" => platform::recording_with_output_v(&app_handle, state, &output_path, &form_data).await,
-        "a" => platform::recording_with_output_a(&app_handle, state, &output_path, &form_data).await,
-        "c" => Err("Screenshot capture doesn't go through start_recording — use take_screenshot instead".to_string()),
+        "sva" => {
+            platform::recording_with_output_sva(&app_handle, state, &output_path, &form_data).await
+        }
+        "sv" => {
+            platform::recording_with_output_sv(&app_handle, state, &output_path, &form_data).await
+        }
+        "sa" => {
+            platform::recording_with_output_sa(&app_handle, state, &output_path, &form_data).await
+        }
+        "va" => {
+            platform::recording_with_output_va(&app_handle, state, &output_path, &form_data).await
+        }
+        "s" => {
+            platform::recording_with_output_s(&app_handle, state, &output_path, &form_data).await
+        }
+        "v" => {
+            platform::recording_with_output_v(&app_handle, state, &output_path, &form_data).await
+        }
+        "a" => {
+            platform::recording_with_output_a(&app_handle, state, &output_path, &form_data).await
+        }
+        "c" => Err(
+            "Screenshot capture doesn't go through start_recording — use take_screenshot instead"
+                .to_string(),
+        ),
         _ => Err("Invalid recording type".to_string()),
     }
 }
@@ -669,7 +816,7 @@ pub async fn take_screenshot(app_handle: AppHandle, form_data: FormData) -> Resu
     let result = platform::take_screenshot(&app_handle, &output_path, &form_data).await;
 
     if result.is_ok() {
-        if let Err(e) = app_handle.emit_all("refresh-file-list", ()) {
+        if let Err(e) = app_handle.emit("refresh-file-list", ()) {
             warn!("Failed to emit refresh-file-list: {}", e);
         }
     }
@@ -678,14 +825,17 @@ pub async fn take_screenshot(app_handle: AppHandle, form_data: FormData) -> Resu
 }
 
 #[tauri::command]
-pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+pub async fn stop_recording(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     info!("Stop recording processing");
 
     let output_path = {
         let app_state = state.output_path.lock().await;
         match &*app_state {
             Some(path) => path.clone(),
-            None => return Err("No recording in progress".to_string())
+            None => return Err("No recording in progress".to_string()),
         }
     };
 
@@ -813,7 +963,7 @@ pub async fn stop_recording(app_handle: AppHandle, state: State<'_, AppState>) -
 
     let output_str = path_to_str(&output_path)?;
 
-    if let Err(e) = app_handle.emit_all("refresh-file-list", ()) {
+    if let Err(e) = app_handle.emit("refresh-file-list", ()) {
         warn!("Failed to emit refresh-file-list: {}", e);
     }
 
@@ -840,7 +990,10 @@ pub async fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
 
     let pid = {
         let process_state = state.ffmpeg_process.lock().await;
-        process_state.as_ref().map(|p| p.id()).ok_or_else(|| "No recording in progress".to_string())?
+        process_state
+            .as_ref()
+            .map(|p| p.id())
+            .ok_or_else(|| "No recording in progress".to_string())?
     };
 
     platform::suspend_process(pid)?;
@@ -864,7 +1017,10 @@ pub async fn resume_recording(state: State<'_, AppState>) -> Result<(), String> 
 
     let pid = {
         let process_state = state.ffmpeg_process.lock().await;
-        process_state.as_ref().map(|p| p.id()).ok_or_else(|| "No recording in progress".to_string())?
+        process_state
+            .as_ref()
+            .map(|p| p.id())
+            .ok_or_else(|| "No recording in progress".to_string())?
     };
 
     platform::resume_process(pid)?;
@@ -893,8 +1049,14 @@ async fn mux_system_audio(
 ) -> Result<(), String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let stem = video_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
-    let ext = video_path.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording");
+    let ext = video_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4");
     let muxed_path = video_path.with_file_name(format!("{}.system_audio_mux.{}", stem, ext));
 
     // Match the audio codec to whatever this container already expects elsewhere in this file
@@ -908,56 +1070,74 @@ async fn mux_system_audio(
 
     let mut args: Vec<String> = vec![
         "-y".to_string(),
-        "-i".to_string(), path_to_str(video_path)?.to_string(),
-        "-i".to_string(), path_to_str(wav_path)?.to_string(),
+        "-i".to_string(),
+        path_to_str(video_path)?.to_string(),
+        "-i".to_string(),
+        path_to_str(wav_path)?.to_string(),
     ];
 
     if video_has_audio {
         args.extend(vec![
             "-filter_complex".to_string(),
             "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[aout]".to_string(),
-            "-map".to_string(), "0:v".to_string(),
-            "-map".to_string(), "[aout]".to_string(),
+            "-map".to_string(),
+            "0:v".to_string(),
+            "-map".to_string(),
+            "[aout]".to_string(),
         ]);
     } else {
         // No existing audio to mix with - the WAV becomes the only audio track. -shortest
         // trims to the video's own length, since the WASAPI capture and ffmpeg's screen capture
         // don't start/stop at exactly the same wall-clock instant.
         args.extend(vec![
-            "-map".to_string(), "0:v".to_string(),
-            "-map".to_string(), "1:a".to_string(),
+            "-map".to_string(),
+            "0:v".to_string(),
+            "-map".to_string(),
+            "1:a".to_string(),
             "-shortest".to_string(),
         ]);
     }
 
-    args.extend(vec!["-c:v".to_string(), "copy".to_string(), "-c:a".to_string(), audio_codec.to_string()]);
+    args.extend(vec![
+        "-c:v".to_string(),
+        "copy".to_string(),
+        "-c:a".to_string(),
+        audio_codec.to_string(),
+    ]);
     args.extend(extra_audio_args);
     args.push(path_to_str(&muxed_path)?.to_string());
 
-    let output = tauri::async_runtime::spawn_blocking(move || Command::new(&ffmpeg_path).args(&args).output())
-        .await
-        .map_err(|e| format!("System-audio mux task panicked: {}", e))?
-        .map_err(|e| format!("Failed to run system-audio mux: {}", e))?;
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new(&ffmpeg_path).args(&args).output()
+    })
+    .await
+    .map_err(|e| format!("System-audio mux task panicked: {}", e))?
+    .map_err(|e| format!("Failed to run system-audio mux: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("System-audio mux failed: {}", extract_ffmpeg_error(&stderr)));
+        return Err(format!(
+            "System-audio mux failed: {}",
+            extract_ffmpeg_error(&stderr)
+        ));
     }
 
-    fs::rename(&muxed_path, video_path).map_err(|e| format!("Failed to replace recording with the system-audio mix: {}", e))?;
+    fs::rename(&muxed_path, video_path).map_err(|e| {
+        format!(
+            "Failed to replace recording with the system-audio mix: {}",
+            e
+        )
+    })?;
 
     Ok(())
 }
 
-async fn create_or_replace_rec_completed_modal(app_handle: tauri::AppHandle, file_path: &str) -> Result<String, String> {
-    if let Some(modal_window) = app_handle.get_window("completed_recording") {
-        if let Err(e) = modal_window.close() {
-            return Err(format!("Failed to close existing modal window: {}", e));
-        }
-    }
-
+async fn create_or_replace_rec_completed_modal(
+    app_handle: tauri::AppHandle,
+    file_path: &str,
+) -> Result<String, String> {
     // The file path is baked into the window's own URL (rather than sent via a
-    // 'display-file-modal' event emitted from here) because emit_all only reaches windows that
+    // 'display-file-modal' event emitted from here) because emit only reaches windows that
     // already exist at the moment it's called - this window doesn't exist yet until `build()`
     // below returns, and even then its webview/JS hasn't loaded far enough to have registered
     // a listener. An event fired here would always be missed. A URL query param has no such
@@ -966,21 +1146,38 @@ async fn create_or_replace_rec_completed_modal(app_handle: tauri::AppHandle, fil
         "src-tauri/src/views/completed_recording.html?path={}",
         urlencoding::encode(file_path)
     );
-    let result = tauri::WindowBuilder::new(
-        &app_handle,
-        "completed_recording",
-        tauri::WindowUrl::App(url.into()),
-    )
-    .title("Recording completed")
-    .center()
-    .resizable(false)
-    .inner_size(420.0, 480.0)
-    .always_on_top(true)
-    .minimizable(false)
-    .build();
 
-    match result {
-        Ok(_) => Ok("Recording completed".to_string()),
-        Err(e) => Err(format!("Failed to create modal window: {}", e)),
-    }
+    // spawn_blocking, not done inline: under Tauri v2's IPC bridge, an async command's own
+    // execution was observed running ON the main/UI thread itself (see ensure_annotation_overlay's
+    // own doc comment for the full live-reproduced hang this caused). Both `.close()` and
+    // `WebviewWindowBuilder::build()` need to marshal onto the main thread and wait for it -
+    // calling either from a command already on the main thread self-deadlocks. Running both on a
+    // real background thread guarantees neither is ever called from the main thread either way.
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(modal_window) = app_handle.get_webview_window("completed_recording") {
+            if let Err(e) = modal_window.close() {
+                return Err(format!("Failed to close existing modal window: {}", e));
+            }
+        }
+
+        let result = tauri::WebviewWindowBuilder::new(
+            &app_handle,
+            "completed_recording",
+            tauri::WebviewUrl::App(url.into()),
+        )
+        .title("Recording completed")
+        .center()
+        .resizable(false)
+        .inner_size(420.0, 480.0)
+        .always_on_top(true)
+        .minimizable(false)
+        .build();
+
+        match result {
+            Ok(_) => Ok("Recording completed".to_string()),
+            Err(e) => Err(format!("Failed to create modal window: {}", e)),
+        }
+    })
+    .await
+    .map_err(|e| format!("Modal window creation task panicked: {}", e))?
 }

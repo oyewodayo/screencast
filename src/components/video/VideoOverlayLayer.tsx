@@ -20,8 +20,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IoChevronDown, IoChevronUp } from "react-icons/io5";
-import { open as openFileDialog } from "@tauri-apps/api/dialog";
-import { convertFileSrc } from "@tauri-apps/api/tauri";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { FrameRect } from "../../utils/videoFrameRect";
 import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";

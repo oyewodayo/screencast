@@ -7,8 +7,8 @@
 // this board's own assets/ folder, see import_board_image) and exporting a flattened PNG.
 import { forwardRef, ReactNode, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
-import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/api/dialog";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 // Self-hosted @font-face rules for BoardText's "Modern" font group - see this file's own doc
 // comment for why bundled rather than relying on the host OS. A plain side-effect import: nothing
 // here references its exports, it just needs to be loaded once wherever the Board feature mounts.

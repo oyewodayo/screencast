@@ -6,7 +6,7 @@
 // tile. Makes resume-vs-start-fresh an explicit choice rather than silently guessing which one
 // the user wants.
 import React, { useCallback, useEffect, useState } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { IoAdd, IoChevronDown, IoCopyOutline, IoEllipsisVertical, IoImagesOutline, IoSearchOutline, IoTrashOutline } from "react-icons/io5";
 import { BoardSummary, createEmptyBoardDocument, DEFAULT_BOARD_HEIGHT, DEFAULT_BOARD_WIDTH } from "../../utils/boardTypes";
 import { applyBoardTemplate, BOARD_TEMPLATES, BoardTemplate } from "../../utils/boardTemplates";

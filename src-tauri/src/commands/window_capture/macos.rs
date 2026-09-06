@@ -54,7 +54,9 @@ pub fn get_monitors(app_handle: &AppHandle) -> Result<Vec<MonitorInfo>, String> 
     Ok(screens)
 }
 
-pub async fn capture_window_screenshots_by_title(_app_handle: tauri::AppHandle) -> Result<Vec<WindowInfo>, String> {
+pub async fn capture_window_screenshots_by_title(
+    _app_handle: tauri::AppHandle,
+) -> Result<Vec<WindowInfo>, String> {
     Err(NOT_IMPLEMENTED.to_string())
 }
 

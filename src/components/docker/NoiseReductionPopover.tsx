@@ -12,7 +12,7 @@
 // rather than pretending it's instant.
 import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
-import { IoClose, IoSyncOutline } from "react-icons/io5";
+import { IoClose, IoSyncOutline, IoRefreshOutline } from "react-icons/io5";
 import { MdOutlineNoiseControlOff } from "react-icons/md";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import Slider from "./Slider";
@@ -35,9 +35,15 @@ interface NoiseReductionPopoverProps {
   anchor: { left: number; top: number };
   onUpdate: (strength: number | undefined) => void;
   onClose: () => void;
+  // Re-learns the noise profile from whatever this clip is playing RIGHT NOW, replacing the one
+  // auto-captured the instant the effect first turned on - lets the user scrub/play to an actual
+  // noise-only moment (no speech) and use THAT instead, the same "point it at clean noise" idea
+  // Audacity's own noise reduction relies on. Undefined whenever there's no live graph yet to
+  // recalibrate (strength is 0) - see the strength > 0 guard around the button below.
+  onRecalibrate?: () => void;
 }
 
-const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({ strength, status, anchor, onUpdate, onClose }) => {
+const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({ strength, status, anchor, onUpdate, onClose, onRecalibrate }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
 
   useEffect(() => {
@@ -99,9 +105,22 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({ strength,
         <NumberStepper value={strength * 100} min={0} max={100} step={STRENGTH_STEP * 100} decimals={0} suffix="%" onChange={(pct) => setStrength(pct / 100)} />
       </div>
 
+      {strength > 0 && (
+        <button
+          type="button"
+          onClick={onRecalibrate}
+          className="flex items-center justify-center gap-1.5 py-1.5 rounded text-[11px] text-white/70 hover:text-white bg-white/5 hover:bg-white/10 transition-colors"
+        >
+          <IoRefreshOutline size={13} />
+          Recalibrate from current playback
+        </button>
+      )}
+
       <p className="text-[10px] leading-snug text-white/40 pt-1 border-t border-white/10">
         {status === "calibrating"
           ? "Learning this clip's background noise from what's playing right now - takes under a second, keep playing."
+          : strength > 0
+          ? "If it's not catching the noise, play a stretch with just background noise (no speech) and hit “Recalibrate” above."
           : "Hear it live as you adjust it - listens for a moment of this clip's own background noise the first time it turns on."}
       </p>
     </div>,

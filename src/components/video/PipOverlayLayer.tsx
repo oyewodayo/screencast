@@ -18,8 +18,8 @@
 // this file smaller than VideoOverlayLayer's. A future pass could add on-canvas resizing the way
 // image/blur overlays have it, following the same pattern VideoOverlayLayer.tsx already establishes.
 import React, { useEffect, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/tauri";
-import { open as openFileDialog } from "@tauri-apps/api/dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { PipOverlay } from "../../utils/videoEditTypes";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { FrameRect } from "../../utils/videoFrameRect";

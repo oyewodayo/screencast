@@ -10,10 +10,10 @@
 // restore possible — the on-disk trashed filename is deliberately not the original name (see
 // unique_trashed_name), so the manifest is the only record of where a given file actually came
 // from and when it was deleted.
-use std::fs;
-use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 use tauri::command;
 
 use crate::services::utility::{briefcast_dir, path_to_str};
@@ -52,7 +52,8 @@ fn read_manifest() -> Result<Vec<TrashRecord>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let contents = fs::read_to_string(&path).map_err(|e| format!("Failed to read trash manifest: {}", e))?;
+    let contents =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read trash manifest: {}", e))?;
     if contents.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -61,7 +62,8 @@ fn read_manifest() -> Result<Vec<TrashRecord>, String> {
 
 fn write_manifest(records: &[TrashRecord]) -> Result<(), String> {
     let path = manifest_path()?;
-    let json = serde_json::to_string_pretty(records).map_err(|e| format!("Failed to serialize trash manifest: {}", e))?;
+    let json = serde_json::to_string_pretty(records)
+        .map_err(|e| format!("Failed to serialize trash manifest: {}", e))?;
     fs::write(&path, json).map_err(|e| format!("Failed to write trash manifest: {}", e))
 }
 
@@ -95,7 +97,10 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
         // process."), which reads as an unexplained internal failure rather than something the
         // user can actually act on - naming the likely cause here is worth the extra branch.
         if e.raw_os_error() == Some(32) {
-            format!("\"{}\" is open in another program - close it and try again.", original_name)
+            format!(
+                "\"{}\" is open in another program - close it and try again.",
+                original_name
+            )
         } else {
             format!("Failed to move file to trash: {}", e)
         }
@@ -143,7 +148,10 @@ fn free_restore_path(original_path: &Path) -> PathBuf {
     }
 
     let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = original_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let stem = original_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
     let ext = original_path.extension().and_then(|e| e.to_str());
 
     for attempt in 1.. {
@@ -177,7 +185,8 @@ pub fn restore_from_trash(trashed_name: String) -> Result<String, String> {
     let destination = free_restore_path(&PathBuf::from(&record.original_path));
     if let Some(parent) = destination.parent() {
         if !parent.exists() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to recreate original folder: {}", e))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to recreate original folder: {}", e))?;
         }
     }
 
@@ -228,7 +237,8 @@ pub fn purge_expired_trash(retention_days: i64) -> Result<u32, String> {
 
     let cutoff = Utc::now().timestamp() - retention_days * 24 * 60 * 60;
     let records = read_manifest()?;
-    let (expired, remaining): (Vec<_>, Vec<_>) = records.into_iter().partition(|r| r.deleted_at < cutoff);
+    let (expired, remaining): (Vec<_>, Vec<_>) =
+        records.into_iter().partition(|r| r.deleted_at < cutoff);
 
     for record in &expired {
         let path = trash_dir()?.join(&record.trashed_name);

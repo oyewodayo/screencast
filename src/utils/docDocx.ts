@@ -35,7 +35,7 @@ import {
   UnderlineType,
   WidthType,
 } from "docx";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import type { DocComment, DocPageSize } from "./docTypes";
 import { PAGE_DIMENSIONS_IN, PAGE_MARGIN_IN } from "./docPageGeometry";
 

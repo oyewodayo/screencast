@@ -5,7 +5,7 @@
 // involvement needed: Tauri's asset:// protocol already serves plain fetchable bytes, and unlike
 // the tainted-canvas bug fixed for image overlay export (videoOverlayRender.ts), decoding audio
 // into peak numbers never touches a <canvas> at all, so there's no tainting concern here either.
-import { convertFileSrc } from "@tauri-apps/api/tauri";
+import { convertFileSrc } from "@tauri-apps/api/core";
 
 // Keyed by source path, not overlay id - two overlays pointing at the same file (e.g. one
 // duplicated from the other) share one decode. Cached forever for the life of the app session;

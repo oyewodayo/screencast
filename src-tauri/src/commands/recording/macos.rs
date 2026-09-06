@@ -18,7 +18,10 @@ use std::process::Command;
 
 use tauri::{AppHandle, State};
 
-use super::{build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error, map_overlay_size, spawn_recording, AppState, FormData};
+use super::{
+    build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error,
+    map_overlay_size, spawn_recording, AppState, FormData,
+};
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
 #[derive(Debug, Clone)]
@@ -33,7 +36,9 @@ pub(crate) struct AvDevice {
 //   [AVFoundation indev @ 0x...] [1] Capture screen 0
 //   [AVFoundation indev @ 0x...] AVFoundation audio devices:
 //   [AVFoundation indev @ 0x...] [0] MacBook Pro Microphone
-pub(crate) fn list_avfoundation_devices(app_handle: &AppHandle) -> Result<(Vec<AvDevice>, Vec<AvDevice>), String> {
+pub(crate) fn list_avfoundation_devices(
+    app_handle: &AppHandle,
+) -> Result<(Vec<AvDevice>, Vec<AvDevice>), String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     // ffmpeg exits non-zero here (there's no real input, only a device listing was asked for) —
@@ -69,10 +74,16 @@ pub(crate) fn list_avfoundation_devices(app_handle: &AppHandle) -> Result<(Vec<A
 
         // Device lines end in "] [<index>] <name>" — find the *last* "] [" so a name that
         // itself happens to contain "] [" can't confuse the split.
-        let Some(bracket_start) = line.rfind("] [") else { continue };
+        let Some(bracket_start) = line.rfind("] [") else {
+            continue;
+        };
         let rest = &line[bracket_start + 2..]; // "[0] FaceTime HD Camera"
-        let Some(close) = rest.find(']') else { continue };
-        let Ok(index) = rest[1..close].parse::<u32>() else { continue };
+        let Some(close) = rest.find(']') else {
+            continue;
+        };
+        let Ok(index) = rest[1..close].parse::<u32>() else {
+            continue;
+        };
         let name = rest[close + 1..].trim().to_string();
 
         if in_video_section {
@@ -100,7 +111,10 @@ fn find_index(devices: &[AvDevice], name: &str) -> Option<u32> {
 }
 
 fn find_screen_index(devices: &[AvDevice]) -> Option<u32> {
-    devices.iter().find(|d| d.name.starts_with("Capture screen")).map(|d| d.index)
+    devices
+        .iter()
+        .find(|d| d.name.starts_with("Capture screen"))
+        .map(|d| d.index)
 }
 
 // Builds avfoundation's "VIDEO:AUDIO" input spec — e.g. "1:0" (both), "1:" (video only), ":0"
@@ -130,9 +144,12 @@ fn add_camera_overlay_args(
         let index = find_index(video_devices, device)
             .ok_or_else(|| format!("Camera '{}' not found", device))?;
         args.extend(vec![
-            "-f".to_string(), "avfoundation".to_string(),
-            "-video_size".to_string(), overlay_size.clone(),
-            "-i".to_string(), av_input_spec(Some(index), None),
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-video_size".to_string(),
+            overlay_size.clone(),
+            "-i".to_string(),
+            av_input_spec(Some(index), None),
         ]);
     }
 
@@ -147,8 +164,10 @@ fn add_camera_overlay_args(
 }
 
 fn require_screen_index(video_devices: &[AvDevice]) -> Result<u32, String> {
-    find_screen_index(video_devices)
-        .ok_or_else(|| "No screen capture device found (expected a 'Capture screen N' entry from avfoundation)".to_string())
+    find_screen_index(video_devices).ok_or_else(|| {
+        "No screen capture device found (expected a 'Capture screen N' entry from avfoundation)"
+            .to_string()
+    })
 }
 
 // Re-derives the avfoundation screen index a "monitor:monitor_<i>" screen_size value refers to,
@@ -196,10 +215,21 @@ pub async fn recording_with_output_sva(
 
     let has_camera_overlay = !form_data.video_devices.is_empty();
     let mut args: Vec<String> = vec![
-        "-f".to_string(), "avfoundation".to_string(),
-        "-capture_cursor".to_string(), "1".to_string(),
-        "-framerate".to_string(), "30".to_string(),
-        "-i".to_string(), av_input_spec(Some(screen_index), if has_camera_overlay { None } else { audio_index }),
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-capture_cursor".to_string(),
+        "1".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
+        "-i".to_string(),
+        av_input_spec(
+            Some(screen_index),
+            if has_camera_overlay {
+                None
+            } else {
+                audio_index
+            },
+        ),
     ];
 
     if has_camera_overlay {
@@ -211,8 +241,10 @@ pub async fn recording_with_output_sva(
         // whichever camera happens to be first.
         if let Some(index) = audio_index {
             args.extend(vec![
-                "-f".to_string(), "avfoundation".to_string(),
-                "-i".to_string(), av_input_spec(None, Some(index)),
+                "-f".to_string(),
+                "avfoundation".to_string(),
+                "-i".to_string(),
+                av_input_spec(None, Some(index)),
             ]);
         }
     }
@@ -237,9 +269,12 @@ pub async fn recording_with_output_sv(
     let screen_index = resolve_screen_target(&video_devices, form_data)?;
 
     let mut args: Vec<String> = vec![
-        "-f".to_string(), "avfoundation".to_string(),
-        "-framerate".to_string(), "30".to_string(),
-        "-i".to_string(), av_input_spec(Some(screen_index), None),
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
+        "-i".to_string(),
+        av_input_spec(Some(screen_index), None),
     ];
 
     if !form_data.video_devices.is_empty() {
@@ -265,10 +300,14 @@ pub async fn recording_with_output_sa(
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
 
     let args: Vec<String> = vec![
-        "-f".to_string(), "avfoundation".to_string(),
-        "-capture_cursor".to_string(), "1".to_string(),
-        "-framerate".to_string(), "30".to_string(),
-        "-i".to_string(), av_input_spec(Some(screen_index), audio_index),
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-capture_cursor".to_string(),
+        "1".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
+        "-i".to_string(),
+        av_input_spec(Some(screen_index), audio_index),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ];
@@ -292,9 +331,12 @@ pub async fn recording_with_output_v(
         .ok_or_else(|| format!("Camera '{}' not found", video_device))?;
 
     let args: Vec<String> = vec![
-        "-f".to_string(), "avfoundation".to_string(),
-        "-i".to_string(), av_input_spec(Some(camera_index), None),
-        "-c:v".to_string(), "mpeg4".to_string(),
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-i".to_string(),
+        av_input_spec(Some(camera_index), None),
+        "-c:v".to_string(),
+        "mpeg4".to_string(),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ];
@@ -315,8 +357,10 @@ pub async fn recording_with_output_a(
         .ok_or_else(|| format!("Audio device '{}' not found", form_data.audio_device))?;
 
     let args: Vec<String> = vec![
-        "-f".to_string(), "avfoundation".to_string(),
-        "-i".to_string(), av_input_spec(None, Some(audio_index)),
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-i".to_string(),
+        av_input_spec(None, Some(audio_index)),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ];
@@ -340,9 +384,12 @@ pub async fn recording_with_output_va(
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
 
     let args: Vec<String> = vec![
-        "-f".to_string(), "avfoundation".to_string(),
-        "-i".to_string(), av_input_spec(Some(camera_index), audio_index),
-        "-c:v".to_string(), "mpeg4".to_string(),
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-i".to_string(),
+        av_input_spec(Some(camera_index), audio_index),
+        "-c:v".to_string(),
+        "mpeg4".to_string(),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ];
@@ -362,10 +409,14 @@ pub async fn recording_with_output_s(
     let screen_index = resolve_screen_target(&video_devices, form_data)?;
 
     let args: Vec<String> = vec![
-        "-f".to_string(), "avfoundation".to_string(),
-        "-capture_cursor".to_string(), "1".to_string(),
-        "-framerate".to_string(), "30".to_string(),
-        "-i".to_string(), av_input_spec(Some(screen_index), None),
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-capture_cursor".to_string(),
+        "1".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
+        "-i".to_string(),
+        av_input_spec(Some(screen_index), None),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ];
@@ -378,7 +429,11 @@ pub async fn recording_with_output_s(
 // track, nothing for stop_recording to stop. Replaces what used to be recording_with_output_c, a
 // continuous screen recording started/stopped exactly like every other mode despite the
 // "Screenshot" label the frontend showed for this record type — the same bug win.rs had.
-pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form_data: &FormData) -> Result<String, String> {
+pub async fn take_screenshot(
+    app_handle: &AppHandle,
+    output_path: &PathBuf,
+    form_data: &FormData,
+) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
     let screen_index = resolve_screen_target(&video_devices, form_data)?;
@@ -386,10 +441,14 @@ pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form
 
     tauri::async_runtime::spawn_blocking(move || {
         let args: Vec<String> = vec![
-            "-f".to_string(), "avfoundation".to_string(),
-            "-capture_cursor".to_string(), "1".to_string(),
-            "-i".to_string(), av_input_spec(Some(screen_index), None),
-            "-frames:v".to_string(), "1".to_string(),
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-capture_cursor".to_string(),
+            "1".to_string(),
+            "-i".to_string(),
+            av_input_spec(Some(screen_index), None),
+            "-frames:v".to_string(),
+            "1".to_string(),
             "-y".to_string(),
             path_to_str(&output_path)?.to_string(),
         ];
@@ -401,7 +460,10 @@ pub async fn take_screenshot(app_handle: &AppHandle, output_path: &PathBuf, form
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Screenshot capture failed: {}", extract_ffmpeg_error(&stderr)));
+            return Err(format!(
+                "Screenshot capture failed: {}",
+                extract_ffmpeg_error(&stderr)
+            ));
         }
 
         Ok(format!("Screenshot saved to {}", output_path.display()))
@@ -420,7 +482,11 @@ pub(crate) fn suspend_process(pid: u32) -> Result<(), String> {
         .args(["-STOP", &pid.to_string()])
         .status()
         .map_err(|e| format!("Failed to pause recording: {}", e))
-        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to pause recording: kill -STOP exited with an error".to_string()))
+        .and_then(|status| {
+            status.success().then_some(()).ok_or_else(|| {
+                "Failed to pause recording: kill -STOP exited with an error".to_string()
+            })
+        })
 }
 
 pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
@@ -428,5 +494,9 @@ pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
         .args(["-CONT", &pid.to_string()])
         .status()
         .map_err(|e| format!("Failed to resume recording: {}", e))
-        .and_then(|status| status.success().then_some(()).ok_or_else(|| "Failed to resume recording: kill -CONT exited with an error".to_string()))
+        .and_then(|status| {
+            status.success().then_some(()).ok_or_else(|| {
+                "Failed to resume recording: kill -CONT exited with an error".to_string()
+            })
+        })
 }

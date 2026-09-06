@@ -121,8 +121,10 @@ fn parse_fraction(s: &str) -> Option<f64> {
 fn probe_media(ffprobe_path: &Path, input_path: &str) -> Result<ProbeInfo, String> {
     let mut cmd = Command::new(ffprobe_path);
     cmd.args([
-        "-v", "quiet",
-        "-print_format", "json",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
         "-show_format",
         "-show_streams",
         input_path,
@@ -130,7 +132,9 @@ fn probe_media(ffprobe_path: &Path, input_path: &str) -> Result<ProbeInfo, Strin
     #[cfg(windows)]
     hide_console_window(&mut cmd);
 
-    let output = cmd.output().map_err(|e| format!("Failed to run ffprobe: {}", e))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
     let probe: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("Failed to parse ffprobe output: {}", e))?;
 
@@ -165,7 +169,14 @@ fn probe_media(ffprobe_path: &Path, input_path: &str) -> Result<ProbeInfo, Strin
         .map(|c| c as u16)
         .unwrap_or(2);
 
-    Ok(ProbeInfo { duration, width, height, fps, has_audio, channels })
+    Ok(ProbeInfo {
+        duration,
+        width,
+        height,
+        fps,
+        has_audio,
+        channels,
+    })
 }
 
 // MJPEG frames on stdout, capped resolution/fps so the base64-over-JSON-IPC payload this
@@ -181,20 +192,30 @@ fn spawn_video_pipe(
 ) -> Result<Child, String> {
     let mut cmd = Command::new(ffmpeg_path);
     cmd.args([
-        "-ss", &seek_secs.to_string(),
-        "-i", input_path,
+        "-ss",
+        &seek_secs.to_string(),
+        "-i",
+        input_path,
         "-an",
-        "-vf", &format!("scale='min({},iw)':-2", max_width),
-        "-r", &fps.to_string(),
-        "-q:v", MJPEG_QUALITY,
-        "-f", "image2pipe",
-        "-vcodec", "mjpeg",
+        "-vf",
+        &format!("scale='min({},iw)':-2", max_width),
+        "-r",
+        &fps.to_string(),
+        "-q:v",
+        MJPEG_QUALITY,
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
         "pipe:1",
     ]);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     hide_console_window(&mut cmd);
-    cmd.spawn().map_err(|e| format!("Failed to start video decode: {}", e))
+    cmd.spawn()
+        .map_err(|e| format!("Failed to start video decode: {}", e))
 }
 
 // Raw PCM on stdout - directly usable by the Web Audio API without needing a container, and
@@ -208,18 +229,26 @@ fn spawn_audio_pipe(
 ) -> Result<Child, String> {
     let mut cmd = Command::new(ffmpeg_path);
     cmd.args([
-        "-ss", &seek_secs.to_string(),
-        "-i", input_path,
+        "-ss",
+        &seek_secs.to_string(),
+        "-i",
+        input_path,
         "-vn",
-        "-f", "s16le",
-        "-ar", &AUDIO_SAMPLE_RATE.to_string(),
-        "-ac", &channels.to_string(),
+        "-f",
+        "s16le",
+        "-ar",
+        &AUDIO_SAMPLE_RATE.to_string(),
+        "-ac",
+        &channels.to_string(),
         "pipe:1",
     ]);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     hide_console_window(&mut cmd);
-    cmd.spawn().map_err(|e| format!("Failed to start audio decode: {}", e))
+    cmd.spawn()
+        .map_err(|e| format!("Failed to start audio decode: {}", e))
 }
 
 // Drains a child's stderr on its own thread so ffmpeg never blocks on a full stderr pipe (it
@@ -250,7 +279,12 @@ fn find_marker(haystack: &[u8], b0: u8, b1: u8) -> Option<usize> {
 //
 // Output fps is forced constant (-r in spawn_video_pipe), so each frame's timestamp is computed
 // deterministically from its position in the sequence rather than parsed out of the stream.
-fn read_video_frames(mut stdout: ChildStdout, fps: f64, seek_offset: f64, tx: SyncSender<VideoFrame>) {
+fn read_video_frames(
+    mut stdout: ChildStdout,
+    fps: f64,
+    seek_offset: f64,
+    tx: SyncSender<VideoFrame>,
+) {
     let mut buffer: Vec<u8> = Vec::new();
     let mut read_buf = [0u8; 65536];
     let mut frame_index: u64 = 0;
@@ -264,8 +298,12 @@ fn read_video_frames(mut stdout: ChildStdout, fps: f64, seek_offset: f64, tx: Sy
         buffer.extend_from_slice(&read_buf[..n]);
 
         loop {
-            let Some(soi) = find_marker(&buffer, 0xFF, 0xD8) else { break };
-            let Some(eoi_rel) = find_marker(&buffer[soi + 2..], 0xFF, 0xD9) else { break };
+            let Some(soi) = find_marker(&buffer, 0xFF, 0xD8) else {
+                break;
+            };
+            let Some(eoi_rel) = find_marker(&buffer[soi + 2..], 0xFF, 0xD9) else {
+                break;
+            };
             let eoi = soi + 2 + eoi_rel;
             let frame_end = eoi + 2;
 
@@ -283,7 +321,13 @@ fn read_video_frames(mut stdout: ChildStdout, fps: f64, seek_offset: f64, tx: Sy
 
 // Reads fixed-size PCM chunks (~170ms each) rather than forwarding every OS-level read() as its
 // own chunk, so chunk size/timing is predictable regardless of how the pipe happens to buffer.
-fn read_audio_chunks(mut stdout: ChildStdout, sample_rate: u32, channels: u16, seek_offset: f64, tx: SyncSender<AudioChunk>) {
+fn read_audio_chunks(
+    mut stdout: ChildStdout,
+    sample_rate: u32,
+    channels: u16,
+    seek_offset: f64,
+    tx: SyncSender<AudioChunk>,
+) {
     let bytes_per_frame = (channels as usize).max(1) * 2; // s16le = 2 bytes/sample
     let chunk_bytes = AUDIO_CHUNK_FRAMES * bytes_per_frame;
     let mut chunk_index: u64 = 0;
@@ -306,10 +350,18 @@ fn read_audio_chunks(mut stdout: ChildStdout, sample_rate: u32, channels: u16, s
         }
         buf.truncate(filled);
         let sample_count = (filled / bytes_per_frame) as u32;
-        let pts = seek_offset + (chunk_index as f64) * (AUDIO_CHUNK_FRAMES as f64) / (sample_rate as f64);
+        let pts =
+            seek_offset + (chunk_index as f64) * (AUDIO_CHUNK_FRAMES as f64) / (sample_rate as f64);
         let data_base64 = BASE64.encode(&buf);
 
-        if tx.send(AudioChunk { data_base64, pts, sample_count }).is_err() {
+        if tx
+            .send(AudioChunk {
+                data_base64,
+                pts,
+                sample_count,
+            })
+            .is_err()
+        {
             return;
         }
         chunk_index += 1;
@@ -324,19 +376,35 @@ fn spawn_session_pipes(
     fps: f64,
     has_audio: bool,
     channels: u16,
-) -> Result<(Child, Receiver<VideoFrame>, Option<Child>, Option<Receiver<AudioChunk>>), String> {
+) -> Result<
+    (
+        Child,
+        Receiver<VideoFrame>,
+        Option<Child>,
+        Option<Receiver<AudioChunk>>,
+    ),
+    String,
+> {
     let mut video_child = spawn_video_pipe(ffmpeg_path, input_path, seek_secs, width, fps)?;
-    let video_stdout = video_child.stdout.take().ok_or("Failed to capture video stdout")?;
+    let video_stdout = video_child
+        .stdout
+        .take()
+        .ok_or("Failed to capture video stdout")?;
     drain_stderr(video_child.stderr.take());
     let (video_tx, video_rx) = mpsc::sync_channel::<VideoFrame>(VIDEO_CHANNEL_CAP);
     std::thread::spawn(move || read_video_frames(video_stdout, fps, seek_secs, video_tx));
 
     let (audio_child, audio_rx) = if has_audio {
         let mut child = spawn_audio_pipe(ffmpeg_path, input_path, seek_secs, channels)?;
-        let audio_stdout = child.stdout.take().ok_or("Failed to capture audio stdout")?;
+        let audio_stdout = child
+            .stdout
+            .take()
+            .ok_or("Failed to capture audio stdout")?;
         drain_stderr(child.stderr.take());
         let (tx, rx) = mpsc::sync_channel::<AudioChunk>(AUDIO_CHANNEL_CAP);
-        std::thread::spawn(move || read_audio_chunks(audio_stdout, AUDIO_SAMPLE_RATE, channels, seek_secs, tx));
+        std::thread::spawn(move || {
+            read_audio_chunks(audio_stdout, AUDIO_SAMPLE_RATE, channels, seek_secs, tx)
+        });
         (Some(child), Some(rx))
     } else {
         (None, None)
@@ -376,7 +444,13 @@ pub async fn start_native_playback(
     let out_fps = probe.fps.min(MAX_FPS);
 
     let (video_child, video_rx, audio_child, audio_rx) = spawn_session_pipes(
-        &ffmpeg_path, &input_path, seek, out_width, out_fps, probe.has_audio, probe.channels,
+        &ffmpeg_path,
+        &input_path,
+        seek,
+        out_width,
+        out_fps,
+        probe.has_audio,
+        probe.channels,
     )?;
 
     let session_id = state.next_id.fetch_add(1, Ordering::SeqCst);
@@ -406,19 +480,32 @@ pub async fn start_native_playback(
 }
 
 #[tauri::command]
-pub fn get_next_video_frame(state: State<'_, NativePlaybackState>, session_id: u64) -> Result<Option<VideoFrame>, String> {
+pub fn get_next_video_frame(
+    state: State<'_, NativePlaybackState>,
+    session_id: u64,
+) -> Result<Option<VideoFrame>, String> {
     let sessions = state.sessions.lock().unwrap();
-    let session = sessions.get(&session_id).ok_or("Unknown playback session")?;
-    match session.video_rx.recv_timeout(std::time::Duration::from_millis(PULL_TIMEOUT_MS)) {
+    let session = sessions
+        .get(&session_id)
+        .ok_or("Unknown playback session")?;
+    match session
+        .video_rx
+        .recv_timeout(std::time::Duration::from_millis(PULL_TIMEOUT_MS))
+    {
         Ok(frame) => Ok(Some(frame)),
         Err(_) => Ok(None), // timed out (nothing new yet) or disconnected (EOF) - same "try again or stop" signal to the caller
     }
 }
 
 #[tauri::command]
-pub fn get_next_audio_chunk(state: State<'_, NativePlaybackState>, session_id: u64) -> Result<Option<AudioChunk>, String> {
+pub fn get_next_audio_chunk(
+    state: State<'_, NativePlaybackState>,
+    session_id: u64,
+) -> Result<Option<AudioChunk>, String> {
     let sessions = state.sessions.lock().unwrap();
-    let session = sessions.get(&session_id).ok_or("Unknown playback session")?;
+    let session = sessions
+        .get(&session_id)
+        .ok_or("Unknown playback session")?;
     let Some(audio_rx) = session.audio_rx.as_ref() else {
         return Ok(None); // source has no audio stream at all
     };
@@ -438,13 +525,21 @@ pub async fn seek_native_playback(
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
 
     let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions.get_mut(&session_id).ok_or("Unknown playback session")?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or("Unknown playback session")?;
 
     kill_session_children(session);
 
     let has_audio = session.audio_rx.is_some();
     let (video_child, video_rx, audio_child, audio_rx) = spawn_session_pipes(
-        &ffmpeg_path, &session.input_path, time_secs, session.width, session.fps, has_audio, session.channels,
+        &ffmpeg_path,
+        &session.input_path,
+        time_secs,
+        session.width,
+        session.fps,
+        has_audio,
+        session.channels,
     )?;
 
     session.video_child = video_child;
@@ -456,7 +551,10 @@ pub async fn seek_native_playback(
 }
 
 #[tauri::command]
-pub fn stop_native_playback(state: State<'_, NativePlaybackState>, session_id: u64) -> Result<(), String> {
+pub fn stop_native_playback(
+    state: State<'_, NativePlaybackState>,
+    session_id: u64,
+) -> Result<(), String> {
     if let Some(mut session) = state.sessions.lock().unwrap().remove(&session_id) {
         kill_session_children(&mut session);
     }

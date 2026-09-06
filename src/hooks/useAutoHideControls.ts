@@ -6,7 +6,6 @@ const useAutoHideControls = (delay = 3000) => {
 
   const show = () => {
     setVisible(true);
-    console.log("Curson In")
     if (timerRef.current) {
       clearTimeout(timerRef.current);
     }
@@ -15,7 +14,6 @@ const useAutoHideControls = (delay = 3000) => {
 
   const hide = () => {
     setVisible(false);
-    console.log("Cursor out")
     if (timerRef.current) {
       clearTimeout(timerRef.current);
     }

@@ -1,8 +1,9 @@
 import './player.css';
 import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
-import { invoke, convertFileSrc } from '@tauri-apps/api/tauri';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { IoPause, IoPlay, IoPlayCircleOutline, IoPlayCircle } from 'react-icons/io5';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { IoPause, IoPlay, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -10,6 +11,7 @@ import { RxDoubleArrowLeft, RxDoubleArrowRight } from 'react-icons/rx';
 import Alert from './custom/Alert';
 import PlaytimeSettings from './custom/PlaytimeSettings';
 import useAutoHideControls from '../hooks/useAutoHideControls';
+import { getWaveformPeaks } from '../utils/audioWaveform';
 
 // Import utility functions
 import {
@@ -20,7 +22,8 @@ import {
   setVolume,
   toggleFullscreen,
   togglePictureInPicture,
-  updateTimelineProgress
+  updateTimelineProgress,
+  CAPTIONS_LANGUAGE_OPTIONS
 } from '../utils/videoUtils';
 
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
@@ -47,6 +50,62 @@ interface ConversionProgress {
   message: string;
 }
 
+// Mirrors the Rust side's ScrubSprite (src-tauri/src/commands/conversion.rs), returned by
+// get_video_scrub_sprite - a pre-generated grid image of downsampled frames the scrub bar crops
+// per-hover instead of decoding a fresh frame on every mouse move.
+interface ScrubSpriteMeta {
+  url: string;
+  columns: number;
+  rows: number;
+  tileWidth: number;
+  tileHeight: number;
+  count: number;
+  interval: number;
+}
+
+// A user- or silence-detection-placed marker on the timeline - persisted as a `.chapters.json`
+// sidecar next to the video (save_video_chapters/load_video_chapters, video_edits.rs), the same
+// write-tmp-then-rename convention as the timeline editor's own `.edits.json`, just a separate,
+// much smaller file so having chapters never implies the file has been opened in the full editor.
+interface Chapter {
+  id: string;
+  time: number;
+  label: string;
+}
+
+const formatChapterTime = (seconds: number): string => {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+};
+
+// Converts SRT subtitle text to WebVTT, the only format a native <track> element understands.
+// The two formats are otherwise line-for-line identical - just a "WEBVTT" header, and "," instead
+// of "." as the sub-second separator in timestamps (00:00:01,000 vs 00:00:01.000).
+const srtToVtt = (srtText: string): string => {
+  const body = srtText.replace(/\r\n?/g, '\n').replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  return `WEBVTT\n\n${body}`;
+};
+
+// Reads a subtitle file's raw bytes via the backend (sidesteps the frontend fs allowlist scope the
+// same way docxImport/docImagePaste already do for their own file reads), converts to WebVTT if
+// it's an .srt, and wraps it as a Blob URL with an explicit text/vtt type. A Blob URL - not
+// convertFileSrc - is required here: Tauri's asset:// protocol guesses Content-Type from the file
+// extension, and its MIME table doesn't know .vtt, so it serves one as text/html - which <track>
+// silently refuses to parse as WebVTT (no error event, cues just never load). A Blob lets this set
+// the exact MIME type itself instead of depending on that guess. media-src in tauri.conf.json's
+// CSP was widened to include blob: specifically to allow this.
+const loadCaptionsSrc = async (path: string): Promise<string> => {
+  const bytes = await invoke<number[]>('read_file_bytes', { path });
+  const text = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+  const vttText = path.toLowerCase().endsWith('.srt') ? srtToVtt(text) : text;
+  return URL.createObjectURL(new Blob([vttText], { type: 'text/vtt' }));
+};
+
 type VolumeLevel = 'low' | 'high' | 'muted';
 // PDFs are handled by the dedicated PdfAnnotator component (see Dashboard.tsx routing) —
 // they never reach this component, so 'pdf' is intentionally not a MediaType here.
@@ -62,7 +121,18 @@ interface KeyboardHandlerActions {
   toggleCaptions: () => void;
   playbackSpeedIncrease: () => void;
   playbackSpeedReduce: () => void;
+  seekBackward: () => void;
+  seekForward: () => void;
+  stepFrameBackward: () => void;
+  stepFrameForward: () => void;
+  toggleShortcutsOverlay: () => void;
 }
+
+// Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
+// keypress. Intentionally not tied to `currentSkipTime` (the on-screen skip buttons' own,
+// user-adjustable amount): that control is for jumping past whole sections, this one is for
+// frame-accurate scrubbing while trimming/reviewing a recording.
+const ARROW_SEEK_SECONDS = 5;
 interface VideoPlayerProps {
   src?: string;
   title?: string;
@@ -144,6 +214,13 @@ export interface VideoPlayerHandle {
   // whole tree every few milliseconds, so this writes video.style.transform directly instead, the
   // same "bypass React for a hot path" idiom the Ken Burns rAF loop below already uses.
   previewCropLive: (crop: ClipCrop | null) => void;
+  // Re-learns the live noise-reduction profile from whatever this clip is playing at the moment
+  // this is called, discarding whatever got auto-captured the instant the effect first turned on -
+  // NoiseReductionPopover's "Recalibrate from current playback" button calls this so a user who
+  // scrubs to an actual noise-only stretch (no speech) can point the profile at THAT instead of
+  // whatever happened to be playing when they first turned the effect on. A no-op when there's no
+  // live graph yet to recalibrate (noiseReduction strength is still 0 - see noiseGraphRef itself).
+  recalibrateNoiseReduction: () => void;
 }
 
 const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange }, ref) => {
@@ -172,6 +249,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // clock could stall on, which read as "clicking the clip stopped playback".
   const noiseCtxRef = useRef<AudioContext | null>(null);
   const noiseWorkletReadyRef = useRef<Promise<void> | null>(null);
+  // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only) - a
+  // completely separate AudioContext/graph from the noise-reduction one above, not a shared one:
+  // noiseCtxRef's own createMediaElementSource call only ever fires when activeClipEffects has a
+  // noiseReduction value, which only the timeline editor (video-only) ever sets, so the two never
+  // actually compete for this element's one-time-only createMediaElementSource call in practice,
+  // and keeping them separate avoids retrofitting that already-working code to share a source.
+  const audioVisualizerCtxRef = useRef<AudioContext | null>(null);
+  const audioAnalyserRef = useRef<AnalyserNode | null>(null);
+  const audioVisualizerSetupRef = useRef(false);
+  const visualizerCanvasRef = useRef<HTMLCanvasElement>(null);
   // The graph itself (source/node), set only once addModule has resolved AND a clip has actually
   // asked for noise reduction - null until then, so a session that never touches the feature never
   // pays for a MediaElementAudioSourceNode at all (the AudioContext/worklet-load above is cheap and
@@ -275,6 +362,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       liveCropOverrideRef.current = crop;
       applyCropAndKenBurns();
     },
+    recalibrateNoiseReduction: () => {
+      const graph = noiseGraphRef.current;
+      if (!graph) return;
+      graph.node.port.postMessage({ type: "recalibrate" });
+      onNoiseReductionStatusChangeRef.current?.("calibrating");
+      // Marks this clip as "already (re)calibrated" so the id-change-driven effect further down
+      // doesn't immediately fire a SECOND, redundant recalibrate right on top of this deliberate
+      // one the next time it re-runs (e.g. the strength slider moving again).
+      lastCalibratedClipIdRef.current = activeClipEffectsRef.current?.id ?? null;
+    },
   }), []);
 
   const videoContainerRef = useRef<HTMLDivElement>(null);
@@ -317,7 +414,108 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // UI state
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [isTheatherMode, setIsTheatherMode] = useState<boolean>(true);
+  // User-toggled loop, independent of the `loop` prop (which Dashboard only ever sets for audio's
+  // own "repeat one" mode - see the native <video loop> attribute's combined value below). Local
+  // rather than lifted to Dashboard: nothing outside this player needs to know a single video is
+  // set to repeat, unlike autoplay-next, which Dashboard needs for its own "what plays next" logic.
+  const [isLoopEnabled, setIsLoopEnabled] = useState<boolean>(false);
+  // Chapter markers - loaded from/persisted to the `.chapters.json` sidecar (see the Chapter
+  // interface's own comment). Empty until loaded, same "nothing yet, not an error" shape as
+  // captionsUrl above.
+  const [chapters, setChapters] = useState<Chapter[]>([]);
+  const [showChaptersMenu, setShowChaptersMenu] = useState<boolean>(false);
+  const [isDetectingChapters, setIsDetectingChapters] = useState<boolean>(false);
+  // Which chapter (if any) the cursor is currently near while hovering the timeline - drives the
+  // small tooltip in handleTimelineHover below. Plain state (not a ref written directly to the
+  // DOM like the sprite-preview position) is fine here: this only changes when the hovered
+  // chapter itself changes, not on every mousemove tick, so it doesn't re-render at anywhere near
+  // that frequency.
+  const [hoveredChapter, setHoveredChapter] = useState<Chapter | null>(null);
+  const chaptersBtnRef = useRef<HTMLButtonElement>(null);
+  const chaptersMenuRef = useRef<HTMLDivElement>(null);
+  // "?" toggles this - see keyboardHandlers.ts's own comment on why a keyboard-only affordance
+  // (no toolbar button) matches the convention this mirrors.
+  const [showShortcutsOverlay, setShowShortcutsOverlay] = useState<boolean>(false);
   const [captionsVisible, setCaptionsVisible] = useState<boolean>(false);
+  // Blob URL for the <track>'s src, once a real subtitle file (auto-detected sibling .vtt/.srt, or
+  // manually picked via the CC button) has actually been loaded and converted - null means there's
+  // genuinely nothing to show yet, distinct from captionsVisible (which only matters once this is
+  // non-null). Kept in a ref too so the unmount-only cleanup effect below can revoke whatever the
+  // LATEST url is without needing it in that effect's own deps.
+  const [captionsUrl, setCaptionsUrl] = useState<string | null>(null);
+  const captionsUrlRef = useRef<string | null>(null);
+  captionsUrlRef.current = captionsUrl;
+  // Shown when the CC button is clicked with nothing loaded yet - lets the user pick between a
+  // file of their own and offline generation, rather than the button jumping straight to one.
+  const [showCaptionsSourceMenu, setShowCaptionsSourceMenu] = useState<boolean>(false);
+  const captionsBtnRef = useRef<HTMLButtonElement>(null);
+  const captionsMenuRef = useRef<HTMLDivElement>(null);
+  // Set by a popover's click-outside handler (settings, captions source menu) when the dismissing
+  // click landed on the <video> itself - consumed by the video's own onClick (handleVideoClick)
+  // so that one click either closes a popover or toggles play/pause, never both. A ref rather than
+  // state since it only needs to survive from one native event to the very next one, not trigger
+  // a render.
+  const suppressNextVideoClickRef = useRef<boolean>(false);
+  // Whether a sibling .vtt/.srt file is picked up automatically on open (see the auto-detect
+  // effect below) - a plain localStorage flag rather than a prop threaded down from Dashboard/
+  // AppSettings, since this component is fully remounted per file (see autoplayNext's own doc
+  // comment above for why that matters): reading it fresh from localStorage on each mount is what
+  // lets the preference survive across files without needing that remount-safe plumbing for just
+  // this one flag. Defaults on (matches this feature's existing behavior before this toggle
+  // existed) unless the user has explicitly turned it off before.
+  const [autoDetectCaptions, setAutoDetectCaptions] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('briefcast:captionsAutoDetect') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const toggleAutoDetectCaptions = (): void => {
+    setAutoDetectCaptions((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('briefcast:captionsAutoDetect', String(next));
+      } catch {
+        // Private/locked-down storage - the toggle still works for this session, just won't
+        // persist across a restart.
+      }
+      return next;
+    });
+  };
+  // Whisper language for "Generate from audio" - "auto" lets whisper.cpp detect it from the
+  // audio itself. Same localStorage persistence approach as autoDetectCaptions above, and for the
+  // same reason (a stable preference across files/restarts, without needing Dashboard/AppSettings
+  // plumbing just for this).
+  const [captionsLanguage, setCaptionsLanguage] = useState<string>(() => {
+    try {
+      return localStorage.getItem('briefcast:captionsLanguage') ?? 'auto';
+    } catch {
+      return 'auto';
+    }
+  });
+  const handleCaptionsLanguageChange = (lang: string): void => {
+    setCaptionsLanguage(lang);
+    try {
+      localStorage.setItem('briefcast:captionsLanguage', lang);
+    } catch {
+      // Private/locked-down storage - still works for this session.
+    }
+  };
+  // True only while a "Generate from audio" transcription is actually running - real model
+  // inference (see generate_captions, conversion.rs), so unlike everything else captions-related
+  // in this component, this can take anywhere from a few seconds to a minute or more.
+  const [isGeneratingCaptions, setIsGeneratingCaptions] = useState<boolean>(false);
+  // 0-100, from the backend's "captions-progress" event (see generateCaptionsFromAudio) - real
+  // transcription progress, not a guess, so the button can show something more honest than an
+  // indefinite spinner for what can be a multi-minute wait on a long recording.
+  const [captionsGenerationProgress, setCaptionsGenerationProgress] = useState<number | null>(null);
+  const [captionsGenerationError, setCaptionsGenerationError] = useState<string | null>(null);
+  const [thumbnailStatus, setThumbnailStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  // A visible snapshot of the exact frame about to become the thumbnail, plus the timestamp it was
+  // taken at - shown in a confirm/cancel picker (openThumbnailPicker/handleSetThumbnail below)
+  // rather than silently acting on whatever frame happened to be on screen when the button was
+  // clicked, which gave no way to see (or double check) what you were actually about to set.
+  const [thumbnailPreview, setThumbnailPreview] = useState<{ url: string; time: number } | null>(null);
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [showSkipTime, setShowSkipTime] = useState<boolean>(false);
 
@@ -326,6 +524,22 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [currentTimeElement, setCurrentTimeElement] = useState<string>("0:00");
   const [totalTimeElement, setTotalTimeElement] = useState<string | null>(null);
   const [currentSkipTime, setCurrentSkipTime] = useState<number>(30);
+
+  // Scrub-bar hover-preview sprite (see handleTimelineHover) - null until the backend finishes
+  // generating it, or permanently for a file it can't be built for (audio/image, or ffmpeg
+  // failure), in which case hovering the timeline just shows no preview.
+  const [scrubSprite, setScrubSprite] = useState<ScrubSpriteMeta | null>(null);
+  const previewWrapRef = useRef<HTMLDivElement>(null);
+  // Audio's own equivalent of the video scrub-sprite above - a real decoded waveform (see
+  // utils/audioWaveform.ts) drawn onto the timeline itself, since there's no video frame to show a
+  // thumbnail of. null until decoded, or permanently for a file with no audio track/a failed decode
+  // (that util already logs its own failures - this just stays empty rather than erroring).
+  const [audioWaveformPeaks, setAudioWaveformPeaks] = useState<number[] | null>(null);
+  const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
+  // Audio's own equivalent of the chapter-hover tooltip / video thumbnail: since there's nothing
+  // visual to preview, hovering the timeline just shows the timestamp under the cursor instead of
+  // the "(nothing)" a bare, permanently-empty .preview-img-wrap used to render for audio files.
+  const [audioHoverTimeLabel, setAudioHoverTimeLabel] = useState<string | null>(null);
 
   // Settings and preferences
   // Falls back to local state when the caller doesn't pass autoplayNext/onAutoplayNextChange
@@ -374,6 +588,298 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (autoPlay) videoRef.current.play().catch(() => {});
     }
   }, [mediaType, src, autoPlay]);
+
+  // Kick off (or reuse the cache for) the scrub-bar hover-preview sprite as soon as a real video
+  // file is open - fired well ahead of the user ever hovering the timeline, since generating it
+  // takes a real ffmpeg pass. filePath (not `src`, which is an already-loadable asset:// URL) is
+  // what the backend needs to actually read the file. Silently gives up on failure (missing
+  // ffmpeg, unreadable file, etc) - a hover hint is a nice-to-have, never worth surfacing as an
+  // error to the user.
+  useEffect(() => {
+    setScrubSprite(null); // clear the previous file's sprite immediately, don't show a stale one
+    if (mediaType !== 'video' || !filePath) return;
+
+    let cancelled = false;
+    invoke<{
+      spritePath: string;
+      columns: number;
+      rows: number;
+      tileWidth: number;
+      tileHeight: number;
+      count: number;
+      interval: number;
+    }>('get_video_scrub_sprite', { inputPath: filePath })
+      .then((sprite) => {
+        if (cancelled) return;
+        setScrubSprite({
+          url: convertFileSrc(sprite.spritePath),
+          columns: sprite.columns,
+          rows: sprite.rows,
+          tileWidth: sprite.tileWidth,
+          tileHeight: sprite.tileHeight,
+          count: sprite.count,
+          interval: sprite.interval,
+        });
+      })
+      .catch((err) => {
+        console.warn('Scrub-bar preview unavailable for this file:', err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, filePath]);
+
+  // Audio's counterpart to the effect above - decodes the whole file's peak amplitudes (see
+  // utils/audioWaveform.ts) as soon as an audio file opens, drawn onto the timeline once ready by
+  // the effect further below. filePath, not `src`, for the same reason as the sprite fetch (the
+  // waveform decoder fetches the real file itself, not the already-loadable asset:// URL).
+  useEffect(() => {
+    setAudioWaveformPeaks(null);
+    if (mediaType !== 'audio' || !filePath) return;
+
+    let cancelled = false;
+    getWaveformPeaks(filePath)
+      .then((peaks) => {
+        if (!cancelled) setAudioWaveformPeaks(peaks);
+      })
+      .catch(() => {
+        // Already logged by getWaveformPeaks itself - a file with no audio track (or a failed
+        // decode) just leaves the timeline waveform-less, same degradation the editor's own
+        // ClipWaveform/AudioChipWaveform accept.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, filePath]);
+
+  // Sets up the real-time audio-reactive visualizer graph once, the first time this element is
+  // actually playing audio (mediaType 'audio') - a completely separate AudioContext/graph from the
+  // noise-reduction one above (see audioVisualizerCtxRef's own doc comment for why that's fine).
+  // createMediaElementSource detaches the element's native audio output the instant it's called,
+  // so this resumes the (possibly suspended, per browser autoplay policy) context and reconnects
+  // through the analyser in the same synchronous block - otherwise there'd be an audible gap where
+  // the file kept "playing" but produced no sound at all until some later resume.
+  useEffect(() => {
+    if (mediaType !== 'audio' || audioVisualizerSetupRef.current) return;
+    const video = videoRef.current;
+    if (!video) return;
+    audioVisualizerSetupRef.current = true;
+
+    const ctx = new AudioContext();
+    try {
+      const source = ctx.createMediaElementSource(video);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.8;
+      source.connect(analyser);
+      analyser.connect(ctx.destination);
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      audioVisualizerCtxRef.current = ctx;
+      audioAnalyserRef.current = analyser;
+    } catch (err) {
+      console.error("Failed to set up audio visualizer:", err);
+      ctx.close().catch(() => {});
+    }
+
+    return () => {
+      audioAnalyserRef.current = null;
+      audioVisualizerCtxRef.current = null;
+      audioVisualizerSetupRef.current = false;
+      ctx.close().catch(() => {});
+    };
+  }, [mediaType]);
+
+  // Draws the live waveform while playing; shows a flat idle line otherwise. Measures the canvas
+  // once per play/pause transition rather than every frame (unlike a naive per-frame resize) - a
+  // container resize mid-playback won't be picked up until the next play/pause, an accepted
+  // tradeoff for how rarely this container's size actually changes while listening.
+  useEffect(() => {
+    const canvas = visualizerCanvasRef.current;
+    if (mediaType !== 'audio' || !canvas) return;
+    const ctx2d = canvas.getContext('2d');
+    if (!ctx2d) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const analyser = audioAnalyserRef.current;
+    if (!isPlaying || !analyser) {
+      ctx2d.clearRect(0, 0, width, height);
+      ctx2d.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+      ctx2d.lineWidth = 2;
+      ctx2d.beginPath();
+      ctx2d.moveTo(0, height / 2);
+      ctx2d.lineTo(width, height / 2);
+      ctx2d.stroke();
+      return;
+    }
+
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    let rafId: number;
+    const draw = () => {
+      analyser.getByteTimeDomainData(dataArray);
+      ctx2d.clearRect(0, 0, width, height);
+      ctx2d.lineWidth = 2;
+      ctx2d.strokeStyle = 'rgba(239, 68, 68, 0.9)';
+      ctx2d.beginPath();
+      const sliceWidth = width / bufferLength;
+      let x = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        const v = dataArray[i] / 128.0;
+        const y = (v * height) / 2;
+        if (i === 0) ctx2d.moveTo(x, y);
+        else ctx2d.lineTo(x, y);
+        x += sliceWidth;
+      }
+      ctx2d.stroke();
+      rafId = requestAnimationFrame(draw);
+    };
+    draw();
+    return () => cancelAnimationFrame(rafId);
+  }, [mediaType, isPlaying]);
+
+  // Sets the hover-preview wrapper's background image + tile-grid sizing once per sprite (not per
+  // hover - handleTimelineHover only ever touches backgroundPosition after this). background-size
+  // at columns*100%/rows*100% makes one tile exactly fill this element's own box regardless of its
+  // actual rendered pixel size - the standard CSS sprite-sheet technique, chosen specifically
+  // because it needs no clientHeight/scale math of its own (an earlier transform-based version of
+  // this did, and got thrown off by the wrapper's border under box-sizing:border-box, showing
+  // several tiles at once instead of one).
+  useEffect(() => {
+    const wrap = previewWrapRef.current;
+    if (!wrap) return;
+    if (!scrubSprite) {
+      wrap.style.backgroundImage = '';
+      return;
+    }
+    wrap.style.backgroundImage = `url("${scrubSprite.url}")`;
+    wrap.style.backgroundSize = `${scrubSprite.columns * 100}% ${scrubSprite.rows * 100}%`;
+  }, [scrubSprite]);
+
+  // Draws the decoded peaks onto the timeline's own waveform canvas - same devicePixelRatio-aware
+  // canvas technique as VideoTimelineDocker's ClipWaveform/AudioChipWaveform (bars centered
+  // vertically, like the latter, since this sits within the thin timeline rather than anchored to
+  // a tall clip block's own bottom edge). Re-runs on `containerSize` (already tracked elsewhere for
+  // the overlay letterbox math) as a proxy for "the timeline's own width may have changed" -
+  // window resize/theater mode/fullscreen all change that without peaks themselves changing.
+  useEffect(() => {
+    const canvas = waveformCanvasRef.current;
+    const timeline = timelineContainerRef.current;
+    if (!canvas || !timeline || !audioWaveformPeaks) return;
+    const widthPx = timeline.getBoundingClientRect().width;
+    const heightPx = canvas.clientHeight;
+    if (widthPx <= 0 || heightPx <= 0) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(widthPx * dpr));
+    canvas.height = Math.max(1, Math.round(heightPx * dpr));
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, widthPx, heightPx);
+
+    const buckets = Math.max(8, Math.floor(widthPx / 2));
+    const barWidth = widthPx / buckets;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    for (let i = 0; i < buckets; i++) {
+      const amp = audioWaveformPeaks[Math.min(audioWaveformPeaks.length - 1, Math.floor((i / buckets) * audioWaveformPeaks.length))] ?? 0;
+      const barHeight = Math.max(1, amp * heightPx);
+      ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
+    }
+  }, [audioWaveformPeaks, containerSize]);
+
+  // Loads this video's chapter markers (if any) from its `.chapters.json` sidecar as soon as it
+  // opens - unlike captions, there's no "auto-detect from a differently-named file" case here
+  // (chapters aren't a format anything outside this app produces), so this either finds this
+  // exact video's own sidecar or comes back empty.
+  useEffect(() => {
+    setChapters([]);
+    if (mediaType !== 'video' || !filePath) return;
+    let cancelled = false;
+    invoke<string | null>('load_video_chapters', { videoPath: filePath })
+      .then((json) => {
+        if (cancelled || !json) return;
+        const parsed = JSON.parse(json);
+        if (Array.isArray(parsed)) setChapters(parsed);
+      })
+      .catch((err) => console.warn('Failed to load chapters:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, filePath]);
+
+  // Opportunistically picks up a same-named subtitle file sitting next to the video (e.g.
+  // "clip.mp4" -> "clip.vtt" or "clip.srt") as soon as it opens - the common case for anyone who
+  // already has captions from another tool. Tries .vtt before .srt so a hand-authored WebVTT file
+  // wins over a stray .srt of the same name rather than being silently shadowed by it. Entirely
+  // silent either way: read_file_bytes rejecting (file doesn't exist) just means there's nothing to
+  // auto-load, not an error - the CC button's own file picker (toggleCaptions) is still there for
+  // a subtitle file that doesn't happen to live right next to the video. Gated on
+  // autoDetectCaptions (Settings > Captions) - off skips the scan entirely, not just the result.
+  useEffect(() => {
+    if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
+    setCaptionsUrl(null);
+    setCaptionsVisible(false);
+    setCaptionsGenerationError(null);
+    if (mediaType !== 'video' || !filePath || !autoDetectCaptions) return;
+
+    let cancelled = false;
+    const basePath = filePath.replace(/\.[^./\\]+$/, '');
+
+    (async () => {
+      for (const ext of ['.vtt', '.srt']) {
+        try {
+          const url = await loadCaptionsSrc(basePath + ext);
+          if (cancelled) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          setCaptionsUrl(url);
+          return; // found one - .vtt took priority, or .srt is all there was
+        } catch {
+          // no sibling file at this extension (read_file_bytes rejected) - try the next one, or
+          // give up quietly once both are exhausted
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // autoDetectCaptions is deliberately not a dependency - it's read fresh whenever this effect
+    // re-runs for mediaType/filePath anyway (closures always see the latest render's value), which
+    // is exactly "apply the current setting to newly-opened files". Adding it as a dependency
+    // would instead make toggling it live wipe out whatever's showing for the CURRENT file,
+    // including a caption the user loaded manually via the CC button - which the auto-detect
+    // setting has no business touching.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mediaType, filePath]);
+
+  // The <track> element has no reactive "visible" prop - its `default` attribute only picks the
+  // INITIAL mode when the track is first added to the text track list, and never again after that.
+  // Actually showing/hiding cues once a track exists requires setting textTracks[0].mode directly.
+  useEffect(() => {
+    const video = videoRef.current;
+    const track = video?.textTracks[0];
+    if (!track) return;
+    track.mode = captionsVisible ? 'showing' : 'hidden';
+  }, [captionsVisible, captionsUrl]);
+
+  // Revokes whatever caption Blob URL is current when this player unmounts entirely (a file
+  // switch already revokes the previous one itself, in the effect above) - reads captionsUrlRef
+  // rather than closing over captionsUrl so this always sees the latest value regardless of which
+  // render's effect instance actually runs on unmount.
+  useEffect(() => {
+    return () => {
+      if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
+    };
+  }, []);
 
   // Tracks the container's live box size for the `overlay` render-prop's letterbox math - window
   // resize, theater mode, and fullscreen all change this without the <video> itself reloading (so
@@ -470,6 +976,163 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     }
   };
 
+  // Steps exactly one frame forward/backward, always pausing first (frame-accuracy while playback
+  // continues isn't meaningful - the frame you land on would already be gone by the time you saw
+  // it). No exact per-video frame rate is available here without an extra ffprobe round-trip per
+  // file, so this uses a fixed 1/30s step - the same approximation most browser-based players
+  // (video.js, Plyr) make for the same reason; close enough to be useful for reviewing/trimming
+  // without needing new backend plumbing just for this.
+  const stepFrame = (direction: 1 | -1): void => {
+    if (mediaType !== 'video') return;
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration)) return;
+    if (!video.paused) {
+      video.pause();
+      setIsPlaying(false);
+      setIsPaused(true);
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    }
+    const FRAME_STEP_SECONDS = 1 / 30;
+    video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + direction * FRAME_STEP_SECONDS));
+  };
+
+  const toggleLoop = (): void => {
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
+    setIsLoopEnabled((prev) => !prev);
+  };
+
+  // Persists whatever chapter list is passed in - called with the already-updated array right
+  // after each mutation below, rather than in a useEffect keyed on `chapters`, so a rapid string
+  // of edits (e.g. detectChaptersFromSilence adding several at once) writes the sidecar once with
+  // the final state instead of once per intermediate state.
+  const persistChapters = (next: Chapter[]): void => {
+    if (!filePath) return;
+    invoke('save_video_chapters', { videoPath: filePath, json: JSON.stringify(next) }).catch((err) =>
+      console.error('Failed to save chapters:', err)
+    );
+  };
+
+  const addChapterAtCurrentTime = (): void => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration)) return;
+    const time = video.currentTime;
+    const next = [...chapters, { id: crypto.randomUUID(), time, label: formatChapterTime(time) }].sort(
+      (a, b) => a.time - b.time
+    );
+    setChapters(next);
+    persistChapters(next);
+  };
+
+  const renameChapter = (id: string, label: string): void => {
+    setChapters((prev) => {
+      const next = prev.map((c) => (c.id === id ? { ...c, label } : c));
+      persistChapters(next);
+      return next;
+    });
+  };
+
+  const deleteChapter = (id: string): void => {
+    setChapters((prev) => {
+      const next = prev.filter((c) => c.id !== id);
+      persistChapters(next);
+      return next;
+    });
+  };
+
+  const seekToChapter = (time: number): void => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = time;
+  };
+
+  // Overwrites this video's gallery/sidebar poster (get_video_thumbnail's cache, conversion.rs)
+  // with whatever frame is on screen right now. That command emits video-thumbnail-updated once
+  // it's done - Dashboard.tsx/VideoFolderGallery.tsx listen for that to bust their own already-
+  // resolved thumbnail URL for this path, since the URL string itself doesn't change (same
+  // content-addressed cache path), only its bytes did.
+  // Pauses on whatever frame is currently showing and snapshots it client-side (crossOrigin=
+  // "anonymous" on the <video> above is what makes this canvas draw legal rather than throwing a
+  // tainted-canvas SecurityError) so the confirm dialog shows the user the EXACT frame ffmpeg
+  // would extract at that same currentTime - not a guess, not a re-seek, the real pixels.
+  const openThumbnailPicker = (): void => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration)) return;
+    video.pause();
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    setThumbnailPreview({ url: canvas.toDataURL('image/jpeg', 0.85), time: video.currentTime });
+  };
+
+  const handleSetThumbnail = async (): Promise<void> => {
+    if (!filePath || !thumbnailPreview) return;
+    setThumbnailStatus('saving');
+    try {
+      await invoke('set_video_thumbnail', { inputPath: filePath, time: thumbnailPreview.time });
+      setThumbnailStatus('saved');
+    } catch (err) {
+      console.error('Failed to set thumbnail:', err);
+      setThumbnailStatus('error');
+    } finally {
+      setThumbnailPreview(null);
+      setTimeout(() => setThumbnailStatus('idle'), 2000);
+    }
+  };
+
+  // Suggests chapters from detect_silence (conversion.rs) - that command reports silence RANGES
+  // (dead air), the inverse of what a chapter boundary means, so a suggested chapter sits at the
+  // END of each silence range (where real content resumes after a pause) rather than its start.
+  // Merges with, rather than replacing, any chapters already placed by hand: existing ones within
+  // MERGE_TOLERANCE_SEC of a suggestion are left alone instead of duplicated.
+  const detectChaptersFromSilence = async (): Promise<void> => {
+    if (!filePath) return;
+    const video = videoRef.current;
+    const duration = video?.duration;
+    setIsDetectingChapters(true);
+    try {
+      const ranges = await invoke<{ start: number; end: number }[]>('detect_silence', {
+        inputPath: filePath,
+        noiseDb: null,
+        minDuration: null,
+      });
+      const MERGE_TOLERANCE_SEC = 3;
+      const END_MARGIN_SEC = 2; // skip a suggestion this close to the very end - nothing left to chapter
+      const candidates = ranges
+        .map((r) => r.end)
+        .filter((t) => !Number.isFinite(duration) || t < (duration as number) - END_MARGIN_SEC);
+
+      setChapters((prev) => {
+        const additions: Chapter[] = [];
+        for (const time of candidates) {
+          const tooClose = [...prev, ...additions].some((c) => Math.abs(c.time - time) < MERGE_TOLERANCE_SEC);
+          if (!tooClose) additions.push({ id: crypto.randomUUID(), time, label: formatChapterTime(time) });
+        }
+        const next = [...prev, ...additions].sort((a, b) => a.time - b.time);
+        persistChapters(next);
+        return next;
+      });
+    } catch (err) {
+      console.error('Silence-based chapter detection failed:', err);
+    } finally {
+      setIsDetectingChapters(false);
+    }
+  };
+
+  // Wraps togglePauseAndPlay for the <video> element's own onClick - suppresses exactly one
+  // toggle right after a popover (settings, captions source menu) was just dismissed by that same
+  // click, so dismissing a popover by clicking the video reads as "closed the popover", not also
+  // "and now it paused/resumed".
+  const handleVideoClick = (): void => {
+    if (suppressNextVideoClickRef.current) {
+      suppressNextVideoClickRef.current = false;
+      return;
+    }
+    togglePauseAndPlay();
+  };
+
   const toggleMute = (): void => {
      if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
@@ -480,8 +1143,60 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     setVolumeLevel(getVolumeLevel(video.volume, video.muted));
   };
 
+  // Once a track is actually loaded, this is a plain visibility toggle. Before that, there's
+  // nothing to toggle - clicking CC instead opens the source menu (load a file, or generate one)
+  // so the button is never a dead end, unlike the stub this replaces (an empty <track src=""> no
+  // button action could ever fill in).
   const toggleCaptions = (): void => {
-    setCaptionsVisible(prev => !prev);
+    if (!captionsUrl) {
+      setShowCaptionsSourceMenu((prev) => !prev);
+      return;
+    }
+    setCaptionsVisible((prev) => !prev);
+  };
+
+  const pickCaptionsFile = async (): Promise<void> => {
+    setShowCaptionsSourceMenu(false);
+    try {
+      const selected = await openFileDialog({ multiple: false, filters: [{ name: 'Subtitles', extensions: ['vtt', 'srt'] }] });
+      if (!selected || Array.isArray(selected)) return; // cancelled
+      const url = await loadCaptionsSrc(selected);
+      if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
+      setCaptionsUrl(url);
+      setCaptionsVisible(true);
+    } catch (err) {
+      console.error('Failed to load captions file:', err);
+    }
+  };
+
+  // Offline speech-to-text (generate_captions, conversion.rs) - genuinely slow (real model
+  // inference over the whole audio track), so this only ever runs when the user explicitly asks
+  // for it here, never automatically. Surfaces a failure inline (missing model/whisper-cli, no
+  // audio track, etc) rather than just console.error - unlike the silent auto-detect/file-picker
+  // paths, the user was just waiting on this, so silence would read as "why isn't this working".
+  const generateCaptionsFromAudio = async (): Promise<void> => {
+    setShowCaptionsSourceMenu(false);
+    if (!filePath) return;
+    setIsGeneratingCaptions(true);
+    setCaptionsGenerationProgress(0);
+    setCaptionsGenerationError(null);
+    const unlisten = await listen<number>('captions-progress', (event) => {
+      setCaptionsGenerationProgress(event.payload);
+    });
+    try {
+      const vttText = await invoke<string>('generate_captions', { inputPath: filePath, language: captionsLanguage });
+      const url = URL.createObjectURL(new Blob([vttText], { type: 'text/vtt' }));
+      if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
+      setCaptionsUrl(url);
+      setCaptionsVisible(true);
+    } catch (err) {
+      console.error('Caption generation failed:', err);
+      setCaptionsGenerationError(String(err));
+    } finally {
+      unlisten();
+      setIsGeneratingCaptions(false);
+      setCaptionsGenerationProgress(null);
+    }
   };
 
   const toggleTheaterMode = (): void => {
@@ -516,6 +1231,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const newRate = adjustPlaybackRate(video.playbackRate, -0.25);
     video.playbackRate = newRate;
     setCurrentPlaySpeed(`${newRate}x`);
+  };
+
+  const seekBackward = (): void => {
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
+    skipTime(videoRef.current, -ARROW_SEEK_SECONDS);
+  };
+
+  const seekForward = (): void => {
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
+    skipTime(videoRef.current, ARROW_SEEK_SECONDS);
   };
 
   const playbackSpeedNormal = (): void => {
@@ -772,6 +1497,59 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     window.addEventListener('mouseup', handleWindowMouseUp);
   };
 
+  // Picks which tile shows through the hover-preview wrapper (.preview-img-wrap) by moving its
+  // CSS background-position - written straight to the DOM via a ref rather than React state, the
+  // same "skip a re-render on a mousemove-frequency event" idiom updateTimelineVisual above
+  // already uses. --preview-position is a separate CSS var from --progress-position (the actual
+  // playback thumb) so hovering never moves the real progress indicator.
+  const handleTimelineHover = (e: MouseEvent<HTMLDivElement>): void => {
+    const timeline = timelineContainerRef.current;
+    const video = videoRef.current;
+    if (!timeline || !video || !Number.isFinite(video.duration)) return;
+
+    const rect = timeline.getBoundingClientRect();
+    const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    timeline.style.setProperty('--preview-position', fraction.toString());
+    const hoverTime = fraction * video.duration;
+
+    // Shows the chapter tooltip whenever the cursor is merely *near* a marker, not just exactly
+    // on its (very thin, hard to precisely hover) tick - tolerance scales with the video's own
+    // length so a 3-hour recording doesn't make every marker impossible to trigger at typical
+    // pixel-per-second zoom, floored at 1s so short videos don't make it trigger too eagerly.
+    if (chapters.length > 0) {
+      const HOVER_TOLERANCE_SEC = Math.max(1, video.duration * 0.01);
+      const nearest = chapters.find((c) => Math.abs(c.time - hoverTime) <= HOVER_TOLERANCE_SEC) ?? null;
+      setHoveredChapter((prev) => (prev?.id === nearest?.id ? prev : nearest));
+    } else if (hoveredChapter) {
+      setHoveredChapter(null);
+    }
+
+    // Audio's stand-in for the video thumbnail: there's no frame to preview, so show the
+    // timestamp under the cursor instead - rounded to whole seconds so this only re-renders
+    // roughly once per second of horizontal cursor movement, not on every pixel of mousemove.
+    if (mediaType === 'audio') {
+      const label = formatDuration(hoverTime);
+      setAudioHoverTimeLabel((prev) => (prev === label ? prev : label));
+    }
+
+    const sprite = scrubSprite;
+    const wrap = previewWrapRef.current;
+    if (!sprite || !wrap || sprite.count === 0) return;
+
+    const index = Math.min(sprite.count - 1, Math.floor(hoverTime / sprite.interval));
+    const col = index % sprite.columns;
+    const row = Math.floor(index / sprite.columns);
+
+    // Standard CSS sprite-sheet positioning to match the background-size set in the effect above
+    // (columns*100% / rows*100%): background-position percentages are relative to (background size
+    // - element size), which for that background-size lands exactly on tile (col, row) at
+    // col/(columns-1)*100% - 0% whenever there's only one column/row, since division by zero would
+    // otherwise apply.
+    const posX = sprite.columns > 1 ? (col / (sprite.columns - 1)) * 100 : 0;
+    const posY = sprite.rows > 1 ? (row / (sprite.rows - 1)) * 100 : 0;
+    wrap.style.backgroundPosition = `${posX}% ${posY}%`;
+  };
+
   const selectSkipTiming = (value: number): void => {
     setCurrentSkipTime(value);
     setShowSkipTime(false);
@@ -783,7 +1561,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
   // Close the settings flyout on any click outside it (its own gear button included, so that
   // click doesn't immediately re-close what toggleSettings just opened) - previously it only ever
-  // closed by clicking the gear again.
+  // closed by clicking the gear again. Also arms suppressNextVideoClickRef when the outside click
+  // landed on the <video> itself, so that same click doesn't also toggle play/pause (see the
+  // video's own onClick below) - without this, dismissing the flyout by clicking the video paused
+  // or resumed playback as an unwanted side effect of what the user experienced as just "closing
+  // the popover".
   useEffect(() => {
     if (!showSettings) return;
 
@@ -792,11 +1574,44 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (settingsMenuRef.current?.contains(target)) return;
       if (settingsBtnRef.current?.contains(target)) return;
       setShowSettings(false);
+      suppressNextVideoClickRef.current = true;
     };
 
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showSettings]);
+
+  // Same click-outside pattern as the settings flyout above, for the captions source menu.
+  useEffect(() => {
+    if (!showCaptionsSourceMenu) return;
+
+    const handleClickOutside = (event: globalThis.MouseEvent): void => {
+      const target = event.target as Node;
+      if (captionsMenuRef.current?.contains(target)) return;
+      if (captionsBtnRef.current?.contains(target)) return;
+      setShowCaptionsSourceMenu(false);
+      suppressNextVideoClickRef.current = true;
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showCaptionsSourceMenu]);
+
+  // Same click-outside pattern again, for the chapters menu.
+  useEffect(() => {
+    if (!showChaptersMenu) return;
+
+    const handleClickOutside = (event: globalThis.MouseEvent): void => {
+      const target = event.target as Node;
+      if (chaptersMenuRef.current?.contains(target)) return;
+      if (chaptersBtnRef.current?.contains(target)) return;
+      setShowChaptersMenu(false);
+      suppressNextVideoClickRef.current = true;
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showChaptersMenu]);
 
   const handleAutoplay = (): void => {
     if (onAutoplayNextChange) {
@@ -804,10 +1619,6 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     } else {
       setLocalAutoPlay(!localAutoPlay);
     }
-  };
-
-  const handleScreenControls = (): void => {
-    // Implementation for screen controls
   };
 
   // Timeline and progress updates
@@ -880,7 +1691,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       toggleMute,
       toggleCaptions,
       playbackSpeedIncrease,
-      playbackSpeedReduce
+      playbackSpeedReduce,
+      seekBackward,
+      seekForward,
+      stepFrameBackward: () => stepFrame(-1),
+      stepFrameForward: () => stepFrame(1),
+      toggleShortcutsOverlay: () => setShowShortcutsOverlay((prev) => !prev)
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -980,7 +1796,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     </svg>
   );
 
-  const renderVolumeIcon = (): JSX.Element => {
+  const renderVolumeIcon = (): React.JSX.Element => {
     switch (volumeLevel) {
       case 'low':
         return <VolumeLowIcon />;
@@ -999,7 +1815,6 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		onMouseLeave={hide}
 		onTouchStart={show}
 		onTouchMove={show}
-		onClick={handleScreenControls} 
 		className="flex flex-row relative w-full h-screen">
 
 		{showAlert && (
@@ -1011,6 +1826,51 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 			onClose={() => setShowAlert(false)}
 			/>
 		)}
+
+		{showShortcutsOverlay && (
+			<div
+				className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50"
+				onMouseDown={(e) => {
+					if (e.target === e.currentTarget) setShowShortcutsOverlay(false);
+				}}
+			>
+				<div className="w-[420px] max-h-[80vh] overflow-y-auto rounded-xl bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-100 shadow-2xl p-5">
+					<div className="flex items-center justify-between mb-3">
+						<h2 className="text-sm font-semibold">Keyboard shortcuts</h2>
+						<button
+							className="p-1 rounded-full hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+							onClick={() => setShowShortcutsOverlay(false)}
+							title="Close"
+						>
+							<IoClose size={18} />
+						</button>
+					</div>
+					<div className="flex flex-col gap-3 text-sm">
+						{[
+							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame']] },
+							{ title: 'Volume', rows: [['M', 'Mute / unmute']] },
+							{ title: 'Display', rows: [['F', 'Fullscreen'], ['T', 'Theater mode'], ['I', 'Picture in picture']] },
+							{ title: 'Captions', rows: [['C', 'Toggle captions']] },
+							{ title: 'Help', rows: [['?', 'Show / hide this overlay']] },
+						].map((group) => (
+							<div key={group.title}>
+								<h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500 mb-1.5">{group.title}</h3>
+								<div className="flex flex-col gap-1.5">
+									{group.rows.map(([keys, description]) => (
+										<div key={keys} className="flex items-center justify-between gap-4">
+											<span className="text-neutral-600 dark:text-neutral-300">{description}</span>
+											<kbd className="shrink-0 px-2 py-1 rounded-md text-xs font-mono bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-300">
+												{keys}
+											</kbd>
+										</div>
+									))}
+								</div>
+							</div>
+						))}
+					</div>
+				</div>
+			</div>
+		)}
       
     	<div
         	className={`w-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
@@ -1019,14 +1879,41 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 			data-volume-level={volumeLevel}>
 			{(mediaType === 'video' || mediaType === 'audio') && (
 				<div>
-					<img className="thumbnail-img" id="thumbnailImg" alt="Video thumbnail" />
-					<div className="pointer-events-auto"></div>
-					
 					<div className="video-controls-container py-2 place-items-center">
-					<div className="timeline-container" id="timelineContainer" ref={timelineContainerRef} onMouseDown={handleTimelineMouseDown}>
+					<div
+						className="timeline-container"
+						id="timelineContainer"
+						ref={timelineContainerRef}
+						onMouseDown={handleTimelineMouseDown}
+						onMouseMove={handleTimelineHover}
+						onMouseLeave={() => { setHoveredChapter(null); setAudioHoverTimeLabel(null); }}
+					>
 						<div className="timeline">
-						<img className="preview-img" id="previewImgSrc" alt="Video preview" />
+						{mediaType === 'audio' && <canvas ref={waveformCanvasRef} className="audio-waveform-canvas" />}
+						<div className="preview-img-wrap" ref={previewWrapRef}>
+							{mediaType === 'audio' && audioHoverTimeLabel && (
+								<span className="audio-hover-time">{audioHoverTimeLabel}</span>
+							)}
+						</div>
 						<div className="thumb-indicator"></div>
+						{hoveredChapter && videoRef.current && Number.isFinite(videoRef.current.duration) && (
+							<div
+								className="chapter-tooltip"
+								style={{ left: `${(hoveredChapter.time / videoRef.current.duration) * 100}%` }}
+							>
+								{hoveredChapter.label === formatChapterTime(hoveredChapter.time)
+									? hoveredChapter.label
+									: `${formatChapterTime(hoveredChapter.time)} — ${hoveredChapter.label}`}
+							</div>
+						)}
+						{videoRef.current && Number.isFinite(videoRef.current.duration) && chapters.map((chapter) => (
+							<div
+								key={chapter.id}
+								className="chapter-tick"
+								style={{ left: `${(chapter.time / videoRef.current!.duration) * 100}%` }}
+								title={chapter.label}
+							/>
+						))}
 						</div>
 					</div>
 					
@@ -1109,17 +1996,153 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						<button
 						className="autoplay-btn w-7"
 						onClick={handleAutoplay}
-						title={isAutoPlay ? 'Autoplay is on' : 'Autoplay is off'}
+						title={isAutoPlay ? 'Autoplay next is on' : 'Autoplay next is off'}
 						aria-pressed={isAutoPlay}
 						>
+							{/* A "skip forward" glyph reads as "advance to next" - unlike the filled-circle
+							    IoPlayCircle this replaces, it can't be mistaken for a record/live indicator
+							    (the actual record button, elsewhere in this app, is also a filled circle). */}
 							{isAutoPlay
-							? <IoPlayCircle className='w-[100%] text-2xl text-red-500' />
-							: <IoPlayCircleOutline className='w-[100%] text-2xl text-white' />}
+							? <IoPlaySkipForward className='w-[100%] text-2xl text-red-500' />
+							: <IoPlaySkipForwardOutline className='w-[100%] text-2xl text-white' />}
 						</button>
 
-						<button className="captions-btn w-7" onClick={toggleCaptions} title={captionsVisible ? 'Captions on' : 'Captions off'}>
-							<FaClosedCaptioning className={`w-[100%] text-2xl ${captionsVisible ? 'text-red-500' : 'text-white'}`} />
+						<button
+						className="loop-btn w-7"
+						onClick={toggleLoop}
+						title={isLoopEnabled ? 'Loop is on' : 'Loop is off'}
+						aria-pressed={isLoopEnabled}
+						>
+							{isLoopEnabled
+							? <IoRepeat className='w-[100%] text-2xl text-red-500' />
+							: <IoRepeatOutline className='w-[100%] text-2xl text-white' />}
 						</button>
+
+						<div className="relative">
+							<button
+								ref={chaptersBtnRef}
+								className="chapters-btn w-7"
+								onClick={() => setShowChaptersMenu((prev) => !prev)}
+								title={chapters.length > 0 ? `${chapters.length} chapter${chapters.length === 1 ? '' : 's'}` : 'Chapters'}
+							>
+								{chapters.length > 0
+								? <IoBookmark className='w-[100%] text-2xl text-red-500' />
+								: <IoBookmarkOutline className='w-[100%] text-2xl text-white' />}
+							</button>
+
+							{showChaptersMenu && (
+								<div
+									ref={chaptersMenuRef}
+									className="origin-bottom-right absolute bottom-full right-0 mb-1 w-72 rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 overflow-hidden"
+								>
+									{chapters.length > 0 && (
+										<div className="max-h-48 overflow-y-auto divide-y divide-gray-100 dark:divide-neutral-700">
+											{chapters.map((chapter) => (
+												<div key={chapter.id} className="flex items-center gap-2 px-3 py-2">
+													<button
+														className="text-xs tabular-nums text-gray-400 dark:text-neutral-500 shrink-0 hover:text-red-500"
+														onClick={() => seekToChapter(chapter.time)}
+														title="Jump to this chapter"
+													>
+														{formatChapterTime(chapter.time)}
+													</button>
+													<input
+														className="flex-1 min-w-0 text-sm bg-transparent border-none outline-none focus:ring-1 focus:ring-red-400 rounded px-1"
+														value={chapter.label}
+														onChange={(e) => renameChapter(chapter.id, e.target.value)}
+													/>
+													<button
+														className="shrink-0 text-gray-400 hover:text-red-500"
+														onClick={() => deleteChapter(chapter.id)}
+														title="Delete chapter"
+													>
+														<IoTrashOutline size={14} />
+													</button>
+												</div>
+											))}
+										</div>
+									)}
+									<button
+										className="flex items-center gap-2 w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+										onClick={addChapterAtCurrentTime}
+									>
+										<IoBookmarkOutline size={14} /> Add chapter at current time
+									</button>
+									<button
+										className="flex items-center gap-2 w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+										onClick={() => void detectChaptersFromSilence()}
+										disabled={isDetectingChapters}
+									>
+										<IoSparklesOutline size={14} /> {isDetectingChapters ? 'Detecting…' : 'Detect from silence'}
+									</button>
+								</div>
+							)}
+						</div>
+
+						<div className="relative">
+							<button
+								ref={captionsBtnRef}
+								className="captions-btn w-7"
+								onClick={toggleCaptions}
+								disabled={isGeneratingCaptions}
+								title={
+									isGeneratingCaptions
+										? `Generating captions from audio… ${Math.round(captionsGenerationProgress ?? 0)}% (can take a while on a long recording)`
+										: !captionsUrl
+										? 'Add captions (load a file, or generate from audio)'
+										: captionsVisible
+										? 'Captions on (click to hide)'
+										: 'Captions off (click to show)'
+								}
+							>
+								{isGeneratingCaptions ? (
+									<div className="flex flex-col items-center gap-0.5">
+										<div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+										<span className="text-[9px] leading-none tabular-nums text-white/80">{Math.round(captionsGenerationProgress ?? 0)}%</span>
+									</div>
+								) : (
+									<FaClosedCaptioning className={`w-[100%] text-2xl ${captionsVisible ? 'text-red-500' : 'text-white'} ${captionsUrl ? '' : 'opacity-50'}`} />
+								)}
+							</button>
+
+							{showCaptionsSourceMenu && (
+								<div
+									ref={captionsMenuRef}
+									className="origin-bottom-right absolute bottom-full right-0 mb-1 w-64 rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 divide-y divide-gray-100 dark:divide-neutral-700 overflow-hidden"
+								>
+									<button
+										className="block w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700"
+										onClick={() => void pickCaptionsFile()}
+									>
+										Load caption file…
+									</button>
+									<div className="flex items-center justify-between gap-2 px-3.5 py-2 text-xs text-gray-500 dark:text-neutral-400">
+										<span>Language</span>
+										<select
+											className="text-xs rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 px-1.5 py-1 focus:outline-none"
+											value={captionsLanguage}
+											onChange={(e) => handleCaptionsLanguageChange(e.target.value)}
+										>
+											{CAPTIONS_LANGUAGE_OPTIONS.map(([code, name]) => (
+												<option key={code} value={code}>{name}</option>
+											))}
+										</select>
+									</div>
+									<button
+										className="block w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700"
+										onClick={() => void generateCaptionsFromAudio()}
+									>
+										Generate from audio (offline)
+									</button>
+								</div>
+							)}
+
+							{captionsGenerationError && (
+								<div className="absolute bottom-full right-0 mb-1 w-64 rounded-md px-3 py-2 text-xs text-white bg-red-600 shadow-lg">
+									{captionsGenerationError}
+								</div>
+							)}
+						</div>
 
 						<button ref={settingsBtnRef} className="settings-btn w-7" onClick={toggleSettings} title="Settings">
 							<FaCog className='w-[100%] text-2xl' />
@@ -1139,6 +2162,17 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							}}
 							opacity={videoOpacity}
 							onOpacityChange={setVideoOpacity}
+							autoDetectCaptions={autoDetectCaptions}
+							onAutoDetectCaptionsChange={toggleAutoDetectCaptions}
+							hasCaptions={!!captionsUrl}
+							onLoadCaptionsFile={() => { setShowSettings(false); void pickCaptionsFile(); }}
+							onGenerateCaptions={() => { setShowSettings(false); void generateCaptionsFromAudio(); }}
+							isGeneratingCaptions={isGeneratingCaptions}
+							captionsGenerationProgress={captionsGenerationProgress}
+							captionsLanguage={captionsLanguage}
+							onCaptionsLanguageChange={handleCaptionsLanguageChange}
+							onSetThumbnail={() => { setShowSettings(false); openThumbnailPicker(); }}
+							thumbnailStatus={thumbnailStatus}
 							/>
 							</div>
 						)}
@@ -1160,8 +2194,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 				<>
 					<video
 						ref={videoRef}
-						loop={loop}
-						onClick={togglePauseAndPlay}
+						loop={loop || isLoopEnabled}
+						crossOrigin="anonymous"
+						onClick={handleVideoClick}
 						onError={handleVideoError}
 						onLoadedMetadata={() => {
 							if (videoRef.current) {
@@ -1173,14 +2208,57 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							}
 						}}
 					>
-						<track
-							kind="captions"
-							src=""
-							label="English"
-							srcLang="en"
-							default={captionsVisible}
-						/>
+						{captionsUrl && (
+							<track
+								kind="captions"
+								src={captionsUrl}
+								label="English"
+								srcLang="en"
+							/>
+						)}
 					</video>
+					{mediaType === 'audio' && (
+						<canvas ref={visualizerCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
+					)}
+					{thumbnailPreview && (
+						<div
+							className="absolute inset-0 z-30 flex items-center justify-center bg-black/70"
+							onClick={() => setThumbnailPreview(null)}
+						>
+							<div
+								className="flex flex-col items-center gap-3 p-4 rounded-lg bg-neutral-900 ring-1 ring-white/10 shadow-2xl"
+								onClick={(e) => e.stopPropagation()}
+							>
+								<img
+									src={thumbnailPreview.url}
+									alt="Chosen thumbnail frame"
+									className="max-w-[60vw] max-h-[40vh] rounded ring-1 ring-white/10"
+								/>
+								<div className="text-white text-sm">
+									Use this frame ({formatChapterTime(thumbnailPreview.time)}) as the thumbnail?
+								</div>
+								<p className="text-neutral-400 text-xs max-w-[60vw] text-center">
+									This updates the video file itself, so it's also what shows in File Explorer or when you share the file elsewhere.
+								</p>
+								<div className="flex gap-2 mt-1">
+									<button
+										className="px-3.5 py-1.5 rounded-md text-sm text-neutral-300 hover:bg-white/10"
+										onClick={() => setThumbnailPreview(null)}
+										disabled={thumbnailStatus === 'saving'}
+									>
+										Cancel
+									</button>
+									<button
+										className="px-3.5 py-1.5 rounded-md text-sm font-medium bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+										onClick={() => void handleSetThumbnail()}
+										disabled={thumbnailStatus === 'saving'}
+									>
+										{thumbnailStatus === 'saving' ? 'Saving…' : 'Use this frame'}
+									</button>
+								</div>
+							</div>
+						</div>
+					)}
 					{isRecovering && (
 						<div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none bg-black/40">
 							<div className="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />

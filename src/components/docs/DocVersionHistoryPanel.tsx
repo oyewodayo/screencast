@@ -8,7 +8,7 @@
 // docxImport.ts), and rendered through a second, read-only Tiptap instance sharing the exact same
 // schema (getDocContentExtensions) and styling (docProseClassName) as the live editor.
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { useEditor, EditorContent, type JSONContent } from "@tiptap/react";
 import * as Y from "yjs";
 import { yDocToProsemirrorJSON } from "y-prosemirror";

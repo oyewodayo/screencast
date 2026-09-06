@@ -25,7 +25,12 @@ use crate::services::utility::{get_heif_decoder_path, get_heif_thumbnailer_path,
 #[cfg(windows)]
 use crate::commands::recording::hide_console_window;
 
-fn extract_thumbnail_blocking(app_handle: &AppHandle, input_path: &PathBuf, output_path: &PathBuf, size: u32) -> Result<(), String> {
+fn extract_thumbnail_blocking(
+    app_handle: &AppHandle,
+    input_path: &PathBuf,
+    output_path: &PathBuf,
+    size: u32,
+) -> Result<(), String> {
     let thumbnailer_path = get_heif_thumbnailer_path(app_handle)?;
 
     let mut cmd = Command::new(&thumbnailer_path);
@@ -38,7 +43,9 @@ fn extract_thumbnail_blocking(app_handle: &AppHandle, input_path: &PathBuf, outp
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let output = cmd.output().map_err(|e| format!("Failed to start heif-thumbnailer: {}", e))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to start heif-thumbnailer: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("heif-thumbnailer failed: {}", stderr.trim()));
@@ -52,13 +59,24 @@ fn extract_thumbnail_blocking(app_handle: &AppHandle, input_path: &PathBuf, outp
 // Renders/extracts a small preview from a HEIC/HEIF file for gallery-grid display - see this
 // module's own doc comment for why that's a different tool (and dramatically faster) than
 // decode_to_png's full tile-grid reconstruction. Same blocking-pool-spawn shape as decode_to_png.
-pub async fn extract_thumbnail(app_handle: AppHandle, input_path: PathBuf, output_path: PathBuf, size: u32) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || extract_thumbnail_blocking(&app_handle, &input_path, &output_path, size))
-        .await
-        .map_err(|e| format!("HEIC thumbnail task panicked: {e}"))?
+pub async fn extract_thumbnail(
+    app_handle: AppHandle,
+    input_path: PathBuf,
+    output_path: PathBuf,
+    size: u32,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        extract_thumbnail_blocking(&app_handle, &input_path, &output_path, size)
+    })
+    .await
+    .map_err(|e| format!("HEIC thumbnail task panicked: {e}"))?
 }
 
-fn decode_blocking(app_handle: &AppHandle, input_path: &PathBuf, output_path: &PathBuf) -> Result<(), String> {
+fn decode_blocking(
+    app_handle: &AppHandle,
+    input_path: &PathBuf,
+    output_path: &PathBuf,
+) -> Result<(), String> {
     let decoder_path = get_heif_decoder_path(app_handle)?;
 
     let mut cmd = Command::new(&decoder_path);
@@ -73,7 +91,9 @@ fn decode_blocking(app_handle: &AppHandle, input_path: &PathBuf, output_path: &P
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let output = cmd.output().map_err(|e| format!("Failed to start heif-dec: {}", e))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to start heif-dec: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("heif-dec failed: {}", stderr.trim()));
@@ -87,8 +107,14 @@ fn decode_blocking(app_handle: &AppHandle, input_path: &PathBuf, output_path: &P
 // Runs the external process on a dedicated blocking-pool thread - Command::output() blocks the
 // calling thread until the child exits, which doesn't belong on an async worker thread (mirrors
 // heic_windows.rs's decode_to_png wrapper for the same reason).
-pub async fn decode_to_png(app_handle: AppHandle, input_path: PathBuf, output_path: PathBuf) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || decode_blocking(&app_handle, &input_path, &output_path))
-        .await
-        .map_err(|e| format!("HEIC fallback decode task panicked: {e}"))?
+pub async fn decode_to_png(
+    app_handle: AppHandle,
+    input_path: PathBuf,
+    output_path: PathBuf,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        decode_blocking(&app_handle, &input_path, &output_path)
+    })
+    .await
+    .map_err(|e| format!("HEIC fallback decode task panicked: {e}"))?
 }

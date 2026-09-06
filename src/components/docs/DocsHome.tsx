@@ -5,8 +5,8 @@
 // click-outside-closes-menu handling) since Docs and Board are both per-item project folders under
 // briefcast_dir(), just with a Y.Doc instead of a canvas as the content.
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
-import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/api/dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import { IoAdd, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoPin, IoSearch, IoTrashOutline } from "react-icons/io5";
 import { MdFileUpload } from "react-icons/md";
 import * as Y from "yjs";
@@ -311,7 +311,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     if (!/\.docx$/i.test(name)) {
       await showMessageDialog(
         "This looks like an older .doc file. Please save it as .docx (in Word, Google Docs, or LibreOffice) and import again.",
-        { title: "Unsupported file", type: "warning" }
+        { title: "Unsupported file", kind: "warning" }
       );
       return;
     }

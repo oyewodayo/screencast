@@ -10,6 +10,19 @@ interface KeyboardHandlers {
   toggleCaptions?: () => void;
   playbackSpeedIncrease?: () => void;
   playbackSpeedReduce?: () => void;
+  // Short, precise position nudges (the arrow-key convention every mainstream player - YouTube,
+  // VLC, QuickTime - uses). Deliberately separate from the on-screen skip-forward/back buttons,
+  // which jump a coarser, user-configurable amount (default 30s) for a different purpose:
+  // arrows are for frame-accurate scrubbing, the buttons are for skipping past whole sections.
+  seekBackward?: () => void;
+  seekForward?: () => void;
+  // Comma/period for single-frame stepping is the convention shared by YouTube, video.js, and
+  // most desktop NLEs - always pauses first (see stepFrame's own comment, VideoPlayer.tsx).
+  stepFrameBackward?: () => void;
+  stepFrameForward?: () => void;
+  // "?" for a shortcuts overlay is the same convention YouTube, Gmail, and most keyboard-driven
+  // web apps share - shown here in the player rather than only buried in Settings > Help.
+  toggleShortcutsOverlay?: () => void;
   onPlaybackRateChange?: (rate: number) => void;
   onVolumeChange?: (volume: number) => void;
 }
@@ -64,7 +77,7 @@ export const createKeyboardHandler = (
       case "ArrowLeft":
         if (!enableArrowSeek) break;
         e.preventDefault();
-        handlers.playbackSpeedReduce?.();
+        handlers.seekBackward?.();
         break;
       case "j":
         e.preventDefault();
@@ -73,7 +86,7 @@ export const createKeyboardHandler = (
       case "ArrowRight":
         if (!enableArrowSeek) break;
         e.preventDefault();
-        handlers.playbackSpeedIncrease?.();
+        handlers.seekForward?.();
         break;
       case "l":
         e.preventDefault();
@@ -82,6 +95,18 @@ export const createKeyboardHandler = (
       case "c":
         e.preventDefault();
         handlers.toggleCaptions?.();
+        break;
+      case ",":
+        e.preventDefault();
+        handlers.stepFrameBackward?.();
+        break;
+      case ".":
+        e.preventDefault();
+        handlers.stepFrameForward?.();
+        break;
+      case "?":
+        e.preventDefault();
+        handlers.toggleShortcutsOverlay?.();
         break;
       default:
         break;

@@ -342,6 +342,23 @@ video {
     background-color: #dc2626;
 }
 
+/* Audio's own scrub-bar visualization (VideoPlayer.tsx draws real decoded peaks onto this via
+   canvas - see the effect keyed on audioWaveformPeaks) - centered on the thin progress line and
+   taller than it, the same "overflow the bar's own box into the padding already reserved around
+   it" approach the chapter tick/tooltip use, so it reads as a proper waveform track rather than
+   being clipped down to the bar's own 3-5px height. pointer-events: none so it never competes
+   with .timeline-container's own drag-to-seek/hover handlers. */
+.timeline .audio-waveform-canvas {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 100%;
+    height: 24px;
+    pointer-events: none;
+    z-index: 0;
+}
+
 .timeline .thumb-indicator {
     --scale: 0;
     position: absolute;
@@ -356,7 +373,47 @@ video {
     box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
 }
 
-.timeline .preview-img {
+/* Chapter marker - a thin tick on the scrub bar, positioned via inline `left` (VideoPlayer.tsx).
+   pointer-events: none so it never intercepts the timeline's own drag-to-seek/hover-preview
+   handlers, which are bound to .timeline-container, not this element - clicking a chapter's own
+   entry in the Chapters menu is the way to jump to it, this is purely a visual marker. */
+.timeline .chapter-tick {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 2px;
+    background-color: rgba(255, 255, 255, 0.9);
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* Chapter hover tooltip - shown (VideoPlayer.tsx's handleTimelineHover) whenever the cursor is
+   merely near a marker, not pixel-precisely on its thin tick. Sits in the gap between the
+   timeline and the scrub-preview thumbnail above it (.preview-img-wrap's own bottom edge is at
+   top: -1rem) rather than a fixed pixel offset, so it stays clear of that thumbnail without the
+   two needing to coordinate on an exact height. */
+.timeline .chapter-tooltip {
+    position: absolute;
+    bottom: 100%;
+    margin-bottom: 2px;
+    transform: translateX(-50%);
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.25rem;
+    background: rgba(0, 0, 0, 0.85);
+    color: #fff;
+    font-size: 11px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 2;
+}
+
+/* Scrub-bar hover preview: a fixed-size window showing one tile of the sprite sheet
+   VideoPlayer.tsx loads as this element's own CSS background-image. background-size is set (in
+   JS) to columns*100%/rows*100%, so the browser scales the sprite to make one tile exactly fill
+   this box on its own - no pixel/scale math needed here, just moving background-position to pick
+   which tile (the standard CSS sprite-sheet technique, the same one YouTube/Vimeo-style scrub
+   previews use). */
+.timeline .preview-img-wrap {
     position: absolute;
     height: 80px;
     aspect-ratio: 16/9;
@@ -366,29 +423,30 @@ video {
     border-radius: 0.25rem;
     border: 2px solid white;
     display: none;
+    overflow: hidden;
+    background-repeat: no-repeat;
+    background-color: #000;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
     pointer-events: none;
 }
 
-.thumbnail-img {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
+.timeline-container:hover .preview-img-wrap {
+    display: block;
+}
+
+/* Audio has no frame to preview, so this reuses the same box's own black background (already set
+   on .preview-img-wrap above) as a plain timestamp readout instead - see audioHoverTimeLabel,
+   VideoPlayer.tsx. */
+.preview-img-wrap .audio-hover-time {
+    display: flex;
+    align-items: center;
+    justify-content: center;
     width: 100%;
     height: 100%;
-    display: none;
-    object-fit: contain;
-    pointer-events: none;
-}
-
-.timeline-container:hover .thumbnail-img {
-    display: block;
-}
-
-.timeline-container:hover .preview-img {
-    display: block;
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: #fff;
 }
 
 .timeline-container:hover .timeline::before {
@@ -430,6 +488,27 @@ video {
     background: rgba(0, 0, 0, 0.5);
 }
 
+/* VideoTimelineDocker's toolbar tool cluster - scrolls horizontally once the panel gets too
+   narrow to fit every tool button, rather than overflowing the panel or squishing buttons down.
+   A thin bar (the global 10px one in index.css reads as bulky against this row's own 28px-tall
+   buttons) that only takes up space while actually scrollable. */
+.timeline-toolbar-scroll::-webkit-scrollbar {
+    height: 4px;
+}
+
+.timeline-toolbar-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.timeline-toolbar-scroll::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 9999px;
+}
+
+.timeline-toolbar-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+
 /* Smooth transitions */
 * {
     box-sizing: border-box;
@@ -456,7 +535,7 @@ video {
         width: 60px;
     }
     
-    .timeline .preview-img {
+    .timeline .preview-img-wrap {
         height: 60px;
     }
 }

@@ -1,5 +1,5 @@
 import { IoClose, IoDesktop, IoScanOutline, IoApps, IoReload } from "react-icons/io5";
-import { convertFileSrc, invoke } from "@tauri-apps/api/tauri";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import { FiMonitor } from "react-icons/fi";
 import { MdMonitor } from "react-icons/md";

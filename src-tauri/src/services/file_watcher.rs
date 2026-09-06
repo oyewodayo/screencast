@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 const DEBOUNCE_MS: u64 = 600;
 
@@ -34,17 +34,18 @@ pub struct FileWatcherState(pub Mutex<Option<Debouncer<RecommendedWatcher>>>);
 // fail over.
 pub fn start_watching(app_handle: &AppHandle, dir: &Path) {
     let emit_handle = app_handle.clone();
-    let result = new_debouncer(Duration::from_millis(DEBOUNCE_MS), move |res: DebounceEventResult| {
-        match res {
+    let result = new_debouncer(
+        Duration::from_millis(DEBOUNCE_MS),
+        move |res: DebounceEventResult| match res {
             Ok(events) if !events.is_empty() => {
-                if let Err(e) = emit_handle.emit_all("refresh-file-list", ()) {
+                if let Err(e) = emit_handle.emit("refresh-file-list", ()) {
                     log::warn!("Failed to emit refresh-file-list from file watcher: {}", e);
                 }
             }
             Ok(_) => {}
             Err(e) => log::warn!("File watcher error: {:?}", e),
-        }
-    })
+        },
+    )
     .and_then(|mut debouncer| {
         debouncer.watcher().watch(dir, RecursiveMode::Recursive)?;
         Ok(debouncer)

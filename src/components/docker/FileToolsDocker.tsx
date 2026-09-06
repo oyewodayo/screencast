@@ -1,6 +1,6 @@
 // components/docker/FileToolsDocker.tsx
 import React, { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import {
   IoFolderOpenOutline,
   IoTrashOutline,
@@ -75,6 +75,9 @@ interface FileToolsDockerProps {
   // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
   // through to VideoTimelineDocker - see its own prop doc comment.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
+  // Video-only: forwards NoiseReductionPopover's "Recalibrate from current playback" click through
+  // to VideoTimelineDocker - see its own prop doc comment.
+  onRecalibrateNoise?: () => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // VideoTimelineDocker - see its own prop doc comments.
   selectedOverlayId?: string | null;
@@ -127,6 +130,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onOutputTimeChange,
   onActiveClipChange,
   noiseReductionStatus,
+  onRecalibrateNoise,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -170,6 +174,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onOutputTimeChange={onOutputTimeChange}
         onActiveClipChange={onActiveClipChange}
         noiseReductionStatus={noiseReductionStatus}
+        onRecalibrateNoise={onRecalibrateNoise}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={onSelectOverlay}
         isPlacingText={isPlacingText}
