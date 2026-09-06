@@ -1781,9 +1781,10 @@ pub struct KeepSegment {
     // own doc comment (videoEditTypes.ts) for the full "this changes the segment's own OUTPUT
     // duration" story; segment_speed() below is what actually clamps/defaults this.
     pub speed: Option<f64>,
-    // Background-noise reduction strength, 0..1 - None/0 means off. See Clip.noiseReduction's own
-    // doc comment (videoEditTypes.ts) for why this has no live-preview equivalent; segment_noise_
-    // reduction_db() below is what actually clamps/maps this to afftdn's own `nr` dB parameter.
+    // Background-noise reduction strength, 0..1 - None/0 means off. VideoPlayer.tsx runs a
+    // perceptually-similar (not bit-identical) live preview of this via a Web Audio worklet;
+    // segment_noise_reduction_params() below is what actually clamps/maps this value onto afftdn's
+    // own `nr`/`nf` parameter pair for the real export-time filter.
     pub noise_reduction: Option<f64>,
 }
 
@@ -2080,19 +2081,64 @@ fn segment_speed(seg: &KeepSegment) -> f64 {
 }
 
 // This segment's own noise-reduction strength (0..1, clamped defensively same as segment_speed's
-// own comment explains) mapped to afftdn's `nr` parameter - its dB range is documented as
-// 0.01..97, but anything past ~40dB starts eating into the wanted signal along with the noise for
-// typical screen-recording mic input, so this maps onto the gentler 4..40 subrange rather than
-// afftdn's full range. None/0 returns None (no filter at all) rather than "afftdn=nr=4" - keeps a
-// clip that's never touched this feature byte-for-byte identical to before it existed, and skips
-// an unnecessary filter stage in the common case.
+// own comment explains) mapped to just afftdn's `nr` parameter half of noise_reduction_afftdn_params
+// - kept as its own function since it's the half segment_needs_filter_graph and the existing test
+// suite already key off of (an (nr, nf) tuple would make ".is_some()" checks awkward for no
+// benefit). See noise_reduction_afftdn_params for the actual mapping and why `nf` matters just as
+// much as `nr` does.
 fn segment_noise_reduction_db(seg: &KeepSegment) -> Option<f64> {
-    let strength = seg.noise_reduction.unwrap_or(0.0).max(0.0).min(1.0);
+    segment_noise_reduction_params(seg).map(|(nr, _nf)| nr)
+}
+
+fn segment_noise_reduction_params(seg: &KeepSegment) -> Option<(f64, f64)> {
+    noise_reduction_afftdn_params(seg.noise_reduction)
+}
+
+// The actual 0..1 -> afftdn (nr, nf) mapping, pulled out standalone (raw strength, not a
+// KeepSegment) so extract_clip_audio - which has no KeepSegment of its own - can share it too.
+//
+// nr (0.01..97dB, "how much to reduce") is the obvious half and was the only one this used to set,
+// clamped to a gentler 4..40 subrange since anything past ~40dB starts eating into the wanted
+// signal along with the noise for typical screen-recording mic input.
+//
+// nf (-80..-20dB, "how loud something has to be to NOT count as noise") turned out to matter just
+// as much: afftdn's own default (-50dB) assumes real noise sits far below the wanted signal, which
+// holds for light tape hiss but not for the kind of background noise a screen recording's mic
+// actually picks up (fans, room tone, distant machinery) - that can sit only 15-25dB below speech,
+// well above -50dB, so afftdn quietly left it almost untouched regardless of how high `nr` was
+// pushed. Verified against synthetic noise+tone fixtures: nr alone (default nf=-50) measured
+// <0.1dB of RMS reduction even at nr=40, while pairing it with nf up to afftdn's own most
+// aggressive allowed value (-20) measured several dB - see this repo's run-briefcast skill session
+// notes for the numbers. None/0 strength returns None (no filter at all) rather than
+// "afftdn=nr=4:nf=-50" - keeps a clip that's never touched this feature byte-for-byte identical to
+// before it existed, and skips an unnecessary filter stage in the common case.
+fn noise_reduction_afftdn_params(strength: Option<f64>) -> Option<(f64, f64)> {
+    let strength = strength.unwrap_or(0.0).max(0.0).min(1.0);
     if strength <= 0.0 {
         None
     } else {
-        Some(4.0 + strength * 36.0)
+        let nr = 4.0 + strength * 36.0; // 4..40dB
+        let nf = -50.0 + strength * 30.0; // -50..-20dB
+        Some((nr, nf))
     }
+}
+
+// Whether this segment needs export_trimmed_video's full filter-graph path rather than its fast
+// `-ss`/`-to` passthrough - true for any per-segment effect that path has nowhere to apply. Pulled
+// out of export_trimmed_video itself (rather than an inline closure) so this decision is unit-
+// testable without spawning ffmpeg - see this file's own test module. noise_reduction belongs here
+// exactly like speed/crop/etc: omitting it once meant a single-segment timeline with ONLY noise
+// reduction turned on silently took the effect-free fast path and never got afftdn applied at all.
+fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
+    seg.color_filter
+        .as_ref()
+        .map_or(false, |cf| cf.preset != "none")
+        || seg.ken_burns.is_some()
+        || seg.transition_in.is_some()
+        || seg.crop.is_some()
+        || seg.flip_horizontal.unwrap_or(false)
+        || (segment_speed(seg) - 1.0).abs() > 0.001
+        || segment_noise_reduction_db(seg).is_some()
 }
 
 // Decomposes an arbitrary speed factor into a chain of ffmpeg `atempo` filters, each within the
@@ -2401,7 +2447,7 @@ fn audio_trim_chain(
     start: f64,
     end: f64,
     speed: f64,
-    noise_reduction_db: Option<f64>,
+    noise_reduction: Option<(f64, f64)>,
     out_label: &str,
 ) -> String {
     if has_audio {
@@ -2410,8 +2456,8 @@ fn audio_trim_chain(
         // "atempo=1.0000", functionally a no-op, so this needs no separate branch for that case.
         // afftdn runs AFTER atempo - it's a per-frame spectral filter, order relative to tempo
         // doesn't change its own output, so there's no reason to special-case which comes first.
-        let denoise = match noise_reduction_db {
-            Some(db) => format!(",afftdn=nr={:.2}", db),
+        let denoise = match noise_reduction {
+            Some((nr, nf)) => format!(",afftdn=nr={:.2}:nf={:.1}", nr, nf),
             None => String::new(),
         };
         format!(
@@ -2634,16 +2680,7 @@ pub async fn export_trimmed_video(
     let has_pip_overlays = !pip_overlays.is_empty();
     // Any clip-level effect also needs the full filter graph - the fast -ss/-to path below has no
     // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
-    let has_clip_effects = segments.iter().any(|s| {
-        s.color_filter
-            .as_ref()
-            .map_or(false, |cf| cf.preset != "none")
-            || s.ken_burns.is_some()
-            || s.transition_in.is_some()
-            || s.crop.is_some()
-            || s.flip_horizontal.unwrap_or(false)
-            || (s.speed.unwrap_or(1.0) - 1.0).abs() > 0.001
-    });
+    let has_clip_effects = segments.iter().any(segment_needs_filter_graph);
     // Any segment beyond the first requesting a transition - gates the pairwise xfade/acrossfade
     // fold below instead of the plain all-at-once `concat=n=N` the multi-segment branch has always
     // used, so a timeline with no transitions set takes the exact same, already-proven path it did
@@ -2767,7 +2804,7 @@ pub async fn export_trimmed_video(
                 seg.start,
                 seg.end,
                 speed,
-                segment_noise_reduction_db(seg),
+                segment_noise_reduction_params(seg),
                 "outa",
             ));
         } else if !has_transitions {
@@ -2790,7 +2827,7 @@ pub async fn export_trimmed_video(
                     seg.start,
                     seg.end,
                     speed,
-                    segment_noise_reduction_db(seg),
+                    segment_noise_reduction_params(seg),
                     &format!("a{}", i),
                 ));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
@@ -2827,7 +2864,7 @@ pub async fn export_trimmed_video(
                     seg.start,
                     seg.end,
                     speed,
-                    segment_noise_reduction_db(seg),
+                    segment_noise_reduction_params(seg),
                     &format!("a{}", i),
                 ));
             }
@@ -3168,6 +3205,75 @@ pub async fn export_trimmed_video(
     }
 
     result
+}
+
+// Extracts one timeline clip's own audio to a standalone file - the audio-only counterpart of
+// export_trimmed_video's single-segment fast path, minus any video stream at all (`-vn`). Always
+// goes through the atrim/atempo/afftdn filter chain (never a bare -ss/-to copy) since there's no
+// "no effects at all" shortcut worth having here: an audio-only encode is already cheap regardless
+// of whether a filter runs, unlike the video fast path this mirrors.
+#[tauri::command]
+pub async fn extract_clip_audio(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    source_path: String,
+    start: f64,
+    end: f64,
+    // Same 0.25..4 clamp segment_speed applies to a KeepSegment - this command has no KeepSegment
+    // of its own (the frontend passes the clip's own fields directly), so the clamp is inlined
+    // below rather than routed through that helper.
+    speed: f64,
+    noise_reduction: Option<f64>,
+    // Already folds mute into 0.0 on the frontend (Clip.ts's own effective-volume convention,
+    // matching pipOverlays/effective_video_volume elsewhere in this file) - no separate `muted`
+    // bool here.
+    volume: f64,
+    output_format: String, // "mp3" | "wav" | "aac"
+    output_path: String,
+) -> Result<String, String> {
+    if end <= start {
+        return Err("End must be after start".to_string());
+    }
+    let speed = speed.max(0.25).min(4.0);
+
+    let mut af_parts = vec![format!(
+        "atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS",
+        start, end
+    )];
+    // afftdn AFTER atempo - see audio_trim_chain's own comment; order doesn't change either
+    // filter's own output, so there's no reason to special-case it here differently.
+    if (speed - 1.0).abs() > 0.001 {
+        af_parts.push(atempo_chain(speed));
+    }
+    if let Some((nr, nf)) = noise_reduction_afftdn_params(noise_reduction) {
+        af_parts.push(format!("afftdn=nr={:.2}:nf={:.1}", nr, nf));
+    }
+    if (volume - 1.0).abs() > 0.001 {
+        af_parts.push(format!("volume={:.3}", volume.max(0.0)));
+    }
+
+    let codec_args: Vec<&str> = match output_format.to_lowercase().as_str() {
+        "mp3" => vec!["-c:a", "libmp3lame", "-b:a", "192k"],
+        "wav" => vec!["-c:a", "pcm_s16le"],
+        "aac" => vec!["-c:a", "aac", "-b:a", "192k"],
+        _ => return Err(format!("Unsupported audio format: {}", output_format)),
+    };
+
+    let mut owned_args: Vec<String> = vec!["-vn".into(), "-af".into(), af_parts.join(",")];
+    owned_args.extend(codec_args.iter().map(|s| s.to_string()));
+    let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+
+    run_conversion(
+        &app_handle,
+        &window,
+        &state,
+        &[InputSpec::plain(source_path.clone())],
+        &source_path,
+        PathBuf::from(output_path),
+        &args,
+    )
+    .await
 }
 
 // Cancel ongoing conversion
@@ -3630,6 +3736,42 @@ mod tests {
         assert_eq!(segment_noise_reduction_db(&seg), None);
     }
 
+    #[test]
+    fn segment_noise_reduction_params_maps_0_to_1_onto_the_full_nr_nf_pair() {
+        let mut seg = base_segment();
+        seg.noise_reduction = Some(1.0);
+        assert_eq!(segment_noise_reduction_params(&seg), Some((40.0, -20.0)));
+
+        seg.noise_reduction = Some(0.5);
+        assert_eq!(segment_noise_reduction_params(&seg), Some((22.0, -35.0)));
+
+        seg.noise_reduction = Some(0.0);
+        assert_eq!(segment_noise_reduction_params(&seg), None);
+    }
+
+    // ---- segment_needs_filter_graph ---------------------------------------------------------------
+
+    #[test]
+    fn segment_needs_filter_graph_is_false_for_a_plain_trim() {
+        assert!(!segment_needs_filter_graph(&base_segment()));
+    }
+
+    #[test]
+    fn segment_needs_filter_graph_is_true_for_noise_reduction_alone() {
+        // Regression case: a single-segment timeline whose ONLY edit is noise reduction (no crop,
+        // speed, color grade, etc.) used to be misclassified as needing no filter graph at all,
+        // which meant export_trimmed_video's fast -ss/-to path was taken and afftdn never got
+        // applied - see this function's own doc comment.
+        let mut seg = base_segment();
+        seg.noise_reduction = Some(0.5);
+        assert!(segment_needs_filter_graph(&seg));
+
+        // 0/None must still count as "off", same convention segment_noise_reduction_db itself uses.
+        let mut off = base_segment();
+        off.noise_reduction = Some(0.0);
+        assert!(!segment_needs_filter_graph(&off));
+    }
+
     // ---- atempo_chain ---------------------------------------------------------------------------
 
     #[test]
@@ -3857,8 +3999,11 @@ mod tests {
 
     #[test]
     fn audio_trim_chain_appends_afftdn_after_atempo_when_noise_reduction_is_set() {
-        let chain = audio_trim_chain(true, 2, 0.0, 5.0, 1.0, Some(22.0), "a2");
-        assert_eq!(chain, "[2:a]atrim=start=0.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000,afftdn=nr=22.00[a2];");
+        let chain = audio_trim_chain(true, 2, 0.0, 5.0, 1.0, Some((22.0, -35.0)), "a2");
+        assert_eq!(
+            chain,
+            "[2:a]atrim=start=0.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000,afftdn=nr=22.00:nf=-35.0[a2];"
+        );
     }
 
     // ---- overlay animation expressions ------------------------------------------------------------

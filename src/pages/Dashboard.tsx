@@ -3557,6 +3557,7 @@ const setScreen = () => {
         onOutputTimeChange={setCurrentOutputTime}
         onActiveClipChange={setActiveClipEffects}
         noiseReductionStatus={noiseReductionStatus}
+        onRecalibrateNoise={() => videoPlayerRef.current?.recalibrateNoiseReduction()}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={setSelectedOverlayId}
         isPlacingText={isPlacingText}

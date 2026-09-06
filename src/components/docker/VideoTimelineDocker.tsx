@@ -47,6 +47,7 @@ import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover from "./ClipEffectsPopover";
 import SpeedPopover from "./SpeedPopover";
 import NoiseReductionPopover from "./NoiseReductionPopover";
+import ExtractAudioPopover from "./ExtractAudioPopover";
 import ExportOptionsPopover from "./ExportOptionsPopover";
 import SilenceDetectionPopover, { SilenceDetectionState } from "./SilenceDetectionPopover";
 import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
@@ -344,6 +345,11 @@ interface VideoTimelineDockerProps {
   // is what needs to show that as a spinner - Dashboard just relays the value it already round-
   // trips through activeClipEffects's own reverse-direction sibling, onActiveClipChange, above.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
+  // Forwards NoiseReductionPopover's "Recalibrate from current playback" click to VideoPlayer's
+  // own imperative recalibrateNoiseReduction() (via videoPlayerRef, held by Dashboard - this
+  // component has no ref to VideoPlayer itself) - same "Dashboard is the only place that can
+  // reach across siblings" shape onLivePreview/onTogglePlayActiveFile already use.
+  onRecalibrateNoise?: () => void;
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
   // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
@@ -410,6 +416,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onOutputTimeChange,
   onActiveClipChange,
   noiseReductionStatus = "idle",
+  onRecalibrateNoise,
   selectedOverlayId = null,
   onSelectOverlay,
   isPlacingText = false,
@@ -588,11 +595,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // Noise reduction popover - same standalone toolbar button/popover shape as Speed just above,
   // for the same reason: an audio-cleanup feature with its own presets/strength control earns its
   // own surface rather than being buried in "Clip effects" (which stays color/Ken Burns/transition
-  // only). Export-only (afftdn, conversion.rs) - there's no live-preview equivalent, unlike speed.
+  // only). Backed by both a live preview (VideoPlayer.tsx's Web Audio worklet) and the real
+  // export-time filter (afftdn, conversion.rs).
   const [noiseReductionPopoverAnchor, setNoiseReductionPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
   const noiseReductionButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     setNoiseReductionPopoverAnchor(null);
+  }, [selectedClipId]);
+
+  // Extract-audio popover - same standalone toolbar button/popover shape as Speed/Reduce noise
+  // above. isExtractingAudio is local (not threaded through editStore's isExporting/exportProgress)
+  // since this is a short, independent operation on one clip's own source file, unrelated to the
+  // Save button's whole-timeline export.
+  const [extractAudioAnchor, setExtractAudioAnchor] = useState<{ left: number; top: number } | null>(null);
+  const extractAudioButtonRef = useRef<HTMLButtonElement>(null);
+  const [isExtractingAudio, setIsExtractingAudio] = useState(false);
+  useEffect(() => {
+    setExtractAudioAnchor(null);
   }, [selectedClipId]);
 
   // Save button's quality/destination options (ExportOptionsPopover) - both default to exactly
@@ -1513,6 +1532,36 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (chosen) setCustomOutputPath(chosen);
   };
 
+  // Extracts the selected clip's own audio (trim + speed + noise reduction, same fields
+  // export_trimmed_video would apply to this clip, via extract_clip_audio - conversion.rs) to a
+  // standalone file the user picks via a native save dialog. Track-level mute/volume folds into a
+  // single `volume` the same way effective_video_volume does for the whole-timeline export, since
+  // a clip has no volume of its own.
+  const handleExtractAudio = async (format: "mp3" | "wav" | "aac") => {
+    if (!selectedClip) return;
+    const stem = selectedClip.sourcePath.replace(/\.[^./\\]+$/, "").split(/[\\/]/).pop() ?? "audio";
+    const chosen = await saveFileDialog({ defaultPath: `${stem} - audio.${format}`, filters: [{ name: format.toUpperCase(), extensions: [format] }] });
+    if (!chosen) return;
+    setIsExtractingAudio(true);
+    try {
+      await invoke("extract_clip_audio", {
+        sourcePath: selectedClip.sourcePath,
+        start: selectedClip.start,
+        end: selectedClip.end,
+        speed: selectedClip.speed ?? 1,
+        noiseReduction: selectedClip.noiseReduction ?? null,
+        volume: editStore.videoAudioMuted ? 0 : editStore.videoAudioVolume,
+        outputFormat: format,
+        outputPath: chosen,
+      });
+      setExtractAudioAnchor(null);
+    } catch (err) {
+      window.alert(`Failed to extract audio: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setIsExtractingAudio(false);
+    }
+  };
+
   // Scans the selected clip's own source file for dead air (detect_silence, conversion.rs), then
   // opens SilenceDetectionPopover to show what it found - nothing is actually cut until the user
   // clicks "Remove" there. Ranges come back in the SOURCE file's own absolute time (detect_silence
@@ -1875,6 +1924,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             ) : (
               <MdOutlineNoiseControlOff size={15} className={selectedClip?.noiseReduction ? "text-blue-400" : undefined} />
             )}
+          </button>
+          <button
+            ref={extractAudioButtonRef}
+            type="button"
+            title={selectedClipId ? "Extract this clip's audio" : "Select a clip to extract its audio"}
+            disabled={!selectedClipId}
+            onClick={() => {
+              if (extractAudioAnchor) {
+                setExtractAudioAnchor(null);
+                return;
+              }
+              const rect = extractAudioButtonRef.current?.getBoundingClientRect();
+              if (rect) setExtractAudioAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+              extractAudioAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoMusicalNotesOutline size={15} />
           </button>
           <ActionButton
             title={selectedClipId ? "Mirror clip horizontally" : "Select a clip to mirror"}
@@ -2707,9 +2775,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               anchor={noiseReductionPopoverAnchor}
               onUpdate={(noiseReduction) => editStore.updateClipEffects(clip.id, { noiseReduction })}
               onClose={() => setNoiseReductionPopoverAnchor(null)}
+              onRecalibrate={onRecalibrateNoise}
             />
           );
         })()}
+
+      {selectedClipId && extractAudioAnchor && (
+        <ExtractAudioPopover
+          anchor={extractAudioAnchor}
+          isExtracting={isExtractingAudio}
+          onExtract={handleExtractAudio}
+          onClose={() => setExtractAudioAnchor(null)}
+        />
+      )}
 
       {selectedAudioOverlayId &&
         audioPopoverAnchor &&

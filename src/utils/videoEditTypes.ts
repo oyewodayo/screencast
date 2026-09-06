@@ -118,11 +118,10 @@ export interface Clip {
   // OUTPUT time and needs no separate speed-awareness of its own.
   speed?: number;
   // Background-noise reduction strength, 0..1 - undefined/0 means off, the pre-existing look.
-  // Unlike color/Ken Burns/crop, this has no live-preview equivalent: it's an FFT denoiser
-  // (afftdn) that only ever runs at export time (conversion.rs's audio_trim_chain) - there's no
-  // cheap way to run the same filter over the live <video> element's audio in the browser, so
-  // NoiseReductionPopover shows a "preview plays the original audio" note rather than pretending
-  // this is previewable the way speed/crop are.
+  // Exported via afftdn (conversion.rs's audio_trim_chain); VideoPlayer.tsx also runs a live
+  // preview of it through a Web Audio worklet (spectral subtraction, same algorithm family as
+  // afftdn but not bit-identical) so NoiseReductionPopover's strength slider is audible while
+  // editing, not just after export.
   noiseReduction?: number;
 }
 

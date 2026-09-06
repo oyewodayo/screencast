@@ -286,6 +286,7 @@ fn main() {
             commands::conversion::generate_captions,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
+            commands::conversion::extract_clip_audio,
             commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,

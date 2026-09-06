@@ -214,6 +214,13 @@ export interface VideoPlayerHandle {
   // whole tree every few milliseconds, so this writes video.style.transform directly instead, the
   // same "bypass React for a hot path" idiom the Ken Burns rAF loop below already uses.
   previewCropLive: (crop: ClipCrop | null) => void;
+  // Re-learns the live noise-reduction profile from whatever this clip is playing at the moment
+  // this is called, discarding whatever got auto-captured the instant the effect first turned on -
+  // NoiseReductionPopover's "Recalibrate from current playback" button calls this so a user who
+  // scrubs to an actual noise-only stretch (no speech) can point the profile at THAT instead of
+  // whatever happened to be playing when they first turned the effect on. A no-op when there's no
+  // live graph yet to recalibrate (noiseReduction strength is still 0 - see noiseGraphRef itself).
+  recalibrateNoiseReduction: () => void;
 }
 
 const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange }, ref) => {
@@ -354,6 +361,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     previewCropLive: (crop: ClipCrop | null) => {
       liveCropOverrideRef.current = crop;
       applyCropAndKenBurns();
+    },
+    recalibrateNoiseReduction: () => {
+      const graph = noiseGraphRef.current;
+      if (!graph) return;
+      graph.node.port.postMessage({ type: "recalibrate" });
+      onNoiseReductionStatusChangeRef.current?.("calibrating");
+      // Marks this clip as "already (re)calibrated" so the id-change-driven effect further down
+      // doesn't immediately fire a SECOND, redundant recalibrate right on top of this deliberate
+      // one the next time it re-runs (e.g. the strength slider moving again).
+      lastCalibratedClipIdRef.current = activeClipEffectsRef.current?.id ?? null;
     },
   }), []);
 
