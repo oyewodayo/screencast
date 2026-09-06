@@ -7,7 +7,7 @@
 // else to configure here, unlike Speed/Reduce noise's own sliders.
 import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
-import { IoClose, IoSyncOutline, IoMusicalNotesOutline } from "react-icons/io5";
+import { IoClose, IoSyncOutline, IoDownloadOutline } from "react-icons/io5";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 
 const FORMATS = [
@@ -44,7 +44,7 @@ const ExtractAudioPopover: React.FC<ExtractAudioPopoverProps> = ({ anchor, isExt
     >
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs font-medium flex items-center gap-1.5">
-          <IoMusicalNotesOutline size={14} />
+          <IoDownloadOutline size={14} />
           Extract audio
         </span>
         <button type="button" title="Close" onClick={onClose} className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white">
