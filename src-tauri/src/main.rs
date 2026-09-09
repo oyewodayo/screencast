@@ -26,6 +26,7 @@ mod services {
     pub mod trash;
     pub mod utility;
     pub mod video_edits;
+    pub mod whiteboards;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
@@ -330,6 +331,15 @@ fn main() {
             services::boards::save_board_thumbnail,
             services::boards::export_board_png,
             services::boards::export_board_png_to_path,
+            services::whiteboards::list_whiteboards,
+            services::whiteboards::create_whiteboard,
+            services::whiteboards::duplicate_whiteboard,
+            services::whiteboards::save_whiteboard,
+            services::whiteboards::load_whiteboard,
+            services::whiteboards::delete_whiteboard,
+            services::whiteboards::save_whiteboard_thumbnail,
+            services::whiteboards::export_whiteboard_png,
+            services::whiteboards::export_whiteboard_png_to_path,
             services::docs::list_docs,
             services::docs::create_doc,
             services::docs::save_doc,

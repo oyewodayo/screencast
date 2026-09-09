@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoMicCircle, IoPauseCircle, IoPlayCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline } from 'react-icons/io5'
+import { IoCameraOutline, IoMicCircle, IoPauseCircle, IoPlayCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline } from 'react-icons/io5'
 
 export type RecordSource = "screen" | "video" | "audio";
 
@@ -44,6 +44,8 @@ interface Props {
     isBoard:boolean;
     handleOpenDocs:()=>void;
     isDocs:boolean;
+    handleOpenWhiteboard:()=>void;
+    isWhiteboard:boolean;
     handleOpenSettings:()=>void;
     handleOpenExternalFile:()=>void;
     handleStopRecording: () => void;
@@ -74,7 +76,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -195,6 +197,18 @@ const ActiveRecordingState = (
                     title="Home"
                     >
                       <IoHomeOutline />
+                    </button>
+                    <button
+                    type="button"
+                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
+                      isWhiteboard
+                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
+                        : "hover:bg-black/40 active:bg-black/60"
+                    }`}
+                    onClick={() => handleOpenWhiteboard()}
+                    title="Whiteboard"
+                    >
+                      <IoGitNetworkOutline />
                     </button>
                     <button
                     type="button"

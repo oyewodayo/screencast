@@ -28,6 +28,7 @@ import DocumentFolderGallery from "../components/DocumentFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import { BoardEditorHandle } from "../components/board/BoardEditor";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
+import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -291,6 +292,9 @@ const Dashboard = () => {
   // Which Docs screen (if any) is showing in the main content pane - same null-means-off pattern
   // as boardScreen. See handleOpenDocs.
   const [docsScreen, setDocsScreen] = useState<DocsScreen | null>(null);
+  // Which Whiteboard screen (if any) is showing in the main content pane - same null-means-off
+  // pattern as boardScreen/docsScreen. See handleOpenWhiteboard.
+  const [whiteboardScreen, setWhiteboardScreen] = useState<WhiteboardScreen | null>(null);
   // Every doc's summary (id/title/linked_to/etc.), refreshed via refreshDocsIndex - backs both the
   // "Link to recording" picker's libraryFiles-independent state and the per-file "has linked
   // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
@@ -1233,9 +1237,10 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); };
-	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); };
-	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); };
+	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); };
+	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); setWhiteboardScreen(null); };
+	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); setWhiteboardScreen(null); };
+	const handleOpenWhiteboard = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen({ mode: "home" }); };
 	const handleOpenSettings = () => setShowSettings(true);
 	const handleCloseSettings = () => setShowSettings(false);
 	// Settings apply immediately to the current session too, not just future ones — otherwise
@@ -1513,6 +1518,7 @@ const setScreen = () => {
 		});
 		setBoardScreen(null);
 		setDocsScreen(null);
+		setWhiteboardScreen(null);
 		setRecentPaths(recordFileOpened(filePath));
 
 		console.log('File selected for playback:', fileName);
@@ -2750,6 +2756,7 @@ const setScreen = () => {
                               setSelectedFile(null);
                               setBoardScreen(null);
                               setDocsScreen(null);
+                              setWhiteboardScreen(null);
                             }
                           }}
                         >
@@ -3138,6 +3145,7 @@ const setScreen = () => {
                   });
                   setBoardScreen(null);
                   setDocsScreen(null);
+                  setWhiteboardScreen(null);
                 } catch (error) {
                   console.error('Error loading converted file:', error);
                 }
@@ -3192,7 +3200,15 @@ const setScreen = () => {
           )}
 
           <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center">
-          {boardScreen ? (
+          {whiteboardScreen ? (
+            <ErrorBoundary
+              key={whiteboardScreen.mode === "editor" ? `editor-${whiteboardScreen.whiteboardId}` : "home"}
+              fallbackTitle="This whiteboard ran into a problem"
+              onReset={() => setWhiteboardScreen({ mode: "home" })}
+            >
+              <WhiteboardWorkspace screen={whiteboardScreen} onScreenChange={setWhiteboardScreen} />
+            </ErrorBoundary>
+          ) : boardScreen ? (
             <BoardWorkspace ref={boardEditorRef} screen={boardScreen} onScreenChange={setBoardScreen} libraryDraggingFiles={draggingFiles} />
           ) : docsScreen ? (
             <ErrorBoundary
@@ -3622,11 +3638,13 @@ const setScreen = () => {
         showRecordingPanelButtons={showRecordingPanelButtons}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
-        isHome={selectedFile === null && boardScreen === null && docsScreen === null}
+        isHome={selectedFile === null && boardScreen === null && docsScreen === null && whiteboardScreen === null}
         handleOpenBoard={handleOpenBoard}
         isBoard={boardScreen !== null}
         handleOpenDocs={handleOpenDocs}
         isDocs={docsScreen !== null}
+        handleOpenWhiteboard={handleOpenWhiteboard}
+        isWhiteboard={whiteboardScreen !== null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}
