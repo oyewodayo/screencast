@@ -39,7 +39,9 @@ import {
 import {
   BoundsBox,
   buildEdgePath,
+  computeCurveBowFromPath,
   CYLINDER_CAP_RATIO,
+  DEFAULT_CURVE_BOW,
   nodeCenter,
   resolveAnchorPoint,
   resolveEdgeEndpoints,
@@ -80,7 +82,36 @@ type Interaction =
       edgeId: string | null;
       end: "source" | "target";
       fixed: WhiteboardEndpoint;
+      // True when this gesture started because the Arrows toolbar tool was armed (see
+      // WhiteboardEditor's ARROW_PRESETS) - a deliberate "I want to draw a connector" action, so
+      // releasing over empty canvas still creates a free-floating arrow. False for an ad-hoc drag
+      // off a hovered node's connection dot in plain select mode, where releasing over empty space
+      // is treated as "changed my mind" and discarded instead (see handlePointerUp's own comment).
+      deliberate: boolean;
+      // A stable doc-space reference point for the FIXED end, resolved once at gesture start (a
+      // node's own center when fixed.nodeId is set, since that never moves mid-drag the way an
+      // "auto" anchor point would as the other end moves; the free point itself otherwise) - what
+      // pathPoints' deviations are measured against for computeCurveBowFromPath, so the curve's
+      // bow direction reflects the actual gesture rather than a point that was itself still moving.
+      fixedRefPoint: { x: number; y: number };
+      // The pointer's own path over the course of THIS gesture (never saved to the document - see
+      // computeCurveBowFromPath's own doc comment) - purely what decides which way a "Curved"
+      // connector's curveBow bows, so the created edge curves the direction it was actually drawn.
+      pathPoints: { x: number; y: number }[];
+      lastPathClientX: number;
+      lastPathClientY: number;
     };
+
+// Below this on-screen movement (CSS px, pre-zoom-correction) between two recorded connector-drag
+// path points, a new one isn't recorded - same "don't bloat with near-duplicate points" reasoning
+// as FREEHAND_MIN_POINT_DISTANCE, just for the ephemeral path computeCurveBowFromPath reads instead
+// of one that gets saved to the document.
+const CURVE_PATH_MIN_POINT_DISTANCE = 4;
+
+// Below this on-screen distance (CSS px, pre-zoom-correction), a connector gesture is treated as a
+// stray click rather than a deliberate drag - keeps a plain click with the Arrows tool armed from
+// creating a zero-length arrow nobody meant to draw.
+const MIN_CONNECTOR_DRAG_DISTANCE = 6;
 
 export interface WhiteboardCanvasHandle {
   zoomBy: (factor: number) => void;
@@ -112,9 +143,14 @@ interface WhiteboardCanvasProps {
   armedShapeType: WhiteboardShapeType | null;
   onShapePlaced: () => void;
   // The edge-drawing tool's own armed state, kept separate from armedShapeType so a shape and the
-  // connector tool can never both be "in progress" at once - see WhiteboardEditor's toolbar.
+  // connector tool can never both be "in progress" at once - see WhiteboardEditor's toolbar. Unlike
+  // armedShapeType, this never auto-disarms after one use (same "stays armed across uses" treatment
+  // as armedShapeType === "freehand" gets) - drawing several arrows/lines in a row is the common
+  // case, not the exception. armedConnectorOverrides is the picked preset's style (color/dash/
+  // routing/arrowheads - see WhiteboardEditor's ARROW_PRESETS), merged onto
+  // createDefaultWhiteboardEdge's own defaults both for the live drag preview and the finished edge.
   connectorArmed: boolean;
-  onConnectorPlaced: () => void;
+  armedConnectorOverrides?: Partial<WhiteboardEdge>;
 }
 
 function clampZoom(z: number): number {
@@ -198,13 +234,17 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   armedShapeType,
   onShapePlaced,
   connectorArmed,
-  onConnectorPlaced,
+  armedConnectorOverrides,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
   const [liveNodes, setLiveNodes] = useState<WhiteboardNode[] | null>(null);
   const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
   const [connectorPreview, setConnectorPreview] = useState<{ from: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null }; to: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null } } | null>(null);
+  // Live-updated bow for connectorPreview's own curve, computed from the gesture's pathPoints so
+  // far - keeps the drag preview showing the SAME direction the committed edge will actually get,
+  // rather than a fixed placeholder direction until release (see computeCurveBowFromPath).
+  const [connectorPreviewBow, setConnectorPreviewBow] = useState<number>(DEFAULT_CURVE_BOW);
   const [freehandPreview, setFreehandPreview] = useState<{ x: number; y: number }[] | null>(null);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [connectorHoverNodeId, setConnectorHoverNodeId] = useState<string | null>(null);
@@ -374,26 +414,63 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
 
   // ---- Connector create / reattach ---------------------------------------------------------------
   const beginConnectorFromNode = useCallback(
-    (node: WhiteboardNode, side: WhiteboardAnchorSide, e: React.PointerEvent) => {
+    (node: WhiteboardNode, side: WhiteboardAnchorSide, e: React.PointerEvent, deliberate: boolean) => {
       e.stopPropagation();
-      interactionRef.current = { mode: "connector", edgeId: null, end: "target", fixed: { nodeId: node.id, anchor: side } };
+      const fixedRefPoint = nodeCenter(node);
+      interactionRef.current = {
+        mode: "connector",
+        edgeId: null,
+        end: "target",
+        fixed: { nodeId: node.id, anchor: side },
+        deliberate,
+        fixedRefPoint,
+        pathPoints: [fixedRefPoint],
+        lastPathClientX: e.clientX,
+        lastPathClientY: e.clientY,
+      };
       const doc0 = clientToDoc(e.clientX, e.clientY);
       setConnectorPreview({ from: resolveAnchorPoint(node, side, doc0), to: { x: doc0.x, y: doc0.y, side: null } });
+      setConnectorPreviewBow(DEFAULT_CURVE_BOW);
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
     [clientToDoc]
   );
+
+  // Starts a brand new connector from a free document-space point (not anchored to any node) -
+  // only reachable while the Arrows toolbar tool is armed (see handleContainerPointerDown), which
+  // is why this is always `deliberate: true`: there's no ad-hoc/accidental way to trigger it.
+  const beginConnectorFromPoint = useCallback((point: { x: number; y: number }, e: React.PointerEvent) => {
+    interactionRef.current = {
+      mode: "connector",
+      edgeId: null,
+      end: "target",
+      fixed: { x: point.x, y: point.y },
+      deliberate: true,
+      fixedRefPoint: point,
+      pathPoints: [point],
+      lastPathClientX: e.clientX,
+      lastPathClientY: e.clientY,
+    };
+    setConnectorPreview({ from: { x: point.x, y: point.y, side: null }, to: { x: point.x, y: point.y, side: null } });
+    setConnectorPreviewBow(DEFAULT_CURVE_BOW);
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+  }, []);
 
   const beginConnectorReattach = useCallback(
     (edge: WhiteboardEdge, end: "source" | "target", e: React.PointerEvent) => {
       e.stopPropagation();
       onSelectionChange(new Set(), new Set([edge.id]));
       const fixed = end === "source" ? edge.target : edge.source;
-      interactionRef.current = { mode: "connector", edgeId: edge.id, end, fixed };
+      const fixedRefPoint = fixed.nodeId ? nodeCenter(nodesById.get(fixed.nodeId)!) : { x: fixed.x ?? 0, y: fixed.y ?? 0 };
+      // deliberate is meaningless for a reattach (edgeId !== null skips that check entirely at
+      // commit time), and curveBow is left untouched rather than recomputed from pathPoints (see
+      // handlePointerUp) - set both only so this interaction's shape matches the "connector"
+      // variant's required fields.
+      interactionRef.current = { mode: "connector", edgeId: edge.id, end, fixed, deliberate: true, fixedRefPoint, pathPoints: [fixedRefPoint], lastPathClientX: e.clientX, lastPathClientY: e.clientY };
       const doc0 = clientToDoc(e.clientX, e.clientY);
-      const fixedPoint = fixed.nodeId ? nodeCenter(nodesById.get(fixed.nodeId)!) : { x: fixed.x ?? 0, y: fixed.y ?? 0 };
-      const fixedResolved = fixed.nodeId ? resolveAnchorPoint(nodesById.get(fixed.nodeId)!, fixed.anchor ?? "auto", doc0) : { ...fixedPoint, side: null };
+      const fixedResolved = fixed.nodeId ? resolveAnchorPoint(nodesById.get(fixed.nodeId)!, fixed.anchor ?? "auto", doc0) : { ...fixedRefPoint, side: null };
       setConnectorPreview(end === "source" ? { from: { x: doc0.x, y: doc0.y, side: null }, to: fixedResolved } : { from: fixedResolved, to: { x: doc0.x, y: doc0.y, side: null } });
+      setConnectorPreviewBow(edge.curveBow ?? DEFAULT_CURVE_BOW);
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
     [onSelectionChange, clientToDoc, nodesById]
@@ -468,6 +545,15 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
 
       if (interaction.mode === "connector") {
         const cur = clientToDoc(e.clientX, e.clientY);
+        // Throttled the same way freehand's own points are (see FREEHAND_MIN_POINT_DISTANCE) -
+        // recorded purely to feed computeCurveBowFromPath below, never saved to the document.
+        const pdx = e.clientX - interaction.lastPathClientX;
+        const pdy = e.clientY - interaction.lastPathClientY;
+        if (Math.hypot(pdx, pdy) >= CURVE_PATH_MIN_POINT_DISTANCE) {
+          interaction.pathPoints.push(cur);
+          interaction.lastPathClientX = e.clientX;
+          interaction.lastPathClientY = e.clientY;
+        }
         // Snap the dragged endpoint to whichever node the pointer is currently over (excluding the
         // fixed endpoint's own node, so a self-loop back onto the same shape isn't offered).
         const target = nodes.find(
@@ -480,6 +566,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           ? resolveAnchorPoint(nodesById.get(interaction.fixed.nodeId)!, interaction.fixed.anchor ?? "auto", draggedResolved)
           : { ...fixedPoint, side: null };
         setConnectorPreview(interaction.end === "target" ? { from: fixedResolved, to: draggedResolved } : { from: draggedResolved, to: fixedResolved });
+        // Only a brand-new edge's bow follows the drawn path live - reattaching an existing edge's
+        // endpoint (edgeId !== null) leaves its curveBow exactly as beginConnectorReattach seeded it.
+        if (interaction.edgeId === null) {
+          const endRef = target ? nodeCenter(target) : cur;
+          setConnectorPreviewBow(computeCurveBowFromPath(interaction.fixedRefPoint, endRef, interaction.pathPoints));
+        }
       }
     },
     [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange]
@@ -537,13 +629,22 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const draggedEndpoint: WhiteboardEndpoint = droppedOnNode ? { nodeId: droppedOnNode.id, anchor: "auto" } : { x: cur.x, y: cur.y };
 
         if (interaction.edgeId === null) {
-          // Only create a real connection if it actually landed on a node - dropping a brand new
-          // connector into empty space is treated as "changed my mind", not a floating arrow, since
-          // there was never a deliberate "draw a free-floating arrow" tool click to justify one.
-          if (droppedOnNode) {
-            const edge = createDefaultWhiteboardEdge(crypto.randomUUID(), interaction.fixed, draggedEndpoint);
-            onAddEdge(edge);
-            onSelectionChange(new Set(), new Set([edge.id]));
+          // Landing on a real node always creates a connection; landing on empty canvas only does
+          // when this gesture came from the Arrows toolbar tool being deliberately armed (a
+          // free-floating arrow is exactly what that tool is for) - an ad-hoc drag off a hovered
+          // node's connection dot in plain select mode still treats empty space as "changed my
+          // mind" and discards it, same as before. Either way, a drag too short to be a real
+          // gesture (a stray click) is dropped rather than creating a zero-length arrow.
+          if (droppedOnNode || interaction.deliberate) {
+            const fixedScreenPoint = interaction.fixed.nodeId ? null : interaction.fixed;
+            const longEnough = fixedScreenPoint ? Math.hypot(cur.x - (fixedScreenPoint.x ?? 0), cur.y - (fixedScreenPoint.y ?? 0)) * zoom >= MIN_CONNECTOR_DRAG_DISTANCE : true;
+            if (longEnough) {
+              const endRef = droppedOnNode ? nodeCenter(droppedOnNode) : cur;
+              const curveBow = computeCurveBowFromPath(interaction.fixedRefPoint, endRef, interaction.pathPoints);
+              const edge = { ...createDefaultWhiteboardEdge(crypto.randomUUID(), interaction.fixed, draggedEndpoint), curveBow, ...armedConnectorOverrides };
+              onAddEdge(edge);
+              onSelectionChange(new Set(), new Set([edge.id]));
+            }
           }
         } else {
           const existing = page.edges.find((ed) => ed.id === interaction.edgeId);
@@ -554,10 +655,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
         setConnectorPreview(null);
         setConnectorHoverNodeId(null);
-        if (connectorArmed) onConnectorPlaced();
+        // Deliberately does NOT disarm connectorArmed - the Arrows tool stays armed across uses,
+        // same "sketch several in a row without re-arming" treatment as the freehand pen tool gets
+        // (see WhiteboardEditor's own doc comment on this).
       }
     },
-    [liveNodes, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, connectorArmed, onConnectorPlaced]
+    [liveNodes, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides]
   );
 
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
@@ -588,11 +691,22 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         return;
       }
 
+      // The Arrows tool is armed and the click landed on empty canvas (a click that landed on a
+      // connectable node instead is already handled by that node's own onPointerDown, which calls
+      // beginConnectorFromNode directly and stopPropagation()s before this handler ever runs) -
+      // start a connector from a free floating point, exactly like starting one from a node except
+      // with no shape to snap to.
+      if (connectorArmed) {
+        const point = clientToDoc(e.clientX, e.clientY);
+        beginConnectorFromPoint(point, e);
+        return;
+      }
+
       const point = clientToDoc(e.clientX, e.clientY);
       interactionRef.current = { mode: "marquee", startDocX: point.x, startDocY: point.y };
       setMarqueeRect({ x: point.x, y: point.y, width: 0, height: 0 });
     },
-    [spaceHeld, pan, editingNodeId, armedShapeType, clientToDoc, onAddNode, onSelectionChange, onShapePlaced]
+    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint]
   );
 
   // ---- Text editing ------------------------------------------------------------------------------
@@ -626,26 +740,56 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     return () => cancelAnimationFrame(raf);
   }, [editingNodeId]);
 
+  // What the connector-drag preview looks like - mirrors the Arrows tool's own armed preset
+  // (color/dash/routing/arrowhead) while it's armed, so the live drag matches what actually gets
+  // created; falls back to a generic blue dashed arrow for reattach-drags on an existing edge
+  // (connectorArmed is false there - dragging one of an edge's own endpoint handles works
+  // regardless of which tool, if any, happens to be armed).
+  const previewEdgeStyle = useMemo(
+    () =>
+      connectorArmed
+        ? {
+            strokeColor: armedConnectorOverrides?.strokeColor ?? "#2563eb",
+            strokeWidth: armedConnectorOverrides?.strokeWidth ?? 2,
+            strokeStyle: armedConnectorOverrides?.strokeStyle ?? "solid",
+            routing: armedConnectorOverrides?.routing ?? "orthogonal",
+            startArrowType: armedConnectorOverrides?.startArrowType ?? "none",
+            endArrowType: armedConnectorOverrides?.endArrowType ?? "triangle",
+          }
+        : { strokeColor: "#2563eb", strokeWidth: 2, strokeStyle: "dashed" as const, routing: "orthogonal" as const, startArrowType: "none" as const, endArrowType: "triangle" as const },
+    [connectorArmed, armedConnectorOverrides]
+  );
+
   const markerCombos = useMemo(() => {
-    // (type, color) pairs actually needed - the connector-preview's own fixed blue "triangle" is
-    // always included since it can appear regardless of what any existing edge uses.
+    // (type, color) pairs actually needed - the connector-preview's own current style is always
+    // included since it can appear regardless of what any existing edge/freehand-arrow uses.
     const combos = new Map<string, { type: Exclude<ArrowheadType, "none">; color: string }>();
-    combos.set(markerId("triangle", "#2563eb"), { type: "triangle", color: "#2563eb" });
+    if (previewEdgeStyle.startArrowType !== "none") combos.set(markerId(previewEdgeStyle.startArrowType, previewEdgeStyle.strokeColor), { type: previewEdgeStyle.startArrowType, color: previewEdgeStyle.strokeColor });
+    if (previewEdgeStyle.endArrowType !== "none") combos.set(markerId(previewEdgeStyle.endArrowType, previewEdgeStyle.strokeColor), { type: previewEdgeStyle.endArrowType, color: previewEdgeStyle.strokeColor });
     for (const edge of page.edges) {
       if (edge.startArrowType !== "none") combos.set(markerId(edge.startArrowType, edge.strokeColor), { type: edge.startArrowType, color: edge.strokeColor });
       if (edge.endArrowType !== "none") combos.set(markerId(edge.endArrowType, edge.strokeColor), { type: edge.endArrowType, color: edge.strokeColor });
     }
+    for (const node of page.nodes) {
+      if (node.shapeType !== "freehand") continue;
+      if (node.startArrowType && node.startArrowType !== "none") combos.set(markerId(node.startArrowType, node.strokeColor), { type: node.startArrowType, color: node.strokeColor });
+      if (node.endArrowType && node.endArrowType !== "none") combos.set(markerId(node.endArrowType, node.strokeColor), { type: node.endArrowType, color: node.strokeColor });
+    }
     return Array.from(combos.values());
-  }, [page.edges]);
+  }, [page.edges, page.nodes, previewEdgeStyle]);
 
-  const dashArrayFor = useCallback(
-    (strokeStyle: WhiteboardEdge["strokeStyle"], strokeWidth: number): string | undefined => {
-      if (strokeStyle === "solid") return undefined;
-      if (strokeStyle === "dotted") return `${(strokeWidth * 0.4) / zoom},${(strokeWidth * 1.6 + 3) / zoom}`;
-      return `${8 / zoom},${6 / zoom}`;
-    },
-    [zoom]
-  );
+  // Raw doc-space dash pattern for a COMMITTED edge's own rendered path - deliberately NOT divided
+  // by zoom (unlike the UI-chrome elements below: hit-test stroke, selection halo, resize/
+  // connection-dot handles), so the line's dash/dot rhythm scales with the ambient
+  // `transform: scale(zoom)` exactly like node borders and everything else that IS actual document
+  // content already does, and exactly like whiteboardHandlers.ts's Canvas2D export (which has no
+  // notion of zoom at all) always draws it. A temporary drag preview (connector/freehand) is the
+  // one exception that stays zoom-constant on purpose - see previewEdgeStyle's own reasoning.
+  const dashArrayFor = useCallback((strokeStyle: WhiteboardEdge["strokeStyle"], strokeWidth: number): string | undefined => {
+    if (strokeStyle === "solid") return undefined;
+    if (strokeStyle === "dotted") return `${strokeWidth * 0.4},${strokeWidth * 1.6 + 3}`;
+    return "8,6";
+  }, []);
 
   return (
     <div
@@ -656,7 +800,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         backgroundImage: showGrid ? "radial-gradient(circle, rgba(120,120,130,0.35) 1px, transparent 1px)" : undefined,
         backgroundSize: showGrid ? `${GRID_SIZE * zoom}px ${GRID_SIZE * zoom}px` : undefined,
         backgroundPosition: showGrid ? `${pan.x}px ${pan.y}px` : undefined,
-        cursor: spaceHeld ? "grab" : armedShapeType === "freehand" ? "crosshair" : "default",
+        cursor: spaceHeld ? "grab" : armedShapeType === "freehand" || connectorArmed ? "crosshair" : "default",
       }}
       onWheel={handleWheel}
       onPointerDown={handleContainerPointerDown}
@@ -677,7 +821,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           </defs>
           {page.edges.map((edge) => {
             const { source, target } = resolveEdgeEndpoints(edge, nodesById);
-            const d = buildEdgePath(source, target, edge.routing);
+            const d = buildEdgePath(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW);
             const selected = selectedEdgeIds.has(edge.id);
             return (
               <g key={edge.id}>
@@ -697,12 +841,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     onSelectionChange(new Set(), new Set([edge.id]));
                   }}
                 />
-                {selected && <path d={d} fill="none" stroke="#2563eb" strokeWidth={(edge.strokeWidth + 5) / zoom} strokeLinecap="round" opacity={0.35} />}
+                {selected && <path d={d} fill="none" stroke="#2563eb" strokeWidth={edge.strokeWidth + 5} strokeLinecap="round" opacity={0.35} />}
                 <path
                   d={d}
                   fill="none"
                   stroke={edge.strokeColor}
-                  strokeWidth={edge.strokeWidth / zoom}
+                  strokeWidth={edge.strokeWidth}
                   strokeDasharray={dashArrayFor(edge.strokeStyle, edge.strokeWidth)}
                   strokeLinecap={edge.strokeStyle === "dotted" ? "round" : "butt"}
                   markerEnd={edge.endArrowType !== "none" ? `url(#${markerId(edge.endArrowType, edge.strokeColor)})` : undefined}
@@ -724,7 +868,15 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             );
           })}
           {connectorPreview && (
-            <path d={buildEdgePath(connectorPreview.from, connectorPreview.to, "orthogonal")} fill="none" stroke="#2563eb" strokeWidth={2 / zoom} strokeDasharray={`${6 / zoom},${4 / zoom}`} markerEnd={`url(#${markerId("triangle", "#2563eb")})`} />
+            <path
+              d={buildEdgePath(connectorPreview.from, connectorPreview.to, previewEdgeStyle.routing, connectorPreviewBow)}
+              fill="none"
+              stroke={previewEdgeStyle.strokeColor}
+              strokeWidth={previewEdgeStyle.strokeWidth / zoom}
+              strokeDasharray={dashArrayFor(previewEdgeStyle.strokeStyle, previewEdgeStyle.strokeWidth) ?? `${6 / zoom},${4 / zoom}`}
+              markerEnd={previewEdgeStyle.endArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.endArrowType, previewEdgeStyle.strokeColor)})` : undefined}
+              markerStart={previewEdgeStyle.startArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.startArrowType, previewEdgeStyle.strokeColor)})` : undefined}
+            />
           )}
           {freehandPreview && freehandPreview.length > 1 && (
             <path d={smoothedPathD(freehandPreview)} fill="none" stroke="#111111" strokeWidth={2.5 / zoom} strokeLinecap="round" strokeLinejoin="round" />
@@ -739,7 +891,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           const isEditing = editingNodeId === node.id;
           const isConnectable = CONNECTABLE_SHAPES.has(node.shapeType);
           const showConnectionDots = isConnectable && (isHovered || selected || connectorArmed);
-          const outline = shapeOutlineFor(node.shapeType, node.width, node.height, { sides: node.sides, starPoints: node.starPoints, starInnerRadiusRatio: node.starInnerRadiusRatio });
+          const outline = shapeOutlineFor(node.shapeType, node.width, node.height, { sides: node.sides, starPoints: node.starPoints, starInnerRadiusRatio: node.starInnerRadiusRatio, waveStyle: node.waveStyle, waveCycles: node.waveCycles });
           return (
             <div
               key={node.id}
@@ -749,7 +901,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               onPointerLeave={() => setHoveredNodeId((prev) => (prev === node.id ? null : prev))}
               onPointerDown={(e) => {
                 if (connectorArmed && isConnectable) {
-                  beginConnectorFromNode(node, "auto", e);
+                  beginConnectorFromNode(node, "auto", e, true);
                   return;
                 }
                 // A tool being armed (shape/text/freehand) means the next click anywhere should
@@ -775,6 +927,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     fill="none"
                     stroke={node.strokeColor}
                     strokeWidth={node.strokeWidth}
+                    markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
+                    markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     vectorEffect="non-scaling-stroke"
@@ -922,7 +1076,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   return (
                     <div
                       key={side}
-                      onPointerDown={(e) => beginConnectorFromNode(node, side, e)}
+                      onPointerDown={(e) => beginConnectorFromNode(node, side, e, false)}
                       className="absolute rounded-full bg-white border-2 border-blue-500 hover:bg-blue-500"
                       style={{ left: p.x - node.x - size / 2, top: p.y - node.y - size / 2, width: size, height: size, cursor: "crosshair" }}
                       title="Drag to connect"

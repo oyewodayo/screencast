@@ -32,6 +32,7 @@ export type WhiteboardShapeType =
   | "note" // sticky note with a folded corner
   | "callout" // speech-bubble rectangle with a tail
   | "step" // chevron/arrow-shaped process step
+  | "wave" // periodic signal trace - WhiteboardNode.waveStyle picks sine/cosine/square/triangle/sawtooth
   | "text"
   | "freehand";
 
@@ -72,6 +73,13 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // rather than reusing BoardShape's bare `points`/`innerRadiusRatio` names because `points` on this
   // type already means something else entirely (see WhiteboardNode.points's own doc comment below).
   starInnerRadiusRatio?: number;
+  // "wave" only - which periodic curve to trace across the node's box (see whiteboardHandlers.ts's
+  // waveOutlineD). Absent - resolves to "sine".
+  waveStyle?: "sine" | "cosine" | "square" | "triangle" | "sawtooth";
+  // "wave" only - how many full periods to trace across the node's own width, 1-8. Absent -
+  // resolves to 2. Wider spacing (fewer cycles) vs. denser (more) is a look the shape needs to
+  // hand over, same reasoning as star's points/polygon's sides being user-adjustable.
+  waveCycles?: number;
   fontFamily: string;
   fontSize: number;
   fontColor: string;
@@ -87,6 +95,12 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // drawing to fit the new box exactly like Board scales an image into its frame, rather than
   // needing a special "translate every point" or "rescale every point" code path of its own.
   points?: { x: number; y: number }[];
+  // "freehand" only - an optional arrowhead capping the stroke's first/last point, oriented along
+  // that end's own final tangent direction. What makes the "Freehand Arrow" toolbar preset (see
+  // WhiteboardEditor.tsx's ARROW_PRESETS) a hand-drawn arrow rather than plain ink: same stroke,
+  // same points, just with a marker on one end. Absent/"none" on a plain ink stroke.
+  startArrowType?: ArrowheadType;
+  endArrowType?: ArrowheadType;
 }
 
 // Which side of a node an edge attaches to - "auto" (the default for a new connection) means
@@ -128,6 +142,14 @@ export interface WhiteboardEdge extends WhiteboardItemBase {
   // leaves/arrives perpendicular to whichever side it's anchored on, just without the hard corners
   // - see whiteboardHandlers.ts's buildEdgePath for all three.
   routing: "straight" | "orthogonal" | "curved";
+  // "curved" only, and only actually consulted for an end with no shape side to bow away from (a
+  // free-floating point - see buildEdgePath/curveControlPoints) - which side the curve bows toward
+  // and how far, roughly -1..1. Set once at creation time from the actual shape of the drag gesture
+  // that drew it (see WhiteboardCanvas.tsx's computeCurveBowFromPath), so the curve bows the way it
+  // was drawn instead of a fixed direction that ignores the gesture entirely. Absent on an edge
+  // created with no such gesture to read (e.g. reattaching an existing edge's endpoint) - resolves
+  // to whiteboardHandlers.ts's DEFAULT_CURVE_BOW.
+  curveBow?: number;
   startArrowType: ArrowheadType;
   endArrowType: ArrowheadType;
 }
@@ -222,6 +244,7 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   note: { width: 150, height: 130 },
   callout: { width: 170, height: 110 },
   step: { width: 190, height: 100 },
+  wave: { width: 220, height: 90 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
 };
@@ -231,7 +254,7 @@ export function createDefaultWhiteboardNode(
   shapeType: WhiteboardShapeType,
   x: number,
   y: number,
-  overrides?: Partial<Pick<WhiteboardNode, "sides" | "starPoints" | "starInnerRadiusRatio">>
+  overrides?: Partial<Pick<WhiteboardNode, "sides" | "starPoints" | "starInnerRadiusRatio" | "waveStyle" | "waveCycles">>
 ): WhiteboardNode {
   const now = Date.now();
   const size = SHAPE_DEFAULT_SIZE[shapeType];
@@ -244,13 +267,15 @@ export function createDefaultWhiteboardNode(
     width: size.width,
     height: size.height,
     text: "",
-    fillColor: shapeType === "text" || shapeType === "freehand" ? null : "#dbeafe",
+    fillColor: shapeType === "text" || shapeType === "freehand" || shapeType === "wave" ? null : "#dbeafe",
     strokeColor: shapeType === "freehand" ? "#111111" : "#2563eb",
     strokeWidth: 2,
     cornerRadius: 0,
     sides: shapeType === "polygon" ? overrides?.sides ?? 5 : undefined,
     starPoints: shapeType === "star" ? overrides?.starPoints ?? 5 : undefined,
     starInnerRadiusRatio: shapeType === "star" ? overrides?.starInnerRadiusRatio ?? 0.45 : undefined,
+    waveStyle: shapeType === "wave" ? overrides?.waveStyle ?? "sine" : undefined,
+    waveCycles: shapeType === "wave" ? overrides?.waveCycles ?? 2 : undefined,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,
     fontColor: "#111111",
@@ -299,6 +324,8 @@ export function createFreehandWhiteboardNode(id: string, rawPoints: { x: number;
     textAlign: "center",
     verticalAlign: "middle",
     points: rawPoints.map((p) => ({ x: (p.x - minX) / width, y: (p.y - minY) / height })),
+    startArrowType: "none",
+    endArrowType: "none",
     createdAt: now,
     updatedAt: now,
   };

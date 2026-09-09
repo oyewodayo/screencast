@@ -126,22 +126,95 @@ function sideNormal(side: "top" | "right" | "bottom" | "left"): { x: number; y: 
   }
 }
 
+// Default bow strength (as a fraction of curveControlDistance) for a free-floating curve end with
+// no drawn-gesture-derived WhiteboardEdge.curveBow to consult - e.g. the live drag preview before
+// a direction has been decided, or an edge whose curveBow is absent (see its own doc comment).
+export const DEFAULT_CURVE_BOW = 0.6;
+
+// The two cubic-bezier control points for a "curved" edge between two resolved endpoints - shared
+// by buildEdgePath (which draws the curve) and edgeEndAngleDeg (which needs the same points to
+// compute each end's real tangent direction for its arrowhead, rather than the straight
+// source->target line, which is wrong once the curve actually bows away from it). Each control
+// point sits out along that end's own side-normal when it's anchored to a shape, so the line
+// leaves/arrives perpendicular to whichever side it's on; an end with nothing to be perpendicular
+// TO (a free-floating point - the common case for a stand-alone arrow drawn straight onto empty
+// canvas, not attached to anything) instead bows out along the perpendicular of the source->target
+// line, scaled by `bow` (sign picks which side, magnitude how far - see WhiteboardEdge.curveBow's
+// own doc comment for where this number actually comes from) - the SAME bow for both free ends, so
+// a fully free-floating arrow curves into one clean, single arc rather than an S-curve.
+function curveControlPoints(source: ResolvedPoint, target: ResolvedPoint, bow: number): { c1: { x: number; y: number }; c2: { x: number; y: number } } {
+  const dist = curveControlDistance(source, target);
+  const dx = target.x - source.x;
+  const dy = target.y - source.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const perp = { x: -dy / len, y: dx / len };
+  const c1 = source.side
+    ? { x: source.x + sideNormal(source.side).x * dist, y: source.y + sideNormal(source.side).y * dist }
+    : { x: source.x + perp.x * dist * bow, y: source.y + perp.y * dist * bow };
+  const c2 = target.side
+    ? { x: target.x + sideNormal(target.side).x * dist, y: target.y + sideNormal(target.side).y * dist }
+    : { x: target.x + perp.x * dist * bow, y: target.y + perp.y * dist * bow };
+  return { c1, c2 };
+}
+
+// Below this signed perpendicular distance (doc px) from the straight start->end line, a drag
+// gesture is treated as "didn't deliberately curve" - a quick, fairly direct drag still gets a
+// visibly curved connector (DEFAULT_CURVE_BOW's fixed direction) rather than an almost-straight
+// line just because the mouse wobbled a couple pixels off-axis.
+const CURVE_BOW_DEVIATION_THRESHOLD = 8;
+
+// The magnitude range a deliberately-curved drag's bow is mapped into (see
+// computeCurveBowFromPath) - MIN so even a gentle, barely-past-the-threshold wiggle still reads as
+// "yes, curved" rather than vanishing back toward a straight line; MAX so an extreme swoop doesn't
+// push the control points so far out the curve starts looping back on itself.
+const MIN_CURVE_BOW_MAGNITUDE = 0.28;
+const MAX_CURVE_BOW_MAGNITUDE = 0.95;
+
+// Derives a WhiteboardEdge.curveBow value from the actual path a "Curved" connector was dragged
+// through - WhiteboardCanvas.tsx records this path purely to feed this function (it's never saved
+// to the document; only the resulting single scalar is). The SIGN comes from the path's AVERAGE
+// signed deviation from the straight start->end line (robust to one noisy/jittery point, unlike
+// picking a single sample) - a curve drawn arcing left bows left, one arced right bows right,
+// matching the gesture instead of an arbitrary fixed rotation. The MAGNITUDE separately comes from
+// the single point of GREATEST deviation, scaled relative to how far apart start/end are and
+// clamped into [MIN_CURVE_BOW_MAGNITUDE, MAX_CURVE_BOW_MAGNITUDE] - so a gentle curve renders
+// gently and a dramatic swoop renders dramatically, instead of every deliberately-curved drag
+// producing the exact same fixed-strength arc regardless of how much it actually bowed. A path
+// with no meaningful deviation (a fairly direct drag) falls back to DEFAULT_CURVE_BOW entirely,
+// same as an edge with no curveBow at all.
+export function computeCurveBowFromPath(start: { x: number; y: number }, end: { x: number; y: number }, path: { x: number; y: number }[]): number {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const len = Math.hypot(dx, dy) || 1;
+  let sumSignedDist = 0;
+  let maxAbsDist = 0;
+  for (const p of path) {
+    // Signed 2D cross product of (end-start) and (p-start), normalized by length - positive means
+    // p sits on the same side as `perp` in curveControlPoints (same (-dy,dx) rotation), so this
+    // sign is directly usable as-is for the bow multiplier there.
+    const cross = dx * (p.y - start.y) - dy * (p.x - start.x);
+    const dist = cross / len;
+    sumSignedDist += dist;
+    maxAbsDist = Math.max(maxAbsDist, Math.abs(dist));
+  }
+  if (maxAbsDist < CURVE_BOW_DEVIATION_THRESHOLD) return DEFAULT_CURVE_BOW;
+  const avgSignedDist = path.length > 0 ? sumSignedDist / path.length : 0;
+  const sign = avgSignedDist >= 0 ? 1 : -1;
+  const ratio = Math.min(1, maxAbsDist / curveControlDistance(start, end));
+  const magnitude = MIN_CURVE_BOW_MAGNITUDE + ratio * (MAX_CURVE_BOW_MAGNITUDE - MIN_CURVE_BOW_MAGNITUDE);
+  return sign * magnitude;
+}
+
 // Builds the SVG path `d` string for an edge between two resolved endpoints. "straight" is a
 // single segment; "orthogonal" (draw.io's default connector look) inserts one or two right-angle
-// bends depending on which sides the two ends leave from; "curved" is a cubic bezier whose control
-// points sit out along each end's own side-normal (see curveControlDistance/sideNormal above), so
-// the line still leaves/arrives perpendicular to whichever side it's anchored on, just smoothly
-// instead of with hard corners.
-export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, routing: EdgeRouting): string {
+// bends depending on which sides the two ends leave from; "curved" is a cubic bezier through
+// curveControlPoints - see its own doc comment for why it always actually curves, never silently
+// degrading to a straight line when neither end is anchored to a shape. `bow` (only consulted when
+// at least one end is free-floating) defaults to DEFAULT_CURVE_BOW's fixed direction when omitted;
+// pass the edge's own WhiteboardEdge.curveBow to bow the curve the way it was actually drawn instead.
+export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, routing: EdgeRouting, bow: number = DEFAULT_CURVE_BOW): string {
   if (routing === "curved") {
-    if (!source.side && !target.side) {
-      // Neither end is anchored to a shape (both free-floating points) - nothing to leave
-      // perpendicular to, so a plain straight line is both simpler and more honest than a fake curve.
-      return `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
-    }
-    const dist = curveControlDistance(source, target);
-    const c1 = source.side ? { x: source.x + sideNormal(source.side).x * dist, y: source.y + sideNormal(source.side).y * dist } : source;
-    const c2 = target.side ? { x: target.x + sideNormal(target.side).x * dist, y: target.y + sideNormal(target.side).y * dist } : target;
+    const { c1, c2 } = curveControlPoints(source, target, bow);
     return `M ${source.x} ${source.y} C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${target.x} ${target.y}`;
   }
 
@@ -170,11 +243,21 @@ export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, rout
 // The path's final segment direction, in degrees (SVG marker-friendly: 0 = pointing +x) - what an
 // arrowhead marker's orient should follow so it points the way the line is actually arriving,
 // rather than the straight source->target direction (wrong for an orthogonal/curved path's last
-// leg). "orthogonal" and "curved" both leave/arrive along the anchored side's own normal, so they
-// share the same side-based angle lookup; only "straight" (or an unanchored end) falls back to the
+// leg). "curved" uses the exact same cubic-bezier control points buildEdgePath drew the curve
+// through (see curveControlPoints) to find each end's real tangent direction - using the straight
+// source->target direction instead (as this used to) is only correct when the curve doesn't
+// actually bow away from that line, which free-floating ends now deliberately do. "orthogonal"
+// leaves/arrives along the anchored side's own normal; only "straight" (or an orthogonal edge with
+// neither end anchored, which buildEdgePath already renders as a plain line) falls back to the
 // literal source->target direction.
-export function edgeEndAngleDeg(source: { x: number; y: number }, target: { x: number; y: number }, routing: EdgeRouting, sourceSide: "top" | "right" | "bottom" | "left" | null, targetSide: "top" | "right" | "bottom" | "left" | null): { startDeg: number; endDeg: number } {
-  if (routing !== "straight" && (sourceSide || targetSide)) {
+export function edgeEndAngleDeg(source: { x: number; y: number }, target: { x: number; y: number }, routing: EdgeRouting, sourceSide: "top" | "right" | "bottom" | "left" | null, targetSide: "top" | "right" | "bottom" | "left" | null, bow: number = DEFAULT_CURVE_BOW): { startDeg: number; endDeg: number } {
+  if (routing === "curved") {
+    const { c1, c2 } = curveControlPoints({ ...source, side: sourceSide }, { ...target, side: targetSide }, bow);
+    const endDeg = (Math.atan2(target.y - c2.y, target.x - c2.x) * 180) / Math.PI;
+    const startDeg = (Math.atan2(source.y - c1.y, source.x - c1.x) * 180) / Math.PI;
+    return { startDeg, endDeg };
+  }
+  if (routing === "orthogonal" && (sourceSide || targetSide)) {
     const sideDeg = (side: "top" | "right" | "bottom" | "left") => (side === "left" ? 180 : side === "right" ? 0 : side === "top" ? -90 : 90);
     // A marker-end arrow points in the direction of travel AT arrival, i.e. the side's outward
     // normal reversed (arriving INTO the shape) - so target uses sideDeg+180, while a marker-start
@@ -213,6 +296,8 @@ export interface ShapeOutlineOptions {
   sides?: number; // "polygon" only
   starPoints?: number; // "star" only
   starInnerRadiusRatio?: number; // "star" only
+  waveStyle?: WhiteboardNode["waveStyle"]; // "wave" only
+  waveCycles?: number; // "wave" only
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -244,6 +329,71 @@ function starPoints(w: number, h: number, points: number, innerRatio: number): [
     result.push([cx + (outer ? outerRx : innerRx) * Math.cos(angle), cy + (outer ? outerRy : innerRy) * Math.sin(angle)]);
   }
   return result;
+}
+
+// Bounds for WhiteboardNode.waveCycles - below 1 the shape stops reading as periodic at all; the
+// upper bound is just a sanity cap (sample count scales with cycles below, so quality doesn't
+// degrade as this grows - it's there only to keep a wildly out-of-range typed value from building
+// an absurdly long path string).
+export const MIN_WAVE_CYCLES = 1;
+export const MAX_WAVE_CYCLES = 60;
+export const DEFAULT_WAVE_CYCLES = 2;
+
+// Builds one continuous open-path `d` string tracing the given periodic waveform across a w×h box,
+// vertically centered (amplitude = 35% of h either side of the midline), repeated `cycles` times.
+// Square/triangle/sawtooth are piecewise-linear so their breakpoints are computed exactly (no
+// sampling needed - that's also what gives square/sawtooth their genuinely vertical edges);
+// sine/cosine are true curves, so they're densely sampled into a polyline instead - smooth enough
+// at typical shape sizes without needing a bezier-approximation formula. All four/five share one
+// moveTo-then-lineTo builder (`toD`) so the result is always a single unclosed path -
+// fillAndStroke/the DOM renderer both already treat an unfilled ("fillColor: null") node as
+// stroke-only, so leaving this open just draws the trace itself rather than an implicitly-closed
+// silhouette.
+export function waveOutlineD(w: number, h: number, style: NonNullable<WhiteboardNode["waveStyle"]>, cyclesInput?: number): string {
+  const cycles = Math.max(MIN_WAVE_CYCLES, Math.min(MAX_WAVE_CYCLES, Math.round(cyclesInput ?? DEFAULT_WAVE_CYCLES)));
+  const amp = h * 0.35;
+  const midY = h / 2;
+  const toD = (points: [number, number][]) => points.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+
+  if (style === "square") {
+    const half = w / (cycles * 2);
+    const points: [number, number][] = [];
+    for (let i = 0; i < cycles * 2; i++) {
+      const y = i % 2 === 0 ? midY - amp : midY + amp;
+      points.push([i * half, y], [(i + 1) * half, y]);
+    }
+    return toD(points);
+  }
+  if (style === "sawtooth") {
+    const period = w / cycles;
+    const points: [number, number][] = [];
+    for (let i = 0; i < cycles; i++) {
+      const x0 = i * period;
+      points.push([x0, midY + amp], [x0 + period, midY - amp], [x0 + period, midY + amp]);
+    }
+    points.pop(); // end at the last ramp's peak, not dropped back to baseline
+    return toD(points);
+  }
+  if (style === "triangle") {
+    const quarter = w / (cycles * 4);
+    const valuePattern = [0, 1, 0, -1]; // matches sine's phase: 0 -> peak -> 0 -> trough -> 0
+    const points: [number, number][] = [];
+    for (let i = 0; i <= cycles * 4; i++) {
+      points.push([i * quarter, midY - amp * valuePattern[i % 4]]);
+    }
+    return toD(points);
+  }
+  // sine/cosine: dense sample of the true curve - samples scale with cycles so each period keeps a
+  // roughly constant point density instead of getting choppier as more cycles are packed in.
+  const samples = 48 * cycles;
+  const points: [number, number][] = [];
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const angle = 2 * Math.PI * cycles * t;
+    const v = style === "cosine" ? Math.cos(angle) : Math.sin(angle);
+    points.push([t * w, midY - amp * v]);
+  }
+  return toD(points);
 }
 
 export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: number, opts?: ShapeOutlineOptions): ShapeOutline {
@@ -334,6 +484,8 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
       ].join(" ");
       return { kind: "path", d };
     }
+    case "wave":
+      return { kind: "path", d: waveOutlineD(w, h, opts?.waveStyle ?? "sine", opts?.waveCycles) };
     case "rectangle":
     case "text":
     case "freehand":
@@ -505,7 +657,7 @@ function polygonPath2D(points: [number, number][]): Path2D {
 // file's own ShapeOutline doc comment), so nothing here ever touches node.x/y again.
 function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
   const { width: w, height: h } = node;
-  const outline = shapeOutlineFor(node.shapeType, w, h, { sides: node.sides, starPoints: node.starPoints, starInnerRadiusRatio: node.starInnerRadiusRatio });
+  const outline = shapeOutlineFor(node.shapeType, w, h, { sides: node.sides, starPoints: node.starPoints, starInnerRadiusRatio: node.starInnerRadiusRatio, waveStyle: node.waveStyle, waveCycles: node.waveCycles });
 
   const fillAndStroke = (path: Path2D) => {
     if (node.fillColor) {
@@ -641,6 +793,21 @@ function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
     ctx.stroke(path);
+    // A "Freehand Arrow" (see whiteboardTypes.ts's WhiteboardNode.endArrowType doc comment) caps
+    // one or both ends with a marker, angled off the stroke's own final two points (a close-enough
+    // stand-in for the smoothed curve's true end tangent - freehandPath2D's own last segment is a
+    // plain line to that final point anyway, so this matches exactly).
+    const pts = (node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height }));
+    if (pts.length >= 2) {
+      const last = pts[pts.length - 1];
+      const beforeLast = pts[pts.length - 2];
+      const endDeg = (Math.atan2(last.y - beforeLast.y, last.x - beforeLast.x) * 180) / Math.PI;
+      drawArrowhead(ctx, node.endArrowType ?? "none", last.x, last.y, endDeg, node.strokeColor, node.strokeWidth);
+      const first = pts[0];
+      const afterFirst = pts[1];
+      const startDeg = (Math.atan2(first.y - afterFirst.y, first.x - afterFirst.x) * 180) / Math.PI;
+      drawArrowhead(ctx, node.startArrowType ?? "none", first.x, first.y, startDeg, node.strokeColor, node.strokeWidth);
+    }
   } else {
     if (node.shapeType !== "text") paintShapeBody(ctx, node);
     paintNodeText(ctx, node);
@@ -724,7 +891,8 @@ const DASH_PATTERNS: Record<WhiteboardEdge["strokeStyle"], number[]> = {
 
 function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesById: Map<string, WhiteboardNode>): void {
   const { source, target } = resolveEdgeEndpoints(edge, nodesById);
-  const path = new Path2D(buildEdgePath(source, target, edge.routing));
+  const bow = edge.curveBow ?? DEFAULT_CURVE_BOW;
+  const path = new Path2D(buildEdgePath(source, target, edge.routing, bow));
   ctx.lineWidth = edge.strokeWidth;
   ctx.strokeStyle = edge.strokeColor;
   ctx.lineCap = edge.strokeStyle === "dotted" ? "round" : "butt";
@@ -734,7 +902,7 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
   ctx.setLineDash([]);
   ctx.lineCap = "butt";
 
-  const { startDeg, endDeg } = edgeEndAngleDeg(source, target, edge.routing, source.side, target.side);
+  const { startDeg, endDeg } = edgeEndAngleDeg(source, target, edge.routing, source.side, target.side, bow);
   drawArrowhead(ctx, edge.endArrowType, target.x, target.y, endDeg, edge.strokeColor, edge.strokeWidth);
   drawArrowhead(ctx, edge.startArrowType, source.x, source.y, startDeg, edge.strokeColor, edge.strokeWidth);
 }

@@ -26,7 +26,7 @@ import {
   IoTrashOutline,
 } from "react-icons/io5";
 import useWhiteboardStore from "../../hooks/useWhiteboardStore";
-import { WhiteboardEdge, WhiteboardNode, WhiteboardPage, WhiteboardShapeType } from "../../utils/whiteboardTypes";
+import { ArrowheadType, WhiteboardEdge, WhiteboardNode, WhiteboardPage, WhiteboardShapeType } from "../../utils/whiteboardTypes";
 import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import { computeContentBounds, renderWhiteboardToCanvas, shapeOutlineFor, CYLINDER_CAP_RATIO } from "../../handlers/whiteboardHandlers";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
@@ -69,6 +69,11 @@ const SHAPE_PRESETS: ShapePreset[] = [
   { type: "note", label: "Note" },
   { type: "callout", label: "Callout" },
   { type: "step", label: "Step" },
+  { type: "wave", label: "Sine Wave", overrides: { waveStyle: "sine" } },
+  { type: "wave", label: "Cosine Wave", overrides: { waveStyle: "cosine" } },
+  { type: "wave", label: "Square Wave", overrides: { waveStyle: "square" } },
+  { type: "wave", label: "Triangle Wave", overrides: { waveStyle: "triangle" } },
+  { type: "wave", label: "Sawtooth Wave", overrides: { waveStyle: "sawtooth" } },
 ];
 
 const TILE_W = 44;
@@ -80,8 +85,17 @@ const TILE_H = 32;
 function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
   const w = TILE_W - 4;
   const h = TILE_H - 4;
-  const outline = shapeOutlineFor(preset.type, w, h, { sides: preset.overrides?.sides, starPoints: preset.overrides?.starPoints, starInnerRadiusRatio: preset.overrides?.starInnerRadiusRatio });
-  const fill = "#dbeafe";
+  const outline = shapeOutlineFor(preset.type, w, h, {
+    sides: preset.overrides?.sides,
+    starPoints: preset.overrides?.starPoints,
+    starInnerRadiusRatio: preset.overrides?.starInnerRadiusRatio,
+    waveStyle: preset.overrides?.waveStyle,
+    waveCycles: preset.overrides?.waveCycles,
+  });
+  // Waves render as an open trace, not a filled silhouette (matches their own default fillColor:
+  // null) - filling the preview swatch would shade the implicit-close area under the curve instead
+  // of just showing the line shape the tile actually places.
+  const fill = preset.type === "wave" ? "none" : "#dbeafe";
   const stroke = "#2563eb";
   return (
     <svg width={TILE_W} height={TILE_H} viewBox={`0 0 ${TILE_W} ${TILE_H}`}>
@@ -109,6 +123,75 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
           </>
         )}
       </g>
+    </svg>
+  );
+}
+
+// One tile per palette entry - shown in the toolbar's "Arrows" popover. "connector" presets draw a
+// real edge (attaches to shapes it starts/ends on, re-routes as they move, editable afterward in
+// the style panel); "freehand" is the one exception - a hand-drawn stroke capped with an arrowhead
+// (see WhiteboardCanvas.tsx's freehand-drawing gesture and whiteboardTypes.ts's
+// WhiteboardNode.endArrowType), armed the same way the Pen tool is rather than through
+// connectorArmed, since it follows the pointer's actual path instead of a single drag start->end.
+type ArrowPreset =
+  | { kind: "connector"; label: string; overrides: Partial<WhiteboardEdge> }
+  | { kind: "freehand"; label: string; endArrowType: ArrowheadType; startArrowType?: ArrowheadType };
+
+const ARROW_PRESETS: ArrowPreset[] = [
+  { kind: "connector", label: "Arrow", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },
+  { kind: "connector", label: "Bidirectional", overrides: { endArrowType: "triangle", startArrowType: "triangle", strokeStyle: "solid", routing: "straight" } },
+  { kind: "connector", label: "Orthogonal", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "orthogonal" } },
+  { kind: "connector", label: "Curved", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "curved" } },
+  { kind: "connector", label: "Open Arrow", overrides: { endArrowType: "triangleOpen", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },
+  { kind: "connector", label: "Block Arrow", overrides: { endArrowType: "block", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },
+  { kind: "connector", label: "Plain Line", overrides: { endArrowType: "none", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },
+  { kind: "connector", label: "Dashed Arrow", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "dashed", routing: "straight" } },
+  { kind: "connector", label: "Dashed Line", overrides: { endArrowType: "none", startArrowType: "none", strokeStyle: "dashed", routing: "straight" } },
+  { kind: "connector", label: "Dotted Arrow", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "dotted", routing: "straight" } },
+  { kind: "connector", label: "Dotted Line", overrides: { endArrowType: "none", startArrowType: "none", strokeStyle: "dotted", routing: "straight" } },
+  { kind: "freehand", label: "Freehand Arrow", endArrowType: "triangle" },
+];
+
+const ARROW_TILE_W = 56;
+const ARROW_TILE_H = 28;
+
+// A small stand-alone arrowhead glyph for the popover previews - deliberately not the same code
+// WhiteboardCanvas.tsx's SVG <marker> defs use (those need a shared marker-per-edge id scheme this
+// static preview has no reason to participate in); close enough in proportion to be recognizable,
+// not meant to be pixel-identical.
+function ArrowTip({ type, x, y, angleDeg, color }: { type: ArrowheadType; x: number; y: number; angleDeg: number; color: string }) {
+  if (type === "none") return null;
+  const s = 7;
+  return (
+    <g transform={`translate(${x},${y}) rotate(${angleDeg})`}>
+      {type === "triangle" && <path d={`M0,0 L${-s},${s * 0.55} L${-s},${-s * 0.55} Z`} fill={color} />}
+      {type === "block" && <path d={`M0,0 L${-s * 1.15},${s * 0.6} L${-s * 0.8},0 L${-s * 1.15},${-s * 0.6} Z`} fill={color} />}
+      {type === "triangleOpen" && <path d={`M${-s},${s * 0.55} L0,0 L${-s},${-s * 0.55}`} fill="none" stroke={color} strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />}
+      {type === "diamond" && <path d={`M0,0 L${-s * 0.6},${s * 0.4} L${-s * 1.2},0 L${-s * 0.6},${-s * 0.4} Z`} fill={color} />}
+      {type === "circle" && <circle cx={-s * 0.5} cy={0} r={s * 0.45} fill={color} />}
+    </g>
+  );
+}
+
+function ArrowPresetPreview({ preset }: { preset: ArrowPreset }) {
+  const y = ARROW_TILE_H / 2;
+  if (preset.kind === "freehand") {
+    return (
+      <svg width={ARROW_TILE_W} height={ARROW_TILE_H} viewBox={`0 0 ${ARROW_TILE_W} ${ARROW_TILE_H}`}>
+        <path d={`M6,${ARROW_TILE_H - 4} C16,6 26,${ARROW_TILE_H - 2} 36,10`} fill="none" stroke="#111111" strokeWidth={2} strokeLinecap="round" />
+        <ArrowTip type={preset.endArrowType} x={36} y={10} angleDeg={-52} color="#111111" />
+      </svg>
+    );
+  }
+  const { strokeStyle, endArrowType, startArrowType, strokeColor = "#374151" } = preset.overrides;
+  const dash = strokeStyle === "dashed" ? "6,4" : strokeStyle === "dotted" ? "1.2,3.5" : undefined;
+  const x1 = 8;
+  const x2 = ARROW_TILE_W - 8;
+  return (
+    <svg width={ARROW_TILE_W} height={ARROW_TILE_H} viewBox={`0 0 ${ARROW_TILE_W} ${ARROW_TILE_H}`}>
+      <line x1={x1} y1={y} x2={x2} y2={y} stroke={strokeColor} strokeWidth={2} strokeDasharray={dash} strokeLinecap={strokeStyle === "dotted" ? "round" : "butt"} />
+      {endArrowType && <ArrowTip type={endArrowType} x={x2} y={y} angleDeg={0} color={strokeColor} />}
+      {startArrowType && <ArrowTip type={startArrowType} x={x1} y={y} angleDeg={180} color={strokeColor} />}
     </svg>
   );
 }
@@ -249,7 +332,9 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [armedShapeType, setArmedShapeType] = useState<WhiteboardShapeType | null>(null);
   const [armedNodeOverrides, setArmedNodeOverrides] = useState<Partial<WhiteboardNode> | undefined>(undefined);
   const [connectorArmed, setConnectorArmed] = useState(false);
+  const [armedConnectorOverrides, setArmedConnectorOverrides] = useState<Partial<WhiteboardEdge> | undefined>(undefined);
   const [shapesMenuOpen, setShapesMenuOpen] = useState(false);
+  const [arrowsMenuOpen, setArrowsMenuOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -265,6 +350,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     document.addEventListener("click", close);
     return () => document.removeEventListener("click", close);
   }, [shapesMenuOpen]);
+
+  useEffect(() => {
+    if (!arrowsMenuOpen) return;
+    const close = () => setArrowsMenuOpen(false);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [arrowsMenuOpen]);
 
   // Fits the view to whichever page is active, every time it changes - covers both "a whiteboard
   // just finished loading" and "the user switched pages" in one code path, since either way the
@@ -296,8 +388,10 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         store.redo();
       } else if (armedShapeType && e.key === "Escape") {
         setArmedShapeType(null);
+        setArmedNodeOverrides(undefined);
       } else if (connectorArmed && e.key === "Escape") {
         setConnectorArmed(false);
+        setArmedConnectorOverrides(undefined);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -380,6 +474,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
 
   const armShape = useCallback((preset: ShapePreset) => {
     setConnectorArmed(false);
+    setArmedConnectorOverrides(undefined);
     setShapesMenuOpen(false);
     setArmedShapeType((prev) => {
       const isSame = prev === preset.type && JSON.stringify(armedNodeOverrides) === JSON.stringify(preset.overrides);
@@ -387,6 +482,27 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     });
     setArmedNodeOverrides(preset.overrides);
   }, [armedNodeOverrides]);
+
+  const armArrow = useCallback(
+    (preset: ArrowPreset) => {
+      setArrowsMenuOpen(false);
+      if (preset.kind === "freehand") {
+        setConnectorArmed(false);
+        setArmedConnectorOverrides(undefined);
+        const startType = preset.startArrowType ?? "none";
+        const isSame = armedShapeType === "freehand" && armedNodeOverrides?.endArrowType === preset.endArrowType && armedNodeOverrides?.startArrowType === startType;
+        setArmedShapeType(isSame ? null : "freehand");
+        setArmedNodeOverrides(isSame ? undefined : { endArrowType: preset.endArrowType, startArrowType: startType });
+        return;
+      }
+      setArmedShapeType(null);
+      setArmedNodeOverrides(undefined);
+      const isSame = connectorArmed && JSON.stringify(armedConnectorOverrides) === JSON.stringify(preset.overrides);
+      setConnectorArmed(!isSame);
+      setArmedConnectorOverrides(isSame ? undefined : preset.overrides);
+    },
+    [armedShapeType, armedNodeOverrides, connectorArmed, armedConnectorOverrides]
+  );
 
   if (store.loading || !doc || !page) {
     return (
@@ -461,6 +577,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           active={armedShapeType === "text"}
           onClick={() => {
             setConnectorArmed(false);
+            setArmedConnectorOverrides(undefined);
             setArmedNodeOverrides(undefined);
             setArmedShapeType((prev) => (prev === "text" ? null : "text"));
           }}
@@ -469,25 +586,55 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         </ToolbarButton>
         <ToolbarButton
           title="Pen (freehand)"
-          active={armedShapeType === "freehand"}
+          active={armedShapeType === "freehand" && !armedNodeOverrides?.endArrowType}
           onClick={() => {
             setConnectorArmed(false);
+            setArmedConnectorOverrides(undefined);
             setArmedNodeOverrides(undefined);
             setArmedShapeType((prev) => (prev === "freehand" ? null : "freehand"));
           }}
         >
           <IoPencilOutline size={18} />
         </ToolbarButton>
-        <ToolbarButton
-          title="Connector"
-          active={connectorArmed}
-          onClick={() => {
-            setArmedShapeType(null);
-            setConnectorArmed((prev) => !prev);
-          }}
-        >
-          <IoGitNetworkOutline size={18} />
-        </ToolbarButton>
+        <div className="relative">
+          <ToolbarButton
+            title="Arrows"
+            active={connectorArmed || (armedShapeType === "freehand" && !!armedNodeOverrides?.endArrowType)}
+            onClick={(e?: any) => {
+              e?.stopPropagation?.();
+              setArrowsMenuOpen((prev) => !prev);
+            }}
+          >
+            <span className="flex items-center gap-0.5">
+              <IoGitNetworkOutline size={18} />
+              <IoChevronDown size={11} />
+            </span>
+          </ToolbarButton>
+          {arrowsMenuOpen && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="absolute left-0 top-full mt-1 w-[240px] max-h-[70vh] overflow-y-auto bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl p-2 flex flex-col gap-0.5 z-20"
+            >
+              {ARROW_PRESETS.map((preset) => {
+                const active =
+                  preset.kind === "freehand"
+                    ? armedShapeType === "freehand" && armedNodeOverrides?.endArrowType === preset.endArrowType && (armedNodeOverrides?.startArrowType ?? "none") === (preset.startArrowType ?? "none")
+                    : connectorArmed && JSON.stringify(armedConnectorOverrides) === JSON.stringify(preset.overrides);
+                return (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    onClick={() => armArrow(preset)}
+                    className={`flex items-center gap-2 px-2 py-1.5 rounded-md ${active ? "bg-blue-100 dark:bg-blue-500/30" : "hover:bg-gray-100 dark:hover:bg-neutral-700"}`}
+                  >
+                    <ArrowPresetPreview preset={preset} />
+                    <span className="text-xs text-gray-600 dark:text-neutral-300">{preset.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
         <div className="w-px h-6 bg-gray-200 dark:bg-neutral-700 mx-1" />
         <ToolbarButton title="Zoom out" onClick={() => canvasRef.current?.zoomBy(1 / 1.25)}>
           <IoRemove size={18} />
@@ -559,7 +706,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             setArmedNodeOverrides(undefined);
           }}
           connectorArmed={connectorArmed}
-          onConnectorPlaced={() => setConnectorArmed(false)}
+          armedConnectorOverrides={armedConnectorOverrides}
         />
         <WhiteboardStylePanel
           selectedNodes={selectedNodes}

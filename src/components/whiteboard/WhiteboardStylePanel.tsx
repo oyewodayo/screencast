@@ -21,6 +21,7 @@ import {
   TbUnderline,
 } from "react-icons/tb";
 import { ArrowheadType, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
+import { DEFAULT_CURVE_BOW, DEFAULT_WAVE_CYCLES, MAX_WAVE_CYCLES, MIN_WAVE_CYCLES } from "../../handlers/whiteboardHandlers";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
   { label: "Sans", value: "system-ui, sans-serif" },
@@ -37,6 +38,14 @@ const ARROWHEAD_OPTIONS: { value: ArrowheadType; label: string }[] = [
   { value: "block", label: "Block" },
   { value: "diamond", label: "Diamond" },
   { value: "circle", label: "Circle" },
+];
+
+const WAVE_STYLE_OPTIONS: { value: NonNullable<WhiteboardNode["waveStyle"]>; label: string }[] = [
+  { value: "sine", label: "Sine" },
+  { value: "cosine", label: "Cosine" },
+  { value: "square", label: "Square" },
+  { value: "triangle", label: "Triangle" },
+  { value: "sawtooth", label: "Sawtooth" },
 ];
 
 const LINE_STYLE_OPTIONS: { value: WhiteboardEdge["strokeStyle"]; label: string }[] = [
@@ -61,6 +70,57 @@ interface WhiteboardStylePanelProps {
   onDuplicateNode: (node: WhiteboardNode) => void;
   onBringToFront: () => void;
   onSendToBack: () => void;
+}
+
+// A plain `value={n}`-controlled number input re-clamps AND redraws its own text on every
+// keystroke, which fights typing a multi-digit value: e.g. typing "12" over a clamped-to-8 field
+// commits "1" then immediately force-overwrites the field's own text back to "8" before the second
+// digit ever lands. This instead tracks the raw typed text locally and never rewrites it out from
+// under the user mid-edit (only a fully separate node selection - via the `key={selectedNodes[0].id}`
+// callers pass - resets it); every keystroke that already parses to a valid number still commits
+// immediately (clamped) so the canvas updates live as you type, same as every other field in this
+// panel (Stroke width, Sides, Font size, ...) already does on every change. Only an unparsable or
+// empty in-progress value (a bare "-", a cleared field) skips committing until it resolves; blur/
+// Enter then normalizes the visible text to whatever finally committed.
+function ClampedNumberField({ initialValue, min, max, onCommit, className }: { initialValue: number; min: number; max: number; onCommit: (n: number) => void; className: string }) {
+  const [text, setText] = React.useState(String(initialValue));
+  // Tracks what was last actually dispatched (as opposed to `initialValue`, a mount-time snapshot),
+  // so blur doesn't re-dispatch an identical value on top of the live commit that already fired for
+  // the same keystroke - each edit becomes exactly one undo step.
+  const lastCommittedRef = React.useRef(initialValue);
+  const parseClamped = (raw: string): number | null => {
+    if (raw.trim() === "") return null;
+    const parsed = Math.round(Number(raw));
+    return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : null;
+  };
+  const commitIfChanged = (clamped: number) => {
+    if (clamped === lastCommittedRef.current) return;
+    lastCommittedRef.current = clamped;
+    onCommit(clamped);
+  };
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      value={text}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        const clamped = parseClamped(raw);
+        if (clamped !== null) commitIfChanged(clamped);
+      }}
+      onBlur={() => {
+        const clamped = parseClamped(text) ?? initialValue;
+        setText(String(clamped));
+        commitIfChanged(clamped);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+      }}
+      className={className}
+    />
+  );
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -104,7 +164,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             {selectedNodes.length > 1 ? `${selectedNodes.length} shapes` : "Shape"}
           </p>
 
-          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand") && (
+          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && n.shapeType !== "wave") && (
             <Field label="Fill">
               <input
                 type="color"
@@ -175,6 +235,64 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 />
               </Field>
             </>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "wave") && (
+            <>
+              <Field label="Wave">
+                <select
+                  value={selectedNodes[0].waveStyle ?? "sine"}
+                  onChange={(e) => updateNodes({ waveStyle: e.target.value as WhiteboardNode["waveStyle"] })}
+                  className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                >
+                  {WAVE_STYLE_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Cycles">
+                <ClampedNumberField
+                  key={selectedNodes[0].id}
+                  initialValue={selectedNodes[0].waveCycles ?? DEFAULT_WAVE_CYCLES}
+                  min={MIN_WAVE_CYCLES}
+                  max={MAX_WAVE_CYCLES}
+                  onCommit={(n) => updateNodes({ waveCycles: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+              </Field>
+            </>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "freehand") && (
+            <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">
+              <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-neutral-500">Arrowheads</p>
+              <Field label="Start">
+                <select
+                  value={selectedNodes[0].startArrowType ?? "none"}
+                  onChange={(e) => updateNodes({ startArrowType: e.target.value as ArrowheadType })}
+                  className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                >
+                  {ARROWHEAD_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="End">
+                <select
+                  value={selectedNodes[0].endArrowType ?? "none"}
+                  onChange={(e) => updateNodes({ endArrowType: e.target.value as ArrowheadType })}
+                  className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                >
+                  {ARROWHEAD_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
           )}
 
           {selectedNodes.some((n) => n.shapeType !== "freehand") && (
@@ -318,6 +436,20 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               ))}
             </select>
           </Field>
+          {edge.routing === "curved" && (
+            <Field label="Curve bow">
+              <input
+                type="range"
+                min={-1}
+                max={1}
+                step={0.05}
+                value={edge.curveBow ?? DEFAULT_CURVE_BOW}
+                onChange={(e) => updateEdge({ curveBow: Number(e.target.value) })}
+                className="w-28"
+                title="Which way (and how far) a free-floating end of this curve bows - only matters where the curve has no shape side to bow away from"
+              />
+            </Field>
+          )}
           <Field label="Start arrow">
             <select
               value={edge.startArrowType}
