@@ -891,7 +891,16 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           const isEditing = editingNodeId === node.id;
           const isConnectable = CONNECTABLE_SHAPES.has(node.shapeType);
           const showConnectionDots = isConnectable && (isHovered || selected || connectorArmed);
-          const outline = shapeOutlineFor(node.shapeType, node.width, node.height, { sides: node.sides, starPoints: node.starPoints, starInnerRadiusRatio: node.starInnerRadiusRatio, waveStyle: node.waveStyle, waveCycles: node.waveCycles });
+          const outline = shapeOutlineFor(node.shapeType, node.width, node.height, {
+            sides: node.sides,
+            starPoints: node.starPoints,
+            starInnerRadiusRatio: node.starInnerRadiusRatio,
+            waveStyle: node.waveStyle,
+            waveCycles: node.waveCycles,
+            angleDegrees: node.angleDegrees,
+            angleRay1Length: node.angleRay1Length,
+            angleRay2Length: node.angleRay2Length,
+          });
           return (
             <div
               key={node.id}
@@ -982,6 +991,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   {outline.innerLines?.map((line, i) => (
                     <polyline key={i} points={line.map(([px, py]) => `${px},${py}`).join(" ")} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
                   ))}
+                  {outline.innerCircle && (
+                    <circle cx={outline.innerCircle.cx} cy={outline.innerCircle.cy} r={outline.innerCircle.r} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} />
+                  )}
                 </svg>
               ) : outline.kind === "path" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>

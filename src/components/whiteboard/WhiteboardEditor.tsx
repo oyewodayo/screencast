@@ -26,7 +26,7 @@ import {
   IoTrashOutline,
 } from "react-icons/io5";
 import useWhiteboardStore from "../../hooks/useWhiteboardStore";
-import { ArrowheadType, WhiteboardEdge, WhiteboardNode, WhiteboardPage, WhiteboardShapeType } from "../../utils/whiteboardTypes";
+import { ArrowheadType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode, WhiteboardPage, WhiteboardShapeType } from "../../utils/whiteboardTypes";
 import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import { computeContentBounds, renderWhiteboardToCanvas, shapeOutlineFor, CYLINDER_CAP_RATIO } from "../../handlers/whiteboardHandlers";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
@@ -45,11 +45,13 @@ interface ShapePreset {
   overrides?: Partial<WhiteboardNode>;
 }
 
-// One tile per palette entry - shown in the toolbar's "Shapes" popover. "Rounded Rectangle" is not
-// its own shapeType (see whiteboardTypes.ts's WhiteboardNode.cornerRadius doc comment) - it's a
-// plain rectangle with a nonzero cornerRadius override applied at creation time; "Pentagon"/
-// "Octagon" are likewise just "polygon" at a different `sides`.
-const SHAPE_PRESETS: ShapePreset[] = [
+// One tile per palette entry - shown in the toolbar's "Shapes" popover, grouped into labeled
+// sections (SHAPE_PRESET_GROUPS below) rather than one long flat grid, now that the palette has
+// grown past basic flowchart shapes. "Rounded Rectangle" is not its own shapeType (see
+// whiteboardTypes.ts's WhiteboardNode.cornerRadius doc comment) - it's a plain rectangle with a
+// nonzero cornerRadius override applied at creation time; "Pentagon"/"Octagon" are likewise just
+// "polygon" at a different `sides`.
+const BASIC_SHAPE_PRESETS: ShapePreset[] = [
   { type: "rectangle", label: "Rectangle" },
   { type: "rectangle", label: "Rounded", overrides: { cornerRadius: 16 } },
   { type: "ellipse", label: "Ellipse" },
@@ -69,11 +71,32 @@ const SHAPE_PRESETS: ShapePreset[] = [
   { type: "note", label: "Note" },
   { type: "callout", label: "Callout" },
   { type: "step", label: "Step" },
+];
+
+const WAVE_SHAPE_PRESETS: ShapePreset[] = [
   { type: "wave", label: "Sine Wave", overrides: { waveStyle: "sine" } },
   { type: "wave", label: "Cosine Wave", overrides: { waveStyle: "cosine" } },
   { type: "wave", label: "Square Wave", overrides: { waveStyle: "square" } },
   { type: "wave", label: "Triangle Wave", overrides: { waveStyle: "triangle" } },
   { type: "wave", label: "Sawtooth Wave", overrides: { waveStyle: "sawtooth" } },
+];
+
+const SCIENCE_SHAPE_PRESETS: ShapePreset[] = [
+  { type: "resistor", label: "Resistor" },
+  { type: "capacitor", label: "Capacitor" },
+  { type: "battery", label: "Battery" },
+  { type: "spring", label: "Spring/Coil" },
+  { type: "flask", label: "Flask" },
+  { type: "beaker", label: "Beaker" },
+  { type: "benzeneRing", label: "Benzene Ring" },
+  { type: "axes", label: "Axes" },
+  { type: "angle", label: "Angle" },
+];
+
+const SHAPE_PRESET_GROUPS: { label: string; presets: ShapePreset[] }[] = [
+  { label: "Basic", presets: BASIC_SHAPE_PRESETS },
+  { label: "Waveforms", presets: WAVE_SHAPE_PRESETS },
+  { label: "Science", presets: SCIENCE_SHAPE_PRESETS },
 ];
 
 const TILE_W = 44;
@@ -91,11 +114,14 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
     starInnerRadiusRatio: preset.overrides?.starInnerRadiusRatio,
     waveStyle: preset.overrides?.waveStyle,
     waveCycles: preset.overrides?.waveCycles,
+    angleDegrees: preset.overrides?.angleDegrees,
+    angleRay1Length: preset.overrides?.angleRay1Length,
+    angleRay2Length: preset.overrides?.angleRay2Length,
   });
-  // Waves render as an open trace, not a filled silhouette (matches their own default fillColor:
-  // null) - filling the preview swatch would shade the implicit-close area under the curve instead
-  // of just showing the line shape the tile actually places.
-  const fill = preset.type === "wave" ? "none" : "#dbeafe";
+  // Line-only shapes (waves, circuit symbols, axes...) render as an open trace, not a filled
+  // silhouette (matches their own default fillColor: null) - filling the preview swatch would shade
+  // the implicit-close area under the trace instead of just showing the line shape the tile places.
+  const fill = LINE_ONLY_SHAPES.has(preset.type) ? "none" : "#dbeafe";
   const stroke = "#2563eb";
   return (
     <svg width={TILE_W} height={TILE_H} viewBox={`0 0 ${TILE_W} ${TILE_H}`}>
@@ -108,6 +134,7 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
             {outline.innerLines?.map((line, i) => (
               <polyline key={i} points={line.map(([x, y]) => `${x},${y}`).join(" ")} fill="none" stroke={stroke} strokeWidth={2} strokeLinecap="round" />
             ))}
+            {outline.innerCircle && <circle cx={outline.innerCircle.cx} cy={outline.innerCircle.cy} r={outline.innerCircle.r} fill="none" stroke={stroke} strokeWidth={2} />}
           </>
         )}
         {outline.kind === "path" && <path d={outline.d} fill={fill} stroke={stroke} strokeWidth={2} strokeLinejoin="round" />}
@@ -555,20 +582,25 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
               onClick={(e) => e.stopPropagation()}
               className="absolute left-0 top-full mt-1 w-[280px] max-h-[70vh] overflow-y-auto bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl p-2 grid grid-cols-3 gap-1 z-20"
             >
-              {SHAPE_PRESETS.map((preset) => {
-                const active = armedShapeType === preset.type && JSON.stringify(armedNodeOverrides) === JSON.stringify(preset.overrides);
-                return (
-                  <button
-                    key={preset.label}
-                    type="button"
-                    onClick={() => armShape(preset)}
-                    className={`flex flex-col items-center gap-0.5 p-1.5 rounded-md ${active ? "bg-blue-100 dark:bg-blue-500/30" : "hover:bg-gray-100 dark:hover:bg-neutral-700"}`}
-                  >
-                    <ShapePresetPreview preset={preset} />
-                    <span className="text-[10px] text-gray-500 dark:text-neutral-400">{preset.label}</span>
-                  </button>
-                );
-              })}
+              {SHAPE_PRESET_GROUPS.map((group) => (
+                <React.Fragment key={group.label}>
+                  <p className="col-span-3 text-[10px] font-medium uppercase tracking-wide text-gray-400 dark:text-neutral-500 px-1 pt-1 first:pt-0">{group.label}</p>
+                  {group.presets.map((preset) => {
+                    const active = armedShapeType === preset.type && JSON.stringify(armedNodeOverrides) === JSON.stringify(preset.overrides);
+                    return (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => armShape(preset)}
+                        className={`flex flex-col items-center gap-0.5 p-1.5 rounded-md ${active ? "bg-blue-100 dark:bg-blue-500/30" : "hover:bg-gray-100 dark:hover:bg-neutral-700"}`}
+                      >
+                        <ShapePresetPreview preset={preset} />
+                        <span className="text-[10px] text-gray-500 dark:text-neutral-400">{preset.label}</span>
+                      </button>
+                    );
+                  })}
+                </React.Fragment>
+              ))}
             </div>
           )}
         </div>

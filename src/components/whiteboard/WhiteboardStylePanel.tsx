@@ -20,8 +20,19 @@ import {
   TbStackFront,
   TbUnderline,
 } from "react-icons/tb";
-import { ArrowheadType, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
-import { DEFAULT_CURVE_BOW, DEFAULT_WAVE_CYCLES, MAX_WAVE_CYCLES, MIN_WAVE_CYCLES } from "../../handlers/whiteboardHandlers";
+import { ArrowheadType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
+import {
+  DEFAULT_ANGLE_DEGREES,
+  DEFAULT_ANGLE_RAY_LENGTH,
+  DEFAULT_CURVE_BOW,
+  DEFAULT_WAVE_CYCLES,
+  MAX_ANGLE_DEGREES,
+  MAX_ANGLE_RAY_LENGTH,
+  MAX_WAVE_CYCLES,
+  MIN_ANGLE_DEGREES,
+  MIN_ANGLE_RAY_LENGTH,
+  MIN_WAVE_CYCLES,
+} from "../../handlers/whiteboardHandlers";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
   { label: "Sans", value: "system-ui, sans-serif" },
@@ -81,17 +92,45 @@ interface WhiteboardStylePanelProps {
 // immediately (clamped) so the canvas updates live as you type, same as every other field in this
 // panel (Stroke width, Sides, Font size, ...) already does on every change. Only an unparsable or
 // empty in-progress value (a bare "-", a cleared field) skips committing until it resolves; blur/
-// Enter then normalizes the visible text to whatever finally committed.
-function ClampedNumberField({ initialValue, min, max, onCommit, className }: { initialValue: number; min: number; max: number; onCommit: (n: number) => void; className: string }) {
+// Enter then normalizes the visible text to whatever finally committed. Also re-syncs its displayed
+// text from `initialValue` whenever that changes from OUTSIDE this field (e.g. a paired range
+// slider driving the same value, like the angle-length sliders) - but only while unfocused, so that
+// external sync never fights the in-progress typing the paragraph above protects.
+function ClampedNumberField({
+  initialValue,
+  min,
+  max,
+  step,
+  integer = true,
+  onCommit,
+  className,
+}: {
+  initialValue: number;
+  min: number;
+  max: number;
+  step?: number;
+  integer?: boolean; // false keeps typed decimals (e.g. a 0.05-step fraction) instead of rounding to a whole number
+  onCommit: (n: number) => void;
+  className: string;
+}) {
   const [text, setText] = React.useState(String(initialValue));
+  const [focused, setFocused] = React.useState(false);
   // Tracks what was last actually dispatched (as opposed to `initialValue`, a mount-time snapshot),
   // so blur doesn't re-dispatch an identical value on top of the live commit that already fired for
   // the same keystroke - each edit becomes exactly one undo step.
   const lastCommittedRef = React.useRef(initialValue);
+  React.useEffect(() => {
+    lastCommittedRef.current = initialValue;
+    if (!focused) setText(String(initialValue));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `focused` deliberately excluded: a
+    // focus change alone shouldn't re-sync text, only a genuinely new initialValue while unfocused.
+  }, [initialValue]);
   const parseClamped = (raw: string): number | null => {
     if (raw.trim() === "") return null;
-    const parsed = Math.round(Number(raw));
-    return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : null;
+    const num = Number(raw);
+    if (!Number.isFinite(num)) return null;
+    const parsed = integer ? Math.round(num) : num;
+    return Math.max(min, Math.min(max, parsed));
   };
   const commitIfChanged = (clamped: number) => {
     if (clamped === lastCommittedRef.current) return;
@@ -103,7 +142,9 @@ function ClampedNumberField({ initialValue, min, max, onCommit, className }: { i
       type="number"
       min={min}
       max={max}
+      step={step ?? (integer ? 1 : "any")}
       value={text}
+      onFocus={() => setFocused(true)}
       onChange={(e) => {
         const raw = e.target.value;
         setText(raw);
@@ -111,6 +152,7 @@ function ClampedNumberField({ initialValue, min, max, onCommit, className }: { i
         if (clamped !== null) commitIfChanged(clamped);
       }}
       onBlur={() => {
+        setFocused(false);
         const clamped = parseClamped(text) ?? initialValue;
         setText(String(clamped));
         commitIfChanged(clamped);
@@ -164,7 +206,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             {selectedNodes.length > 1 ? `${selectedNodes.length} shapes` : "Shape"}
           </p>
 
-          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && n.shapeType !== "wave") && (
+          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
             <Field label="Fill">
               <input
                 type="color"
@@ -260,6 +302,66 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   onCommit={(n) => updateNodes({ waveCycles: n })}
                   className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                 />
+              </Field>
+            </>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "angle") && (
+            <>
+              <Field label="Angle (°)">
+                <ClampedNumberField
+                  key={selectedNodes[0].id}
+                  initialValue={selectedNodes[0].angleDegrees ?? DEFAULT_ANGLE_DEGREES}
+                  min={MIN_ANGLE_DEGREES}
+                  max={MAX_ANGLE_DEGREES}
+                  onCommit={(n) => updateNodes({ angleDegrees: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+              </Field>
+              <Field label="Side 1">
+                <div className="flex items-center gap-1.5">
+                  <ClampedNumberField
+                    key={selectedNodes[0].id}
+                    initialValue={selectedNodes[0].angleRay1Length ?? DEFAULT_ANGLE_RAY_LENGTH}
+                    min={MIN_ANGLE_RAY_LENGTH}
+                    max={MAX_ANGLE_RAY_LENGTH}
+                    step={0.05}
+                    integer={false}
+                    onCommit={(n) => updateNodes({ angleRay1Length: n })}
+                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  />
+                  <input
+                    type="range"
+                    min={MIN_ANGLE_RAY_LENGTH}
+                    max={MAX_ANGLE_RAY_LENGTH}
+                    step={0.05}
+                    value={selectedNodes[0].angleRay1Length ?? DEFAULT_ANGLE_RAY_LENGTH}
+                    onChange={(e) => updateNodes({ angleRay1Length: Number(e.target.value) })}
+                    className="w-16"
+                  />
+                </div>
+              </Field>
+              <Field label="Side 2">
+                <div className="flex items-center gap-1.5">
+                  <ClampedNumberField
+                    key={selectedNodes[0].id}
+                    initialValue={selectedNodes[0].angleRay2Length ?? DEFAULT_ANGLE_RAY_LENGTH}
+                    min={MIN_ANGLE_RAY_LENGTH}
+                    max={MAX_ANGLE_RAY_LENGTH}
+                    step={0.05}
+                    integer={false}
+                    onCommit={(n) => updateNodes({ angleRay2Length: n })}
+                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  />
+                  <input
+                    type="range"
+                    min={MIN_ANGLE_RAY_LENGTH}
+                    max={MAX_ANGLE_RAY_LENGTH}
+                    step={0.05}
+                    value={selectedNodes[0].angleRay2Length ?? DEFAULT_ANGLE_RAY_LENGTH}
+                    onChange={(e) => updateNodes({ angleRay2Length: Number(e.target.value) })}
+                    className="w-16"
+                  />
+                </div>
               </Field>
             </>
           )}

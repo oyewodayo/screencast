@@ -33,8 +33,34 @@ export type WhiteboardShapeType =
   | "callout" // speech-bubble rectangle with a tail
   | "step" // chevron/arrow-shaped process step
   | "wave" // periodic signal trace - WhiteboardNode.waveStyle picks sine/cosine/square/triangle/sawtooth
+  // Science/diagram symbols - all fixed (non-parametric) glyphs, same reasoning as document/cloud
+  // (a hand-tuned icon, not something with an obvious "how many sides" knob like polygon/star).
+  | "resistor" // circuit zigzag
+  | "capacitor" // circuit parallel-plate symbol
+  | "spring" // physics coil/spring
+  | "battery" // circuit single-cell symbol (long + short plate)
+  | "flask" // chemistry Erlenmeyer flask
+  | "beaker" // chemistry graduated beaker
+  | "benzeneRing" // chemistry aromatic ring (hexagon + inscribed circle)
+  | "axes" // math x/y coordinate axes
+  | "angle" // math angle-with-arc marker
   | "text"
   | "freehand";
+
+// Shapes that render as an open/line-style glyph with no interior region to speak of (a circuit
+// symbol, a coordinate-axes cross) - same treatment as freehand/text: default fillColor is null,
+// and the style panel hides the Fill swatch for them. Kept as one shared set rather than repeating
+// this shapeType list in whiteboardTypes.ts/WhiteboardStylePanel.tsx/WhiteboardEditor.tsx
+// separately, so adding a future line-only shape only means updating it here.
+export const LINE_ONLY_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>([
+  "wave",
+  "resistor",
+  "capacitor",
+  "spring",
+  "battery",
+  "axes",
+  "angle",
+]);
 
 interface WhiteboardItemBase {
   id: string;
@@ -76,10 +102,21 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // "wave" only - which periodic curve to trace across the node's box (see whiteboardHandlers.ts's
   // waveOutlineD). Absent - resolves to "sine".
   waveStyle?: "sine" | "cosine" | "square" | "triangle" | "sawtooth";
-  // "wave" only - how many full periods to trace across the node's own width, 1-8. Absent -
-  // resolves to 2. Wider spacing (fewer cycles) vs. denser (more) is a look the shape needs to
-  // hand over, same reasoning as star's points/polygon's sides being user-adjustable.
+  // "wave" only - how many full periods to trace across the node's own width (see
+  // whiteboardHandlers.ts's MIN/MAX_WAVE_CYCLES for the bounds). Absent - resolves to
+  // DEFAULT_WAVE_CYCLES. Wider spacing (fewer cycles) vs. denser (more) is a look the shape needs
+  // to hand over, same reasoning as star's points/polygon's sides being user-adjustable.
   waveCycles?: number;
+  // "angle" only - the angle (degrees) between the two rays, and each ray's own length as a
+  // fraction of its natural max (the horizontal ray's max is the node's own width; the angled
+  // ray's max is min(width, height) - see whiteboardHandlers.ts's angleOutlineD). Absent - resolve
+  // to DEFAULT_ANGLE_DEGREES/DEFAULT_ANGLE_RAY_LENGTH. Independently adjustable rather than a
+  // single "size" knob so the glyph can actually represent a specific angle/side-length
+  // relationship (e.g. sketching a real angle-side-angle construction) rather than just being a
+  // fixed decorative icon like cloud/document.
+  angleDegrees?: number;
+  angleRay1Length?: number;
+  angleRay2Length?: number;
   fontFamily: string;
   fontSize: number;
   fontColor: string;
@@ -245,6 +282,15 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   callout: { width: 170, height: 110 },
   step: { width: 190, height: 100 },
   wave: { width: 220, height: 90 },
+  resistor: { width: 180, height: 60 },
+  capacitor: { width: 140, height: 90 },
+  spring: { width: 200, height: 70 },
+  battery: { width: 140, height: 90 },
+  flask: { width: 150, height: 170 },
+  beaker: { width: 140, height: 150 },
+  benzeneRing: { width: 160, height: 150 },
+  axes: { width: 160, height: 160 },
+  angle: { width: 170, height: 130 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
 };
@@ -254,7 +300,7 @@ export function createDefaultWhiteboardNode(
   shapeType: WhiteboardShapeType,
   x: number,
   y: number,
-  overrides?: Partial<Pick<WhiteboardNode, "sides" | "starPoints" | "starInnerRadiusRatio" | "waveStyle" | "waveCycles">>
+  overrides?: Partial<Pick<WhiteboardNode, "sides" | "starPoints" | "starInnerRadiusRatio" | "waveStyle" | "waveCycles" | "angleDegrees" | "angleRay1Length" | "angleRay2Length">>
 ): WhiteboardNode {
   const now = Date.now();
   const size = SHAPE_DEFAULT_SIZE[shapeType];
@@ -267,7 +313,7 @@ export function createDefaultWhiteboardNode(
     width: size.width,
     height: size.height,
     text: "",
-    fillColor: shapeType === "text" || shapeType === "freehand" || shapeType === "wave" ? null : "#dbeafe",
+    fillColor: shapeType === "text" || shapeType === "freehand" || LINE_ONLY_SHAPES.has(shapeType) ? null : "#dbeafe",
     strokeColor: shapeType === "freehand" ? "#111111" : "#2563eb",
     strokeWidth: 2,
     cornerRadius: 0,
@@ -276,6 +322,9 @@ export function createDefaultWhiteboardNode(
     starInnerRadiusRatio: shapeType === "star" ? overrides?.starInnerRadiusRatio ?? 0.45 : undefined,
     waveStyle: shapeType === "wave" ? overrides?.waveStyle ?? "sine" : undefined,
     waveCycles: shapeType === "wave" ? overrides?.waveCycles ?? 2 : undefined,
+    angleDegrees: shapeType === "angle" ? overrides?.angleDegrees ?? 50 : undefined,
+    angleRay1Length: shapeType === "angle" ? overrides?.angleRay1Length ?? 1 : undefined,
+    angleRay2Length: shapeType === "angle" ? overrides?.angleRay2Length ?? 1 : undefined,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,
     fontColor: "#111111",

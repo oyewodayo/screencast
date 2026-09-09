@@ -286,7 +286,10 @@ export type ShapeOutline =
   | { kind: "ellipse" }
   // innerLines: extra stroke-only (no fill) line segments drawn after the main outline - e.g.
   // cube's 3D edge lines, note's folded-corner crease. Each entry is one polyline's points.
-  | { kind: "polygon"; points: [number, number][]; innerLines?: [number, number][][] }
+  // innerCircle: an extra stroke-only (no fill) circle drawn after innerLines - benzeneRing's
+  // inscribed ring denoting the aromatic bond, the one case so far that needs a circle rather than
+  // a polyline nested inside a polygon outline.
+  | { kind: "polygon"; points: [number, number][]; innerLines?: [number, number][][]; innerCircle?: { cx: number; cy: number; r: number } }
   | { kind: "cylinder" }
   // A hand-built SVG path `d` string for outlines a simple point list can't express (currently
   // just the curved ones: document's wavy edge, cloud's bumps).
@@ -298,6 +301,9 @@ export interface ShapeOutlineOptions {
   starInnerRadiusRatio?: number; // "star" only
   waveStyle?: WhiteboardNode["waveStyle"]; // "wave" only
   waveCycles?: number; // "wave" only
+  angleDegrees?: number; // "angle" only
+  angleRay1Length?: number; // "angle" only
+  angleRay2Length?: number; // "angle" only
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -338,6 +344,194 @@ function starPoints(w: number, h: number, points: number, innerRatio: number): [
 export const MIN_WAVE_CYCLES = 1;
 export const MAX_WAVE_CYCLES = 60;
 export const DEFAULT_WAVE_CYCLES = 2;
+
+// ---- Science/diagram symbol outlines -------------------------------------------------------------
+//
+// Fixed (non-parametric) glyphs - like document/cloud above, these are hand-tuned single shapes,
+// not built from a user-adjustable parameter the way polygon/star/wave are. Each returns a `d`
+// string built from one or more independent M-started subpaths (no trailing Z on the line-only
+// ones), which is exactly what makes a plain multi-segment circuit symbol expressible as a single
+// ShapeOutline "path" - see this file's ShapeOutline doc comment: fillAndStroke/the DOM renderer
+// only fill when the node actually has a fillColor (LINE_ONLY_SHAPES in whiteboardTypes.ts keeps
+// these at fillColor: null by default), so an open, unfilled multi-subpath `d` just draws as the
+// bare line art it looks like.
+
+// Classic zigzag resistor symbol: flat leads in/out, a symmetric triangle-wave zigzag between.
+function resistorOutlineD(w: number, h: number): string {
+  const midY = h / 2;
+  const leadIn = w * 0.12;
+  const leadOut = w * 0.88;
+  const peaks = 6;
+  const amp = h * 0.32;
+  const points: [number, number][] = [[0, midY], [leadIn, midY]];
+  for (let i = 0; i < peaks; i++) {
+    const x = leadIn + ((leadOut - leadIn) * (i + 0.5)) / peaks;
+    points.push([x, i % 2 === 0 ? midY - amp : midY + amp]);
+  }
+  points.push([leadOut, midY], [w, midY]);
+  return points.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+}
+
+// Two parallel plates with leads - the standard capacitor symbol.
+function capacitorOutlineD(w: number, h: number): string {
+  const midY = h / 2;
+  const gap = w * 0.14;
+  const x1 = w / 2 - gap / 2;
+  const x2 = w / 2 + gap / 2;
+  const halfH = h * 0.38;
+  return [`M0,${midY} L${x1.toFixed(2)},${midY}`, `M${x1.toFixed(2)},${(midY - halfH).toFixed(2)} L${x1.toFixed(2)},${(midY + halfH).toFixed(2)}`, `M${x2.toFixed(2)},${(midY - halfH).toFixed(2)} L${x2.toFixed(2)},${(midY + halfH).toFixed(2)}`, `M${x2.toFixed(2)},${midY} L${w},${midY}`].join(
+    " "
+  );
+}
+
+// Same two-plate idea as the capacitor but one plate long/thin and the other short - the standard
+// single-cell battery symbol, distinguishing it at a glance from a capacitor.
+function batteryOutlineD(w: number, h: number): string {
+  const midY = h / 2;
+  const gap = w * 0.12;
+  const longX = w / 2 - gap / 2;
+  const shortX = w / 2 + gap / 2;
+  const longHalf = h * 0.38;
+  const shortHalf = h * 0.18;
+  return [
+    `M0,${midY} L${longX.toFixed(2)},${midY}`,
+    `M${longX.toFixed(2)},${(midY - longHalf).toFixed(2)} L${longX.toFixed(2)},${(midY + longHalf).toFixed(2)}`,
+    `M${shortX.toFixed(2)},${(midY - shortHalf).toFixed(2)} L${shortX.toFixed(2)},${(midY + shortHalf).toFixed(2)}`,
+    `M${shortX.toFixed(2)},${midY} L${w},${midY}`,
+  ].join(" ");
+}
+
+// A row of alternating-bulge semicircular arcs between two flat leads - reads as a coil/spring
+// viewed from the side (physics) as readily as an inductor (circuits), so it's left generically
+// named "spring" rather than picking one domain.
+function springOutlineD(w: number, h: number): string {
+  const midY = h / 2;
+  const leadIn = w * 0.1;
+  const leadOut = w * 0.1;
+  const coilW = w - leadIn - leadOut;
+  const loops = 5;
+  const r = coilW / (loops * 2);
+  const parts = [`M0,${midY.toFixed(2)}`, `L${leadIn.toFixed(2)},${midY.toFixed(2)}`];
+  let x = leadIn;
+  for (let i = 0; i < loops; i++) {
+    const nx = x + 2 * r;
+    parts.push(`A${r.toFixed(2)},${r.toFixed(2)} 0 0,${i % 2 === 0 ? 1 : 0} ${nx.toFixed(2)},${midY.toFixed(2)}`);
+    x = nx;
+  }
+  parts.push(`L${w},${midY.toFixed(2)}`);
+  return parts.join(" ");
+}
+
+// Narrow neck flaring straight down to a flat, gently-rounded-corner base - the Erlenmeyer flask
+// silhouette. Closed (has a Z), so - unlike the line-only symbols above - this one's meant to take
+// a fill (e.g. shading in "liquid").
+function flaskOutlineD(w: number, h: number): string {
+  const neckHalfW = w * 0.11;
+  const neckX0 = w / 2 - neckHalfW;
+  const neckX1 = w / 2 + neckHalfW;
+  const shoulderY = h * 0.32;
+  const bottomY = h * 0.92;
+  const baseHalfW = w * 0.46;
+  const cornerHalfW = baseHalfW * 0.7;
+  return [
+    `M${neckX0.toFixed(2)},0`,
+    `L${neckX0.toFixed(2)},${shoulderY.toFixed(2)}`,
+    `L${(w / 2 - baseHalfW).toFixed(2)},${bottomY.toFixed(2)}`,
+    `Q${(w / 2 - baseHalfW).toFixed(2)},${h} ${(w / 2 - cornerHalfW).toFixed(2)},${h}`,
+    `L${(w / 2 + cornerHalfW).toFixed(2)},${h}`,
+    `Q${(w / 2 + baseHalfW).toFixed(2)},${h} ${(w / 2 + baseHalfW).toFixed(2)},${bottomY.toFixed(2)}`,
+    `L${neckX1.toFixed(2)},${shoulderY.toFixed(2)}`,
+    `L${neckX1.toFixed(2)},0`,
+    `Z`,
+  ].join(" ");
+}
+
+// Slightly flared straight sides + a rounded-corner flat bottom, deliberately left open at the top
+// (no closing segment back across the rim) plus a few short graduation-mark ticks on the left wall.
+// Left open rather than Z-closed so a stroke never draws a line across the mouth, while an implicit
+// fill-close still lets a fillColor shade the "contents" up to a flat waterline at the rim - see
+// this section's own doc comment.
+function beakerOutlineD(w: number, h: number): string {
+  const leftTop = w * 0.1;
+  const rightTop = w * 0.9;
+  const leftBottom = w * 0.16;
+  const rightBottom = w * 0.84;
+  const cornerR = w * 0.06;
+  const body = [
+    `M${leftTop.toFixed(2)},0`,
+    `L${leftBottom.toFixed(2)},${(h - cornerR).toFixed(2)}`,
+    `Q${leftBottom.toFixed(2)},${h} ${(leftBottom + cornerR).toFixed(2)},${h}`,
+    `L${(rightBottom - cornerR).toFixed(2)},${h}`,
+    `Q${rightBottom.toFixed(2)},${h} ${rightBottom.toFixed(2)},${(h - cornerR).toFixed(2)}`,
+    `L${rightTop.toFixed(2)},0`,
+  ].join(" ");
+  const tickLen = w * 0.09;
+  const tickInset = w * 0.03;
+  const ticks = [0.45, 0.62, 0.79]
+    .map((f) => {
+      const y = h * f;
+      const xWall = leftTop + (leftBottom - leftTop) * f;
+      const x0 = xWall + tickInset;
+      return `M${x0.toFixed(2)},${y.toFixed(2)} L${(x0 + tickLen).toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+  return `${body} ${ticks}`;
+}
+
+// A "+"-shaped cross with a chevron arrowhead on the +x and +y ends only (x pointing right, y
+// pointing up - standard math convention) - two independent line subpaths plus two independent
+// two-segment chevron subpaths, all open.
+function axesOutlineD(w: number, h: number): string {
+  const midX = w / 2;
+  const midY = h / 2;
+  const s = Math.min(w, h) * 0.07;
+  return [
+    `M0,${midY} L${w},${midY}`,
+    `M${midX},${h} L${midX},0`,
+    `M${(w - s).toFixed(2)},${(midY - s).toFixed(2)} L${w},${midY} L${(w - s).toFixed(2)},${(midY + s).toFixed(2)}`,
+    `M${(midX - s).toFixed(2)},${s.toFixed(2)} L${midX},0 L${(midX + s).toFixed(2)},${s.toFixed(2)}`,
+  ].join(" ");
+}
+
+// Bounds for WhiteboardNode.angleDegrees/angleRay1Length/angleRay2Length. Degrees stops short of
+// 0/180 so the two rays never fully overlap (an angle glyph showing no angle at all); ray lengths
+// stop short of 0 for the same reason (a ray you can't see isn't a side you can measure). The
+// default (1) lands each ray exactly at its box edge, but the max goes well past that (2.5x) rather
+// than stopping there - 1.0 being the ceiling made the length sliders default to fully maxed-out
+// with nowhere to go but shorter, which read as "stuck"/fixed rather than as an adjustable length.
+// The node's own SVG layers render with `overflow: visible` (see WhiteboardCanvas.tsx), so a ray
+// past 1.0 genuinely draws outside the node's bounding box instead of getting clipped.
+export const MIN_ANGLE_DEGREES = 5;
+export const MAX_ANGLE_DEGREES = 175;
+export const DEFAULT_ANGLE_DEGREES = 50;
+export const MIN_ANGLE_RAY_LENGTH = 0.2;
+export const MAX_ANGLE_RAY_LENGTH = 2.5;
+export const DEFAULT_ANGLE_RAY_LENGTH = 1;
+
+// Two rays from a shared vertex (bottom-left corner) - one flat along the bottom (ray 1), one at
+// the given angle measured counterclockwise from it (ray 2) - plus a short arc near the vertex
+// marking the angle between them, the standard geometry "angle" glyph. Ray 1's own natural max
+// length is the node's width, ray 2's is min(width, height) - each `rayFrac` scales its ray
+// independently off that, so shortening one doesn't also shrink the other. The arc radius is
+// clamped to whichever ray ends up shorter so it never overshoots a shortened ray.
+function angleOutlineD(w: number, h: number, degrees: number, ray1Frac: number, ray2Frac: number): string {
+  const vx = 0;
+  const vy = h;
+  const theta = (degrees * Math.PI) / 180;
+  const ray1Len = w * ray1Frac;
+  const ray2Len = Math.min(w, h) * ray2Frac;
+  const ray2x = vx + ray2Len * Math.cos(theta);
+  const ray2y = vy - ray2Len * Math.sin(theta);
+  const arcR = Math.min(Math.min(w, h) * 0.28, ray1Len * 0.9, ray2Len * 0.9);
+  const arcStartX = vx + arcR;
+  const arcEndX = vx + arcR * Math.cos(theta);
+  const arcEndY = vy - arcR * Math.sin(theta);
+  return [
+    `M${vx},${vy} L${(vx + ray1Len).toFixed(2)},${vy}`,
+    `M${vx},${vy} L${ray2x.toFixed(2)},${ray2y.toFixed(2)}`,
+    `M${arcStartX.toFixed(2)},${vy} A${arcR.toFixed(2)},${arcR.toFixed(2)} 0 0,0 ${arcEndX.toFixed(2)},${arcEndY.toFixed(2)}`,
+  ].join(" ");
+}
 
 // Builds one continuous open-path `d` string tracing the given periodic waveform across a w×h box,
 // vertically centered (amplitude = 35% of h either side of the midline), repeated `cycles` times.
@@ -486,6 +680,29 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
     }
     case "wave":
       return { kind: "path", d: waveOutlineD(w, h, opts?.waveStyle ?? "sine", opts?.waveCycles) };
+    case "resistor":
+      return { kind: "path", d: resistorOutlineD(w, h) };
+    case "capacitor":
+      return { kind: "path", d: capacitorOutlineD(w, h) };
+    case "spring":
+      return { kind: "path", d: springOutlineD(w, h) };
+    case "battery":
+      return { kind: "path", d: batteryOutlineD(w, h) };
+    case "flask":
+      return { kind: "path", d: flaskOutlineD(w, h) };
+    case "beaker":
+      return { kind: "path", d: beakerOutlineD(w, h) };
+    case "benzeneRing": {
+      const hex = regularPolygonPoints(w, h, 6);
+      return { kind: "polygon", points: hex, innerCircle: { cx: w / 2, cy: h / 2, r: Math.min(w, h) * 0.28 } };
+    }
+    case "axes":
+      return { kind: "path", d: axesOutlineD(w, h) };
+    case "angle":
+      return {
+        kind: "path",
+        d: angleOutlineD(w, h, opts?.angleDegrees ?? DEFAULT_ANGLE_DEGREES, opts?.angleRay1Length ?? DEFAULT_ANGLE_RAY_LENGTH, opts?.angleRay2Length ?? DEFAULT_ANGLE_RAY_LENGTH),
+      };
     case "rectangle":
     case "text":
     case "freehand":
@@ -657,7 +874,16 @@ function polygonPath2D(points: [number, number][]): Path2D {
 // file's own ShapeOutline doc comment), so nothing here ever touches node.x/y again.
 function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
   const { width: w, height: h } = node;
-  const outline = shapeOutlineFor(node.shapeType, w, h, { sides: node.sides, starPoints: node.starPoints, starInnerRadiusRatio: node.starInnerRadiusRatio, waveStyle: node.waveStyle, waveCycles: node.waveCycles });
+  const outline = shapeOutlineFor(node.shapeType, w, h, {
+    sides: node.sides,
+    starPoints: node.starPoints,
+    starInnerRadiusRatio: node.starInnerRadiusRatio,
+    waveStyle: node.waveStyle,
+    waveCycles: node.waveCycles,
+    angleDegrees: node.angleDegrees,
+    angleRay1Length: node.angleRay1Length,
+    angleRay2Length: node.angleRay2Length,
+  });
 
   const fillAndStroke = (path: Path2D) => {
     if (node.fillColor) {
@@ -687,6 +913,13 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
         ctx.lineWidth = node.strokeWidth;
         ctx.strokeStyle = node.strokeColor;
         for (const line of outline.innerLines) ctx.stroke(polylineOpenPath2D(line));
+      }
+      if (outline.innerCircle && node.strokeWidth > 0) {
+        ctx.lineWidth = node.strokeWidth;
+        ctx.strokeStyle = node.strokeColor;
+        const circle = new Path2D();
+        circle.ellipse(outline.innerCircle.cx, outline.innerCircle.cy, outline.innerCircle.r, outline.innerCircle.r, 0, 0, Math.PI * 2);
+        ctx.stroke(circle);
       }
       return;
     }
