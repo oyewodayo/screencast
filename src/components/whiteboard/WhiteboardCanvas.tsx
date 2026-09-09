@@ -60,6 +60,13 @@ const HIT_STROKE_SCREEN_WIDTH = 14;
 // keeps a slow stroke from recording hundreds of near-duplicate points that would otherwise bloat
 // the saved document for no visible smoothness gain.
 const FREEHAND_MIN_POINT_DISTANCE = 3;
+// Minimum on-screen movement (CSS px, pre-zoom-correction) between two recorded laser-trail points
+// - same "don't bloat with near-duplicate points" reasoning as FREEHAND_MIN_POINT_DISTANCE, just for
+// an ephemeral trail instead of a saved stroke.
+const LASER_MIN_POINT_DISTANCE = 2;
+// How long (ms) a laser trail point stays visible before it's fully faded/pruned - the "comet tail"
+// length. Short enough that the trail reads as "where the pointer just was," not a lingering mark.
+const LASER_FADE_MS = 550;
 
 type ResizeCorner = "nw" | "ne" | "sw" | "se";
 const RESIZE_CORNERS: ResizeCorner[] = ["nw", "ne", "sw", "se"];
@@ -170,6 +177,12 @@ interface WhiteboardCanvasProps {
   // createDefaultWhiteboardEdge's own defaults both for the live drag preview and the finished edge.
   connectorArmed: boolean;
   armedConnectorOverrides?: Partial<WhiteboardEdge>;
+  // The laser pointer tool's armed state (see the "Laser pointer" toolbar button in
+  // WhiteboardEditor.tsx) - a purely visual, never-saved glowing trail that follows the pointer,
+  // for pointing things out live (e.g. while screen-recording a walkthrough) without marking up the
+  // actual diagram. Unlike every other tool here, it has no document-side effect at all: no node,
+  // no edge, nothing that touches undo history - see this file's own laserTrail state.
+  laserArmed: boolean;
 }
 
 function clampZoom(z: number): number {
@@ -255,6 +268,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   onShapePlaced,
   connectorArmed,
   armedConnectorOverrides,
+  laserArmed,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
@@ -266,6 +280,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // rather than a fixed placeholder direction until release (see computeCurveBowFromPath).
   const [connectorPreviewBow, setConnectorPreviewBow] = useState<number>(DEFAULT_CURVE_BOW);
   const [freehandPreview, setFreehandPreview] = useState<{ x: number; y: number }[] | null>(null);
+  // The laser pointer's trail - each point stamped with when it was recorded (performance.now(),
+  // ms) so rendering can age it out smoothly. Never touches the document/undo stack - see
+  // laserArmed's own doc comment on the props interface.
+  const [laserTrail, setLaserTrail] = useState<{ x: number; y: number; t: number }[]>([]);
+  // Throttles laser-point recording by on-screen distance (see LASER_MIN_POINT_DISTANCE) - a plain
+  // ref since it's pure bookkeeping for that throttle, not something a re-render needs to reflect.
+  const lastLaserClientRef = useRef<{ x: number; y: number } | null>(null);
   // Live-in-progress waypoints for whichever edge is currently having a bend point dragged (see the
   // "waypoint" Interaction mode) - same "stage locally, commit once" pattern liveNodes uses for
   // node drags, so a whole drag becomes one undo step instead of one per pointermove tick.
@@ -288,6 +309,31 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     },
     [pan, zoom]
   );
+
+  // ---- Laser pointer trail fade ------------------------------------------------------------------
+  // The trail needs to keep shrinking even while the pointer sits still (a real laser dot doesn't
+  // freeze mid-fade), so this runs its own rAF loop pruning points older than LASER_FADE_MS -
+  // pointermove alone only re-renders when the pointer actually moves. Stops entirely (and clears
+  // whatever's left) the moment the tool is disarmed, so nothing lingers after switching tools.
+  useEffect(() => {
+    if (!laserArmed) {
+      setLaserTrail((prev) => (prev.length > 0 ? [] : prev));
+      return;
+    }
+    let frame: number;
+    const tick = () => {
+      // Always writes a fresh (filter()-returned) array, even on a frame where nothing actually
+      // aged out, so the render below - which computes each point's fade purely from performance.now()
+      // - gets a re-render every frame and animates smoothly instead of only updating in the choppy
+      // steps a "did anything actually change" bailout would produce. Cheap enough for a small,
+      // short-lived trail; only runs while this opt-in tool is armed.
+      const cutoff = performance.now() - LASER_FADE_MS;
+      setLaserTrail((prev) => prev.filter((p) => p.t >= cutoff));
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [laserArmed]);
 
   // ---- Space-bar temporary pan tool (same convention as Figma/draw.io) ------------------------
   useEffect(() => {
@@ -590,6 +636,18 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // ---- Pointer move / up on the container --------------------------------------------------------
   const handlePointerMove = useCallback(
     (e: React.PointerEvent) => {
+      // Tracked independently of interactionRef (below) since the laser trail follows plain
+      // hover-move, not a captured drag the way every other tool here works - it needs to keep
+      // recording even when `!interaction`, so this runs before that check ever short-circuits.
+      if (laserArmed) {
+        const last = lastLaserClientRef.current;
+        if (!last || Math.hypot(e.clientX - last.x, e.clientY - last.y) >= LASER_MIN_POINT_DISTANCE) {
+          lastLaserClientRef.current = { x: e.clientX, y: e.clientY };
+          const point = clientToDoc(e.clientX, e.clientY);
+          setLaserTrail((prev) => [...prev, { x: point.x, y: point.y, t: performance.now() }]);
+        }
+      }
+
       const interaction = interactionRef.current;
       if (!interaction) return;
 
@@ -705,7 +763,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
       }
     },
-    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange]
+    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange, laserArmed]
   );
 
   const handlePointerUp = useCallback(
@@ -820,6 +878,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         return;
       }
       if (e.button !== 0) return;
+      // The laser pointer is purely for pointing, not interacting - a click while it's armed does
+      // nothing (no marquee, no placement, no selection change). Space-panning above still works so
+      // the view can be repositioned while pointing.
+      if (laserArmed) return;
       if (editingNodeId) setEditingNodeId(null);
 
       if (armedShapeType === "freehand") {
@@ -860,7 +922,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       interactionRef.current = { mode: "marquee", startDocX: point.x, startDocY: point.y };
       setMarqueeRect({ x: point.x, y: point.y, width: 0, height: 0 });
     },
-    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint, selectedNodeIds, selectedEdgeIds]
+    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, laserArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint, selectedNodeIds, selectedEdgeIds]
   );
 
   // ---- Text editing ------------------------------------------------------------------------------
@@ -954,7 +1016,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         backgroundImage: showGrid ? "radial-gradient(circle, rgba(120,120,130,0.35) 1px, transparent 1px)" : undefined,
         backgroundSize: showGrid ? `${GRID_SIZE * zoom}px ${GRID_SIZE * zoom}px` : undefined,
         backgroundPosition: showGrid ? `${pan.x}px ${pan.y}px` : undefined,
-        cursor: spaceHeld ? "grab" : armedShapeType === "freehand" || connectorArmed ? "crosshair" : "default",
+        cursor: laserArmed ? "none" : spaceHeld ? "grab" : armedShapeType === "freehand" || connectorArmed ? "crosshair" : "default",
       }}
       onWheel={handleWheel}
       onPointerDown={handleContainerPointerDown}
@@ -994,8 +1056,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     // Same "let an armed tool's click through to the container" reasoning as the
                     // node div's own onPointerDown guard above - an edge's fat invisible hit-stroke
                     // is an easy, easy-to-hit-by-accident target for a click that was meant to
-                    // place a new shape/text/stroke on top of it.
-                    if (armedShapeType) return;
+                    // place a new shape/text/stroke on top of it. laserArmed additionally means
+                    // "just pointing, not editing" - clicks should do nothing at all while it's on.
+                    if (armedShapeType || laserArmed) return;
                     e.stopPropagation();
                     onSelectionChange(new Set(), new Set([edge.id]));
                   }}
@@ -1125,8 +1188,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 // beginMoveNode's own stopPropagation would swallow the click first and move THIS
                 // node instead, silently breaking every tool for any target that overlaps existing
                 // content (easy to hit in practice: fit-to-content's own pan/zoom can put an
-                // existing shape right under a click meant for empty canvas).
-                if (armedShapeType) return;
+                // existing shape right under a click meant for empty canvas). laserArmed also
+                // returns here (not just from the container) so a click doesn't select/move THIS
+                // node while the laser tool is meant to be purely non-interactive.
+                if (armedShapeType || laserArmed) return;
                 beginMoveNode(node, e, e.shiftKey);
               }}
               onDoubleClick={(e) => {
@@ -1374,6 +1439,37 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             style={{ left: marqueeRect.x, top: marqueeRect.y, width: marqueeRect.width, height: marqueeRect.height }}
           />
         )}
+
+        {/* Laser pointer - rendered last so it always sits above every shape/edge/UI-chrome layer
+            above, matching a real presentation pointer. Sizes divide by zoom (UI-chrome convention -
+            see this file's own top comment) so the dot stays a constant screen size regardless of
+            canvas zoom, and never gets saved anywhere - see laserArmed's doc comment on the props. */}
+        {laserArmed &&
+          laserTrail.length > 0 &&
+          (() => {
+            const now = performance.now();
+            const head = laserTrail[laserTrail.length - 1];
+            return (
+              <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none" }} width={1} height={1}>
+                <circle cx={head.x} cy={head.y} r={16 / zoom} fill="#ef4444" opacity={0.18} />
+                <circle cx={head.x} cy={head.y} r={9 / zoom} fill="#ef4444" opacity={0.35} />
+                {/* Connected segments between CONSECUTIVE points, not a dot per point - a dot per
+                    point leaves visible gaps whenever two points end up more than a dot-radius
+                    apart (exactly the "broken"/dotted look), where a stroked line between them
+                    always reads as one continuous tapering trail regardless of point spacing. */}
+                {laserTrail.length > 1 && (
+                  <g fill="none" stroke="#ef4444" strokeLinecap="round">
+                    {laserTrail.slice(1).map((p, i) => {
+                      const prev = laserTrail[i];
+                      const lifeFrac = Math.max(0, 1 - (now - p.t) / LASER_FADE_MS);
+                      return <line key={i} x1={prev.x} y1={prev.y} x2={p.x} y2={p.y} strokeWidth={(1.5 + 3 * lifeFrac) / zoom} opacity={lifeFrac * 0.6} />;
+                    })}
+                  </g>
+                )}
+                <circle cx={head.x} cy={head.y} r={4 / zoom} fill="#ef4444" />
+              </svg>
+            );
+          })()}
       </div>
     </div>
   );

@@ -385,6 +385,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [armedNodeOverrides, setArmedNodeOverrides] = useState<Partial<WhiteboardNode> | undefined>(undefined);
   const [connectorArmed, setConnectorArmed] = useState(false);
   const [armedConnectorOverrides, setArmedConnectorOverrides] = useState<Partial<WhiteboardEdge> | undefined>(undefined);
+  const [laserArmed, setLaserArmed] = useState(false);
   const [shapesMenuOpen, setShapesMenuOpen] = useState(false);
   const [arrowsMenuOpen, setArrowsMenuOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -525,6 +526,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   }, [store, page, whiteboardId, onBack]);
 
   const armShape = useCallback((preset: ShapePreset) => {
+    setLaserArmed(false);
     setConnectorArmed(false);
     setArmedConnectorOverrides(undefined);
     setShapesMenuOpen(false);
@@ -537,6 +539,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
 
   const armArrow = useCallback(
     (preset: ArrowPreset) => {
+      setLaserArmed(false);
       setArrowsMenuOpen(false);
       if (preset.kind === "freehand") {
         setConnectorArmed(false);
@@ -596,7 +599,10 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
               e?.stopPropagation?.();
               setShapesMenuOpen((prev) => {
                 const next = !prev;
-                if (next) setArrowsMenuOpen(false);
+                if (next) {
+                  setArrowsMenuOpen(false);
+                  setLaserArmed(false);
+                }
                 return next;
               });
             }}
@@ -637,6 +643,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           title="Text"
           active={armedShapeType === "text"}
           onClick={() => {
+            setLaserArmed(false);
             setShapesMenuOpen(false);
             setArrowsMenuOpen(false);
             setConnectorArmed(false);
@@ -651,6 +658,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           title="Pen (freehand)"
           active={armedShapeType === "freehand" && !armedNodeOverrides?.endArrowType}
           onClick={() => {
+            setLaserArmed(false);
             setShapesMenuOpen(false);
             setArrowsMenuOpen(false);
             setConnectorArmed(false);
@@ -661,6 +669,24 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         >
           <IoPencilOutline size={18} />
         </ToolbarButton>
+        <ToolbarButton
+          title="Laser pointer"
+          active={laserArmed}
+          onClick={() => {
+            setShapesMenuOpen(false);
+            setArrowsMenuOpen(false);
+            setConnectorArmed(false);
+            setArmedConnectorOverrides(undefined);
+            setArmedNodeOverrides(undefined);
+            setArmedShapeType(null);
+            setLaserArmed((prev) => !prev);
+          }}
+        >
+          <span className="relative flex items-center justify-center w-[18px] h-[18px]">
+            <span className="w-2.5 h-2.5 rounded-full bg-red-500" />
+            <span className="absolute inset-0 rounded-full border border-red-400 opacity-60" />
+          </span>
+        </ToolbarButton>
         <div className="relative">
           <ToolbarButton
             title="Arrows"
@@ -669,7 +695,10 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
               e?.stopPropagation?.();
               setArrowsMenuOpen((prev) => {
                 const next = !prev;
-                if (next) setShapesMenuOpen(false);
+                if (next) {
+                  setShapesMenuOpen(false);
+                  setLaserArmed(false);
+                }
                 return next;
               });
             }}
@@ -777,6 +806,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           }}
           connectorArmed={connectorArmed}
           armedConnectorOverrides={armedConnectorOverrides}
+          laserArmed={laserArmed}
         />
         <WhiteboardStylePanel
           selectedNodes={selectedNodes}
