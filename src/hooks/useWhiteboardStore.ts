@@ -1,18 +1,31 @@
 // hooks/useWhiteboardStore.ts
 //
 // Mirrors useBoardStore.ts's shape (load-on-mount, debounced autosave, undo/redo command stack)
-// but keyed by whiteboardId and talking to services/whiteboards.rs instead of boards.rs. Does not
-// create whiteboards on disk itself - WhiteboardHome's "New whiteboard" flow calls
-// create_whiteboard directly, then navigates here with an id that's already guaranteed to exist.
+// but keyed by whiteboardId and talking to services/whiteboards.rs instead of boards.rs, PLUS a
+// page dimension Board has no equivalent of: every node/edge mutator below applies to whichever
+// WhiteboardPage is currently active (doc.activePageId), never the whole document - see
+// whiteboardTypes.ts's WhiteboardPage doc comment for why a whiteboard is a set of independent
+// pages rather than one flat nodes/edges pair.
+//
+// Undo/redo is deliberately PER PAGE, not one global stack across the whole document: switching
+// pages (setActivePage) resets both stacks. This keeps every mutator's "which page does this
+// command apply to" question trivially answerable (always "whichever page is active right now" -
+// commands never need to carry a pageId of their own) at the cost of not being able to undo a
+// page-2 edit after switching back to page 1 - a reasonable trade for a canvas-per-page tool where
+// cross-page undo is rarely what anyone actually wants anyway.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { WhiteboardCommand, WhiteboardDocument, WhiteboardEdge, WhiteboardNode } from "../utils/whiteboardTypes";
+import { WhiteboardCommand, WhiteboardDocument, WhiteboardEdge, WhiteboardNode, WhiteboardPage, createEmptyWhiteboardPage } from "../utils/whiteboardTypes";
 import { applyCommand, invertCommand, undoDeleteNode } from "../handlers/whiteboardHandlers";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
 export interface UseWhiteboardStoreResult {
   doc: WhiteboardDocument | null;
+  // The page currently being edited/viewed (doc.pages.find(p => p.id === doc.activePageId)) -
+  // every mutator below reads/writes this page. Never null once doc has loaded (load always
+  // ensures activePageId points at a real page - see the load effect and migrateDocument below).
+  activePage: WhiteboardPage | null;
   loading: boolean;
   loadError: string | null;
   addNode: (node: WhiteboardNode) => void;
@@ -30,6 +43,19 @@ export interface UseWhiteboardStoreResult {
   setShowGrid: (show: boolean) => void;
   // Not an undo command - same reasoning as Board/Docs not undo-tracking a title edit.
   renameWhiteboard: (name: string) => void;
+  // ---- Pages - none of these are undo-tracked (same reasoning as renameWhiteboard: page
+  // structure is workspace organization, not diagram content you'd expect Ctrl+Z to touch).
+  addPage: () => void;
+  renamePage: (pageId: string, name: string) => void;
+  // Refuses to delete the whiteboard's last remaining page - every whiteboard always has at least
+  // one page, same invariant a spreadsheet enforces on its last sheet tab.
+  deletePage: (pageId: string) => void;
+  duplicatePage: (pageId: string) => void;
+  reorderPages: (newOrder: WhiteboardPage[]) => void;
+  // Switches which page is active - resets undo/redo (see this file's own top comment) and, when
+  // switching away from an empty untitled page created by mistake, does nothing special; that
+  // cleanup is left to the user via deletePage.
+  setActivePage: (pageId: string) => void;
   undo: () => void;
   redo: () => void;
   canUndo: boolean;
@@ -40,6 +66,22 @@ export interface UseWhiteboardStoreResult {
   // navigating back to Whiteboard Home (and before regenerating the thumbnail) so trailing edits
   // from the last few hundred ms aren't lost.
   flushSave: () => void;
+}
+
+// Normalizes a just-loaded document into the current (pages-based) shape - a whiteboard saved
+// before pages existed (WHITEBOARD_SCHEMA_VERSION 1) has top-level `nodes`/`edges` instead of
+// `pages`/`activePageId`; wrap those into a single page so every consumer past this point can
+// assume `pages`/`activePageId` always exist. Untyped `raw: any` deliberately - this is the one
+// place on-disk data may not yet match WhiteboardDocument's current shape, same convention
+// useBoardStore.ts's load effect uses for its own pre-BoardText normalization.
+function migrateDocument(raw: any): WhiteboardDocument {
+  if (Array.isArray(raw.pages) && raw.pages.length > 0) {
+    return { showGrid: true, ...raw, activePageId: raw.activePageId ?? raw.pages[0].id };
+  }
+  const page = createEmptyWhiteboardPage(crypto.randomUUID(), "Page 1");
+  page.nodes = raw.nodes ?? [];
+  page.edges = raw.edges ?? [];
+  return { showGrid: true, ...raw, pages: [page], activePageId: page.id };
 }
 
 export default function useWhiteboardStore(whiteboardId: string | undefined): UseWhiteboardStoreResult {
@@ -69,8 +111,7 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
       try {
         const json = await invoke<string>("load_whiteboard", { id: whiteboardId });
         if (cancelled) return;
-        const parsed = JSON.parse(json);
-        setDoc({ showGrid: true, edges: [], ...parsed });
+        setDoc(migrateDocument(JSON.parse(json)));
       } catch (err) {
         console.error("Failed to load whiteboard:", err);
         if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
@@ -113,15 +154,29 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     return () => flushSave();
   }, [whiteboardId, flushSave]);
 
+  // Applies `fn` to whichever page is currently active, leaving every other page untouched -
+  // every node/edge command below goes through this. Bumps the document's own updatedAt (not each
+  // page's - pages don't carry their own timestamp, only the document does) so "last edited" on
+  // the home grid reflects an edit made on any page.
+  const updateActivePage = useCallback((fn: (page: WhiteboardPage) => WhiteboardPage) => {
+    setDoc((prev) => {
+      if (!prev) return prev;
+      const pages = prev.pages.map((p) => (p.id === prev.activePageId ? fn(p) : p));
+      return { ...prev, pages, updatedAt: new Date().toISOString() };
+    });
+  }, []);
+
   const dispatch = useCallback(
     (command: WhiteboardCommand) => {
-      setDoc((prev) => (prev ? applyCommand(prev, command) : prev));
+      updateActivePage((page) => applyCommand(page, command));
       setUndoStack((prev) => [...prev, command]);
       setRedoStack([]);
       scheduleAutosave();
     },
-    [scheduleAutosave]
+    [updateActivePage, scheduleAutosave]
   );
+
+  const activePage = doc ? doc.pages.find((p) => p.id === doc.activePageId) ?? doc.pages[0] ?? null : null;
 
   const addNode = useCallback((node: WhiteboardNode) => dispatch({ type: "add-node", item: node }), [dispatch]);
 
@@ -135,8 +190,8 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
 
   const deleteNode = useCallback(
     (node: WhiteboardNode) => {
-      const current = docRef.current;
-      const edges = current ? current.edges.filter((e) => e.source.nodeId === node.id || e.target.nodeId === node.id) : [];
+      const page = docRef.current?.pages.find((p) => p.id === docRef.current!.activePageId);
+      const edges = page ? page.edges.filter((e) => e.source.nodeId === node.id || e.target.nodeId === node.id) : [];
       dispatch({ type: "delete-node", item: node, edges });
     },
     [dispatch]
@@ -164,9 +219,9 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
 
   const reorderNodes = useCallback(
     (newOrder: WhiteboardNode[]) => {
-      const current = docRef.current;
-      if (!current) return;
-      dispatch({ type: "reorder-nodes", before: current.nodes, after: newOrder });
+      const page = docRef.current?.pages.find((p) => p.id === docRef.current!.activePageId);
+      if (!page) return;
+      dispatch({ type: "reorder-nodes", before: page.nodes, after: newOrder });
     },
     [dispatch]
   );
@@ -186,23 +241,102 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     [scheduleAutosave]
   );
 
+  const addPage = useCallback(() => {
+    setDoc((prev) => {
+      if (!prev) return prev;
+      const page = createEmptyWhiteboardPage(crypto.randomUUID(), `Page ${prev.pages.length + 1}`);
+      return { ...prev, pages: [...prev.pages, page], activePageId: page.id, updatedAt: new Date().toISOString() };
+    });
+    setUndoStack([]);
+    setRedoStack([]);
+    scheduleAutosave();
+  }, [scheduleAutosave]);
+
+  const renamePage = useCallback(
+    (pageId: string, name: string) => {
+      setDoc((prev) => (prev ? { ...prev, pages: prev.pages.map((p) => (p.id === pageId ? { ...p, name } : p)), updatedAt: new Date().toISOString() } : prev));
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
+  const deletePage = useCallback(
+    (pageId: string) => {
+      setDoc((prev) => {
+        if (!prev || prev.pages.length <= 1) return prev;
+        const pages = prev.pages.filter((p) => p.id !== pageId);
+        const activePageId = prev.activePageId === pageId ? pages[0].id : prev.activePageId;
+        return { ...prev, pages, activePageId, updatedAt: new Date().toISOString() };
+      });
+      setUndoStack([]);
+      setRedoStack([]);
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
+  const duplicatePage = useCallback(
+    (pageId: string) => {
+      setDoc((prev) => {
+        if (!prev) return prev;
+        const source = prev.pages.find((p) => p.id === pageId);
+        if (!source) return prev;
+        const idMap = new Map<string, string>();
+        const nodes = source.nodes.map((n) => {
+          const newId = crypto.randomUUID();
+          idMap.set(n.id, newId);
+          return { ...n, id: newId };
+        });
+        const edges = source.edges.map((e) => ({
+          ...e,
+          id: crypto.randomUUID(),
+          source: e.source.nodeId ? { ...e.source, nodeId: idMap.get(e.source.nodeId) } : e.source,
+          target: e.target.nodeId ? { ...e.target, nodeId: idMap.get(e.target.nodeId) } : e.target,
+        }));
+        const copy: WhiteboardPage = { id: crypto.randomUUID(), name: `${source.name} copy`, nodes, edges };
+        const sourceIndex = prev.pages.findIndex((p) => p.id === pageId);
+        const pages = [...prev.pages.slice(0, sourceIndex + 1), copy, ...prev.pages.slice(sourceIndex + 1)];
+        return { ...prev, pages, activePageId: copy.id, updatedAt: new Date().toISOString() };
+      });
+      setUndoStack([]);
+      setRedoStack([]);
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
+  const reorderPages = useCallback(
+    (newOrder: WhiteboardPage[]) => {
+      setDoc((prev) => (prev ? { ...prev, pages: newOrder, updatedAt: new Date().toISOString() } : prev));
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
+  const setActivePage = useCallback(
+    (pageId: string) => {
+      setDoc((prev) => (prev && prev.activePageId !== pageId ? { ...prev, activePageId: pageId } : prev));
+      setUndoStack([]);
+      setRedoStack([]);
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
   const undo = useCallback(() => {
     setUndoStack((prevUndo) => {
       if (prevUndo.length === 0) return prevUndo;
       const command = prevUndo[prevUndo.length - 1];
-      setDoc((prev) => {
-        if (!prev) return prev;
-        // delete-node's inverse needs to restore both the node and every edge it cascaded away -
-        // more than invertCommand's return type alone can express (see its own doc comment on this
-        // case), so this one command type is undone directly rather than via applyCommand+invertCommand.
-        if (command.type === "delete-node") return undoDeleteNode(prev, command);
-        return applyCommand(prev, invertCommand(command));
-      });
+      // delete-node's inverse needs to restore both the node and every edge it cascaded away -
+      // more than invertCommand's return type alone can express (see its own doc comment on this
+      // case), so this one command type is undone directly rather than via applyCommand+invertCommand.
+      if (command.type === "delete-node") updateActivePage((page) => undoDeleteNode(page, command));
+      else updateActivePage((page) => applyCommand(page, invertCommand(command)));
       setRedoStack((prevRedo) => [...prevRedo, command]);
       scheduleAutosave();
       return prevUndo.slice(0, -1);
     });
-  }, [scheduleAutosave]);
+  }, [updateActivePage, scheduleAutosave]);
 
   const redo = useCallback(() => {
     setRedoStack((prevRedo) => {
@@ -210,15 +344,16 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
       const command = prevRedo[prevRedo.length - 1];
       // Forward direction never needs special-casing - applyCommand's "delete-node" branch already
       // removes both the node and its cascade-listed edges in one go.
-      setDoc((prev) => (prev ? applyCommand(prev, command) : prev));
+      updateActivePage((page) => applyCommand(page, command));
       setUndoStack((prevUndo) => [...prevUndo, command]);
       scheduleAutosave();
       return prevRedo.slice(0, -1);
     });
-  }, [scheduleAutosave]);
+  }, [updateActivePage, scheduleAutosave]);
 
   return {
     doc,
+    activePage,
     loading,
     loadError,
     addNode,
@@ -231,6 +366,12 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     reorderNodes,
     setShowGrid,
     renameWhiteboard,
+    addPage,
+    renamePage,
+    deletePage,
+    duplicatePage,
+    reorderPages,
+    setActivePage,
     undo,
     redo,
     canUndo: undoStack.length > 0,

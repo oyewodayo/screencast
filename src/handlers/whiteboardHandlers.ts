@@ -4,14 +4,20 @@
 // for the Whiteboard feature, same "build from scratch" separation boardHandlers.ts's own top
 // comment describes for Board: geometry here is axis-aligned (no rotation) and centered on
 // connector routing, neither of which the Board/image-editor geometry helpers have any use for.
+//
+// Every function below that reads/writes node or edge arrays operates on one WhiteboardPage at a
+// time (never the whole WhiteboardDocument) - a command always targets whichever page is currently
+// active (see useWhiteboardStore.ts), and export/bounds/undo are all naturally per-page too since
+// draw.io-style pages are independent canvases, not one shared coordinate space.
 
 import {
   WhiteboardAnchorSide,
   WhiteboardCommand,
-  WhiteboardDocument,
   WhiteboardEdge,
   WhiteboardEndpoint,
   WhiteboardNode,
+  WhiteboardPage,
+  WhiteboardShapeType,
 } from "../utils/whiteboardTypes";
 
 // ---- Node geometry ----------------------------------------------------------------------------
@@ -135,6 +141,44 @@ export function edgeEndAngleDeg(source: { x: number; y: number }, target: { x: n
   return { startDeg: deg + 180, endDeg: deg };
 }
 
+// ---- Shape outlines -----------------------------------------------------------------------------
+//
+// Shared geometry for the "other shapes" beyond plain rectangle/ellipse - both the DOM canvas
+// (WhiteboardCanvas.tsx, building an SVG <polygon>/<path>) and the PNG export renderer (renderNode
+// below, building Canvas2D path calls) branch on this same description so the two stay visually
+// identical rather than drifting apart as two independent hand-written implementations.
+export type ShapeOutline =
+  | { kind: "rect" } // rectangle/text - rendered via the node's own div border/background, not called from here
+  | { kind: "ellipse" }
+  | { kind: "polygon"; points: [number, number][] }
+  | { kind: "cylinder" };
+
+export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: number): ShapeOutline {
+  switch (shapeType) {
+    case "ellipse":
+      return { kind: "ellipse" };
+    case "diamond":
+      return { kind: "polygon", points: [[w / 2, 0], [w, h / 2], [w / 2, h], [0, h / 2]] };
+    case "triangle":
+      return { kind: "polygon", points: [[w / 2, 0], [w, h], [0, h]] };
+    case "hexagon":
+      return { kind: "polygon", points: [[w * 0.25, 0], [w * 0.75, 0], [w, h / 2], [w * 0.75, h], [w * 0.25, h], [0, h / 2]] };
+    case "parallelogram":
+      return { kind: "polygon", points: [[w * 0.25, 0], [w, 0], [w * 0.75, h], [0, h]] };
+    case "cylinder":
+      return { kind: "cylinder" };
+    case "rectangle":
+    case "text":
+    case "freehand":
+    default:
+      return { kind: "rect" };
+  }
+}
+
+// The cylinder's cap ellipse height, as a fraction of the node's own height - shared by both
+// renderers so the SVG version and the PNG-export Canvas2D version draw the exact same shape.
+export const CYLINDER_CAP_RATIO = 0.18;
+
 // ---- Bounding box / content fit -----------------------------------------------------------------
 
 export interface BoundsBox {
@@ -149,22 +193,22 @@ const EMPTY_BOUNDS_PADDING = 400;
 // Bounding box of every node (edges never extend past the box their endpoints already live in,
 // node-attached or free) - used both by "fit to content" (WhiteboardEditor's zoom-to-fit) and PNG
 // export (renderWhiteboardToCanvas below), padded so shapes/strokes never touch the crop edge.
-export function computeContentBounds(doc: WhiteboardDocument): BoundsBox {
-  if (doc.nodes.length === 0 && doc.edges.length === 0) {
+export function computeContentBounds(page: WhiteboardPage): BoundsBox {
+  if (page.nodes.length === 0 && page.edges.length === 0) {
     return { minX: -EMPTY_BOUNDS_PADDING, minY: -EMPTY_BOUNDS_PADDING, maxX: EMPTY_BOUNDS_PADDING, maxY: EMPTY_BOUNDS_PADDING };
   }
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
-  for (const node of doc.nodes) {
+  for (const node of page.nodes) {
     minX = Math.min(minX, node.x);
     minY = Math.min(minY, node.y);
     maxX = Math.max(maxX, node.x + node.width);
     maxY = Math.max(maxY, node.y + node.height);
   }
-  const nodesById = new Map(doc.nodes.map((n) => [n.id, n]));
-  for (const edge of doc.edges) {
+  const nodesById = new Map(page.nodes.map((n) => [n.id, n]));
+  for (const edge of page.edges) {
     const { source, target } = resolveEdgeEndpoints(edge, nodesById);
     minX = Math.min(minX, source.x, target.x);
     minY = Math.min(minY, source.y, target.y);
@@ -178,36 +222,34 @@ export function computeContentBounds(doc: WhiteboardDocument): BoundsBox {
   return { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad };
 }
 
-// ---- Command apply/invert ----------------------------------------------------------------------
+// ---- Command apply/invert (scoped to one page) ---------------------------------------------------
 
-export function applyCommand(doc: WhiteboardDocument, command: WhiteboardCommand): WhiteboardDocument {
-  const updatedAt = new Date().toISOString();
+export function applyCommand(page: WhiteboardPage, command: WhiteboardCommand): WhiteboardPage {
   switch (command.type) {
     case "add-node":
-      return { ...doc, nodes: [...doc.nodes, command.item], updatedAt };
+      return { ...page, nodes: [...page.nodes, command.item] };
     case "delete-node": {
       const removedEdgeIds = new Set(command.edges.map((e) => e.id));
       return {
-        ...doc,
-        nodes: doc.nodes.filter((n) => n.id !== command.item.id),
-        edges: doc.edges.filter((e) => !removedEdgeIds.has(e.id)),
-        updatedAt,
+        ...page,
+        nodes: page.nodes.filter((n) => n.id !== command.item.id),
+        edges: page.edges.filter((e) => !removedEdgeIds.has(e.id)),
       };
     }
     case "edit-node":
-      return { ...doc, nodes: doc.nodes.map((n) => (n.id === command.after.id ? command.after : n)), updatedAt };
+      return { ...page, nodes: page.nodes.map((n) => (n.id === command.after.id ? command.after : n)) };
     case "batch-edit-nodes": {
       const afterById = new Map(command.after.map((n) => [n.id, n]));
-      return { ...doc, nodes: doc.nodes.map((n) => afterById.get(n.id) ?? n), updatedAt };
+      return { ...page, nodes: page.nodes.map((n) => afterById.get(n.id) ?? n) };
     }
     case "add-edge":
-      return { ...doc, edges: [...doc.edges, command.item], updatedAt };
+      return { ...page, edges: [...page.edges, command.item] };
     case "delete-edge":
-      return { ...doc, edges: doc.edges.filter((e) => e.id !== command.item.id), updatedAt };
+      return { ...page, edges: page.edges.filter((e) => e.id !== command.item.id) };
     case "edit-edge":
-      return { ...doc, edges: doc.edges.map((e) => (e.id === command.after.id ? command.after : e)), updatedAt };
+      return { ...page, edges: page.edges.map((e) => (e.id === command.after.id ? command.after : e)) };
     case "reorder-nodes":
-      return { ...doc, nodes: command.after, updatedAt };
+      return { ...page, nodes: command.after };
   }
 }
 
@@ -239,32 +281,71 @@ export function invertCommand(command: WhiteboardCommand): WhiteboardCommand {
 // Re-adds a deleted node's cascade-deleted edges too, in one shot - invertCommand alone can't
 // express "add-node AND add-edge (several)" as a single WhiteboardCommand (the command union has
 // no such combined type), so useWhiteboardStore's undo calls this instead of invertCommand for a
-// "delete-node" specifically, applying the node re-add and each edge re-add as one doc update.
-export function undoDeleteNode(doc: WhiteboardDocument, command: Extract<WhiteboardCommand, { type: "delete-node" }>): WhiteboardDocument {
-  const updatedAt = new Date().toISOString();
-  return { ...doc, nodes: [...doc.nodes, command.item], edges: [...doc.edges, ...command.edges], updatedAt };
+// "delete-node" specifically, applying the node re-add and each edge re-add as one page update.
+export function undoDeleteNode(page: WhiteboardPage, command: Extract<WhiteboardCommand, { type: "delete-node" }>): WhiteboardPage {
+  return { ...page, nodes: [...page.nodes, command.item], edges: [...page.edges, ...command.edges] };
 }
 
 // ---- Export rendering (flattened PNG) ------------------------------------------------------------
 
-function shapePath(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
-  const { x, y, width, height } = node;
+function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, radius: number): void {
+  const r = Math.max(0, Math.min(radius, w / 2, h / 2));
+  if (r <= 0) {
+    ctx.rect(x, y, w, h);
+    return;
+  }
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Draws a freehand stroke through its (fraction-of-box) points as a smooth curve - each segment is
+// a quadratic curve through the midpoint of two consecutive points, the standard cheap "smooth a
+// polyline" trick (avoids the visibly faceted look plain line-to-line segments would have for a
+// hand-drawn ink stroke).
+function freehandPath(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+  const pts = (node.points ?? []).map((p) => ({ x: node.x + p.x * node.width, y: node.y + p.y * node.height }));
   ctx.beginPath();
-  switch (node.shapeType) {
-    case "rectangle":
-    case "text":
-      ctx.rect(x, y, width, height);
+  if (pts.length === 0) return;
+  if (pts.length === 1) {
+    ctx.arc(pts[0].x, pts[0].y, Math.max(1, node.strokeWidth / 2), 0, Math.PI * 2);
+    return;
+  }
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const mid = { x: (pts[i].x + pts[i + 1].x) / 2, y: (pts[i].y + pts[i + 1].y) / 2 };
+    ctx.quadraticCurveTo(pts[i].x, pts[i].y, mid.x, mid.y);
+  }
+  ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+}
+
+function shapePath(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+  const { x, y, width: w, height: h } = node;
+  ctx.beginPath();
+  const outline = shapeOutlineFor(node.shapeType, w, h);
+  switch (outline.kind) {
+    case "rect":
+      roundedRectPath(ctx, x, y, w, h, node.cornerRadius ?? 0);
       break;
     case "ellipse":
-      ctx.ellipse(x + width / 2, y + height / 2, width / 2, height / 2, 0, 0, Math.PI * 2);
+      ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
       break;
-    case "diamond":
-      ctx.moveTo(x + width / 2, y);
-      ctx.lineTo(x + width, y + height / 2);
-      ctx.lineTo(x + width / 2, y + height);
-      ctx.lineTo(x, y + height / 2);
+    case "polygon":
+      outline.points.forEach(([px, py], i) => (i === 0 ? ctx.moveTo(x + px, y + py) : ctx.lineTo(x + px, y + py)));
       ctx.closePath();
       break;
+    case "cylinder": {
+      const ry = h * CYLINDER_CAP_RATIO;
+      ctx.moveTo(x, y + ry);
+      ctx.lineTo(x, y + h - ry);
+      ctx.ellipse(x + w / 2, y + h - ry, w / 2, ry, 0, Math.PI, 0, true);
+      ctx.lineTo(x + w, y + ry);
+      ctx.closePath();
+      break;
+    }
   }
 }
 
@@ -288,6 +369,16 @@ function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number)
 }
 
 function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+  if (node.shapeType === "freehand") {
+    freehandPath(ctx, node);
+    ctx.lineWidth = node.strokeWidth;
+    ctx.strokeStyle = node.strokeColor;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.stroke();
+    return;
+  }
+
   if (node.shapeType !== "text") {
     shapePath(ctx, node);
     if (node.fillColor) {
@@ -299,6 +390,20 @@ function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
       ctx.strokeStyle = node.strokeColor;
       ctx.stroke();
     }
+    // Cylinder's cap ellipse is drawn as a second pass AFTER the body's own fill/stroke, so its
+    // outline paints on top of (and hides) the flat seam where the body path's top edge sits -
+    // matches WhiteboardCanvas.tsx's DOM rendering, where the cap is a second <ellipse> element
+    // placed after the body path in the DOM for the same paint-order reason.
+    if (node.shapeType === "cylinder") {
+      const ry = node.height * CYLINDER_CAP_RATIO;
+      ctx.beginPath();
+      ctx.ellipse(node.x + node.width / 2, node.y + ry, node.width / 2, ry, 0, 0, Math.PI * 2);
+      if (node.fillColor) {
+        ctx.fillStyle = node.fillColor;
+        ctx.fill();
+      }
+      if (node.strokeWidth > 0) ctx.stroke();
+    }
   }
   if (node.text) {
     ctx.save();
@@ -306,16 +411,39 @@ function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
     ctx.rect(node.x, node.y, node.width, node.height);
     ctx.clip();
     ctx.fillStyle = node.fontColor;
-    ctx.font = `${node.fontWeight === "bold" ? "bold " : ""}${node.fontSize}px system-ui, sans-serif`;
+    const fontStyle = node.fontStyle === "italic" ? "italic " : "";
+    const fontWeight = node.fontWeight === "bold" ? "bold " : "";
+    ctx.font = `${fontStyle}${fontWeight}${node.fontSize}px ${node.fontFamily || "system-ui, sans-serif"}`;
     ctx.textAlign = node.textAlign;
     ctx.textBaseline = "middle";
     const paddingX = 8;
     const lines = wrapText(ctx, node.text, node.width - paddingX * 2);
     const lineHeight = node.fontSize * 1.25;
     const totalHeight = lines.length * lineHeight;
-    const startY = node.y + node.height / 2 - totalHeight / 2 + lineHeight / 2;
+    const startY =
+      node.verticalAlign === "top"
+        ? node.y + lineHeight / 2 + 4
+        : node.verticalAlign === "bottom"
+        ? node.y + node.height - totalHeight + lineHeight / 2 - 4
+        : node.y + node.height / 2 - totalHeight / 2 + lineHeight / 2;
     const textX = node.textAlign === "left" ? node.x + paddingX : node.textAlign === "right" ? node.x + node.width - paddingX : node.x + node.width / 2;
-    lines.forEach((line, i) => ctx.fillText(line, textX, startY + i * lineHeight));
+    lines.forEach((line, i) => {
+      const lineY = startY + i * lineHeight;
+      ctx.fillText(line, textX, lineY);
+      if (node.textDecoration === "underline") {
+        const metrics = ctx.measureText(line);
+        const underlineY = lineY + node.fontSize * 0.35;
+        const startX = node.textAlign === "left" ? textX : node.textAlign === "right" ? textX - metrics.width : textX - metrics.width / 2;
+        ctx.save();
+        ctx.strokeStyle = node.fontColor;
+        ctx.lineWidth = Math.max(1, node.fontSize / 16);
+        ctx.beginPath();
+        ctx.moveTo(startX, underlineY);
+        ctx.lineTo(startX + metrics.width, underlineY);
+        ctx.stroke();
+        ctx.restore();
+      }
+    });
     ctx.restore();
   }
 }
@@ -351,12 +479,12 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
   if (edge.startArrow) drawArrowhead(ctx, source.x, source.y, startDeg, edge.strokeColor);
 }
 
-// Flattens the whole document onto an offscreen canvas sized to its content bounds (see
-// computeContentBounds) - the Whiteboard equivalent of boardHandlers.ts's renderBoardToCanvas,
-// used by WhiteboardEditor's "Export PNG" action and (with `maxDimension` set) its home-grid
-// thumbnail, same "one renderer, two call sites" convention as BoardEditor.tsx's own renderOffscreen.
-export function renderWhiteboardToCanvas(doc: WhiteboardDocument, maxDimension?: number): HTMLCanvasElement {
-  const bounds = computeContentBounds(doc);
+// Flattens one page onto an offscreen canvas sized to its content bounds (see computeContentBounds)
+// - the Whiteboard equivalent of boardHandlers.ts's renderBoardToCanvas, used by WhiteboardEditor's
+// "Export PNG" action (current page only) and (with `maxDimension` set) its home-grid thumbnail,
+// same "one renderer, two call sites" convention as BoardEditor.tsx's own renderOffscreen.
+export function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimension?: number): HTMLCanvasElement {
+  const bounds = computeContentBounds(page);
   const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
   const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
   const scale = maxDimension ? Math.min(1, maxDimension / Math.max(contentWidth, contentHeight)) : 1;
@@ -373,9 +501,9 @@ export function renderWhiteboardToCanvas(doc: WhiteboardDocument, maxDimension?:
   ctx.scale(scale, scale);
   ctx.translate(-bounds.minX, -bounds.minY);
 
-  const nodesById = new Map(doc.nodes.map((n) => [n.id, n]));
-  for (const edge of doc.edges) renderEdge(ctx, edge, nodesById);
-  for (const node of doc.nodes) renderNode(ctx, node);
+  const nodesById = new Map(page.nodes.map((n) => [n.id, n]));
+  for (const edge of page.edges) renderEdge(ctx, edge, nodesById);
+  for (const node of page.nodes) renderNode(ctx, node);
 
   return canvas;
 }
