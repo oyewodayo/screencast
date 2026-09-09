@@ -348,7 +348,22 @@ export type ShapeOutline =
   // these are never one flat-colored silhouette, so each part carries its OWN role deciding how
   // it's colored at render time (see ChartPartRole's own doc comment) rather than the node's plain
   // fillColor/strokeColor pair covering the whole shape.
-  | { kind: "chart"; parts: ChartPart[] };
+  // `labels` - small text annotations (axis scale numbers, per-bar values) neither Path2D nor an
+  // SVG <path> can express, so they're kept as plain position+text objects the renderer draws with
+  // <text>/ctx.fillText instead - see ChartLabel's own doc comment.
+  | { kind: "chart"; parts: ChartPart[]; labels?: ChartLabel[] };
+
+// One small text annotation on a "chart" shape - always rendered in a fixed neutral gray at a fixed
+// small size regardless of the node's own font settings (an axis tick number isn't "the shape's
+// text" the way WhiteboardNode.text is; it's scaffolding, same treatment ChartPart's "axis" role
+// gets). `anchor` matches SVG's own text-anchor/Canvas2D's textAlign values directly, so both
+// renderers can pass it straight through with no translation.
+export interface ChartLabel {
+  x: number;
+  y: number;
+  text: string;
+  anchor: "start" | "middle" | "end";
+}
 
 // How one piece of a "chart" ShapeOutline gets colored - resolved by the renderer (both
 // WhiteboardCanvas.tsx's SVG and this file's own Canvas2D paintShapeBody), not baked into the outline
@@ -363,9 +378,12 @@ export type ShapeOutline =
 //   "axis"   - a fixed neutral gray, thin stroke, regardless of the node's own colors - a chart's
 //              axis/baseline is scaffolding, not data, so it stays visually recessive even if the
 //              node's stroke color is something bold.
+//   "grid"   - functionPlot's optional graph-paper gridlines (WhiteboardNode.plotShowGrid) - an even
+//              fainter, thinner gray than "axis", so the axis lines themselves still read as the
+//              more prominent x=0/y=0 reference even with the full grid turned on.
 //   "slice"  - `color` is REQUIRED and used as-is (a pie chart's per-slice palette color - see
 //              PIE_PALETTE) - the one role where node.fillColor/strokeColor play no part at all.
-export type ChartPart = { d: string; role: "fill" | "stroke" | "axis" | "marker" } | { d: string; role: "slice"; color: string };
+export type ChartPart = { d: string; role: "fill" | "stroke" | "axis" | "marker" | "grid" } | { d: string; role: "slice"; color: string };
 
 export interface ShapeOutlineOptions {
   sides?: number; // "polygon" only
@@ -378,6 +396,12 @@ export interface ShapeOutlineOptions {
   angleRay2Length?: number; // "angle" only
   chartData?: number[]; // "barChart"/"lineChart"/"pieChart"/"scatterPlot" only
   plotFunction?: FunctionPlotType; // "functionPlot" only
+  plotDomainScale?: number; // "functionPlot" only
+  plotCycles?: number; // "functionPlot" only (sine/cosine)
+  plotShowGrid?: boolean; // "functionPlot" only
+  plotXTickInterval?: number; // "functionPlot" only
+  plotYTickInterval?: number; // "functionPlot" only
+  showChartLabels?: boolean; // "barChart"/"lineChart"/"scatterPlot"/"functionPlot" only
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -728,10 +752,18 @@ function dotPathD(cx: number, cy: number, r: number): string {
   return `M${(cx - r).toFixed(2)},${cy.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 1,0 ${(cx + r).toFixed(2)},${cy.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 1,0 ${(cx - r).toFixed(2)},${cy.toFixed(2)}`;
 }
 
+// Formats a tick/data-value number for display: rounds to 2 decimal places (clears float noise like
+// 1.4999999999998) then drops a trailing ".00"/trailing zero so whole numbers print as "5", not
+// "5.00" - every axis/value label on every chart type goes through this one function.
+function formatTick(n: number): string {
+  const rounded = Math.round(n * 100) / 100;
+  return String(rounded);
+}
+
 // Shared x-axis layout for bar/line/scatter (pie has no axis at all): a baseline near the bottom,
 // N evenly-spaced columns above it scaled to the series' own max value - `columnX`/`baselineY`/
 // `valueToY` are exposed so each chart type only has to describe what it draws AT each column, not
-// re-derive the shared layout.
+// re-derive the shared layout. `max` is exposed too so callers can build matching Y-axis tick labels.
 function chartColumnLayout(w: number, h: number, values: number[]) {
   const n = Math.max(1, values.length);
   const baselineY = h * 0.88;
@@ -739,45 +771,64 @@ function chartColumnLayout(w: number, h: number, values: number[]) {
   const max = Math.max(...values, 1e-6);
   const columnX = (i: number) => (n === 1 ? w / 2 : (w * (i + 0.5)) / n);
   const valueToY = (v: number) => baselineY - (Math.max(0, v) / max) * (baselineY - topY);
-  return { baselineY, columnX, valueToY };
+  return { baselineY, topY, columnX, valueToY, max };
 }
 
-function barChartParts(w: number, h: number, data?: number[]): ChartPart[] {
+// The "0" / max-value labels every bar/line/scatter chart plants near its baseline and top - kept
+// INSIDE the box (a couple px in from the left edge, not out past x=0) so they never bleed into
+// whatever's placed next to the chart on the canvas - one shared helper so the three chart types
+// can't drift out of sync on where/how this is placed.
+function chartYAxisLabels(baselineY: number, topY: number, max: number): ChartLabel[] {
+  return [
+    { x: 2, y: baselineY - 6, text: "0", anchor: "start" },
+    { x: 2, y: topY + 8, text: formatTick(max), anchor: "start" },
+  ];
+}
+
+function barChartOutline(w: number, h: number, data?: number[], showLabels = true): { parts: ChartPart[]; labels: ChartLabel[] } {
   const values = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
-  const { baselineY, columnX, valueToY } = chartColumnLayout(w, h, values);
+  const { baselineY, topY, columnX, valueToY, max } = chartColumnLayout(w, h, values);
   const barW = (w / values.length) * 0.6;
   const bars = values.map((v, i) => {
     const cx = columnX(i);
     const y = valueToY(v);
     return `M${(cx - barW / 2).toFixed(2)},${baselineY.toFixed(2)} L${(cx - barW / 2).toFixed(2)},${y.toFixed(2)} L${(cx + barW / 2).toFixed(2)},${y.toFixed(2)} L${(cx + barW / 2).toFixed(2)},${baselineY.toFixed(2)} Z`;
   });
-  return [
+  const parts: ChartPart[] = [
     { d: bars.join(" "), role: "fill" },
     { d: openPathD([{ x: 0, y: baselineY }, { x: w, y: baselineY }]), role: "axis" },
   ];
+  if (!showLabels) return { parts, labels: [] };
+  // Each bar's own value printed just above it, in addition to the shared Y-axis min/max - a bar
+  // chart's bars are spaced out enough (unlike line/scatter's tighter points) that per-bar labels
+  // stay readable rather than overlapping.
+  const valueLabels: ChartLabel[] = values.map((v, i) => ({ x: columnX(i), y: Math.max(10, valueToY(v) - 6), text: formatTick(v), anchor: "middle" }));
+  return { parts, labels: [...chartYAxisLabels(baselineY, topY, max), ...valueLabels] };
 }
 
-function lineChartParts(w: number, h: number, data?: number[]): ChartPart[] {
+function lineChartOutline(w: number, h: number, data?: number[], showLabels = true): { parts: ChartPart[]; labels: ChartLabel[] } {
   const values = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
-  const { baselineY, columnX, valueToY } = chartColumnLayout(w, h, values);
+  const { baselineY, topY, columnX, valueToY, max } = chartColumnLayout(w, h, values);
   const points = values.map((v, i) => ({ x: columnX(i), y: valueToY(v) }));
   const dotR = Math.min(w, h) * 0.02 + 2;
-  return [
+  const parts: ChartPart[] = [
     { d: openPathD(points), role: "stroke" },
     { d: points.map((p) => dotPathD(p.x, p.y, dotR)).join(" "), role: "marker" },
     { d: openPathD([{ x: 0, y: baselineY }, { x: w, y: baselineY }]), role: "axis" },
   ];
+  return { parts, labels: showLabels ? chartYAxisLabels(baselineY, topY, max) : [] };
 }
 
-function scatterPlotParts(w: number, h: number, data?: number[]): ChartPart[] {
+function scatterPlotOutline(w: number, h: number, data?: number[], showLabels = true): { parts: ChartPart[]; labels: ChartLabel[] } {
   const values = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
-  const { baselineY, columnX, valueToY } = chartColumnLayout(w, h, values);
+  const { baselineY, topY, columnX, valueToY, max } = chartColumnLayout(w, h, values);
   const dotR = Math.min(w, h) * 0.025 + 2;
   const dots = values.map((v, i) => dotPathD(columnX(i), valueToY(v), dotR));
-  return [
+  const parts: ChartPart[] = [
     { d: dots.join(" "), role: "marker" },
     { d: openPathD([{ x: 0, y: baselineY }, { x: w, y: baselineY }]), role: "axis" },
   ];
+  return { parts, labels: showLabels ? chartYAxisLabels(baselineY, topY, max) : [] };
 }
 
 // Cycled for however many slices a pie chart has - distinct, readable hues rather than shades of one
@@ -855,14 +906,101 @@ export function evalPlotFunction(type: FunctionPlotType, x: number): number {
   }
 }
 
-// Samples `type` densely across its own FUNCTION_PLOT_DOMAINS window, auto-fits the sampled Y range
-// to the box (so e.g. cubic's much taller range and sine's -1..1 range both fill the plot equally
-// well instead of one looking cramped), and draws x=0/y=0 axis lines wherever those actually fall
-// inside the plotted window (falling back to the left/bottom edge when they don't, e.g. sqrt's
-// domain never goes negative).
-function functionPlotParts(w: number, h: number, type: FunctionPlotType): ChartPart[] {
-  const [xMin, xMax] = FUNCTION_PLOT_DOMAINS[type];
-  const samples = 80;
+// Bounds for WhiteboardNode.plotDomainScale - multiplies FUNCTION_PLOT_DOMAINS' own window (see its
+// doc comment). Kept well away from 0 (a near-zero domain has almost no visible curve left to show)
+// and capped so the sampled curve doesn't get so stretched-thin relative to its sample count that it
+// visibly facets.
+export const MIN_PLOT_DOMAIN_SCALE = 0.25;
+export const MAX_PLOT_DOMAIN_SCALE = 4;
+export const DEFAULT_PLOT_DOMAIN_SCALE = 1;
+
+// Bounds for WhiteboardNode.plotCycles (sine/cosine only - see its own doc comment for why these two
+// get a direct cycle count instead of plotDomainScale's abstract multiplier). Matches the "wave"
+// shapeType's own MIN/MAX_WAVE_CYCLES reasoning, just a smaller ceiling - a function plot's box is
+// typically narrower than a dedicated wave shape, so cramming in as many as 60 would just look like
+// visual noise well before that limit.
+export const MIN_PLOT_CYCLES = 1;
+export const MAX_PLOT_CYCLES = 20;
+export const DEFAULT_PLOT_CYCLES = 2;
+
+// Picks N "nice-ish" evenly-spaced tick positions between lo and hi INCLUSIVE of both ends (an axis
+// reads oddly without its own start/end labeled) - the auto-interval fallback when no explicit
+// WhiteboardNode.plotXTickInterval/plotYTickInterval is set.
+function tickValues(lo: number, hi: number, count: number): number[] {
+  if (count <= 1) return [lo];
+  const step = (hi - lo) / (count - 1);
+  return Array.from({ length: count }, (_, i) => lo + step * i);
+}
+
+// Safety cap on how many ticks a user-typed interval can ever produce - a very small interval over
+// a wide (zoomed-out) domain would otherwise generate hundreds of overlapping, unreadable labels.
+const MAX_INTERVAL_TICKS = 40;
+
+// Ticks at every multiple of `interval` that falls within [lo, hi] - the explicit-interval
+// counterpart to tickValues' fixed-count spacing (see WhiteboardNode.plotXTickInterval/
+// plotYTickInterval's own doc comment for why this is two separate functions rather than one that
+// takes "either a count or an interval").
+function tickValuesByInterval(lo: number, hi: number, interval: number): number[] {
+  if (!Number.isFinite(interval) || interval <= 0) return [];
+  // A stale small interval left over from before the domain grew (e.g. Cycles turned up after the
+  // interval was set for a much narrower window) would otherwise need far more than
+  // MAX_INTERVAL_TICKS ticks to cover [lo, hi] - cutting the loop off at the cap then truncates
+  // ticks from ONE end only, leaving the rest of the domain (and however much of the curve sits
+  // there) completely unlabeled instead of just coarser. Widening the interval by a whole multiple
+  // instead keeps ticks evenly spaced across the FULL domain, just less dense than asked for.
+  const neededTicks = Math.floor((hi - lo) / interval) + 1;
+  const effectiveInterval = neededTicks > MAX_INTERVAL_TICKS ? interval * Math.ceil(neededTicks / MAX_INTERVAL_TICKS) : interval;
+  const start = Math.ceil(lo / effectiveInterval) * effectiveInterval;
+  const ticks: number[] = [];
+  for (let v = start; v <= hi + 1e-9; v += effectiveInterval) {
+    ticks.push(Math.abs(v) < 1e-9 ? 0 : v);
+  }
+  return ticks;
+}
+
+// Picks tickValuesByInterval when the node has an explicit interval set, else falls back to the
+// auto 5-evenly-spaced-ticks behavior.
+function functionPlotTicks(lo: number, hi: number, intervalInput: number | undefined): number[] {
+  return intervalInput && intervalInput > 0 ? tickValuesByInterval(lo, hi, intervalInput) : tickValues(lo, hi, 5);
+}
+
+// Sine/cosine get a direct "how many periods" domain (see WhiteboardNode.plotCycles's own doc
+// comment); every other function keeps using plotDomainScale as a plain multiplier on its own
+// FUNCTION_PLOT_DOMAINS window.
+function functionPlotDomain(type: FunctionPlotType, domainScaleInput?: number, cyclesInput?: number): [number, number] {
+  if (type === "sine" || type === "cosine") {
+    const cycles = Math.max(MIN_PLOT_CYCLES, Math.min(MAX_PLOT_CYCLES, Math.round(cyclesInput ?? DEFAULT_PLOT_CYCLES)));
+    return [-cycles * Math.PI, cycles * Math.PI];
+  }
+  const domainScale = Math.max(MIN_PLOT_DOMAIN_SCALE, Math.min(MAX_PLOT_DOMAIN_SCALE, domainScaleInput ?? DEFAULT_PLOT_DOMAIN_SCALE));
+  const [baseMin, baseMax] = FUNCTION_PLOT_DOMAINS[type];
+  return [baseMin * domainScale, baseMax * domainScale];
+}
+
+// Samples `type` densely across functionPlotDomain's window, auto-fits the sampled Y range to the
+// box (so e.g. cubic's much taller range and sine's -1..1 range both fill the plot equally well
+// instead of one looking cramped), draws x=0/y=0 axis lines wherever those actually fall inside the
+// plotted window (falling back to the left/bottom edge when they don't, e.g. sqrt's domain never
+// goes negative), optionally (`showGrid`) fills the whole plot with faint gridlines at every tick,
+// and optionally (`showLabels`) labels both axes with their own tick values, positioned right beside
+// wherever the axis line ITSELF actually sits - not the box edge - so a tick reads as "this number
+// belongs to this line" the way a real graph's does. The two toggles are independent of each other.
+function functionPlotOutline(
+  w: number,
+  h: number,
+  type: FunctionPlotType,
+  domainScaleInput?: number,
+  xTickInterval?: number,
+  yTickInterval?: number,
+  showLabels = true,
+  cyclesInput?: number,
+  showGrid = false
+): { parts: ChartPart[]; labels: ChartLabel[] } {
+  const [xMin, xMax] = functionPlotDomain(type, domainScaleInput, cyclesInput);
+  // More samples for a wider (zoomed-out) domain, same "keep point density roughly constant"
+  // reasoning waveOutlineD's own cycles-scaled sample count uses.
+  const domainScale = (xMax - xMin) / (FUNCTION_PLOT_DOMAINS[type][1] - FUNCTION_PLOT_DOMAINS[type][0] || 1);
+  const samples = Math.round(80 * Math.max(1, domainScale));
   const raw: { x: number; y: number }[] = [];
   for (let i = 0; i <= samples; i++) {
     const x = xMin + ((xMax - xMin) * i) / samples;
@@ -880,7 +1018,18 @@ function functionPlotParts(w: number, h: number, type: FunctionPlotType): ChartP
   const curve = raw.map((p) => ({ x: mapX(p.x), y: mapY(p.y) }));
   const yAxisY = yMin <= 0 && yMax >= 0 ? mapY(0) : padY + plotH;
   const xAxisX = xMin <= 0 && xMax >= 0 ? mapX(0) : padX;
-  return [
+  const parts: ChartPart[] = [];
+  // Grid drawn BEFORE the axis/curve so it always sits visually behind them, not on top.
+  if (showGrid) {
+    const gridXTicks = functionPlotTicks(xMin, xMax, xTickInterval);
+    const gridYTicks = functionPlotTicks(yMin, yMax, yTickInterval);
+    const gridLines = [
+      ...gridXTicks.map((tx) => openPathD([{ x: mapX(tx), y: padY }, { x: mapX(tx), y: padY + plotH }])),
+      ...gridYTicks.map((ty) => openPathD([{ x: padX, y: mapY(ty) }, { x: padX + plotW, y: mapY(ty) }])),
+    ];
+    if (gridLines.length > 0) parts.push({ d: gridLines.join(" "), role: "grid" });
+  }
+  parts.push(
     { d: openPathD(curve), role: "stroke" },
     {
       d: [
@@ -888,8 +1037,26 @@ function functionPlotParts(w: number, h: number, type: FunctionPlotType): ChartP
         openPathD([{ x: xAxisX, y: padY }, { x: xAxisX, y: padY + plotH }]),
       ].join(" "),
       role: "axis",
-    },
+    }
+  );
+  if (!showLabels) return { parts, labels: [] };
+  // Each axis's numbers sit on whichever side of its own line has room, flipping to the other side
+  // rather than running off the box when the line itself sits near an edge (e.g. sqrt/logarithm,
+  // whose domain never goes negative, put the y-axis right at the plot's left edge).
+  const xLabelY = yAxisY < padY + plotH - 20 ? yAxisY + 12 : yAxisY - 8;
+  const yLabelNearLeft = xAxisX > padX + 20;
+  const yLabelX = yLabelNearLeft ? xAxisX - 4 : xAxisX + 4;
+  const yLabelAnchor: ChartLabel["anchor"] = yLabelNearLeft ? "end" : "start";
+  // Both axes crossing through the plotted window means their "0" ticks land on the exact same
+  // point (the origin) - keep only the y-axis's copy so the origin isn't double-labeled.
+  const originVisible = xMin <= 0 && xMax >= 0 && yMin <= 0 && yMax >= 0;
+  const xTicks = functionPlotTicks(xMin, xMax, xTickInterval).filter((t) => !originVisible || Math.abs(t) > 1e-9);
+  const yTicks = functionPlotTicks(yMin, yMax, yTickInterval);
+  const labels: ChartLabel[] = [
+    ...xTicks.map((tx) => ({ x: mapX(tx), y: Math.max(2, Math.min(xLabelY, h - 2)), text: formatTick(tx), anchor: "middle" as const })),
+    ...yTicks.map((ty) => ({ x: Math.max(2, Math.min(yLabelX, w - 2)), y: mapY(ty), text: formatTick(ty), anchor: yLabelAnchor })),
   ];
+  return { parts, labels };
 }
 
 // Builds one continuous open-path `d` string tracing the given periodic waveform across a w×h box,
@@ -1093,15 +1260,28 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
         innerLines: [[[w * 0.15, 0], [w * 0.15, h]], [[0, h * 0.15], [w, h * 0.15]]],
       };
     case "barChart":
-      return { kind: "chart", parts: barChartParts(w, h, opts?.chartData) };
+      return { kind: "chart", ...barChartOutline(w, h, opts?.chartData, opts?.showChartLabels ?? true) };
     case "lineChart":
-      return { kind: "chart", parts: lineChartParts(w, h, opts?.chartData) };
+      return { kind: "chart", ...lineChartOutline(w, h, opts?.chartData, opts?.showChartLabels ?? true) };
     case "pieChart":
       return { kind: "chart", parts: pieChartParts(w, h, opts?.chartData) };
     case "scatterPlot":
-      return { kind: "chart", parts: scatterPlotParts(w, h, opts?.chartData) };
+      return { kind: "chart", ...scatterPlotOutline(w, h, opts?.chartData, opts?.showChartLabels ?? true) };
     case "functionPlot":
-      return { kind: "chart", parts: functionPlotParts(w, h, opts?.plotFunction ?? "sine") };
+      return {
+        kind: "chart",
+        ...functionPlotOutline(
+          w,
+          h,
+          opts?.plotFunction ?? "sine",
+          opts?.plotDomainScale,
+          opts?.plotXTickInterval,
+          opts?.plotYTickInterval,
+          opts?.showChartLabels ?? true,
+          opts?.plotCycles,
+          opts?.plotShowGrid ?? false
+        ),
+      };
     case "rectangle":
     case "text":
     case "freehand":
@@ -1297,6 +1477,12 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
     angleRay2Length: node.angleRay2Length,
     chartData: node.chartData,
     plotFunction: node.plotFunction,
+    plotDomainScale: node.plotDomainScale,
+    plotCycles: node.plotCycles,
+    plotShowGrid: node.plotShowGrid,
+    plotXTickInterval: node.plotXTickInterval,
+    plotYTickInterval: node.plotYTickInterval,
+    showChartLabels: node.showChartLabels,
   });
 
   const fillAndStroke = (path: Path2D) => {
@@ -1374,11 +1560,25 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
           ctx.lineWidth = 1;
           ctx.strokeStyle = "#ffffff";
           ctx.stroke(path);
+        } else if (part.role === "grid") {
+          ctx.lineWidth = 0.5;
+          ctx.strokeStyle = "#e5e7eb";
+          ctx.stroke(path);
         } else {
           // "stroke" and "axis"
           ctx.lineWidth = part.role === "axis" ? 1 : Math.max(1, node.strokeWidth);
           ctx.strokeStyle = part.role === "axis" ? "#9ca3af" : node.strokeColor;
           ctx.stroke(path);
+        }
+      }
+      if (outline.labels && outline.labels.length > 0) {
+        ctx.font = "9px system-ui, sans-serif";
+        ctx.fillStyle = "#6b7280";
+        ctx.textBaseline = "middle";
+        for (const label of outline.labels) {
+          // SVG's text-anchor="middle" is Canvas2D's textAlign="center" - everything else lines up.
+          ctx.textAlign = label.anchor === "middle" ? "center" : label.anchor;
+          ctx.fillText(label.text, label.x, label.y);
         }
       }
       return;

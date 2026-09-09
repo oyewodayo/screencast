@@ -1191,6 +1191,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             angleRay2Length: node.angleRay2Length,
             chartData: node.chartData,
             plotFunction: node.plotFunction,
+            plotDomainScale: node.plotDomainScale,
+            plotCycles: node.plotCycles,
+            plotShowGrid: node.plotShowGrid,
+            plotXTickInterval: node.plotXTickInterval,
+            plotYTickInterval: node.plotYTickInterval,
+            showChartLabels: node.showChartLabels,
           });
           return (
             <div
@@ -1310,10 +1316,17 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={1} />
                     ) : part.role === "axis" ? (
                       <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={1} />
+                    ) : part.role === "grid" ? (
+                      <path key={i} d={part.d} fill="none" stroke="#e5e7eb" strokeWidth={0.75} />
                     ) : (
                       <path key={i} d={part.d} fill="none" stroke={node.strokeColor} strokeWidth={Math.max(1, node.strokeWidth)} strokeLinecap="round" strokeLinejoin="round" />
                     )
                   )}
+                  {outline.labels?.map((label, i) => (
+                    <text key={i} x={label.x} y={label.y} textAnchor={label.anchor} dominantBaseline="middle" fontSize={9} fill="#6b7280">
+                      {label.text}
+                    </text>
+                  ))}
                 </svg>
               ) : null}
 

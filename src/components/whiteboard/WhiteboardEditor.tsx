@@ -153,6 +153,9 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
     angleRay2Length: preset.overrides?.angleRay2Length,
     chartData: preset.overrides?.chartData,
     plotFunction: preset.overrides?.plotFunction,
+    plotDomainScale: preset.overrides?.plotDomainScale,
+    plotCycles: preset.overrides?.plotCycles,
+    plotShowGrid: preset.overrides?.plotShowGrid,
   });
   // Line-only shapes (waves, circuit symbols, axes...) render as an open trace, not a filled
   // silhouette (matches their own default fillColor: null) - filling the preview swatch would shade
@@ -203,6 +206,8 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
               <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={sw} />
             ) : part.role === "axis" ? (
               <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={sw} />
+            ) : part.role === "grid" ? (
+              <path key={i} d={part.d} fill="none" stroke="#e5e7eb" strokeWidth={sw * 0.75} />
             ) : (
               <path key={i} d={part.d} fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" />
             )

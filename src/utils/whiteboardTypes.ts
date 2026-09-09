@@ -109,6 +109,11 @@ export type FunctionPlotType = "linear" | "quadratic" | "cubic" | "sine" | "cosi
 // (to seed it) and WhiteboardStylePanel.tsx (to show the data-editing field).
 export const CHART_DATA_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["barChart", "lineChart", "pieChart", "scatterPlot"]);
 
+// The shapeTypes whose "chart" ShapeOutline can carry tick/value labels (see ChartLabel and
+// WhiteboardNode.showChartLabels) - every chart type except pieChart, which has no axis at all to
+// label (a pie's own "data" is communicated by slice size/color, not a scale).
+export const CHART_LABEL_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["barChart", "lineChart", "scatterPlot", "functionPlot"]);
+
 interface WhiteboardItemBase {
   id: string;
   createdAt: number;
@@ -180,6 +185,36 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // "functionPlot" only - which curve to trace (see whiteboardHandlers.ts's evalPlotFunction).
   // Absent - resolves to "sine".
   plotFunction?: FunctionPlotType;
+  // "functionPlot" only, and only consulted for the 7 non-periodic functions (everything except
+  // sine/cosine, which use plotCycles below instead) - multiplies the curve's own default x-domain
+  // (see whiteboardHandlers.ts's FUNCTION_PLOT_DOMAINS). Below 1 zooms in, above 1 zooms out. Absent
+  // - resolves to DEFAULT_PLOT_DOMAIN_SCALE (1, the function's own default window).
+  plotDomainScale?: number;
+  // "functionPlot" only, and only for plotFunction "sine"/"cosine" - how many full periods are
+  // shown, domain = [-cycles*PI, cycles*PI] (a whole number of periods, same as WhiteboardNode's
+  // own "wave" shapeType's waveCycles - a directly countable "how many waves" knob reads far more
+  // naturally for a periodic curve than the abstract domain-scale multiplier plotDomainScale is for
+  // the other 7 functions, which is why sine/cosine get this instead of that rather than in
+  // addition to it). Absent - resolves to DEFAULT_PLOT_CYCLES (2).
+  plotCycles?: number;
+  // "functionPlot" only - draws faint gridlines across the whole plot at every tick position (both
+  // axes), not just the tick marks themselves - the "graph paper" look, for reading values off the
+  // curve more easily. Independent of showChartLabels below (you can have gridlines with no numbers,
+  // or numbers with no gridlines). Absent - resolves to false (off by default, matching how the
+  // shape looked before this field existed).
+  plotShowGrid?: boolean;
+  // "functionPlot" only - the spacing between consecutive tick numbers along each axis, in that
+  // axis's own units (so an X interval that makes sense for sine's ~±6 radian domain is a very
+  // different number from what makes sense for cubic's ~±2 domain - two separate fields rather than
+  // one shared interval, since applying the same absolute spacing to both would leave whichever
+  // axis has the smaller range with only one or two ticks, or none). Absent/0 - resolves to an
+  // auto-picked interval that always yields 5 evenly-spaced ticks across whatever's currently in
+  // view, same as before this field existed.
+  plotXTickInterval?: number;
+  plotYTickInterval?: number;
+  // "barChart"/"lineChart"/"pieChart"/"scatterPlot"/"functionPlot" only - whether to draw the
+  // axis/value tick numbers at all. Absent - resolves to true (shown by default).
+  showChartLabels?: boolean;
   fontFamily: string;
   fontSize: number;
   fontColor: string;
@@ -397,7 +432,27 @@ export function createDefaultWhiteboardNode(
   shapeType: WhiteboardShapeType,
   x: number,
   y: number,
-  overrides?: Partial<Pick<WhiteboardNode, "sides" | "starPoints" | "starInnerRadiusRatio" | "waveStyle" | "waveCycles" | "angleDegrees" | "angleRay1Length" | "angleRay2Length" | "chartData" | "plotFunction">>
+  overrides?: Partial<
+    Pick<
+      WhiteboardNode,
+      | "sides"
+      | "starPoints"
+      | "starInnerRadiusRatio"
+      | "waveStyle"
+      | "waveCycles"
+      | "angleDegrees"
+      | "angleRay1Length"
+      | "angleRay2Length"
+      | "chartData"
+      | "plotFunction"
+      | "plotDomainScale"
+      | "plotCycles"
+      | "plotShowGrid"
+      | "plotXTickInterval"
+      | "plotYTickInterval"
+      | "showChartLabels"
+    >
+  >
 ): WhiteboardNode {
   const now = Date.now();
   const size = SHAPE_DEFAULT_SIZE[shapeType];
@@ -424,6 +479,12 @@ export function createDefaultWhiteboardNode(
     angleRay2Length: shapeType === "angle" ? overrides?.angleRay2Length ?? 1 : undefined,
     chartData: CHART_DATA_SHAPES.has(shapeType) ? overrides?.chartData ?? DEFAULT_CHART_DATA : undefined,
     plotFunction: shapeType === "functionPlot" ? overrides?.plotFunction ?? "sine" : undefined,
+    plotDomainScale: shapeType === "functionPlot" ? overrides?.plotDomainScale ?? 1 : undefined,
+    plotCycles: shapeType === "functionPlot" ? overrides?.plotCycles ?? 2 : undefined,
+    plotShowGrid: shapeType === "functionPlot" ? overrides?.plotShowGrid ?? false : undefined,
+    plotXTickInterval: shapeType === "functionPlot" ? overrides?.plotXTickInterval : undefined,
+    plotYTickInterval: shapeType === "functionPlot" ? overrides?.plotYTickInterval : undefined,
+    showChartLabels: CHART_LABEL_SHAPES.has(shapeType) ? overrides?.showChartLabels ?? true : undefined,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,
     fontColor: "#111111",

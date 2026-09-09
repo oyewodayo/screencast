@@ -20,17 +20,23 @@ import {
   TbStackFront,
   TbUnderline,
 } from "react-icons/tb";
-import { ArrowheadType, CHART_DATA_SHAPES, DEFAULT_CHART_DATA, FunctionPlotType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
+import { ArrowheadType, CHART_DATA_SHAPES, CHART_LABEL_SHAPES, DEFAULT_CHART_DATA, FunctionPlotType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
 import {
   DEFAULT_ANGLE_DEGREES,
   DEFAULT_ANGLE_RAY_LENGTH,
   DEFAULT_CURVE_BOW,
+  DEFAULT_PLOT_CYCLES,
+  DEFAULT_PLOT_DOMAIN_SCALE,
   DEFAULT_WAVE_CYCLES,
   MAX_ANGLE_DEGREES,
   MAX_ANGLE_RAY_LENGTH,
+  MAX_PLOT_CYCLES,
+  MAX_PLOT_DOMAIN_SCALE,
   MAX_WAVE_CYCLES,
   MIN_ANGLE_DEGREES,
   MIN_ANGLE_RAY_LENGTH,
+  MIN_PLOT_CYCLES,
+  MIN_PLOT_DOMAIN_SCALE,
   MIN_WAVE_CYCLES,
 } from "../../handlers/whiteboardHandlers";
 
@@ -116,6 +122,7 @@ function ClampedNumberField({
   integer = true,
   onCommit,
   className,
+  title,
 }: {
   initialValue: number;
   min: number;
@@ -124,6 +131,7 @@ function ClampedNumberField({
   integer?: boolean; // false keeps typed decimals (e.g. a 0.05-step fraction) instead of rounding to a whole number
   onCommit: (n: number) => void;
   className: string;
+  title?: string;
 }) {
   const [text, setText] = React.useState(String(initialValue));
   const [focused, setFocused] = React.useState(false);
@@ -173,6 +181,7 @@ function ClampedNumberField({
         if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
       }}
       className={className}
+      title={title}
     />
   );
 }
@@ -450,6 +459,106 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   </option>
                 ))}
               </select>
+            </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "functionPlot" && n.plotFunction !== "sine" && n.plotFunction !== "cosine") && (
+            <Field label="Zoom">
+              <div className="flex items-center gap-1.5">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].plotDomainScale ?? DEFAULT_PLOT_DOMAIN_SCALE}
+                  min={MIN_PLOT_DOMAIN_SCALE}
+                  max={MAX_PLOT_DOMAIN_SCALE}
+                  step={0.25}
+                  integer={false}
+                  onCommit={(n) => updateNodes({ plotDomainScale: n })}
+                  className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+                <input
+                  type="range"
+                  min={MIN_PLOT_DOMAIN_SCALE}
+                  max={MAX_PLOT_DOMAIN_SCALE}
+                  step={0.25}
+                  value={selectedNodes[0].plotDomainScale ?? DEFAULT_PLOT_DOMAIN_SCALE}
+                  onChange={(e) => updateNodes({ plotDomainScale: Number(e.target.value) })}
+                  className="w-16"
+                  title="How much of the x-axis is shown - below 1 zooms in, above 1 zooms out"
+                />
+              </div>
+            </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "functionPlot" && (n.plotFunction === "sine" || n.plotFunction === "cosine")) && (
+            <Field label="Cycles">
+              <div className="flex items-center gap-1.5">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].plotCycles ?? DEFAULT_PLOT_CYCLES}
+                  min={MIN_PLOT_CYCLES}
+                  max={MAX_PLOT_CYCLES}
+                  onCommit={(n) => updateNodes({ plotCycles: n })}
+                  className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+                <input
+                  type="range"
+                  min={MIN_PLOT_CYCLES}
+                  max={MAX_PLOT_CYCLES}
+                  value={selectedNodes[0].plotCycles ?? DEFAULT_PLOT_CYCLES}
+                  onChange={(e) => updateNodes({ plotCycles: Number(e.target.value) })}
+                  className="w-16"
+                  title="How many full wave periods are shown"
+                />
+              </div>
+            </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "functionPlot") && (
+            <>
+              <Field label="X interval">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].plotXTickInterval ?? 0}
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  integer={false}
+                  onCommit={(n) => updateNodes({ plotXTickInterval: n <= 0 ? undefined : n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Spacing between x-axis tick numbers, in this plot's own x units - 0 picks it automatically"
+                />
+              </Field>
+              <Field label="Y interval">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].plotYTickInterval ?? 0}
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  integer={false}
+                  onCommit={(n) => updateNodes({ plotYTickInterval: n <= 0 ? undefined : n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Spacing between y-axis tick numbers, in this plot's own y units - 0 picks it automatically"
+                />
+              </Field>
+            </>
+          )}
+          {selectedNodes.every((n) => CHART_LABEL_SHAPES.has(n.shapeType)) && (
+            <Field label="Show numbers">
+              <input
+                type="checkbox"
+                checked={selectedNodes[0].showChartLabels ?? true}
+                onChange={(e) => updateNodes({ showChartLabels: e.target.checked })}
+                className="h-3.5 w-3.5"
+              />
+            </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "functionPlot") && (
+            <Field label="Show grid">
+              <input
+                type="checkbox"
+                checked={selectedNodes[0].plotShowGrid ?? false}
+                onChange={(e) => updateNodes({ plotShowGrid: e.target.checked })}
+                className="h-3.5 w-3.5"
+                title="Faint gridlines across the whole plot at every tick, not just the axis tick marks"
+              />
             </Field>
           )}
           {selectedNodes.every((n) => n.shapeType === "freehand") && (
