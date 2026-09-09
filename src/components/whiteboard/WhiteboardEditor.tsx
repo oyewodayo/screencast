@@ -26,6 +26,7 @@ import {
   IoDownloadOutline,
   IoGitNetworkOutline,
   IoGridOutline,
+  IoImageOutline,
   IoPencilOutline,
   IoRemove,
   IoShapesOutline,
@@ -436,6 +437,10 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   // coordinates from the click that opened it, so the popover can anchor itself near the arrow
   // regardless of where on the (possibly panned/zoomed) canvas it was.
   const [quickConnectPicker, setQuickConnectPicker] = useState<{ nodeId: string; side: Exclude<WhiteboardAnchorSide, "auto">; x: number; y: number } | null>(null);
+  // Right-click context menu (export selection as PNG, delete) - opened by WhiteboardCanvas.tsx's
+  // onItemContextMenu once a node/edge right-click has already updated the selection to match.
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeIds: Set<string>; edgeIds: Set<string> } | null>(null);
+  const [exportingSelection, setExportingSelection] = useState(false);
   const [shapesMenuOpen, setShapesMenuOpen] = useState(false);
   const [arrowsMenuOpen, setArrowsMenuOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -467,6 +472,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     document.addEventListener("click", close);
     return () => document.removeEventListener("click", close);
   }, [quickConnectPicker]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [contextMenu]);
 
   // Fits the view to whichever page is active, every time it changes - covers both "a whiteboard
   // just finished loading" and "the user switched pages" in one code path, since either way the
@@ -581,6 +593,69 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     }
     onBack();
   }, [store, page, whiteboardId, onBack]);
+
+  // Right-click "Export selection as PNG" - builds a throwaway WhiteboardPage containing only the
+  // right-clicked node(s)/edge(s) (plus, for a selected edge, whichever of its own endpoint nodes
+  // weren't ALSO selected - otherwise resolveEdgeEndpoints would have nothing to resolve that
+  // endpoint against and the edge would collapse to a point) and reuses renderWhiteboardToCanvas
+  // completely unchanged - it only ever reads page.nodes/page.edges, so it can't tell this apart
+  // from a real page. Same save-dialog + export_whiteboard_png_to_path plumbing handleSaveAs above
+  // already uses for the whole board.
+  const handleExportSelection = useCallback(
+    async (nodeIds: Set<string>, edgeIds: Set<string>) => {
+      if (!doc || !page || (nodeIds.size === 0 && edgeIds.size === 0)) return;
+      setContextMenu(null);
+      setExportingSelection(true);
+      setExportError(null);
+      try {
+        const referencedNodeIds = new Set<string>();
+        for (const edge of page.edges) {
+          if (!edgeIds.has(edge.id)) continue;
+          if (edge.source.nodeId) referencedNodeIds.add(edge.source.nodeId);
+          if (edge.target.nodeId) referencedNodeIds.add(edge.target.nodeId);
+        }
+        const selectionPage: WhiteboardPage = {
+          ...page,
+          nodes: page.nodes.filter((n) => nodeIds.has(n.id) || referencedNodeIds.has(n.id)),
+          edges: page.edges.filter((e) => edgeIds.has(e.id)),
+        };
+        if (selectionPage.nodes.length === 0 && selectionPage.edges.length === 0) return;
+        const canvas = await renderWhiteboardToCanvas(selectionPage);
+        const bytes = await canvasToPngBytes(canvas);
+        const safeName = doc.name.trim().replace(/[^a-zA-Z0-9 _-]/g, "_") || "Whiteboard";
+        const destPath = await saveFileDialog({ defaultPath: `${safeName} - selection.png`, filters: [{ name: "PNG Image", extensions: ["png"] }] });
+        if (!destPath) return;
+        await invoke("export_whiteboard_png_to_path", { destPath, bytes: Array.from(bytes) });
+      } catch (err) {
+        console.error("Failed to export selection:", err);
+        setExportError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setExportingSelection(false);
+      }
+    },
+    [doc, page]
+  );
+
+  // Right-click "Delete" - same edges-then-nodes order WhiteboardCanvas.tsx's own keyboard Delete
+  // handler uses (deleting a node cascades its own attached edges - see store.deleteNode - so
+  // clearing explicitly-selected edges first avoids any ambiguity about which delete "owns" them).
+  const handleDeleteSelection = useCallback(
+    (nodeIds: Set<string>, edgeIds: Set<string>) => {
+      if (!page) return;
+      for (const id of edgeIds) {
+        const edge = page.edges.find((e) => e.id === id);
+        if (edge) store.deleteEdge(edge);
+      }
+      for (const id of nodeIds) {
+        const node = page.nodes.find((n) => n.id === id);
+        if (node) store.deleteNode(node);
+      }
+      setSelectedNodeIds(new Set());
+      setSelectedEdgeIds(new Set());
+      setContextMenu(null);
+    },
+    [page, store]
+  );
 
   const armShape = useCallback((preset: ShapePreset) => {
     setLaserArmed(false);
@@ -880,6 +955,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           armedConnectorOverrides={armedConnectorOverrides}
           laserArmed={laserArmed}
           onQuickConnectArrowClick={(nodeId, side, point) => setQuickConnectPicker({ nodeId, side, x: point.x, y: point.y })}
+          onItemContextMenu={(nodeIds, edgeIds, point) => setContextMenu({ x: point.x, y: point.y, nodeIds, edgeIds })}
         />
         <WhiteboardStylePanel
           selectedNodes={selectedNodes}
@@ -934,6 +1010,38 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
               ))}
             </React.Fragment>
           ))}
+        </div>
+      )}
+
+      {/* Right-click context menu on a node/edge - see WhiteboardCanvas.tsx's onContextMenu
+          handlers on each node/edge for the "select if not already selected, then open here"
+          gesture this responds to. Same fixed-viewport-coordinate anchoring as the quick-connect
+          picker above, for the same reason (can open anywhere on the canvas). */}
+      {contextMenu && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="fixed z-30 w-52 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200"
+          style={{
+            left: Math.max(8, Math.min(contextMenu.x, window.innerWidth - 216)),
+            top: Math.max(8, Math.min(contextMenu.y, window.innerHeight - 100)),
+          }}
+        >
+          <button
+            type="button"
+            disabled={exportingSelection}
+            onClick={() => handleExportSelection(contextMenu.nodeIds, contextMenu.edgeIds)}
+            className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+          >
+            <IoImageOutline size={14} /> {exportingSelection ? "Exporting…" : "Export selection as PNG"}
+          </button>
+          <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
+          <button
+            type="button"
+            onClick={() => handleDeleteSelection(contextMenu.nodeIds, contextMenu.edgeIds)}
+            className="w-full flex items-center gap-2 text-left px-3 py-1.5 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
+          >
+            <IoTrashOutline size={14} /> Delete
+          </button>
         </div>
       )}
 

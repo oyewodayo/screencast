@@ -192,6 +192,12 @@ interface WhiteboardCanvasProps {
   // quick-connect shape-picker popover near `screenPoint` in response; the actual placement happens
   // later, once a shape is picked, via the WhiteboardCanvasHandle's placeConnectedShape.
   onQuickConnectArrowClick: (nodeId: string, side: Exclude<WhiteboardAnchorSide, "auto">, screenPoint: { x: number; y: number }) => void;
+  // Right-clicked a node or edge - WhiteboardEditor.tsx opens its context menu (export selection as
+  // PNG, delete) near `screenPoint`. Selection is already updated to `nodeIds`/`edgeIds` by the time
+  // this fires (see the node/edge onContextMenu handlers below: right-clicking something already
+  // part of a multi-selection keeps that whole selection; right-clicking something outside it
+  // replaces the selection with just that one item first, same convention most apps use).
+  onItemContextMenu: (nodeIds: Set<string>, edgeIds: Set<string>, screenPoint: { x: number; y: number }) => void;
 }
 
 function clampZoom(z: number): number {
@@ -306,6 +312,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   armedConnectorOverrides,
   laserArmed,
   onQuickConnectArrowClick,
+  onItemContextMenu,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
@@ -1077,6 +1084,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       onPointerDown={handleContainerPointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
+      // Right-clicking empty canvas has nothing to act on (see the node/edge handlers below for the
+      // actual context-menu trigger) - still suppress the OS's own menu here so it doesn't leak
+      // through on the one part of the canvas that isn't a node/edge.
+      onContextMenu={(e) => e.preventDefault()}
     >
       <div className="absolute top-0 left-0 w-0 h-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0" }}>
         {/* Edges layer - one SVG so paths can overlap nodes correctly (drawn before nodes = behind
@@ -1116,6 +1127,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     if (armedShapeType || laserArmed) return;
                     e.stopPropagation();
                     onSelectionChange(new Set(), new Set([edge.id]));
+                  }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const nextEdgeIds = selectedEdgeIds.has(edge.id) ? selectedEdgeIds : new Set([edge.id]);
+                    const nextNodeIds = selectedEdgeIds.has(edge.id) ? selectedNodeIds : new Set<string>();
+                    onSelectionChange(nextNodeIds, nextEdgeIds);
+                    onItemContextMenu(nextNodeIds, nextEdgeIds, { x: e.clientX, y: e.clientY });
                   }}
                 />
                 {selected && <path d={d} fill="none" stroke="#2563eb" strokeWidth={edge.strokeWidth + 5} strokeLinecap="round" opacity={0.35} />}
@@ -1261,6 +1280,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               onDoubleClick={(e) => {
                 e.stopPropagation();
                 if (node.shapeType !== "freehand") setEditingNodeId(node.id);
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const nextNodeIds = selectedNodeIds.has(node.id) ? selectedNodeIds : new Set([node.id]);
+                const nextEdgeIds = selectedNodeIds.has(node.id) ? selectedEdgeIds : new Set<string>();
+                onSelectionChange(nextNodeIds, nextEdgeIds);
+                onItemContextMenu(nextNodeIds, nextEdgeIds, { x: e.clientX, y: e.clientY });
               }}
             >
               {node.shapeType === "freehand" ? (
