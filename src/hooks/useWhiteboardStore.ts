@@ -68,20 +68,37 @@ export interface UseWhiteboardStoreResult {
   flushSave: () => void;
 }
 
-// Normalizes a just-loaded document into the current (pages-based) shape - a whiteboard saved
-// before pages existed (WHITEBOARD_SCHEMA_VERSION 1) has top-level `nodes`/`edges` instead of
+// An edge saved before arrowhead types existed (still-earlier version of this feature) carries
+// boolean `startArrow`/`endArrow` instead of `startArrowType`/`endArrowType` - translate those in
+// place (true -> "triangle", the only style that boolean era ever drew; false/absent -> "none").
+// `raw: any` deliberately, same reasoning as migrateDocument's own doc comment below.
+function migrateEdge(raw: any): any {
+  if (raw.startArrowType !== undefined && raw.endArrowType !== undefined) return raw;
+  const { startArrow, endArrow, ...rest } = raw;
+  return {
+    ...rest,
+    startArrowType: raw.startArrowType ?? (startArrow ? "triangle" : "none"),
+    endArrowType: raw.endArrowType ?? (endArrow ? "triangle" : "none"),
+  };
+}
+
+// Normalizes a just-loaded document into the current shape - a whiteboard saved before pages
+// existed (WHITEBOARD_SCHEMA_VERSION 1) has top-level `nodes`/`edges` instead of
 // `pages`/`activePageId`; wrap those into a single page so every consumer past this point can
-// assume `pages`/`activePageId` always exist. Untyped `raw: any` deliberately - this is the one
-// place on-disk data may not yet match WhiteboardDocument's current shape, same convention
-// useBoardStore.ts's load effect uses for its own pre-BoardText normalization.
+// assume `pages`/`activePageId` always exist. Every page's edges also get migrateEdge applied
+// (see its own doc comment) regardless of whether the page structure itself is old or current,
+// since the two migrations happened at different times and are independent of each other. Untyped
+// `raw: any` deliberately - this is the one place on-disk data may not yet match
+// WhiteboardDocument's current shape, same convention useBoardStore.ts's load effect uses for its
+// own pre-BoardText normalization.
 function migrateDocument(raw: any): WhiteboardDocument {
-  if (Array.isArray(raw.pages) && raw.pages.length > 0) {
-    return { showGrid: true, ...raw, activePageId: raw.activePageId ?? raw.pages[0].id };
-  }
-  const page = createEmptyWhiteboardPage(crypto.randomUUID(), "Page 1");
-  page.nodes = raw.nodes ?? [];
-  page.edges = raw.edges ?? [];
-  return { showGrid: true, ...raw, pages: [page], activePageId: page.id };
+  const pages: WhiteboardPage[] =
+    Array.isArray(raw.pages) && raw.pages.length > 0
+      ? raw.pages
+      : [{ ...createEmptyWhiteboardPage(crypto.randomUUID(), "Page 1"), nodes: raw.nodes ?? [], edges: raw.edges ?? [] }];
+  const migratedPages = pages.map((page: any) => ({ ...page, edges: (page.edges ?? []).map(migrateEdge) }));
+  const activePageId = raw.activePageId ?? migratedPages[0].id;
+  return { showGrid: true, ...raw, pages: migratedPages, activePageId };
 }
 
 export default function useWhiteboardStore(whiteboardId: string | undefined): UseWhiteboardStoreResult {

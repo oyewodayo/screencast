@@ -20,7 +20,7 @@ import {
   TbStackFront,
   TbUnderline,
 } from "react-icons/tb";
-import { WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
+import { ArrowheadType, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
   { label: "Sans", value: "system-ui, sans-serif" },
@@ -28,6 +28,27 @@ const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
   { label: "Monospace", value: "'Courier New', monospace" },
   { label: "Rounded", value: "'Trebuchet MS', sans-serif" },
   { label: "Casual", value: "'Comic Sans MS', cursive" },
+];
+
+const ARROWHEAD_OPTIONS: { value: ArrowheadType; label: string }[] = [
+  { value: "none", label: "None" },
+  { value: "triangle", label: "Triangle" },
+  { value: "triangleOpen", label: "Open" },
+  { value: "block", label: "Block" },
+  { value: "diamond", label: "Diamond" },
+  { value: "circle", label: "Circle" },
+];
+
+const LINE_STYLE_OPTIONS: { value: WhiteboardEdge["strokeStyle"]; label: string }[] = [
+  { value: "solid", label: "Solid" },
+  { value: "dashed", label: "Dashed" },
+  { value: "dotted", label: "Dotted" },
+];
+
+const ROUTING_OPTIONS: { value: WhiteboardEdge["routing"]; label: string }[] = [
+  { value: "straight", label: "Straight" },
+  { value: "orthogonal", label: "Orthogonal" },
+  { value: "curved", label: "Curved" },
 ];
 
 interface WhiteboardStylePanelProps {
@@ -117,6 +138,43 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 className="w-28"
               />
             </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "polygon") && (
+            <Field label="Sides">
+              <input
+                type="number"
+                min={3}
+                max={12}
+                value={selectedNodes[0].sides ?? 5}
+                onChange={(e) => updateNodes({ sides: Math.max(3, Math.min(12, Number(e.target.value))) })}
+                className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+              />
+            </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "star") && (
+            <>
+              <Field label="Points">
+                <input
+                  type="number"
+                  min={3}
+                  max={12}
+                  value={selectedNodes[0].starPoints ?? 5}
+                  onChange={(e) => updateNodes({ starPoints: Math.max(3, Math.min(12, Number(e.target.value))) })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+              </Field>
+              <Field label="Spikiness">
+                <input
+                  type="range"
+                  min={0.15}
+                  max={0.85}
+                  step={0.05}
+                  value={selectedNodes[0].starInnerRadiusRatio ?? 0.45}
+                  onChange={(e) => updateNodes({ starInnerRadiusRatio: Number(e.target.value) })}
+                  className="w-28"
+                />
+              </Field>
+            </>
           )}
 
           {selectedNodes.some((n) => n.shapeType !== "freehand") && (
@@ -234,17 +292,57 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           <Field label="Width">
             <input type="range" min={1} max={8} value={edge.strokeWidth} onChange={(e) => updateEdge({ strokeWidth: Number(e.target.value) })} className="w-28" />
           </Field>
-          <Field label="Dashed">
-            <input type="checkbox" checked={edge.strokeStyle === "dashed"} onChange={(e) => updateEdge({ strokeStyle: e.target.checked ? "dashed" : "solid" })} />
+          <Field label="Line">
+            <select
+              value={edge.strokeStyle}
+              onChange={(e) => updateEdge({ strokeStyle: e.target.value as WhiteboardEdge["strokeStyle"] })}
+              className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+            >
+              {LINE_STYLE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
           </Field>
-          <Field label="Orthogonal">
-            <input type="checkbox" checked={edge.routing === "orthogonal"} onChange={(e) => updateEdge({ routing: e.target.checked ? "orthogonal" : "straight" })} />
+          <Field label="Routing">
+            <select
+              value={edge.routing}
+              onChange={(e) => updateEdge({ routing: e.target.value as WhiteboardEdge["routing"] })}
+              className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+            >
+              {ROUTING_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
           </Field>
           <Field label="Start arrow">
-            <input type="checkbox" checked={edge.startArrow} onChange={(e) => updateEdge({ startArrow: e.target.checked })} />
+            <select
+              value={edge.startArrowType}
+              onChange={(e) => updateEdge({ startArrowType: e.target.value as ArrowheadType })}
+              className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+            >
+              {ARROWHEAD_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
           </Field>
           <Field label="End arrow">
-            <input type="checkbox" checked={edge.endArrow} onChange={(e) => updateEdge({ endArrow: e.target.checked })} />
+            <select
+              value={edge.endArrowType}
+              onChange={(e) => updateEdge({ endArrowType: e.target.value as ArrowheadType })}
+              className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+            >
+              {ARROWHEAD_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
           </Field>
           <input
             type="text"

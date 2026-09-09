@@ -47,7 +47,8 @@ interface ShapePreset {
 
 // One tile per palette entry - shown in the toolbar's "Shapes" popover. "Rounded Rectangle" is not
 // its own shapeType (see whiteboardTypes.ts's WhiteboardNode.cornerRadius doc comment) - it's a
-// plain rectangle with a nonzero cornerRadius override applied at creation time.
+// plain rectangle with a nonzero cornerRadius override applied at creation time; "Pentagon"/
+// "Octagon" are likewise just "polygon" at a different `sides`.
 const SHAPE_PRESETS: ShapePreset[] = [
   { type: "rectangle", label: "Rectangle" },
   { type: "rectangle", label: "Rounded", overrides: { cornerRadius: 16 } },
@@ -55,8 +56,19 @@ const SHAPE_PRESETS: ShapePreset[] = [
   { type: "diamond", label: "Diamond" },
   { type: "triangle", label: "Triangle" },
   { type: "hexagon", label: "Hexagon" },
+  { type: "polygon", label: "Pentagon", overrides: { sides: 5 } },
+  { type: "polygon", label: "Octagon", overrides: { sides: 8 } },
+  { type: "star", label: "Star" },
   { type: "parallelogram", label: "Parallelogram" },
+  { type: "trapezoid", label: "Trapezoid" },
+  { type: "cross", label: "Cross" },
   { type: "cylinder", label: "Cylinder" },
+  { type: "cube", label: "Cube" },
+  { type: "cloud", label: "Cloud" },
+  { type: "document", label: "Document" },
+  { type: "note", label: "Note" },
+  { type: "callout", label: "Callout" },
+  { type: "step", label: "Step" },
 ];
 
 const TILE_W = 44;
@@ -66,26 +78,34 @@ const TILE_H = 32;
 // (shapeOutlineFor) the real canvas draws with, rather than a hand-picked icon that could drift
 // out of sync with what clicking the tile actually produces.
 function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
-  const outline = shapeOutlineFor(preset.type, TILE_W - 4, TILE_H - 4);
+  const w = TILE_W - 4;
+  const h = TILE_H - 4;
+  const outline = shapeOutlineFor(preset.type, w, h, { sides: preset.overrides?.sides, starPoints: preset.overrides?.starPoints, starInnerRadiusRatio: preset.overrides?.starInnerRadiusRatio });
   const fill = "#dbeafe";
   const stroke = "#2563eb";
   return (
     <svg width={TILE_W} height={TILE_H} viewBox={`0 0 ${TILE_W} ${TILE_H}`}>
       <g transform="translate(2,2)">
-        {outline.kind === "rect" && (
-          <rect x={0} y={0} width={TILE_W - 4} height={TILE_H - 4} rx={preset.overrides?.cornerRadius ?? 0} fill={fill} stroke={stroke} strokeWidth={2} />
+        {outline.kind === "rect" && <rect x={0} y={0} width={w} height={h} rx={preset.overrides?.cornerRadius ?? 0} fill={fill} stroke={stroke} strokeWidth={2} />}
+        {outline.kind === "ellipse" && <ellipse cx={w / 2} cy={h / 2} rx={w / 2} ry={h / 2} fill={fill} stroke={stroke} strokeWidth={2} />}
+        {outline.kind === "polygon" && (
+          <>
+            <polygon points={outline.points.map(([x, y]) => `${x},${y}`).join(" ")} fill={fill} stroke={stroke} strokeWidth={2} strokeLinejoin="round" />
+            {outline.innerLines?.map((line, i) => (
+              <polyline key={i} points={line.map(([x, y]) => `${x},${y}`).join(" ")} fill="none" stroke={stroke} strokeWidth={2} strokeLinecap="round" />
+            ))}
+          </>
         )}
-        {outline.kind === "ellipse" && <ellipse cx={(TILE_W - 4) / 2} cy={(TILE_H - 4) / 2} rx={(TILE_W - 4) / 2} ry={(TILE_H - 4) / 2} fill={fill} stroke={stroke} strokeWidth={2} />}
-        {outline.kind === "polygon" && <polygon points={outline.points.map(([x, y]) => `${x},${y}`).join(" ")} fill={fill} stroke={stroke} strokeWidth={2} strokeLinejoin="round" />}
+        {outline.kind === "path" && <path d={outline.d} fill={fill} stroke={stroke} strokeWidth={2} strokeLinejoin="round" />}
         {outline.kind === "cylinder" && (
           <>
             <path
-              d={`M0,${(TILE_H - 4) * CYLINDER_CAP_RATIO} L0,${(TILE_H - 4) * (1 - CYLINDER_CAP_RATIO)} A${(TILE_W - 4) / 2},${(TILE_H - 4) * CYLINDER_CAP_RATIO} 0 0,0 ${TILE_W - 4},${(TILE_H - 4) * (1 - CYLINDER_CAP_RATIO)} L${TILE_W - 4},${(TILE_H - 4) * CYLINDER_CAP_RATIO} Z`}
+              d={`M0,${h * CYLINDER_CAP_RATIO} L0,${h * (1 - CYLINDER_CAP_RATIO)} A${w / 2},${h * CYLINDER_CAP_RATIO} 0 0,0 ${w},${h * (1 - CYLINDER_CAP_RATIO)} L${w},${h * CYLINDER_CAP_RATIO} Z`}
               fill={fill}
               stroke={stroke}
               strokeWidth={2}
             />
-            <ellipse cx={(TILE_W - 4) / 2} cy={(TILE_H - 4) * CYLINDER_CAP_RATIO} rx={(TILE_W - 4) / 2} ry={(TILE_H - 4) * CYLINDER_CAP_RATIO} fill={fill} stroke={stroke} strokeWidth={2} />
+            <ellipse cx={w / 2} cy={h * CYLINDER_CAP_RATIO} rx={w / 2} ry={h * CYLINDER_CAP_RATIO} fill={fill} stroke={stroke} strokeWidth={2} />
           </>
         )}
       </g>
@@ -417,7 +437,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           {shapesMenuOpen && (
             <div
               onClick={(e) => e.stopPropagation()}
-              className="absolute left-0 top-full mt-1 w-[188px] bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl p-2 grid grid-cols-2 gap-1 z-20"
+              className="absolute left-0 top-full mt-1 w-[280px] max-h-[70vh] overflow-y-auto bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl p-2 grid grid-cols-3 gap-1 z-20"
             >
               {SHAPE_PRESETS.map((preset) => {
                 const active = armedShapeType === preset.type && JSON.stringify(armedNodeOverrides) === JSON.stringify(preset.overrides);

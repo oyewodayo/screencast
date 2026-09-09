@@ -11,6 +11,7 @@
 // draw.io-style pages are independent canvases, not one shared coordinate space.
 
 import {
+  ArrowheadType,
   WhiteboardAnchorSide,
   WhiteboardCommand,
   WhiteboardEdge,
@@ -58,9 +59,9 @@ export function resolveAnchorPoint(node: WhiteboardNode, side: WhiteboardAnchorS
 }
 
 // Resolves one endpoint of an edge to a live document-space point (+ which side it's leaving
-// from, needed by buildEdgePath's orthogonal routing). `towardPoint` is the OTHER endpoint's own
-// resolved reference point (its node's center, or its free x/y) - what an "auto" anchor picks a
-// side relative to.
+// from, needed by buildEdgePath's orthogonal/curved routing). `towardPoint` is the OTHER
+// endpoint's own resolved reference point (its node's center, or its free x/y) - what an "auto"
+// anchor picks a side relative to.
 export function resolveEndpointPoint(
   endpoint: WhiteboardEndpoint,
   nodesById: Map<string, WhiteboardNode>,
@@ -99,11 +100,51 @@ export function resolveEdgeEndpoints(edge: WhiteboardEdge, nodesById: Map<string
   return { source, target };
 }
 
+export type EdgeRouting = "straight" | "orthogonal" | "curved";
+type ResolvedPoint = { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null };
+
+// How far a curved edge's control point extends outward from its endpoint, along that endpoint's
+// own side-normal, before bending toward the other end - large enough that the curve visibly
+// leaves perpendicular to the shape (rather than looking like a barely-bent straight line) but
+// clamped so two very close nodes don't produce a control point that overshoots past the other end.
+function curveControlDistance(source: { x: number; y: number }, target: { x: number; y: number }): number {
+  return Math.min(120, Math.max(30, Math.hypot(target.x - source.x, target.y - source.y) / 2));
+}
+
+// The outward unit normal for a given side - which direction a curve (or the initial/final leg of
+// an orthogonal route) travels immediately after leaving that side.
+function sideNormal(side: "top" | "right" | "bottom" | "left"): { x: number; y: number } {
+  switch (side) {
+    case "top":
+      return { x: 0, y: -1 };
+    case "bottom":
+      return { x: 0, y: 1 };
+    case "left":
+      return { x: -1, y: 0 };
+    case "right":
+      return { x: 1, y: 0 };
+  }
+}
+
 // Builds the SVG path `d` string for an edge between two resolved endpoints. "straight" is a
 // single segment; "orthogonal" (draw.io's default connector look) inserts one or two right-angle
-// bends depending on which sides the two ends leave from - a clean flowchart-style route without
-// needing real obstacle-avoidance routing.
-export function buildEdgePath(source: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null }, target: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null }, routing: "straight" | "orthogonal"): string {
+// bends depending on which sides the two ends leave from; "curved" is a cubic bezier whose control
+// points sit out along each end's own side-normal (see curveControlDistance/sideNormal above), so
+// the line still leaves/arrives perpendicular to whichever side it's anchored on, just smoothly
+// instead of with hard corners.
+export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, routing: EdgeRouting): string {
+  if (routing === "curved") {
+    if (!source.side && !target.side) {
+      // Neither end is anchored to a shape (both free-floating points) - nothing to leave
+      // perpendicular to, so a plain straight line is both simpler and more honest than a fake curve.
+      return `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
+    }
+    const dist = curveControlDistance(source, target);
+    const c1 = source.side ? { x: source.x + sideNormal(source.side).x * dist, y: source.y + sideNormal(source.side).y * dist } : source;
+    const c2 = target.side ? { x: target.x + sideNormal(target.side).x * dist, y: target.y + sideNormal(target.side).y * dist } : target;
+    return `M ${source.x} ${source.y} C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${target.x} ${target.y}`;
+  }
+
   if (routing === "straight" || !source.side || !target.side) {
     return `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
   }
@@ -128,11 +169,18 @@ export function buildEdgePath(source: { x: number; y: number; side: "top" | "rig
 
 // The path's final segment direction, in degrees (SVG marker-friendly: 0 = pointing +x) - what an
 // arrowhead marker's orient should follow so it points the way the line is actually arriving,
-// rather than the straight source->target direction (wrong for an orthogonal path's last leg).
-export function edgeEndAngleDeg(source: { x: number; y: number }, target: { x: number; y: number }, routing: "straight" | "orthogonal", sourceSide: "top" | "right" | "bottom" | "left" | null, targetSide: "top" | "right" | "bottom" | "left" | null): { startDeg: number; endDeg: number } {
-  if (routing === "orthogonal" && targetSide) {
-    const endDeg = targetSide === "left" ? 0 : targetSide === "right" ? 180 : targetSide === "top" ? 90 : -90;
-    const startDeg = sourceSide === "left" ? 180 : sourceSide === "right" ? 0 : sourceSide === "top" ? -90 : 90;
+// rather than the straight source->target direction (wrong for an orthogonal/curved path's last
+// leg). "orthogonal" and "curved" both leave/arrive along the anchored side's own normal, so they
+// share the same side-based angle lookup; only "straight" (or an unanchored end) falls back to the
+// literal source->target direction.
+export function edgeEndAngleDeg(source: { x: number; y: number }, target: { x: number; y: number }, routing: EdgeRouting, sourceSide: "top" | "right" | "bottom" | "left" | null, targetSide: "top" | "right" | "bottom" | "left" | null): { startDeg: number; endDeg: number } {
+  if (routing !== "straight" && (sourceSide || targetSide)) {
+    const sideDeg = (side: "top" | "right" | "bottom" | "left") => (side === "left" ? 180 : side === "right" ? 0 : side === "top" ? -90 : 90);
+    // A marker-end arrow points in the direction of travel AT arrival, i.e. the side's outward
+    // normal reversed (arriving INTO the shape) - so target uses sideDeg+180, while a marker-start
+    // arrow (pointing back out along departure) uses the source side's own outward angle directly.
+    const endDeg = targetSide ? sideDeg(targetSide) + 180 : (Math.atan2(target.y - source.y, target.x - source.x) * 180) / Math.PI;
+    const startDeg = sourceSide ? sideDeg(sourceSide) : (Math.atan2(source.y - target.y, source.x - target.x) * 180) / Math.PI;
     return { startDeg, endDeg };
   }
   const dx = target.x - source.x;
@@ -143,17 +191,62 @@ export function edgeEndAngleDeg(source: { x: number; y: number }, target: { x: n
 
 // ---- Shape outlines -----------------------------------------------------------------------------
 //
-// Shared geometry for the "other shapes" beyond plain rectangle/ellipse - both the DOM canvas
+// Shared geometry for every shape beyond plain rectangle/ellipse - both the DOM canvas
 // (WhiteboardCanvas.tsx, building an SVG <polygon>/<path>) and the PNG export renderer (renderNode
-// below, building Canvas2D path calls) branch on this same description so the two stay visually
-// identical rather than drifting apart as two independent hand-written implementations.
+// below, building Canvas2D paths) branch on this same description so the two stay visually
+// identical rather than drifting apart as two independent hand-written implementations. Every
+// coordinate here is node-LOCAL (0,0 at the node's own top-left, (w,h) at its bottom-right) - the
+// DOM renderer applies this inside a div already positioned at the node's x/y, and the Canvas2D
+// renderer ctx.translate(node.x, node.y) first, so neither has to re-derive absolute coordinates.
 export type ShapeOutline =
-  | { kind: "rect" } // rectangle/text - rendered via the node's own div border/background, not called from here
+  | { kind: "rect" } // rectangle/text - rendered via the node's own div border/background, not built here
   | { kind: "ellipse" }
-  | { kind: "polygon"; points: [number, number][] }
-  | { kind: "cylinder" };
+  // innerLines: extra stroke-only (no fill) line segments drawn after the main outline - e.g.
+  // cube's 3D edge lines, note's folded-corner crease. Each entry is one polyline's points.
+  | { kind: "polygon"; points: [number, number][]; innerLines?: [number, number][][] }
+  | { kind: "cylinder" }
+  // A hand-built SVG path `d` string for outlines a simple point list can't express (currently
+  // just the curved ones: document's wavy edge, cloud's bumps).
+  | { kind: "path"; d: string };
 
-export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: number): ShapeOutline {
+export interface ShapeOutlineOptions {
+  sides?: number; // "polygon" only
+  starPoints?: number; // "star" only
+  starInnerRadiusRatio?: number; // "star" only
+}
+
+// A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
+// construction, shared by shapeOutlineFor's "polygon" (n = sides) and "star" (outer ring) cases.
+function regularPolygonPoints(w: number, h: number, sides: number): [number, number][] {
+  const cx = w / 2;
+  const cy = h / 2;
+  const rx = w / 2;
+  const ry = h / 2;
+  const points: [number, number][] = [];
+  for (let i = 0; i < sides; i++) {
+    const angle = -Math.PI / 2 + (i * 2 * Math.PI) / sides;
+    points.push([cx + rx * Math.cos(angle), cy + ry * Math.sin(angle)]);
+  }
+  return points;
+}
+
+function starPoints(w: number, h: number, points: number, innerRatio: number): [number, number][] {
+  const cx = w / 2;
+  const cy = h / 2;
+  const outerRx = w / 2;
+  const outerRy = h / 2;
+  const innerRx = outerRx * innerRatio;
+  const innerRy = outerRy * innerRatio;
+  const result: [number, number][] = [];
+  for (let i = 0; i < points * 2; i++) {
+    const angle = -Math.PI / 2 + (i * Math.PI) / points;
+    const outer = i % 2 === 0;
+    result.push([cx + (outer ? outerRx : innerRx) * Math.cos(angle), cy + (outer ? outerRy : innerRy) * Math.sin(angle)]);
+  }
+  return result;
+}
+
+export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: number, opts?: ShapeOutlineOptions): ShapeOutline {
   switch (shapeType) {
     case "ellipse":
       return { kind: "ellipse" };
@@ -167,6 +260,80 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
       return { kind: "polygon", points: [[w * 0.25, 0], [w, 0], [w * 0.75, h], [0, h]] };
     case "cylinder":
       return { kind: "cylinder" };
+    case "polygon":
+      return { kind: "polygon", points: regularPolygonPoints(w, h, Math.max(3, Math.min(12, opts?.sides ?? 5))) };
+    case "star":
+      return { kind: "polygon", points: starPoints(w, h, Math.max(3, Math.min(12, opts?.starPoints ?? 5)), opts?.starInnerRadiusRatio ?? 0.45) };
+    case "trapezoid":
+      return { kind: "polygon", points: [[w * 0.2, 0], [w * 0.8, 0], [w, h], [0, h]] };
+    case "cross": {
+      // Classic 12-point plus-sign, arm thickness = 35% of the shorter side, centered.
+      const t = Math.min(w, h) * 0.35;
+      const cx = w / 2;
+      const cy = h / 2;
+      const half = t / 2;
+      return {
+        kind: "polygon",
+        points: [
+          [cx - half, 0], [cx + half, 0], [cx + half, cy - half], [w, cy - half],
+          [w, cy + half], [cx + half, cy + half], [cx + half, h], [cx - half, h],
+          [cx - half, cy + half], [0, cy + half], [0, cy - half], [cx - half, cy - half],
+        ],
+      };
+    }
+    case "cube": {
+      // A regular hexagon (flat vertex at top) with 3 spokes from center to alternating vertices -
+      // the classic "isometric cube" icon (reads as 3 visible faces meeting at the center point).
+      const hex = regularPolygonPoints(w, h, 6);
+      const center: [number, number] = [w / 2, h / 2];
+      return { kind: "polygon", points: hex, innerLines: [[center, hex[0]], [center, hex[2]], [center, hex[4]]] };
+    }
+    case "note": {
+      // A rectangle with the top-right corner cut diagonally (the folded-corner sticky-note look),
+      // plus a crease line tracing the fold so the cut doesn't just look like a chamfered rectangle.
+      const fold = Math.min(w, h) * 0.28;
+      return {
+        kind: "polygon",
+        points: [[0, 0], [w - fold, 0], [w, fold], [w, h], [0, h]],
+        innerLines: [[[w - fold, 0], [w - fold, fold], [w, fold]]],
+      };
+    }
+    case "callout": {
+      // A rectangle with a small triangular tail poking out of the bottom-left area - the
+      // speech-bubble look, built as one outline (no separate tail piece to layer/align).
+      const tailW = w * 0.18;
+      const tailX = w * 0.18;
+      const tailH = h * 0.22;
+      const bodyH = h - tailH;
+      return {
+        kind: "polygon",
+        points: [[0, 0], [w, 0], [w, bodyH], [tailX + tailW, bodyH], [tailX, h], [tailX, bodyH], [0, bodyH]],
+      };
+    }
+    case "step": {
+      // A chevron/arrow pointing right with a matching notch on the left, for process-flow steps.
+      const notch = w * 0.22;
+      return { kind: "polygon", points: [[0, 0], [w - notch, 0], [w, h / 2], [w - notch, h], [0, h], [notch, h / 2]] };
+    }
+    case "document":
+      // A rectangle with a single wavy bottom edge (cubic bezier "S" curve) - the flowchart
+      // "document" shape.
+      return { kind: "path", d: `M0,0 L${w},0 L${w},${h * 0.82} C${w * 0.75},${h} ${w * 0.25},${h * 0.68} 0,${h * 0.82} Z` };
+    case "cloud": {
+      // Five overlapping cubic-bezier bumps forming a closed cloud silhouette. Hand-tuned control
+      // points rather than a geometric circle-union (which needs real curve-intersection math) -
+      // verified by eye against the toolbar's shape-preset preview, same as every other shape here.
+      const d = [
+        `M ${w * 0.28},${h * 0.78}`,
+        `C ${w * 0.08},${h * 0.78} ${w * -0.02},${h * 0.55} ${w * 0.12},${h * 0.42}`,
+        `C ${w * 0.04},${h * 0.22} ${w * 0.24},${h * 0.02} ${w * 0.42},${h * 0.14}`,
+        `C ${w * 0.5},${h * 0.0} ${w * 0.72},${h * 0.0} ${w * 0.8},${h * 0.18}`,
+        `C ${w * 0.94},${h * 0.12} ${w * 1.08},${h * 0.32} ${w * 0.92},${h * 0.46}`,
+        `C ${w * 1.04},${h * 0.56} ${w * 0.98},${h * 0.78} ${w * 0.82},${h * 0.78}`,
+        `Z`,
+      ].join(" ");
+      return { kind: "path", d };
+    }
     case "rectangle":
     case "text":
     case "freehand":
@@ -288,65 +455,116 @@ export function undoDeleteNode(page: WhiteboardPage, command: Extract<Whiteboard
 
 // ---- Export rendering (flattened PNG) ------------------------------------------------------------
 
-function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, radius: number): void {
-  const r = Math.max(0, Math.min(radius, w / 2, h / 2));
-  if (r <= 0) {
-    ctx.rect(x, y, w, h);
-    return;
-  }
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
 // Draws a freehand stroke through its (fraction-of-box) points as a smooth curve - each segment is
 // a quadratic curve through the midpoint of two consecutive points, the standard cheap "smooth a
 // polyline" trick (avoids the visibly faceted look plain line-to-line segments would have for a
-// hand-drawn ink stroke).
-function freehandPath(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
-  const pts = (node.points ?? []).map((p) => ({ x: node.x + p.x * node.width, y: node.y + p.y * node.height }));
-  ctx.beginPath();
-  if (pts.length === 0) return;
+// hand-drawn ink stroke). Node-local coordinates (see this file's ShapeOutline doc comment) -
+// caller has already ctx.translate(node.x, node.y).
+function freehandPath2D(node: WhiteboardNode): Path2D {
+  const pts = (node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height }));
+  const path = new Path2D();
+  if (pts.length === 0) return path;
   if (pts.length === 1) {
-    ctx.arc(pts[0].x, pts[0].y, Math.max(1, node.strokeWidth / 2), 0, Math.PI * 2);
-    return;
+    path.arc(pts[0].x, pts[0].y, Math.max(1, node.strokeWidth / 2), 0, Math.PI * 2);
+    return path;
   }
-  ctx.moveTo(pts[0].x, pts[0].y);
+  path.moveTo(pts[0].x, pts[0].y);
   for (let i = 1; i < pts.length - 1; i++) {
     const mid = { x: (pts[i].x + pts[i + 1].x) / 2, y: (pts[i].y + pts[i + 1].y) / 2 };
-    ctx.quadraticCurveTo(pts[i].x, pts[i].y, mid.x, mid.y);
+    path.quadraticCurveTo(pts[i].x, pts[i].y, mid.x, mid.y);
   }
-  ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+  path.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+  return path;
 }
 
-function shapePath(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
-  const { x, y, width: w, height: h } = node;
-  ctx.beginPath();
-  const outline = shapeOutlineFor(node.shapeType, w, h);
+function roundedRectPath2D(w: number, h: number, radius: number): Path2D {
+  const path = new Path2D();
+  const r = Math.max(0, Math.min(radius, w / 2, h / 2));
+  if (r <= 0) {
+    path.rect(0, 0, w, h);
+    return path;
+  }
+  path.moveTo(r, 0);
+  path.arcTo(w, 0, w, h, r);
+  path.arcTo(w, h, 0, h, r);
+  path.arcTo(0, h, 0, 0, r);
+  path.arcTo(0, 0, w, 0, r);
+  path.closePath();
+  return path;
+}
+
+function polygonPath2D(points: [number, number][]): Path2D {
+  const path = new Path2D();
+  points.forEach(([px, py], i) => (i === 0 ? path.moveTo(px, py) : path.lineTo(px, py)));
+  path.closePath();
+  return path;
+}
+
+// Fills+strokes one node's shape body in the ctx's CURRENT coordinate space - callers
+// ctx.translate(node.x, node.y) first, matching shapeOutlineFor's node-local convention (see this
+// file's own ShapeOutline doc comment), so nothing here ever touches node.x/y again.
+function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+  const { width: w, height: h } = node;
+  const outline = shapeOutlineFor(node.shapeType, w, h, { sides: node.sides, starPoints: node.starPoints, starInnerRadiusRatio: node.starInnerRadiusRatio });
+
+  const fillAndStroke = (path: Path2D) => {
+    if (node.fillColor) {
+      ctx.fillStyle = node.fillColor;
+      ctx.fill(path);
+    }
+    if (node.strokeWidth > 0) {
+      ctx.lineWidth = node.strokeWidth;
+      ctx.strokeStyle = node.strokeColor;
+      ctx.stroke(path);
+    }
+  };
+
   switch (outline.kind) {
     case "rect":
-      roundedRectPath(ctx, x, y, w, h, node.cornerRadius ?? 0);
-      break;
-    case "ellipse":
-      ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
-      break;
-    case "polygon":
-      outline.points.forEach(([px, py], i) => (i === 0 ? ctx.moveTo(x + px, y + py) : ctx.lineTo(x + px, y + py)));
-      ctx.closePath();
-      break;
+      fillAndStroke(roundedRectPath2D(w, h, node.cornerRadius ?? 0));
+      return;
+    case "ellipse": {
+      const p = new Path2D();
+      p.ellipse(w / 2, h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+      fillAndStroke(p);
+      return;
+    }
+    case "polygon": {
+      fillAndStroke(polygonPath2D(outline.points));
+      if (outline.innerLines && node.strokeWidth > 0) {
+        ctx.lineWidth = node.strokeWidth;
+        ctx.strokeStyle = node.strokeColor;
+        for (const line of outline.innerLines) ctx.stroke(polylineOpenPath2D(line));
+      }
+      return;
+    }
     case "cylinder": {
       const ry = h * CYLINDER_CAP_RATIO;
-      ctx.moveTo(x, y + ry);
-      ctx.lineTo(x, y + h - ry);
-      ctx.ellipse(x + w / 2, y + h - ry, w / 2, ry, 0, Math.PI, 0, true);
-      ctx.lineTo(x + w, y + ry);
-      ctx.closePath();
-      break;
+      const body = new Path2D();
+      body.moveTo(0, ry);
+      body.lineTo(0, h - ry);
+      body.ellipse(w / 2, h - ry, w / 2, ry, 0, Math.PI, 0, true);
+      body.lineTo(w, ry);
+      body.closePath();
+      fillAndStroke(body);
+      // Cap ellipse drawn AFTER the body so its own outline paints on top of (and hides) the flat
+      // seam where the body path's top edge sits - matches WhiteboardCanvas.tsx's DOM rendering,
+      // where the cap is a second <ellipse> element placed after the body path in the DOM.
+      const cap = new Path2D();
+      cap.ellipse(w / 2, ry, w / 2, ry, 0, 0, Math.PI * 2);
+      fillAndStroke(cap);
+      return;
     }
+    case "path":
+      fillAndStroke(new Path2D(outline.d));
+      return;
   }
+}
+
+function polylineOpenPath2D(points: [number, number][]): Path2D {
+  const path = new Path2D();
+  points.forEach(([px, py], i) => (i === 0 ? path.moveTo(px, py) : path.lineTo(px, py)));
+  return path;
 }
 
 function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
@@ -368,115 +586,157 @@ function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number)
   return lines;
 }
 
+// Renders text in node-local coordinates (0,0 at top-left) - caller has already
+// ctx.translate(node.x, node.y), same convention as paintShapeBody above.
+function paintNodeText(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+  if (!node.text) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, node.width, node.height);
+  ctx.clip();
+  ctx.fillStyle = node.fontColor;
+  const fontStyle = node.fontStyle === "italic" ? "italic " : "";
+  const fontWeight = node.fontWeight === "bold" ? "bold " : "";
+  ctx.font = `${fontStyle}${fontWeight}${node.fontSize}px ${node.fontFamily || "system-ui, sans-serif"}`;
+  ctx.textAlign = node.textAlign;
+  ctx.textBaseline = "middle";
+  const paddingX = 8;
+  const lines = wrapText(ctx, node.text, node.width - paddingX * 2);
+  const lineHeight = node.fontSize * 1.25;
+  const totalHeight = lines.length * lineHeight;
+  const startY =
+    node.verticalAlign === "top"
+      ? lineHeight / 2 + 4
+      : node.verticalAlign === "bottom"
+      ? node.height - totalHeight + lineHeight / 2 - 4
+      : node.height / 2 - totalHeight / 2 + lineHeight / 2;
+  const textX = node.textAlign === "left" ? paddingX : node.textAlign === "right" ? node.width - paddingX : node.width / 2;
+  lines.forEach((line, i) => {
+    const lineY = startY + i * lineHeight;
+    ctx.fillText(line, textX, lineY);
+    if (node.textDecoration === "underline") {
+      const metrics = ctx.measureText(line);
+      const underlineY = lineY + node.fontSize * 0.35;
+      const startX = node.textAlign === "left" ? textX : node.textAlign === "right" ? textX - metrics.width : textX - metrics.width / 2;
+      ctx.save();
+      ctx.strokeStyle = node.fontColor;
+      ctx.lineWidth = Math.max(1, node.fontSize / 16);
+      ctx.beginPath();
+      ctx.moveTo(startX, underlineY);
+      ctx.lineTo(startX + metrics.width, underlineY);
+      ctx.stroke();
+      ctx.restore();
+    }
+  });
+  ctx.restore();
+}
+
 function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+  ctx.save();
+  ctx.translate(node.x, node.y);
   if (node.shapeType === "freehand") {
-    freehandPath(ctx, node);
+    const path = freehandPath2D(node);
     ctx.lineWidth = node.strokeWidth;
     ctx.strokeStyle = node.strokeColor;
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
-    ctx.stroke();
-    return;
+    ctx.stroke(path);
+  } else {
+    if (node.shapeType !== "text") paintShapeBody(ctx, node);
+    paintNodeText(ctx, node);
   }
-
-  if (node.shapeType !== "text") {
-    shapePath(ctx, node);
-    if (node.fillColor) {
-      ctx.fillStyle = node.fillColor;
-      ctx.fill();
-    }
-    if (node.strokeWidth > 0) {
-      ctx.lineWidth = node.strokeWidth;
-      ctx.strokeStyle = node.strokeColor;
-      ctx.stroke();
-    }
-    // Cylinder's cap ellipse is drawn as a second pass AFTER the body's own fill/stroke, so its
-    // outline paints on top of (and hides) the flat seam where the body path's top edge sits -
-    // matches WhiteboardCanvas.tsx's DOM rendering, where the cap is a second <ellipse> element
-    // placed after the body path in the DOM for the same paint-order reason.
-    if (node.shapeType === "cylinder") {
-      const ry = node.height * CYLINDER_CAP_RATIO;
-      ctx.beginPath();
-      ctx.ellipse(node.x + node.width / 2, node.y + ry, node.width / 2, ry, 0, 0, Math.PI * 2);
-      if (node.fillColor) {
-        ctx.fillStyle = node.fillColor;
-        ctx.fill();
-      }
-      if (node.strokeWidth > 0) ctx.stroke();
-    }
-  }
-  if (node.text) {
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(node.x, node.y, node.width, node.height);
-    ctx.clip();
-    ctx.fillStyle = node.fontColor;
-    const fontStyle = node.fontStyle === "italic" ? "italic " : "";
-    const fontWeight = node.fontWeight === "bold" ? "bold " : "";
-    ctx.font = `${fontStyle}${fontWeight}${node.fontSize}px ${node.fontFamily || "system-ui, sans-serif"}`;
-    ctx.textAlign = node.textAlign;
-    ctx.textBaseline = "middle";
-    const paddingX = 8;
-    const lines = wrapText(ctx, node.text, node.width - paddingX * 2);
-    const lineHeight = node.fontSize * 1.25;
-    const totalHeight = lines.length * lineHeight;
-    const startY =
-      node.verticalAlign === "top"
-        ? node.y + lineHeight / 2 + 4
-        : node.verticalAlign === "bottom"
-        ? node.y + node.height - totalHeight + lineHeight / 2 - 4
-        : node.y + node.height / 2 - totalHeight / 2 + lineHeight / 2;
-    const textX = node.textAlign === "left" ? node.x + paddingX : node.textAlign === "right" ? node.x + node.width - paddingX : node.x + node.width / 2;
-    lines.forEach((line, i) => {
-      const lineY = startY + i * lineHeight;
-      ctx.fillText(line, textX, lineY);
-      if (node.textDecoration === "underline") {
-        const metrics = ctx.measureText(line);
-        const underlineY = lineY + node.fontSize * 0.35;
-        const startX = node.textAlign === "left" ? textX : node.textAlign === "right" ? textX - metrics.width : textX - metrics.width / 2;
-        ctx.save();
-        ctx.strokeStyle = node.fontColor;
-        ctx.lineWidth = Math.max(1, node.fontSize / 16);
-        ctx.beginPath();
-        ctx.moveTo(startX, underlineY);
-        ctx.lineTo(startX + metrics.width, underlineY);
-        ctx.stroke();
-        ctx.restore();
-      }
-    });
-    ctx.restore();
-  }
-}
-
-function drawArrowhead(ctx: CanvasRenderingContext2D, x: number, y: number, angleDeg: number, color: string): void {
-  const size = 10;
-  const rad = (angleDeg * Math.PI) / 180;
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(rad);
-  ctx.beginPath();
-  ctx.moveTo(0, 0);
-  ctx.lineTo(-size, size / 2);
-  ctx.lineTo(-size, -size / 2);
-  ctx.closePath();
-  ctx.fillStyle = color;
-  ctx.fill();
   ctx.restore();
 }
 
+// Renders one arrowhead marker at (x, y), oriented along angleDeg (0 = pointing +x, matching
+// edgeEndAngleDeg's convention) - see whiteboardTypes.ts's ArrowheadType doc comment for what each
+// type looks like. Geometry here is hand-tuned to visually match the SVG <marker> defs
+// WhiteboardCanvas.tsx builds for the same types (see its markerContentFor), so the live view and
+// the exported PNG show the same arrowheads.
+function drawArrowhead(ctx: CanvasRenderingContext2D, type: ArrowheadType, x: number, y: number, angleDeg: number, color: string, edgeStrokeWidth: number): void {
+  if (type === "none") return;
+  const rad = (angleDeg * Math.PI) / 180;
+  const size = 8 + Math.min(10, edgeStrokeWidth * 1.5);
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rad);
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
+  switch (type) {
+    case "triangle": {
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(-size, size * 0.5);
+      ctx.lineTo(-size, -size * 0.5);
+      ctx.closePath();
+      ctx.fill();
+      break;
+    }
+    case "block": {
+      const s = size * 1.15;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(-s, s * 0.55);
+      ctx.lineTo(-s * 0.7, 0);
+      ctx.lineTo(-s, -s * 0.55);
+      ctx.closePath();
+      ctx.fill();
+      break;
+    }
+    case "triangleOpen": {
+      ctx.beginPath();
+      ctx.moveTo(-size, size * 0.55);
+      ctx.lineTo(0, 0);
+      ctx.lineTo(-size, -size * 0.55);
+      ctx.lineWidth = Math.max(1.5, edgeStrokeWidth);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.stroke();
+      break;
+    }
+    case "diamond": {
+      const s = size * 0.55;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(-s, s * 0.65);
+      ctx.lineTo(-2 * s, 0);
+      ctx.lineTo(-s, -s * 0.65);
+      ctx.closePath();
+      ctx.fill();
+      break;
+    }
+    case "circle": {
+      const r = size * 0.42;
+      ctx.beginPath();
+      ctx.arc(-r, 0, r, 0, Math.PI * 2);
+      ctx.fill();
+      break;
+    }
+  }
+  ctx.restore();
+}
+
+const DASH_PATTERNS: Record<WhiteboardEdge["strokeStyle"], number[]> = {
+  solid: [],
+  dashed: [8, 6],
+  dotted: [1.5, 5],
+};
+
 function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesById: Map<string, WhiteboardNode>): void {
   const { source, target } = resolveEdgeEndpoints(edge, nodesById);
-  const path = buildEdgePath(source, target, edge.routing);
-  const p2d = new Path2D(path);
+  const path = new Path2D(buildEdgePath(source, target, edge.routing));
   ctx.lineWidth = edge.strokeWidth;
   ctx.strokeStyle = edge.strokeColor;
-  ctx.setLineDash(edge.strokeStyle === "dashed" ? [8, 6] : []);
-  ctx.stroke(p2d);
+  ctx.lineCap = edge.strokeStyle === "dotted" ? "round" : "butt";
+  const pattern = DASH_PATTERNS[edge.strokeStyle];
+  ctx.setLineDash(edge.strokeStyle === "dotted" ? pattern.map((n) => n * (edge.strokeWidth / 2 || 1)) : pattern);
+  ctx.stroke(path);
   ctx.setLineDash([]);
+  ctx.lineCap = "butt";
 
   const { startDeg, endDeg } = edgeEndAngleDeg(source, target, edge.routing, source.side, target.side);
-  if (edge.endArrow) drawArrowhead(ctx, target.x, target.y, endDeg, edge.strokeColor);
-  if (edge.startArrow) drawArrowhead(ctx, source.x, source.y, startDeg, edge.strokeColor);
+  drawArrowhead(ctx, edge.endArrowType, target.x, target.y, endDeg, edge.strokeColor, edge.strokeWidth);
+  drawArrowhead(ctx, edge.startArrowType, source.x, source.y, startDeg, edge.strokeColor, edge.strokeWidth);
 }
 
 // Flattens one page onto an offscreen canvas sized to its content bounds (see computeContentBounds)

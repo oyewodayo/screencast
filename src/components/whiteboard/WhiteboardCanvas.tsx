@@ -25,6 +25,7 @@
 // BoardCanvas.tsx's own liveImages uses, so a whole gesture is exactly one undo step.
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import {
+  ArrowheadType,
   createDefaultWhiteboardEdge,
   createDefaultWhiteboardNode,
   createFreehandWhiteboardNode,
@@ -122,12 +123,43 @@ function clampZoom(z: number): number {
 
 // SVG <marker> content doesn't reliably inherit the stroking path's color across the WebView2
 // versions this app targets (that needs `fill="context-stroke"`, a newer addition some installs
-// won't have yet) - so instead of one shared marker, one is defined per distinct edge stroke color
-// actually in use and referenced by a color-keyed id. Cheap in practice: a whiteboard has a
-// handful of edge colors at most, not one per edge.
-function markerIdForColor(color: string): string {
-  return `wb-arrow-${color.replace(/[^a-zA-Z0-9]/g, "")}`;
+// won't have yet) - so instead of one shared marker, one is defined per distinct (arrowhead type,
+// edge stroke color) combination actually in use and referenced by a keyed id. Cheap in practice:
+// a whiteboard has a handful of colors and arrow types at most, not one marker per edge.
+function markerId(type: ArrowheadType, color: string): string {
+  return `wb-arrow-${type}-${color.replace(/[^a-zA-Z0-9]/g, "")}`;
 }
+
+// The actual marker content for each arrowhead type, in a shared 0..10 (x) × 0..10 (y) local box
+// with the tip at x=10 - orient="auto" rotates this so local +x points along the path's direction
+// of travel at that end, and refX/refY (set on the <marker> element itself) is deliberately a
+// touch left of the true tip so the arrowhead slightly overshoots the path's mathematical endpoint
+// rather than sitting with its base flush against it - the same convention (and refX/refY values)
+// the previous single-type marker used, just generalized across shapes. Hand-tuned to visually
+// match drawArrowhead's Canvas2D versions in whiteboardHandlers.ts (used for PNG export) so the
+// live view and the export show the same arrowheads.
+function markerContentFor(type: Exclude<ArrowheadType, "none">, color: string): React.ReactNode {
+  switch (type) {
+    case "triangle":
+      return <path d="M0,0 L10,5 L0,10 Z" fill={color} />;
+    case "block":
+      return <path d="M0,0 L10,5 L0,10 L3,5 Z" fill={color} />;
+    case "triangleOpen":
+      return <path d="M2,0 L10,5 L2,10" fill="none" stroke={color} strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />;
+    case "diamond":
+      return <path d="M0,5 L5,1.5 L10,5 L5,8.5 Z" fill={color} />;
+    case "circle":
+      return <circle cx="6" cy="5" r="4" fill={color} />;
+  }
+}
+
+const MARKER_REF: Record<Exclude<ArrowheadType, "none">, number> = {
+  triangle: 8.5,
+  block: 8.5,
+  triangleOpen: 8.5,
+  diamond: 9,
+  circle: 9,
+};
 
 // Builds a smoothed SVG path through a freehand stroke's LOCAL points (already denormalized to the
 // node's own 0..width/0..height box) - quadratic curves through consecutive midpoints, same
@@ -594,11 +626,26 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     return () => cancelAnimationFrame(raf);
   }, [editingNodeId]);
 
-  const markerColors = useMemo(() => {
-    const colors = new Set<string>(["#2563eb"]); // connector-preview color, always needed
-    for (const edge of page.edges) if (edge.startArrow || edge.endArrow) colors.add(edge.strokeColor);
-    return Array.from(colors);
+  const markerCombos = useMemo(() => {
+    // (type, color) pairs actually needed - the connector-preview's own fixed blue "triangle" is
+    // always included since it can appear regardless of what any existing edge uses.
+    const combos = new Map<string, { type: Exclude<ArrowheadType, "none">; color: string }>();
+    combos.set(markerId("triangle", "#2563eb"), { type: "triangle", color: "#2563eb" });
+    for (const edge of page.edges) {
+      if (edge.startArrowType !== "none") combos.set(markerId(edge.startArrowType, edge.strokeColor), { type: edge.startArrowType, color: edge.strokeColor });
+      if (edge.endArrowType !== "none") combos.set(markerId(edge.endArrowType, edge.strokeColor), { type: edge.endArrowType, color: edge.strokeColor });
+    }
+    return Array.from(combos.values());
   }, [page.edges]);
+
+  const dashArrayFor = useCallback(
+    (strokeStyle: WhiteboardEdge["strokeStyle"], strokeWidth: number): string | undefined => {
+      if (strokeStyle === "solid") return undefined;
+      if (strokeStyle === "dotted") return `${(strokeWidth * 0.4) / zoom},${(strokeWidth * 1.6 + 3) / zoom}`;
+      return `${8 / zoom},${6 / zoom}`;
+    },
+    [zoom]
+  );
 
   return (
     <div
@@ -622,9 +669,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             the svg itself has no intrinsic size; each path uses absolute doc-space coordinates. */}
         <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none" }} width={1} height={1}>
           <defs>
-            {markerColors.map((color) => (
-              <marker key={color} id={markerIdForColor(color)} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
-                <path d="M0,0 L8,4 L0,8 Z" fill={color} />
+            {markerCombos.map(({ type, color }) => (
+              <marker key={markerId(type, color)} id={markerId(type, color)} markerWidth="10" markerHeight="10" refX={MARKER_REF[type]} refY="5" orient="auto" markerUnits="userSpaceOnUse">
+                {markerContentFor(type, color)}
               </marker>
             ))}
           </defs>
@@ -656,9 +703,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   fill="none"
                   stroke={edge.strokeColor}
                   strokeWidth={edge.strokeWidth / zoom}
-                  strokeDasharray={edge.strokeStyle === "dashed" ? `${8 / zoom},${6 / zoom}` : undefined}
-                  markerEnd={edge.endArrow ? `url(#${markerIdForColor(edge.strokeColor)})` : undefined}
-                  markerStart={edge.startArrow ? `url(#${markerIdForColor(edge.strokeColor)})` : undefined}
+                  strokeDasharray={dashArrayFor(edge.strokeStyle, edge.strokeWidth)}
+                  strokeLinecap={edge.strokeStyle === "dotted" ? "round" : "butt"}
+                  markerEnd={edge.endArrowType !== "none" ? `url(#${markerId(edge.endArrowType, edge.strokeColor)})` : undefined}
+                  markerStart={edge.startArrowType !== "none" ? `url(#${markerId(edge.startArrowType, edge.strokeColor)})` : undefined}
                   style={{ pointerEvents: "none" }}
                 />
                 {edge.label && (
@@ -676,7 +724,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             );
           })}
           {connectorPreview && (
-            <path d={buildEdgePath(connectorPreview.from, connectorPreview.to, "orthogonal")} fill="none" stroke="#2563eb" strokeWidth={2 / zoom} strokeDasharray={`${6 / zoom},${4 / zoom}`} markerEnd={`url(#${markerIdForColor("#2563eb")})`} />
+            <path d={buildEdgePath(connectorPreview.from, connectorPreview.to, "orthogonal")} fill="none" stroke="#2563eb" strokeWidth={2 / zoom} strokeDasharray={`${6 / zoom},${4 / zoom}`} markerEnd={`url(#${markerId("triangle", "#2563eb")})`} />
           )}
           {freehandPreview && freehandPreview.length > 1 && (
             <path d={smoothedPathD(freehandPreview)} fill="none" stroke="#111111" strokeWidth={2.5 / zoom} strokeLinecap="round" strokeLinejoin="round" />
@@ -691,7 +739,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           const isEditing = editingNodeId === node.id;
           const isConnectable = CONNECTABLE_SHAPES.has(node.shapeType);
           const showConnectionDots = isConnectable && (isHovered || selected || connectorArmed);
-          const outline = shapeOutlineFor(node.shapeType, node.width, node.height);
+          const outline = shapeOutlineFor(node.shapeType, node.width, node.height, { sides: node.sides, starPoints: node.starPoints, starInnerRadiusRatio: node.starInnerRadiusRatio });
           return (
             <div
               key={node.id}
@@ -777,6 +825,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               ) : outline.kind === "polygon" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
                   <polygon points={outline.points.map(([px, py]) => `${px},${py}`).join(" ")} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
+                  {outline.innerLines?.map((line, i) => (
+                    <polyline key={i} points={line.map(([px, py]) => `${px},${py}`).join(" ")} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
+                  ))}
+                </svg>
+              ) : outline.kind === "path" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  <path d={outline.d} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
                 </svg>
               ) : null}
 
