@@ -26,7 +26,7 @@ import {
   IoTrashOutline,
 } from "react-icons/io5";
 import useWhiteboardStore from "../../hooks/useWhiteboardStore";
-import { ArrowheadType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode, WhiteboardPage, WhiteboardShapeType } from "../../utils/whiteboardTypes";
+import { ArrowheadType, LINE_ONLY_SHAPES, WhiteboardAnchorSide, WhiteboardEdge, WhiteboardNode, WhiteboardPage, WhiteboardShapeType } from "../../utils/whiteboardTypes";
 import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import { computeContentBounds, renderWhiteboardToCanvas, shapeOutlineFor, CYLINDER_CAP_RATIO } from "../../handlers/whiteboardHandlers";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
@@ -386,6 +386,12 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [connectorArmed, setConnectorArmed] = useState(false);
   const [armedConnectorOverrides, setArmedConnectorOverrides] = useState<Partial<WhiteboardEdge> | undefined>(undefined);
   const [laserArmed, setLaserArmed] = useState(false);
+  // The shape-picker popover that opens after clicking one of a node's hover arrows (see
+  // WhiteboardCanvas.tsx's HoverConnectArrows) - lets you choose WHICH shape to add and connect,
+  // rather than always cloning the hovered node's own shape type. `x`/`y` are viewport (client)
+  // coordinates from the click that opened it, so the popover can anchor itself near the arrow
+  // regardless of where on the (possibly panned/zoomed) canvas it was.
+  const [quickConnectPicker, setQuickConnectPicker] = useState<{ nodeId: string; side: Exclude<WhiteboardAnchorSide, "auto">; x: number; y: number } | null>(null);
   const [shapesMenuOpen, setShapesMenuOpen] = useState(false);
   const [arrowsMenuOpen, setArrowsMenuOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -410,6 +416,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     document.addEventListener("click", close);
     return () => document.removeEventListener("click", close);
   }, [arrowsMenuOpen]);
+
+  useEffect(() => {
+    if (!quickConnectPicker) return;
+    const close = () => setQuickConnectPicker(null);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [quickConnectPicker]);
 
   // Fits the view to whichever page is active, every time it changes - covers both "a whiteboard
   // just finished loading" and "the user switched pages" in one code path, since either way the
@@ -807,6 +820,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           connectorArmed={connectorArmed}
           armedConnectorOverrides={armedConnectorOverrides}
           laserArmed={laserArmed}
+          onQuickConnectArrowClick={(nodeId, side, point) => setQuickConnectPicker({ nodeId, side, x: point.x, y: point.y })}
         />
         <WhiteboardStylePanel
           selectedNodes={selectedNodes}
@@ -826,6 +840,43 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onSendToBack={() => handleReorder(false)}
         />
       </div>
+
+      {/* Quick-connect shape picker - opens after clicking one of a node's hover arrows (see
+          WhiteboardCanvas.tsx's HoverConnectArrows), anchored near the click via `fixed` viewport
+          coordinates rather than the toolbar's own popover positioning since it can open anywhere
+          on the canvas, not just under a toolbar button. Reuses the exact same preset groups/preview
+          the Shapes toolbar popover does, so "what shapes are offered" never has to be kept in sync
+          across two separate lists. */}
+      {quickConnectPicker && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="fixed z-30 w-[280px] max-h-[70vh] overflow-y-auto bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl p-2 grid grid-cols-3 gap-1"
+          style={{
+            left: Math.max(8, Math.min(quickConnectPicker.x, window.innerWidth - 290)),
+            top: Math.max(8, Math.min(quickConnectPicker.y, window.innerHeight - 340)),
+          }}
+        >
+          {SHAPE_PRESET_GROUPS.map((group) => (
+            <React.Fragment key={group.label}>
+              <p className="col-span-3 text-[10px] font-medium uppercase tracking-wide text-gray-400 dark:text-neutral-500 px-1 pt-1 first:pt-0">{group.label}</p>
+              {group.presets.map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  onClick={() => {
+                    canvasRef.current?.placeConnectedShape(quickConnectPicker.nodeId, quickConnectPicker.side, preset.type, preset.overrides);
+                    setQuickConnectPicker(null);
+                  }}
+                  className="flex flex-col items-center gap-0.5 p-1.5 rounded-md hover:bg-gray-100 dark:hover:bg-neutral-700"
+                >
+                  <ShapePresetPreview preset={preset} />
+                  <span className="text-[10px] text-gray-500 dark:text-neutral-400">{preset.label}</span>
+                </button>
+              ))}
+            </React.Fragment>
+          ))}
+        </div>
+      )}
 
       {/* Page tab strip - draw.io's own Page-1/Page-2/+ bar. Always shown, even with just one page,
           so "Add page" is always discoverable rather than appearing only once a second page exists. */}

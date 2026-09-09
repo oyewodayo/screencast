@@ -141,6 +141,10 @@ export interface WhiteboardCanvasHandle {
   zoomBy: (factor: number) => void;
   resetView: () => void;
   fitToContent: (bounds: BoundsBox) => void;
+  // Called by WhiteboardEditor.tsx once the user picks a shape from the quick-connect popover that
+  // opens after clicking one of a node's hover arrows (see onQuickConnectArrowClick below) - builds
+  // and places that shape, connected to the source node, in one step.
+  placeConnectedShape: (sourceNodeId: string, side: Exclude<WhiteboardAnchorSide, "auto">, shapeType: WhiteboardShapeType, overrides?: Partial<WhiteboardNode>) => void;
 }
 
 interface WhiteboardCanvasProps {
@@ -183,6 +187,10 @@ interface WhiteboardCanvasProps {
   // actual diagram. Unlike every other tool here, it has no document-side effect at all: no node,
   // no edge, nothing that touches undo history - see this file's own laserTrail state.
   laserArmed: boolean;
+  // A hover arrow (see HoverConnectArrows below) was clicked - WhiteboardEditor.tsx opens its
+  // quick-connect shape-picker popover near `screenPoint` in response; the actual placement happens
+  // later, once a shape is picked, via the WhiteboardCanvasHandle's placeConnectedShape.
+  onQuickConnectArrowClick: (nodeId: string, side: Exclude<WhiteboardAnchorSide, "auto">, screenPoint: { x: number; y: number }) => void;
 }
 
 function clampZoom(z: number): number {
@@ -269,6 +277,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   connectorArmed,
   armedConnectorOverrides,
   laserArmed,
+  onQuickConnectArrowClick,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
@@ -386,35 +395,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       }
     },
     [zoom, pan, zoomAtClientPoint, onPanChange]
-  );
-
-  useImperativeHandle(
-    ref,
-    () => ({
-      zoomBy: (factor: number) => {
-        const rect = containerRef.current?.getBoundingClientRect();
-        const cx = rect ? rect.left + rect.width / 2 : 0;
-        const cy = rect ? rect.top + rect.height / 2 : 0;
-        zoomAtClientPoint(zoom * factor, cx, cy);
-      },
-      resetView: () => {
-        onZoomChange(1);
-        onPanChange({ x: 0, y: 0 });
-      },
-      fitToContent: (bounds: BoundsBox) => {
-        const rect = containerRef.current?.getBoundingClientRect();
-        if (!rect || rect.width === 0 || rect.height === 0) return;
-        const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
-        const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
-        const nextZoom = clampZoom(Math.min(rect.width / contentWidth, rect.height / contentHeight));
-        onZoomChange(nextZoom);
-        onPanChange({
-          x: (rect.width - contentWidth * nextZoom) / 2 - bounds.minX * nextZoom,
-          y: (rect.height - contentHeight * nextZoom) / 2 - bounds.minY * nextZoom,
-        });
-      },
-    }),
-    [zoom, zoomAtClientPoint, onZoomChange, onPanChange]
   );
 
   // ---- Delete / Escape -------------------------------------------------------------------------
@@ -606,31 +586,78 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     [onEditEdge]
   );
 
-  // How far (doc units) a cloned shape lands from the one it was cloned off of - see
-  // handleQuickClone below.
+  // How far (doc units) a hover-arrow-placed shape lands from the node it was placed off of - see
+  // placeConnectedShape (exposed on the imperative handle below).
   const QUICK_CLONE_GAP = 80;
 
-  // The hover-arrow "quick clone + connect" gesture (see HoverConnectArrows) - a full copy of
-  // `node` (same size/shapeType/style, blank text) placed just past it in `side`'s direction, with
-  // a fresh default-styled edge connecting the original to the copy. Both added as one undo step
-  // (onAddNodeWithEdge) since from the user's perspective clicking one arrow is a single action.
-  const handleQuickClone = useCallback(
-    (node: WhiteboardNode, side: Exclude<WhiteboardAnchorSide, "auto">) => {
-      const now = Date.now();
-      const offset =
+  // The hover-arrow "connect a new shape" gesture (see HoverConnectArrows and
+  // WhiteboardEditor.tsx's quick-connect picker popover, which is what actually calls this via the
+  // imperative handle once the user picks a shape) - builds a fresh default-styled node of
+  // `shapeType` (own default size, not copied from the source node - a Hourglass placed off a wide
+  // Rectangle shouldn't be stretched into the Rectangle's own proportions), positioned just past
+  // `sourceNodeId` in `side`'s direction and centered on it along the other axis, plus a
+  // fresh default-styled edge connecting the two. Both added as one undo step (onAddNodeWithEdge)
+  // since from the user's perspective picking one shape from the popover is a single action.
+  const placeConnectedShape = useCallback(
+    (sourceNodeId: string, side: Exclude<WhiteboardAnchorSide, "auto">, shapeType: WhiteboardShapeType, overrides?: Partial<WhiteboardNode>) => {
+      const source = page.nodes.find((n) => n.id === sourceNodeId);
+      if (!source) return;
+      const base = createDefaultWhiteboardNode(crypto.randomUUID(), shapeType, 0, 0, {
+        sides: overrides?.sides,
+        starPoints: overrides?.starPoints,
+        starInnerRadiusRatio: overrides?.starInnerRadiusRatio,
+        waveStyle: overrides?.waveStyle,
+        waveCycles: overrides?.waveCycles,
+        angleDegrees: overrides?.angleDegrees,
+        angleRay1Length: overrides?.angleRay1Length,
+        angleRay2Length: overrides?.angleRay2Length,
+      });
+      const merged: WhiteboardNode = { ...base, ...overrides };
+      const sourceCenter = nodeCenter(source);
+      const { x, y } =
         side === "right"
-          ? { x: node.width + QUICK_CLONE_GAP, y: 0 }
+          ? { x: source.x + source.width + QUICK_CLONE_GAP, y: sourceCenter.y - merged.height / 2 }
           : side === "left"
-          ? { x: -(node.width + QUICK_CLONE_GAP), y: 0 }
+          ? { x: source.x - QUICK_CLONE_GAP - merged.width, y: sourceCenter.y - merged.height / 2 }
           : side === "bottom"
-          ? { x: 0, y: node.height + QUICK_CLONE_GAP }
-          : { x: 0, y: -(node.height + QUICK_CLONE_GAP) };
-      const newNode: WhiteboardNode = { ...node, id: crypto.randomUUID(), x: node.x + offset.x, y: node.y + offset.y, text: "", createdAt: now, updatedAt: now };
-      const edge = createDefaultWhiteboardEdge(crypto.randomUUID(), { nodeId: node.id, anchor: "auto" }, { nodeId: newNode.id, anchor: "auto" });
+          ? { x: sourceCenter.x - merged.width / 2, y: source.y + source.height + QUICK_CLONE_GAP }
+          : { x: sourceCenter.x - merged.width / 2, y: source.y - QUICK_CLONE_GAP - merged.height };
+      const newNode: WhiteboardNode = { ...merged, x, y };
+      const edge = createDefaultWhiteboardEdge(crypto.randomUUID(), { nodeId: source.id, anchor: "auto" }, { nodeId: newNode.id, anchor: "auto" });
       onAddNodeWithEdge(newNode, edge);
       onSelectionChange(new Set([newNode.id]), new Set());
     },
-    [onAddNodeWithEdge, onSelectionChange]
+    [page.nodes, onAddNodeWithEdge, onSelectionChange]
+  );
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      zoomBy: (factor: number) => {
+        const rect = containerRef.current?.getBoundingClientRect();
+        const cx = rect ? rect.left + rect.width / 2 : 0;
+        const cy = rect ? rect.top + rect.height / 2 : 0;
+        zoomAtClientPoint(zoom * factor, cx, cy);
+      },
+      resetView: () => {
+        onZoomChange(1);
+        onPanChange({ x: 0, y: 0 });
+      },
+      fitToContent: (bounds: BoundsBox) => {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect || rect.width === 0 || rect.height === 0) return;
+        const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
+        const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
+        const nextZoom = clampZoom(Math.min(rect.width / contentWidth, rect.height / contentHeight));
+        onZoomChange(nextZoom);
+        onPanChange({
+          x: (rect.width - contentWidth * nextZoom) / 2 - bounds.minX * nextZoom,
+          y: (rect.height - contentHeight * nextZoom) / 2 - bounds.minY * nextZoom,
+        });
+      },
+      placeConnectedShape,
+    }),
+    [zoom, zoomAtClientPoint, onZoomChange, onPanChange, placeConnectedShape]
   );
 
   // ---- Pointer move / up on the container --------------------------------------------------------
@@ -1148,9 +1175,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           const isEditing = editingNodeId === node.id;
           const isConnectable = CONNECTABLE_SHAPES.has(node.shapeType);
           const showConnectionDots = isConnectable && (isHovered || selected || connectorArmed);
-          // Hover-arrow "quick clone + connect" (see handleQuickClone) - hidden while any tool is
-          // armed or a connector drag is underway so it doesn't compete with that other intent, and
-          // (like the connection dots) only on shapes an edge can actually anchor to.
+          // Hover-arrow "pick a connected shape" (see onQuickConnectArrowClick/placeConnectedShape)
+          // - hidden while any tool is armed or a connector drag is underway so it doesn't compete
+          // with that other intent, and (like the connection dots) only on shapes an edge can
+          // actually anchor to.
           const showQuickConnectArrows = isConnectable && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
           const outline = shapeOutlineFor(node.shapeType, node.width, node.height, {
             sides: node.sides,
@@ -1418,11 +1446,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       type="button"
                       style={style}
                       className="rounded-full bg-blue-50 border border-blue-300 text-blue-500 hover:bg-blue-500 hover:text-white hover:border-blue-500 flex items-center justify-center leading-none"
-                      title="Click to add a connected shape"
+                      title="Click to pick a connected shape"
                       onPointerDown={(e) => e.stopPropagation()}
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleQuickClone(node, side);
+                        onQuickConnectArrowClick(node.id, side, { x: e.clientX, y: e.clientY });
                       }}
                     >
                       <span style={{ fontSize: 13 / zoom }}>{glyph}</span>
