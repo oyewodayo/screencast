@@ -69,6 +69,14 @@ export type WhiteboardShapeType =
   | "pieChart"
   | "scatterPlot"
   | "functionPlot"
+  // A typeset math formula (rendered via KaTeX - see whiteboardHandlers.ts's paintEquation and
+  // WhiteboardCanvas.tsx's own KaTeX rendering) - reuses WhiteboardNode.text to hold the raw LaTeX
+  // SOURCE (e.g. "E = mc^2"), the same field every other shape's label already lives in, rather than
+  // a separate field: double-clicking to edit shows/edits the raw source exactly like editing any
+  // other shape's label already works, and when not editing that same text renders as typeset math
+  // instead of a plain string. Has no shape body at all - same treatment as "text" (no border/fill,
+  // just the formula itself), not one of the "chart" shapes above.
+  | "equation"
   | "text"
   | "freehand";
 
@@ -423,6 +431,7 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   pieChart: { width: 190, height: 190 },
   scatterPlot: { width: 220, height: 160 },
   functionPlot: { width: 200, height: 160 },
+  equation: { width: 220, height: 70 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
 };
@@ -464,8 +473,12 @@ export function createDefaultWhiteboardNode(
     y: y - size.height / 2,
     width: size.width,
     height: size.height,
-    text: "",
-    fillColor: shapeType === "text" || shapeType === "freehand" || LINE_ONLY_SHAPES.has(shapeType) ? null : "#ffffff",
+    // "equation" gets a real starting formula rather than blank - an empty math shape has nothing
+    // to double-click-and-discover the way an empty text label's own placeholder hint already
+    // covers, so showing something immediately is worth the (easily deleted) default text this is
+    // the one shapeType where every other one intentionally starts blank.
+    text: shapeType === "equation" ? "E = mc^2" : "",
+    fillColor: shapeType === "text" || shapeType === "equation" || shapeType === "freehand" || LINE_ONLY_SHAPES.has(shapeType) ? null : "#ffffff",
     strokeColor: shapeType === "freehand" ? "#111111" : "#000000",
     strokeWidth: 2,
     cornerRadius: 0,

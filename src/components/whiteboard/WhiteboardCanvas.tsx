@@ -24,6 +24,7 @@
 // editEdge/addNode call) on pointer release - the same "stage locally, commit once" discipline
 // BoardCanvas.tsx's own liveImages uses, so a whole gesture is exactly one undo step.
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import katex from "katex";
 import {
   ArrowheadType,
   createDefaultWhiteboardEdge,
@@ -252,6 +253,33 @@ function smoothedPathD(points: { x: number; y: number }[]): string {
   const last = points[points.length - 1];
   d += ` L ${last.x} ${last.y}`;
   return d;
+}
+
+// Renders `source` (an "equation" node's WhiteboardNode.text, holding raw LaTeX - see that
+// shapeType's own doc comment) as real typeset math via KaTeX, memoized so retyping-unrelated
+// re-renders of the parent (panning, other nodes moving, etc.) don't re-run KaTeX every frame.
+// throwOnError:false makes malformed LaTeX render as an inline error message instead of throwing,
+// which matters here specifically because this runs on every keystroke while the source is still
+// mid-edit and often momentarily invalid (an unclosed \frac{, say) - throwing would crash the
+// canvas rather than just showing a red error span until the syntax is finished.
+function EquationDisplay({ source, fontSize, color }: { source: string; fontSize: number; color: string }) {
+  const html = useMemo(() => {
+    try {
+      return katex.renderToString(source, { throwOnError: false, displayMode: true, output: "html" });
+    } catch {
+      return "";
+    }
+  }, [source]);
+  return (
+    <div
+      // overflow visible rather than this file's usual text-label clipping - cutting a typeset
+      // formula off mid-glyph (an integral sign missing its bottom half, say) reads as broken in a
+      // way a plain truncated sentence doesn't, so a formula too big for its box is allowed to spill
+      // past the edges instead.
+      style={{ fontSize, color, lineHeight: 1.2 }}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
 }
 
 const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProps>(({
@@ -1271,7 +1299,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     boxSizing: "border-box",
                   }}
                 />
-              ) : node.shapeType === "text" ? (
+              ) : node.shapeType === "text" || node.shapeType === "equation" ? (
                 isHovered || selected ? <div style={{ position: "absolute", inset: 0, border: "1px dashed #9ca3af" }} /> : null
               ) : outline.kind === "cylinder" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
@@ -1330,7 +1358,18 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 </svg>
               ) : null}
 
-              {!isEditing && node.text && (
+              {!isEditing && node.text && node.shapeType === "equation" && (
+                <div
+                  className="absolute inset-0 flex px-2 overflow-visible pointer-events-none"
+                  style={{
+                    alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
+                    justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                  }}
+                >
+                  <EquationDisplay source={node.text} fontSize={node.fontSize} color={node.fontColor} />
+                </div>
+              )}
+              {!isEditing && node.text && node.shapeType !== "equation" && (
                 <div
                   className="absolute inset-0 flex px-2 overflow-hidden whitespace-pre-wrap break-words"
                   style={{
@@ -1349,8 +1388,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   <span>{node.text}</span>
                 </div>
               )}
-              {!isEditing && !node.text && node.shapeType === "text" && (isHovered || selected) && (
-                <div className="absolute inset-0 flex items-center justify-center text-neutral-400 text-xs pointer-events-none">Double-click to type</div>
+              {!isEditing && !node.text && (node.shapeType === "text" || node.shapeType === "equation") && (isHovered || selected) && (
+                <div className="absolute inset-0 flex items-center justify-center text-neutral-400 text-xs pointer-events-none">
+                  {node.shapeType === "equation" ? "Double-click to type LaTeX" : "Double-click to type"}
+                </div>
               )}
 
               {isEditing && (
@@ -1364,7 +1405,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
                     textAlign: node.textAlign,
                     color: node.fontColor,
-                    fontFamily: node.fontFamily,
+                    // Editing shows the raw LaTeX SOURCE, not typeset math - a monospace font here
+                    // (regardless of the node's own fontFamily, which only applies once rendered)
+                    // makes braces/backslashes/subscript carets easy to see and count while typing.
+                    fontFamily: node.shapeType === "equation" ? "monospace" : node.fontFamily,
                     fontSize: node.fontSize,
                     fontWeight: node.fontWeight,
                     fontStyle: node.fontStyle,

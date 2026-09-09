@@ -267,7 +267,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             {selectedNodes.length > 1 ? `${selectedNodes.length} shapes` : "Shape"}
           </p>
 
-          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
+          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "equation" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
             <Field label="Fill">
               <input
                 type="color"
@@ -595,19 +595,25 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
 
           {selectedNodes.some((n) => n.shapeType !== "freehand") && (
             <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">
-              <Field label="Font">
-                <select
-                  value={selectedNodes[0].fontFamily}
-                  onChange={(e) => updateNodes({ fontFamily: e.target.value })}
-                  className="w-28 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
-                >
-                  {FONT_FAMILY_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </Field>
+              {/* Font family/Bold/Italic/Underline are meaningless for "equation" - KaTeX typesets
+                  with its own math font regardless, so these controls would sit there doing nothing
+                  visible if shown. Font size/color and Align DO still apply (see EquationDisplay/
+                  paintEquation), so only those stay visible for it. */}
+              {selectedNodes.every((n) => n.shapeType !== "equation") && (
+                <Field label="Font">
+                  <select
+                    value={selectedNodes[0].fontFamily}
+                    onChange={(e) => updateNodes({ fontFamily: e.target.value })}
+                    className="w-28 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  >
+                    {FONT_FAMILY_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              )}
               <Field label="Font size">
                 <input
                   type="number"
@@ -621,32 +627,34 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               <Field label="Font color">
                 <input type="color" value={selectedNodes[0].fontColor} onChange={(e) => updateNodes({ fontColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
               </Field>
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-gray-600 dark:text-neutral-300">Style</span>
-                <div className="flex gap-1">
-                  <button
-                    type="button"
-                    onClick={() => updateNodes({ fontWeight: selectedNodes[0].fontWeight === "bold" ? "normal" : "bold" })}
-                    className={`px-2 py-1 rounded font-bold text-xs ${selectedNodes[0].fontWeight === "bold" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                  >
-                    B
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => updateNodes({ fontStyle: selectedNodes[0].fontStyle === "italic" ? "normal" : "italic" })}
-                    className={`p-1.5 rounded ${selectedNodes[0].fontStyle === "italic" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                  >
-                    <TbItalic size={14} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => updateNodes({ textDecoration: selectedNodes[0].textDecoration === "underline" ? "none" : "underline" })}
-                    className={`p-1.5 rounded ${selectedNodes[0].textDecoration === "underline" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                  >
-                    <TbUnderline size={14} />
-                  </button>
+              {selectedNodes.every((n) => n.shapeType !== "equation") && (
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-600 dark:text-neutral-300">Style</span>
+                  <div className="flex gap-1">
+                    <button
+                      type="button"
+                      onClick={() => updateNodes({ fontWeight: selectedNodes[0].fontWeight === "bold" ? "normal" : "bold" })}
+                      className={`px-2 py-1 rounded font-bold text-xs ${selectedNodes[0].fontWeight === "bold" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
+                    >
+                      B
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateNodes({ fontStyle: selectedNodes[0].fontStyle === "italic" ? "normal" : "italic" })}
+                      className={`p-1.5 rounded ${selectedNodes[0].fontStyle === "italic" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
+                    >
+                      <TbItalic size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateNodes({ textDecoration: selectedNodes[0].textDecoration === "underline" ? "none" : "underline" })}
+                      className={`p-1.5 rounded ${selectedNodes[0].textDecoration === "underline" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
+                    >
+                      <TbUnderline size={14} />
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
               <div className="flex items-center justify-between">
                 <span className="text-xs text-gray-600 dark:text-neutral-300">Align</span>
                 <div className="flex gap-1">

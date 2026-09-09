@@ -10,6 +10,7 @@
 // active (see useWhiteboardStore.ts), and export/bounds/undo are all naturally per-page too since
 // draw.io-style pages are independent canvases, not one shared coordinate space.
 
+import katex from "katex";
 import {
   ArrowheadType,
   DEFAULT_CHART_DATA,
@@ -1656,7 +1657,40 @@ function paintNodeText(ctx: CanvasRenderingContext2D, node: WhiteboardNode): voi
   ctx.restore();
 }
 
-function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+// Builds a rasterized image of `node`'s KaTeX-typeset formula (WhiteboardNode.text, holding the raw
+// LaTeX source - see the "equation" shapeType's own doc comment) via an SVG <foreignObject>, the
+// standard way to get real HTML/CSS layout (which is how KaTeX itself renders - not SVG paths, not
+// something Path2D/ctx.fillText could reproduce) into a Canvas2D bitmap: serialize an SVG wrapping
+// the KaTeX HTML output, load it as an <img> (an inherently async step - there is no synchronous way
+// to rasterize SVG/HTML in a browser), then this is just ctx.drawImage like any other image. Relies
+// on katex/dist/katex.min.css already being loaded in the document (see WhiteboardEditor.tsx's own
+// import of it) for the math fonts to resolve correctly - the one place in this whole file that
+// depends on something outside its own node-local drawing calls.
+async function paintEquation(ctx: CanvasRenderingContext2D, node: WhiteboardNode): Promise<void> {
+  const source = node.text?.trim();
+  if (!source) return;
+  let html: string;
+  try {
+    html = katex.renderToString(source, { throwOnError: false, displayMode: true, output: "html" });
+  } catch {
+    return; // throwOnError:false already covers malformed LaTeX; this only guards a truly unexpected throw
+  }
+  const justify = node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center";
+  const align = node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center";
+  const svgMarkup = `<svg xmlns="http://www.w3.org/2000/svg" width="${node.width}" height="${node.height}"><foreignObject width="100%" height="100%"><div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;display:flex;align-items:${align};justify-content:${justify};box-sizing:border-box;padding:0 8px;font-size:${node.fontSize}px;color:${node.fontColor};overflow:visible;">${html}</div></foreignObject></svg>`;
+  const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
+  const img = new Image();
+  await new Promise<void>((resolve) => {
+    img.onload = () => resolve();
+    // A single malformed export shouldn't hang the whole PNG - drawImage below just no-ops on a
+    // never-loaded image.
+    img.onerror = () => resolve();
+    img.src = dataUrl;
+  });
+  ctx.drawImage(img, 0, 0, node.width, node.height);
+}
+
+async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): Promise<void> {
   ctx.save();
   ctx.translate(node.x, node.y);
   // Matches WhiteboardCanvas.tsx's own `transform: rotate(deg); transform-origin: center` - rotate
@@ -1689,6 +1723,8 @@ function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
       const startDeg = (Math.atan2(first.y - afterFirst.y, first.x - afterFirst.x) * 180) / Math.PI;
       drawArrowhead(ctx, node.startArrowType ?? "none", first.x, first.y, startDeg, node.strokeColor, node.strokeWidth);
     }
+  } else if (node.shapeType === "equation") {
+    await paintEquation(ctx, node);
   } else {
     if (node.shapeType !== "text") paintShapeBody(ctx, node);
     paintNodeText(ctx, node);
@@ -1793,7 +1829,11 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
 // - the Whiteboard equivalent of boardHandlers.ts's renderBoardToCanvas, used by WhiteboardEditor's
 // "Export PNG" action (current page only) and (with `maxDimension` set) its home-grid thumbnail,
 // same "one renderer, two call sites" convention as BoardEditor.tsx's own renderOffscreen.
-export function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimension?: number): HTMLCanvasElement {
+// Async only because of "equation" nodes (see paintEquation's own doc comment for why rasterizing
+// typeset math has no synchronous path) - every existing caller already awaits this inside an async
+// handler (export/save-as/thumbnail), so this didn't need to change anything at those call sites
+// beyond adding `await`.
+export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimension?: number): Promise<HTMLCanvasElement> {
   const bounds = computeContentBounds(page);
   const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
   const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
@@ -1813,7 +1853,9 @@ export function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimension?: nu
 
   const nodesById = new Map(page.nodes.map((n) => [n.id, n]));
   for (const edge of page.edges) renderEdge(ctx, edge, nodesById);
-  for (const node of page.nodes) renderNode(ctx, node);
+  // Sequential awaits, not Promise.all - every node shares this one ctx (save/translate/restore),
+  // so two renderNode calls running concurrently would interleave their transform stacks.
+  for (const node of page.nodes) await renderNode(ctx, node);
 
   return canvas;
 }

@@ -7,6 +7,11 @@
 // the two IO actions that aren't part of the store's own load/edit/autosave lifecycle: exporting a
 // flattened PNG of the current page and saving the home-grid thumbnail on the way back out.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// Global (loaded once for the whole whiteboard feature, not per-node) - the math glyph fonts/spacing
+// rules "equation" nodes need, in both WhiteboardCanvas.tsx's live KaTeX rendering and
+// whiteboardHandlers.ts's PNG-export rasterization (which relies on this already being loaded in the
+// document by the time it runs - see paintEquation's own doc comment).
+import "katex/dist/katex.min.css";
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
@@ -14,6 +19,7 @@ import {
   IoArrowBack,
   IoArrowRedo,
   IoArrowUndo,
+  IoCalculatorOutline,
   IoChevronDown,
   IoContractOutline,
   IoCopyOutline,
@@ -532,7 +538,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     setIsExporting(true);
     setExportError(null);
     try {
-      const canvas = renderWhiteboardToCanvas(page);
+      const canvas = await renderWhiteboardToCanvas(page);
       const bytes = await canvasToPngBytes(canvas);
       await invoke<string>("export_whiteboard_png", { whiteboardName: doc.name, bytes: Array.from(bytes) });
     } catch (err) {
@@ -548,7 +554,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     setIsExporting(true);
     setExportError(null);
     try {
-      const canvas = renderWhiteboardToCanvas(page);
+      const canvas = await renderWhiteboardToCanvas(page);
       const bytes = await canvasToPngBytes(canvas);
       const safeName = doc.name.trim().replace(/[^a-zA-Z0-9 _-]/g, "_") || "Whiteboard";
       const destPath = await saveFileDialog({ defaultPath: `${safeName}.png`, filters: [{ name: "PNG Image", extensions: ["png"] }] });
@@ -566,7 +572,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     store.flushSave();
     if (page) {
       try {
-        const thumb = renderWhiteboardToCanvas(page, THUMBNAIL_MAX_DIMENSION);
+        const thumb = await renderWhiteboardToCanvas(page, THUMBNAIL_MAX_DIMENSION);
         const bytes = await canvasToPngBytes(thumb);
         await invoke("save_whiteboard_thumbnail", { whiteboardId, bytes: Array.from(bytes) });
       } catch (err) {
@@ -704,6 +710,21 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           }}
         >
           <span className="font-semibold text-sm">A</span>
+        </ToolbarButton>
+        <ToolbarButton
+          title="Equation (LaTeX)"
+          active={armedShapeType === "equation"}
+          onClick={() => {
+            setLaserArmed(false);
+            setShapesMenuOpen(false);
+            setArrowsMenuOpen(false);
+            setConnectorArmed(false);
+            setArmedConnectorOverrides(undefined);
+            setArmedNodeOverrides(undefined);
+            setArmedShapeType((prev) => (prev === "equation" ? null : "equation"));
+          }}
+        >
+          <IoCalculatorOutline size={18} />
         </ToolbarButton>
         <ToolbarButton
           title="Pen (freehand)"
