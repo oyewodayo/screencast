@@ -52,6 +52,8 @@ const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
 const GRID_SIZE = 24;
 const HANDLE_SCREEN_SIZE = 9;
+// On-screen distance (CSS px, pre-zoom-correction) from a node's top edge out to its rotate handle.
+const ROTATE_HANDLE_GAP = 22;
 const CONNECTION_DOT_SCREEN_SIZE = 9;
 const HIT_STROKE_SCREEN_WIDTH = 14;
 // Minimum on-screen movement (CSS px, pre-zoom-correction) between two recorded freehand points -
@@ -70,6 +72,10 @@ const CONNECTABLE_SHAPES = new Set<WhiteboardShapeType>(["rectangle", "ellipse",
 type Interaction =
   | { mode: "move"; ids: string[]; startClientX: number; startClientY: number; startNodes: WhiteboardNode[] }
   | { mode: "resize"; id: string; corner: ResizeCorner; startClientX: number; startClientY: number; startNode: WhiteboardNode }
+  // Angle is recomputed fresh from the pointer's current position each move (pointer-to-center
+  // angle, not a delta from drag start), so this only needs the node being rotated and its center -
+  // no startClientX/Y the way move/resize need for a delta-based drag.
+  | { mode: "rotate"; id: string; startNode: WhiteboardNode; center: { x: number; y: number } }
   | { mode: "marquee"; startDocX: number; startDocY: number }
   | { mode: "pan"; startClientX: number; startClientY: number; startPan: { x: number; y: number } }
   | { mode: "freehand"; points: { x: number; y: number }[]; lastClientX: number; lastClientY: number }
@@ -371,6 +377,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       const active = document.activeElement;
       const isTyping = active instanceof HTMLElement && (active.isContentEditable || active.tagName === "INPUT" || active.tagName === "TEXTAREA");
       if (isTyping) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        onSelectionChange(new Set(page.nodes.map((n) => n.id)), new Set(page.edges.map((ed) => ed.id)));
+        return;
+      }
       if (e.key === "Delete" || e.key === "Backspace") {
         if (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0) return;
         e.preventDefault();
@@ -426,6 +437,16 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       e.stopPropagation();
       onSelectionChange(new Set([node.id]), new Set());
       interactionRef.current = { mode: "resize", id: node.id, corner, startClientX: e.clientX, startClientY: e.clientY, startNode: node };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  const beginRotateNode = useCallback(
+    (node: WhiteboardNode, e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      interactionRef.current = { mode: "rotate", id: node.id, startNode: node, center: nodeCenter(node) };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
     [onSelectionChange]
@@ -607,6 +628,18 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         return;
       }
 
+      if (interaction.mode === "rotate") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        // atan2's 0deg points along +x (screen-right); +90 rotates that to point along -y
+        // (screen-up) instead, matching the handle's own resting position directly above the node.
+        let deg = (Math.atan2(cur.y - interaction.center.y, cur.x - interaction.center.x) * 180) / Math.PI + 90;
+        if (e.shiftKey) deg = Math.round(deg / 15) * 15;
+        deg = ((deg % 360) + 360) % 360;
+        const rotated: WhiteboardNode = { ...interaction.startNode, rotation: deg };
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? rotated : n)));
+        return;
+      }
+
       if (interaction.mode === "waypoint") {
         const cur = clientToDoc(e.clientX, e.clientY);
         const next = [...interaction.startWaypoints];
@@ -690,6 +723,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       } else if (interaction.mode === "resize" && liveNodes) {
         const after = liveNodes.find((n) => n.id === interaction.id);
         if (after) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "rotate" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after && after.rotation !== interaction.startNode.rotation) onEditNode(interaction.startNode, after);
         setLiveNodes(null);
       } else if (interaction.mode === "marquee") {
         if (marqueeRect && (marqueeRect.width > 2 || marqueeRect.height > 2)) {
@@ -814,11 +851,16 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         return;
       }
 
+      // Clear any existing selection the instant this plain background click starts, rather than
+      // waiting for pointerUp's marquee-with-no-drag fallback to do it - a marquee drag that goes on
+      // to enclose nodes overwrites this with the real result anyway, so eagerly clearing here can
+      // only ever make an empty-space click FEEL more immediate, never produce a wrong final state.
+      if (selectedNodeIds.size > 0 || selectedEdgeIds.size > 0) onSelectionChange(new Set(), new Set());
       const point = clientToDoc(e.clientX, e.clientY);
       interactionRef.current = { mode: "marquee", startDocX: point.x, startDocY: point.y };
       setMarqueeRect({ x: point.x, y: point.y, width: 0, height: 0 });
     },
-    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint]
+    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint, selectedNodeIds, selectedEdgeIds]
   );
 
   // ---- Text editing ------------------------------------------------------------------------------
@@ -1061,7 +1103,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             <div
               key={node.id}
               className="absolute"
-              style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
+              style={{
+                left: node.x,
+                top: node.y,
+                width: node.width,
+                height: node.height,
+                transform: node.rotation ? `rotate(${node.rotation}deg)` : undefined,
+                transformOrigin: "center",
+              }}
               onPointerEnter={() => setHoveredNodeId(node.id)}
               onPointerLeave={() => setHoveredNodeId((prev) => (prev === node.id ? null : prev))}
               onPointerDown={(e) => {
@@ -1221,7 +1270,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 <div className="absolute pointer-events-none" style={{ inset: -3 / zoom, border: `${1.5 / zoom}px dashed #2563eb` }} />
               )}
 
-              {selected && selectedNodeIds.size === 1 && !connectorArmed &&
+              {/* Resize handles only for an UNrotated shape - dragging a corner assumes screen-axis
+                  dx/dy map straight onto width/height, which stops being true once the box itself
+                  is rotated (see WhiteboardNode.rotation's own doc comment on this tradeoff). */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && !node.rotation &&
                 RESIZE_CORNERS.map((corner) => {
                   const size = HANDLE_SCREEN_SIZE / zoom;
                   const left = corner.includes("w") ? -size / 2 : node.width - size / 2;
@@ -1235,6 +1287,30 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     />
                   );
                 })}
+
+              {/* Rotate handle - a small circle above the shape's top edge, connected by a thin
+                  stem, rotating along with everything else in this div since it's a plain child
+                  positioned relative to the (possibly already-rotated) box. */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && (
+                <>
+                  <div
+                    className="absolute bg-blue-300"
+                    style={{ left: node.width / 2 - 0.5 / zoom, top: -ROTATE_HANDLE_GAP / zoom, width: 1 / zoom, height: (ROTATE_HANDLE_GAP - HANDLE_SCREEN_SIZE / 2) / zoom, pointerEvents: "none" }}
+                  />
+                  <div
+                    onPointerDown={(e) => beginRotateNode(node, e)}
+                    className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-500"
+                    style={{
+                      left: node.width / 2 - HANDLE_SCREEN_SIZE / zoom / 2,
+                      top: -ROTATE_HANDLE_GAP / zoom - HANDLE_SCREEN_SIZE / zoom / 2,
+                      width: HANDLE_SCREEN_SIZE / zoom,
+                      height: HANDLE_SCREEN_SIZE / zoom,
+                      cursor: "grab",
+                    }}
+                    title="Drag to rotate (hold Shift to snap to 15°)"
+                  />
+                </>
+              )}
 
               {showConnectionDots &&
                 !connectorArmed &&

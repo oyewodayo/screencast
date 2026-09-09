@@ -1213,6 +1213,14 @@ function paintNodeText(ctx: CanvasRenderingContext2D, node: WhiteboardNode): voi
 function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
   ctx.save();
   ctx.translate(node.x, node.y);
+  // Matches WhiteboardCanvas.tsx's own `transform: rotate(deg); transform-origin: center` - rotate
+  // about the box's own center, then shift back so everything drawn below (all in node-local
+  // 0,0-w,h space) doesn't need to know rotation happened at all.
+  if (node.rotation) {
+    ctx.translate(node.width / 2, node.height / 2);
+    ctx.rotate((node.rotation * Math.PI) / 180);
+    ctx.translate(-node.width / 2, -node.height / 2);
+  }
   if (node.shapeType === "freehand") {
     const path = freehandPath2D(node);
     ctx.lineWidth = node.strokeWidth;

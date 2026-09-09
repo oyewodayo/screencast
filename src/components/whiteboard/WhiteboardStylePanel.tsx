@@ -229,6 +229,16 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               className="w-28"
             />
           </Field>
+          <Field label="Rotation (°)">
+            <ClampedNumberField
+              key={selectedNodes.map((n) => n.id).join(",")}
+              initialValue={selectedNodes[0].rotation ?? 0}
+              min={0}
+              max={359}
+              onCommit={(n) => updateNodes({ rotation: n === 0 ? undefined : n })}
+              className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+            />
+          </Field>
           {selectedNodes.every((n) => n.shapeType === "rectangle") && (
             <Field label="Corner radius">
               <input

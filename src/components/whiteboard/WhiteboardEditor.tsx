@@ -138,32 +138,40 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
   // Line-only shapes (waves, circuit symbols, axes...) render as an open trace, not a filled
   // silhouette (matches their own default fillColor: null) - filling the preview swatch would shade
   // the implicit-close area under the trace instead of just showing the line shape the tile places.
-  const fill = LINE_ONLY_SHAPES.has(preset.type) ? "none" : "#dbeafe";
-  const stroke = "#2563eb";
+  // Fill is a light gray rather than the real default (white - see createDefaultWhiteboardNode)
+  // purely so the swatch stays visible against this popover's own white background; the stroke
+  // does match the real black default, since that's the part actually worth previewing accurately.
+  const fill = LINE_ONLY_SHAPES.has(preset.type) ? "none" : "#f3f4f6";
+  const stroke = "#000000";
+  // Thinner and miter-jointed (sharp corners) rather than the real canvas's own strokeWidth/round
+  // joins - at this tile's ~40x28px size a 2px round-jointed stroke reads as a heavy, bulbous
+  // outline (a plain triangle looks like it has rounded corners purely from the stroke thickness),
+  // out of proportion to how the shape actually renders once placed at normal size.
+  const sw = 1.25;
   return (
     <svg width={TILE_W} height={TILE_H} viewBox={`0 0 ${TILE_W} ${TILE_H}`}>
       <g transform="translate(2,2)">
-        {outline.kind === "rect" && <rect x={0} y={0} width={w} height={h} rx={preset.overrides?.cornerRadius ?? 0} fill={fill} stroke={stroke} strokeWidth={2} />}
-        {outline.kind === "ellipse" && <ellipse cx={w / 2} cy={h / 2} rx={w / 2} ry={h / 2} fill={fill} stroke={stroke} strokeWidth={2} />}
+        {outline.kind === "rect" && <rect x={0} y={0} width={w} height={h} rx={preset.overrides?.cornerRadius ?? 0} fill={fill} stroke={stroke} strokeWidth={sw} />}
+        {outline.kind === "ellipse" && <ellipse cx={w / 2} cy={h / 2} rx={w / 2} ry={h / 2} fill={fill} stroke={stroke} strokeWidth={sw} />}
         {outline.kind === "polygon" && (
           <>
-            <polygon points={outline.points.map(([x, y]) => `${x},${y}`).join(" ")} fill={fill} stroke={stroke} strokeWidth={2} strokeLinejoin="round" />
+            <polygon points={outline.points.map(([x, y]) => `${x},${y}`).join(" ")} fill={fill} stroke={stroke} strokeWidth={sw} strokeLinejoin="miter" />
             {outline.innerLines?.map((line, i) => (
-              <polyline key={i} points={line.map(([x, y]) => `${x},${y}`).join(" ")} fill="none" stroke={stroke} strokeWidth={2} strokeLinecap="round" />
+              <polyline key={i} points={line.map(([x, y]) => `${x},${y}`).join(" ")} fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" />
             ))}
-            {outline.innerCircle && <circle cx={outline.innerCircle.cx} cy={outline.innerCircle.cy} r={outline.innerCircle.r} fill="none" stroke={stroke} strokeWidth={2} />}
+            {outline.innerCircle && <circle cx={outline.innerCircle.cx} cy={outline.innerCircle.cy} r={outline.innerCircle.r} fill="none" stroke={stroke} strokeWidth={sw} />}
           </>
         )}
-        {outline.kind === "path" && <path d={outline.d} fill={fill} stroke={stroke} strokeWidth={2} strokeLinejoin="round" />}
+        {outline.kind === "path" && <path d={outline.d} fill={fill} stroke={stroke} strokeWidth={sw} strokeLinejoin="miter" />}
         {outline.kind === "cylinder" && (
           <>
             <path
               d={`M0,${h * CYLINDER_CAP_RATIO} L0,${h * (1 - CYLINDER_CAP_RATIO)} A${w / 2},${h * CYLINDER_CAP_RATIO} 0 0,0 ${w},${h * (1 - CYLINDER_CAP_RATIO)} L${w},${h * CYLINDER_CAP_RATIO} Z`}
               fill={fill}
               stroke={stroke}
-              strokeWidth={2}
+              strokeWidth={sw}
             />
-            <ellipse cx={w / 2} cy={h * CYLINDER_CAP_RATIO} rx={w / 2} ry={h * CYLINDER_CAP_RATIO} fill={fill} stroke={stroke} strokeWidth={2} />
+            <ellipse cx={w / 2} cy={h * CYLINDER_CAP_RATIO} rx={w / 2} ry={h * CYLINDER_CAP_RATIO} fill={fill} stroke={stroke} strokeWidth={sw} />
           </>
         )}
       </g>
@@ -586,7 +594,11 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             active={armedShapeType !== null && armedShapeType !== "text" && armedShapeType !== "freehand"}
             onClick={(e?: any) => {
               e?.stopPropagation?.();
-              setShapesMenuOpen((prev) => !prev);
+              setShapesMenuOpen((prev) => {
+                const next = !prev;
+                if (next) setArrowsMenuOpen(false);
+                return next;
+              });
             }}
           >
             <span className="flex items-center gap-0.5">
@@ -625,6 +637,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           title="Text"
           active={armedShapeType === "text"}
           onClick={() => {
+            setShapesMenuOpen(false);
+            setArrowsMenuOpen(false);
             setConnectorArmed(false);
             setArmedConnectorOverrides(undefined);
             setArmedNodeOverrides(undefined);
@@ -637,6 +651,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           title="Pen (freehand)"
           active={armedShapeType === "freehand" && !armedNodeOverrides?.endArrowType}
           onClick={() => {
+            setShapesMenuOpen(false);
+            setArrowsMenuOpen(false);
             setConnectorArmed(false);
             setArmedConnectorOverrides(undefined);
             setArmedNodeOverrides(undefined);
@@ -651,7 +667,11 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             active={connectorArmed || (armedShapeType === "freehand" && !!armedNodeOverrides?.endArrowType)}
             onClick={(e?: any) => {
               e?.stopPropagation?.();
-              setArrowsMenuOpen((prev) => !prev);
+              setArrowsMenuOpen((prev) => {
+                const next = !prev;
+                if (next) setShapesMenuOpen(false);
+                return next;
+              });
             }}
           >
             <span className="flex items-center gap-0.5">

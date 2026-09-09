@@ -83,9 +83,13 @@ interface WhiteboardItemBase {
   updatedAt: number;
 }
 
-// Geometry is a plain axis-aligned box in document space - no rotation (unlike BoardItem), which
-// keeps anchor-point math for connectors (resolveAnchorPoint in whiteboardHandlers.ts) simple:
-// the four side midpoints are always just x/y/width/height arithmetic.
+// Geometry is a plain axis-aligned x/y/width/height box - `rotation` (below) is purely a rendering
+// transform layered on top of it, not a change to the box itself. That's a deliberate scope
+// tradeoff: resolveAnchorPoint/resolveAutoSide in whiteboardHandlers.ts (what a connector's "auto"
+// end anchors to) still work entirely in this unrotated box - correct for rotation 0, and still
+// reasonable for a modest tilt, but a connector attached to a heavily-rotated shape won't hug its
+// actual rotated outline. Resize handles are hidden whenever rotation is set (WhiteboardCanvas.tsx)
+// rather than shipping resize math that doesn't account for it.
 export interface WhiteboardNode extends WhiteboardItemBase {
   kind: "node";
   shapeType: WhiteboardShapeType;
@@ -93,6 +97,9 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   y: number;
   width: number;
   height: number;
+  // Degrees, clockwise, about the box's own center - 0/undefined = unrotated. Purely a visual
+  // transform (see this interface's own top comment for what that does and doesn't affect).
+  rotation?: number;
   text: string;
   // Ignored for shapeType "text"/"freehand" (a label/ink stroke has no interior to fill) - null =
   // no fill, same "null = transparent" convention boardTypes.ts uses.
@@ -357,8 +364,8 @@ export function createDefaultWhiteboardNode(
     width: size.width,
     height: size.height,
     text: "",
-    fillColor: shapeType === "text" || shapeType === "freehand" || LINE_ONLY_SHAPES.has(shapeType) ? null : "#dbeafe",
-    strokeColor: shapeType === "freehand" ? "#111111" : "#2563eb",
+    fillColor: shapeType === "text" || shapeType === "freehand" || LINE_ONLY_SHAPES.has(shapeType) ? null : "#ffffff",
+    strokeColor: shapeType === "freehand" ? "#111111" : "#000000",
     strokeWidth: 2,
     cornerRadius: 0,
     sides: shapeType === "polygon" ? overrides?.sides ?? 5 : undefined,
