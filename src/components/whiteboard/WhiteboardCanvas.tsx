@@ -100,6 +100,17 @@ type Interaction =
       pathPoints: { x: number; y: number }[];
       lastPathClientX: number;
       lastPathClientY: number;
+    }
+  | {
+      // Dragging one bend point of an edge's WhiteboardEdge.waypoints - either an existing one
+      // (beginWaypointDrag, `index` = its current position) or a brand-new one just spliced into
+      // `startWaypoints` at the drag's start (beginNewWaypointDrag, dragged out from a segment's
+      // midpoint handle) - either way this only ever moves the single point at `index`, so
+      // handlePointerMove doesn't need to know which case it is.
+      mode: "waypoint";
+      edgeId: string;
+      index: number;
+      startWaypoints: { x: number; y: number }[];
     };
 
 // Below this on-screen movement (CSS px, pre-zoom-correction) between two recorded connector-drag
@@ -130,6 +141,8 @@ interface WhiteboardCanvasProps {
   selectedEdgeIds: Set<string>;
   onSelectionChange: (nodeIds: Set<string>, edgeIds: Set<string>) => void;
   onAddNode: (node: WhiteboardNode) => void;
+  // Hover-arrow "quick clone + connect" (see HoverConnectArrows below) - one undo step for both.
+  onAddNodeWithEdge: (node: WhiteboardNode, edge: WhiteboardEdge) => void;
   onEditNode: (before: WhiteboardNode, after: WhiteboardNode) => void;
   onBatchEditNodes: (before: WhiteboardNode[], after: WhiteboardNode[]) => void;
   onDeleteNode: (node: WhiteboardNode) => void;
@@ -225,6 +238,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   selectedEdgeIds,
   onSelectionChange,
   onAddNode,
+  onAddNodeWithEdge,
   onEditNode,
   onBatchEditNodes,
   onDeleteNode,
@@ -246,6 +260,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // rather than a fixed placeholder direction until release (see computeCurveBowFromPath).
   const [connectorPreviewBow, setConnectorPreviewBow] = useState<number>(DEFAULT_CURVE_BOW);
   const [freehandPreview, setFreehandPreview] = useState<{ x: number; y: number }[] | null>(null);
+  // Live-in-progress waypoints for whichever edge is currently having a bend point dragged (see the
+  // "waypoint" Interaction mode) - same "stage locally, commit once" pattern liveNodes uses for
+  // node drags, so a whole drag becomes one undo step instead of one per pointermove tick.
+  const [liveWaypointsEdgeId, setLiveWaypointsEdgeId] = useState<string | null>(null);
+  const [liveWaypoints, setLiveWaypoints] = useState<{ x: number; y: number }[] | null>(null);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [connectorHoverNodeId, setConnectorHoverNodeId] = useState<string | null>(null);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
@@ -476,6 +495,77 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     [onSelectionChange, clientToDoc, nodesById]
   );
 
+  // Starts dragging an EXISTING bend point (the small solid dot rendered at edge.waypoints[index]
+  // when the edge is selected).
+  const beginWaypointDrag = useCallback(
+    (edge: WhiteboardEdge, index: number, e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set(), new Set([edge.id]));
+      const startWaypoints = [...(edge.waypoints ?? [])];
+      interactionRef.current = { mode: "waypoint", edgeId: edge.id, index, startWaypoints };
+      setLiveWaypointsEdgeId(edge.id);
+      setLiveWaypoints(startWaypoints);
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  // Starts dragging a NEW bend point out from one of the small hollow "add a point here" handles
+  // rendered at each segment's midpoint - splices it into a copy of the waypoints array up front
+  // (at `insertAt`) so from here on it's just beginWaypointDrag's own "drag the point at this
+  // index" gesture, with no special-casing needed anywhere else.
+  const beginNewWaypointDrag = useCallback(
+    (edge: WhiteboardEdge, insertAt: number, initialPoint: { x: number; y: number }, e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set(), new Set([edge.id]));
+      const startWaypoints = [...(edge.waypoints ?? [])];
+      startWaypoints.splice(insertAt, 0, initialPoint);
+      interactionRef.current = { mode: "waypoint", edgeId: edge.id, index: insertAt, startWaypoints };
+      setLiveWaypointsEdgeId(edge.id);
+      setLiveWaypoints(startWaypoints);
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  // Double-clicking an existing bend point removes it outright - the direct, symmetric counterpart
+  // to dragging one of the midpoint handles to ADD one.
+  const removeWaypoint = useCallback(
+    (edge: WhiteboardEdge, index: number, e: React.MouseEvent) => {
+      e.stopPropagation();
+      const next = (edge.waypoints ?? []).filter((_, i) => i !== index);
+      onEditEdge(edge, { ...edge, waypoints: next });
+    },
+    [onEditEdge]
+  );
+
+  // How far (doc units) a cloned shape lands from the one it was cloned off of - see
+  // handleQuickClone below.
+  const QUICK_CLONE_GAP = 80;
+
+  // The hover-arrow "quick clone + connect" gesture (see HoverConnectArrows) - a full copy of
+  // `node` (same size/shapeType/style, blank text) placed just past it in `side`'s direction, with
+  // a fresh default-styled edge connecting the original to the copy. Both added as one undo step
+  // (onAddNodeWithEdge) since from the user's perspective clicking one arrow is a single action.
+  const handleQuickClone = useCallback(
+    (node: WhiteboardNode, side: Exclude<WhiteboardAnchorSide, "auto">) => {
+      const now = Date.now();
+      const offset =
+        side === "right"
+          ? { x: node.width + QUICK_CLONE_GAP, y: 0 }
+          : side === "left"
+          ? { x: -(node.width + QUICK_CLONE_GAP), y: 0 }
+          : side === "bottom"
+          ? { x: 0, y: node.height + QUICK_CLONE_GAP }
+          : { x: 0, y: -(node.height + QUICK_CLONE_GAP) };
+      const newNode: WhiteboardNode = { ...node, id: crypto.randomUUID(), x: node.x + offset.x, y: node.y + offset.y, text: "", createdAt: now, updatedAt: now };
+      const edge = createDefaultWhiteboardEdge(crypto.randomUUID(), { nodeId: node.id, anchor: "auto" }, { nodeId: newNode.id, anchor: "auto" });
+      onAddNodeWithEdge(newNode, edge);
+      onSelectionChange(new Set([newNode.id]), new Set());
+    },
+    [onAddNodeWithEdge, onSelectionChange]
+  );
+
   // ---- Pointer move / up on the container --------------------------------------------------------
   const handlePointerMove = useCallback(
     (e: React.PointerEvent) => {
@@ -514,6 +604,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
         const resized: WhiteboardNode = { ...start, x, y, width, height };
         setLiveNodes(page.nodes.map((n) => (n.id === start.id ? resized : n)));
+        return;
+      }
+
+      if (interaction.mode === "waypoint") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        const next = [...interaction.startWaypoints];
+        next[interaction.index] = cur;
+        setLiveWaypoints(next);
         return;
       }
 
@@ -658,9 +756,23 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // Deliberately does NOT disarm connectorArmed - the Arrows tool stays armed across uses,
         // same "sketch several in a row without re-arming" treatment as the freehand pen tool gets
         // (see WhiteboardEditor's own doc comment on this).
+      } else if (interaction.mode === "waypoint" && liveWaypoints) {
+        // A plain click with no drag in between (most likely the first half of a double-click on an
+        // existing dot, meant to remove it via removeWaypoint - see the dot's onDoubleClick) leaves
+        // liveWaypoints identical to what the gesture started with - skip committing a no-op edit
+        // for it rather than polluting undo history with two empty steps before the real removal.
+        const moved =
+          liveWaypoints.length !== interaction.startWaypoints.length ||
+          liveWaypoints.some((p, i) => p.x !== interaction.startWaypoints[i].x || p.y !== interaction.startWaypoints[i].y);
+        if (moved) {
+          const existing = page.edges.find((ed) => ed.id === interaction.edgeId);
+          if (existing) onEditEdge(existing, { ...existing, waypoints: liveWaypoints });
+        }
+        setLiveWaypointsEdgeId(null);
+        setLiveWaypoints(null);
       }
     },
-    [liveNodes, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides]
+    [liveNodes, liveWaypoints, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides]
   );
 
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
@@ -821,8 +933,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           </defs>
           {page.edges.map((edge) => {
             const { source, target } = resolveEdgeEndpoints(edge, nodesById);
-            const d = buildEdgePath(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW);
+            const waypoints = liveWaypointsEdgeId === edge.id && liveWaypoints ? liveWaypoints : edge.waypoints ?? [];
+            const d = buildEdgePath(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, waypoints);
             const selected = selectedEdgeIds.has(edge.id);
+            // The full point sequence a bend-point handle needs (segment midpoints for "add a
+            // point here", plus each real waypoint's own drag handle) - source and target included
+            // so the first/last segments get their own midpoint handle too.
+            const fullSequence = [{ x: source.x, y: source.y }, ...waypoints, { x: target.x, y: target.y }];
             return (
               <g key={edge.id}>
                 <path
@@ -860,6 +977,41 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 )}
                 {selected && (
                   <>
+                    {/* Segment midpoint handles - drag one to insert a new bend point there. Hollow/
+                        faint so they read as "add a point" rather than competing visually with the
+                        solid waypoint dots and endpoint circles below. */}
+                    {fullSequence.slice(0, -1).map((p, i) => {
+                      const next = fullSequence[i + 1];
+                      const mid = { x: (p.x + next.x) / 2, y: (p.y + next.y) / 2 };
+                      return (
+                        <circle
+                          key={`mid-${i}`}
+                          cx={mid.x}
+                          cy={mid.y}
+                          r={5 / zoom}
+                          fill="#ffffff"
+                          fillOpacity={0.6}
+                          stroke="#93c5fd"
+                          strokeWidth={1.5 / zoom}
+                          style={{ pointerEvents: "auto", cursor: "copy" }}
+                          onPointerDown={(e) => beginNewWaypointDrag(edge, i, mid, e)}
+                        />
+                      );
+                    })}
+                    {waypoints.map((wp, i) => (
+                      <circle
+                        key={`wp-${i}`}
+                        cx={wp.x}
+                        cy={wp.y}
+                        r={5.5 / zoom}
+                        fill="#2563eb"
+                        stroke="#ffffff"
+                        strokeWidth={1.5 / zoom}
+                        style={{ pointerEvents: "auto", cursor: "grab" }}
+                        onPointerDown={(e) => beginWaypointDrag(edge, i, e)}
+                        onDoubleClick={(e) => removeWaypoint(edge, i, e)}
+                      />
+                    ))}
                     <circle cx={source.x} cy={source.y} r={6 / zoom} fill="#ffffff" stroke="#2563eb" strokeWidth={2 / zoom} style={{ pointerEvents: "auto", cursor: "grab" }} onPointerDown={(e) => beginConnectorReattach(edge, "source", e)} />
                     <circle cx={target.x} cy={target.y} r={6 / zoom} fill="#ffffff" stroke="#2563eb" strokeWidth={2 / zoom} style={{ pointerEvents: "auto", cursor: "grab" }} onPointerDown={(e) => beginConnectorReattach(edge, "target", e)} />
                   </>
@@ -891,6 +1043,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           const isEditing = editingNodeId === node.id;
           const isConnectable = CONNECTABLE_SHAPES.has(node.shapeType);
           const showConnectionDots = isConnectable && (isHovered || selected || connectorArmed);
+          // Hover-arrow "quick clone + connect" (see handleQuickClone) - hidden while any tool is
+          // armed or a connector drag is underway so it doesn't compete with that other intent, and
+          // (like the connection dots) only on shapes an edge can actually anchor to.
+          const showQuickConnectArrows = isConnectable && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
           const outline = shapeOutlineFor(node.shapeType, node.width, node.height, {
             sides: node.sides,
             starPoints: node.starPoints,
@@ -1093,6 +1249,43 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       style={{ left: p.x - node.x - size / 2, top: p.y - node.y - size / 2, width: size, height: size, cursor: "crosshair" }}
                       title="Drag to connect"
                     />
+                  );
+                })}
+
+              {showQuickConnectArrows &&
+                ANCHOR_SIDES.map((side) => {
+                  const size = 22 / zoom;
+                  const margin = 14 / zoom;
+                  const style: React.CSSProperties = { position: "absolute", width: size, height: size };
+                  if (side === "top") {
+                    style.left = node.width / 2 - size / 2;
+                    style.top = -size - margin;
+                  } else if (side === "bottom") {
+                    style.left = node.width / 2 - size / 2;
+                    style.top = node.height + margin;
+                  } else if (side === "left") {
+                    style.top = node.height / 2 - size / 2;
+                    style.left = -size - margin;
+                  } else {
+                    style.top = node.height / 2 - size / 2;
+                    style.left = node.width + margin;
+                  }
+                  const glyph = side === "top" ? "↑" : side === "bottom" ? "↓" : side === "left" ? "←" : "→";
+                  return (
+                    <button
+                      key={side}
+                      type="button"
+                      style={style}
+                      className="rounded-full bg-blue-50 border border-blue-300 text-blue-500 hover:bg-blue-500 hover:text-white hover:border-blue-500 flex items-center justify-center leading-none"
+                      title="Click to add a connected shape"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleQuickClone(node, side);
+                      }}
+                    >
+                      <span style={{ fontSize: 13 / zoom }}>{glyph}</span>
+                    </button>
                   );
                 })}
             </div>

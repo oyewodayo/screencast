@@ -93,8 +93,25 @@ const SCIENCE_SHAPE_PRESETS: ShapePreset[] = [
   { type: "angle", label: "Angle" },
 ];
 
+const GENERAL_SHAPE_PRESETS: ShapePreset[] = [
+  { type: "star", label: "4-Point Star", overrides: { starPoints: 4 } },
+  { type: "star", label: "8-Point Star", overrides: { starPoints: 8 } },
+  { type: "hourglass", label: "Hourglass" },
+  { type: "teardrop", label: "Teardrop" },
+  { type: "lightningBolt", label: "Lightning Bolt" },
+  { type: "halfCircle", label: "Half Circle" },
+  { type: "banner", label: "Banner" },
+  { type: "frame", label: "Frame" },
+  { type: "tape", label: "Tape" },
+  { type: "display", label: "Display" },
+  { type: "predefinedProcess", label: "Predefined Process" },
+  { type: "manualInput", label: "Manual Input" },
+  { type: "internalStorage", label: "Internal Storage" },
+];
+
 const SHAPE_PRESET_GROUPS: { label: string; presets: ShapePreset[] }[] = [
   { label: "Basic", presets: BASIC_SHAPE_PRESETS },
+  { label: "General", presets: GENERAL_SHAPE_PRESETS },
   { label: "Waveforms", presets: WAVE_SHAPE_PRESETS },
   { label: "Science", presets: SCIENCE_SHAPE_PRESETS },
 ];
@@ -710,6 +727,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           selectedEdgeIds={selectedEdgeIds}
           onSelectionChange={handleSelectionChange}
           onAddNode={(node) => store.addNode(armedNodeOverrides ? { ...node, ...armedNodeOverrides } : node)}
+          onAddNodeWithEdge={store.addNodeWithEdge}
           onEditNode={store.editNode}
           onBatchEditNodes={store.batchEditNodes}
           onDeleteNode={(node) => {

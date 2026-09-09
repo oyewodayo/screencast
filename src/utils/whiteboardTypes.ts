@@ -44,6 +44,21 @@ export type WhiteboardShapeType =
   | "benzeneRing" // chemistry aromatic ring (hexagon + inscribed circle)
   | "axes" // math x/y coordinate axes
   | "angle" // math angle-with-arc marker
+  // General-purpose glyphs (draw.io's own "General" shape palette) - fixed icons, same reasoning
+  // as the science symbols above. "4-Point Star"/"8-Point Star" aren't their own shapeType - like
+  // Pentagon/Octagon, they're just "star" at a different starPoints (see WhiteboardEditor.tsx's
+  // GENERAL_SHAPE_PRESETS).
+  | "hourglass"
+  | "teardrop"
+  | "lightningBolt"
+  | "halfCircle"
+  | "banner" // ribbon/banner with a notched bottom edge
+  | "frame" // UML-style frame: rectangle + a small pentagon "tab" in the top-left corner
+  | "tape" // flowchart tape symbol - wavy top AND bottom edges
+  | "display" // flowchart display symbol - lens/eye-shaped
+  | "predefinedProcess" // flowchart predefined-process - rectangle with two inset vertical bars
+  | "manualInput" // flowchart manual-input - rectangle with a slanted top edge
+  | "internalStorage" // flowchart internal-storage - rectangle with an inset corner cross
   | "text"
   | "freehand";
 
@@ -187,6 +202,17 @@ export interface WhiteboardEdge extends WhiteboardItemBase {
   // created with no such gesture to read (e.g. reattaching an existing edge's endpoint) - resolves
   // to whiteboardHandlers.ts's DEFAULT_CURVE_BOW.
   curveBow?: number;
+  // Manually-added bend points, in order from source to target, absolute document-space
+  // coordinates (edges aren't resizable boxes the way nodes are, so unlike WhiteboardNode.points
+  // there's no box to express these as a fraction of). Absent/empty - the routing algorithm alone
+  // decides the path, same as before this field existed. Dragging a point ON the rendered path
+  // (see WhiteboardCanvas.tsx's beginNewWaypointDrag) inserts a new one here; dragging an existing
+  // dot (beginWaypointDrag) moves it; double-clicking one removes it. "curved" routing smooths a
+  // spline through source -> waypoints -> target (see whiteboardHandlers.ts's smoothPolylineD);
+  // "straight"/"orthogonal" both fall back to sharp segments through the same points once any
+  // waypoints exist - orthogonal's own auto right-angle-bend algorithm only applies when there are
+  // none, since it and a user's own manual bends are two competing ways to shape the same line.
+  waypoints?: { x: number; y: number }[];
   startArrowType: ArrowheadType;
   endArrowType: ArrowheadType;
 }
@@ -195,6 +221,13 @@ export type WhiteboardItem = WhiteboardNode | WhiteboardEdge;
 
 export type WhiteboardCommand =
   | { type: "add-node"; item: WhiteboardNode }
+  // A node and one edge connecting it to an existing node, added together as ONE undo step - the
+  // hover-arrow "quick clone + connect" gesture (see WhiteboardCanvas.tsx's HoverConnectArrows)
+  // creates both at once and undoing it should be one step, not two. Unlike delete-node below, this
+  // needs no special-casing in useWhiteboardStore's undo(): invertCommand can already express its
+  // full inverse as an ordinary "delete-node" command (this node + this one edge), since both ids
+  // are already right here on the command itself.
+  | { type: "add-node-with-edge"; node: WhiteboardNode; edge: WhiteboardEdge }
   // Cascades: deleting a node also removes every edge attached to it, as ONE undo step - an edge
   // left pointing at a node id that no longer exists would have nothing left to resolve its
   // attached endpoint against.
@@ -291,6 +324,17 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   benzeneRing: { width: 160, height: 150 },
   axes: { width: 160, height: 160 },
   angle: { width: 170, height: 130 },
+  hourglass: { width: 120, height: 140 },
+  teardrop: { width: 120, height: 150 },
+  lightningBolt: { width: 100, height: 160 },
+  halfCircle: { width: 130, height: 130 },
+  banner: { width: 180, height: 110 },
+  frame: { width: 180, height: 140 },
+  tape: { width: 180, height: 100 },
+  display: { width: 180, height: 100 },
+  predefinedProcess: { width: 170, height: 100 },
+  manualInput: { width: 180, height: 110 },
+  internalStorage: { width: 170, height: 120 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
 };

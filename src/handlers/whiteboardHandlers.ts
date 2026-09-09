@@ -205,14 +205,44 @@ export function computeCurveBowFromPath(start: { x: number; y: number }, end: { 
   return sign * magnitude;
 }
 
-// Builds the SVG path `d` string for an edge between two resolved endpoints. "straight" is a
-// single segment; "orthogonal" (draw.io's default connector look) inserts one or two right-angle
-// bends depending on which sides the two ends leave from; "curved" is a cubic bezier through
-// curveControlPoints - see its own doc comment for why it always actually curves, never silently
-// degrading to a straight line when neither end is anchored to a shape. `bow` (only consulted when
-// at least one end is free-floating) defaults to DEFAULT_CURVE_BOW's fixed direction when omitted;
-// pass the edge's own WhiteboardEdge.curveBow to bow the curve the way it was actually drawn instead.
-export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, routing: EdgeRouting, bow: number = DEFAULT_CURVE_BOW): string {
+// Smooths a polyline into one open path `d` string - each interior point becomes a quadratic
+// curve's control point, arriving at the midpoint of it and the NEXT point (the standard cheap
+// "smooth a polyline" trick, same technique WhiteboardCanvas.tsx's own smoothedPathD and this
+// file's freehandPath2D use for freehand ink) - kept as an independent copy rather than shared with
+// those two so a future change to one (say, freehand ink wanting a different smoothing feel) can't
+// silently affect edge waypoints too.
+function smoothPolylineD(points: { x: number; y: number }[]): string {
+  if (points.length === 0) return "";
+  if (points.length < 3) return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const mid = { x: (points[i].x + points[i + 1].x) / 2, y: (points[i].y + points[i + 1].y) / 2 };
+    d += ` Q ${points[i].x} ${points[i].y} ${mid.x} ${mid.y}`;
+  }
+  const last = points[points.length - 1];
+  d += ` L ${last.x} ${last.y}`;
+  return d;
+}
+
+// Builds the SVG path `d` string for an edge between two resolved endpoints. `waypoints` (manual
+// bend points a user dragged onto the line - see WhiteboardEdge.waypoints's own doc comment) take
+// priority when present: "curved" smooths a spline through source->waypoints->target,
+// straight/orthogonal both connect them with sharp segments - orthogonal's own auto right-angle
+// routing below only runs when there are none. Otherwise: "straight" is a single segment;
+// "orthogonal" (draw.io's default connector look) inserts one or two right-angle bends depending
+// on which sides the two ends leave from; "curved" is a cubic bezier through curveControlPoints -
+// see its own doc comment for why it always actually curves, never silently degrading to a
+// straight line when neither end is anchored to a shape. `bow` (only consulted when at least one
+// end is free-floating AND there are no waypoints) defaults to DEFAULT_CURVE_BOW's fixed direction
+// when omitted; pass the edge's own WhiteboardEdge.curveBow to bow the curve the way it was
+// actually drawn instead.
+export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, routing: EdgeRouting, bow: number = DEFAULT_CURVE_BOW, waypoints: { x: number; y: number }[] = []): string {
+  if (waypoints.length > 0) {
+    const points = [{ x: source.x, y: source.y }, ...waypoints, { x: target.x, y: target.y }];
+    if (routing === "curved") return smoothPolylineD(points);
+    return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+  }
+
   if (routing === "curved") {
     const { c1, c2 } = curveControlPoints(source, target, bow);
     return `M ${source.x} ${source.y} C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${target.x} ${target.y}`;
@@ -250,7 +280,25 @@ export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, rout
 // leaves/arrives along the anchored side's own normal; only "straight" (or an orthogonal edge with
 // neither end anchored, which buildEdgePath already renders as a plain line) falls back to the
 // literal source->target direction.
-export function edgeEndAngleDeg(source: { x: number; y: number }, target: { x: number; y: number }, routing: EdgeRouting, sourceSide: "top" | "right" | "bottom" | "left" | null, targetSide: "top" | "right" | "bottom" | "left" | null, bow: number = DEFAULT_CURVE_BOW): { startDeg: number; endDeg: number } {
+export function edgeEndAngleDeg(
+  source: { x: number; y: number },
+  target: { x: number; y: number },
+  routing: EdgeRouting,
+  sourceSide: "top" | "right" | "bottom" | "left" | null,
+  targetSide: "top" | "right" | "bottom" | "left" | null,
+  bow: number = DEFAULT_CURVE_BOW,
+  waypoints: { x: number; y: number }[] = []
+): { startDeg: number; endDeg: number } {
+  if (waypoints.length > 0) {
+    // Approximates each end's tangent as the direction from its nearest waypoint - exact for the
+    // straight/orthogonal (sharp-segment) case, a reasonable stand-in for "curved" (the true
+    // tangent at a quadratic spline's very end point is this same direction anyway).
+    const nearStart = waypoints[0];
+    const nearEnd = waypoints[waypoints.length - 1];
+    const startDeg = (Math.atan2(source.y - nearStart.y, source.x - nearStart.x) * 180) / Math.PI;
+    const endDeg = (Math.atan2(target.y - nearEnd.y, target.x - nearEnd.x) * 180) / Math.PI;
+    return { startDeg, endDeg };
+  }
   if (routing === "curved") {
     const { c1, c2 } = curveControlPoints({ ...source, side: sourceSide }, { ...target, side: targetSide }, bow);
     const endDeg = (Math.atan2(target.y - c2.y, target.x - c2.x) * 180) / Math.PI;
@@ -533,6 +581,109 @@ function angleOutlineD(w: number, h: number, degrees: number, ray1Frac: number, 
   ].join(" ");
 }
 
+// ---- General-purpose glyph outlines (draw.io's own "General" shape palette) -----------------------
+//
+// Fixed (non-parametric) icons, same reasoning/conventions as the science symbols above - closed
+// shapes, so (unlike those) they keep the normal default fillColor rather than being in
+// LINE_ONLY_SHAPES.
+
+// Two triangles meeting at the center - traced as one continuous polygon that touches itself at
+// that shared vertex rather than crossing through it, which is what keeps this a clean bowtie
+// silhouette instead of a self-intersecting mess.
+function hourglassPolygonPoints(w: number, h: number): [number, number][] {
+  return [[0, 0], [w, 0], [w / 2, h / 2], [w, h], [0, h], [w / 2, h / 2]];
+}
+
+// A rounded drop with a point at the top - two cubic beziers from the tip out to the sides of a
+// circle, then one semicircular arc around the bottom connecting them.
+function teardropOutlineD(w: number, h: number): string {
+  const cx = w / 2;
+  const r = Math.min(w, h * 0.76) / 2;
+  const circleCy = h - r;
+  return [
+    `M${cx.toFixed(2)},0`,
+    `C${(cx + r * 1.1).toFixed(2)},${(r * 0.3).toFixed(2)} ${(cx + r).toFixed(2)},${(circleCy - r * 0.7).toFixed(2)} ${(cx + r).toFixed(2)},${circleCy.toFixed(2)}`,
+    `A${r.toFixed(2)},${r.toFixed(2)} 0 0,1 ${(cx - r).toFixed(2)},${circleCy.toFixed(2)}`,
+    `C${(cx - r).toFixed(2)},${(circleCy - r * 0.7).toFixed(2)} ${(cx - r * 1.1).toFixed(2)},${(r * 0.3).toFixed(2)} ${cx.toFixed(2)},0`,
+    `Z`,
+  ].join(" ");
+}
+
+// The Material Design "bolt" icon's own point list (its 24x24 path M7,2v11h3v9l7-12h-4l4-8H7z,
+// unrolled into absolute points and normalized to 0-1) - reused rather than hand-tuned since it's
+// already a well-proportioned, widely-recognized lightning-bolt silhouette.
+function lightningBoltPolygonPoints(w: number, h: number): [number, number][] {
+  const fractions: [number, number][] = [
+    [7 / 24, 2 / 24],
+    [7 / 24, 13 / 24],
+    [10 / 24, 13 / 24],
+    [10 / 24, 22 / 24],
+    [17 / 24, 10 / 24],
+    [13 / 24, 10 / 24],
+    [17 / 24, 2 / 24],
+  ];
+  return fractions.map(([fx, fy]) => [fx * w, fy * h]);
+}
+
+// A "D" - flat left edge, semicircular bulge to the right. The radius (w) and the flat edge's own
+// half-length (h/2) are independent, so this isn't a true half-circle unless w === h/2, but it
+// reads as one at any reasonable box proportions.
+function halfCircleOutlineD(w: number, h: number): string {
+  return `M0,0 L0,${h} A${w.toFixed(2)},${(h / 2).toFixed(2)} 0 0,0 0,0 Z`;
+}
+
+// A rectangle with a triangular notch cut inward from each half of the bottom edge - the
+// swallowtail ribbon/banner look.
+function bannerPolygonPoints(w: number, h: number): [number, number][] {
+  return [[0, 0], [w, 0], [w, h], [w * 0.75, h * 0.7], [w * 0.5, h], [w * 0.25, h * 0.7], [0, h]];
+}
+
+// UML "Frame" notation - an outer rectangle plus a small pentagon "tab" (a rectangle with its
+// top-right corner clipped) overlapping the top-left corner, where a frame's name/label would go.
+// Two independent closed subpaths in one `d`, same multi-subpath convention the circuit symbols use.
+function frameOutlineD(w: number, h: number): string {
+  const tabW = w * 0.4;
+  const tabH = h * 0.22;
+  const notch = tabH * 0.4;
+  return [
+    `M0,0 L${w},0 L${w},${h} L0,${h} Z`,
+    `M0,0 L${tabW.toFixed(2)},0 L${tabW.toFixed(2)},${(tabH - notch).toFixed(2)} L${(tabW - notch).toFixed(2)},${tabH.toFixed(2)} L0,${tabH.toFixed(2)} Z`,
+  ].join(" ");
+}
+
+// A rectangle with both its top and bottom edges replaced by a shallow S-curve - the flowchart
+// "tape" symbol, mirroring document's own wavy-bottom-edge technique onto both edges.
+function tapeOutlineD(w: number, h: number): string {
+  const waveH = h * 0.12;
+  return [
+    `M0,${waveH.toFixed(2)}`,
+    `C${(w * 0.25).toFixed(2)},0 ${(w * 0.75).toFixed(2)},${(waveH * 2).toFixed(2)} ${w},${waveH.toFixed(2)}`,
+    `L${w},${(h - waveH).toFixed(2)}`,
+    `C${(w * 0.75).toFixed(2)},${h} ${(w * 0.25).toFixed(2)},${(h - waveH * 2).toFixed(2)} 0,${(h - waveH).toFixed(2)}`,
+    `Z`,
+  ].join(" ");
+}
+
+// The flowchart "Display" symbol - a lens/eye silhouette (points at the left/right, curved top and
+// bottom) rather than the true asymmetric display glyph, for a cleaner, more symmetric icon.
+function displayOutlineD(w: number, h: number): string {
+  return [
+    `M0,${(h / 2).toFixed(2)}`,
+    `C0,${(h * 0.2).toFixed(2)} ${(w * 0.2).toFixed(2)},0 ${(w * 0.4).toFixed(2)},0`,
+    `L${(w * 0.7).toFixed(2)},0`,
+    `C${(w * 0.9).toFixed(2)},0 ${w},${(h * 0.2).toFixed(2)} ${w},${(h / 2).toFixed(2)}`,
+    `C${w},${(h * 0.8).toFixed(2)} ${(w * 0.9).toFixed(2)},${h} ${(w * 0.7).toFixed(2)},${h}`,
+    `L${(w * 0.4).toFixed(2)},${h}`,
+    `C${(w * 0.2).toFixed(2)},${h} 0,${(h * 0.8).toFixed(2)} 0,${(h / 2).toFixed(2)}`,
+    `Z`,
+  ].join(" ");
+}
+
+// Flowchart "Manual Input" - a rectangle whose top edge is a single upward slant instead of flat.
+function manualInputPolygonPoints(w: number, h: number): [number, number][] {
+  return [[0, h * 0.25], [w, 0], [w, h], [0, h]];
+}
+
 // Builds one continuous open-path `d` string tracing the given periodic waveform across a w×h box,
 // vertically centered (amplitude = 35% of h either side of the midline), repeated `cycles` times.
 // Square/triangle/sawtooth are piecewise-linear so their breakpoints are computed exactly (no
@@ -703,6 +854,36 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
         kind: "path",
         d: angleOutlineD(w, h, opts?.angleDegrees ?? DEFAULT_ANGLE_DEGREES, opts?.angleRay1Length ?? DEFAULT_ANGLE_RAY_LENGTH, opts?.angleRay2Length ?? DEFAULT_ANGLE_RAY_LENGTH),
       };
+    case "hourglass":
+      return { kind: "polygon", points: hourglassPolygonPoints(w, h) };
+    case "teardrop":
+      return { kind: "path", d: teardropOutlineD(w, h) };
+    case "lightningBolt":
+      return { kind: "polygon", points: lightningBoltPolygonPoints(w, h) };
+    case "halfCircle":
+      return { kind: "path", d: halfCircleOutlineD(w, h) };
+    case "banner":
+      return { kind: "polygon", points: bannerPolygonPoints(w, h) };
+    case "frame":
+      return { kind: "path", d: frameOutlineD(w, h) };
+    case "tape":
+      return { kind: "path", d: tapeOutlineD(w, h) };
+    case "display":
+      return { kind: "path", d: displayOutlineD(w, h) };
+    case "predefinedProcess":
+      return {
+        kind: "polygon",
+        points: [[0, 0], [w, 0], [w, h], [0, h]],
+        innerLines: [[[w * 0.15, 0], [w * 0.15, h]], [[w * 0.85, 0], [w * 0.85, h]]],
+      };
+    case "manualInput":
+      return { kind: "polygon", points: manualInputPolygonPoints(w, h) };
+    case "internalStorage":
+      return {
+        kind: "polygon",
+        points: [[0, 0], [w, 0], [w, h], [0, h]],
+        innerLines: [[[w * 0.15, 0], [w * 0.15, h]], [[0, h * 0.15], [w, h * 0.15]]],
+      };
     case "rectangle":
     case "text":
     case "freehand":
@@ -750,6 +931,12 @@ export function computeContentBounds(page: WhiteboardPage): BoundsBox {
     minY = Math.min(minY, source.y, target.y);
     maxX = Math.max(maxX, source.x, target.x);
     maxY = Math.max(maxY, source.y, target.y);
+    for (const wp of edge.waypoints ?? []) {
+      minX = Math.min(minX, wp.x);
+      minY = Math.min(minY, wp.y);
+      maxX = Math.max(maxX, wp.x);
+      maxY = Math.max(maxY, wp.y);
+    }
   }
   if (!Number.isFinite(minX)) {
     return { minX: -EMPTY_BOUNDS_PADDING, minY: -EMPTY_BOUNDS_PADDING, maxX: EMPTY_BOUNDS_PADDING, maxY: EMPTY_BOUNDS_PADDING };
@@ -764,6 +951,8 @@ export function applyCommand(page: WhiteboardPage, command: WhiteboardCommand): 
   switch (command.type) {
     case "add-node":
       return { ...page, nodes: [...page.nodes, command.item] };
+    case "add-node-with-edge":
+      return { ...page, nodes: [...page.nodes, command.node], edges: [...page.edges, command.edge] };
     case "delete-node": {
       const removedEdgeIds = new Set(command.edges.map((e) => e.id));
       return {
@@ -793,6 +982,11 @@ export function invertCommand(command: WhiteboardCommand): WhiteboardCommand {
   switch (command.type) {
     case "add-node":
       return { type: "delete-node", item: command.item, edges: [] };
+    // Unlike plain "add-node", this DOES have everything needed to invert cleanly: delete-node's
+    // own `edges` cascade array is exactly "the edges to remove alongside this node," and here
+    // that's just the one edge this command added - no special-casing needed in useWhiteboardStore.
+    case "add-node-with-edge":
+      return { type: "delete-node", item: command.node, edges: [command.edge] };
     // Deliberately drops command.edges - this alone can't express "add-node AND re-add several
     // edges" as one WhiteboardCommand. useWhiteboardStore's undo() special-cases "delete-node" and
     // calls undoDeleteNode directly instead of going through invertCommand for it; this branch only
@@ -1125,7 +1319,8 @@ const DASH_PATTERNS: Record<WhiteboardEdge["strokeStyle"], number[]> = {
 function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesById: Map<string, WhiteboardNode>): void {
   const { source, target } = resolveEdgeEndpoints(edge, nodesById);
   const bow = edge.curveBow ?? DEFAULT_CURVE_BOW;
-  const path = new Path2D(buildEdgePath(source, target, edge.routing, bow));
+  const waypoints = edge.waypoints ?? [];
+  const path = new Path2D(buildEdgePath(source, target, edge.routing, bow, waypoints));
   ctx.lineWidth = edge.strokeWidth;
   ctx.strokeStyle = edge.strokeColor;
   ctx.lineCap = edge.strokeStyle === "dotted" ? "round" : "butt";
@@ -1135,7 +1330,7 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
   ctx.setLineDash([]);
   ctx.lineCap = "butt";
 
-  const { startDeg, endDeg } = edgeEndAngleDeg(source, target, edge.routing, source.side, target.side, bow);
+  const { startDeg, endDeg } = edgeEndAngleDeg(source, target, edge.routing, source.side, target.side, bow, waypoints);
   drawArrowhead(ctx, edge.endArrowType, target.x, target.y, endDeg, edge.strokeColor, edge.strokeWidth);
   drawArrowhead(ctx, edge.startArrowType, source.x, source.y, startDeg, edge.strokeColor, edge.strokeWidth);
 }

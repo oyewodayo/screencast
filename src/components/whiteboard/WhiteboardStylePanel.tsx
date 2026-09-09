@@ -538,7 +538,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               ))}
             </select>
           </Field>
-          {edge.routing === "curved" && (
+          {edge.routing === "curved" && !(edge.waypoints && edge.waypoints.length > 0) && (
             <Field label="Curve bow">
               <input
                 type="range"
@@ -550,6 +550,18 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 className="w-28"
                 title="Which way (and how far) a free-floating end of this curve bows - only matters where the curve has no shape side to bow away from"
               />
+            </Field>
+          )}
+          {edge.waypoints && edge.waypoints.length > 0 && (
+            <Field label="Bend points">
+              <button
+                type="button"
+                onClick={() => updateEdge({ waypoints: [] })}
+                className="h-7 px-2 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs hover:bg-gray-50 dark:hover:bg-neutral-700"
+                title="Remove every manually-dragged bend point on this connector, letting the routing style alone decide its path again"
+              >
+                Clear ({edge.waypoints.length})
+              </button>
             </Field>
           )}
           <Field label="Start arrow">

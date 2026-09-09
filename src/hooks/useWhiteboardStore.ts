@@ -29,6 +29,9 @@ export interface UseWhiteboardStoreResult {
   loading: boolean;
   loadError: string | null;
   addNode: (node: WhiteboardNode) => void;
+  // Adds a node and one edge connecting it to an existing node, as a single undo step - the
+  // hover-arrow "quick clone + connect" gesture (see WhiteboardCanvas.tsx's HoverConnectArrows).
+  addNodeWithEdge: (node: WhiteboardNode, edge: WhiteboardEdge) => void;
   editNode: (before: WhiteboardNode, after: WhiteboardNode) => void;
   // Deletes a node AND every edge attached to it, as one undo step - see whiteboardTypes.ts's
   // 'delete-node' command doc comment for why edges can't be left dangling.
@@ -196,6 +199,8 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
   const activePage = doc ? doc.pages.find((p) => p.id === doc.activePageId) ?? doc.pages[0] ?? null : null;
 
   const addNode = useCallback((node: WhiteboardNode) => dispatch({ type: "add-node", item: node }), [dispatch]);
+
+  const addNodeWithEdge = useCallback((node: WhiteboardNode, edge: WhiteboardEdge) => dispatch({ type: "add-node-with-edge", node, edge }), [dispatch]);
 
   const editNode = useCallback(
     (before: WhiteboardNode, after: WhiteboardNode) => {
@@ -374,6 +379,7 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     loading,
     loadError,
     addNode,
+    addNodeWithEdge,
     editNode,
     deleteNode,
     batchEditNodes,
