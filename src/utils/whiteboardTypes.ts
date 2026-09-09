@@ -59,6 +59,16 @@ export type WhiteboardShapeType =
   | "predefinedProcess" // flowchart predefined-process - rectangle with two inset vertical bars
   | "manualInput" // flowchart manual-input - rectangle with a slanted top edge
   | "internalStorage" // flowchart internal-storage - rectangle with an inset corner cross
+  // Graph plots - WhiteboardNode.chartData drives the first four (see its own doc comment for why
+  // they all share one field); "functionPlot" instead picks a curve via WhiteboardNode.plotFunction.
+  // All built from whiteboardHandlers.ts's shared "chart" ShapeOutline kind (multiple independently-
+  // colored parts: bars/curve, axis lines, point markers, pie slices), since none of these are a
+  // single flat-colored silhouette the way every other shape here is.
+  | "barChart"
+  | "lineChart"
+  | "pieChart"
+  | "scatterPlot"
+  | "functionPlot"
   | "text"
   | "freehand";
 
@@ -75,7 +85,29 @@ export const LINE_ONLY_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<Whiteb
   "battery",
   "axes",
   "angle",
+  // lineChart/scatterPlot: a stroked line/dot markers, nothing that reads as "the shape's own
+  // fill region". pieChart: always multi-colored from its own fixed palette (see PIE_PALETTE),
+  // so node.fillColor has no effect on it at all. functionPlot: axis lines + a stroked curve, same
+  // reasoning as lineChart. barChart is deliberately NOT here - its bars DO use node.fillColor.
+  "lineChart",
+  "pieChart",
+  "scatterPlot",
+  "functionPlot",
 ]);
+
+// The built-in sample series a bar/line/pie/scatter chart starts with (and falls back to if
+// chartData is ever emptied out entirely) - just enough points to look like a real chart immediately
+// on placement rather than a blank box, picked with no particular meaning beyond "visually varied".
+export const DEFAULT_CHART_DATA: number[] = [4, 7, 3, 9, 5];
+
+// Which curve a "functionPlot" node traces (see whiteboardHandlers.ts's evalPlotFunction/
+// FUNCTION_PLOT_DOMAINS) - a curated preset list rather than an arbitrary user-typed formula, same
+// "fixed choices, not a formula parser" tradeoff WhiteboardNode.waveStyle makes for periodic shapes.
+export type FunctionPlotType = "linear" | "quadratic" | "cubic" | "sine" | "cosine" | "exponential" | "sqrt" | "logarithm" | "absolute";
+
+// The four shapeTypes that read WhiteboardNode.chartData - shared by createDefaultWhiteboardNode
+// (to seed it) and WhiteboardStylePanel.tsx (to show the data-editing field).
+export const CHART_DATA_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["barChart", "lineChart", "pieChart", "scatterPlot"]);
 
 interface WhiteboardItemBase {
   id: string;
@@ -139,6 +171,15 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   angleDegrees?: number;
   angleRay1Length?: number;
   angleRay2Length?: number;
+  // "barChart"/"lineChart"/"pieChart"/"scatterPlot" only - the data series, edited in the style
+  // panel as one comma-separated numbers field. Shared by all four chart shapeTypes rather than each
+  // getting its own field, since they're all "the same series, drawn differently" - switching a
+  // node's shapeType between them (not currently exposed in the UI, but nothing stops it) keeps the
+  // data intact rather than losing it. Absent/empty - resolves to DEFAULT_CHART_DATA.
+  chartData?: number[];
+  // "functionPlot" only - which curve to trace (see whiteboardHandlers.ts's evalPlotFunction).
+  // Absent - resolves to "sine".
+  plotFunction?: FunctionPlotType;
   fontFamily: string;
   fontSize: number;
   fontColor: string;
@@ -342,6 +383,11 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   predefinedProcess: { width: 170, height: 100 },
   manualInput: { width: 180, height: 110 },
   internalStorage: { width: 170, height: 120 },
+  barChart: { width: 220, height: 160 },
+  lineChart: { width: 220, height: 160 },
+  pieChart: { width: 190, height: 190 },
+  scatterPlot: { width: 220, height: 160 },
+  functionPlot: { width: 200, height: 160 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
 };
@@ -351,7 +397,7 @@ export function createDefaultWhiteboardNode(
   shapeType: WhiteboardShapeType,
   x: number,
   y: number,
-  overrides?: Partial<Pick<WhiteboardNode, "sides" | "starPoints" | "starInnerRadiusRatio" | "waveStyle" | "waveCycles" | "angleDegrees" | "angleRay1Length" | "angleRay2Length">>
+  overrides?: Partial<Pick<WhiteboardNode, "sides" | "starPoints" | "starInnerRadiusRatio" | "waveStyle" | "waveCycles" | "angleDegrees" | "angleRay1Length" | "angleRay2Length" | "chartData" | "plotFunction">>
 ): WhiteboardNode {
   const now = Date.now();
   const size = SHAPE_DEFAULT_SIZE[shapeType];
@@ -376,6 +422,8 @@ export function createDefaultWhiteboardNode(
     angleDegrees: shapeType === "angle" ? overrides?.angleDegrees ?? 50 : undefined,
     angleRay1Length: shapeType === "angle" ? overrides?.angleRay1Length ?? 1 : undefined,
     angleRay2Length: shapeType === "angle" ? overrides?.angleRay2Length ?? 1 : undefined,
+    chartData: CHART_DATA_SHAPES.has(shapeType) ? overrides?.chartData ?? DEFAULT_CHART_DATA : undefined,
+    plotFunction: shapeType === "functionPlot" ? overrides?.plotFunction ?? "sine" : undefined,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,
     fontColor: "#111111",

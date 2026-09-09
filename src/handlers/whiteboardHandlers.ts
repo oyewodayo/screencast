@@ -12,6 +12,8 @@
 
 import {
   ArrowheadType,
+  DEFAULT_CHART_DATA,
+  FunctionPlotType,
   WhiteboardAnchorSide,
   WhiteboardCommand,
   WhiteboardEdge,
@@ -341,7 +343,29 @@ export type ShapeOutline =
   | { kind: "cylinder" }
   // A hand-built SVG path `d` string for outlines a simple point list can't express (currently
   // just the curved ones: document's wavy edge, cloud's bumps).
-  | { kind: "path"; d: string };
+  | { kind: "path"; d: string }
+  // The graph-plot shapes (bar/line/pie/scatter charts, function plots) - unlike every kind above,
+  // these are never one flat-colored silhouette, so each part carries its OWN role deciding how
+  // it's colored at render time (see ChartPartRole's own doc comment) rather than the node's plain
+  // fillColor/strokeColor pair covering the whole shape.
+  | { kind: "chart"; parts: ChartPart[] };
+
+// How one piece of a "chart" ShapeOutline gets colored - resolved by the renderer (both
+// WhiteboardCanvas.tsx's SVG and this file's own Canvas2D paintShapeBody), not baked into the outline
+// itself, so a chart shape still respects the node's own fillColor/strokeColor the same way every
+// other shape does wherever that's meaningful:
+//   "fill"   - node.fillColor (bar-chart bars) - fill only, no stroke.
+//   "stroke" - node.strokeColor (a line-chart's connecting line, a function plot's curve) - stroke
+//              only, no fill (filling an open, possibly-zigzagging line would shade a meaningless
+//              region under it).
+//   "marker" - node.strokeColor, filled solid (line/scatter point dots - small closed circles, so
+//              filling them is exactly what makes them read as dots rather than rings).
+//   "axis"   - a fixed neutral gray, thin stroke, regardless of the node's own colors - a chart's
+//              axis/baseline is scaffolding, not data, so it stays visually recessive even if the
+//              node's stroke color is something bold.
+//   "slice"  - `color` is REQUIRED and used as-is (a pie chart's per-slice palette color - see
+//              PIE_PALETTE) - the one role where node.fillColor/strokeColor play no part at all.
+export type ChartPart = { d: string; role: "fill" | "stroke" | "axis" | "marker" } | { d: string; role: "slice"; color: string };
 
 export interface ShapeOutlineOptions {
   sides?: number; // "polygon" only
@@ -352,6 +376,8 @@ export interface ShapeOutlineOptions {
   angleDegrees?: number; // "angle" only
   angleRay1Length?: number; // "angle" only
   angleRay2Length?: number; // "angle" only
+  chartData?: number[]; // "barChart"/"lineChart"/"pieChart"/"scatterPlot" only
+  plotFunction?: FunctionPlotType; // "functionPlot" only
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -684,6 +710,188 @@ function manualInputPolygonPoints(w: number, h: number): [number, number][] {
   return [[0, h * 0.25], [w, 0], [w, h], [0, h]];
 }
 
+// ---- Graph plots (bar/line/pie/scatter charts, function plots) ----------------------------------
+//
+// All built from the "chart" ShapeOutline kind's independently-colored `parts` (see ChartPart's own
+// doc comment) rather than one flat silhouette. A path built with `openPathD` below is always a
+// single M-started, un-closed polyline - correct for "stroke"/"axis" roles (no fill happens either
+// way) and for "marker" dots too (each is its own tiny closed loop via two arcs, so it fills as a
+// solid dot regardless of the overall path being "open").
+
+function openPathD(points: { x: number; y: number }[]): string {
+  return points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" ");
+}
+
+// A small filled dot at (cx, cy) - two arcs forming a closed circle, the same "two semicircle arcs"
+// trick teardropOutlineD/halfCircleOutlineD already use, just closed into a full loop this time.
+function dotPathD(cx: number, cy: number, r: number): string {
+  return `M${(cx - r).toFixed(2)},${cy.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 1,0 ${(cx + r).toFixed(2)},${cy.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 1,0 ${(cx - r).toFixed(2)},${cy.toFixed(2)}`;
+}
+
+// Shared x-axis layout for bar/line/scatter (pie has no axis at all): a baseline near the bottom,
+// N evenly-spaced columns above it scaled to the series' own max value - `columnX`/`baselineY`/
+// `valueToY` are exposed so each chart type only has to describe what it draws AT each column, not
+// re-derive the shared layout.
+function chartColumnLayout(w: number, h: number, values: number[]) {
+  const n = Math.max(1, values.length);
+  const baselineY = h * 0.88;
+  const topY = h * 0.08;
+  const max = Math.max(...values, 1e-6);
+  const columnX = (i: number) => (n === 1 ? w / 2 : (w * (i + 0.5)) / n);
+  const valueToY = (v: number) => baselineY - (Math.max(0, v) / max) * (baselineY - topY);
+  return { baselineY, columnX, valueToY };
+}
+
+function barChartParts(w: number, h: number, data?: number[]): ChartPart[] {
+  const values = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
+  const { baselineY, columnX, valueToY } = chartColumnLayout(w, h, values);
+  const barW = (w / values.length) * 0.6;
+  const bars = values.map((v, i) => {
+    const cx = columnX(i);
+    const y = valueToY(v);
+    return `M${(cx - barW / 2).toFixed(2)},${baselineY.toFixed(2)} L${(cx - barW / 2).toFixed(2)},${y.toFixed(2)} L${(cx + barW / 2).toFixed(2)},${y.toFixed(2)} L${(cx + barW / 2).toFixed(2)},${baselineY.toFixed(2)} Z`;
+  });
+  return [
+    { d: bars.join(" "), role: "fill" },
+    { d: openPathD([{ x: 0, y: baselineY }, { x: w, y: baselineY }]), role: "axis" },
+  ];
+}
+
+function lineChartParts(w: number, h: number, data?: number[]): ChartPart[] {
+  const values = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
+  const { baselineY, columnX, valueToY } = chartColumnLayout(w, h, values);
+  const points = values.map((v, i) => ({ x: columnX(i), y: valueToY(v) }));
+  const dotR = Math.min(w, h) * 0.02 + 2;
+  return [
+    { d: openPathD(points), role: "stroke" },
+    { d: points.map((p) => dotPathD(p.x, p.y, dotR)).join(" "), role: "marker" },
+    { d: openPathD([{ x: 0, y: baselineY }, { x: w, y: baselineY }]), role: "axis" },
+  ];
+}
+
+function scatterPlotParts(w: number, h: number, data?: number[]): ChartPart[] {
+  const values = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
+  const { baselineY, columnX, valueToY } = chartColumnLayout(w, h, values);
+  const dotR = Math.min(w, h) * 0.025 + 2;
+  const dots = values.map((v, i) => dotPathD(columnX(i), valueToY(v), dotR));
+  return [
+    { d: dots.join(" "), role: "marker" },
+    { d: openPathD([{ x: 0, y: baselineY }, { x: w, y: baselineY }]), role: "axis" },
+  ];
+}
+
+// Cycled for however many slices a pie chart has - distinct, readable hues rather than shades of one
+// color, since (unlike bar/line/scatter) a pie chart's whole point is telling slices apart.
+const PIE_PALETTE = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316"];
+
+function pieChartParts(w: number, h: number, data?: number[]): ChartPart[] {
+  const raw = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
+  const values = raw.map((v) => Math.max(0, v));
+  const total = values.reduce((a, b) => a + b, 0);
+  const cx = w / 2;
+  const cy = h / 2;
+  const r = Math.min(w, h) * 0.42;
+  if (total <= 0) return [];
+  // A slice at (or past, from float error) the full circle can't be expressed as one wedge arc -
+  // its start/end points coincide, which SVG treats as a zero-length (invisible) arc. Draw it as a
+  // plain closed circle instead - visually identical to a "wedge" that happens to be the whole pie.
+  const fullIndex = values.findIndex((v) => v / total >= 0.999999);
+  if (fullIndex !== -1) {
+    return [{ d: dotPathD(cx, cy, r), role: "slice", color: PIE_PALETTE[fullIndex % PIE_PALETTE.length] }];
+  }
+  let angle = -Math.PI / 2;
+  const parts: ChartPart[] = [];
+  values.forEach((v, i) => {
+    if (v <= 0) return;
+    const sweep = (v / total) * Math.PI * 2;
+    const endAngle = angle + sweep;
+    const x0 = cx + r * Math.cos(angle);
+    const y0 = cy + r * Math.sin(angle);
+    const x1 = cx + r * Math.cos(endAngle);
+    const y1 = cy + r * Math.sin(endAngle);
+    const largeArc = sweep > Math.PI ? 1 : 0;
+    const d = `M${cx.toFixed(2)},${cy.toFixed(2)} L${x0.toFixed(2)},${y0.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 ${largeArc},1 ${x1.toFixed(2)},${y1.toFixed(2)} Z`;
+    parts.push({ d, role: "slice", color: PIE_PALETTE[i % PIE_PALETTE.length] });
+    angle = endAngle;
+  });
+  return parts;
+}
+
+// The x-domain each function is sampled over - picked per-function so the interesting part of its
+// shape (a full period for sine/cosine, a reasonable growth range for exponential, the defined
+// x>=0 half for sqrt/logarithm) actually lands in view rather than an arbitrary fixed window.
+const FUNCTION_PLOT_DOMAINS: Record<FunctionPlotType, [number, number]> = {
+  linear: [-3, 3],
+  quadratic: [-3, 3],
+  cubic: [-2, 2],
+  sine: [-2 * Math.PI, 2 * Math.PI],
+  cosine: [-2 * Math.PI, 2 * Math.PI],
+  exponential: [-2, 2],
+  sqrt: [0, 6],
+  logarithm: [0.1, 6],
+  absolute: [-3, 3],
+};
+
+export function evalPlotFunction(type: FunctionPlotType, x: number): number {
+  switch (type) {
+    case "linear":
+      return x;
+    case "quadratic":
+      return x * x;
+    case "cubic":
+      return x * x * x;
+    case "sine":
+      return Math.sin(x);
+    case "cosine":
+      return Math.cos(x);
+    case "exponential":
+      return Math.exp(x);
+    case "sqrt":
+      return Math.sqrt(x);
+    case "logarithm":
+      return Math.log(x);
+    case "absolute":
+      return Math.abs(x);
+  }
+}
+
+// Samples `type` densely across its own FUNCTION_PLOT_DOMAINS window, auto-fits the sampled Y range
+// to the box (so e.g. cubic's much taller range and sine's -1..1 range both fill the plot equally
+// well instead of one looking cramped), and draws x=0/y=0 axis lines wherever those actually fall
+// inside the plotted window (falling back to the left/bottom edge when they don't, e.g. sqrt's
+// domain never goes negative).
+function functionPlotParts(w: number, h: number, type: FunctionPlotType): ChartPart[] {
+  const [xMin, xMax] = FUNCTION_PLOT_DOMAINS[type];
+  const samples = 80;
+  const raw: { x: number; y: number }[] = [];
+  for (let i = 0; i <= samples; i++) {
+    const x = xMin + ((xMax - xMin) * i) / samples;
+    raw.push({ x, y: evalPlotFunction(type, x) });
+  }
+  const yMin = Math.min(...raw.map((p) => p.y));
+  const yMax = Math.max(...raw.map((p) => p.y));
+  const yRange = Math.max(yMax - yMin, 1e-6);
+  const padX = w * 0.08;
+  const padY = h * 0.08;
+  const plotW = w - padX * 2;
+  const plotH = h - padY * 2;
+  const mapX = (x: number) => padX + ((x - xMin) / (xMax - xMin)) * plotW;
+  const mapY = (y: number) => padY + plotH - ((y - yMin) / yRange) * plotH;
+  const curve = raw.map((p) => ({ x: mapX(p.x), y: mapY(p.y) }));
+  const yAxisY = yMin <= 0 && yMax >= 0 ? mapY(0) : padY + plotH;
+  const xAxisX = xMin <= 0 && xMax >= 0 ? mapX(0) : padX;
+  return [
+    { d: openPathD(curve), role: "stroke" },
+    {
+      d: [
+        openPathD([{ x: padX, y: yAxisY }, { x: padX + plotW, y: yAxisY }]),
+        openPathD([{ x: xAxisX, y: padY }, { x: xAxisX, y: padY + plotH }]),
+      ].join(" "),
+      role: "axis",
+    },
+  ];
+}
+
 // Builds one continuous open-path `d` string tracing the given periodic waveform across a w×h box,
 // vertically centered (amplitude = 35% of h either side of the midline), repeated `cycles` times.
 // Square/triangle/sawtooth are piecewise-linear so their breakpoints are computed exactly (no
@@ -884,6 +1092,16 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
         points: [[0, 0], [w, 0], [w, h], [0, h]],
         innerLines: [[[w * 0.15, 0], [w * 0.15, h]], [[0, h * 0.15], [w, h * 0.15]]],
       };
+    case "barChart":
+      return { kind: "chart", parts: barChartParts(w, h, opts?.chartData) };
+    case "lineChart":
+      return { kind: "chart", parts: lineChartParts(w, h, opts?.chartData) };
+    case "pieChart":
+      return { kind: "chart", parts: pieChartParts(w, h, opts?.chartData) };
+    case "scatterPlot":
+      return { kind: "chart", parts: scatterPlotParts(w, h, opts?.chartData) };
+    case "functionPlot":
+      return { kind: "chart", parts: functionPlotParts(w, h, opts?.plotFunction ?? "sine") };
     case "rectangle":
     case "text":
     case "freehand":
@@ -1077,6 +1295,8 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
     angleDegrees: node.angleDegrees,
     angleRay1Length: node.angleRay1Length,
     angleRay2Length: node.angleRay2Length,
+    chartData: node.chartData,
+    plotFunction: node.plotFunction,
   });
 
   const fillAndStroke = (path: Path2D) => {
@@ -1137,6 +1357,32 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
     case "path":
       fillAndStroke(new Path2D(outline.d));
       return;
+    case "chart": {
+      for (const part of outline.parts) {
+        const path = new Path2D(part.d);
+        if (part.role === "fill") {
+          if (node.fillColor) {
+            ctx.fillStyle = node.fillColor;
+            ctx.fill(path);
+          }
+        } else if (part.role === "marker") {
+          ctx.fillStyle = node.strokeColor;
+          ctx.fill(path);
+        } else if (part.role === "slice") {
+          ctx.fillStyle = part.color;
+          ctx.fill(path);
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = "#ffffff";
+          ctx.stroke(path);
+        } else {
+          // "stroke" and "axis"
+          ctx.lineWidth = part.role === "axis" ? 1 : Math.max(1, node.strokeWidth);
+          ctx.strokeStyle = part.role === "axis" ? "#9ca3af" : node.strokeColor;
+          ctx.stroke(path);
+        }
+      }
+      return;
+    }
   }
 }
 

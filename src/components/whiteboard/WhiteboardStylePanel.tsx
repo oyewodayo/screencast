@@ -20,7 +20,7 @@ import {
   TbStackFront,
   TbUnderline,
 } from "react-icons/tb";
-import { ArrowheadType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
+import { ArrowheadType, CHART_DATA_SHAPES, DEFAULT_CHART_DATA, FunctionPlotType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
 import {
   DEFAULT_ANGLE_DEGREES,
   DEFAULT_ANGLE_RAY_LENGTH,
@@ -57,6 +57,18 @@ const WAVE_STYLE_OPTIONS: { value: NonNullable<WhiteboardNode["waveStyle"]>; lab
   { value: "square", label: "Square" },
   { value: "triangle", label: "Triangle" },
   { value: "sawtooth", label: "Sawtooth" },
+];
+
+const FUNCTION_PLOT_OPTIONS: { value: FunctionPlotType; label: string }[] = [
+  { value: "linear", label: "Linear" },
+  { value: "quadratic", label: "Quadratic" },
+  { value: "cubic", label: "Cubic" },
+  { value: "sine", label: "Sine" },
+  { value: "cosine", label: "Cosine" },
+  { value: "exponential", label: "Exponential" },
+  { value: "sqrt", label: "Square Root" },
+  { value: "logarithm", label: "Logarithm" },
+  { value: "absolute", label: "Absolute Value" },
 ];
 
 const LINE_STYLE_OPTIONS: { value: WhiteboardEdge["strokeStyle"]; label: string }[] = [
@@ -156,6 +168,46 @@ function ClampedNumberField({
         const clamped = parseClamped(text) ?? initialValue;
         setText(String(clamped));
         commitIfChanged(clamped);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+      }}
+      className={className}
+    />
+  );
+}
+
+// Same "track raw typed text locally, commit a parsed value, never fight mid-edit" discipline as
+// ClampedNumberField above, just parsing a comma-separated number LIST instead of one number -
+// commits on every keystroke that currently parses to at least one valid number (so the chart
+// updates live as you type, same as every other field here), tolerating trailing junk like "3, 5,"
+// while you're still typing the next value rather than dropping the whole edit.
+function ChartDataField({ initialValue, onCommit, className }: { initialValue: number[]; onCommit: (values: number[]) => void; className: string }) {
+  const [text, setText] = React.useState(initialValue.join(", "));
+  const lastCommittedKey = React.useRef(text);
+  const parse = (raw: string): number[] =>
+    raw
+      .split(",")
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n));
+  return (
+    <input
+      type="text"
+      value={text}
+      placeholder="3, 7, 5, 9"
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        const values = parse(raw);
+        if (values.length === 0) return;
+        const key = values.join(",");
+        if (key === lastCommittedKey.current) return;
+        lastCommittedKey.current = key;
+        onCommit(values);
+      }}
+      onBlur={() => {
+        const values = parse(text);
+        if (values.length > 0) setText(values.join(", "));
       }}
       onKeyDown={(e) => {
         if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
@@ -374,6 +426,31 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 </div>
               </Field>
             </>
+          )}
+          {selectedNodes.every((n) => CHART_DATA_SHAPES.has(n.shapeType)) && (
+            <Field label="Data">
+              <ChartDataField
+                key={selectedNodes.map((n) => n.id).join(",")}
+                initialValue={selectedNodes[0].chartData ?? DEFAULT_CHART_DATA}
+                onCommit={(values) => updateNodes({ chartData: values })}
+                className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+              />
+            </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "functionPlot") && (
+            <Field label="Function">
+              <select
+                value={selectedNodes[0].plotFunction ?? "sine"}
+                onChange={(e) => updateNodes({ plotFunction: e.target.value as FunctionPlotType })}
+                className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+              >
+                {FUNCTION_PLOT_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
           )}
           {selectedNodes.every((n) => n.shapeType === "freehand") && (
             <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">

@@ -1189,6 +1189,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             angleDegrees: node.angleDegrees,
             angleRay1Length: node.angleRay1Length,
             angleRay2Length: node.angleRay2Length,
+            chartData: node.chartData,
+            plotFunction: node.plotFunction,
           });
           return (
             <div
@@ -1296,6 +1298,22 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               ) : outline.kind === "path" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
                   <path d={outline.d} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
+                </svg>
+              ) : outline.kind === "chart" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  {outline.parts.map((part, i) =>
+                    part.role === "fill" ? (
+                      <path key={i} d={part.d} fill={node.fillColor ?? "none"} stroke="none" />
+                    ) : part.role === "marker" ? (
+                      <path key={i} d={part.d} fill={node.strokeColor} stroke="none" />
+                    ) : part.role === "slice" ? (
+                      <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={1} />
+                    ) : part.role === "axis" ? (
+                      <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={1} />
+                    ) : (
+                      <path key={i} d={part.d} fill="none" stroke={node.strokeColor} strokeWidth={Math.max(1, node.strokeWidth)} strokeLinecap="round" strokeLinejoin="round" />
+                    )
+                  )}
                 </svg>
               ) : null}
 

@@ -109,11 +109,28 @@ const GENERAL_SHAPE_PRESETS: ShapePreset[] = [
   { type: "internalStorage", label: "Internal Storage" },
 ];
 
+const CHART_SHAPE_PRESETS: ShapePreset[] = [
+  { type: "barChart", label: "Bar Chart" },
+  { type: "lineChart", label: "Line Chart" },
+  { type: "pieChart", label: "Pie Chart" },
+  { type: "scatterPlot", label: "Scatter Plot" },
+  { type: "functionPlot", label: "Linear Plot", overrides: { plotFunction: "linear" } },
+  { type: "functionPlot", label: "Quadratic Plot", overrides: { plotFunction: "quadratic" } },
+  { type: "functionPlot", label: "Cubic Plot", overrides: { plotFunction: "cubic" } },
+  { type: "functionPlot", label: "Sine Plot", overrides: { plotFunction: "sine" } },
+  { type: "functionPlot", label: "Cosine Plot", overrides: { plotFunction: "cosine" } },
+  { type: "functionPlot", label: "Exponential Plot", overrides: { plotFunction: "exponential" } },
+  { type: "functionPlot", label: "Square Root Plot", overrides: { plotFunction: "sqrt" } },
+  { type: "functionPlot", label: "Logarithm Plot", overrides: { plotFunction: "logarithm" } },
+  { type: "functionPlot", label: "Absolute Value Plot", overrides: { plotFunction: "absolute" } },
+];
+
 const SHAPE_PRESET_GROUPS: { label: string; presets: ShapePreset[] }[] = [
   { label: "Basic", presets: BASIC_SHAPE_PRESETS },
   { label: "General", presets: GENERAL_SHAPE_PRESETS },
   { label: "Waveforms", presets: WAVE_SHAPE_PRESETS },
   { label: "Science", presets: SCIENCE_SHAPE_PRESETS },
+  { label: "Charts & Plots", presets: CHART_SHAPE_PRESETS },
 ];
 
 const TILE_W = 44;
@@ -134,6 +151,8 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
     angleDegrees: preset.overrides?.angleDegrees,
     angleRay1Length: preset.overrides?.angleRay1Length,
     angleRay2Length: preset.overrides?.angleRay2Length,
+    chartData: preset.overrides?.chartData,
+    plotFunction: preset.overrides?.plotFunction,
   });
   // Line-only shapes (waves, circuit symbols, axes...) render as an open trace, not a filled
   // silhouette (matches their own default fillColor: null) - filling the preview swatch would shade
@@ -174,6 +193,20 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
             <ellipse cx={w / 2} cy={h * CYLINDER_CAP_RATIO} rx={w / 2} ry={h * CYLINDER_CAP_RATIO} fill={fill} stroke={stroke} strokeWidth={sw} />
           </>
         )}
+        {outline.kind === "chart" &&
+          outline.parts.map((part, i) =>
+            part.role === "fill" ? (
+              <path key={i} d={part.d} fill={fill} stroke="none" />
+            ) : part.role === "marker" ? (
+              <path key={i} d={part.d} fill={stroke} stroke="none" />
+            ) : part.role === "slice" ? (
+              <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={sw} />
+            ) : part.role === "axis" ? (
+              <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={sw} />
+            ) : (
+              <path key={i} d={part.d} fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" />
+            )
+          )}
       </g>
     </svg>
   );
