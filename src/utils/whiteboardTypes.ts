@@ -478,9 +478,16 @@ export function createDefaultWhiteboardNode(
     // covers, so showing something immediately is worth the (easily deleted) default text this is
     // the one shapeType where every other one intentionally starts blank.
     text: shapeType === "equation" ? "E = mc^2" : "",
+    // "equation" keeps the SAME null/transparent fill every other blank-starting shape gets, but
+    // (unlike them) its own body is actually rendered now (see WhiteboardCanvas.tsx's own div for
+    // "rectangle"/"equation") - a card/background/corner-radius around the formula, entirely
+    // opt-in via the style panel's Fill/Stroke/Corner radius fields.
     fillColor: shapeType === "text" || shapeType === "equation" || shapeType === "freehand" || LINE_ONLY_SHAPES.has(shapeType) ? null : "#ffffff",
     strokeColor: shapeType === "freehand" ? "#111111" : "#000000",
-    strokeWidth: 2,
+    // 0 rather than the usual 2 - a fresh equation should still look like just the formula (no
+    // border) until the user deliberately turns Stroke width up in the style panel, not gain a
+    // visible box around it the instant it becomes possible to have one.
+    strokeWidth: shapeType === "equation" ? 0 : 2,
     cornerRadius: 0,
     sides: shapeType === "polygon" ? overrides?.sides ?? 5 : undefined,
     starPoints: shapeType === "star" ? overrides?.starPoints ?? 5 : undefined,

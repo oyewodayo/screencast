@@ -1315,7 +1315,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     boxSizing: "border-box",
                   }}
                 />
-              ) : node.shapeType === "rectangle" ? (
+              ) : node.shapeType === "rectangle" || node.shapeType === "equation" ? (
+                // "equation" reuses the plain rectangle body (background/border/corner-radius) so a
+                // formula can sit on a card/badge instead of bare on the canvas - purely optional,
+                // still transparent/borderless by default (same fillColor: null start every other
+                // "starts blank" shape gets) until the style panel's Fill/Stroke/Corner radius
+                // fields are actually used.
                 <div
                   style={{
                     position: "absolute",
@@ -1326,7 +1331,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     boxSizing: "border-box",
                   }}
                 />
-              ) : node.shapeType === "text" || node.shapeType === "equation" ? (
+              ) : node.shapeType === "text" ? (
                 isHovered || selected ? <div style={{ position: "absolute", inset: 0, border: "1px dashed #9ca3af" }} /> : null
               ) : outline.kind === "cylinder" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>

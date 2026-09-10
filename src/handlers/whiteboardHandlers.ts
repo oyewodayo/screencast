@@ -1724,6 +1724,10 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): 
       drawArrowhead(ctx, node.startArrowType ?? "none", first.x, first.y, startDeg, node.strokeColor, node.strokeWidth);
     }
   } else if (node.shapeType === "equation") {
+    // Card/background/border first (shapeOutlineFor already resolves "equation" to the same plain
+    // "rect" kind as "rectangle"/"text" - see its own doc comment), THEN the typeset formula drawn
+    // on top - matches WhiteboardCanvas.tsx's own div-then-EquationDisplay stacking order.
+    paintShapeBody(ctx, node);
     await paintEquation(ctx, node);
   } else {
     if (node.shapeType !== "text") paintShapeBody(ctx, node);

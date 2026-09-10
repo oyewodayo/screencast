@@ -267,7 +267,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             {selectedNodes.length > 1 ? `${selectedNodes.length} shapes` : "Shape"}
           </p>
 
-          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "equation" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
+          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
             <Field label="Fill">
               <input
                 type="color"
@@ -300,7 +300,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
             />
           </Field>
-          {selectedNodes.every((n) => n.shapeType === "rectangle") && (
+          {selectedNodes.every((n) => n.shapeType === "rectangle" || n.shapeType === "equation") && (
             <Field label="Corner radius">
               <input
                 type="range"
