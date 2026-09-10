@@ -115,10 +115,18 @@ function expandGroupSelection(ids: Set<string>, nodes: WhiteboardNode[]): Set<st
 }
 
 const ANCHOR_SIDES: Exclude<WhiteboardAnchorSide, "auto">[] = ["top", "right", "bottom", "left"];
-// Shapes with a meaningful "attach a connector here" edge - freehand ink and free-floating text
-// have no such natural anchor, so they don't show connection dots or accept connector drops aimed
-// at their body (a connector can still end at a free point over them, same as empty canvas).
-const CONNECTABLE_SHAPES = new Set<WhiteboardShapeType>(["rectangle", "ellipse", "diamond", "triangle", "hexagon", "parallelogram", "cylinder"]);
+// Every shape type EXCEPT these two has a meaningful "attach a connector here" edge - a plain
+// x/y/width/height box that resolveAnchorPoint/resolveAutoSide can pick a side of, regardless of
+// which of the toolbar's palette groups (Basic/General/Waveforms/Science/Charts & Plots/...) it
+// comes from, so this is a denylist rather than an allowlist of specific shapeTypes: new shapes
+// stay connectable by default without needing to be added here. "freehand" ink and free-floating
+// "text" are the only two with no such natural anchor, so they don't show connection dots, don't
+// show the hover "quick connect" arrows, and don't accept connector drops aimed at their body (a
+// connector can still end at a free point over them, same as empty canvas).
+const NON_CONNECTABLE_SHAPES = new Set<WhiteboardShapeType>(["text", "freehand"]);
+function isConnectableShape(shapeType: WhiteboardShapeType): boolean {
+  return !NON_CONNECTABLE_SHAPES.has(shapeType);
+}
 
 type Interaction =
   | { mode: "move"; ids: string[]; startClientX: number; startClientY: number; startNodes: WhiteboardNode[] }
@@ -895,7 +903,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // Snap the dragged endpoint to whichever node the pointer is currently over (excluding the
         // fixed endpoint's own node, so a self-loop back onto the same shape isn't offered).
         const target = nodes.find(
-          (n) => n.id !== interaction.fixed.nodeId && CONNECTABLE_SHAPES.has(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
+          (n) => n.id !== interaction.fixed.nodeId && isConnectableShape(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
         );
         setConnectorHoverNodeId(target?.id ?? null);
         const fixedPoint = interaction.fixed.nodeId ? nodeCenter(nodesById.get(interaction.fixed.nodeId)!) : { x: interaction.fixed.x ?? 0, y: interaction.fixed.y ?? 0 };
@@ -967,7 +975,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       } else if (interaction.mode === "connector") {
         const cur = clientToDoc(e.clientX, e.clientY);
         const droppedOnNode = nodes.find(
-          (n) => n.id !== interaction.fixed.nodeId && CONNECTABLE_SHAPES.has(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
+          (n) => n.id !== interaction.fixed.nodeId && isConnectableShape(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
         );
         const draggedEndpoint: WhiteboardEndpoint = droppedOnNode ? { nodeId: droppedOnNode.id, anchor: "auto" } : { x: cur.x, y: cur.y };
 
@@ -1315,7 +1323,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           const isHovered = hoveredNodeId === node.id;
           const isConnectorTarget = connectorHoverNodeId === node.id;
           const isEditing = editingNodeId === node.id;
-          const isConnectable = CONNECTABLE_SHAPES.has(node.shapeType);
+          const isConnectable = isConnectableShape(node.shapeType);
           const showConnectionDots = isConnectable && (isHovered || selected || connectorArmed);
           // Hover-arrow "pick a connected shape" (see onQuickConnectArrowClick/placeConnectedShape)
           // - hidden while any tool is armed or a connector drag is underway so it doesn't compete
