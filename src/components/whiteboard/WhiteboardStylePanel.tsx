@@ -24,6 +24,8 @@ import {
 } from "react-icons/tb";
 import { ArrowheadType, CHART_DATA_SHAPES, CHART_LABEL_SHAPES, DEFAULT_CHART_DATA, FunctionPlotType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
 import {
+  DEFAULT_AMP_INPUT_LEAD_LENGTH,
+  DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
   DEFAULT_ANGLE_DEGREES,
   DEFAULT_ANGLE_RAY_LENGTH,
   DEFAULT_CURVE_BOW,
@@ -31,12 +33,14 @@ import {
   DEFAULT_PLOT_CYCLES,
   DEFAULT_PLOT_DOMAIN_SCALE,
   DEFAULT_WAVE_CYCLES,
+  MAX_AMP_LEAD_LENGTH,
   MAX_ANGLE_DEGREES,
   MAX_ANGLE_RAY_LENGTH,
   MAX_NUMBER_LINE_MAX,
   MAX_PLOT_CYCLES,
   MAX_PLOT_DOMAIN_SCALE,
   MAX_WAVE_CYCLES,
+  MIN_AMP_LEAD_LENGTH,
   MIN_ANGLE_DEGREES,
   MIN_ANGLE_RAY_LENGTH,
   MIN_NUMBER_LINE_MAX,
@@ -684,6 +688,71 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 />
               </div>
             </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "amplifier") && (
+            <>
+              <Field label="Swap +/-">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].ampInvertingOnTop ?? false}
+                  onChange={(e) => updateNodes({ ampInvertingOnTop: e.target.checked })}
+                  className="h-3.5 w-3.5"
+                  title="Draw the inverting (-) input on top and the non-inverting (+) input on bottom, instead of the usual + on top / - on bottom - a pure label swap, the leads themselves don't move"
+                />
+              </Field>
+              <Field label="Input 1 length">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].ampInputTopLeadLength ?? DEFAULT_AMP_INPUT_LEAD_LENGTH}
+                  min={MIN_AMP_LEAD_LENGTH}
+                  max={MAX_AMP_LEAD_LENGTH}
+                  onCommit={(n) => updateNodes({ ampInputTopLeadLength: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Length of the top input lead - same value the diamond handle on the canvas drags"
+                />
+              </Field>
+              <Field label="Input 2 length">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].ampInputBottomLeadLength ?? DEFAULT_AMP_INPUT_LEAD_LENGTH}
+                  min={MIN_AMP_LEAD_LENGTH}
+                  max={MAX_AMP_LEAD_LENGTH}
+                  onCommit={(n) => updateNodes({ ampInputBottomLeadLength: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Length of the bottom input lead - same value the diamond handle on the canvas drags"
+                />
+              </Field>
+              <Field label="Output length">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].ampOutputLeadLength ?? DEFAULT_AMP_OUTPUT_LEAD_LENGTH}
+                  min={MIN_AMP_LEAD_LENGTH}
+                  max={MAX_AMP_LEAD_LENGTH}
+                  onCommit={(n) => updateNodes({ ampOutputLeadLength: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Length of the output lead - same value the diamond handle on the canvas drags"
+                />
+              </Field>
+              <Field label="Lead shape">
+                <button
+                  type="button"
+                  onClick={() =>
+                    updateNodes({
+                      ampInputTopLeadLength: undefined,
+                      ampInputBottomLeadLength: undefined,
+                      ampOutputLeadLength: undefined,
+                      ampInputTopLeadYOffset: undefined,
+                      ampInputBottomLeadYOffset: undefined,
+                      ampOutputLeadYOffset: undefined,
+                    })
+                  }
+                  className="text-xs px-2 py-1 rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                  title="Undo every length change and bend on all three leads, back to the shape's original straight, symmetric layout"
+                >
+                  Reset leads
+                </button>
+              </Field>
+            </>
           )}
           {selectedNodes.every((n) => n.shapeType === "freehand") && (
             <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">

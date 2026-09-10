@@ -474,17 +474,20 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const doc = store.doc;
   const page = store.activePage;
 
-  // While a rotate-handle drag is in progress, WhiteboardCanvas reports the live in-progress angle
-  // here purely for display (see its own onRotationPreview doc comment) - the drag itself doesn't
-  // commit to the store (and isn't undo-tracked) until pointer-up, but the style panel's Rotation
-  // box should still track the shape turning in real time rather than sitting stale until release.
-  const [rotationPreview, setRotationPreview] = useState<{ id: string; rotation: number } | null>(null);
+  // While any node-editing drag is in progress (move/resize/rotate/amplifier-lead), WhiteboardCanvas
+  // reports its own in-progress liveNodes array here purely for display (see its own
+  // onLiveNodesChange doc comment) - the drag itself doesn't commit to the store (and isn't
+  // undo-tracked) until pointer-up, but the style panel's numeric fields (Rotation, X/Y, amplifier
+  // lead lengths, ...) should still track the shape changing in real time rather than sitting stale
+  // until release.
+  const [liveNodesOverride, setLiveNodesOverride] = useState<WhiteboardNode[] | null>(null);
 
   const selectedNodes = useMemo(() => {
     const list = page ? page.nodes.filter((n) => selectedNodeIds.has(n.id)) : [];
-    if (!rotationPreview) return list;
-    return list.map((n) => (n.id === rotationPreview.id ? { ...n, rotation: rotationPreview.rotation } : n));
-  }, [page, selectedNodeIds, rotationPreview]);
+    if (!liveNodesOverride) return list;
+    const liveById = new Map(liveNodesOverride.map((n) => [n.id, n]));
+    return list.map((n) => liveById.get(n.id) ?? n);
+  }, [page, selectedNodeIds, liveNodesOverride]);
   const selectedEdges = useMemo(() => (page ? page.edges.filter((e) => selectedEdgeIds.has(e.id)) : []), [page, selectedEdgeIds]);
 
   useEffect(() => {
@@ -979,7 +982,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onAddNodeWithEdge={store.addNodeWithEdge}
           onEditNode={store.editNode}
           onBatchEditNodes={store.batchEditNodes}
-          onRotationPreview={setRotationPreview}
+          onLiveNodesChange={setLiveNodesOverride}
           onDeleteNode={(node) => {
             store.deleteNode(node);
             setSelectedNodeIds((prev) => {

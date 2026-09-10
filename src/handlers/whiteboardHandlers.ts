@@ -405,6 +405,13 @@ export interface ShapeOutlineOptions {
   plotYTickInterval?: number; // "functionPlot" only
   showChartLabels?: boolean; // "barChart"/"lineChart"/"scatterPlot"/"functionPlot" only
   numberLineMax?: number; // "numberLine" only
+  ampInputTopLeadLength?: number; // "amplifier" only
+  ampInputBottomLeadLength?: number; // "amplifier" only
+  ampOutputLeadLength?: number; // "amplifier" only
+  ampInputTopLeadYOffset?: number; // "amplifier" only
+  ampInputBottomLeadYOffset?: number; // "amplifier" only
+  ampOutputLeadYOffset?: number; // "amplifier" only
+  ampInvertingOnTop?: boolean; // "amplifier" only
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -579,25 +586,164 @@ function groundOutlineD(w: number, h: number): string {
   return parts.join(" ");
 }
 
-// Op-amp - a triangle (closed, fillable - same "diodeOutlineD" reasoning) with two input leads on
-// its flat left side (marked +/- with small open-line glyphs, same "open zero-area subpath mixed
-// into the one closed+filled `d`" trick diodeOutlineD already uses) and one output lead from its tip.
-function amplifierOutlineD(w: number, h: number): string {
-  const triLeftX = w * 0.22;
-  const tipX = w * 0.82;
-  const plusY = h * 0.28;
-  const minusY = h * 0.72;
-  const glyphX = triLeftX + w * 0.08;
-  const glyphHalf = w * 0.04;
-  return [
-    `M0,${plusY.toFixed(2)} L${triLeftX.toFixed(2)},${plusY.toFixed(2)}`,
-    `M0,${minusY.toFixed(2)} L${triLeftX.toFixed(2)},${minusY.toFixed(2)}`,
-    `M${triLeftX.toFixed(2)},0 L${triLeftX.toFixed(2)},${h.toFixed(2)} L${tipX.toFixed(2)},${(h / 2).toFixed(2)} Z`,
-    `M${tipX.toFixed(2)},${(h / 2).toFixed(2)} L${w},${(h / 2).toFixed(2)}`,
-    `M${(glyphX - glyphHalf).toFixed(2)},${plusY.toFixed(2)} L${(glyphX + glyphHalf).toFixed(2)},${plusY.toFixed(2)}`,
-    `M${glyphX.toFixed(2)},${(plusY - glyphHalf).toFixed(2)} L${glyphX.toFixed(2)},${(plusY + glyphHalf).toFixed(2)}`,
-    `M${(glyphX - glyphHalf).toFixed(2)},${minusY.toFixed(2)} L${(glyphX + glyphHalf).toFixed(2)},${minusY.toFixed(2)}`,
+// Bounds for WhiteboardNode.ampInputTopLeadLength/ampInputBottomLeadLength/ampOutputLeadLength
+// ("amplifier" only) - each lead's own length in absolute doc units (NOT a fraction of width -
+// unlike every other per-node "how big is this part" field in this file, these are deliberately
+// absolute so dragging a lead's own terminal handle can lengthen/shorten JUST that wire, leaving
+// the triangle body and the opposite lead untouched, the same way dragging one edge of a rotated
+// box leaves the opposite edge fixed in world space - see WhiteboardCanvas.tsx's beginAmpLeadDrag
+// and its "ampLead" pointer-move branch, which grows/shrinks the node's own width right along
+// with the dragged lead so the terminal actually tracks the cursor). A fraction-of-width field
+// couldn't do this: changing it while resizing the box to match would always rescale the OTHER
+// lead and the triangle too (they all read the same width), losing the "only this one wire
+// changed" feel entirely.
+export const MIN_AMP_LEAD_LENGTH = 5;
+export const MAX_AMP_LEAD_LENGTH = 1000;
+export const DEFAULT_AMP_INPUT_LEAD_LENGTH = 35;
+export const DEFAULT_AMP_OUTPUT_LEAD_LENGTH = 29;
+// The op-amp triangle always keeps at least this much width (see amplifierOutlineParts's own
+// degenerate-guard below) - a normal corner-resize shrinking the node way down while the lead
+// lengths stay at whatever absolute value they were last dragged to would otherwise invert or
+// collapse the triangle entirely.
+const AMP_MIN_TRIANGLE_WIDTH = 24;
+// Vertical position of the input leads/+-glyphs (before any WhiteboardNode.ampInput*LeadYOffset
+// bend), as a fraction of node height - shared by amplifierOutlineParts (the actual geometry) and
+// WhiteboardCanvas.tsx's terminal-handle placement, so the handles always sit exactly on the
+// rendered leads.
+export const AMP_PLUS_Y_FRAC = 0.28;
+export const AMP_MINUS_Y_FRAC = 0.72;
+// Bound for a lead's yOffset - deliberately the SAME generous, height-INDEPENDENT range the length
+// fields use (MIN/MAX_AMP_LEAD_LENGTH's own scale) rather than clamped to the node's own current
+// height, so a bend can freely route well outside the shape's own bounding box (the node div's SVG
+// already renders with overflow: visible, so there's nothing stopping that visually) - routing a
+// lead down to some other shape far below the amplifier, say, isn't something the amplifier's own
+// height should ever get to veto.
+const AMP_LEAD_Y_OFFSET_BOUND = MAX_AMP_LEAD_LENGTH;
+// Half-size of the +/- glyph marks, in FIXED absolute doc units - deliberately NOT a fraction of
+// node width the way most of this shape's other proportions are, so dragging a lead terminal
+// (which changes the node's own width to grow/shrink that lead - see WhiteboardCanvas.tsx's
+// beginAmpLeadDrag) can never make the glyphs themselves grow or shrink as a side effect. A normal
+// whole-shape corner-resize doesn't rescale them either, for the same reason: their only job is to
+// stay legibly sized "+"/"-" marks, not to track the body's own proportions.
+const AMP_GLYPH_HALF = 7;
+
+export interface AmplifierLeadGeometry {
+  topLeadLength?: number;
+  bottomLeadLength?: number;
+  outputLeadLength?: number;
+  topLeadYOffset?: number;
+  bottomLeadYOffset?: number;
+  outputLeadYOffset?: number;
+  invertingOnTop?: boolean;
+}
+
+// Clamps a lead's own yOffset to AMP_LEAD_Y_OFFSET_BOUND and adds it to naturalY - shared by
+// amplifierOutlineParts (the geometry) and WhiteboardCanvas.tsx's terminal-handle placement, so a
+// handle always renders exactly on top of its own rendered wire.
+export function clampAmpLeadTerminalY(naturalY: number, yOffset: number | undefined): number {
+  return naturalY + Math.max(-AMP_LEAD_Y_OFFSET_BOUND, Math.min(AMP_LEAD_Y_OFFSET_BOUND, yOffset ?? 0));
+}
+
+// Op-amp - a triangle with two input leads on its flat left side (marked +/- with small open-line
+// glyphs) and one output lead from its tip. Unlike every other circuit-symbol glyph in this file
+// (diode, ground, ...), this one is a "chart"-kind ShapeOutline (multiple independently-colored
+// parts) rather than a single filled+stroked "path" - see the return statement's own doc comment
+// for why a shape with a DRAGGABLE, potentially-bent lead needs that split.
+//
+// The triangle body is ALWAYS a plain, undistorted shape - a vertical left edge at ONE shared x
+// (bodyAttachX, below) - regardless of how different the two input lead lengths are. An earlier
+// version tried to slant the body's own edge to reach each lead's own length directly (a straight
+// or "ears + diagonal" line from (topLen,0) to (bottomLen,h)); once the two lengths differed by
+// much, that line's own geometry could fold back on itself into a self-intersecting dart/bowtie
+// shape instead of a triangle. Attaching both leads to ONE shared point per height instead sidesteps
+// that entirely: bodyAttachX = whichever lead is currently LONGER (matching the box-growth math in
+// WhiteboardCanvas.tsx's "ampLead" pointer-move branch, which already grows the node's own width to
+// fit whichever input lead is longer), and the SHORTER lead's terminal simply sits INSET from the
+// box's own left edge by the difference between the two lengths - still a perfectly straight
+// horizontal run at its own height, just not reaching all the way to x=0. The two input leads are
+// always independently adjustable (own lengths, no "linked" mode - matching a real op-amp's +/-
+// inputs being two unrelated wires); each can also be dragged vertically (yOffset) into an L-shaped
+// bend - see clampAmpLeadTerminalY's own doc comment. A lead with no offset AND equal to the other
+// lead's length renders as the exact same plain straight-edged triangle this shape always had, so
+// this whole feature is backward-compatible with every amplifier placed before it existed.
+// Resolves every position an amplifier's geometry needs from its raw fields - shared by
+// amplifierOutlineParts (the actual outline) and WhiteboardCanvas.tsx's terminal-handle placement,
+// so the handles always sit exactly on the rendered wires (including the degenerate-guard scaling
+// and the Y-offset clamping, both of which the handles need to mirror exactly or they'd drift off
+// the line they're supposed to be sitting on).
+export function resolveAmplifierGeometry(w: number, h: number, geo?: AmplifierLeadGeometry) {
+  let topLen = Math.max(MIN_AMP_LEAD_LENGTH, Math.min(MAX_AMP_LEAD_LENGTH, geo?.topLeadLength ?? DEFAULT_AMP_INPUT_LEAD_LENGTH));
+  let bottomLen = Math.max(MIN_AMP_LEAD_LENGTH, Math.min(MAX_AMP_LEAD_LENGTH, geo?.bottomLeadLength ?? DEFAULT_AMP_INPUT_LEAD_LENGTH));
+  let outputLen = Math.max(MIN_AMP_LEAD_LENGTH, Math.min(MAX_AMP_LEAD_LENGTH, geo?.outputLeadLength ?? DEFAULT_AMP_OUTPUT_LEAD_LENGTH));
+  // Degenerate guard: if the (independently-clamped, absolute) lead lengths would together eat
+  // more than the box has room for - e.g. after a normal corner-resize shrinks `w` without
+  // touching any lead - scale ALL THREE down proportionally rather than letting the triangle
+  // invert. Uses the LONGER of the two input leads (whichever one actually reaches furthest into
+  // the box) rather than their sum, matching how the two leads share one triangle edge instead of
+  // stacking end to end the way an input lead and the output lead do.
+  const available = Math.max(AMP_MIN_TRIANGLE_WIDTH, w - AMP_MIN_TRIANGLE_WIDTH);
+  const totalSpan = Math.max(topLen, bottomLen) + outputLen;
+  if (totalSpan > available) {
+    const scale = available / totalSpan;
+    topLen *= scale;
+    bottomLen *= scale;
+    outputLen *= scale;
+  }
+  const bodyAttachX = Math.max(topLen, bottomLen);
+  const topTerminalX = bodyAttachX - topLen;
+  const bottomTerminalX = bodyAttachX - bottomLen;
+  const tipX = w - outputLen;
+  const plusY = h * AMP_PLUS_Y_FRAC;
+  const minusY = h * AMP_MINUS_Y_FRAC;
+  const midY = h / 2;
+  const topTerminalY = clampAmpLeadTerminalY(plusY, geo?.topLeadYOffset);
+  const bottomTerminalY = clampAmpLeadTerminalY(minusY, geo?.bottomLeadYOffset);
+  const outputTerminalY = clampAmpLeadTerminalY(midY, geo?.outputLeadYOffset);
+  return { bodyAttachX, topTerminalX, bottomTerminalX, tipX, plusY, minusY, midY, topTerminalY, bottomTerminalY, outputTerminalY };
+}
+
+function amplifierOutlineParts(w: number, h: number, geo?: AmplifierLeadGeometry): ChartPart[] {
+  const { bodyAttachX, topTerminalX, bottomTerminalX, tipX, plusY, minusY, midY, topTerminalY, bottomTerminalY, outputTerminalY } = resolveAmplifierGeometry(w, h, geo);
+  // Proportional inset from the shared body attach point (not a fixed fraction of the whole node
+  // width) so the +/- marks stay sensibly placed inside the triangle body regardless of how long
+  // either lead currently is.
+  const glyphX = bodyAttachX + (tipX - bodyAttachX) * 0.15;
+  const glyphHalf = AMP_GLYPH_HALF;
+  // Which height gets the "+" (horizontal + vertical stroke) vs the "-" (horizontal stroke only) -
+  // a pure label swap (see WhiteboardNode.ampInvertingOnTop's own doc comment): the physical
+  // top/bottom lead geometry above never changes, only which glyph is drawn at which of the two
+  // already-computed heights.
+  const plusGlyphY = geo?.invertingOnTop ? minusY : plusY;
+  const minusGlyphY = geo?.invertingOnTop ? plusY : minusY;
+  const triangleD = `M${bodyAttachX.toFixed(2)},0 L${bodyAttachX.toFixed(2)},${h.toFixed(2)} L${tipX.toFixed(2)},${midY.toFixed(2)} Z`;
+  // Each lead: a short vertical jog RIGHT AT THE TERMINAL (only when yOffset !== 0 - collapses to a
+  // plain single-segment line whenever the jog's start/end Y coincide) to reach its own natural
+  // height, then a straight horizontal run the rest of the way to bodyAttachX. The bend sits at the
+  // terminal deliberately - that's the end the user is actually dragging, so the direction change
+  // should happen right there, not sprung on the fixed body end the user never touched.
+  const linesD = [
+    `M${topTerminalX.toFixed(2)},${topTerminalY.toFixed(2)} L${topTerminalX.toFixed(2)},${plusY.toFixed(2)} L${bodyAttachX.toFixed(2)},${plusY.toFixed(2)}`,
+    `M${bottomTerminalX.toFixed(2)},${bottomTerminalY.toFixed(2)} L${bottomTerminalX.toFixed(2)},${minusY.toFixed(2)} L${bodyAttachX.toFixed(2)},${minusY.toFixed(2)}`,
+    // Output lead: mirrors the input leads' own "jog right at the terminal" pattern.
+    `M${tipX.toFixed(2)},${midY.toFixed(2)} L${w},${midY.toFixed(2)} L${w},${outputTerminalY.toFixed(2)}`,
+    `M${(glyphX - glyphHalf).toFixed(2)},${plusGlyphY.toFixed(2)} L${(glyphX + glyphHalf).toFixed(2)},${plusGlyphY.toFixed(2)}`,
+    `M${glyphX.toFixed(2)},${(plusGlyphY - glyphHalf).toFixed(2)} L${glyphX.toFixed(2)},${(plusGlyphY + glyphHalf).toFixed(2)}`,
+    `M${(glyphX - glyphHalf).toFixed(2)},${minusGlyphY.toFixed(2)} L${(glyphX + glyphHalf).toFixed(2)},${minusGlyphY.toFixed(2)}`,
   ].join(" ");
+  // The triangle is its OWN two parts (one "fill", one "stroke", same `d`) rather than one
+  // filled+stroked "path" outline the way diode/ground/etc.'s single-piece glyphs work - a bent
+  // lead's 3-point L-shaped subpath (topTerminalY !== plusY, e.g.) is an OPEN path, and SVG/Canvas2D
+  // both implicitly close an open subpath with a straight line back to its start FOR FILL PURPOSES
+  // ONLY (never for the stroke) - mixed into one shared filled `d` the way the straight-line-only
+  // version of this shape used to work, that implicit closing line would fill in a phantom
+  // triangular sliver alongside the real triangle body. Keeping the leads/glyphs on their own
+  // "stroke"-only part (see ChartPart's own role union) sidesteps the whole issue: they're never
+  // filled at all, so an open subpath among them is always exactly as harmless as it looks.
+  return [
+    { d: triangleD, role: "fill" },
+    { d: triangleD, role: "stroke" },
+    { d: linesD, role: "stroke" },
+  ];
 }
 
 // A zigzag chain of `segments` bonds - the skeletal-formula alkane-chain backbone (see the
@@ -1395,7 +1541,18 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
     case "ground":
       return { kind: "path", d: groundOutlineD(w, h) };
     case "amplifier":
-      return { kind: "path", d: amplifierOutlineD(w, h) };
+      return {
+        kind: "chart",
+        parts: amplifierOutlineParts(w, h, {
+          topLeadLength: opts?.ampInputTopLeadLength,
+          bottomLeadLength: opts?.ampInputBottomLeadLength,
+          outputLeadLength: opts?.ampOutputLeadLength,
+          topLeadYOffset: opts?.ampInputTopLeadYOffset,
+          bottomLeadYOffset: opts?.ampInputBottomLeadYOffset,
+          outputLeadYOffset: opts?.ampOutputLeadYOffset,
+          invertingOnTop: opts?.ampInvertingOnTop,
+        }),
+      };
     case "bondLine":
       return { kind: "path", d: bondLineOutlineD(w, h, opts?.sides ?? 5) };
     case "unitCircle":
@@ -1657,6 +1814,13 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
     plotYTickInterval: node.plotYTickInterval,
     showChartLabels: node.showChartLabels,
     numberLineMax: node.numberLineMax,
+    ampInputTopLeadLength: node.ampInputTopLeadLength,
+    ampInputBottomLeadLength: node.ampInputBottomLeadLength,
+    ampOutputLeadLength: node.ampOutputLeadLength,
+    ampInputTopLeadYOffset: node.ampInputTopLeadYOffset,
+    ampInputBottomLeadYOffset: node.ampInputBottomLeadYOffset,
+    ampOutputLeadYOffset: node.ampOutputLeadYOffset,
+    ampInvertingOnTop: node.ampInvertingOnTop,
   });
 
   const fillAndStroke = (path: Path2D) => {

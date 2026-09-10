@@ -24,6 +24,7 @@
 // editEdge/addNode call) on pointer release - the same "stage locally, commit once" discipline
 // BoardCanvas.tsx's own liveImages uses, so a whole gesture is exactly one undo step.
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { TbRotateClockwise } from "react-icons/tb";
 import katex from "katex";
 import {
   ArrowheadType,
@@ -38,12 +39,20 @@ import {
   WhiteboardShapeType,
 } from "../../utils/whiteboardTypes";
 import {
+  AMP_MINUS_Y_FRAC,
+  AMP_PLUS_Y_FRAC,
   BoundsBox,
   buildEdgePath,
+  clampAmpLeadTerminalY,
   computeCurveBowFromPath,
   CYLINDER_CAP_RATIO,
+  DEFAULT_AMP_INPUT_LEAD_LENGTH,
+  DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
   DEFAULT_CURVE_BOW,
+  MAX_AMP_LEAD_LENGTH,
+  MIN_AMP_LEAD_LENGTH,
   nodeCenter,
+  resolveAmplifierGeometry,
   resolveAnchorPoint,
   resolveEdgeEndpoints,
   shapeOutlineFor,
@@ -55,6 +64,9 @@ const GRID_SIZE = 24;
 const HANDLE_SCREEN_SIZE = 9;
 // On-screen distance (CSS px, pre-zoom-correction) from a node's top edge out to its rotate handle.
 const ROTATE_HANDLE_GAP = 22;
+// The rotate handle renders as a small icon button, bigger than the plain resize/connection dots
+// so the glyph inside it stays legible.
+const ROTATE_ICON_SCREEN_SIZE = 18;
 const CONNECTION_DOT_SCREEN_SIZE = 9;
 const HIT_STROKE_SCREEN_WIDTH = 14;
 // Minimum on-screen movement (CSS px, pre-zoom-correction) between two recorded freehand points -
@@ -102,6 +114,21 @@ function cornerWorldPoint(node: WhiteboardNode, corner: ResizeCorner): { x: numb
   const rotated = node.rotation ? rotateVector(offset.x, offset.y, node.rotation) : offset;
   return { x: center.x + rotated.x, y: center.y + rotated.y };
 }
+
+// Same idea as cornerLocalOffset/cornerWorldPoint above, just for the midpoint of the west/east
+// edge instead of a corner (y stays 0 - vertically centered) - what the amplifier's lead-terminal
+// drag (beginAmpLeadDrag) anchors the OPPOSITE side against, the same "solve so that point stays
+// fixed in world space" trick the resize-corner math uses, just for a one-axis (width-only) resize.
+function edgeLocalOffset(width: number, edge: "w" | "e"): { x: number; y: number } {
+  return { x: (edge === "w" ? -width : width) / 2, y: 0 };
+}
+function edgeWorldPoint(node: WhiteboardNode, edge: "w" | "e"): { x: number; y: number } {
+  const center = nodeCenter(node);
+  const offset = edgeLocalOffset(node.width, edge);
+  const rotated = node.rotation ? rotateVector(offset.x, offset.y, node.rotation) : offset;
+  return { x: center.x + rotated.x, y: center.y + rotated.y };
+}
+
 // Given a set of already-selected node ids, adds every OTHER node sharing a groupId with one of
 // them - a group is meant to act as one unit once formed (see WhiteboardNode.groupId's own doc
 // comment), so any selection that catches part of a group (a marquee that only overlaps some of
@@ -142,10 +169,43 @@ type Interaction =
       // own (recalculated) center every render. See cornerWorldPoint's own doc comment.
       anchorWorld: { x: number; y: number };
     }
-  // Angle is recomputed fresh from the pointer's current position each move (pointer-to-center
-  // angle, not a delta from drag start), so this only needs the node being rotated and its center -
-  // no startClientX/Y the way move/resize need for a delta-based drag.
-  | { mode: "rotate"; id: string; startNode: WhiteboardNode; center: { x: number; y: number } }
+  // Rotation is a DELTA from drag start: startAngle is the pointer's own angle around `center` at
+  // pointer-down, and each move adds (current pointer angle - startAngle) to the node's own
+  // startNode.rotation - see the "rotate" pointer-move branch's own doc comment for why an absolute
+  // "pointer angle IS the rotation" formula (what this used to be) breaks once the rotate handle
+  // itself doesn't rest at a fixed, predictable angle around center (rendering it at the box's
+  // top-right corner instead of top-center, for a non-square box, means its own resting angle isn't
+  // simply "straight up" anymore).
+  | { mode: "rotate"; id: string; startNode: WhiteboardNode; center: { x: number; y: number }; startAngle: number }
+  // Dragging one of an "amplifier" node's lead TERMINALS (see beginAmpLeadDrag) - a diagrams.net-
+  // style "grab the actual line" shape-specific handle, the first of its kind in this file (every
+  // other special-purpose handle so far - angle's ray lengths - is style-panel-only). A mostly-
+  // horizontal drag is structurally a one-axis (width-only) resize: it grows/shrinks the node's own
+  // width AND the lead's own length together (keeping the triangle body and the OPPOSITE edge fixed
+  // in world space, via anchorWorld - see edgeWorldPoint), so the terminal itself tracks the cursor
+  // instead of just changing a value the whole box has to rescale to visualize. A mostly-vertical
+  // drag instead bends that one lead's own yOffset, independent of width/height entirely.
+  //
+  // `axisLocked` starts undefined and is set (mutated directly on this object - see the "ampLead"
+  // pointer-move branch) the FIRST time cumulative movement crosses AMP_LEAD_INTENT_THRESHOLD, then
+  // reused for the rest of the gesture rather than re-deciding "x or y" from the live delta every
+  // frame. Two things this fixes that a naive per-frame |dx| vs |dy| comparison doesn't: (1) a real
+  // mouse's first few pixels of movement are rarely perfectly axis-aligned, so without a dead zone
+  // and a locked choice, a deliberate vertical drag could commit a stray horizontal (length) change
+  // on its very first frame before the gesture's true direction is clear; (2) a plain click (never
+  // crosses the threshold, axisLocked stays undefined for the WHOLE gesture) is then trivially
+  // distinguished from a drag at pointer-up by checking axisLocked instead of a separate raw-
+  // distance check that could disagree with whatever the move handler already decided.
+  | {
+      mode: "ampLead";
+      id: string;
+      which: "inputTop" | "inputBottom" | "output";
+      startClientX: number;
+      startClientY: number;
+      startNode: WhiteboardNode;
+      anchorWorld: { x: number; y: number };
+      axisLocked?: "x" | "y";
+    }
   | { mode: "marquee"; startDocX: number; startDocY: number }
   | { mode: "pan"; startClientX: number; startClientY: number; startPan: { x: number; y: number } }
   | { mode: "freehand"; points: { x: number; y: number }[]; lastClientX: number; lastClientY: number }
@@ -199,6 +259,15 @@ const CURVE_PATH_MIN_POINT_DISTANCE = 4;
 // stray click rather than a deliberate drag - keeps a plain click with the Arrows tool armed from
 // creating a zero-length arrow nobody meant to draw.
 const MIN_CONNECTOR_DRAG_DISTANCE = 6;
+
+// Below this on-screen distance (CSS px, pre-zoom-correction), an amplifier lead-terminal gesture
+// hasn't shown its intent yet - no length/bend change commits, and the drag's eventual x/y axis
+// isn't decided (see the "ampLead" Interaction variant's own axisLocked doc comment). A gesture
+// that never crosses this at all is a plain click, a no-op (there's nothing left to toggle now
+// that the two input leads are always independent) - same "stray click vs. real drag" distinction
+// MIN_CONNECTOR_DRAG_DISTANCE makes, just tighter since committing even a tiny stray length/bend
+// change here would be more noticeable than it is for a connector.
+const AMP_LEAD_INTENT_THRESHOLD = 5;
 
 export interface WhiteboardCanvasHandle {
   zoomBy: (factor: number) => void;
@@ -260,13 +329,15 @@ interface WhiteboardCanvasProps {
   // part of a multi-selection keeps that whole selection; right-clicking something outside it
   // replaces the selection with just that one item first, same convention most apps use).
   onItemContextMenu: (nodeIds: Set<string>, edgeIds: Set<string>, screenPoint: { x: number; y: number }) => void;
-  // Fires on every pointer-move of an active rotate-handle drag with the angle currently being
-  // dragged to (and with `null` once the drag ends) - purely a live readout for
-  // WhiteboardEditor.tsx's style panel, which has no other way to see mid-drag state since the
-  // drag itself doesn't commit to the store (isn't undo-tracked) until pointer-up. This canvas's own
-  // on-screen angle popover (rendered next to the rotate handle below) doesn't need this prop at all
-  // - it reads the same live value directly off `interactionRef`/`liveNodes` during render instead.
-  onRotationPreview?: (preview: { id: string; rotation: number } | null) => void;
+  // Mirrors `liveNodes` (this component's own in-progress-drag staging state) out to the parent -
+  // WhiteboardEditor.tsx merges it into what it hands the style panel, so numeric fields (rotation,
+  // amplifier lead lengths, position, ...) update live as a shape is dragged instead of only once
+  // the drag commits to the store on pointer-up (which is when the store itself - and hence
+  // ordinary `selectedNodes` built from it - would otherwise first see the change). `null` while no
+  // node-editing drag is in progress. On-screen readouts that live INSIDE this canvas (the rotate
+  // angle popover, the amplifier lead handles) don't need this prop at all - they already read
+  // `liveNodes`/`interactionRef` directly during render.
+  onLiveNodesChange?: (nodes: WhiteboardNode[] | null) => void;
 }
 
 function clampZoom(z: number): number {
@@ -382,11 +453,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   laserArmed,
   onQuickConnectArrowClick,
   onItemContextMenu,
-  onRotationPreview,
+  onLiveNodesChange,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
   const [liveNodes, setLiveNodes] = useState<WhiteboardNode[] | null>(null);
+  // Mirrors liveNodes out to the parent on every change - see onLiveNodesChange's own doc comment.
+  // A plain effect rather than calling onLiveNodesChange directly alongside every setLiveNodes call
+  // site (move/resize/rotate/ampLead each have their own, plus the commit points that reset to
+  // null) - one place stays correct automatically instead of every call site needing to remember to
+  // also notify the parent.
+  useEffect(() => {
+    onLiveNodesChange?.(liveNodes);
+  }, [liveNodes, onLiveNodesChange]);
   const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
   const [connectorPreview, setConnectorPreview] = useState<{ from: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null }; to: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null } } | null>(null);
   // Live-updated bow for connectorPreview's own curve, computed from the gesture's pathPoints so
@@ -545,13 +624,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         setMarqueeRect(null);
         setFreehandPreview(null);
         setLiveNodes(null);
-        onRotationPreview?.(null);
         onSelectionChange(new Set(), new Set());
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes, onRotationPreview]);
+  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes]);
 
   // ---- Node move / resize ----------------------------------------------------------------------
   const beginMoveNode = useCallback(
@@ -601,7 +679,25 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     (node: WhiteboardNode, e: React.PointerEvent) => {
       e.stopPropagation();
       onSelectionChange(new Set([node.id]), new Set());
-      interactionRef.current = { mode: "rotate", id: node.id, startNode: node, center: nodeCenter(node) };
+      const center = nodeCenter(node);
+      const startPointer = clientToDoc(e.clientX, e.clientY);
+      const startAngle = (Math.atan2(startPointer.y - center.y, startPointer.x - center.x) * 180) / Math.PI;
+      interactionRef.current = { mode: "rotate", id: node.id, startNode: node, center, startAngle };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange, clientToDoc]
+  );
+
+  const beginAmpLeadDrag = useCallback(
+    (node: WhiteboardNode, which: "inputTop" | "inputBottom" | "output", e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      // Dragging either INPUT terminal anchors the east (right) edge fixed; the OUTPUT terminal
+      // anchors the west (left) edge - each drag only ever moves the side it's grabbing. Only
+      // consulted for a horizontal (length) drag - see the "ampLead" pointer-move branch's own
+      // dominant-axis check - but cheap enough to always compute up front regardless.
+      const anchorWorld = edgeWorldPoint(node, which === "output" ? "w" : "e");
+      interactionRef.current = { mode: "ampLead", id: node.id, which, startClientX: e.clientX, startClientY: e.clientY, startNode: node, anchorWorld };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
     [onSelectionChange]
@@ -844,14 +940,91 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
 
       if (interaction.mode === "rotate") {
         const cur = clientToDoc(e.clientX, e.clientY);
-        // atan2's 0deg points along +x (screen-right); +90 rotates that to point along -y
-        // (screen-up) instead, matching the handle's own resting position directly above the node.
-        let deg = (Math.atan2(cur.y - interaction.center.y, cur.x - interaction.center.x) * 180) / Math.PI + 90;
+        const curAngle = (Math.atan2(cur.y - interaction.center.y, cur.x - interaction.center.x) * 180) / Math.PI;
+        // DELTA from drag start (how far the pointer has swept around center), added to the node's
+        // OWN starting rotation - see the "rotate" Interaction variant's own doc comment for why
+        // this can't just be "the pointer's angle IS the rotation" (that only works if the handle
+        // always rests at a fixed, known angle around center, which stopped being true once the
+        // handle moved to the box's top-right corner instead of top-center).
+        let deg = (interaction.startNode.rotation ?? 0) + (curAngle - interaction.startAngle);
         if (e.shiftKey) deg = Math.round(deg / 15) * 15;
         deg = ((deg % 360) + 360) % 360;
         const rotated: WhiteboardNode = { ...interaction.startNode, rotation: deg };
         setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? rotated : n)));
-        onRotationPreview?.({ id: interaction.id, rotation: deg });
+        return;
+      }
+
+      if (interaction.mode === "ampLead") {
+        const dx = (e.clientX - interaction.startClientX) / zoom;
+        const dy = (e.clientY - interaction.startClientY) / zoom;
+        const start = interaction.startNode;
+        const rotation = start.rotation ?? 0;
+        // Same screen-space -> the shape's own rotated axes projection the resize handles use -
+        // dragging a handle on a tilted amplifier should still feel like sliding along ITS lead.
+        const local = rotation ? rotateVector(dx, dy, -rotation) : { x: dx, y: dy };
+        const isOutput = interaction.which === "output";
+        const isTop = interaction.which === "inputTop";
+
+        // Below the intent threshold, this gesture hasn't shown whether it's a click or a drag (or
+        // which axis a drag is along) yet - don't touch liveNodes at all, so a hand that isn't
+        // perfectly still while clicking never sneaks in a stray length/bend change (see
+        // AMP_LEAD_INTENT_THRESHOLD's own doc comment).
+        if (!interaction.axisLocked) {
+          const totalMoved = Math.hypot(e.clientX - interaction.startClientX, e.clientY - interaction.startClientY);
+          if (totalMoved < AMP_LEAD_INTENT_THRESHOLD) return;
+          interaction.axisLocked = Math.abs(local.y) > Math.abs(local.x) ? "y" : "x";
+        }
+
+        if (interaction.axisLocked === "y") {
+          // Vertical drag - bend THIS ONE lead's own terminal up/down, always independent of the
+          // other lead and without touching width/height at all - the bend can freely route well
+          // outside the shape's own bounding box (see AMP_LEAD_Y_OFFSET_BOUND's own doc comment).
+          const naturalY = isOutput ? start.height / 2 : isTop ? start.height * AMP_PLUS_Y_FRAC : start.height * AMP_MINUS_Y_FRAC;
+          const oldOffset = isOutput ? start.ampOutputLeadYOffset ?? 0 : isTop ? start.ampInputTopLeadYOffset ?? 0 : start.ampInputBottomLeadYOffset ?? 0;
+          const newOffset = clampAmpLeadTerminalY(naturalY, oldOffset + local.y) - naturalY;
+          const node: WhiteboardNode = isOutput
+            ? { ...start, ampOutputLeadYOffset: newOffset }
+            : isTop
+            ? { ...start, ampInputTopLeadYOffset: newOffset }
+            : { ...start, ampInputBottomLeadYOffset: newOffset };
+          setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? node : n)));
+          return;
+        }
+
+        // Horizontal drag - lengthen/shorten THIS ONE lead, always independent of the other input
+        // lead (a real op-amp's +/- inputs are two unrelated wires - there's no scenario where you'd
+        // want dragging one to also tug the other). Structurally a one-axis resize: the input
+        // terminals sit on the box's own WEST edge (dragging right SHRINKS width), the output
+        // terminal on the EAST edge (dragging right GROWS width) - mirror images of a plain "w"/"e"
+        // resize handle. See beginAmpLeadDrag's own doc comment for the "grow the box, keep the
+        // opposite edge fixed" anchoring this reuses from the resize handles.
+        let width: number;
+        let node: WhiteboardNode;
+        if (isOutput) {
+          const oldLen = start.ampOutputLeadLength ?? DEFAULT_AMP_OUTPUT_LEAD_LENGTH;
+          const newLen = Math.max(MIN_AMP_LEAD_LENGTH, Math.min(MAX_AMP_LEAD_LENGTH, oldLen + local.x));
+          width = Math.max(20, start.width + (newLen - oldLen));
+          node = { ...start, ampOutputLeadLength: newLen };
+        } else {
+          // The box only grows/shrinks in response to changes in whichever input lead is currently
+          // LONGER (matching amplifierOutlineParts's own degenerate-guard, which reads their max -
+          // not their sum - since they share one triangle edge instead of stacking end to end), so
+          // shrinking the currently-shorter one never disturbs the other lead or the box at all.
+          const oldTop = start.ampInputTopLeadLength ?? DEFAULT_AMP_INPUT_LEAD_LENGTH;
+          const oldBottom = start.ampInputBottomLeadLength ?? DEFAULT_AMP_INPUT_LEAD_LENGTH;
+          const draggedOld = isTop ? oldTop : oldBottom;
+          const draggedNew = Math.max(MIN_AMP_LEAD_LENGTH, Math.min(MAX_AMP_LEAD_LENGTH, draggedOld - local.x));
+          const newTop = isTop ? draggedNew : oldTop;
+          const newBottom = isTop ? oldBottom : draggedNew;
+          width = Math.max(20, start.width + (Math.max(newTop, newBottom) - Math.max(oldTop, oldBottom)));
+          node = { ...start, ampInputTopLeadLength: newTop, ampInputBottomLeadLength: newBottom };
+        }
+        const anchorOffset = edgeLocalOffset(width, isOutput ? "w" : "e");
+        const rotatedAnchorOffset = rotation ? rotateVector(anchorOffset.x, anchorOffset.y, rotation) : anchorOffset;
+        node.x = interaction.anchorWorld.x - rotatedAnchorOffset.x - width / 2;
+        node.y = interaction.anchorWorld.y - rotatedAnchorOffset.y - start.height / 2;
+        node.width = width;
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? node : n)));
         return;
       }
 
@@ -920,7 +1093,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
       }
     },
-    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange, laserArmed, onRotationPreview]
+    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange, laserArmed]
   );
 
   const handlePointerUp = useCallback(
@@ -943,7 +1116,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const after = liveNodes.find((n) => n.id === interaction.id);
         if (after && after.rotation !== interaction.startNode.rotation) onEditNode(interaction.startNode, after);
         setLiveNodes(null);
-        onRotationPreview?.(null);
+      } else if (interaction.mode === "ampLead") {
+        // A plain click (axisLocked never set - see the pointer-move branch's own dead-zone check)
+        // is a no-op: nothing was ever staged into liveNodes for it to commit.
+        if (liveNodes) {
+          const after = liveNodes.find((n) => n.id === interaction.id);
+          if (after) onEditNode(interaction.startNode, after);
+        }
+        setLiveNodes(null);
       } else if (interaction.mode === "marquee") {
         if (marqueeRect && (marqueeRect.width > 2 || marqueeRect.height > 2)) {
           const enclosed = page.nodes.filter(
@@ -1025,7 +1205,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         setLiveWaypoints(null);
       }
     },
-    [liveNodes, liveWaypoints, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, onRotationPreview]
+    [liveNodes, liveWaypoints, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides]
   );
 
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
@@ -1348,6 +1528,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             plotYTickInterval: node.plotYTickInterval,
             showChartLabels: node.showChartLabels,
             numberLineMax: node.numberLineMax,
+            ampInputTopLeadLength: node.ampInputTopLeadLength,
+            ampInputBottomLeadLength: node.ampInputBottomLeadLength,
+            ampOutputLeadLength: node.ampOutputLeadLength,
+            ampInputTopLeadYOffset: node.ampInputTopLeadYOffset,
+            ampInputBottomLeadYOffset: node.ampInputBottomLeadYOffset,
+            ampOutputLeadYOffset: node.ampOutputLeadYOffset,
+            ampInvertingOnTop: node.ampInvertingOnTop,
           });
           return (
             <div
@@ -1621,42 +1808,41 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   );
                 })}
 
-              {/* Rotate handle - a small circle above the shape's top edge, connected by a thin
-                  stem, rotating along with everything else in this div since it's a plain child
-                  positioned relative to the (possibly already-rotated) box. */}
+              {/* Rotate handle - a small icon button above the shape's TOP-RIGHT corner (not
+                  top-center, where it used to sit): centered horizontally, it collided with the
+                  hover "quick connect" arrow (showQuickConnectArrows below) that occupies the exact
+                  same top-center spot, each stealing the other's clicks. Rotating along with
+                  everything else in this div since it's a plain child positioned relative to the
+                  (possibly already-rotated) box. */}
               {selected && selectedNodeIds.size === 1 && !connectorArmed && (
-                <>
-                  <div
-                    className="absolute bg-blue-300"
-                    style={{ left: node.width / 2 - 0.5 / zoom, top: -ROTATE_HANDLE_GAP / zoom, width: 1 / zoom, height: (ROTATE_HANDLE_GAP - HANDLE_SCREEN_SIZE / 2) / zoom, pointerEvents: "none" }}
-                  />
-                  <div
-                    onPointerDown={(e) => beginRotateNode(node, e)}
-                    className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-500"
-                    style={{
-                      left: node.width / 2 - HANDLE_SCREEN_SIZE / zoom / 2,
-                      top: -ROTATE_HANDLE_GAP / zoom - HANDLE_SCREEN_SIZE / zoom / 2,
-                      width: HANDLE_SCREEN_SIZE / zoom,
-                      height: HANDLE_SCREEN_SIZE / zoom,
-                      cursor: "grab",
-                    }}
-                    title="Drag to rotate (hold Shift to snap to 15°)"
-                  />
-                </>
+                <div
+                  onPointerDown={(e) => beginRotateNode(node, e)}
+                  className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-600 text-blue-600 hover:text-white flex items-center justify-center shadow-sm"
+                  style={{
+                    left: node.width - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                    top: -ROTATE_HANDLE_GAP / zoom - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                    width: ROTATE_ICON_SCREEN_SIZE / zoom,
+                    height: ROTATE_ICON_SCREEN_SIZE / zoom,
+                    cursor: "grab",
+                  }}
+                  title="Drag to rotate (hold Shift to snap to 15°)"
+                >
+                  <TbRotateClockwise size={ROTATE_ICON_SCREEN_SIZE * 0.7} style={{ width: "70%", height: "70%" }} />
+                </div>
               )}
 
               {/* Live angle readout while THIS node's rotate handle is actively being dragged -
                   reads interactionRef directly rather than needing its own state, since every
                   pointermove of the drag already triggers a re-render via setLiveNodes above.
                   Outer div is positioned in the node's own (pre-rotation) local space, same as the
-                  handles above; the inner div counter-rotates by -node.rotation so the number
+                  handle above; the inner div counter-rotates by -node.rotation so the number
                   itself always reads upright regardless of how far the shape has turned. */}
               {selected && interactionRef.current?.mode === "rotate" && interactionRef.current.id === node.id && (
                 <div
                   className="absolute pointer-events-none"
                   style={{
-                    left: node.width / 2,
-                    top: -ROTATE_HANDLE_GAP / zoom - HANDLE_SCREEN_SIZE / zoom - 10 / zoom,
+                    left: node.width - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                    top: -ROTATE_HANDLE_GAP / zoom - ROTATE_ICON_SCREEN_SIZE / zoom - 10 / zoom,
                     transform: "translate(-50%, -100%)",
                   }}
                 >
@@ -1690,6 +1876,50 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     />
                   );
                 })}
+
+              {/* Amplifier lead-TERMINAL handles - diagrams.net-style "grab the actual line" shape-
+                  specific handles (see WhiteboardNode.ampInputTopLeadLength's own doc comment),
+                  styled amber/diamond rather than the resize corners' plain white squares so they
+                  read as "adjusts this shape's own geometry" rather than "resize the whole box".
+                  Positioned at each lead's own FAR/dangling end via resolveAmplifierGeometry (the
+                  SAME resolver amplifierOutlineParts itself uses, so a handle always sits exactly on
+                  its own rendered wire - including the degenerate-guard scaling and the shared
+                  bodyAttachX inset a shorter input lead's terminal needs) - the actual visible tip of
+                  the wire, matching where a user would naturally reach to grab it. Dragging mostly
+                  sideways lengthens/shortens (see the "ampLead" pointer-move branch's own "grow the
+                  box" mechanism); dragging mostly up/down bends it instead - and all three are always
+                  independent of one another, matching a real op-amp's +/- inputs being two unrelated
+                  wires. Rendered AFTER (so on top of, in DOM stacking order) the generic connection
+                  dots above - the "left" connection dot sits at the box's own left-edge midpoint,
+                  which can land close enough to the top/bottom input terminals to otherwise steal
+                  their clicks. */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && node.shapeType === "amplifier" && (() => {
+                const size = HANDLE_SCREEN_SIZE / zoom;
+                const geo = resolveAmplifierGeometry(node.width, node.height, {
+                  topLeadLength: node.ampInputTopLeadLength,
+                  bottomLeadLength: node.ampInputBottomLeadLength,
+                  outputLeadLength: node.ampOutputLeadLength,
+                  topLeadYOffset: node.ampInputTopLeadYOffset,
+                  bottomLeadYOffset: node.ampInputBottomLeadYOffset,
+                  outputLeadYOffset: node.ampOutputLeadYOffset,
+                });
+                const handleStyle = (x: number, y: number): React.CSSProperties => ({
+                  left: x - size / 2,
+                  top: y - size / 2,
+                  width: size,
+                  height: size,
+                  transform: "rotate(45deg)",
+                  cursor: "move",
+                });
+                const handleClass = "absolute border border-amber-600 bg-amber-400 hover:bg-amber-500";
+                return (
+                  <>
+                    <div onPointerDown={(e) => beginAmpLeadDrag(node, "inputTop", e)} className={handleClass} style={handleStyle(geo.topTerminalX, geo.topTerminalY)} title="Drag to lengthen/shorten or bend this lead (independent of the other input lead)" />
+                    <div onPointerDown={(e) => beginAmpLeadDrag(node, "inputBottom", e)} className={handleClass} style={handleStyle(geo.bottomTerminalX, geo.bottomTerminalY)} title="Drag to lengthen/shorten or bend this lead (independent of the other input lead)" />
+                    <div onPointerDown={(e) => beginAmpLeadDrag(node, "output", e)} className={handleClass} style={handleStyle(node.width, geo.outputTerminalY)} title="Drag to lengthen/shorten or bend the output lead" />
+                  </>
+                );
+              })()}
 
               {showQuickConnectArrows &&
                 ANCHOR_SIDES.map((side) => {

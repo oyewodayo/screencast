@@ -273,6 +273,37 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // numberLineOutline), so cranking this up doesn't degrade into unreadable clutter. Absent -
   // resolves to DEFAULT_NUMBER_LINE_MAX (10, the line's original fixed range).
   numberLineMax?: number;
+  // "amplifier" only - each lead's own length in ABSOLUTE doc units (not a fraction of width - see
+  // whiteboardHandlers.ts's MIN/MAX/DEFAULT_AMP_*_LEAD_LENGTH for why absolute is what lets dragging
+  // one terminal lengthen/shorten JUST that wire). The two input leads are always independently
+  // adjustable - own fields, no "linked" mode - matching a real op-amp's +/- inputs being two
+  // unrelated wires with no reason to ever move together. Dragged directly via the small handles
+  // WhiteboardCanvas.tsx shows on a selected amplifier's lead terminals (see its own
+  // beginAmpLeadDrag) rather than through a style-panel field - a "grab the actual line" interaction
+  // like diagrams.net's shape-specific handles, scoped to just this one shape for now to prove the
+  // mechanism out before rolling it out to the rest of the circuit-symbol shapes. Absent - resolves
+  // to the shape's original fixed proportions.
+  ampInputTopLeadLength?: number;
+  ampInputBottomLeadLength?: number;
+  ampOutputLeadLength?: number;
+  // "amplifier" only - each lead's terminal can also be dragged vertically, bending the wire into an
+  // L-shape (a short jog right at the terminal, then a straight run to the body at its natural
+  // height - see whiteboardHandlers.ts's amplifierOutlineParts) rather than a plain straight
+  // horizontal line. Doc units, offset from the lead's own natural resting height - free to extend
+  // well outside the node's own current height/bounding box (see
+  // whiteboardHandlers.ts's AMP_LEAD_Y_OFFSET_BOUND), since routing a lead out to some other shape
+  // isn't something the amplifier's own box size should ever get to veto; the box itself never
+  // grows for this axis the way the length fields above grow it for theirs. Absent/0 - resolves to
+  // a plain straight lead, pixel-identical to before this field existed.
+  ampInputTopLeadYOffset?: number;
+  ampInputBottomLeadYOffset?: number;
+  ampOutputLeadYOffset?: number;
+  // "amplifier" only - which input the "+"/"-" glyphs mark, purely a labeling swap (the physical
+  // top/bottom leads themselves - their positions, drag handles, length/bend fields - never change,
+  // only which glyph is drawn at which height). Real schematics draw the inverting input on
+  // whichever side keeps its wire from crossing others, so this needs to be flippable per instance
+  // rather than fixed. Absent/false - "+" on top, "-" on bottom (this shape's original layout).
+  ampInvertingOnTop?: boolean;
   fontFamily: string;
   fontSize: number;
   fontColor: string;
