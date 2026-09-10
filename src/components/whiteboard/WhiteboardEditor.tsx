@@ -32,6 +32,7 @@ import {
   IoShapesOutline,
   IoTrashOutline,
 } from "react-icons/io5";
+import { TbPointer } from "react-icons/tb";
 import useWhiteboardStore from "../../hooks/useWhiteboardStore";
 import { ArrowheadType, LINE_ONLY_SHAPES, WhiteboardAnchorSide, WhiteboardEdge, WhiteboardNode, WhiteboardPage, WhiteboardShapeType } from "../../utils/whiteboardTypes";
 import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
@@ -455,6 +456,20 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
+  // Drops back to plain selection mode - clears every armed tool (shape/text/equation/freehand/
+  // connector/laser) at once. Exists as its own dedicated toolbar button rather than relying solely
+  // on Escape (see the keydown handler below) because Escape doesn't exist on a touchscreen - a
+  // tablet/touch user arming the pen tool had no way at all to get back out of it before this.
+  const deselectTools = useCallback(() => {
+    setArmedShapeType(null);
+    setArmedNodeOverrides(undefined);
+    setConnectorArmed(false);
+    setArmedConnectorOverrides(undefined);
+    setLaserArmed(false);
+    setShapesMenuOpen(false);
+    setArrowsMenuOpen(false);
+  }, []);
+
   const doc = store.doc;
   const page = store.activePage;
 
@@ -527,17 +542,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       } else if (mod && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
         e.preventDefault();
         store.redo();
-      } else if (armedShapeType && e.key === "Escape") {
-        setArmedShapeType(null);
-        setArmedNodeOverrides(undefined);
-      } else if (connectorArmed && e.key === "Escape") {
-        setConnectorArmed(false);
-        setArmedConnectorOverrides(undefined);
+      } else if (e.key === "Escape" && (armedShapeType || connectorArmed || laserArmed)) {
+        deselectTools();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [store, armedShapeType, connectorArmed]);
+  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools]);
 
   const handleReorder = useCallback(
     (toFront: boolean) => {
@@ -742,6 +753,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           <IoArrowRedo size={18} />
         </ToolbarButton>
         <div className="w-px h-6 bg-gray-200 dark:bg-neutral-700 mx-1" />
+        <ToolbarButton
+          title="Select"
+          active={armedShapeType === null && !connectorArmed && !laserArmed}
+          onClick={deselectTools}
+        >
+          <TbPointer size={18} />
+        </ToolbarButton>
         <div className="relative">
           <ToolbarButton
             title="Shapes"

@@ -1105,6 +1105,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         backgroundSize: showGrid ? `${GRID_SIZE * zoom}px ${GRID_SIZE * zoom}px` : undefined,
         backgroundPosition: showGrid ? `${pan.x}px ${pan.y}px` : undefined,
         cursor: laserArmed ? "none" : spaceHeld ? "grab" : armedShapeType === "freehand" || connectorArmed ? "crosshair" : "default",
+        // Without this, a touch-drag is up for grabs between this canvas's own pointer handlers and
+        // the browser's native touch gestures (panning/scrolling) - on most touchscreens the browser
+        // wins that race, so a finger stroke either scrolls the page or gets cut short by a
+        // pointercancel partway through instead of drawing. "none" hands the whole gesture to our own
+        // pointer handlers (panning/zooming here are already reimplemented via wheel/pinch and the
+        // space-drag shortcut, so there's no native touch behavior actually worth keeping).
+        touchAction: "none",
       }}
       onWheel={handleWheel}
       onPointerDown={handleContainerPointerDown}
