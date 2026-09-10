@@ -9,6 +9,8 @@
 import React from "react";
 import { IoCopyOutline, IoTrashOutline } from "react-icons/io5";
 import {
+  TbComponents,
+  TbComponentsOff,
   TbItalic,
   TbLayoutAlignBottom,
   TbLayoutAlignCenter,
@@ -102,6 +104,8 @@ interface WhiteboardStylePanelProps {
   onDuplicateNode: (node: WhiteboardNode) => void;
   onBringToFront: () => void;
   onSendToBack: () => void;
+  onGroup: () => void;
+  onUngroup: () => void;
 }
 
 // A plain `value={n}`-controlled number input re-clamps AND redraws its own text on every
@@ -248,6 +252,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   onDuplicateNode,
   onBringToFront,
   onSendToBack,
+  onGroup,
+  onUngroup,
 }) => {
   const updateNodes = (patch: Partial<WhiteboardNode>) => {
     if (selectedNodes.length === 0) return;
@@ -808,6 +814,16 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             <button type="button" onClick={onSendToBack} title="Send to back" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
               <TbStackBack size={16} />
             </button>
+            {selectedNodes.length >= 2 && (
+              <button type="button" onClick={onGroup} title="Group" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
+                <TbComponents size={16} />
+              </button>
+            )}
+            {selectedNodes.some((n) => n.groupId) && (
+              <button type="button" onClick={onUngroup} title="Ungroup" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
+                <TbComponentsOff size={16} />
+              </button>
+            )}
             {selectedNodes.length === 1 && (
               <button type="button" onClick={() => onDuplicateNode(selectedNodes[0])} title="Duplicate" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
                 <IoCopyOutline size={16} />

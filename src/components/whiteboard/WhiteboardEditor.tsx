@@ -561,6 +561,21 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     [page, selectedNodeIds, store]
   );
 
+  // Group/Ungroup are plain batchEditNodes calls that set/clear WhiteboardNode.groupId - no
+  // dedicated command type needed (see that field's own doc comment), which also means they're
+  // undo-tracked for free the same way any other multi-node style edit already is.
+  const handleGroup = useCallback(() => {
+    if (selectedNodes.length < 2) return;
+    const groupId = crypto.randomUUID();
+    store.batchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, groupId })));
+  }, [selectedNodes, store]);
+
+  const handleUngroup = useCallback(() => {
+    const grouped = selectedNodes.filter((n) => n.groupId);
+    if (grouped.length === 0) return;
+    store.batchEditNodes(grouped, grouped.map((n) => ({ ...n, groupId: undefined })));
+  }, [selectedNodes, store]);
+
   const handleDuplicateNode = useCallback(
     (node: WhiteboardNode) => {
       const copy: WhiteboardNode = { ...node, id: crypto.randomUUID(), x: node.x + 24, y: node.y + 24, createdAt: Date.now(), updatedAt: Date.now() };
@@ -1012,6 +1027,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onDuplicateNode={handleDuplicateNode}
           onBringToFront={() => handleReorder(true)}
           onSendToBack={() => handleReorder(false)}
+          onGroup={handleGroup}
+          onUngroup={handleUngroup}
         />
       </div>
 

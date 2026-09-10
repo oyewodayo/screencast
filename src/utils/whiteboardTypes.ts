@@ -181,6 +181,13 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // Degrees, clockwise, about the box's own center - 0/undefined = unrotated. Purely a visual
   // transform (see this interface's own top comment for what that does and doesn't affect).
   rotation?: number;
+  // Shared by every node in the same "Group" action (see WhiteboardEditor.tsx's handleGroup) -
+  // clicking, selecting-via-marquee, or dragging any one member acts on every node sharing this id
+  // (see WhiteboardCanvas.tsx's expandGroupSelection). Purely a selection/interaction convenience,
+  // same "no new command type" reasoning batch-edit-nodes already covers everything grouping needs:
+  // Group/Ungroup are just an ordinary batchEditNodes call that sets/clears this field, undo-tracked
+  // for free the same way any other multi-node style edit already is. Absent = not in a group.
+  groupId?: string;
   text: string;
   // Ignored for shapeType "text"/"freehand" (a label/ink stroke has no interior to fill) - null =
   // no fill, same "null = transparent" convention boardTypes.ts uses.

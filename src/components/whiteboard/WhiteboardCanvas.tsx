@@ -102,6 +102,18 @@ function cornerWorldPoint(node: WhiteboardNode, corner: ResizeCorner): { x: numb
   const rotated = node.rotation ? rotateVector(offset.x, offset.y, node.rotation) : offset;
   return { x: center.x + rotated.x, y: center.y + rotated.y };
 }
+// Given a set of already-selected node ids, adds every OTHER node sharing a groupId with one of
+// them - a group is meant to act as one unit once formed (see WhiteboardNode.groupId's own doc
+// comment), so any selection that catches part of a group (a marquee that only overlaps some of
+// its members, e.g.) gets topped up to the whole group rather than leaving it half-selected.
+function expandGroupSelection(ids: Set<string>, nodes: WhiteboardNode[]): Set<string> {
+  const groupIds = new Set(nodes.filter((n) => n.groupId && ids.has(n.id)).map((n) => n.groupId!));
+  if (groupIds.size === 0) return ids;
+  const expanded = new Set(ids);
+  for (const n of nodes) if (n.groupId && groupIds.has(n.groupId)) expanded.add(n.id);
+  return expanded;
+}
+
 const ANCHOR_SIDES: Exclude<WhiteboardAnchorSide, "auto">[] = ["top", "right", "bottom", "left"];
 // Shapes with a meaningful "attach a connector here" edge - freehand ink and free-floating text
 // have no such natural anchor, so they don't show connection dots or accept connector drops aimed
@@ -537,13 +549,20 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   const beginMoveNode = useCallback(
     (node: WhiteboardNode, e: React.PointerEvent, additive: boolean) => {
       e.stopPropagation();
+      // A grouped node toggles/selects its WHOLE group as one unit, same "acts as one thing" idea
+      // moving it below already relies on - clicking (or shift-clicking) just one member would
+      // otherwise leave the group only partly selected, which then only partly drags.
+      const clickedGroup = node.groupId ? page.nodes.filter((n) => n.groupId === node.groupId).map((n) => n.id) : [node.id];
       let nextSelected = selectedNodeIds;
       if (additive) {
         nextSelected = new Set(selectedNodeIds);
-        if (nextSelected.has(node.id)) nextSelected.delete(node.id);
-        else nextSelected.add(node.id);
+        const alreadyIn = clickedGroup.some((id) => nextSelected.has(id));
+        for (const id of clickedGroup) {
+          if (alreadyIn) nextSelected.delete(id);
+          else nextSelected.add(id);
+        }
       } else if (!selectedNodeIds.has(node.id)) {
-        nextSelected = new Set([node.id]);
+        nextSelected = new Set(clickedGroup);
       }
       onSelectionChange(nextSelected, additive ? selectedEdgeIds : new Set());
       const ids = nextSelected.has(node.id) ? Array.from(nextSelected) : [node.id];
@@ -926,7 +945,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               n.y < marqueeRect.y + marqueeRect.height &&
               n.y + n.height > marqueeRect.y
           );
-          onSelectionChange(new Set(enclosed.map((n) => n.id)), new Set());
+          onSelectionChange(expandGroupSelection(new Set(enclosed.map((n) => n.id)), page.nodes), new Set());
         } else {
           onSelectionChange(new Set(), new Set());
         }
