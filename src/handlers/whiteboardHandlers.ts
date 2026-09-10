@@ -403,6 +403,7 @@ export interface ShapeOutlineOptions {
   plotXTickInterval?: number; // "functionPlot" only
   plotYTickInterval?: number; // "functionPlot" only
   showChartLabels?: boolean; // "barChart"/"lineChart"/"scatterPlot"/"functionPlot" only
+  numberLineMax?: number; // "numberLine" only
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -519,6 +520,103 @@ function springOutlineD(w: number, h: number): string {
   }
   parts.push(`L${w},${midY.toFixed(2)}`);
   return parts.join(" ");
+}
+
+// Same construction as springOutlineD, but every bump bulges the SAME direction (a constant sweep
+// flag instead of alternating) - the conventional circuit-schematic "row of loops" inductor coil,
+// distinct from "spring"'s side-view-of-a-physical-spring look.
+function inductorOutlineD(w: number, h: number): string {
+  const midY = h / 2;
+  const leadIn = w * 0.1;
+  const leadOut = w * 0.1;
+  const coilW = w - leadIn - leadOut;
+  const loops = 4;
+  const r = coilW / (loops * 2);
+  const parts = [`M0,${midY.toFixed(2)}`, `L${leadIn.toFixed(2)},${midY.toFixed(2)}`];
+  let x = leadIn;
+  for (let i = 0; i < loops; i++) {
+    const nx = x + 2 * r;
+    parts.push(`A${r.toFixed(2)},${r.toFixed(2)} 0 1,1 ${nx.toFixed(2)},${midY.toFixed(2)}`);
+    x = nx;
+  }
+  parts.push(`L${w},${midY.toFixed(2)}`);
+  return parts.join(" ");
+}
+
+// Circuit diode - a lead in, a triangle pointing at the cathode bar, the bar itself, a lead out.
+// Unlike resistor/capacitor/etc., the triangle subpath IS closed (has a Z) - a diode's triangle is
+// a real fillable region (see LINE_ONLY_SHAPES's own doc comment on why this one's excluded from
+// it), the leads/bar stay open zero-area subpaths the same way frameOutlineD already mixes open and
+// closed subpaths in one `d`.
+function diodeOutlineD(w: number, h: number): string {
+  const midY = h / 2;
+  const amp = h * 0.32;
+  const baseX = w * 0.38;
+  const tipX = w * 0.62;
+  return [
+    `M0,${midY.toFixed(2)} L${baseX.toFixed(2)},${midY.toFixed(2)}`,
+    `M${baseX.toFixed(2)},${(midY - amp).toFixed(2)} L${tipX.toFixed(2)},${midY.toFixed(2)} L${baseX.toFixed(2)},${(midY + amp).toFixed(2)} Z`,
+    `M${tipX.toFixed(2)},${(midY - amp).toFixed(2)} L${tipX.toFixed(2)},${(midY + amp).toFixed(2)}`,
+    `M${tipX.toFixed(2)},${midY.toFixed(2)} L${w},${midY.toFixed(2)}`,
+  ].join(" ");
+}
+
+// Circuit ground - a short lead down to three horizontal bars of decreasing width, the standard
+// "signal ground" symbol.
+function groundOutlineD(w: number, h: number): string {
+  const midX = w / 2;
+  const leadBottomY = h * 0.4;
+  const bars: [number, number][] = [
+    [w * 0.35, h * 0.4],
+    [w * 0.22, h * 0.62],
+    [w * 0.1, h * 0.84],
+  ];
+  const parts = [`M${midX.toFixed(2)},0 L${midX.toFixed(2)},${leadBottomY.toFixed(2)}`];
+  for (const [halfW, y] of bars) {
+    parts.push(`M${(midX - halfW).toFixed(2)},${y.toFixed(2)} L${(midX + halfW).toFixed(2)},${y.toFixed(2)}`);
+  }
+  return parts.join(" ");
+}
+
+// A zigzag chain of `segments` bonds - the skeletal-formula alkane-chain backbone (see the
+// "bondLine" shapeType's own doc comment). Points alternate between a "low" and "high" y so the
+// chain reads as the usual up-down carbon backbone, evenly spaced across the full width.
+function bondLineOutlineD(w: number, h: number, segments: number): string {
+  const n = Math.max(1, Math.round(segments));
+  const highY = h * 0.25;
+  const lowY = h * 0.75;
+  const points: string[] = [];
+  for (let i = 0; i <= n; i++) {
+    const x = (w * i) / n;
+    const y = i % 2 === 0 ? lowY : highY;
+    points.push(`${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`);
+  }
+  return points.join(" ");
+}
+
+// Circle + x/y axes through the center + a short tick every 30 degrees - the standard "unit circle"
+// reference diagram (see the shapeType's own doc comment on why this deliberately stops short of
+// labeling each tick with its coordinate/radian value).
+function unitCircleOutlineD(w: number, h: number): string {
+  const cx = w / 2;
+  const cy = h / 2;
+  const r = (Math.min(w, h) / 2) * 0.82;
+  const circle = `M${(cx + r).toFixed(2)},${cy.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 1,0 ${(cx - r).toFixed(2)},${cy.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 1,0 ${(cx + r).toFixed(2)},${cy.toFixed(2)}`;
+  const axisReach = r * 1.15;
+  const axes = `M${(cx - axisReach).toFixed(2)},${cy.toFixed(2)} L${(cx + axisReach).toFixed(2)},${cy.toFixed(2)} M${cx.toFixed(2)},${(cy - axisReach).toFixed(2)} L${cx.toFixed(2)},${(cy + axisReach).toFixed(2)}`;
+  const tickLen = Math.min(w, h) * 0.035;
+  const ticks: string[] = [];
+  for (let deg = 0; deg < 360; deg += 30) {
+    const rad = (deg * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const x1 = cx + r * cos;
+    const y1 = cy - r * sin;
+    const x2 = cx + (r + tickLen) * cos;
+    const y2 = cy - (r + tickLen) * sin;
+    ticks.push(`M${x1.toFixed(2)},${y1.toFixed(2)} L${x2.toFixed(2)},${y2.toFixed(2)}`);
+  }
+  return [circle, axes, ...ticks].join(" ");
 }
 
 // Narrow neck flaring straight down to a flat, gently-rounded-corner base - the Erlenmeyer flask
@@ -832,6 +930,34 @@ function scatterPlotOutline(w: number, h: number, data?: number[], showLabels = 
   return { parts, labels: showLabels ? chartYAxisLabels(baselineY, topY, max) : [] };
 }
 
+// Bounds for WhiteboardNode.numberLineMax - the line always spans [-max, max]. Floor allows as
+// tight a range as [-1, 1]; ceiling is arbitrary but generous (tick spacing auto-widens well before
+// this via tickValuesByInterval, so even the largest range stays readable).
+export const MIN_NUMBER_LINE_MAX = 1;
+export const MAX_NUMBER_LINE_MAX = 1000;
+export const DEFAULT_NUMBER_LINE_MAX = 10;
+
+// A symmetric [-max, max] integer number line - a horizontal "stroke" line plus a short tick at
+// every whole number (or a coarser multiple once max grows past what tickValuesByInterval's own
+// MAX_INTERVAL_TICKS cap allows at a spacing of 1 - same auto-widening a function plot's own tick
+// interval gets, so cranking the range up doesn't degrade into unreadable clutter), with the number
+// itself labeled below when showLabels is on.
+function numberLineOutline(w: number, h: number, showLabels = true, maxInput?: number): { parts: ChartPart[]; labels: ChartLabel[] } {
+  const max = Math.max(MIN_NUMBER_LINE_MAX, Math.min(MAX_NUMBER_LINE_MAX, Math.round(maxInput ?? DEFAULT_NUMBER_LINE_MAX)));
+  const min = -max;
+  const midY = h * 0.4;
+  const padX = w * 0.03;
+  const mapX = (v: number) => padX + ((v - min) / (max - min)) * (w - padX * 2);
+  const lines = [openPathD([{ x: padX, y: midY }, { x: w - padX, y: midY }])];
+  const labels: ChartLabel[] = [];
+  for (const v of tickValuesByInterval(min, max, 1)) {
+    const x = mapX(v);
+    lines.push(openPathD([{ x, y: midY - 5 }, { x, y: midY + 5 }]));
+    if (showLabels) labels.push({ x, y: midY + 16, text: formatTick(v), anchor: "middle" });
+  }
+  return { parts: [{ d: lines.join(" "), role: "stroke" }], labels };
+}
+
 // Cycled for however many slices a pie chart has - distinct, readable hues rather than shades of one
 // color, since (unlike bar/line/scatter) a pie chart's whole point is telling slices apart.
 const PIE_PALETTE = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316"];
@@ -882,6 +1008,7 @@ const FUNCTION_PLOT_DOMAINS: Record<FunctionPlotType, [number, number]> = {
   sqrt: [0, 6],
   logarithm: [0.1, 6],
   absolute: [-3, 3],
+  normal: [-4, 4], // the standard normal's tails are already visually flat past +-4
 };
 
 export function evalPlotFunction(type: FunctionPlotType, x: number): number {
@@ -904,6 +1031,9 @@ export function evalPlotFunction(type: FunctionPlotType, x: number): number {
       return Math.log(x);
     case "absolute":
       return Math.abs(x);
+    case "normal":
+      // The standard normal PDF (mean 0, variance 1) - (1/sqrt(2*pi)) * e^(-x^2/2).
+      return Math.exp(-(x * x) / 2) / Math.sqrt(2 * Math.PI);
   }
 }
 
@@ -1230,6 +1360,22 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
         kind: "path",
         d: angleOutlineD(w, h, opts?.angleDegrees ?? DEFAULT_ANGLE_DEGREES, opts?.angleRay1Length ?? DEFAULT_ANGLE_RAY_LENGTH, opts?.angleRay2Length ?? DEFAULT_ANGLE_RAY_LENGTH),
       };
+    // A plain horizontal line - just enough for the toolbar preview swatch to show SOMETHING
+    // recognizable. The real placed shape never actually consults this: it gets its own dedicated
+    // rendering (with a real arrowhead marker) in both WhiteboardCanvas.tsx and this file's own
+    // renderNode, the same way "freehand" bypasses shapeOutlineFor entirely.
+    case "vector":
+      return { kind: "path", d: `M0,${(h / 2).toFixed(2)} L${w},${(h / 2).toFixed(2)}` };
+    case "diode":
+      return { kind: "path", d: diodeOutlineD(w, h) };
+    case "inductor":
+      return { kind: "path", d: inductorOutlineD(w, h) };
+    case "ground":
+      return { kind: "path", d: groundOutlineD(w, h) };
+    case "bondLine":
+      return { kind: "path", d: bondLineOutlineD(w, h, opts?.sides ?? 5) };
+    case "unitCircle":
+      return { kind: "path", d: unitCircleOutlineD(w, h) };
     case "hourglass":
       return { kind: "polygon", points: hourglassPolygonPoints(w, h) };
     case "teardrop":
@@ -1268,6 +1414,8 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
       return { kind: "chart", parts: pieChartParts(w, h, opts?.chartData) };
     case "scatterPlot":
       return { kind: "chart", ...scatterPlotOutline(w, h, opts?.chartData, opts?.showChartLabels ?? true) };
+    case "numberLine":
+      return { kind: "chart", ...numberLineOutline(w, h, opts?.showChartLabels ?? true, opts?.numberLineMax) };
     case "functionPlot":
       return {
         kind: "chart",
@@ -1484,6 +1632,7 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
     plotXTickInterval: node.plotXTickInterval,
     plotYTickInterval: node.plotYTickInterval,
     showChartLabels: node.showChartLabels,
+    numberLineMax: node.numberLineMax,
   });
 
   const fillAndStroke = (path: Path2D) => {
@@ -1729,6 +1878,22 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): 
     // on top - matches WhiteboardCanvas.tsx's own div-then-EquationDisplay stacking order.
     paintShapeBody(ctx, node);
     await paintEquation(ctx, node);
+  } else if (node.shapeType === "vector") {
+    // A plain horizontal line spanning the node's own width (length = magnitude - see the
+    // shapeType's own doc comment) capped with real arrowhead markers, matching
+    // WhiteboardCanvas.tsx's own <marker>-based rendering. 0deg/180deg (not computed) since the
+    // line is always exactly horizontal in local space - direction comes entirely from the
+    // rotation ctx.rotate already applied above.
+    const midY = node.height / 2;
+    ctx.lineWidth = node.strokeWidth;
+    ctx.strokeStyle = node.strokeColor;
+    ctx.beginPath();
+    ctx.moveTo(0, midY);
+    ctx.lineTo(node.width, midY);
+    ctx.stroke();
+    drawArrowhead(ctx, node.endArrowType ?? "none", node.width, midY, 0, node.strokeColor, node.strokeWidth);
+    drawArrowhead(ctx, node.startArrowType ?? "none", 0, midY, 180, node.strokeColor, node.strokeWidth);
+    paintNodeText(ctx, node);
   } else {
     if (node.shapeType !== "text") paintShapeBody(ctx, node);
     paintNodeText(ctx, node);

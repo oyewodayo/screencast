@@ -92,12 +92,19 @@ const SCIENCE_SHAPE_PRESETS: ShapePreset[] = [
   { type: "resistor", label: "Resistor" },
   { type: "capacitor", label: "Capacitor" },
   { type: "battery", label: "Battery" },
+  { type: "diode", label: "Diode" },
+  { type: "inductor", label: "Inductor" },
+  { type: "ground", label: "Ground" },
   { type: "spring", label: "Spring/Coil" },
   { type: "flask", label: "Flask" },
   { type: "beaker", label: "Beaker" },
   { type: "benzeneRing", label: "Benzene Ring" },
+  { type: "bondLine", label: "Bond-Line Chain", overrides: { sides: 5 } },
   { type: "axes", label: "Axes" },
   { type: "angle", label: "Angle" },
+  { type: "vector", label: "Vector Arrow" },
+  { type: "unitCircle", label: "Unit Circle" },
+  { type: "numberLine", label: "Number Line" },
 ];
 
 const GENERAL_SHAPE_PRESETS: ShapePreset[] = [
@@ -130,6 +137,7 @@ const CHART_SHAPE_PRESETS: ShapePreset[] = [
   { type: "functionPlot", label: "Square Root Plot", overrides: { plotFunction: "sqrt" } },
   { type: "functionPlot", label: "Logarithm Plot", overrides: { plotFunction: "logarithm" } },
   { type: "functionPlot", label: "Absolute Value Plot", overrides: { plotFunction: "absolute" } },
+  { type: "functionPlot", label: "Normal Distribution", overrides: { plotFunction: "normal" } },
 ];
 
 const SHAPE_PRESET_GROUPS: { label: string; presets: ShapePreset[] }[] = [
@@ -163,6 +171,7 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
     plotDomainScale: preset.overrides?.plotDomainScale,
     plotCycles: preset.overrides?.plotCycles,
     plotShowGrid: preset.overrides?.plotShowGrid,
+    numberLineMax: preset.overrides?.numberLineMax,
   });
   // Line-only shapes (waves, circuit symbols, axes...) render as an open trace, not a filled
   // silhouette (matches their own default fillColor: null) - filling the preview swatch would shade
@@ -449,7 +458,17 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const doc = store.doc;
   const page = store.activePage;
 
-  const selectedNodes = useMemo(() => (page ? page.nodes.filter((n) => selectedNodeIds.has(n.id)) : []), [page, selectedNodeIds]);
+  // While a rotate-handle drag is in progress, WhiteboardCanvas reports the live in-progress angle
+  // here purely for display (see its own onRotationPreview doc comment) - the drag itself doesn't
+  // commit to the store (and isn't undo-tracked) until pointer-up, but the style panel's Rotation
+  // box should still track the shape turning in real time rather than sitting stale until release.
+  const [rotationPreview, setRotationPreview] = useState<{ id: string; rotation: number } | null>(null);
+
+  const selectedNodes = useMemo(() => {
+    const list = page ? page.nodes.filter((n) => selectedNodeIds.has(n.id)) : [];
+    if (!rotationPreview) return list;
+    return list.map((n) => (n.id === rotationPreview.id ? { ...n, rotation: rotationPreview.rotation } : n));
+  }, [page, selectedNodeIds, rotationPreview]);
   const selectedEdges = useMemo(() => (page ? page.edges.filter((e) => selectedEdgeIds.has(e.id)) : []), [page, selectedEdgeIds]);
 
   useEffect(() => {
@@ -926,6 +945,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onAddNodeWithEdge={store.addNodeWithEdge}
           onEditNode={store.editNode}
           onBatchEditNodes={store.batchEditNodes}
+          onRotationPreview={setRotationPreview}
           onDeleteNode={(node) => {
             store.deleteNode(node);
             setSelectedNodeIds((prev) => {

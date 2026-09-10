@@ -198,6 +198,13 @@ interface WhiteboardCanvasProps {
   // part of a multi-selection keeps that whole selection; right-clicking something outside it
   // replaces the selection with just that one item first, same convention most apps use).
   onItemContextMenu: (nodeIds: Set<string>, edgeIds: Set<string>, screenPoint: { x: number; y: number }) => void;
+  // Fires on every pointer-move of an active rotate-handle drag with the angle currently being
+  // dragged to (and with `null` once the drag ends) - purely a live readout for
+  // WhiteboardEditor.tsx's style panel, which has no other way to see mid-drag state since the
+  // drag itself doesn't commit to the store (isn't undo-tracked) until pointer-up. This canvas's own
+  // on-screen angle popover (rendered next to the rotate handle below) doesn't need this prop at all
+  // - it reads the same live value directly off `interactionRef`/`liveNodes` during render instead.
+  onRotationPreview?: (preview: { id: string; rotation: number } | null) => void;
 }
 
 function clampZoom(z: number): number {
@@ -313,6 +320,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   laserArmed,
   onQuickConnectArrowClick,
   onItemContextMenu,
+  onRotationPreview,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
@@ -455,17 +463,33 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           if (node) onDeleteNode(node);
         }
         onSelectionChange(new Set(), new Set());
+      } else if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        // Nudges selected nodes by a fixed step in document space (1px, or 10px with Shift held -
+        // the same two-tier step the style panel's own nudge buttons use, so the keyboard shortcut
+        // and the manual on-panel control feel like the same feature rather than two different ones).
+        if (selectedNodeIds.size === 0) return;
+        e.preventDefault();
+        const step = e.shiftKey ? 10 : 1;
+        const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+        const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+        const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id));
+        if (selected.length === 0) return;
+        const after = selected.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
+        if (after.length === 1) onEditNode(selected[0], after[0]);
+        else onBatchEditNodes(selected, after);
       } else if (e.key === "Escape") {
         interactionRef.current = null;
         setConnectorPreview(null);
         setMarqueeRect(null);
         setFreehandPreview(null);
+        setLiveNodes(null);
+        onRotationPreview?.(null);
         onSelectionChange(new Set(), new Set());
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange]);
+  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes, onRotationPreview]);
 
   // ---- Node move / resize ----------------------------------------------------------------------
   const beginMoveNode = useCallback(
@@ -757,6 +781,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         deg = ((deg % 360) + 360) % 360;
         const rotated: WhiteboardNode = { ...interaction.startNode, rotation: deg };
         setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? rotated : n)));
+        onRotationPreview?.({ id: interaction.id, rotation: deg });
         return;
       }
 
@@ -825,7 +850,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
       }
     },
-    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange, laserArmed]
+    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange, laserArmed, onRotationPreview]
   );
 
   const handlePointerUp = useCallback(
@@ -848,6 +873,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const after = liveNodes.find((n) => n.id === interaction.id);
         if (after && after.rotation !== interaction.startNode.rotation) onEditNode(interaction.startNode, after);
         setLiveNodes(null);
+        onRotationPreview?.(null);
       } else if (interaction.mode === "marquee") {
         if (marqueeRect && (marqueeRect.width > 2 || marqueeRect.height > 2)) {
           const enclosed = page.nodes.filter(
@@ -929,7 +955,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         setLiveWaypoints(null);
       }
     },
-    [liveNodes, liveWaypoints, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides]
+    [liveNodes, liveWaypoints, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, onRotationPreview]
   );
 
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
@@ -1049,7 +1075,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       if (edge.endArrowType !== "none") combos.set(markerId(edge.endArrowType, edge.strokeColor), { type: edge.endArrowType, color: edge.strokeColor });
     }
     for (const node of page.nodes) {
-      if (node.shapeType !== "freehand") continue;
+      if (node.shapeType !== "freehand" && node.shapeType !== "vector") continue;
       if (node.startArrowType && node.startArrowType !== "none") combos.set(markerId(node.startArrowType, node.strokeColor), { type: node.startArrowType, color: node.strokeColor });
       if (node.endArrowType && node.endArrowType !== "none") combos.set(markerId(node.endArrowType, node.strokeColor), { type: node.endArrowType, color: node.strokeColor });
     }
@@ -1244,6 +1270,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             plotXTickInterval: node.plotXTickInterval,
             plotYTickInterval: node.plotYTickInterval,
             showChartLabels: node.showChartLabels,
+            numberLineMax: node.numberLineMax,
           });
           return (
             <div
@@ -1301,6 +1328,21 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
                     strokeLinecap="round"
                     strokeLinejoin="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                </svg>
+              ) : node.shapeType === "vector" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  <line
+                    x1={0}
+                    y1={node.height / 2}
+                    x2={node.width}
+                    y2={node.height / 2}
+                    stroke={node.strokeColor}
+                    strokeWidth={node.strokeWidth}
+                    markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
+                    markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
+                    strokeLinecap="round"
                     vectorEffect="non-scaling-stroke"
                   />
                 </svg>
@@ -1510,6 +1552,36 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     title="Drag to rotate (hold Shift to snap to 15°)"
                   />
                 </>
+              )}
+
+              {/* Live angle readout while THIS node's rotate handle is actively being dragged -
+                  reads interactionRef directly rather than needing its own state, since every
+                  pointermove of the drag already triggers a re-render via setLiveNodes above.
+                  Outer div is positioned in the node's own (pre-rotation) local space, same as the
+                  handles above; the inner div counter-rotates by -node.rotation so the number
+                  itself always reads upright regardless of how far the shape has turned. */}
+              {selected && interactionRef.current?.mode === "rotate" && interactionRef.current.id === node.id && (
+                <div
+                  className="absolute pointer-events-none"
+                  style={{
+                    left: node.width / 2,
+                    top: -ROTATE_HANDLE_GAP / zoom - HANDLE_SCREEN_SIZE / zoom - 10 / zoom,
+                    transform: "translate(-50%, -100%)",
+                  }}
+                >
+                  <div
+                    className="bg-neutral-900 text-white rounded shadow whitespace-nowrap"
+                    style={{
+                      transform: `rotate(${-(node.rotation ?? 0)}deg)`,
+                      fontSize: 11 / zoom,
+                      lineHeight: 1,
+                      padding: `${4 / zoom}px ${6 / zoom}px`,
+                      borderRadius: 4 / zoom,
+                    }}
+                  >
+                    {Math.round(node.rotation ?? 0)}°
+                  </div>
+                </div>
               )}
 
               {showConnectionDots &&

@@ -25,16 +25,19 @@ import {
   DEFAULT_ANGLE_DEGREES,
   DEFAULT_ANGLE_RAY_LENGTH,
   DEFAULT_CURVE_BOW,
+  DEFAULT_NUMBER_LINE_MAX,
   DEFAULT_PLOT_CYCLES,
   DEFAULT_PLOT_DOMAIN_SCALE,
   DEFAULT_WAVE_CYCLES,
   MAX_ANGLE_DEGREES,
   MAX_ANGLE_RAY_LENGTH,
+  MAX_NUMBER_LINE_MAX,
   MAX_PLOT_CYCLES,
   MAX_PLOT_DOMAIN_SCALE,
   MAX_WAVE_CYCLES,
   MIN_ANGLE_DEGREES,
   MIN_ANGLE_RAY_LENGTH,
+  MIN_NUMBER_LINE_MAX,
   MIN_PLOT_CYCLES,
   MIN_PLOT_DOMAIN_SCALE,
   MIN_WAVE_CYCLES,
@@ -251,6 +254,17 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
     onBatchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, ...patch })));
   };
 
+  // Shifts every selected node by the same (dx, dy) in document space - the manual on-panel
+  // counterpart to WhiteboardCanvas.tsx's arrow-key nudge (same 1px/10px-with-Shift step sizing),
+  // for when a mouse/trackpad is more convenient than reaching for the keyboard, or for
+  // sub-pixel-precision alignment work where holding an arrow key's repeat rate is too coarse to
+  // stop exactly where intended. A relative shift (not an absolute position) so it stays meaningful
+  // for a multi-selection of nodes that don't share one position.
+  const nudgeSelected = (dx: number, dy: number) => {
+    if (selectedNodes.length === 0) return;
+    onBatchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy })));
+  };
+
   const edge = selectedEdges.length === 1 ? selectedEdges[0] : null;
   const updateEdge = (patch: Partial<WhiteboardEdge>) => {
     if (!edge) return;
@@ -266,6 +280,72 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           <p className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-neutral-500">
             {selectedNodes.length > 1 ? `${selectedNodes.length} shapes` : "Shape"}
           </p>
+
+          {selectedNodes.length === 1 && (
+            <>
+              <Field label="X">
+                <ClampedNumberField
+                  key={selectedNodes[0].id}
+                  initialValue={Math.round(selectedNodes[0].x)}
+                  min={-100000}
+                  max={100000}
+                  onCommit={(n) => updateNodes({ x: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+              </Field>
+              <Field label="Y">
+                <ClampedNumberField
+                  key={selectedNodes[0].id}
+                  initialValue={Math.round(selectedNodes[0].y)}
+                  min={-100000}
+                  max={100000}
+                  onCommit={(n) => updateNodes({ y: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+              </Field>
+            </>
+          )}
+          <Field label="Nudge">
+            {/* 1px per click, 10px with Shift held - same step sizes as the arrow-key shortcut
+                (WhiteboardCanvas.tsx's keydown handler) so both controls move a selection by
+                identical, predictable amounts. */}
+            <div className="grid grid-cols-3 grid-rows-2 gap-0.5">
+              <span />
+              <button
+                type="button"
+                onClick={(e) => nudgeSelected(0, e.shiftKey ? -10 : -1)}
+                title="Nudge up (↑, Shift for 10px)"
+                className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
+              >
+                ↑
+              </button>
+              <span />
+              <button
+                type="button"
+                onClick={(e) => nudgeSelected(e.shiftKey ? -10 : -1, 0)}
+                title="Nudge left (←, Shift for 10px)"
+                className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
+              >
+                ←
+              </button>
+              <button
+                type="button"
+                onClick={(e) => nudgeSelected(0, e.shiftKey ? 10 : 1)}
+                title="Nudge down (↓, Shift for 10px)"
+                className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
+              >
+                ↓
+              </button>
+              <button
+                type="button"
+                onClick={(e) => nudgeSelected(e.shiftKey ? 10 : 1, 0)}
+                title="Nudge right (→, Shift for 10px)"
+                className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
+              >
+                →
+              </button>
+            </div>
+          </Field>
 
           {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
             <Field label="Fill">
@@ -320,6 +400,18 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 max={12}
                 value={selectedNodes[0].sides ?? 5}
                 onChange={(e) => updateNodes({ sides: Math.max(3, Math.min(12, Number(e.target.value))) })}
+                className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+              />
+            </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "bondLine") && (
+            <Field label="Bonds">
+              <input
+                type="number"
+                min={1}
+                max={20}
+                value={selectedNodes[0].sides ?? 5}
+                onChange={(e) => updateNodes({ sides: Math.max(1, Math.min(20, Number(e.target.value))) })}
                 className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
               />
             </Field>
@@ -559,6 +651,30 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 className="h-3.5 w-3.5"
                 title="Faint gridlines across the whole plot at every tick, not just the axis tick marks"
               />
+            </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "numberLine") && (
+            <Field label="Range">
+              <div className="flex items-center gap-1.5">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].numberLineMax ?? DEFAULT_NUMBER_LINE_MAX}
+                  min={MIN_NUMBER_LINE_MAX}
+                  max={MAX_NUMBER_LINE_MAX}
+                  onCommit={(n) => updateNodes({ numberLineMax: n })}
+                  className="w-14 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Line spans -this to +this"
+                />
+                <input
+                  type="range"
+                  min={MIN_NUMBER_LINE_MAX}
+                  max={100}
+                  value={Math.min(100, selectedNodes[0].numberLineMax ?? DEFAULT_NUMBER_LINE_MAX)}
+                  onChange={(e) => updateNodes({ numberLineMax: Number(e.target.value) })}
+                  className="w-16"
+                  title="Line spans -this to +this"
+                />
+              </div>
             </Field>
           )}
           {selectedNodes.every((n) => n.shapeType === "freehand") && (

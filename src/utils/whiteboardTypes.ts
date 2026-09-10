@@ -44,6 +44,29 @@ export type WhiteboardShapeType =
   | "benzeneRing" // chemistry aromatic ring (hexagon + inscribed circle)
   | "axes" // math x/y coordinate axes
   | "angle" // math angle-with-arc marker
+  // Physics vector arrow - a plain horizontal line capped with WhiteboardNode.startArrowType/
+  // endArrowType (the SAME two fields "freehand" arrows already use, defaulting to
+  // none/"triangle" here), reusing the node's own existing width (length = magnitude) and
+  // rotation (direction) instead of inventing separate angle/magnitude fields - resize to change
+  // magnitude, use the rotate handle to change direction, exactly like every other shape's own
+  // resize/rotate already work. WhiteboardNode.text becomes an optional magnitude label (e.g. "10
+  // N") drawn above the line by default (see its own default verticalAlign).
+  | "vector"
+  | "diode" // circuit diode - triangle + cathode bar (NOT line-only - the triangle is a real fillable region)
+  | "inductor" // circuit inductor - a row of same-direction coil bumps (vs. "spring"'s alternating ones)
+  | "ground" // circuit ground - three stacked bars of decreasing width below a lead
+  // Chemistry skeletal-formula primitive - a zigzag alkane-chain backbone, WhiteboardNode.sides
+  // reused as the bond COUNT (same "reuse sides for the one number this shape needs" convention
+  // "polygon" already sets) rather than a new field. Deliberately just this one flexible primitive
+  // rather than a library of named-molecule presets - combine with the existing "hexagon"/"polygon"
+  // ring shapes (cyclohexane, cyclopentane, ...) and "benzeneRing" for anything past a plain chain;
+  // true arbitrary skeletal structures (branching, double bonds, ring-fusion) would need a real
+  // molecule editor, well past what a single generic zigzag shape can cover.
+  | "bondLine"
+  | "unitCircle" // math reference diagram - circle + axes + tick marks at each 30 degrees
+  // Math number line - reuses the "chart" kind's tick/label machinery (see barChart etc.'s own doc
+  // comment on it) for its own evenly-spaced integer ticks, same as functionPlot's axes do.
+  | "numberLine"
   // General-purpose glyphs (draw.io's own "General" shape palette) - fixed icons, same reasoning
   // as the science symbols above. "4-Point Star"/"8-Point Star" aren't their own shapeType - like
   // Pentagon/Octagon, they're just "star" at a different starPoints (see WhiteboardEditor.tsx's
@@ -101,6 +124,14 @@ export const LINE_ONLY_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<Whiteb
   "pieChart",
   "scatterPlot",
   "functionPlot",
+  // "diode" is deliberately NOT here - its triangle is a real fillable region, same reasoning as
+  // barChart's bars.
+  "vector",
+  "inductor",
+  "ground",
+  "bondLine",
+  "unitCircle",
+  "numberLine",
 ]);
 
 // The built-in sample series a bar/line/pie/scatter chart starts with (and falls back to if
@@ -111,7 +142,7 @@ export const DEFAULT_CHART_DATA: number[] = [4, 7, 3, 9, 5];
 // Which curve a "functionPlot" node traces (see whiteboardHandlers.ts's evalPlotFunction/
 // FUNCTION_PLOT_DOMAINS) - a curated preset list rather than an arbitrary user-typed formula, same
 // "fixed choices, not a formula parser" tradeoff WhiteboardNode.waveStyle makes for periodic shapes.
-export type FunctionPlotType = "linear" | "quadratic" | "cubic" | "sine" | "cosine" | "exponential" | "sqrt" | "logarithm" | "absolute";
+export type FunctionPlotType = "linear" | "quadratic" | "cubic" | "sine" | "cosine" | "exponential" | "sqrt" | "logarithm" | "absolute" | "normal";
 
 // The four shapeTypes that read WhiteboardNode.chartData - shared by createDefaultWhiteboardNode
 // (to seed it) and WhiteboardStylePanel.tsx (to show the data-editing field).
@@ -120,7 +151,7 @@ export const CHART_DATA_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<White
 // The shapeTypes whose "chart" ShapeOutline can carry tick/value labels (see ChartLabel and
 // WhiteboardNode.showChartLabels) - every chart type except pieChart, which has no axis at all to
 // label (a pie's own "data" is communicated by slice size/color, not a scale).
-export const CHART_LABEL_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["barChart", "lineChart", "scatterPlot", "functionPlot"]);
+export const CHART_LABEL_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["barChart", "lineChart", "scatterPlot", "functionPlot", "numberLine"]);
 
 interface WhiteboardItemBase {
   id: string;
@@ -223,6 +254,13 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // "barChart"/"lineChart"/"pieChart"/"scatterPlot"/"functionPlot" only - whether to draw the
   // axis/value tick numbers at all. Absent - resolves to true (shown by default).
   showChartLabels?: boolean;
+  // "numberLine" only - the line spans [-numberLineMax, numberLineMax] (symmetric around 0, since
+  // that's what every real use of a plain reference number line wants - there's no case for an
+  // off-center range the way a function plot's domain can usefully be). Tick spacing auto-widens
+  // past whatever integer step keeps the label count readable (see whiteboardHandlers.ts's
+  // numberLineOutline), so cranking this up doesn't degrade into unreadable clutter. Absent -
+  // resolves to DEFAULT_NUMBER_LINE_MAX (10, the line's original fixed range).
+  numberLineMax?: number;
   fontFamily: string;
   fontSize: number;
   fontColor: string;
@@ -432,6 +470,13 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   scatterPlot: { width: 220, height: 160 },
   functionPlot: { width: 200, height: 160 },
   equation: { width: 220, height: 70 },
+  vector: { width: 160, height: 40 },
+  diode: { width: 160, height: 60 },
+  inductor: { width: 180, height: 60 },
+  ground: { width: 100, height: 90 },
+  bondLine: { width: 200, height: 60 },
+  unitCircle: { width: 200, height: 200 },
+  numberLine: { width: 280, height: 60 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
 };
@@ -460,6 +505,7 @@ export function createDefaultWhiteboardNode(
       | "plotXTickInterval"
       | "plotYTickInterval"
       | "showChartLabels"
+      | "numberLineMax"
     >
   >
 ): WhiteboardNode {
@@ -489,7 +535,10 @@ export function createDefaultWhiteboardNode(
     // visible box around it the instant it becomes possible to have one.
     strokeWidth: shapeType === "equation" ? 0 : 2,
     cornerRadius: 0,
-    sides: shapeType === "polygon" ? overrides?.sides ?? 5 : undefined,
+    // "bondLine" reuses `sides` for its own one number (how many zigzag bonds/segments) - same
+    // "no dedicated field for a shape that only needs one integer" convention "polygon" already
+    // set for its own side count.
+    sides: shapeType === "polygon" ? overrides?.sides ?? 5 : shapeType === "bondLine" ? overrides?.sides ?? 5 : undefined,
     starPoints: shapeType === "star" ? overrides?.starPoints ?? 5 : undefined,
     starInnerRadiusRatio: shapeType === "star" ? overrides?.starInnerRadiusRatio ?? 0.45 : undefined,
     waveStyle: shapeType === "wave" ? overrides?.waveStyle ?? "sine" : undefined,
@@ -505,6 +554,7 @@ export function createDefaultWhiteboardNode(
     plotXTickInterval: shapeType === "functionPlot" ? overrides?.plotXTickInterval : undefined,
     plotYTickInterval: shapeType === "functionPlot" ? overrides?.plotYTickInterval : undefined,
     showChartLabels: CHART_LABEL_SHAPES.has(shapeType) ? overrides?.showChartLabels ?? true : undefined,
+    numberLineMax: shapeType === "numberLine" ? overrides?.numberLineMax ?? 10 : undefined,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,
     fontColor: "#111111",
@@ -512,7 +562,14 @@ export function createDefaultWhiteboardNode(
     fontStyle: "normal",
     textDecoration: "none",
     textAlign: "center",
-    verticalAlign: "middle",
+    // "vector" defaults its optional magnitude label ABOVE the line rather than centered on/through
+    // it - "middle" would visually collide with the arrow itself for the thin box a vector starts
+    // at (see SHAPE_DEFAULT_SIZE).
+    verticalAlign: shapeType === "vector" ? "top" : "middle",
+    // Only "vector" sets these here - "freehand" gets its own via createFreehandWhiteboardNode, and
+    // every other shapeType leaves them undefined (meaningless off a vector/freehand node).
+    startArrowType: shapeType === "vector" ? "none" : undefined,
+    endArrowType: shapeType === "vector" ? "triangle" : undefined,
     createdAt: now,
     updatedAt: now,
   };
