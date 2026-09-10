@@ -181,6 +181,15 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // Degrees, clockwise, about the box's own center - 0/undefined = unrotated. Purely a visual
   // transform (see this interface's own top comment for what that does and doesn't affect).
   rotation?: number;
+  // Mirrors the shape about its own center's vertical/horizontal axis, applied BEFORE rotation (so
+  // flipping then rotating some angle gives the same result a real object flipped-then-turned
+  // would) - see WhiteboardCanvas.tsx's localToWorldVector for the exact composition, matched by
+  // whiteboardHandlers.ts's Canvas2D export (ctx.rotate called before ctx.scale, same order). Same
+  // scope as rotation above: purely a rendering transform - the underlying box and every geometry
+  // function that builds a shape's outline from width/height never need to know a flip happened.
+  // Absent/false - unflipped.
+  flipHorizontal?: boolean;
+  flipVertical?: boolean;
   // Shared by every node in the same "Group" action (see WhiteboardEditor.tsx's handleGroup) -
   // clicking, selecting-via-marquee, or dragging any one member acts on every node sharing this id
   // (see WhiteboardCanvas.tsx's expandGroupSelection). Purely a selection/interaction convenience,

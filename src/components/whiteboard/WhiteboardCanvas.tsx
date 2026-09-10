@@ -100,19 +100,46 @@ function rotateVector(x: number, y: number, deg: number): { x: number; y: number
   return { x: x * cos - y * sin, y: x * sin + y * cos };
 }
 
-// A box corner's position relative to ITS OWN center, in local (unrotated) space - e.g. "se" is
-// always (+width/2, +height/2) regardless of where the box actually sits or how it's rotated.
+// A box corner's position relative to ITS OWN center, in local (unrotated, unflipped) space - e.g.
+// "se" is always (+width/2, +height/2) regardless of where the box actually sits or how it's
+// rotated/flipped.
 function cornerLocalOffset(width: number, height: number, corner: ResizeCorner): { x: number; y: number } {
   return { x: (corner.includes("w") ? -width : width) / 2, y: (corner.includes("n") ? -height : height) / 2 };
 }
 
-// A box corner's actual WORLD/doc-space position, accounting for the node's own rotation (rotated
-// around its center, matching transformOrigin: "center" on the node's own wrapper div below).
+// Mirrors a local offset vector per WhiteboardNode.flipHorizontal/flipVertical - flip is its own
+// inverse (applying it twice is a no-op), so this same function converts local -> flipped-local in
+// both directions.
+function flipVector(v: { x: number; y: number }, node: WhiteboardNode): { x: number; y: number } {
+  return { x: node.flipHorizontal ? -v.x : v.x, y: node.flipVertical ? -v.y : v.y };
+}
+
+// Converts a LOCAL offset vector (relative to a node's own center) to its WORLD/doc-space vector,
+// matching the node's own render transform exactly - see the node div's own `transform: rotate(deg)
+// scaleX(-1) scaleY(-1)` below (flip applied first/innermost, rotation second/outermost - same
+// order whiteboardHandlers.ts's Canvas2D export calls ctx.rotate/ctx.scale in). `worldToLocalVector`
+// below is its inverse.
+function localToWorldVector(v: { x: number; y: number }, node: WhiteboardNode): { x: number; y: number } {
+  const flipped = flipVector(v, node);
+  return node.rotation ? rotateVector(flipped.x, flipped.y, node.rotation) : flipped;
+}
+// Inverse of localToWorldVector - what a screen-space drag delta (already zoom-corrected) means in
+// the shape's OWN (possibly rotated AND flipped) local axes. Un-rotate first, then un-flip (flip is
+// applied INNERMOST in the forward direction, so it's the LAST step to undo, mirroring
+// localToWorldVector's own order in reverse).
+function worldToLocalVector(v: { x: number; y: number }, node: WhiteboardNode): { x: number; y: number } {
+  const unrotated = node.rotation ? rotateVector(v.x, v.y, -node.rotation) : v;
+  return flipVector(unrotated, node);
+}
+
+// A box corner's actual WORLD/doc-space position, accounting for the node's own rotation AND flip
+// (both applied about its own center, matching transformOrigin: "center" on the node's own wrapper
+// div below).
 function cornerWorldPoint(node: WhiteboardNode, corner: ResizeCorner): { x: number; y: number } {
   const center = nodeCenter(node);
   const offset = cornerLocalOffset(node.width, node.height, corner);
-  const rotated = node.rotation ? rotateVector(offset.x, offset.y, node.rotation) : offset;
-  return { x: center.x + rotated.x, y: center.y + rotated.y };
+  const world = localToWorldVector(offset, node);
+  return { x: center.x + world.x, y: center.y + world.y };
 }
 
 // Same idea as cornerLocalOffset/cornerWorldPoint above, just for the midpoint of the west/east
@@ -125,8 +152,8 @@ function edgeLocalOffset(width: number, edge: "w" | "e"): { x: number; y: number
 function edgeWorldPoint(node: WhiteboardNode, edge: "w" | "e"): { x: number; y: number } {
   const center = nodeCenter(node);
   const offset = edgeLocalOffset(node.width, edge);
-  const rotated = node.rotation ? rotateVector(offset.x, offset.y, node.rotation) : offset;
-  return { x: center.x + rotated.x, y: center.y + rotated.y };
+  const world = localToWorldVector(offset, node);
+  return { x: center.x + world.x, y: center.y + world.y };
 }
 
 // Given a set of already-selected node ids, adds every OTHER node sharing a groupId with one of
@@ -920,19 +947,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const dx = (e.clientX - interaction.startClientX) / zoom;
         const dy = (e.clientY - interaction.startClientY) / zoom;
         const start = interaction.startNode;
-        const rotation = start.rotation ?? 0;
-        // Project the screen-space drag delta into the box's OWN (possibly rotated) axes first -
-        // dragging a rotated corner should feel like stretching along ITS edges, not the screen's.
-        const local = rotation ? rotateVector(dx, dy, -rotation) : { x: dx, y: dy };
+        // Project the screen-space drag delta into the box's OWN (possibly rotated AND/OR flipped)
+        // axes first - dragging a rotated/flipped corner should feel like stretching along ITS
+        // edges, not the screen's (see worldToLocalVector's own doc comment).
+        const local = worldToLocalVector({ x: dx, y: dy }, start);
         const width = interaction.corner.includes("w") ? Math.max(20, start.width - local.x) : Math.max(20, start.width + local.x);
         const height = interaction.corner.includes("n") ? Math.max(20, start.height - local.y) : Math.max(20, start.height + local.y);
         // Solve new x/y so the OPPOSITE corner lands exactly back on anchorWorld (fixed at drag
         // start) - see cornerWorldPoint's own doc comment for why this can't just reuse the old
-        // x/y-in-local-space approach once rotation is involved.
+        // x/y-in-local-space approach once rotation/flip is involved.
         const anchorOffset = cornerLocalOffset(width, height, oppositeCorner(interaction.corner));
-        const rotatedAnchorOffset = rotation ? rotateVector(anchorOffset.x, anchorOffset.y, rotation) : anchorOffset;
-        const x = interaction.anchorWorld.x - rotatedAnchorOffset.x - width / 2;
-        const y = interaction.anchorWorld.y - rotatedAnchorOffset.y - height / 2;
+        const worldAnchorOffset = localToWorldVector(anchorOffset, start);
+        const x = interaction.anchorWorld.x - worldAnchorOffset.x - width / 2;
+        const y = interaction.anchorWorld.y - worldAnchorOffset.y - height / 2;
         const resized: WhiteboardNode = { ...start, x, y, width, height };
         setLiveNodes(page.nodes.map((n) => (n.id === start.id ? resized : n)));
         return;
@@ -958,10 +985,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const dx = (e.clientX - interaction.startClientX) / zoom;
         const dy = (e.clientY - interaction.startClientY) / zoom;
         const start = interaction.startNode;
-        const rotation = start.rotation ?? 0;
-        // Same screen-space -> the shape's own rotated axes projection the resize handles use -
-        // dragging a handle on a tilted amplifier should still feel like sliding along ITS lead.
-        const local = rotation ? rotateVector(dx, dy, -rotation) : { x: dx, y: dy };
+        // Same screen-space -> the shape's own rotated/flipped axes projection the resize handles
+        // use - dragging a handle on a tilted/mirrored amplifier should still feel like sliding
+        // along ITS lead.
+        const local = worldToLocalVector({ x: dx, y: dy }, start);
         const isOutput = interaction.which === "output";
         const isTop = interaction.which === "inputTop";
 
@@ -1020,9 +1047,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           node = { ...start, ampInputTopLeadLength: newTop, ampInputBottomLeadLength: newBottom };
         }
         const anchorOffset = edgeLocalOffset(width, isOutput ? "w" : "e");
-        const rotatedAnchorOffset = rotation ? rotateVector(anchorOffset.x, anchorOffset.y, rotation) : anchorOffset;
-        node.x = interaction.anchorWorld.x - rotatedAnchorOffset.x - width / 2;
-        node.y = interaction.anchorWorld.y - rotatedAnchorOffset.y - start.height / 2;
+        const worldAnchorOffset = localToWorldVector(anchorOffset, start);
+        node.x = interaction.anchorWorld.x - worldAnchorOffset.x - width / 2;
+        node.y = interaction.anchorWorld.y - worldAnchorOffset.y - start.height / 2;
         node.width = width;
         setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? node : n)));
         return;
@@ -1545,7 +1572,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 top: node.y,
                 width: node.width,
                 height: node.height,
-                transform: node.rotation ? `rotate(${node.rotation}deg)` : undefined,
+                // Rotate listed FIRST, flip SECOND - CSS composes a `transform` list right-to-left
+                // (the last-listed function applies to the element's own local points first), so
+                // this ordering flips in local space BEFORE rotating the already-flipped result,
+                // matching whiteboardHandlers.ts's Canvas2D export (ctx.rotate called before
+                // ctx.scale - see WhiteboardNode.flipHorizontal's own doc comment).
+                transform:
+                  [node.rotation ? `rotate(${node.rotation}deg)` : null, node.flipHorizontal ? "scaleX(-1)" : null, node.flipVertical ? "scaleY(-1)" : null].filter(Boolean).join(" ") || undefined,
                 transformOrigin: "center",
               }}
               onPointerEnter={() => setHoveredNodeId(node.id)}

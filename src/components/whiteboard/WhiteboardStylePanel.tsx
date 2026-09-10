@@ -11,6 +11,8 @@ import { IoCopyOutline, IoTrashOutline } from "react-icons/io5";
 import {
   TbComponents,
   TbComponentsOff,
+  TbFlipHorizontal,
+  TbFlipVertical,
   TbItalic,
   TbLayoutAlignBottom,
   TbLayoutAlignCenter,
@@ -391,6 +393,26 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               onCommit={(n) => updateNodes({ rotation: n === 0 || n === 360 ? undefined : n })}
               className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
             />
+          </Field>
+          <Field label="Flip">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => updateNodes({ flipHorizontal: !(selectedNodes[0].flipHorizontal ?? false) })}
+                title="Flip horizontal"
+                className={`p-1.5 rounded ${selectedNodes[0].flipHorizontal ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
+              >
+                <TbFlipHorizontal size={16} />
+              </button>
+              <button
+                type="button"
+                onClick={() => updateNodes({ flipVertical: !(selectedNodes[0].flipVertical ?? false) })}
+                title="Flip vertical"
+                className={`p-1.5 rounded ${selectedNodes[0].flipVertical ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
+              >
+                <TbFlipVertical size={16} />
+              </button>
+            </div>
           </Field>
           {selectedNodes.every((n) => n.shapeType === "rectangle" || n.shapeType === "equation") && (
             <Field label="Corner radius">

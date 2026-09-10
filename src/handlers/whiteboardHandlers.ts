@@ -2045,12 +2045,15 @@ async function paintEquation(ctx: CanvasRenderingContext2D, node: WhiteboardNode
 async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): Promise<void> {
   ctx.save();
   ctx.translate(node.x, node.y);
-  // Matches WhiteboardCanvas.tsx's own `transform: rotate(deg); transform-origin: center` - rotate
-  // about the box's own center, then shift back so everything drawn below (all in node-local
-  // 0,0-w,h space) doesn't need to know rotation happened at all.
-  if (node.rotation) {
+  // Matches WhiteboardCanvas.tsx's own `transform: rotate(deg) scaleX(-1) scaleY(-1); transform-
+  // origin: center` - rotate then flip about the box's own center (ctx.rotate called BEFORE
+  // ctx.scale, so - per how Canvas2D composes transforms - the flip applies to local points first,
+  // rotation second, the same order that CSS transform list produces), then shift back so
+  // everything drawn below (all in node-local 0,0-w,h space) doesn't need to know either happened.
+  if (node.rotation || node.flipHorizontal || node.flipVertical) {
     ctx.translate(node.width / 2, node.height / 2);
-    ctx.rotate((node.rotation * Math.PI) / 180);
+    if (node.rotation) ctx.rotate((node.rotation * Math.PI) / 180);
+    if (node.flipHorizontal || node.flipVertical) ctx.scale(node.flipHorizontal ? -1 : 1, node.flipVertical ? -1 : 1);
     ctx.translate(-node.width / 2, -node.height / 2);
   }
   if (node.shapeType === "freehand") {
