@@ -354,11 +354,12 @@ export type ShapeOutline =
   // <text>/ctx.fillText instead - see ChartLabel's own doc comment.
   | { kind: "chart"; parts: ChartPart[]; labels?: ChartLabel[] };
 
-// One small text annotation on a "chart" shape - always rendered in a fixed neutral gray at a fixed
-// small size regardless of the node's own font settings (an axis tick number isn't "the shape's
-// text" the way WhiteboardNode.text is; it's scaffolding, same treatment ChartPart's "axis" role
-// gets). `anchor` matches SVG's own text-anchor/Canvas2D's textAlign values directly, so both
-// renderers can pass it straight through with no translation.
+// One small text annotation on a "chart" shape - axis tick numbers/values, styled with the node's
+// own Font/Font size/Font color/Bold/Italic/Underline style-panel fields (the same ones any other
+// shape's own WhiteboardNode.text obeys - see paintNodeText), since the style panel already shows
+// those controls for every CHART_LABEL_SHAPES member and a control that visibly does nothing is
+// worse than not showing it at all. `anchor` matches SVG's own text-anchor/Canvas2D's textAlign
+// values directly, so both renderers can pass it straight through with no translation.
 export interface ChartLabel {
   x: number;
   y: number;
@@ -576,6 +577,27 @@ function groundOutlineD(w: number, h: number): string {
     parts.push(`M${(midX - halfW).toFixed(2)},${y.toFixed(2)} L${(midX + halfW).toFixed(2)},${y.toFixed(2)}`);
   }
   return parts.join(" ");
+}
+
+// Op-amp - a triangle (closed, fillable - same "diodeOutlineD" reasoning) with two input leads on
+// its flat left side (marked +/- with small open-line glyphs, same "open zero-area subpath mixed
+// into the one closed+filled `d`" trick diodeOutlineD already uses) and one output lead from its tip.
+function amplifierOutlineD(w: number, h: number): string {
+  const triLeftX = w * 0.22;
+  const tipX = w * 0.82;
+  const plusY = h * 0.28;
+  const minusY = h * 0.72;
+  const glyphX = triLeftX + w * 0.08;
+  const glyphHalf = w * 0.04;
+  return [
+    `M0,${plusY.toFixed(2)} L${triLeftX.toFixed(2)},${plusY.toFixed(2)}`,
+    `M0,${minusY.toFixed(2)} L${triLeftX.toFixed(2)},${minusY.toFixed(2)}`,
+    `M${triLeftX.toFixed(2)},0 L${triLeftX.toFixed(2)},${h.toFixed(2)} L${tipX.toFixed(2)},${(h / 2).toFixed(2)} Z`,
+    `M${tipX.toFixed(2)},${(h / 2).toFixed(2)} L${w},${(h / 2).toFixed(2)}`,
+    `M${(glyphX - glyphHalf).toFixed(2)},${plusY.toFixed(2)} L${(glyphX + glyphHalf).toFixed(2)},${plusY.toFixed(2)}`,
+    `M${glyphX.toFixed(2)},${(plusY - glyphHalf).toFixed(2)} L${glyphX.toFixed(2)},${(plusY + glyphHalf).toFixed(2)}`,
+    `M${(glyphX - glyphHalf).toFixed(2)},${minusY.toFixed(2)} L${(glyphX + glyphHalf).toFixed(2)},${minusY.toFixed(2)}`,
+  ].join(" ");
 }
 
 // A zigzag chain of `segments` bonds - the skeletal-formula alkane-chain backbone (see the
@@ -1372,6 +1394,8 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
       return { kind: "path", d: inductorOutlineD(w, h) };
     case "ground":
       return { kind: "path", d: groundOutlineD(w, h) };
+    case "amplifier":
+      return { kind: "path", d: amplifierOutlineD(w, h) };
     case "bondLine":
       return { kind: "path", d: bondLineOutlineD(w, h, opts?.sides ?? 5) };
     case "unitCircle":
@@ -1722,13 +1746,28 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
         }
       }
       if (outline.labels && outline.labels.length > 0) {
-        ctx.font = "9px system-ui, sans-serif";
-        ctx.fillStyle = "#6b7280";
+        const labelFontStyle = node.fontStyle === "italic" ? "italic " : "";
+        const labelFontWeight = node.fontWeight === "bold" ? "bold " : "";
+        ctx.font = `${labelFontStyle}${labelFontWeight}${node.fontSize}px ${node.fontFamily || "system-ui, sans-serif"}`;
+        ctx.fillStyle = node.fontColor;
         ctx.textBaseline = "middle";
         for (const label of outline.labels) {
           // SVG's text-anchor="middle" is Canvas2D's textAlign="center" - everything else lines up.
           ctx.textAlign = label.anchor === "middle" ? "center" : label.anchor;
           ctx.fillText(label.text, label.x, label.y);
+          if (node.textDecoration === "underline") {
+            const metrics = ctx.measureText(label.text);
+            const underlineY = label.y + node.fontSize * 0.35;
+            const startX = label.anchor === "start" ? label.x : label.anchor === "end" ? label.x - metrics.width : label.x - metrics.width / 2;
+            ctx.save();
+            ctx.strokeStyle = node.fontColor;
+            ctx.lineWidth = Math.max(1, node.fontSize / 16);
+            ctx.beginPath();
+            ctx.moveTo(startX, underlineY);
+            ctx.lineTo(startX + metrics.width, underlineY);
+            ctx.stroke();
+            ctx.restore();
+          }
         }
       }
       return;

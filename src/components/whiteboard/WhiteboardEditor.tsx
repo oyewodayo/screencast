@@ -96,6 +96,7 @@ const SCIENCE_SHAPE_PRESETS: ShapePreset[] = [
   { type: "diode", label: "Diode" },
   { type: "inductor", label: "Inductor" },
   { type: "ground", label: "Ground" },
+  { type: "amplifier", label: "Amplifier" },
   { type: "spring", label: "Spring/Coil" },
   { type: "flask", label: "Flask" },
   { type: "beaker", label: "Beaker" },

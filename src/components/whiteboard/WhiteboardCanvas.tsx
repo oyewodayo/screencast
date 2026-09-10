@@ -71,6 +71,37 @@ const LASER_FADE_MS = 550;
 
 type ResizeCorner = "nw" | "ne" | "sw" | "se";
 const RESIZE_CORNERS: ResizeCorner[] = ["nw", "ne", "sw", "se"];
+
+function oppositeCorner(corner: ResizeCorner): ResizeCorner {
+  return corner === "nw" ? "se" : corner === "se" ? "nw" : corner === "ne" ? "sw" : "ne";
+}
+
+// Rotates a LOCAL vector (relative to a node's own center) by `deg` to get its WORLD/doc-space
+// vector - the exact same rotation the node's own `transform: rotate(deg)` (see the node div below)
+// applies visually, so this and that CSS transform always agree on which way is which. Passing
+// `-deg` does the inverse (world -> local) - used by the resize-drag math below to figure out what
+// a screen-space pointer movement means in the shape's OWN (possibly tilted) axes.
+function rotateVector(x: number, y: number, deg: number): { x: number; y: number } {
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  return { x: x * cos - y * sin, y: x * sin + y * cos };
+}
+
+// A box corner's position relative to ITS OWN center, in local (unrotated) space - e.g. "se" is
+// always (+width/2, +height/2) regardless of where the box actually sits or how it's rotated.
+function cornerLocalOffset(width: number, height: number, corner: ResizeCorner): { x: number; y: number } {
+  return { x: (corner.includes("w") ? -width : width) / 2, y: (corner.includes("n") ? -height : height) / 2 };
+}
+
+// A box corner's actual WORLD/doc-space position, accounting for the node's own rotation (rotated
+// around its center, matching transformOrigin: "center" on the node's own wrapper div below).
+function cornerWorldPoint(node: WhiteboardNode, corner: ResizeCorner): { x: number; y: number } {
+  const center = nodeCenter(node);
+  const offset = cornerLocalOffset(node.width, node.height, corner);
+  const rotated = node.rotation ? rotateVector(offset.x, offset.y, node.rotation) : offset;
+  return { x: center.x + rotated.x, y: center.y + rotated.y };
+}
 const ANCHOR_SIDES: Exclude<WhiteboardAnchorSide, "auto">[] = ["top", "right", "bottom", "left"];
 // Shapes with a meaningful "attach a connector here" edge - freehand ink and free-floating text
 // have no such natural anchor, so they don't show connection dots or accept connector drops aimed
@@ -79,7 +110,18 @@ const CONNECTABLE_SHAPES = new Set<WhiteboardShapeType>(["rectangle", "ellipse",
 
 type Interaction =
   | { mode: "move"; ids: string[]; startClientX: number; startClientY: number; startNodes: WhiteboardNode[] }
-  | { mode: "resize"; id: string; corner: ResizeCorner; startClientX: number; startClientY: number; startNode: WhiteboardNode }
+  | {
+      mode: "resize";
+      id: string;
+      corner: ResizeCorner;
+      startClientX: number;
+      startClientY: number;
+      startNode: WhiteboardNode;
+      // The OPPOSITE corner's world/doc-space position, fixed at drag start - what the resize math
+      // solves new x/y against so that corner visually stays put even as the box rotates around its
+      // own (recalculated) center every render. See cornerWorldPoint's own doc comment.
+      anchorWorld: { x: number; y: number };
+    }
   // Angle is recomputed fresh from the pointer's current position each move (pointer-to-center
   // angle, not a delta from drag start), so this only needs the node being rotated and its center -
   // no startClientX/Y the way move/resize need for a delta-based drag.
@@ -521,7 +563,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     (node: WhiteboardNode, corner: ResizeCorner, e: React.PointerEvent) => {
       e.stopPropagation();
       onSelectionChange(new Set([node.id]), new Set());
-      interactionRef.current = { mode: "resize", id: node.id, corner, startClientX: e.clientX, startClientY: e.clientY, startNode: node };
+      const anchorWorld = cornerWorldPoint(node, oppositeCorner(corner));
+      interactionRef.current = { mode: "resize", id: node.id, corner, startClientX: e.clientX, startClientY: e.clientY, startNode: node, anchorWorld };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
     [onSelectionChange]
@@ -754,19 +797,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const dx = (e.clientX - interaction.startClientX) / zoom;
         const dy = (e.clientY - interaction.startClientY) / zoom;
         const start = interaction.startNode;
-        let { x, y, width, height } = start;
-        if (interaction.corner.includes("w")) {
-          width = Math.max(20, start.width - dx);
-          x = start.x + (start.width - width);
-        } else {
-          width = Math.max(20, start.width + dx);
-        }
-        if (interaction.corner.includes("n")) {
-          height = Math.max(20, start.height - dy);
-          y = start.y + (start.height - height);
-        } else {
-          height = Math.max(20, start.height + dy);
-        }
+        const rotation = start.rotation ?? 0;
+        // Project the screen-space drag delta into the box's OWN (possibly rotated) axes first -
+        // dragging a rotated corner should feel like stretching along ITS edges, not the screen's.
+        const local = rotation ? rotateVector(dx, dy, -rotation) : { x: dx, y: dy };
+        const width = interaction.corner.includes("w") ? Math.max(20, start.width - local.x) : Math.max(20, start.width + local.x);
+        const height = interaction.corner.includes("n") ? Math.max(20, start.height - local.y) : Math.max(20, start.height + local.y);
+        // Solve new x/y so the OPPOSITE corner lands exactly back on anchorWorld (fixed at drag
+        // start) - see cornerWorldPoint's own doc comment for why this can't just reuse the old
+        // x/y-in-local-space approach once rotation is involved.
+        const anchorOffset = cornerLocalOffset(width, height, oppositeCorner(interaction.corner));
+        const rotatedAnchorOffset = rotation ? rotateVector(anchorOffset.x, anchorOffset.y, rotation) : anchorOffset;
+        const x = interaction.anchorWorld.x - rotatedAnchorOffset.x - width / 2;
+        const y = interaction.anchorWorld.y - rotatedAnchorOffset.y - height / 2;
         const resized: WhiteboardNode = { ...start, x, y, width, height };
         setLiveNodes(page.nodes.map((n) => (n.id === start.id ? resized : n)));
         return;
@@ -1432,7 +1475,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     )
                   )}
                   {outline.labels?.map((label, i) => (
-                    <text key={i} x={label.x} y={label.y} textAnchor={label.anchor} dominantBaseline="middle" fontSize={9} fill="#6b7280">
+                    <text
+                      key={i}
+                      x={label.x}
+                      y={label.y}
+                      textAnchor={label.anchor}
+                      dominantBaseline="middle"
+                      fontFamily={node.fontFamily}
+                      fontSize={node.fontSize}
+                      fontWeight={node.fontWeight}
+                      fontStyle={node.fontStyle}
+                      textDecoration={node.textDecoration === "underline" ? "underline" : undefined}
+                      fill={node.fontColor}
+                    >
                       {label.text}
                     </text>
                   ))}
@@ -1519,10 +1574,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 <div className="absolute pointer-events-none" style={{ inset: -3 / zoom, border: `${1.5 / zoom}px dashed #2563eb` }} />
               )}
 
-              {/* Resize handles only for an UNrotated shape - dragging a corner assumes screen-axis
-                  dx/dy map straight onto width/height, which stops being true once the box itself
-                  is rotated (see WhiteboardNode.rotation's own doc comment on this tradeoff). */}
-              {selected && selectedNodeIds.size === 1 && !connectorArmed && !node.rotation &&
+              {/* Resize handles - shown (and draggable) at any rotation; beginResizeNode/the
+                  "resize" pointer-move branch project the drag into the box's own rotated axes and
+                  solve for the opposite corner staying fixed in world space (see cornerWorldPoint's
+                  own doc comment). Cursor icons stay screen-axis-aligned regardless of rotation -
+                  a cosmetic simplification, not a functional one. */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed &&
                 RESIZE_CORNERS.map((corner) => {
                   const size = HANDLE_SCREEN_SIZE / zoom;
                   const left = corner.includes("w") ? -size / 2 : node.width - size / 2;

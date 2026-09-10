@@ -55,6 +55,9 @@ export type WhiteboardShapeType =
   | "diode" // circuit diode - triangle + cathode bar (NOT line-only - the triangle is a real fillable region)
   | "inductor" // circuit inductor - a row of same-direction coil bumps (vs. "spring"'s alternating ones)
   | "ground" // circuit ground - three stacked bars of decreasing width below a lead
+  // Op-amp - a triangle (NOT line-only, same "real fillable region" reasoning as "diode") with two
+  // input leads marked +/- on its flat side and one output lead from its tip.
+  | "amplifier"
   // Chemistry skeletal-formula primitive - a zigzag alkane-chain backbone, WhiteboardNode.sides
   // reused as the bond COUNT (same "reuse sides for the one number this shape needs" convention
   // "polygon" already sets) rather than a new field. Deliberately just this one flexible primitive
@@ -164,8 +167,10 @@ interface WhiteboardItemBase {
 // tradeoff: resolveAnchorPoint/resolveAutoSide in whiteboardHandlers.ts (what a connector's "auto"
 // end anchors to) still work entirely in this unrotated box - correct for rotation 0, and still
 // reasonable for a modest tilt, but a connector attached to a heavily-rotated shape won't hug its
-// actual rotated outline. Resize handles are hidden whenever rotation is set (WhiteboardCanvas.tsx)
-// rather than shipping resize math that doesn't account for it.
+// actual rotated outline. Resize handles, unlike that, DO account for rotation (see
+// WhiteboardCanvas.tsx's cornerWorldPoint/rotateVector) - a dragged corner's screen-space delta is
+// projected into the box's own rotated axes, and the opposite corner is solved to stay fixed in
+// WORLD space rather than just this unrotated box's local space.
 export interface WhiteboardNode extends WhiteboardItemBase {
   kind: "node";
   shapeType: WhiteboardShapeType;
@@ -474,6 +479,7 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   diode: { width: 160, height: 60 },
   inductor: { width: 180, height: 60 },
   ground: { width: 100, height: 90 },
+  amplifier: { width: 160, height: 110 },
   bondLine: { width: 200, height: 60 },
   unitCircle: { width: 200, height: 200 },
   numberLine: { width: 280, height: 60 },

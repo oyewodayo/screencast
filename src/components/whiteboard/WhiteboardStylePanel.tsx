@@ -375,8 +375,10 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               key={selectedNodes.map((n) => n.id).join(",")}
               initialValue={selectedNodes[0].rotation ?? 0}
               min={0}
-              max={359}
-              onCommit={(n) => updateNodes({ rotation: n === 0 ? undefined : n })}
+              max={360}
+              // 360 is visually identical to 0 (no rotation) - normalize both to "unset" rather than
+              // clamping a typed 360 down to 359, which read as an arbitrary, unexplained cap.
+              onCommit={(n) => updateNodes({ rotation: n === 0 || n === 360 ? undefined : n })}
               className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
             />
           </Field>
