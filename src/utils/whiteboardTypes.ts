@@ -154,16 +154,38 @@ export const LINE_ONLY_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<Whiteb
 // on placement rather than a blank box, picked with no particular meaning beyond "visually varied".
 export const DEFAULT_CHART_DATA: number[] = [4, 7, 3, 9, 5];
 
-// "latticeGauge" node fields (WhiteboardNode.latticeSize/latticeSiteSpacing) and their sliders'
-// bounds in LatticeGaugeWidget.tsx - shared here (rather than living only in the widget file) so
-// createDefaultWhiteboardNode's own defaults can never drift from what the widget's sliders
-// actually allow.
+// "latticeGauge" node fields (WhiteboardNode.latticeSize/latticeSiteSpacing/latticeSiteRadius/
+// latticeLinkWidth) and their sliders' bounds in LatticeGaugeWidget.tsx / WhiteboardStylePanel.tsx
+// - shared here (rather than living only in one of those files) so createDefaultWhiteboardNode's
+// own defaults can never drift from what the sliders actually allow.
 export const DEFAULT_LATTICE_SIZE = 5;
 export const MIN_LATTICE_SIZE = 2;
-export const MAX_LATTICE_SIZE = 8;
+// Not literally unbounded - the number of gluon links grows as ~3*N^3, and every one of them is a
+// real instanced mesh whose transform gets recomputed on the JS main thread on every rebuild (see
+// LatticeGaugeWidget.tsx's own geometry-rebuild effect); an actually-uncapped N risks freezing the
+// tab (or exhausting GPU memory) on one accidental keystroke. 64 (262,144 sites, ~780K links) is
+// generously past anything a teaching diagram needs while staying inside what a typical GPU/CPU
+// can still build and render without locking up - well beyond the original cap of 8, which was
+// needlessly conservative for a value that's otherwise entirely the user's own call.
+export const MAX_LATTICE_SIZE = 64;
 export const DEFAULT_LATTICE_SITE_SPACING = 1;
 export const MIN_LATTICE_SITE_SPACING = 0.5;
 export const MAX_LATTICE_SITE_SPACING = 2.5;
+// The quark spheres' own radius, in world units - independent of site spacing (it used to be a
+// fixed 0.16x-of-spacing multiplier with no control of its own; now spacing and "how big the
+// spheres are" are two separate knobs, since tying them together left no way to make spheres
+// bigger/smaller without also changing how far apart the sites sit).
+export const DEFAULT_LATTICE_SITE_RADIUS = 0.16;
+export const MIN_LATTICE_SITE_RADIUS = 0.02;
+export const MAX_LATTICE_SITE_RADIUS = 0.6;
+// The gluon links' own radius (their "line weight") - links render as real 3D cylinders, not GPU
+// line primitives, specifically so this is adjustable at all: WebGL line width is stuck at ~1px on
+// most platforms (ANGLE/Windows included), so a wide-line approach would render exactly as thin
+// regardless of what this is set to. The old fixed-at-1px look is roughly what MIN reproduces;
+// DEFAULT is deliberately much thicker than that (the whole point of adding this control).
+export const DEFAULT_LATTICE_LINK_WIDTH = 0.035;
+export const MIN_LATTICE_LINK_WIDTH = 0.005;
+export const MAX_LATTICE_LINK_WIDTH = 0.25;
 
 // Which curve a "functionPlot" node traces (see whiteboardHandlers.ts's evalPlotFunction/
 // FUNCTION_PLOT_DOMAINS) - a curated preset list rather than an arbitrary user-typed formula, same
@@ -370,6 +392,12 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // rather than eagerly corrected here, same "resolve at read time" treatment every other
   // absent/stale shape field on this type gets.
   latticePlaquetteAnchor?: { i: number; j: number; k: number };
+  // Quark sphere radius and gluon link radius ("line weight"), both in absolute world units,
+  // independent of latticeSiteSpacing (see DEFAULT_LATTICE_SITE_RADIUS/DEFAULT_LATTICE_LINK_WIDTH's
+  // own doc comments in whiteboardTypes.ts for why they're decoupled from spacing). Absent -
+  // resolves to those defaults.
+  latticeSiteRadius?: number;
+  latticeLinkWidth?: number;
   fontFamily: string;
   fontSize: number;
   fontColor: string;

@@ -29,12 +29,18 @@ import {
   CHART_DATA_SHAPES,
   CHART_LABEL_SHAPES,
   DEFAULT_CHART_DATA,
+  DEFAULT_LATTICE_LINK_WIDTH,
+  DEFAULT_LATTICE_SITE_RADIUS,
   DEFAULT_LATTICE_SITE_SPACING,
   DEFAULT_LATTICE_SIZE,
   FunctionPlotType,
   LINE_ONLY_SHAPES,
+  MAX_LATTICE_LINK_WIDTH,
+  MAX_LATTICE_SITE_RADIUS,
   MAX_LATTICE_SITE_SPACING,
   MAX_LATTICE_SIZE,
+  MIN_LATTICE_LINK_WIDTH,
+  MIN_LATTICE_SITE_RADIUS,
   MIN_LATTICE_SITE_SPACING,
   MIN_LATTICE_SIZE,
   WhiteboardEdge,
@@ -851,6 +857,54 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.1}
                     value={selectedNodes[0].latticeSiteSpacing ?? DEFAULT_LATTICE_SITE_SPACING}
                     onChange={(e) => updateNodes({ latticeSiteSpacing: Number(e.target.value) })}
+                    className="w-16"
+                  />
+                </div>
+              </Field>
+              <Field label="Quark size">
+                <div className="flex items-center gap-1.5">
+                  <ClampedNumberField
+                    key={selectedNodes.map((n) => n.id).join(",")}
+                    initialValue={selectedNodes[0].latticeSiteRadius ?? DEFAULT_LATTICE_SITE_RADIUS}
+                    min={MIN_LATTICE_SITE_RADIUS}
+                    max={MAX_LATTICE_SITE_RADIUS}
+                    step={0.01}
+                    integer={false}
+                    onCommit={(n) => updateNodes({ latticeSiteRadius: n })}
+                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    title="Quark sphere radius, in world units - independent of site spacing"
+                  />
+                  <input
+                    type="range"
+                    min={MIN_LATTICE_SITE_RADIUS}
+                    max={MAX_LATTICE_SITE_RADIUS}
+                    step={0.01}
+                    value={selectedNodes[0].latticeSiteRadius ?? DEFAULT_LATTICE_SITE_RADIUS}
+                    onChange={(e) => updateNodes({ latticeSiteRadius: Number(e.target.value) })}
+                    className="w-16"
+                  />
+                </div>
+              </Field>
+              <Field label="Gluon width">
+                <div className="flex items-center gap-1.5">
+                  <ClampedNumberField
+                    key={selectedNodes.map((n) => n.id).join(",")}
+                    initialValue={selectedNodes[0].latticeLinkWidth ?? DEFAULT_LATTICE_LINK_WIDTH}
+                    min={MIN_LATTICE_LINK_WIDTH}
+                    max={MAX_LATTICE_LINK_WIDTH}
+                    step={0.005}
+                    integer={false}
+                    onCommit={(n) => updateNodes({ latticeLinkWidth: n })}
+                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    title="Gauge-link line weight (radius), in world units"
+                  />
+                  <input
+                    type="range"
+                    min={MIN_LATTICE_LINK_WIDTH}
+                    max={MAX_LATTICE_LINK_WIDTH}
+                    step={0.005}
+                    value={selectedNodes[0].latticeLinkWidth ?? DEFAULT_LATTICE_LINK_WIDTH}
+                    onChange={(e) => updateNodes({ latticeLinkWidth: Number(e.target.value) })}
                     className="w-16"
                   />
                 </div>

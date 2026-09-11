@@ -24,10 +24,16 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import {
+  DEFAULT_LATTICE_LINK_WIDTH,
+  DEFAULT_LATTICE_SITE_RADIUS,
   DEFAULT_LATTICE_SITE_SPACING,
   DEFAULT_LATTICE_SIZE,
+  MAX_LATTICE_LINK_WIDTH,
+  MAX_LATTICE_SITE_RADIUS,
   MAX_LATTICE_SITE_SPACING,
   MAX_LATTICE_SIZE,
+  MIN_LATTICE_LINK_WIDTH,
+  MIN_LATTICE_SITE_RADIUS,
   MIN_LATTICE_SITE_SPACING,
   MIN_LATTICE_SIZE,
   WhiteboardNode,
@@ -61,7 +67,10 @@ const SITE_COLOR = new THREE.Color("#e0584a");
 // own doc comment on why), so there's no JS-side buffer that would actually read a THREE.Color
 // constant for it.
 const LINK_COLOR = new THREE.Color("#2dd4bf");
-const SITE_RADIUS_FRACTION = 0.16;
+// Radial segment count for the (potentially many thousands of) gluon-link cylinders - 6 rather
+// than the plaquette overlay's 8 since there are only ever 4 of those but there can be ~3*N^3 of
+// these; still reads as round at the sizes these render at.
+const LINK_RADIAL_SEGMENTS = 6;
 
 function clamp(v: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, v));
@@ -71,15 +80,13 @@ function clamp(v: number, min: number, max: number): number {
 // Deliberately free of any THREE.* types - a plain description of where every site/link sits,
 // built once per (n, spacing) pair and turned into actual GPU buffers by the component below.
 // Sites are indexed i + j*n + k*n*n; links only run in the +x/+y/+z direction from each site (so
-// every link is counted exactly once) with each link's two vertices carrying which site they came
-// from (for gauge-mode color blending - see recolorLattice) and an "along" 0/1 marking which end
-// of the link it is (for the flux shader's traveling-pulse direction).
+// every link is counted exactly once), with each link's two endpoint site indices (linkSites) kept
+// for gauge-mode color blending and for positioning its own instanced cylinder (see the geometry-
+// rebuild effect's own link-construction block).
 interface LatticeGeometry {
   n: number;
   sitePositions: Float32Array; // n^3 * 3
-  linkPositions: Float32Array; // numLinks * 2 * 3
-  linkAlong: Float32Array; // numLinks * 2
-  linkSites: Uint32Array; // numLinks * 2 - which site each link vertex came from
+  linkSites: Uint32Array; // numLinks * 2 - [siteA, siteB] per link
   linkOrigin: Int32Array; // numLinks - the site index each link runs FROM (its lower-coordinate end)
   linkAxis: Uint8Array; // numLinks - which axis it runs along, 0=x/1=y/2=z
   numSites: number;
@@ -128,25 +135,15 @@ function buildLatticeGeometry(n: number, spacing: number): LatticeGeometry {
     }
   }
 
-  const numLinks = linkOriginList.length;
-  const linkPositions = new Float32Array(numLinks * 2 * 3);
-  const linkAlong = new Float32Array(numLinks * 2);
-  const linkSites = new Uint32Array(numLinks * 2);
-  for (let li = 0; li < numLinks; li++) {
-    const siteA = linkSitePairs[li * 2];
-    const siteB = linkSitePairs[li * 2 + 1];
-    for (let e = 0; e < 2; e++) {
-      const site = e === 0 ? siteA : siteB;
-      const vi = li * 2 + e;
-      linkPositions[vi * 3] = sitePositions[site * 3];
-      linkPositions[vi * 3 + 1] = sitePositions[site * 3 + 1];
-      linkPositions[vi * 3 + 2] = sitePositions[site * 3 + 2];
-      linkAlong[vi] = e;
-      linkSites[vi] = site;
-    }
-  }
-
-  return { n, sitePositions, linkPositions, linkAlong, linkSites, linkOrigin: new Int32Array(linkOriginList), linkAxis: new Uint8Array(linkAxisList), numSites, numLinks };
+  return {
+    n,
+    sitePositions,
+    linkSites: new Uint32Array(linkSitePairs),
+    linkOrigin: new Int32Array(linkOriginList),
+    linkAxis: new Uint8Array(linkAxisList),
+    numSites,
+    numLinks: linkOriginList.length,
+  };
 }
 
 // Which lattice site (i, j, k) a plaquette highlight is anchored at, clamped to a range that's
@@ -219,26 +216,30 @@ function mulberry32(seed: number): () => number {
 }
 
 // ---- Link flux/highlight shader ----------------------------------------------------------------
-// A custom ShaderMaterial (rather than LineBasicMaterial) so the "animate gauge flux" toggle and
-// the plaquette-loop pulse can both be pure GPU-side effects driven by one uTime uniform update
-// per frame, instead of re-touching the link color BUFFER every frame (which would mean walking
-// every link vertex on the CPU 60 times a second). aAlong (0 at a link's start vertex, 1 at its
-// end) drives a brightness wave that visibly travels along each link's own length when flux
-// animation is on; aHighlight (1 for the plaquette loop's own 4 links, 0 otherwise) blends toward
-// HIGHLIGHT_COLOR and adds its own independent pulse, so entering/leaving "plaquette" mode is just
-// swapping that one attribute buffer, not touching aAlong/uTime at all.
+// Gluon links are an InstancedMesh of unit cylinders (radius 1, height 1, axis along local +Y) -
+// see cylinderBetween's own doc comment for why real 3D geometry rather than a GPU line at all
+// (WebGL line width is stuck at ~1px on most platforms, which would make the new adjustable
+// "Gluon width" style-panel field a no-op). Each instance is scaled/rotated/positioned to span one
+// link (see the geometry-rebuild effect's own link-construction block) - since every instance
+// shares the exact same unit-cylinder base geometry, "how far along this link am I" falls straight
+// out of the base geometry's own local Y coordinate (-0.5..0.5 -> 0..1) with no extra per-vertex
+// attribute needed; aColorA/aColorB/aHighlight are the only custom data, one INSTANCED value each
+// (not per-vertex), set by recolorLattice below. The flux travel/highlight pulse math itself is
+// identical to what the old per-vertex-line version did, just reading instanced inputs instead.
 const LINK_VERTEX_SHADER = `
-  attribute float aAlong;
+  attribute vec3 aColorA;
+  attribute vec3 aColorB;
   attribute float aHighlight;
-  attribute vec3 linkColor;
   varying float vAlong;
   varying float vHighlight;
-  varying vec3 vColor;
+  varying vec3 vColorA;
+  varying vec3 vColorB;
   void main() {
-    vAlong = aAlong;
+    vAlong = position.y + 0.5;
     vHighlight = aHighlight;
-    vColor = linkColor;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    vColorA = aColorA;
+    vColorB = aColorB;
+    gl_Position = projectionMatrix * modelViewMatrix * instanceMatrix * vec4(position, 1.0);
   }
 `;
 const LINK_FRAGMENT_SHADER = `
@@ -247,34 +248,34 @@ const LINK_FRAGMENT_SHADER = `
   uniform float uFlow;
   varying float vAlong;
   varying float vHighlight;
-  varying vec3 vColor;
+  varying vec3 vColorA;
+  varying vec3 vColorB;
   void main() {
     vec3 highlight = vec3(0.976, 0.812, 0.082);
-    vec3 base = mix(vColor, highlight, vHighlight);
+    vec3 base = mix(mix(vColorA, vColorB, vAlong), highlight, vHighlight);
     float travel = mix(1.0, 0.5 + 0.5 * sin((vAlong * 10.0 - uTime * 2.2) * 6.28318530718), uFlow);
     float pulse = mix(1.0, 0.75 + 0.35 * sin(uTime * 3.0), vHighlight);
     gl_FragColor = vec4(base * mix(0.6, 1.5, travel) * pulse, 1.0);
   }
 `;
 
-// Recomputes every color buffer (site instance colors + link vertex colors) for the CURRENT
-// teaching mode/gaugeSeed, without touching geometry topology - called on mount, whenever the
-// lattice is rebuilt, and whenever mode/seed/visibility changes. "gauge" mode assigns each site
-// its own random hue (seeded by gaugeSeed) and blends each link's two vertex colors toward its own
-// two endpoint sites' colors (the GPU linearly interpolates a 2-vertex line's varying across the
-// segment for free, so this alone is what makes a link "flow" from one site's color into the
-// other's).
+// Recomputes every color (site instance colors + link instance colors) for the CURRENT teaching
+// mode/gaugeSeed, without touching geometry topology - called on mount, whenever the lattice is
+// rebuilt, and whenever mode/seed/visibility changes. "gauge" mode assigns each site its own
+// random hue (seeded by gaugeSeed) and gives each link its two endpoint sites' colors as aColorA/
+// aColorB (the GPU linearly interpolates that pair across the cylinder's own length in the
+// fragment shader - see LINK_FRAGMENT_SHADER - so this alone is what makes a link "flow" from one
+// site's color into the other's).
 function recolorLattice(
   geo: LatticeGeometry,
   siteMesh: THREE.InstancedMesh,
-  linkGeometry: THREE.BufferGeometry,
+  linkColorAAttr: THREE.InstancedBufferAttribute,
+  linkColorBAttr: THREE.InstancedBufferAttribute,
+  linkHighlightAttr: THREE.InstancedBufferAttribute,
   mode: "free" | "plaquette" | "gauge",
   gaugeSeed: number,
   plaquetteAnchor: { i: number; j: number; k: number }
 ) {
-  const linkColorAttr = linkGeometry.getAttribute("linkColor") as THREE.BufferAttribute;
-  const highlightAttr = linkGeometry.getAttribute("aHighlight") as THREE.BufferAttribute;
-
   if (mode === "gauge") {
     const rng = mulberry32(gaugeSeed);
     const siteColors = new Array<THREE.Color>(geo.numSites);
@@ -284,34 +285,40 @@ function recolorLattice(
       siteColors[s] = tmp.clone().setHSL(hue, 0.65, 0.55);
       siteMesh.setColorAt(s, siteColors[s]);
     }
-    for (let vi = 0; vi < geo.numLinks * 2; vi++) {
-      const c = siteColors[geo.linkSites[vi]];
-      linkColorAttr.setXYZ(vi, c.r, c.g, c.b);
+    for (let li = 0; li < geo.numLinks; li++) {
+      const a = siteColors[geo.linkSites[li * 2]];
+      const b = siteColors[geo.linkSites[li * 2 + 1]];
+      linkColorAAttr.setXYZ(li, a.r, a.g, a.b);
+      linkColorBAttr.setXYZ(li, b.r, b.g, b.b);
     }
   } else {
     for (let s = 0; s < geo.numSites; s++) siteMesh.setColorAt(s, SITE_COLOR);
-    for (let vi = 0; vi < geo.numLinks * 2; vi++) linkColorAttr.setXYZ(vi, LINK_COLOR.r, LINK_COLOR.g, LINK_COLOR.b);
+    for (let li = 0; li < geo.numLinks; li++) {
+      linkColorAAttr.setXYZ(li, LINK_COLOR.r, LINK_COLOR.g, LINK_COLOR.b);
+      linkColorBAttr.setXYZ(li, LINK_COLOR.r, LINK_COLOR.g, LINK_COLOR.b);
+    }
   }
 
   if (mode === "plaquette") {
     const edgeKeys = plaquetteEdgeKeys(plaquetteAnchor, geo.n);
     for (let li = 0; li < geo.numLinks; li++) {
-      const hi = edgeKeys.has(`${geo.linkOrigin[li]}:${geo.linkAxis[li]}`) ? 1 : 0;
-      highlightAttr.setX(li * 2, hi);
-      highlightAttr.setX(li * 2 + 1, hi);
+      linkHighlightAttr.setX(li, edgeKeys.has(`${geo.linkOrigin[li]}:${geo.linkAxis[li]}`) ? 1 : 0);
     }
   } else {
-    for (let vi = 0; vi < geo.numLinks * 2; vi++) highlightAttr.setX(vi, 0);
+    for (let li = 0; li < geo.numLinks; li++) linkHighlightAttr.setX(li, 0);
   }
 
   if (siteMesh.instanceColor) siteMesh.instanceColor.needsUpdate = true;
-  linkColorAttr.needsUpdate = true;
-  highlightAttr.needsUpdate = true;
+  linkColorAAttr.needsUpdate = true;
+  linkColorBAttr.needsUpdate = true;
+  linkHighlightAttr.needsUpdate = true;
 }
 
 export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelect }: LatticeGaugeWidgetProps) {
   const n = clamp(node.latticeSize ?? DEFAULT_LATTICE_SIZE, MIN_LATTICE_SIZE, MAX_LATTICE_SIZE);
   const spacing = clamp(node.latticeSiteSpacing ?? DEFAULT_LATTICE_SITE_SPACING, MIN_LATTICE_SITE_SPACING, MAX_LATTICE_SITE_SPACING);
+  const siteRadius = clamp(node.latticeSiteRadius ?? DEFAULT_LATTICE_SITE_RADIUS, MIN_LATTICE_SITE_RADIUS, MAX_LATTICE_SITE_RADIUS);
+  const linkWidth = clamp(node.latticeLinkWidth ?? DEFAULT_LATTICE_LINK_WIDTH, MIN_LATTICE_LINK_WIDTH, MAX_LATTICE_LINK_WIDTH);
   const showQuarks = node.latticeShowQuarks ?? true;
   const showGluons = node.latticeShowGluons ?? true;
   const animateFlux = node.latticeAnimateFlux ?? true;
@@ -340,10 +347,22 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const siteMeshRef = useRef<THREE.InstancedMesh | null>(null);
-  const linkMeshRef = useRef<THREE.LineSegments | null>(null);
+  // Gluon links - an InstancedMesh of unit cylinders now (see LINK_VERTEX_SHADER's own doc
+  // comment), not a LineSegments. The three ...AttrRef refs point at that mesh's own instanced
+  // attribute buffers so recolorLattice can be called without needing to re-look them up from the
+  // geometry every time (both the "N/spacing/radius/width changed, full rebuild" effect and the
+  // "just mode/seed/anchor changed, recolor only" effect call it).
+  const linkMeshRef = useRef<THREE.InstancedMesh | null>(null);
   const linkMaterialRef = useRef<THREE.ShaderMaterial | null>(null);
+  const linkColorARef = useRef<THREE.InstancedBufferAttribute | null>(null);
+  const linkColorBRef = useRef<THREE.InstancedBufferAttribute | null>(null);
+  const linkHighlightRef = useRef<THREE.InstancedBufferAttribute | null>(null);
   const latticeRef = useRef<LatticeGeometry | null>(null);
   const prevExtentRef = useRef<number>(0);
+  // Which N the camera was last auto-refit for - see the geometry-rebuild effect's own comment on
+  // why the refit only ever fires again once THIS changes, not on every rebuild (spacing alone
+  // rebuilds the geometry too, just without touching the camera).
+  const prevNRef = useRef<number>(0);
   const [webglError, setWebglError] = useState(false);
   // The thick amber loop overlay (see cylinderBetween's own doc comment for why it's real 3D
   // geometry, not a wide line) - one shared Group/Material created once at mount, repopulated with
@@ -368,7 +387,13 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     if (!container) return;
     let renderer: THREE.WebGLRenderer;
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "low-power" });
+      // preserveDrawingBuffer: true - without it, WebGL is free to discard the drawing buffer
+      // right after compositing each frame, so a canvas.drawImage/toDataURL call made well after
+      // the animation loop's last render() (e.g. from an "Export PNG" click, seconds later) can
+      // read back blank. See whiteboardHandlers.ts's renderNode "latticeGauge" branch, which is
+      // exactly that kind of later, unrelated read - it's what makes the exported PNG show this
+      // node's actual live 3D view instead of just its shapeOutlineFor placeholder glyph.
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "low-power", preserveDrawingBuffer: true });
     } catch {
       setWebglError(true);
       return;
@@ -381,6 +406,13 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     // display:block - a bare <canvas> defaults to inline, which leaves a few px of baseline
     // whitespace below it inside this flex child and can trip a stray scrollbar.
     renderer.domElement.style.display = "block";
+    // The exact lookup key whiteboardHandlers.ts's renderNode uses to find this live canvas at
+    // export time (see its own "latticeGauge" branch) - see this effect's own preserveDrawingBuffer
+    // comment for why that read is even reliable. node.id is stable for this widget instance's
+    // whole lifetime (WhiteboardCanvas.tsx keys the node div by it, so an id change remounts this
+    // component entirely rather than re-running this effect), so setting it once at mount here
+    // never needs to be kept in sync afterward.
+    renderer.domElement.setAttribute("data-lattice-node-id", node.id);
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -463,6 +495,9 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
       siteMeshRef.current = null;
       linkMeshRef.current = null;
       linkMaterialRef.current = null;
+      linkColorARef.current = null;
+      linkColorBRef.current = null;
+      linkHighlightRef.current = null;
       plaquetteGroupRef.current = null;
       plaquetteMaterialRef.current = null;
     };
@@ -486,7 +521,7 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     }
   }, []);
 
-  // ---- Rebuild geometry whenever N or spacing changes (including live, mid-drag) -----------------
+  // ---- Rebuild geometry whenever N, spacing, quark size, or gluon width changes --------------------
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
@@ -505,7 +540,7 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     const geo = buildLatticeGeometry(n, spacing);
     latticeRef.current = geo;
 
-    const sphereGeo = new THREE.SphereGeometry(SITE_RADIUS_FRACTION * spacing, 16, 12);
+    const sphereGeo = new THREE.SphereGeometry(siteRadius, 16, 12);
     // An InstancedMesh with a per-instance color (siteMesh.setColorAt below) forces three.js's
     // USE_COLOR shader define on REGARDLESS of the material's own vertexColors setting - it's
     // tied to instanceColor being non-null, not to this flag (see WebGLProgram's own instancingColor
@@ -529,41 +564,82 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     scene.add(siteMesh);
     siteMeshRef.current = siteMesh;
 
-    const linkGeometry = new THREE.BufferGeometry();
-    linkGeometry.setAttribute("position", new THREE.BufferAttribute(geo.linkPositions, 3));
-    linkGeometry.setAttribute("aAlong", new THREE.BufferAttribute(geo.linkAlong, 1));
-    linkGeometry.setAttribute("aHighlight", new THREE.BufferAttribute(new Float32Array(geo.numLinks * 2), 1));
-    linkGeometry.setAttribute("linkColor", new THREE.BufferAttribute(new Float32Array(geo.numLinks * 2 * 3), 3));
+    // Gluon links - one InstancedMesh of unit cylinders (radius 1, height 1, local +Y axis), each
+    // instance transformed to span exactly one link (position = midpoint, scale.y = its actual
+    // length, scale.x/z = linkWidth, rotation aligns local +Y to the link's own direction) - see
+    // LINK_VERTEX_SHADER's own doc comment for why one shared unit geometry is enough (no per-link
+    // geometry needed) and cylinderBetween's for why cylinders instead of GPU lines at all.
+    const linkUnitGeo = new THREE.CylinderGeometry(1, 1, 1, LINK_RADIAL_SEGMENTS, 1);
+    const linkColorA = new THREE.InstancedBufferAttribute(new Float32Array(geo.numLinks * 3), 3);
+    const linkColorB = new THREE.InstancedBufferAttribute(new Float32Array(geo.numLinks * 3), 3);
+    const linkHighlight = new THREE.InstancedBufferAttribute(new Float32Array(geo.numLinks), 1);
+    linkUnitGeo.setAttribute("aColorA", linkColorA);
+    linkUnitGeo.setAttribute("aColorB", linkColorB);
+    linkUnitGeo.setAttribute("aHighlight", linkHighlight);
+    linkColorARef.current = linkColorA;
+    linkColorBRef.current = linkColorB;
+    linkHighlightRef.current = linkHighlight;
+
     const linkMaterial = new THREE.ShaderMaterial({
       uniforms: { uTime: { value: 0 }, uFlow: { value: animateFlux ? 1 : 0 } },
       vertexShader: LINK_VERTEX_SHADER,
       fragmentShader: LINK_FRAGMENT_SHADER,
     });
-    const linkMesh = new THREE.LineSegments(linkGeometry, linkMaterial);
+    const linkMesh = new THREE.InstancedMesh(linkUnitGeo, linkMaterial, geo.numLinks);
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3();
+    for (let li = 0; li < geo.numLinks; li++) {
+      const siteA = geo.linkSites[li * 2];
+      const siteB = geo.linkSites[li * 2 + 1];
+      const ax = geo.sitePositions[siteA * 3];
+      const ay = geo.sitePositions[siteA * 3 + 1];
+      const az = geo.sitePositions[siteA * 3 + 2];
+      const bx = geo.sitePositions[siteB * 3];
+      const by = geo.sitePositions[siteB * 3 + 1];
+      const bz = geo.sitePositions[siteB * 3 + 2];
+      dir.set(bx - ax, by - ay, bz - az);
+      const length = Math.max(dir.length(), 0.0001);
+      dir.normalize();
+      dummy.position.set((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
+      dummy.scale.set(linkWidth, length, linkWidth);
+      dummy.quaternion.setFromUnitVectors(up, dir);
+      dummy.updateMatrix();
+      linkMesh.setMatrixAt(li, dummy.matrix);
+    }
+    linkMesh.instanceMatrix.needsUpdate = true;
     linkMesh.visible = showGluons;
     scene.add(linkMesh);
     linkMeshRef.current = linkMesh;
     linkMaterialRef.current = linkMaterial;
 
-    recolorLattice(geo, siteMesh, linkGeometry, mode, gaugeSeed, plaquetteAnchor);
+    recolorLattice(geo, siteMesh, linkColorA, linkColorB, linkHighlight, mode, gaugeSeed, plaquetteAnchor);
     rebuildPlaquetteOverlay(n, spacing, plaquetteAnchor);
     if (plaquetteGroupRef.current) plaquetteGroupRef.current.visible = mode === "plaquette";
 
-    // Re-fit the camera's distance to the new lattice extent, scaling the user's CURRENT radius
-    // (rather than resetting it outright) so nudging the spacing slider zooms proportionally
-    // instead of yanking the view back to a fixed default and discarding whatever angle/zoom the
-    // user had already set up.
+    // Re-fit the camera's distance ONLY when N itself changed (including the very first build) -
+    // a bigger lattice genuinely needs the camera further back to still fit in frame. Deliberately
+    // does NOT run for a spacing-only change: spacing is supposed to visibly spread the sites out
+    // or pull them in, and scaling the camera distance by that same factor - which an earlier
+    // version of this effect did unconditionally - exactly cancels that out on screen (the lattice
+    // gets physically bigger/smaller in world units, but the camera backs away/closes in by the
+    // identical ratio, so the projected size never visibly changes at all). Letting a spacing
+    // change actually resize the lattice on screen, and leaving the user to scroll-zoom afterward
+    // if they want, is what makes the slider do anything perceptible. Quark size/gluon width never
+    // touch it either - those change how thick things look, not how far apart they are.
     const extent = Math.max(1, (n - 1) * spacing);
     const orbit = orbitRef.current;
-    if (prevExtentRef.current <= 0) {
-      orbit.radius = extent * 1.7 + 2;
-    } else {
-      orbit.radius = clamp(orbit.radius * (extent / prevExtentRef.current), 1, 400);
+    if (prevNRef.current !== n) {
+      if (prevExtentRef.current <= 0) {
+        orbit.radius = extent * 1.7 + 2;
+      } else {
+        orbit.radius = clamp(orbit.radius * (extent / prevExtentRef.current), 1, 400);
+      }
+      prevNRef.current = n;
     }
     prevExtentRef.current = extent;
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [n, spacing]);
+  }, [n, spacing, siteRadius, linkWidth]);
 
   // ---- Instant (no rebuild) updates: visibility + mode/seed recolor + flux uniform ---------------
   useEffect(() => {
@@ -578,9 +654,11 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
   useEffect(() => {
     const geo = latticeRef.current;
     const siteMesh = siteMeshRef.current;
-    const linkMesh = linkMeshRef.current;
-    if (!geo || !siteMesh || !linkMesh) return;
-    recolorLattice(geo, siteMesh, linkMesh.geometry, mode, gaugeSeed, plaquetteAnchor);
+    const colorA = linkColorARef.current;
+    const colorB = linkColorBRef.current;
+    const highlight = linkHighlightRef.current;
+    if (!geo || !siteMesh || !colorA || !colorB || !highlight) return;
+    recolorLattice(geo, siteMesh, colorA, colorB, highlight, mode, gaugeSeed, plaquetteAnchor);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, gaugeSeed, plaquetteAnchor.i, plaquetteAnchor.j, plaquetteAnchor.k]);
 
