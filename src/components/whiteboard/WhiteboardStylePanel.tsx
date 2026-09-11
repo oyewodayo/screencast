@@ -369,19 +369,23 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               />
             </Field>
           )}
-          <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink color" : "Stroke color"}>
-            <input type="color" value={selectedNodes[0].strokeColor} onChange={(e) => updateNodes({ strokeColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
-          </Field>
-          <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink width" : "Stroke width"}>
-            <input
-              type="range"
-              min={selectedNodes.every((n) => n.shapeType === "freehand") ? 1 : 0}
-              max={12}
-              value={selectedNodes[0].strokeWidth}
-              onChange={(e) => updateNodes({ strokeWidth: Number(e.target.value) })}
-              className="w-28"
-            />
-          </Field>
+          {selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
+            <>
+              <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink color" : "Stroke color"}>
+                <input type="color" value={selectedNodes[0].strokeColor} onChange={(e) => updateNodes({ strokeColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
+              </Field>
+              <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink width" : "Stroke width"}>
+                <input
+                  type="range"
+                  min={selectedNodes.every((n) => n.shapeType === "freehand") ? 1 : 0}
+                  max={12}
+                  value={selectedNodes[0].strokeWidth}
+                  onChange={(e) => updateNodes({ strokeWidth: Number(e.target.value) })}
+                  className="w-28"
+                />
+              </Field>
+            </>
+          )}
           <Field label="Rotation (°)">
             <ClampedNumberField
               key={selectedNodes.map((n) => n.id).join(",")}
@@ -808,7 +812,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             </div>
           )}
 
-          {selectedNodes.some((n) => n.shapeType !== "freehand") && (
+          {selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge") && (
             <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">
               {/* Font family/Bold/Italic/Underline are meaningless for "equation" - KaTeX typesets
                   with its own math font regardless, so these controls would sit there doing nothing

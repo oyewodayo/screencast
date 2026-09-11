@@ -103,6 +103,15 @@ export type WhiteboardShapeType =
   // instead of a plain string. Has no shape body at all - same treatment as "text" (no border/fill,
   // just the formula itself), not one of the "chart" shapes above.
   | "equation"
+  // A live, interactive 3D lattice-gauge-theory teaching widget (quarks as colored spheres on
+  // lattice sites, gluons as colored links between neighboring sites - orbit/zoom/pan via a real
+  // WebGL scene, not a flat drawing) - see LatticeGaugeWidget.tsx, which owns everything about how
+  // this shapeType actually renders; WhiteboardCanvas.tsx just mounts it in place of the usual
+  // shapeOutlineFor-driven SVG/div body every other shapeType gets (see its own node-body branch).
+  // shapeOutlineFor still returns a plain placeholder glyph for this shapeType (the toolbar preset
+  // tile, and the Canvas2D PNG-export path, which has no way to capture a live WebGL frame - see
+  // its own "latticeGauge" case).
+  | "latticeGauge"
   | "text"
   | "freehand";
 
@@ -135,12 +144,26 @@ export const LINE_ONLY_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<Whiteb
   "bondLine",
   "unitCircle",
   "numberLine",
+  // The widget paints its own dark scene, never node.fillColor - same reasoning as every other
+  // shape here (nothing for the style panel's Fill swatch to actually apply to).
+  "latticeGauge",
 ]);
 
 // The built-in sample series a bar/line/pie/scatter chart starts with (and falls back to if
 // chartData is ever emptied out entirely) - just enough points to look like a real chart immediately
 // on placement rather than a blank box, picked with no particular meaning beyond "visually varied".
 export const DEFAULT_CHART_DATA: number[] = [4, 7, 3, 9, 5];
+
+// "latticeGauge" node fields (WhiteboardNode.latticeSize/latticeSiteSpacing) and their sliders'
+// bounds in LatticeGaugeWidget.tsx - shared here (rather than living only in the widget file) so
+// createDefaultWhiteboardNode's own defaults can never drift from what the widget's sliders
+// actually allow.
+export const DEFAULT_LATTICE_SIZE = 5;
+export const MIN_LATTICE_SIZE = 2;
+export const MAX_LATTICE_SIZE = 8;
+export const DEFAULT_LATTICE_SITE_SPACING = 1;
+export const MIN_LATTICE_SITE_SPACING = 0.5;
+export const MAX_LATTICE_SITE_SPACING = 2.5;
 
 // Which curve a "functionPlot" node traces (see whiteboardHandlers.ts's evalPlotFunction/
 // FUNCTION_PLOT_DOMAINS) - a curated preset list rather than an arbitrary user-typed formula, same
@@ -313,6 +336,40 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // whichever side keeps its wire from crossing others, so this needs to be flippable per instance
   // rather than fixed. Absent/false - "+" on top, "-" on bottom (this shape's original layout).
   ampInvertingOnTop?: boolean;
+  // "latticeGauge" only - persisted widget state (see LatticeGaugeWidget.tsx). Camera orbit/zoom/
+  // pan is deliberately NOT here - that's a live view preference, not diagram content, same
+  // "ephemeral" reasoning WhiteboardCanvas.tsx's own pan/zoom props get (they live on
+  // WhiteboardEditor's view state, never in the document).
+  //
+  // The lattice's own edge length, sites per edge - N^3 total sites. Absent - resolves to
+  // DEFAULT_LATTICE_SIZE.
+  latticeSize?: number;
+  // Doc-agnostic 3D world units between neighboring sites (purely a "how spread out" visual knob -
+  // no relationship to the node's own width/height, which only ever scale the embedded widget's
+  // 2D screen footprint, never its 3D content). Absent - resolves to DEFAULT_LATTICE_SITE_SPACING.
+  latticeSiteSpacing?: number;
+  // Show/hide the matter-field spheres and the gauge-link lines independently - each absent
+  // resolves to true (both shown, matching the widget's own on-by-default toggle switches).
+  latticeShowQuarks?: boolean;
+  latticeShowGluons?: boolean;
+  // Whether gauge links show a traveling brightness pulse (the "flux") or sit at flat color.
+  // Absent - resolves to true.
+  latticeAnimateFlux?: boolean;
+  // Which of the three teaching-mode panels is active - "free" is plain exploration with no
+  // highlight; "plaquette" highlights one elementary closed loop of 4 links (the smallest Wilson
+  // loop, U_plaquette); "gauge" recolors each site with its own random "phase" and blends adjacent
+  // links between their endpoints' phases, illustrating a local gauge transformation. Absent -
+  // resolves to "free".
+  latticeTeachingMode?: "free" | "plaquette" | "gauge";
+  // "latticeGauge" only, "plaquette" mode only - which unit square is highlighted/explained: the
+  // xy-plane loop anchored at lattice site (i,j,k) (its other 3 corners are (i+1,j,k), (i+1,j+1,k),
+  // (i,j+1,k) - see LatticeGaugeWidget.tsx's plaquetteLoopSegments). Set by clicking a quark while
+  // in plaquette mode (LatticeGaugeWidget.tsx's pickPlaquetteAnchor) rather than fixed, so a user
+  // can walk the explanation across different faces of the lattice. Absent - resolves to {0,0,0}.
+  // Out-of-range for the CURRENT latticeSize (e.g. after shrinking N) is clamped back on read
+  // rather than eagerly corrected here, same "resolve at read time" treatment every other
+  // absent/stale shape field on this type gets.
+  latticePlaquetteAnchor?: { i: number; j: number; k: number };
   fontFamily: string;
   fontSize: number;
   fontColor: string;
@@ -440,6 +497,15 @@ export interface WhiteboardDocument {
   id: string;
   name: string;
   showGrid: boolean;
+  // Whether dragging/resizing a node, or dragging a free-floating connector endpoint/waypoint,
+  // snaps to the same GRID_SIZE lattice showGrid's dots mark (see WhiteboardCanvas.tsx's
+  // snapCoord/isSnapEnabled) - independent of showGrid itself, same "visibility vs. behavior are
+  // two separate switches" convention draw.io's own Grid/Snap-to-Grid menu items use, so a user can
+  // snap without the visual dots (a cleaner-looking export) or show the dots without snapping
+  // (free-form sketching with just a visual reference). Absent on a document predating this field -
+  // resolves to true (see useWhiteboardStore.ts's migrateDocument), matching showGrid's own
+  // "on by default" treatment.
+  snapToGrid: boolean;
   pages: WhiteboardPage[];
   // Not undo-tracked (see useWhiteboardStore.ts's setActivePage) - which page was open is a view
   // preference, not diagram content, same reasoning as showGrid.
@@ -470,6 +536,7 @@ export function createEmptyWhiteboardDocument(id: string, name: string): Whitebo
     id,
     name,
     showGrid: true,
+    snapToGrid: true,
     pages: [firstPage],
     activePageId: firstPage.id,
     createdAt: now,
@@ -527,6 +594,10 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   inductor: { width: 180, height: 60 },
   ground: { width: 100, height: 90 },
   amplifier: { width: 160, height: 110 },
+  // Wide - room for the 3D viewport AND its own side control panel side by side, matching the
+  // reference layout (see LatticeGaugeWidget.tsx) - every other shape's default is sized for a
+  // single glyph, not a two-pane app.
+  latticeGauge: { width: 640, height: 460 },
   bondLine: { width: 200, height: 60 },
   unitCircle: { width: 200, height: 200 },
   numberLine: { width: 280, height: 60 },
@@ -608,6 +679,12 @@ export function createDefaultWhiteboardNode(
     plotYTickInterval: shapeType === "functionPlot" ? overrides?.plotYTickInterval : undefined,
     showChartLabels: CHART_LABEL_SHAPES.has(shapeType) ? overrides?.showChartLabels ?? true : undefined,
     numberLineMax: shapeType === "numberLine" ? overrides?.numberLineMax ?? 10 : undefined,
+    latticeSize: shapeType === "latticeGauge" ? DEFAULT_LATTICE_SIZE : undefined,
+    latticeSiteSpacing: shapeType === "latticeGauge" ? DEFAULT_LATTICE_SITE_SPACING : undefined,
+    latticeShowQuarks: shapeType === "latticeGauge" ? true : undefined,
+    latticeShowGluons: shapeType === "latticeGauge" ? true : undefined,
+    latticeAnimateFlux: shapeType === "latticeGauge" ? true : undefined,
+    latticeTeachingMode: shapeType === "latticeGauge" ? "free" : undefined,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,
     fontColor: "#111111",

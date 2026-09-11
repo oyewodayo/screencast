@@ -1553,6 +1553,17 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
           invertingOnTop: opts?.ampInvertingOnTop,
         }),
       };
+    // "latticeGauge" has no flat-drawing form of its own at all - the live shape is a real WebGL
+    // scene (see whiteboardTypes.ts's own doc comment on this shapeType), which neither the SVG
+    // outline system nor the Canvas2D PNG-export path (renderWhiteboardToCanvas below) can capture
+    // a frame of. This is just a recognizable placeholder glyph for both of those - the same
+    // isometric-cube icon "cube" uses, plus a center dot standing in for a lattice site - not an
+    // attempt at a miniature of the actual widget.
+    case "latticeGauge": {
+      const hex = regularPolygonPoints(w, h, 6);
+      const center: [number, number] = [w / 2, h / 2];
+      return { kind: "polygon", points: hex, innerLines: [[center, hex[0]], [center, hex[2]], [center, hex[4]]], innerCircle: { cx: w / 2, cy: h / 2, r: Math.min(w, h) * 0.09 } };
+    }
     case "bondLine":
       return { kind: "path", d: bondLineOutlineD(w, h, opts?.sides ?? 5) };
     case "unitCircle":

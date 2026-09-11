@@ -44,6 +44,7 @@ export interface UseWhiteboardStoreResult {
   // Full replacement order for the whole nodes array - "Bring to front" / "Send to back".
   reorderNodes: (newOrder: WhiteboardNode[]) => void;
   setShowGrid: (show: boolean) => void;
+  setSnapToGrid: (snap: boolean) => void;
   // Not an undo command - same reasoning as Board/Docs not undo-tracking a title edit.
   renameWhiteboard: (name: string) => void;
   // ---- Pages - none of these are undo-tracked (same reasoning as renameWhiteboard: page
@@ -101,7 +102,7 @@ function migrateDocument(raw: any): WhiteboardDocument {
       : [{ ...createEmptyWhiteboardPage(crypto.randomUUID(), "Page 1"), nodes: raw.nodes ?? [], edges: raw.edges ?? [] }];
   const migratedPages = pages.map((page: any) => ({ ...page, edges: (page.edges ?? []).map(migrateEdge) }));
   const activePageId = raw.activePageId ?? migratedPages[0].id;
-  return { showGrid: true, ...raw, pages: migratedPages, activePageId };
+  return { showGrid: true, snapToGrid: true, ...raw, pages: migratedPages, activePageId };
 }
 
 export default function useWhiteboardStore(whiteboardId: string | undefined): UseWhiteboardStoreResult {
@@ -255,6 +256,12 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     scheduleAutosave();
   }, [scheduleAutosave]);
 
+  // Same "not undo-tracked" reasoning as setShowGrid above.
+  const setSnapToGrid = useCallback((snap: boolean) => {
+    setDoc((prev) => (prev ? { ...prev, snapToGrid: snap } : prev));
+    scheduleAutosave();
+  }, [scheduleAutosave]);
+
   const renameWhiteboard = useCallback(
     (name: string) => {
       setDoc((prev) => (prev ? { ...prev, name, updatedAt: new Date().toISOString() } : prev));
@@ -388,6 +395,7 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     deleteEdge,
     reorderNodes,
     setShowGrid,
+    setSnapToGrid,
     renameWhiteboard,
     addPage,
     renamePage,

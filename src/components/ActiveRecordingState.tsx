@@ -127,9 +127,16 @@ const ActiveRecordingState = (
         // black video behind it would make unstyled icons/text disappear entirely. The
         // gradient scrim guarantees legibility regardless of what's playing, same technique
         // the video player's own control bar uses (player.css .video-controls-container).
-        <div className="bg-gradient-to-t from-black/20 via-black/10 to-transparent pt-3">
-            <div className='mx-2 h-4' data-tauri-drag-region />
-            <div className='flex justify-between pl-2 pb-2 items-center align-middle'>
+        // pointer-events-none on this whole wrapper, with it explicitly turned back on for the
+        // drag-region strip and the actual icon row below: this bar sits at the very top of the
+        // fixed bottom docker, right where the whiteboard/board page-tab strip's own controls
+        // (e.g. the page-menu chevron) end - even though pt-4's own gap is visually empty/
+        // transparent, without this it was still a real, click-intercepting DOM element sitting
+        // on top of whatever the tab strip renders in that last sliver of space, silently
+        // swallowing clicks meant for it.
+        <div className="bg-gradient-to-t from-black/15 via-black/5 to-transparent pt-4 pointer-events-none">
+            <div className='mx-2 h-4 pointer-events-auto' data-tauri-drag-region />
+            <div className='flex justify-between pl-2 pb-2 items-center align-middle pointer-events-auto'>
                 {/* Each icon gets its own padded hit-area that darkens on hover/focus so it
                     reads clearly regardless of what's playing behind this bar (light or dark
                     video frame, or the plain home screen) - a bare white icon with no feedback

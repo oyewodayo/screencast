@@ -26,6 +26,7 @@
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { TbRotateClockwise } from "react-icons/tb";
 import katex from "katex";
+import LatticeGaugeWidget from "./LatticeGaugeWidget";
 import {
   ArrowheadType,
   createDefaultWhiteboardEdge,
@@ -83,6 +84,26 @@ const LASER_FADE_MS = 550;
 
 type ResizeCorner = "nw" | "ne" | "sw" | "se";
 const RESIZE_CORNERS: ResizeCorner[] = ["nw", "ne", "sw", "se"];
+
+// The lattice a move/resize/connector-endpoint/waypoint drag snaps to when snapping is active (see
+// isSnapEnabled) - the SAME GRID_SIZE the background dot-grid is drawn at (showGrid), so a snapped
+// shape's corners land visibly on the dots rather than some other, unrelated spacing.
+function snapCoord(v: number): number {
+  return Math.round(v / GRID_SIZE) * GRID_SIZE;
+}
+function snapPoint(p: { x: number; y: number }): { x: number; y: number } {
+  return { x: snapCoord(p.x), y: snapCoord(p.y) };
+}
+// Whether THIS gesture should snap - the document's own snapToGrid toggle, inverted for as long as
+// Alt is held (mirroring the rotate handle's own shiftKey-for-15deg convention: a modifier changes
+// snap behavior for the duration of the drag, rather than needing the toolbar toggle clicked first)
+// - lets a snap-on document still place one shape off-grid, and a snap-off document still snap just
+// one drag, without a trip to the toolbar either way. Alt is free to reuse here: it only means
+// anything at pointerDOWN (start a pan - see handleContainerPointerDown), never during an
+// already-captured move/resize/connector/waypoint drag.
+function isSnapEnabled(snapToGrid: boolean, e: { altKey: boolean }): boolean {
+  return snapToGrid !== e.altKey;
+}
 
 function oppositeCorner(corner: ResizeCorner): ResizeCorner {
   return corner === "nw" ? "se" : corner === "se" ? "nw" : corner === "ne" ? "sw" : "ne";
@@ -183,7 +204,19 @@ function isConnectableShape(shapeType: WhiteboardShapeType): boolean {
 }
 
 type Interaction =
-  | { mode: "move"; ids: string[]; startClientX: number; startClientY: number; startNodes: WhiteboardNode[] }
+  | {
+      mode: "move";
+      ids: string[];
+      startClientX: number;
+      startClientY: number;
+      startNodes: WhiteboardNode[];
+      // The actually-clicked node (always a member of startNodes) - what snapping (see
+      // isSnapEnabled) measures against when several nodes move together as a group, so the WHOLE
+      // group's relative layout is preserved (one shared dx/dy) while still landing the node the
+      // user actually grabbed on the lattice, the same "snap the thing you're dragging" feel a
+      // single-node move gets for free.
+      anchorId: string;
+    }
   | {
       mode: "resize";
       id: string;
@@ -309,6 +342,9 @@ export interface WhiteboardCanvasHandle {
 interface WhiteboardCanvasProps {
   page: WhiteboardPage;
   showGrid: boolean;
+  // See WhiteboardDocument.snapToGrid's own doc comment - independent of showGrid, consulted by
+  // isSnapEnabled for move/resize drags and free-floating connector endpoint/waypoint drags.
+  snapToGrid: boolean;
   zoom: number;
   onZoomChange: (zoom: number) => void;
   pan: { x: number; y: number };
@@ -458,6 +494,7 @@ function EquationDisplay({ source, fontSize, color }: { source: string; fontSize
 const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProps>(({
   page,
   showGrid,
+  snapToGrid,
   zoom,
   onZoomChange,
   pan,
@@ -685,6 +722,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         startClientX: e.clientX,
         startClientY: e.clientY,
         startNodes: page.nodes.filter((n) => ids.includes(n.id)),
+        anchorId: node.id,
       };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
@@ -929,6 +967,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
 
       const interaction = interactionRef.current;
       if (!interaction) return;
+      const snapEnabled = isSnapEnabled(snapToGrid, e);
 
       if (interaction.mode === "pan") {
         onPanChange({ x: interaction.startPan.x + (e.clientX - interaction.startClientX), y: interaction.startPan.y + (e.clientY - interaction.startClientY) });
@@ -936,8 +975,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       }
 
       if (interaction.mode === "move") {
-        const dx = (e.clientX - interaction.startClientX) / zoom;
-        const dy = (e.clientY - interaction.startClientY) / zoom;
+        let dx = (e.clientX - interaction.startClientX) / zoom;
+        let dy = (e.clientY - interaction.startClientY) / zoom;
+        if (snapEnabled) {
+          // Snap against the ANCHOR node's own resulting position, then apply that same dx/dy to
+          // every other selected node - keeps the whole group's relative layout intact (one shared
+          // delta) while still landing the node the user actually grabbed on the lattice, rather
+          // than independently snapping each node (which would pull a multi-selection apart).
+          const anchor = interaction.startNodes.find((n) => n.id === interaction.anchorId) ?? interaction.startNodes[0];
+          if (anchor) {
+            dx = snapCoord(anchor.x + dx) - anchor.x;
+            dy = snapCoord(anchor.y + dy) - anchor.y;
+          }
+        }
         const movedById = new Map(interaction.startNodes.map((n) => [n.id, { ...n, x: n.x + dx, y: n.y + dy }]));
         setLiveNodes(page.nodes.map((n) => movedById.get(n.id) ?? n));
         return;
@@ -951,8 +1001,23 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // axes first - dragging a rotated/flipped corner should feel like stretching along ITS
         // edges, not the screen's (see worldToLocalVector's own doc comment).
         const local = worldToLocalVector({ x: dx, y: dy }, start);
-        const width = interaction.corner.includes("w") ? Math.max(20, start.width - local.x) : Math.max(20, start.width + local.x);
-        const height = interaction.corner.includes("n") ? Math.max(20, start.height - local.y) : Math.max(20, start.height + local.y);
+        let width = interaction.corner.includes("w") ? Math.max(20, start.width - local.x) : Math.max(20, start.width + local.x);
+        let height = interaction.corner.includes("n") ? Math.max(20, start.height - local.y) : Math.max(20, start.height + local.y);
+        if (snapEnabled) {
+          // Snap the MOVING corner's own world/doc-space point to the lattice, then re-derive
+          // width/height from it and the fixed anchorWorld corner - works regardless of rotation/
+          // flip (unlike snapping width/height directly, which would only land the corner on-grid
+          // for an unrotated box) because the diagonal vector from the fixed corner to the moving
+          // one, in this box's own local axes, is exactly (±width, ±height) - see
+          // cornerLocalOffset's own doc comment for that same ± convention.
+          const diagonalLocal = { x: interaction.corner.includes("w") ? -width : width, y: interaction.corner.includes("n") ? -height : height };
+          const diagonalWorld = localToWorldVector(diagonalLocal, start);
+          const movingWorld = { x: interaction.anchorWorld.x + diagonalWorld.x, y: interaction.anchorWorld.y + diagonalWorld.y };
+          const snappedWorld = snapPoint(movingWorld);
+          const snappedLocal = worldToLocalVector({ x: snappedWorld.x - interaction.anchorWorld.x, y: snappedWorld.y - interaction.anchorWorld.y }, start);
+          width = Math.max(20, Math.abs(snappedLocal.x));
+          height = Math.max(20, Math.abs(snappedLocal.y));
+        }
         // Solve new x/y so the OPPOSITE corner lands exactly back on anchorWorld (fixed at drag
         // start) - see cornerWorldPoint's own doc comment for why this can't just reuse the old
         // x/y-in-local-space approach once rotation/flip is involved.
@@ -1058,7 +1123,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       if (interaction.mode === "waypoint") {
         const cur = clientToDoc(e.clientX, e.clientY);
         const next = [...interaction.startWaypoints];
-        next[interaction.index] = cur;
+        next[interaction.index] = snapEnabled ? snapPoint(cur) : cur;
         setLiveWaypoints(next);
         return;
       }
@@ -1107,7 +1172,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         );
         setConnectorHoverNodeId(target?.id ?? null);
         const fixedPoint = interaction.fixed.nodeId ? nodeCenter(nodesById.get(interaction.fixed.nodeId)!) : { x: interaction.fixed.x ?? 0, y: interaction.fixed.y ?? 0 };
-        const draggedResolved = target ? resolveAnchorPoint(target, "auto", fixedPoint) : { x: cur.x, y: cur.y, side: null };
+        // A free-floating endpoint (not hovering a node) snaps to the lattice; one landing ON a
+        // node instead tracks that node's own anchor point, which is never itself snapped (it
+        // follows the shape, not the grid).
+        const freePoint = snapEnabled ? snapPoint(cur) : cur;
+        const draggedResolved = target ? resolveAnchorPoint(target, "auto", fixedPoint) : { x: freePoint.x, y: freePoint.y, side: null };
         const fixedResolved = interaction.fixed.nodeId
           ? resolveAnchorPoint(nodesById.get(interaction.fixed.nodeId)!, interaction.fixed.anchor ?? "auto", draggedResolved)
           : { ...fixedPoint, side: null };
@@ -1115,12 +1184,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // Only a brand-new edge's bow follows the drawn path live - reattaching an existing edge's
         // endpoint (edgeId !== null) leaves its curveBow exactly as beginConnectorReattach seeded it.
         if (interaction.edgeId === null) {
-          const endRef = target ? nodeCenter(target) : cur;
+          const endRef = target ? nodeCenter(target) : freePoint;
           setConnectorPreviewBow(computeCurveBowFromPath(interaction.fixedRefPoint, endRef, interaction.pathPoints));
         }
       }
     },
-    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange, laserArmed]
+    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange, laserArmed, snapToGrid]
   );
 
   const handlePointerUp = useCallback(
@@ -1128,6 +1197,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       const interaction = interactionRef.current;
       interactionRef.current = null;
       if (!interaction) return;
+      const snapEnabled = isSnapEnabled(snapToGrid, e);
 
       if (interaction.mode === "move" && liveNodes) {
         const idSet = new Set(interaction.ids);
@@ -1184,7 +1254,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const droppedOnNode = nodes.find(
           (n) => n.id !== interaction.fixed.nodeId && isConnectableShape(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
         );
-        const draggedEndpoint: WhiteboardEndpoint = droppedOnNode ? { nodeId: droppedOnNode.id, anchor: "auto" } : { x: cur.x, y: cur.y };
+        const freePoint = snapEnabled ? snapPoint(cur) : cur;
+        const draggedEndpoint: WhiteboardEndpoint = droppedOnNode ? { nodeId: droppedOnNode.id, anchor: "auto" } : { x: freePoint.x, y: freePoint.y };
 
         if (interaction.edgeId === null) {
           // Landing on a real node always creates a connection; landing on empty canvas only does
@@ -1197,7 +1268,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             const fixedScreenPoint = interaction.fixed.nodeId ? null : interaction.fixed;
             const longEnough = fixedScreenPoint ? Math.hypot(cur.x - (fixedScreenPoint.x ?? 0), cur.y - (fixedScreenPoint.y ?? 0)) * zoom >= MIN_CONNECTOR_DRAG_DISTANCE : true;
             if (longEnough) {
-              const endRef = droppedOnNode ? nodeCenter(droppedOnNode) : cur;
+              const endRef = droppedOnNode ? nodeCenter(droppedOnNode) : freePoint;
               const curveBow = computeCurveBowFromPath(interaction.fixedRefPoint, endRef, interaction.pathPoints);
               const edge = { ...createDefaultWhiteboardEdge(crypto.randomUUID(), interaction.fixed, draggedEndpoint), curveBow, ...armedConnectorOverrides };
               onAddEdge(edge);
@@ -1232,7 +1303,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         setLiveWaypoints(null);
       }
     },
-    [liveNodes, liveWaypoints, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides]
+    [liveNodes, liveWaypoints, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
   );
 
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
@@ -1260,10 +1331,16 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       if (armedShapeType) {
         const point = clientToDoc(e.clientX, e.clientY);
         const node = createDefaultWhiteboardNode(crypto.randomUUID(), armedShapeType, point.x, point.y);
-        onAddNode(node);
-        onSelectionChange(new Set([node.id]), new Set());
+        // Snaps the placed box's own top-left corner (not the click point itself) to the lattice -
+        // same "corner lands on-grid" target the resize handles snap to, so a freshly-dropped shape
+        // and one just finished being resized end up looking the same, rather than a click-point
+        // snap that (for a non-GRID_SIZE-multiple default size) would still leave the box's actual
+        // edges off-grid.
+        const placed = isSnapEnabled(snapToGrid, e) ? { ...node, x: snapCoord(node.x), y: snapCoord(node.y) } : node;
+        onAddNode(placed);
+        onSelectionChange(new Set([placed.id]), new Set());
         onShapePlaced();
-        if (armedShapeType === "text") setEditingNodeId(node.id);
+        if (armedShapeType === "text") setEditingNodeId(placed.id);
         return;
       }
 
@@ -1274,7 +1351,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       // with no shape to snap to.
       if (connectorArmed) {
         const point = clientToDoc(e.clientX, e.clientY);
-        beginConnectorFromPoint(point, e);
+        beginConnectorFromPoint(isSnapEnabled(snapToGrid, e) ? snapPoint(point) : point, e);
         return;
       }
 
@@ -1287,7 +1364,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       interactionRef.current = { mode: "marquee", startDocX: point.x, startDocY: point.y };
       setMarqueeRect({ x: point.x, y: point.y, width: 0, height: 0 });
     },
-    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, laserArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint, selectedNodeIds, selectedEdgeIds]
+    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, laserArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint, selectedNodeIds, selectedEdgeIds, snapToGrid]
   );
 
   // ---- Text editing ------------------------------------------------------------------------------
@@ -1603,7 +1680,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               }}
               onDoubleClick={(e) => {
                 e.stopPropagation();
-                if (node.shapeType !== "freehand") setEditingNodeId(node.id);
+                // "latticeGauge" has no text concept at all (see its own shapeType doc comment) -
+                // same "nothing to edit" exclusion "freehand" ink already gets.
+                if (node.shapeType !== "freehand" && node.shapeType !== "latticeGauge") setEditingNodeId(node.id);
               }}
               onContextMenu={(e) => {
                 e.preventDefault();
@@ -1643,6 +1722,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     vectorEffect="non-scaling-stroke"
                   />
                 </svg>
+              ) : node.shapeType === "latticeGauge" ? (
+                <LatticeGaugeWidget node={node} canvasZoom={zoom} onCommit={(patch) => onEditNode(node, { ...node, ...patch })} />
               ) : node.shapeType === "ellipse" ? (
                 <div
                   style={{

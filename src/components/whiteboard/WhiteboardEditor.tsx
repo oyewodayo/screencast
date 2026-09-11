@@ -7,6 +7,7 @@
 // the two IO actions that aren't part of the store's own load/edit/autosave lifecycle: exporting a
 // flattened PNG of the current page and saving the home-grid thumbnail on the way back out.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 // Global (loaded once for the whole whiteboard feature, not per-node) - the math glyph fonts/spacing
 // rules "equation" nodes need, in both WhiteboardCanvas.tsx's live KaTeX rendering and
 // whiteboardHandlers.ts's PNG-export rasterization (which relies on this already being loaded in the
@@ -20,13 +21,16 @@ import {
   IoArrowRedo,
   IoArrowUndo,
   IoCalculatorOutline,
+  IoChevronBack,
   IoChevronDown,
+  IoChevronForward,
   IoContractOutline,
   IoCopyOutline,
   IoDownloadOutline,
   IoGitNetworkOutline,
   IoGridOutline,
   IoImageOutline,
+  IoMagnetOutline,
   IoPencilOutline,
   IoRemove,
   IoShapesOutline,
@@ -142,12 +146,18 @@ const CHART_SHAPE_PRESETS: ShapePreset[] = [
   { type: "functionPlot", label: "Normal Distribution", overrides: { plotFunction: "normal" } },
 ];
 
+// Just the one preset for now - unlike every other group, a "latticeGauge" node has no size/style
+// variants worth offering as separate tiles (its own on-canvas control panel is where N, spacing,
+// and every other knob actually live - see LatticeGaugeWidget.tsx).
+const PHYSICS_3D_SHAPE_PRESETS: ShapePreset[] = [{ type: "latticeGauge", label: "Lattice Gauge Theory" }];
+
 const SHAPE_PRESET_GROUPS: { label: string; presets: ShapePreset[] }[] = [
   { label: "Basic", presets: BASIC_SHAPE_PRESETS },
   { label: "General", presets: GENERAL_SHAPE_PRESETS },
   { label: "Waveforms", presets: WAVE_SHAPE_PRESETS },
   { label: "Science", presets: SCIENCE_SHAPE_PRESETS },
   { label: "Charts & Plots", presets: CHART_SHAPE_PRESETS },
+  { label: "Physics 3D", presets: PHYSICS_3D_SHAPE_PRESETS },
 ];
 
 const TILE_W = 44;
@@ -324,6 +334,10 @@ interface PageTabProps {
   page: WhiteboardPage;
   active: boolean;
   canDelete: boolean;
+  // Undefined when this page is already at that end of the tab strip - lets the menu just hide the
+  // button instead of showing a control that would do nothing.
+  onMoveLeft?: () => void;
+  onMoveRight?: () => void;
   onSelect: () => void;
   onRename: (name: string) => void;
   onDelete: () => void;
@@ -332,13 +346,17 @@ interface PageTabProps {
 
 // One page tab - mirrors draw.io's own Page-1/Page-2 tab strip. Double-click to rename inline;
 // a small "..." menu (shown once active, since that's the only tab with room/reason to act on
-// right now) offers duplicate and delete, the latter behind a two-step confirm (same convention
-// as BoardHome's card menu) since deleting a page is permanent and NOT undo-tracked.
-function PageTab({ page, active, canDelete, onSelect, onRename, onDelete, onDuplicate }: PageTabProps) {
+// right now) offers rename/move/duplicate/delete, the last behind a two-step confirm (same
+// convention as BoardHome's card menu) since deleting a page is permanent and NOT undo-tracked.
+function PageTab({ page, active, canDelete, onMoveLeft, onMoveRight, onSelect, onRename, onDelete, onDuplicate }: PageTabProps) {
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(page.name);
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // Where the portaled menu anchors, in VIEWPORT coordinates (captured from the chevron button's
+  // own rect at the moment it's clicked) - see the menu's own doc comment below for why it's a
+  // portal at all rather than a plain absolutely-positioned child.
+  const [menuAnchor, setMenuAnchor] = useState<{ left: number; bottom: number } | null>(null);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -392,6 +410,8 @@ function PageTab({ page, active, canDelete, onSelect, onRename, onDelete, onDupl
           onClick={(e) => {
             e.stopPropagation();
             setConfirmDelete(false);
+            const rect = e.currentTarget.getBoundingClientRect();
+            setMenuAnchor({ left: rect.left, bottom: window.innerHeight - rect.top });
             setMenuOpen((prev) => !prev);
           }}
           className="p-0.5 rounded hover:bg-gray-200 dark:hover:bg-neutral-700"
@@ -399,32 +419,82 @@ function PageTab({ page, active, canDelete, onSelect, onRename, onDelete, onDupl
           <IoChevronDown size={11} />
         </button>
       )}
-      {menuOpen && (
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="absolute left-0 top-full mt-1 w-36 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg overflow-hidden z-10"
-        >
-          <button
-            type="button"
-            onClick={() => {
-              setMenuOpen(false);
-              onDuplicate();
-            }}
-            className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-xs text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700"
+      {menuOpen &&
+        menuAnchor &&
+        createPortal(
+          <div
+            onClick={(e) => e.stopPropagation()}
+            // A PORTAL into document.body, `position: fixed` anchored to the chevron button's own
+            // viewport rect (captured on click, above) - not a plain absolutely-positioned child of
+            // this tab. The tab strip's own row needs `overflow-x-auto` (many pages scroll
+            // horizontally), and per the CSS spec, setting only one overflow axis forces the OTHER
+            // axis to auto too - silently clipping anything that tries to extend past this row's own
+            // top edge, including a plain "opens upward" dropdown. Escaping via a portal sidesteps
+            // that entirely. Anchored via `bottom` (not `top`) - measured up from the button's own
+            // top edge - so the menu still opens upward and never needs to know its own rendered
+            // height in advance to position correctly.
+            style={{ position: "fixed", left: menuAnchor.left, bottom: menuAnchor.bottom + 4 }}
+            className="w-40 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg overflow-hidden z-50"
           >
-            <IoCopyOutline size={13} /> Duplicate page
-          </button>
-          {canDelete && (
             <button
               type="button"
-              onClick={() => (confirmDelete ? onDelete() : setConfirmDelete(true))}
-              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
+              onClick={() => {
+                setMenuOpen(false);
+                setDraftName(page.name);
+                setRenaming(true);
+              }}
+              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-xs text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700"
             >
-              <IoTrashOutline size={13} /> {confirmDelete ? "Confirm delete?" : "Delete page"}
+              <IoPencilOutline size={13} /> Rename page
             </button>
-          )}
-        </div>
-      )}
+            <button
+              type="button"
+              onClick={() => {
+                setMenuOpen(false);
+                onDuplicate();
+              }}
+              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-xs text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            >
+              <IoCopyOutline size={13} /> Duplicate page
+            </button>
+            {(onMoveLeft || onMoveRight) && <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />}
+            {onMoveLeft && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMoveLeft();
+                }}
+                className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-xs text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700"
+              >
+                <IoChevronBack size={13} /> Move left
+              </button>
+            )}
+            {onMoveRight && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMoveRight();
+                }}
+                className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-xs text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700"
+              >
+                <IoChevronForward size={13} /> Move right
+              </button>
+            )}
+            {canDelete && <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />}
+            {canDelete && (
+              <button
+                type="button"
+                onClick={() => (confirmDelete ? onDelete() : setConfirmDelete(true))}
+                className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
+              >
+                <IoTrashOutline size={13} /> {confirmDelete ? "Confirm delete?" : "Delete page"}
+              </button>
+            )}
+          </div>,
+          document.body
+        )}
     </div>
   );
 }
@@ -750,10 +820,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
 
   return (
     // pb tracks --docker-height (published by BottomDocker's own ResizeObserver - see
-    // BoardStylePanel.tsx's identical comment on the same pattern) so the page tab strip at the
-    // bottom always scrolls clear of the app's fixed bottom icon bar instead of rendering
-    // underneath it, invisible and unclickable.
-    <div className="flex flex-col w-full h-full bg-white dark:bg-neutral-950 pb-[var(--docker-height,64px)]">
+    // BoardStylePanel.tsx's identical comment on the same pattern) PLUS a fixed 16px buffer on top
+    // of that, so the page tab strip's own controls (its chevron menu button, in particular) always
+    // clear the app's fixed bottom icon bar with real margin to spare - sitting them exactly flush
+    // (zero gap) left the tab strip's bottom edge one ResizeObserver tick / sub-pixel DPI-rounding
+    // away from actually being covered by the docker's own click-intercepting drag-region strip,
+    // making the chevron unclickable.
+    <div className="flex flex-col w-full h-full bg-white dark:bg-neutral-950 pb-[calc(var(--docker-height,64px)+16px)]">
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-gray-200 dark:border-neutral-800 flex-wrap">
         <ToolbarButton title="Back to whiteboards" onClick={() => void handleBack()}>
           <IoArrowBack size={18} />
@@ -950,6 +1023,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         <ToolbarButton title={doc.showGrid ? "Hide grid" : "Show grid"} active={doc.showGrid} onClick={() => store.setShowGrid(!doc.showGrid)}>
           <IoGridOutline size={18} />
         </ToolbarButton>
+        <ToolbarButton
+          title={doc.snapToGrid ? "Snap to grid on (hold Alt to move freely)" : "Snap to grid off (hold Alt to snap)"}
+          active={doc.snapToGrid}
+          onClick={() => store.setSnapToGrid(!doc.snapToGrid)}
+        >
+          <IoMagnetOutline size={18} />
+        </ToolbarButton>
         <div className="flex-1" />
         {store.isSaving && <span className="text-xs text-gray-400 dark:text-neutral-500 mr-2">Saving…</span>}
         {exportError && <span className="text-xs text-red-500 dark:text-red-400 mr-2">{exportError}</span>}
@@ -971,6 +1051,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           ref={canvasRef}
           page={page}
           showGrid={doc.showGrid}
+          snapToGrid={doc.snapToGrid}
           zoom={zoom}
           onZoomChange={setZoom}
           pan={pan}
@@ -1105,9 +1186,12 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       )}
 
       {/* Page tab strip - draw.io's own Page-1/Page-2/+ bar. Always shown, even with just one page,
-          so "Add page" is always discoverable rather than appearing only once a second page exists. */}
-      <div className="flex items-end gap-0.5 px-2 pt-1 bg-gray-50 dark:bg-neutral-900 border-t border-gray-200 dark:border-neutral-800 overflow-x-auto">
-        {doc.pages.map((p) => (
+          so "Add page" is always discoverable rather than appearing only once a second page exists.
+          pb-2 gives its own controls (the active tab's chevron menu, in particular) a real gap
+          below them on top of the outer container's own pb buffer - see that pb's own doc comment
+          for why touching-but-not-overlapping the fixed bottom docker isn't safe to rely on. */}
+      <div className="flex items-end gap-0.5 px-2 pt-1 pb-2 bg-gray-50 dark:bg-neutral-900 border-t border-gray-200 dark:border-neutral-800 overflow-x-auto">
+        {doc.pages.map((p, index) => (
           <PageTab
             key={p.id}
             page={p}
@@ -1117,6 +1201,24 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             onRename={(name) => store.renamePage(p.id, name)}
             onDelete={() => store.deletePage(p.id)}
             onDuplicate={() => store.duplicatePage(p.id)}
+            onMoveLeft={
+              index > 0
+                ? () => {
+                    const next = [...doc.pages];
+                    [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                    store.reorderPages(next);
+                  }
+                : undefined
+            }
+            onMoveRight={
+              index < doc.pages.length - 1
+                ? () => {
+                    const next = [...doc.pages];
+                    [next[index], next[index + 1]] = [next[index + 1], next[index]];
+                    store.reorderPages(next);
+                  }
+                : undefined
+            }
           />
         ))}
         <button type="button" title="Add page" onClick={store.addPage} className="p-1.5 mb-0.5 rounded hover:bg-gray-200 dark:hover:bg-neutral-700 text-gray-500 dark:text-neutral-400">
