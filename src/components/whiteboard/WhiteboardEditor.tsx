@@ -1125,10 +1125,20 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       {quickConnectPicker && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="fixed z-30 w-[280px] max-h-[70vh] overflow-y-auto bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl p-2 grid grid-cols-3 gap-1"
+          className="fixed z-30 w-[280px] overflow-y-auto bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl p-2 grid grid-cols-3 gap-1"
           style={{
             left: Math.max(8, Math.min(quickConnectPicker.x, window.innerWidth - 290)),
-            top: Math.max(8, Math.min(quickConnectPicker.y, window.innerHeight - 340)),
+            // maxHeight and the top clamp both read the SAME window.innerHeight * 0.7 expression
+            // (rather than one carrying it in a "max-h-[70vh]" Tailwind class while the other
+            // guessed a plain pixel number, which is what this used to do) - those two drifted
+            // apart once already: a hardcoded "the popover is about 340px tall" guess here was
+            // never updated as the shape palette grew past that over time, so the actual (taller)
+            // popover's own top could still land low enough to push most of it below the real
+            // window edge - outside the OS window entirely, not just clipped by overflow-y-auto
+            // (which only helps for content taller than a box that's actually fully on-screen),
+            // with no way to scroll down to whatever fell past it.
+            top: Math.max(8, Math.min(quickConnectPicker.y, window.innerHeight - window.innerHeight * 0.7 - 8)),
+            maxHeight: window.innerHeight * 0.7,
           }}
         >
           {SHAPE_PRESET_GROUPS.map((group) => (

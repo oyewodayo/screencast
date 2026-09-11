@@ -24,7 +24,22 @@ import {
   TbStackFront,
   TbUnderline,
 } from "react-icons/tb";
-import { ArrowheadType, CHART_DATA_SHAPES, CHART_LABEL_SHAPES, DEFAULT_CHART_DATA, FunctionPlotType, LINE_ONLY_SHAPES, WhiteboardEdge, WhiteboardNode } from "../../utils/whiteboardTypes";
+import {
+  ArrowheadType,
+  CHART_DATA_SHAPES,
+  CHART_LABEL_SHAPES,
+  DEFAULT_CHART_DATA,
+  DEFAULT_LATTICE_SITE_SPACING,
+  DEFAULT_LATTICE_SIZE,
+  FunctionPlotType,
+  LINE_ONLY_SHAPES,
+  MAX_LATTICE_SITE_SPACING,
+  MAX_LATTICE_SIZE,
+  MIN_LATTICE_SITE_SPACING,
+  MIN_LATTICE_SIZE,
+  WhiteboardEdge,
+  WhiteboardNode,
+} from "../../utils/whiteboardTypes";
 import {
   DEFAULT_AMP_INPUT_LEAD_LENGTH,
   DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
@@ -777,6 +792,95 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 >
                   Reset leads
                 </button>
+              </Field>
+            </>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "latticeGauge") && (
+            <>
+              <Field label="Teaching mode">
+                <select
+                  value={selectedNodes[0].latticeTeachingMode ?? "free"}
+                  onChange={(e) => updateNodes({ latticeTeachingMode: e.target.value as "free" | "plaquette" | "gauge" })}
+                  className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                >
+                  <option value="free">Free explore</option>
+                  <option value="plaquette">Plaquette loop U□</option>
+                  <option value="gauge">Gauge transformation</option>
+                </select>
+              </Field>
+              <Field label="Lattice size">
+                <div className="flex items-center gap-1.5">
+                  <ClampedNumberField
+                    key={selectedNodes.map((n) => n.id).join(",")}
+                    initialValue={selectedNodes[0].latticeSize ?? DEFAULT_LATTICE_SIZE}
+                    min={MIN_LATTICE_SIZE}
+                    max={MAX_LATTICE_SIZE}
+                    onCommit={(n) => updateNodes({ latticeSize: n })}
+                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    title="Sites per edge (N) - the lattice is N x N x N"
+                  />
+                  <input
+                    type="range"
+                    min={MIN_LATTICE_SIZE}
+                    max={MAX_LATTICE_SIZE}
+                    step={1}
+                    value={selectedNodes[0].latticeSize ?? DEFAULT_LATTICE_SIZE}
+                    onChange={(e) => updateNodes({ latticeSize: Number(e.target.value) })}
+                    className="w-16"
+                    title="Sites per edge (N) - the lattice is N x N x N"
+                  />
+                </div>
+              </Field>
+              <Field label="Site spacing">
+                <div className="flex items-center gap-1.5">
+                  <ClampedNumberField
+                    key={selectedNodes.map((n) => n.id).join(",")}
+                    initialValue={selectedNodes[0].latticeSiteSpacing ?? DEFAULT_LATTICE_SITE_SPACING}
+                    min={MIN_LATTICE_SITE_SPACING}
+                    max={MAX_LATTICE_SITE_SPACING}
+                    step={0.1}
+                    integer={false}
+                    onCommit={(n) => updateNodes({ latticeSiteSpacing: n })}
+                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    title="3D-world distance between neighboring sites - purely a spread-out/compact look, unrelated to the shape's own on-canvas width/height"
+                  />
+                  <input
+                    type="range"
+                    min={MIN_LATTICE_SITE_SPACING}
+                    max={MAX_LATTICE_SITE_SPACING}
+                    step={0.1}
+                    value={selectedNodes[0].latticeSiteSpacing ?? DEFAULT_LATTICE_SITE_SPACING}
+                    onChange={(e) => updateNodes({ latticeSiteSpacing: Number(e.target.value) })}
+                    className="w-16"
+                  />
+                </div>
+              </Field>
+              <Field label="Show quarks">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].latticeShowQuarks ?? true}
+                  onChange={(e) => updateNodes({ latticeShowQuarks: e.target.checked })}
+                  className="h-3.5 w-3.5"
+                  title="Matter-field spheres on each site"
+                />
+              </Field>
+              <Field label="Show gluons">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].latticeShowGluons ?? true}
+                  onChange={(e) => updateNodes({ latticeShowGluons: e.target.checked })}
+                  className="h-3.5 w-3.5"
+                  title="Gauge-link lines between neighboring sites"
+                />
+              </Field>
+              <Field label="Animate flux">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].latticeAnimateFlux ?? true}
+                  onChange={(e) => updateNodes({ latticeAnimateFlux: e.target.checked })}
+                  className="h-3.5 w-3.5"
+                  title="A traveling brightness pulse along every gauge link"
+                />
               </Field>
             </>
           )}

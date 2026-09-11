@@ -1723,7 +1723,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   />
                 </svg>
               ) : node.shapeType === "latticeGauge" ? (
-                <LatticeGaugeWidget node={node} canvasZoom={zoom} onCommit={(patch) => onEditNode(node, { ...node, ...patch })} />
+                <LatticeGaugeWidget
+                  node={node}
+                  canvasZoom={zoom}
+                  onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
+                  onSelect={() => onSelectionChange(new Set([node.id]), new Set())}
+                />
               ) : node.shapeType === "ellipse" ? (
                 <div
                   style={{

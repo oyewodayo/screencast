@@ -3,17 +3,24 @@
 // The live body of a "latticeGauge" WhiteboardNode (see whiteboardTypes.ts's own doc comment on
 // that shapeType) - a small lattice-gauge-theory teaching widget: matter fields (quarks) as colored
 // spheres on an N×N×N cubic lattice's sites, gauge fields (gluons) as colored links between
-// neighboring sites, rendered with a real WebGL scene (three.js) instead of the flat SVG/div body
-// every other whiteboard shape gets from shapeOutlineFor. Mounted directly by WhiteboardCanvas.tsx
-// in place of that usual shape body.
+// neighboring sites, rendered with a real WebGL scene (three.js, transparent background) instead
+// of the flat SVG/div body every other whiteboard shape gets from shapeOutlineFor. Mounted directly
+// by WhiteboardCanvas.tsx in place of that usual shape body.
+//
+// This file owns ONLY the live 3D view and the one small text readout in its bottom-left corner -
+// every actual CONTROL (teaching mode, lattice size/spacing, the three visibility toggles) lives in
+// WhiteboardStylePanel.tsx's own "latticeGauge" Field block instead, edited the same way any other
+// shape's own parametric fields are (an amplifier's lead length, a function plot's domain scale,
+// ...), undo-tracked through the ordinary onEditNode/batchEditNodes path - this component never
+// calls onCommit for any of those. The one exception is picking a new plaquette anchor
+// (pickPlaquetteAnchor below), which has to happen by clicking an actual site IN the 3D view, so
+// that alone still commits from here.
 //
 // Two kinds of state, same split WhiteboardCanvas.tsx itself makes between the document and its own
-// view state (pan/zoom): the lattice's own DATA (size, spacing, which teaching mode, the two
-// visibility toggles, flux animation) lives on the WhiteboardNode and is undo-tracked via onCommit,
-// exactly like any other shape-specific field (an amplifier's lead length, a function plot's domain
-// scale, ...); the CAMERA (orbit/zoom/pan) is a pure view preference, kept in a local ref and never
-// persisted - reopening this board always starts from the same default angle, the same way
-// WhiteboardEditor's own pan/zoom resets per session rather than being saved into the document.
+// view state (pan/zoom): the lattice's own DATA lives on the WhiteboardNode and is undo-tracked;
+// the CAMERA (orbit/zoom/pan) is a pure view preference, kept in a local ref and never persisted -
+// reopening this board always starts from the same default angle, the same way WhiteboardEditor's
+// own pan/zoom resets per session rather than being saved into the document.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import {
@@ -33,18 +40,21 @@ export interface LatticeGaugeWidgetProps {
   // same regardless of how zoomed-in the surrounding diagram canvas happens to be, the same
   // "divide screen deltas by zoom" convention every drag gesture in that file already follows.
   canvasZoom: number;
-  // Persists one discrete control change (a teaching-mode click, a toggle, a slider release) as a
-  // single ordinary node edit - WhiteboardCanvas.tsx wires this to
-  // onEditNode(node, { ...node, ...patch }), the same commit path any other shape-specific
-  // style-panel field goes through, so each change is one undo step and autosaves like everything
-  // else in the document.
+  // Persists one discrete change as a single ordinary node edit - WhiteboardCanvas.tsx wires this
+  // to onEditNode(node, { ...node, ...patch }), the same commit path any other shape-specific
+  // style-panel field goes through. In practice this widget only ever calls it for one thing now
+  // (see this file's own top comment) - picking a new plaquette anchor by clicking a quark.
   onCommit: (patch: Partial<WhiteboardNode>) => void;
+  // A plain click on the 3D view (not a drag - that orbits) selects this node, the same outcome
+  // clicking any other shape's own body gets - WhiteboardCanvas.tsx wires this to
+  // onSelectionChange(new Set([node.id]), new Set()). Needed because this widget has no other
+  // chrome left to click for that (see this file's own top comment) - every other shape's node
+  // div does it via its own onPointerDown directly, which this widget's viewport deliberately
+  // intercepts (stopPropagation) for orbiting instead.
+  onSelect: () => void;
 }
 
 // ---- Theme -----------------------------------------------------------------------------------
-const BG_COLOR = "#05070c";
-const PANEL_BG = "#0b0f1a";
-const BORDER_COLOR = "#1c2333";
 const SITE_COLOR = new THREE.Color("#e0584a");
 // The link fragment shader (LINK_FRAGMENT_SHADER below) carries its own copy of this same color as
 // a GLSL literal - the plaquette-highlight blend happens entirely on the GPU (see recolorLattice's
@@ -299,63 +309,31 @@ function recolorLattice(
   highlightAttr.needsUpdate = true;
 }
 
-// ---- Small presentational bits ------------------------------------------------------------------
-function ToggleRow({ label, checked, color, onChange }: { label: string; checked: boolean; color: string; onChange: (v: boolean) => void }) {
-  return (
-    <div className="flex items-center justify-between gap-2 text-[11px] text-neutral-300">
-      <span>{label}</span>
-      <button
-        type="button"
-        onClick={() => onChange(!checked)}
-        aria-pressed={checked}
-        className="relative w-8 h-4 rounded-full shrink-0 transition-colors"
-        style={{ backgroundColor: checked ? color : "#2a3244" }}
-      >
-        <span className="absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all" style={{ left: checked ? 16 : 2 }} />
-      </button>
-    </div>
-  );
-}
-
-function ModeButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="w-full text-left px-2.5 py-1.5 rounded-md border text-[11px] transition-colors"
-      style={active ? { borderColor: "#eab308", color: "#facc15", backgroundColor: "rgba(234,179,8,0.08)" } : { borderColor: BORDER_COLOR, color: "#9ca3af" }}
-    >
-      {label}
-    </button>
-  );
-}
-
-export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: LatticeGaugeWidgetProps) {
+export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelect }: LatticeGaugeWidgetProps) {
   const n = clamp(node.latticeSize ?? DEFAULT_LATTICE_SIZE, MIN_LATTICE_SIZE, MAX_LATTICE_SIZE);
   const spacing = clamp(node.latticeSiteSpacing ?? DEFAULT_LATTICE_SITE_SPACING, MIN_LATTICE_SITE_SPACING, MAX_LATTICE_SITE_SPACING);
   const showQuarks = node.latticeShowQuarks ?? true;
   const showGluons = node.latticeShowGluons ?? true;
   const animateFlux = node.latticeAnimateFlux ?? true;
   const mode = node.latticeTeachingMode ?? "free";
+  // Every one of these lives on the node and is edited from WhiteboardStylePanel.tsx's own
+  // "latticeGauge" Field block now (see its own doc comment there) - this widget only ever READS
+  // them, plus owns the one thing that has to happen inside the live 3D view itself: picking a new
+  // plaquette anchor by clicking a quark (see pickPlaquetteAnchor below).
+  const plaquetteAnchor = clampPlaquetteAnchor(node.latticePlaquetteAnchor, n);
 
-  // Sliders stage locally while being dragged (same "stage locally, commit once" discipline
-  // WhiteboardCanvas.tsx's own move/resize gestures follow) so the lattice visibly resizes on
-  // every tick of the drag, but only ONE undo step lands once the pointer is released - see the
-  // range inputs' own onPointerUp below, which reads the DOM's live value directly rather than this
-  // state (sidesteps any same-tick stale-closure risk between the last onChange and onPointerUp).
-  const [liveN, setLiveN] = useState(n);
-  const [liveSpacing, setLiveSpacing] = useState(spacing);
-  useEffect(() => setLiveN(n), [n]);
-  useEffect(() => setLiveSpacing(spacing), [spacing]);
-
-  // Clamped against liveN (not the committed n) so the highlight/caption never point at a corner
-  // that stopped existing mid-slider-drag, before the drag's own commit lands.
-  const plaquetteAnchor = clampPlaquetteAnchor(node.latticePlaquetteAnchor, liveN);
-
-  // Re-rolled (not persisted - see this file's own top comment) each time "Gauge transformation"
-  // is clicked, including re-clicking it while already active, so the button doubles as "apply a
-  // NEW gauge transformation" rather than a plain on/off toggle.
-  const [gaugeSeed, setGaugeSeed] = useState(1);
+  // Re-rolled automatically the moment `mode` freshly becomes "gauge" (see the effect below) -
+  // not persisted (a view/demo detail, not diagram content, same "ephemeral" reasoning camera
+  // orbit state gets - see this file's own top comment). There's no button left inside this widget
+  // to click for a fresh reroll (teaching mode is now a plain <select> in the style panel, which
+  // doesn't fire onChange for reselecting its already-current option) - toggling away and back to
+  // "Gauge transformation" is what gets a new one now.
+  const [gaugeSeed, setGaugeSeed] = useState(() => Math.floor(Math.random() * 1e9) || 1);
+  const prevModeRef = useRef(mode);
+  useEffect(() => {
+    if (mode === "gauge" && prevModeRef.current !== "gauge") setGaugeSeed(Math.floor(Math.random() * 1e9) || 1);
+    prevModeRef.current = mode;
+  }, [mode]);
 
   const mountRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -379,14 +357,6 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: Latti
   // reads this every frame and positions the camera from it.
   const orbitRef = useRef({ azimuth: Math.PI / 4, polar: Math.PI * 0.36, radius: 10, target: new THREE.Vector3(0, 0, 0) });
   const dragRef = useRef<{ mode: "orbit" | "pan"; lastX: number; lastY: number; distance: number } | null>(null);
-  // True for the instant right after a real (beyond-threshold) viewport drag ends - see the panel's
-  // own onClickCapture below for why this needs to exist at all: setPointerCapture retargets
-  // pointermove/pointerup back to the viewport as a gesture is dragged past its edge (which is why
-  // orbiting still works fine even once the cursor is over the panel), but browsers do NOT retarget
-  // the native "click" that fires right after pointerup - that lands on whatever's actually under
-  // the cursor. Without this guard, ending an orbit/pan drag with the cursor sitting over a mode
-  // button or toggle spuriously "clicks" it.
-  const suppressPanelClickRef = useRef(false);
   const basisRightRef = useRef(new THREE.Vector3());
   const basisUpRef = useRef(new THREE.Vector3());
   const basisForwardRef = useRef(new THREE.Vector3());
@@ -398,12 +368,15 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: Latti
     if (!container) return;
     let renderer: THREE.WebGLRenderer;
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "low-power" });
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "low-power" });
     } catch {
       setWebglError(true);
       return;
     }
-    renderer.setClearColor(new THREE.Color(BG_COLOR), 1);
+    // Fully transparent clear (alpha 0) - this widget has no backdrop of its own any more; the
+    // scene sits directly on the whiteboard canvas's own background, same as any other shape's
+    // body would show the canvas through wherever it has no fill.
+    renderer.setClearColor(0x000000, 0);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     // display:block - a bare <canvas> defaults to inline, which leaves a few px of baseline
     // whitespace below it inside this flex child and can trip a stray scrollbar.
@@ -529,10 +502,10 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: Latti
       linkMaterialRef.current?.dispose();
     }
 
-    const geo = buildLatticeGeometry(liveN, liveSpacing);
+    const geo = buildLatticeGeometry(n, spacing);
     latticeRef.current = geo;
 
-    const sphereGeo = new THREE.SphereGeometry(SITE_RADIUS_FRACTION * liveSpacing, 16, 12);
+    const sphereGeo = new THREE.SphereGeometry(SITE_RADIUS_FRACTION * spacing, 16, 12);
     // An InstancedMesh with a per-instance color (siteMesh.setColorAt below) forces three.js's
     // USE_COLOR shader define on REGARDLESS of the material's own vertexColors setting - it's
     // tied to instanceColor being non-null, not to this flag (see WebGLProgram's own instancingColor
@@ -573,14 +546,14 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: Latti
     linkMaterialRef.current = linkMaterial;
 
     recolorLattice(geo, siteMesh, linkGeometry, mode, gaugeSeed, plaquetteAnchor);
-    rebuildPlaquetteOverlay(liveN, liveSpacing, plaquetteAnchor);
+    rebuildPlaquetteOverlay(n, spacing, plaquetteAnchor);
     if (plaquetteGroupRef.current) plaquetteGroupRef.current.visible = mode === "plaquette";
 
     // Re-fit the camera's distance to the new lattice extent, scaling the user's CURRENT radius
     // (rather than resetting it outright) so nudging the spacing slider zooms proportionally
     // instead of yanking the view back to a fixed default and discarding whatever angle/zoom the
     // user had already set up.
-    const extent = Math.max(1, (liveN - 1) * liveSpacing);
+    const extent = Math.max(1, (n - 1) * spacing);
     const orbit = orbitRef.current;
     if (prevExtentRef.current <= 0) {
       orbit.radius = extent * 1.7 + 2;
@@ -590,7 +563,7 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: Latti
     prevExtentRef.current = extent;
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveN, liveSpacing]);
+  }, [n, spacing]);
 
   // ---- Instant (no rebuild) updates: visibility + mode/seed recolor + flux uniform ---------------
   useEffect(() => {
@@ -617,7 +590,7 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: Latti
   // rebuildPlaquetteOverlay, for the case where N/spacing themselves just changed) so picking a
   // new anchor while N is untouched doesn't pay for rebuilding the whole site/link mesh pair.
   useEffect(() => {
-    rebuildPlaquetteOverlay(liveN, liveSpacing, plaquetteAnchor);
+    rebuildPlaquetteOverlay(n, spacing, plaquetteAnchor);
     if (plaquetteGroupRef.current) plaquetteGroupRef.current.visible = mode === "plaquette";
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, plaquetteAnchor.i, plaquetteAnchor.j, plaquetteAnchor.k]);
@@ -697,23 +670,16 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: Latti
       e.stopPropagation();
       const drag = dragRef.current;
       const wasClick = !drag || drag.distance <= 4;
-      // Below this raw on-screen distance, treat the gesture as a stray click rather than a real
-      // drag - same "don't swallow a plain click" reasoning WhiteboardCanvas.tsx's own
-      // MIN_CONNECTOR_DRAG_DISTANCE applies, just for suppressing the panel click-leak below instead
-      // of for deciding whether to create something.
-      if (drag && drag.distance > 4) {
-        suppressPanelClickRef.current = true;
-        // Deferred past this same gesture's own native click (see suppressPanelClickRef's own doc
-        // comment - that click has already been synchronously dispatched and handled, if it was
-        // going to happen at all, before this timer ever fires).
-        setTimeout(() => {
-          suppressPanelClickRef.current = false;
-        }, 0);
-      }
       dragRef.current = null;
-      if (wasClick && mode === "plaquette" && e.button !== 2) pickPlaquetteAnchor(e.clientX, e.clientY);
+      if (!wasClick || e.button === 2) return;
+      // A plain click always selects this node first (there's no separate drag-handle chrome left
+      // to click on - see this file's own top comment on why every control, including position,
+      // is edited from WhiteboardStylePanel.tsx now) - orbiting/panning never reaches here (that's
+      // a real drag, caught by the `!wasClick` return above), so this can't fight with them.
+      onSelect();
+      if (mode === "plaquette") pickPlaquetteAnchor(e.clientX, e.clientY);
     },
-    [mode, pickPlaquetteAnchor]
+    [mode, onSelect, pickPlaquetteAnchor]
   );
 
   const handleViewportWheel = useCallback((e: React.WheelEvent) => {
@@ -722,168 +688,65 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit }: Latti
     orbitRef.current.radius = clamp(orbitRef.current.radius * Math.exp(e.deltaY * 0.0012), 1, 400);
   }, []);
 
-  // Everything in the control panel is an ordinary click/drag on plain HTML controls - stopping
-  // propagation here (rather than per-control) keeps a slider drag or a button click from ever
-  // reaching the node's own onPointerDown (which would start dragging the whole node instead).
-  const stopPanelPointer = useCallback((e: React.PointerEvent) => e.stopPropagation(), []);
-
-  const totalSites = liveN * liveN * liveN;
+  const totalSites = n * n * n;
 
   return (
-    <div
-      className="w-full h-full flex flex-col rounded-md overflow-hidden select-none"
-      style={{ backgroundColor: BG_COLOR, border: `1px solid ${BORDER_COLOR}` }}
-    >
-      {/* Header - the ONE part of this widget that does NOT stopPropagation, so it doubles as the
-          node's own drag handle (click+drag here selects/moves the node like any other shape's
-          body would); everything below intercepts its own pointer events instead. */}
+    // No fill/border of its own any more (see this file's own top comment) - the 3D scene sits
+    // directly on the whiteboard canvas's own background via the renderer's transparent clear
+    // color (see the mount effect's own comment on that), and every control that used to live in
+    // an embedded side panel here now lives in WhiteboardStylePanel.tsx's "latticeGauge" Field
+    // block instead, reached the same way any other shape's fields are: select this node.
+    <div className="w-full h-full relative select-none">
       <div
-        className="shrink-0 h-6 px-2.5 flex items-center justify-between font-mono text-[10px] tracking-wide cursor-move"
-        style={{ backgroundColor: PANEL_BG, borderBottom: `1px solid ${BORDER_COLOR}`, color: "#5eead4" }}
+        ref={mountRef}
+        className="absolute inset-0 overflow-hidden"
+        style={{ cursor: dragRef.current ? "grabbing" : "grab", touchAction: "none" }}
+        onPointerDown={handleViewportPointerDown}
+        onPointerMove={handleViewportPointerMove}
+        onPointerUp={handleViewportPointerUp}
+        onPointerCancel={handleViewportPointerUp}
+        onWheel={handleViewportWheel}
+        onDoubleClick={(e) => e.stopPropagation()}
+        onContextMenu={(e) => {
+          // Right-drag pans (see handleViewportPointerDown) - suppress the OS context menu that
+          // would otherwise pop up on release, same as WhiteboardCanvas.tsx's own space-drag/
+          // alt-drag pan tool never triggering one either. Selection still happens for a real
+          // right-click (see WhiteboardCanvas.tsx's own onContextMenu on the outer node div, which
+          // this bubbles up to since it's not stopped here).
+          e.preventDefault();
+        }}
       >
-        <span>LATTICE::GAUGE</span>
-        <span className="text-neutral-500">
-          {liveN}×{liveN}×{liveN} · {totalSites} sites
-        </span>
+        {webglError && (
+          <div className="absolute inset-0 flex items-center justify-center text-center text-[11px] text-gray-500 dark:text-neutral-400 px-4">
+            WebGL is unavailable in this window - the lattice can't be rendered here.
+          </div>
+        )}
       </div>
 
-      <div className="flex-1 flex min-h-0">
-        {/* Left column: 3D viewport, plus (only in "plaquette" mode) an explanation caption below
-            it - a flex-col wrapper rather than the viewport filling this whole column alone, so
-            the caption appearing/disappearing just resizes the viewport's own flex-1 share (the
-            ResizeObserver in the mount effect picks that up automatically, same as a user resizing
-            the node itself) rather than needing any extra plumbing. */}
-        <div className="flex-[1.7] min-w-0 min-h-0 flex flex-col">
-          <div
-            ref={mountRef}
-            className="relative flex-1 min-h-0 overflow-hidden"
-            style={{ cursor: dragRef.current ? "grabbing" : "grab", touchAction: "none" }}
-            onPointerDown={handleViewportPointerDown}
-            onPointerMove={handleViewportPointerMove}
-            onPointerUp={handleViewportPointerUp}
-            onPointerCancel={handleViewportPointerUp}
-            onWheel={handleViewportWheel}
-            onDoubleClick={(e) => e.stopPropagation()}
-            onContextMenu={(e) => {
-              // Right-drag pans (see handleViewportPointerDown) - suppress the OS context menu that
-              // would otherwise pop up on release, same as WhiteboardCanvas.tsx's own space-drag/
-              // alt-drag pan tool never triggering one either.
-              e.preventDefault();
-              e.stopPropagation();
-            }}
-          >
-            {webglError && (
-              <div className="absolute inset-0 flex items-center justify-center text-center text-[11px] text-neutral-500 px-4">
-                WebGL is unavailable in this window - the lattice can't be rendered here.
-              </div>
-            )}
-            <div className="absolute left-2 bottom-1.5 text-[9px] text-neutral-600 pointer-events-none font-mono">
-              drag to orbit · scroll to zoom · right-drag to pan
-            </div>
+      {/* Every bit of text this widget displays lives in this one bottom-left readout - a small
+          translucent, theme-aware backing (not a solid box) just behind the text for legibility
+          over whatever's rendered behind it, not a container for the whole shape. pointer-events
+          none so it never steals a click/drag meant for the 3D view underneath - including the
+          click-to-move-plaquette gesture the last block's own hint describes. */}
+      <div className="absolute left-2 bottom-2 max-w-[80%] pointer-events-none">
+        <div className="inline-block rounded px-2 py-1.5 bg-white/80 dark:bg-neutral-900/75 backdrop-blur-[2px] font-mono text-[9.5px] leading-relaxed text-gray-600 dark:text-neutral-400">
+          <div className="text-[10px] font-semibold" style={{ color: "#0d9488" }}>
+            LATTICE::GAUGE <span className="font-normal text-gray-500 dark:text-neutral-500">· {n}×{n}×{n} · {totalSites} sites</span>
           </div>
-
+          <div className="mt-0.5">drag to orbit · scroll to zoom · right-drag to pan</div>
           {mode === "plaquette" && (
-            <div
-              className="shrink-0 p-3 text-[10.5px] leading-relaxed overflow-y-auto"
-              style={{ backgroundColor: PANEL_BG, borderTop: `1px solid ${BORDER_COLOR}`, color: "#9ca3af", maxHeight: "42%" }}
-              onPointerDown={(e) => e.stopPropagation()}
-              onWheel={(e) => e.stopPropagation()}
-              onDoubleClick={(e) => e.stopPropagation()}
-            >
-              <div className="text-[11px] font-semibold mb-1" style={{ color: "#facc15" }}>
+            <div className="mt-1.5 pt-1.5 border-t border-gray-300/70 dark:border-neutral-700/70 max-w-[280px]">
+              <div className="font-semibold" style={{ color: "#b45309" }}>
                 Plaquette U□ — plane (x,y) at site ({plaquetteAnchor.i}, {plaquetteAnchor.j}, {plaquetteAnchor.k})
               </div>
-              <div className="font-mono mb-1.5" style={{ color: "#e5e7eb" }}>
-                Loop: Ux(n) · Uy(n+x̂) · Ux†(n+ŷ) · Uy†(n)
-              </div>
-              <div>This ordered product of 4 link matrices is the smallest closed Wilson loop.</div>
+              <div className="mt-0.5">Loop: Ux(n) · Uy(n+x̂) · Ux†(n+ŷ) · Uy†(n)</div>
               <div className="mt-1">
-                Tr[U□] is gauge-invariant — it&apos;s the lattice stand-in for the field strength F_μν, and 1 − Re Tr[U□]/3 is (up to constants) the Wilson gauge action on
-                this face.
+                This ordered product of 4 link matrices is the smallest closed Wilson loop. Tr[U□] is gauge-invariant — the lattice stand-in for the field strength F_μν; 1 −
+                Re Tr[U□]/3 is (up to constants) the Wilson gauge action on this face.
               </div>
-              <div className="mt-1.5 text-[9.5px] text-neutral-600">Click any quark in the view above to move this plaquette.</div>
+              <div className="mt-1 text-gray-500 dark:text-neutral-500">Click any quark above to move this plaquette.</div>
             </div>
           )}
-        </div>
-
-        {/* Control panel */}
-        <div
-          className="w-[192px] shrink-0 overflow-y-auto p-2.5 flex flex-col gap-3"
-          style={{ backgroundColor: PANEL_BG, borderLeft: `1px solid ${BORDER_COLOR}` }}
-          onPointerDown={stopPanelPointer}
-          onWheel={(e) => e.stopPropagation()}
-          onDoubleClick={(e) => e.stopPropagation()}
-          onClickCapture={(e) => {
-            // See suppressPanelClickRef's own doc comment - swallows the one stray click a viewport
-            // orbit/pan drag can leak onto whatever panel control the cursor happened to end over.
-            // Capture phase, so this runs before the actual button's own onClick does.
-            if (suppressPanelClickRef.current) {
-              e.preventDefault();
-              e.stopPropagation();
-            }
-          }}
-        >
-          <div className="flex flex-col gap-1.5">
-            <div className="text-[9px] tracking-widest text-neutral-500 font-mono">TEACHING MODE</div>
-            <ModeButton label="Free explore" active={mode === "free"} onClick={() => onCommit({ latticeTeachingMode: "free" })} />
-            <ModeButton label="Plaquette loop U□" active={mode === "plaquette"} onClick={() => onCommit({ latticeTeachingMode: "plaquette" })} />
-            <ModeButton
-              label="Gauge transformation"
-              active={mode === "gauge"}
-              onClick={() => {
-                setGaugeSeed((s) => s + 1);
-                if (mode !== "gauge") onCommit({ latticeTeachingMode: "gauge" });
-              }}
-            />
-          </div>
-
-          <div className="flex flex-col gap-1">
-            <div className="text-[9px] tracking-widest text-neutral-500 font-mono">LATTICE SIZE — N = {liveN}</div>
-            <input
-              type="range"
-              min={MIN_LATTICE_SIZE}
-              max={MAX_LATTICE_SIZE}
-              step={1}
-              value={liveN}
-              onChange={(e) => setLiveN(Number(e.target.value))}
-              onPointerUp={(e) => onCommit({ latticeSize: Number((e.currentTarget as HTMLInputElement).value) })}
-              onKeyUp={(e) => onCommit({ latticeSize: Number((e.currentTarget as HTMLInputElement).value) })}
-              className="w-full accent-teal-400"
-            />
-          </div>
-
-          <div className="flex flex-col gap-1">
-            <div className="text-[9px] tracking-widest text-neutral-500 font-mono">SITE SPACING — {liveSpacing.toFixed(1)}</div>
-            <input
-              type="range"
-              min={MIN_LATTICE_SITE_SPACING}
-              max={MAX_LATTICE_SITE_SPACING}
-              step={0.1}
-              value={liveSpacing}
-              onChange={(e) => setLiveSpacing(Number(e.target.value))}
-              onPointerUp={(e) => onCommit({ latticeSiteSpacing: Number((e.currentTarget as HTMLInputElement).value) })}
-              onKeyUp={(e) => onCommit({ latticeSiteSpacing: Number((e.currentTarget as HTMLInputElement).value) })}
-              className="w-full accent-teal-400"
-            />
-          </div>
-
-          <div className="flex flex-col gap-2 pt-1 border-t" style={{ borderColor: BORDER_COLOR }}>
-            <ToggleRow label="Show quarks (sites)" checked={showQuarks} color="#e0584a" onChange={(v) => onCommit({ latticeShowQuarks: v })} />
-            <ToggleRow label="Show gluons (links)" checked={showGluons} color="#2dd4bf" onChange={(v) => onCommit({ latticeShowGluons: v })} />
-            <ToggleRow label="Animate gauge flux" checked={animateFlux} color="#38bdf8" onChange={(v) => onCommit({ latticeAnimateFlux: v })} />
-          </div>
-
-          <div className="flex flex-col gap-1 pt-1 border-t text-[9.5px] text-neutral-500 leading-relaxed" style={{ borderColor: BORDER_COLOR }}>
-            <div>
-              <span style={{ color: "#e0584a" }}>●</span> matter field ψ(n) — site variable
-            </div>
-            <div>
-              <span style={{ color: "#2dd4bf" }}>—</span> gauge link Uμ(n) — link variable
-            </div>
-            <div>
-              <span style={{ color: "#facc15" }}>—</span> highlighted plaquette loop
-            </div>
-          </div>
         </div>
       </div>
     </div>
