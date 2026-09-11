@@ -112,6 +112,14 @@ export type WhiteboardShapeType =
   // tile, and the Canvas2D PNG-export path, which has no way to capture a live WebGL frame - see
   // its own "latticeGauge" case).
   | "latticeGauge"
+  // A grid of rows x columns with per-cell text - see WhiteboardTable.tsx, which owns this
+  // shapeType's live rendering AND editing (cell text, row/column resize, insert/delete), same
+  // "one file owns the whole shapeType's body" split WhiteboardCanvas.tsx already uses for
+  // "latticeGauge"/LatticeGaugeWidget.tsx. Unlike latticeGauge, a table's content (grid lines +
+  // cell text) IS representable as a flat drawing, so shapeOutlineFor still returns a real
+  // (if simplified - no cell text) grid glyph for the toolbar tile/Canvas2D export, rather than
+  // just a placeholder icon.
+  | "table"
   | "text"
   | "freehand";
 
@@ -186,6 +194,20 @@ export const MAX_LATTICE_SITE_RADIUS = 0.6;
 export const DEFAULT_LATTICE_LINK_WIDTH = 0.035;
 export const MIN_LATTICE_LINK_WIDTH = 0.005;
 export const MAX_LATTICE_LINK_WIDTH = 0.25;
+
+// "table" node fields (WhiteboardNode.tableRows/tableCols/tableColWidths/tableRowHeights) - shared
+// here (rather than living only in WhiteboardTable.tsx/WhiteboardStylePanel.tsx) so
+// createDefaultWhiteboardNode's and resolveTableGrid's own defaults/clamps can never drift apart.
+export const DEFAULT_TABLE_ROWS = 3;
+export const DEFAULT_TABLE_COLS = 3;
+export const MIN_TABLE_ROWS = 1;
+export const MAX_TABLE_ROWS = 30;
+export const MIN_TABLE_COLS = 1;
+export const MAX_TABLE_COLS = 15;
+// A dragged row/column divider can't shrink its row/column below this fraction of the table's own
+// height/width - keeps a cell from being resized down to nothing (which would make it impossible to
+// grab again to resize back) or crossing over a neighboring divider.
+export const MIN_TABLE_CELL_FRACTION = 0.06;
 
 // Which curve a "functionPlot" node traces (see whiteboardHandlers.ts's evalPlotFunction/
 // FUNCTION_PLOT_DOMAINS) - a curated preset list rather than an arbitrary user-typed formula, same
@@ -398,6 +420,29 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // resolves to those defaults.
   latticeSiteRadius?: number;
   latticeLinkWidth?: number;
+  // "table" only - grid dimensions and content (see WhiteboardTable.tsx). Absent - resolves to
+  // DEFAULT_TABLE_ROWS/DEFAULT_TABLE_COLS (see resolveTableGrid below, the single place every
+  // reader of these fields - the live widget, the style panel, the Canvas2D export - resolves them,
+  // so a stale/out-of-range value from before a row/column was added or removed can never crash or
+  // silently desync one reader from another).
+  tableRows?: number;
+  tableCols?: number;
+  // Each column's/row's own width/height as a fraction (0-1) of the node's own width/height,
+  // summing to 1 - same resize-safe convention "freehand"'s `points` fractions use (see this
+  // interface's own `points` doc comment below): resizing the table's box rescales the whole grid
+  // for free instead of needing bespoke per-row/column resize math. Length should match
+  // tableCols/tableRows; resolveTableGrid falls back to equal fractions if it doesn't (a stale
+  // array left over from a since-changed row/column count).
+  tableColWidths?: number[];
+  tableRowHeights?: number[];
+  // Per-cell text, tableCellText[row][col]. A cell past the array's own bounds (same staleness case
+  // as above) resolves to "".
+  tableCellText?: string[][];
+  // Whether the first row renders bold with a subtly shaded background - the common "title row"
+  // table convention (draw.io's own table insert offers the same toggle). Absent - resolves to
+  // true (a fresh table looks like it has a header until deliberately turned off, since that's the
+  // far more common case than a header-less data grid).
+  tableHeaderRow?: boolean;
   fontFamily: string;
   fontSize: number;
   fontColor: string;
@@ -629,6 +674,7 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   bondLine: { width: 200, height: 60 },
   unitCircle: { width: 200, height: 200 },
   numberLine: { width: 280, height: 60 },
+  table: { width: 360, height: 180 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
 };
@@ -658,6 +704,8 @@ export function createDefaultWhiteboardNode(
       | "plotYTickInterval"
       | "showChartLabels"
       | "numberLineMax"
+      | "tableRows"
+      | "tableCols"
     >
   >
 ): WhiteboardNode {
@@ -713,6 +761,17 @@ export function createDefaultWhiteboardNode(
     latticeShowGluons: shapeType === "latticeGauge" ? true : undefined,
     latticeAnimateFlux: shapeType === "latticeGauge" ? true : undefined,
     latticeTeachingMode: shapeType === "latticeGauge" ? "free" : undefined,
+    tableRows: shapeType === "table" ? overrides?.tableRows ?? DEFAULT_TABLE_ROWS : undefined,
+    tableCols: shapeType === "table" ? overrides?.tableCols ?? DEFAULT_TABLE_COLS : undefined,
+    tableColWidths:
+      shapeType === "table" ? Array(overrides?.tableCols ?? DEFAULT_TABLE_COLS).fill(1 / (overrides?.tableCols ?? DEFAULT_TABLE_COLS)) : undefined,
+    tableRowHeights:
+      shapeType === "table" ? Array(overrides?.tableRows ?? DEFAULT_TABLE_ROWS).fill(1 / (overrides?.tableRows ?? DEFAULT_TABLE_ROWS)) : undefined,
+    tableCellText:
+      shapeType === "table"
+        ? Array.from({ length: overrides?.tableRows ?? DEFAULT_TABLE_ROWS }, () => Array(overrides?.tableCols ?? DEFAULT_TABLE_COLS).fill(""))
+        : undefined,
+    tableHeaderRow: shapeType === "table" ? true : undefined,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,
     fontColor: "#111111",
@@ -773,6 +832,60 @@ export function createFreehandWhiteboardNode(id: string, rawPoints: { x: number;
     createdAt: now,
     updatedAt: now,
   };
+}
+
+export interface ResolvedTableGrid {
+  rows: number;
+  cols: number;
+  colWidths: number[]; // fractions of node.width, length === cols, sums to 1
+  rowHeights: number[]; // fractions of node.height, length === rows, sums to 1
+  cellText: string[][]; // [row][col], always exactly rows x cols
+}
+
+// The one place a "table" node's own fields get resolved into a definitely-consistent grid - every
+// reader (WhiteboardTable.tsx's live rendering/editing, WhiteboardStylePanel.tsx's row/column
+// steppers, whiteboardHandlers.ts's Canvas2D export) goes through this rather than reading
+// tableRows/tableColWidths/tableCellText off the node directly, so a stale/malformed array (missing
+// entirely, wrong length after a row/column count changed some other way, a non-finite fraction)
+// can never desync one reader from another or throw - it just falls back to an even split / an
+// empty cell, the same "resolve absent/stale data at read time" convention every other optional
+// field on this type already follows.
+export function resolveTableGrid(node: WhiteboardNode): ResolvedTableGrid {
+  const rows = Math.max(MIN_TABLE_ROWS, Math.min(MAX_TABLE_ROWS, Math.round(node.tableRows ?? DEFAULT_TABLE_ROWS)));
+  const cols = Math.max(MIN_TABLE_COLS, Math.min(MAX_TABLE_COLS, Math.round(node.tableCols ?? DEFAULT_TABLE_COLS)));
+  const normalize = (fractions: number[] | undefined, count: number): number[] => {
+    const valid = fractions && fractions.length === count && fractions.every((f) => Number.isFinite(f) && f > 0);
+    const source = valid ? fractions! : Array(count).fill(1 / count);
+    const sum = source.reduce((a, b) => a + b, 0);
+    return source.map((f) => f / sum);
+  };
+  const colWidths = normalize(node.tableColWidths, cols);
+  const rowHeights = normalize(node.tableRowHeights, rows);
+  const cellText = Array.from({ length: rows }, (_, r) => Array.from({ length: cols }, (_, c) => node.tableCellText?.[r]?.[c] ?? ""));
+  return { rows, cols, colWidths, rowHeights, cellText };
+}
+
+// Inserts a new fraction at `index` sized to the average of the existing ones, rescaling the whole
+// array (including the new entry) back down so it still sums to 1 - shared by WhiteboardTable.tsx
+// (inserting a row/column at a specific position) and WhiteboardStylePanel.tsx (its rows/columns
+// stepper, which always inserts/removes at the end) so a freshly inserted row/column starts a
+// reasonable size instead of 0 (invisible) or 1 (crushing every other row/column to nothing).
+export function insertTableFraction(fractions: number[], index: number): number[] {
+  const avg = 1 / (fractions.length + 1);
+  const next = [...fractions];
+  next.splice(index, 0, avg);
+  const sum = next.reduce((a, b) => a + b, 0);
+  return next.map((f) => f / sum);
+}
+
+// Removes the fraction at `index`, redistributing its share proportionally across the rest (a wide
+// column absorbs proportionally more of a deleted neighbor's width than a narrow one does) rather
+// than resetting every remaining row/column to an equal split, which would throw away any
+// deliberate resizing already done elsewhere in the table.
+export function removeTableFraction(fractions: number[], index: number): number[] {
+  const next = fractions.filter((_, i) => i !== index);
+  const sum = next.reduce((a, b) => a + b, 0);
+  return sum > 0 ? next.map((f) => f / sum) : next.map(() => 1 / next.length);
 }
 
 export function createDefaultWhiteboardEdge(id: string, source: WhiteboardEndpoint, target: WhiteboardEndpoint): WhiteboardEdge {

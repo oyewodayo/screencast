@@ -27,6 +27,7 @@ import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo
 import { TbRotateClockwise } from "react-icons/tb";
 import katex from "katex";
 import LatticeGaugeWidget from "./LatticeGaugeWidget";
+import WhiteboardTable from "./WhiteboardTable";
 import {
   ArrowheadType,
   createDefaultWhiteboardEdge,
@@ -1682,7 +1683,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 e.stopPropagation();
                 // "latticeGauge" has no text concept at all (see its own shapeType doc comment) -
                 // same "nothing to edit" exclusion "freehand" ink already gets.
-                if (node.shapeType !== "freehand" && node.shapeType !== "latticeGauge") setEditingNodeId(node.id);
+                // "table" has no single node-wide text concept either - it edits per-CELL text
+                // instead (see WhiteboardTable.tsx's own double-click handler on each cell).
+                if (node.shapeType !== "freehand" && node.shapeType !== "latticeGauge" && node.shapeType !== "table") setEditingNodeId(node.id);
               }}
               onContextMenu={(e) => {
                 e.preventDefault();
@@ -1729,6 +1732,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
                   onSelect={() => onSelectionChange(new Set([node.id]), new Set())}
                 />
+              ) : node.shapeType === "table" ? (
+                <WhiteboardTable node={node} selected={selected} canvasZoom={zoom} onCommit={(patch) => onEditNode(node, { ...node, ...patch })} />
               ) : node.shapeType === "ellipse" ? (
                 <div
                   style={{

@@ -83,6 +83,11 @@ const BASIC_SHAPE_PRESETS: ShapePreset[] = [
   { type: "note", label: "Note" },
   { type: "callout", label: "Callout" },
   { type: "step", label: "Step" },
+  // Rows/columns are adjustable afterward via the style panel's own Rows/Columns steppers (see
+  // WhiteboardStylePanel.tsx's TableStructureFields) - same "one preset, tune it after placing"
+  // treatment PHYSICS_3D_SHAPE_PRESETS already gives "latticeGauge", rather than cluttering this
+  // palette with a tile per row/column combination.
+  { type: "table", label: "Table" },
 ];
 
 const WAVE_SHAPE_PRESETS: ShapePreset[] = [

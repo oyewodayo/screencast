@@ -14,6 +14,8 @@ import katex from "katex";
 import {
   ArrowheadType,
   DEFAULT_CHART_DATA,
+  DEFAULT_TABLE_COLS,
+  DEFAULT_TABLE_ROWS,
   FunctionPlotType,
   WhiteboardAnchorSide,
   WhiteboardCommand,
@@ -22,6 +24,7 @@ import {
   WhiteboardNode,
   WhiteboardPage,
   WhiteboardShapeType,
+  resolveTableGrid,
 } from "../utils/whiteboardTypes";
 
 // ---- Node geometry ----------------------------------------------------------------------------
@@ -412,6 +415,10 @@ export interface ShapeOutlineOptions {
   ampInputBottomLeadYOffset?: number; // "amplifier" only
   ampOutputLeadYOffset?: number; // "amplifier" only
   ampInvertingOnTop?: boolean; // "amplifier" only
+  tableRows?: number; // "table" only
+  tableCols?: number; // "table" only
+  tableColWidths?: number[]; // "table" only - fractions, length === tableCols
+  tableRowHeights?: number[]; // "table" only - fractions, length === tableRows
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -1415,6 +1422,25 @@ export function waveOutlineD(w: number, h: number, style: NonNullable<Whiteboard
   return toD(points);
 }
 
+// The internal grid-divider lines for a "table" shape's outline - shared by shapeOutlineFor's own
+// "table" case (the toolbar tile preview, and the Canvas2D export's fallback if paintTable ever
+// can't run) below. Column dividers first, then row dividers, matching no particular reader's
+// expectation - both draw every line in the returned list identically regardless of order.
+function tableGridInnerLines(w: number, h: number, colWidths: number[], rowHeights: number[]): [number, number][][] {
+  const lines: [number, number][][] = [];
+  let x = 0;
+  for (let i = 0; i < colWidths.length - 1; i++) {
+    x += colWidths[i] * w;
+    lines.push([[x, 0], [x, h]]);
+  }
+  let y = 0;
+  for (let i = 0; i < rowHeights.length - 1; i++) {
+    y += rowHeights[i] * h;
+    lines.push([[0, y], [w, y]]);
+  }
+  return lines;
+}
+
 export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: number, opts?: ShapeOutlineOptions): ShapeOutline {
   switch (shapeType) {
     case "ellipse":
@@ -1623,6 +1649,13 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
           opts?.plotShowGrid ?? false
         ),
       };
+    case "table": {
+      const cols = Math.max(1, opts?.tableCols ?? DEFAULT_TABLE_COLS);
+      const rows = Math.max(1, opts?.tableRows ?? DEFAULT_TABLE_ROWS);
+      const colWidths = opts?.tableColWidths && opts.tableColWidths.length === cols ? opts.tableColWidths : Array(cols).fill(1 / cols);
+      const rowHeights = opts?.tableRowHeights && opts.tableRowHeights.length === rows ? opts.tableRowHeights : Array(rows).fill(1 / rows);
+      return { kind: "polygon", points: [[0, 0], [w, 0], [w, h], [0, h]], innerLines: tableGridInnerLines(w, h, colWidths, rowHeights) };
+    }
     case "rectangle":
     case "text":
     case "freehand":
@@ -2053,6 +2086,78 @@ async function paintEquation(ctx: CanvasRenderingContext2D, node: WhiteboardNode
   ctx.drawImage(img, 0, 0, node.width, node.height);
 }
 
+// Draws a "table" node's full content (background, header shading, grid lines, per-cell text) for
+// PNG export - unlike "latticeGauge" (a live WebGL scene with no flat-drawing equivalent to fall
+// back to except a live DOM canvas grab), everything a table shows on-screen IS representable in
+// Canvas2D, so this reproduces WhiteboardTable.tsx's own layout exactly rather than settling for
+// shapeOutlineFor's simplified grid-lines-only glyph.
+function paintTable(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+  const grid = resolveTableGrid(node);
+  const { width: w, height: h } = node;
+  const colBounds = [0];
+  for (const f of grid.colWidths) colBounds.push(colBounds[colBounds.length - 1] + f * w);
+  const rowBounds = [0];
+  for (const f of grid.rowHeights) rowBounds.push(rowBounds[rowBounds.length - 1] + f * h);
+  const headerRow = node.tableHeaderRow ?? true;
+
+  if (node.fillColor) {
+    ctx.fillStyle = node.fillColor;
+    ctx.fillRect(0, 0, w, h);
+  }
+  if (headerRow && grid.rows > 0) {
+    ctx.fillStyle = "rgba(0,0,0,0.06)";
+    ctx.fillRect(0, 0, w, rowBounds[1]);
+  }
+  if (node.strokeWidth > 0) {
+    ctx.lineWidth = node.strokeWidth;
+    ctx.strokeStyle = node.strokeColor;
+    ctx.strokeRect(0, 0, w, h);
+    ctx.beginPath();
+    for (const x of colBounds.slice(1, -1)) {
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+    }
+    for (const y of rowBounds.slice(1, -1)) {
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+    }
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = node.fontColor;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = node.textAlign;
+  const paddingX = 6;
+  for (let r = 0; r < grid.rows; r++) {
+    const cellH = rowBounds[r + 1] - rowBounds[r];
+    const isHeaderRow = headerRow && r === 0;
+    const fontStyle = node.fontStyle === "italic" ? "italic " : "";
+    const fontWeight = isHeaderRow || node.fontWeight === "bold" ? "bold " : "";
+    ctx.font = `${fontStyle}${fontWeight}${node.fontSize}px ${node.fontFamily || "system-ui, sans-serif"}`;
+    for (let c = 0; c < grid.cols; c++) {
+      const text = grid.cellText[r][c];
+      if (!text) continue;
+      const cellW = colBounds[c + 1] - colBounds[c];
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(colBounds[c], rowBounds[r], cellW, cellH);
+      ctx.clip();
+      const x = node.textAlign === "left" ? colBounds[c] + paddingX : node.textAlign === "right" ? colBounds[c] + cellW - paddingX : colBounds[c] + cellW / 2;
+      const lineHeight = node.fontSize * 1.25;
+      const lines = wrapText(ctx, text, cellW - paddingX * 2);
+      const totalHeight = lines.length * lineHeight;
+      const startY =
+        node.verticalAlign === "top"
+          ? rowBounds[r] + lineHeight / 2 + 2
+          : node.verticalAlign === "bottom"
+          ? rowBounds[r] + cellH - totalHeight + lineHeight / 2 - 2
+          : rowBounds[r] + cellH / 2 - totalHeight / 2 + lineHeight / 2;
+      lines.forEach((line, i) => ctx.fillText(line, x, startY + i * lineHeight));
+      ctx.restore();
+    }
+  }
+}
+
 async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): Promise<void> {
   ctx.save();
   ctx.translate(node.x, node.y);
@@ -2129,6 +2234,8 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): 
     } else {
       paintShapeBody(ctx, node);
     }
+  } else if (node.shapeType === "table") {
+    paintTable(ctx, node);
   } else {
     if (node.shapeType !== "text") paintShapeBody(ctx, node);
     paintNodeText(ctx, node);

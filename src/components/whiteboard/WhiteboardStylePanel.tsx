@@ -39,12 +39,19 @@ import {
   MAX_LATTICE_SITE_RADIUS,
   MAX_LATTICE_SITE_SPACING,
   MAX_LATTICE_SIZE,
+  MAX_TABLE_COLS,
+  MAX_TABLE_ROWS,
   MIN_LATTICE_LINK_WIDTH,
   MIN_LATTICE_SITE_RADIUS,
   MIN_LATTICE_SITE_SPACING,
   MIN_LATTICE_SIZE,
+  MIN_TABLE_COLS,
+  MIN_TABLE_ROWS,
   WhiteboardEdge,
   WhiteboardNode,
+  insertTableFraction,
+  removeTableFraction,
+  resolveTableGrid,
 } from "../../utils/whiteboardTypes";
 import {
   DEFAULT_AMP_INPUT_LEAD_LENGTH,
@@ -266,6 +273,65 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span>{label}</span>
       {children}
     </label>
+  );
+}
+
+// Rows/Columns steppers + header-row toggle for a single selected "table" node - see this block's
+// own call site (in the main component below) for why row/column count can't go through the
+// generic multi-node `updateNodes` the way every other field in this panel does. Always
+// adds/removes at the END (the last row/column) - inserting/deleting at an arbitrary position is a
+// WhiteboardTable.tsx affordance instead (hover a specific row/column while it's selected).
+function TableStructureFields({ node, updateNodes }: { node: WhiteboardNode; updateNodes: (patch: Partial<WhiteboardNode>) => void }) {
+  const grid = resolveTableGrid(node);
+  const addRow = () => {
+    if (grid.rows >= MAX_TABLE_ROWS) return;
+    updateNodes({
+      tableRows: grid.rows + 1,
+      tableRowHeights: insertTableFraction(grid.rowHeights, grid.rows),
+      tableCellText: [...grid.cellText.map((r) => [...r]), Array(grid.cols).fill("")],
+    });
+  };
+  const removeRow = () => {
+    if (grid.rows <= MIN_TABLE_ROWS) return;
+    updateNodes({ tableRows: grid.rows - 1, tableRowHeights: removeTableFraction(grid.rowHeights, grid.rows - 1), tableCellText: grid.cellText.slice(0, -1) });
+  };
+  const addCol = () => {
+    if (grid.cols >= MAX_TABLE_COLS) return;
+    updateNodes({ tableCols: grid.cols + 1, tableColWidths: insertTableFraction(grid.colWidths, grid.cols), tableCellText: grid.cellText.map((r) => [...r, ""]) });
+  };
+  const removeCol = () => {
+    if (grid.cols <= MIN_TABLE_COLS) return;
+    updateNodes({ tableCols: grid.cols - 1, tableColWidths: removeTableFraction(grid.colWidths, grid.cols - 1), tableCellText: grid.cellText.map((r) => r.slice(0, -1)) });
+  };
+  const stepperButtonClass = "h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none disabled:opacity-30 disabled:hover:bg-transparent";
+  return (
+    <>
+      <Field label="Rows">
+        <div className="flex items-center gap-1.5">
+          <button type="button" onClick={removeRow} disabled={grid.rows <= MIN_TABLE_ROWS} className={stepperButtonClass} title="Remove last row">
+            −
+          </button>
+          <span className="w-4 text-center">{grid.rows}</span>
+          <button type="button" onClick={addRow} disabled={grid.rows >= MAX_TABLE_ROWS} className={stepperButtonClass} title="Add row">
+            +
+          </button>
+        </div>
+      </Field>
+      <Field label="Columns">
+        <div className="flex items-center gap-1.5">
+          <button type="button" onClick={removeCol} disabled={grid.cols <= MIN_TABLE_COLS} className={stepperButtonClass} title="Remove last column">
+            −
+          </button>
+          <span className="w-4 text-center">{grid.cols}</span>
+          <button type="button" onClick={addCol} disabled={grid.cols >= MAX_TABLE_COLS} className={stepperButtonClass} title="Add column">
+            +
+          </button>
+        </div>
+      </Field>
+      <Field label="Header row">
+        <input type="checkbox" checked={node.tableHeaderRow ?? true} onChange={(e) => updateNodes({ tableHeaderRow: e.target.checked })} className="h-3.5 w-3.5" />
+      </Field>
+    </>
   );
 }
 
@@ -937,6 +1003,17 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 />
               </Field>
             </>
+          )}
+          {/* "table" structure - rows/columns/header toggle. Row/column count only edits ONE node
+              at a time (unlike every other field in this panel, which applies the same patch to
+              every selected node uniformly) - a rows/cols change also has to grow/shrink the
+              node's own tableRowHeights/tableColWidths/tableCellText arrays, and those are only
+              meaningful computed against THAT one node's own current grid (see resolveTableGrid) -
+              applying one node's freshly-computed arrays onto a DIFFERENT table with its own,
+              likely different, row/column count would corrupt it. Cell text/resize/insert-at-a-
+              specific-position all live in WhiteboardTable.tsx instead (see its own top comment). */}
+          {selectedNodes.length === 1 && selectedNodes[0].shapeType === "table" && (
+            <TableStructureFields node={selectedNodes[0]} updateNodes={updateNodes} />
           )}
           {selectedNodes.every((n) => n.shapeType === "freehand") && (
             <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">
