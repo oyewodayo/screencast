@@ -88,6 +88,18 @@ const BASIC_SHAPE_PRESETS: ShapePreset[] = [
   // treatment PHYSICS_3D_SHAPE_PRESETS already gives "latticeGauge", rather than cluttering this
   // palette with a tile per row/column combination.
   { type: "table", label: "Table" },
+  // "+" reuses "cross" (already the exact same plus-sign silhouette) rather than a dedicated
+  // shapeType - see whiteboardTypes.ts's own doc comment on why only the other three signs are new
+  // shapeTypes.
+  { type: "cross", label: "Plus (+)" },
+  { type: "minusSign", label: "Minus (-)" },
+  { type: "multiplySign", label: "Multiply (x)" },
+  { type: "divideSign", label: "Divide" },
+  { type: "equalsSign", label: "Equals (=)" },
+  { type: "greaterThanSign", label: "Greater Than" },
+  { type: "lessThanSign", label: "Less Than" },
+  { type: "greaterEqualSign", label: "Greater or Equal" },
+  { type: "lessEqualSign", label: "Less or Equal" },
 ];
 
 const WAVE_SHAPE_PRESETS: ShapePreset[] = [
@@ -512,6 +524,12 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set());
   const [selectedEdgeIds, setSelectedEdgeIds] = useState<Set<string>>(new Set());
+  // A "table" node's own live cell/row/column selection, lifted up from WhiteboardCanvas.tsx (see
+  // its own onTableRangeChange prop) so WhiteboardStylePanel.tsx's "Cell" background/border-style
+  // controls know which cells to act on - the panel otherwise has no selection concept below "which
+  // whole node." Not undo-tracked, not saved - purely a live UI pointer, same treatment every other
+  // transient selection state on this component already gets.
+  const [tableRangeSelection, setTableRangeSelection] = useState<{ nodeId: string; range: { r0: number; c0: number; r1: number; c1: number } } | null>(null);
   const [armedShapeType, setArmedShapeType] = useState<WhiteboardShapeType | null>(null);
   const [armedNodeOverrides, setArmedNodeOverrides] = useState<Partial<WhiteboardNode> | undefined>(undefined);
   const [connectorArmed, setConnectorArmed] = useState(false);
@@ -607,28 +625,6 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page?.id]);
 
-  // ---- Keyboard shortcuts: undo/redo (Delete/Escape live inside WhiteboardCanvas, which owns
-  // selection-adjacent state that undo/redo doesn't need) -----------------------------------------
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      const active = document.activeElement;
-      const isTyping = active instanceof HTMLElement && (active.isContentEditable || active.tagName === "INPUT" || active.tagName === "TEXTAREA");
-      if (isTyping) return;
-      const mod = e.ctrlKey || e.metaKey;
-      if (mod && e.key.toLowerCase() === "z" && !e.shiftKey) {
-        e.preventDefault();
-        store.undo();
-      } else if (mod && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
-        e.preventDefault();
-        store.redo();
-      } else if (e.key === "Escape" && (armedShapeType || connectorArmed || laserArmed)) {
-        deselectTools();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools]);
-
   const handleReorder = useCallback(
     (toFront: boolean) => {
       if (!page || selectedNodeIds.size === 0) return;
@@ -668,6 +664,103 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     setSelectedNodeIds(nodeIds);
     setSelectedEdgeIds(edgeIds);
   }, []);
+
+  // ---- Clipboard (Ctrl+C / Ctrl+V) ----------------------------------------------------------------
+  // In-memory only (never the OS clipboard) - a plain ref rather than state since copying never
+  // needs to trigger a render, and a ref survives page switches for free (it lives on this
+  // component, not on any one page), which is exactly what lets "copy on page A, switch to page B,
+  // paste" work with no extra plumbing (see useWhiteboardStore.ts's own doc comment on why every
+  // mutator otherwise only ever targets whichever page is currently active).
+  const clipboardRef = useRef<{ nodes: WhiteboardNode[]; edges: WhiteboardEdge[] } | null>(null);
+  // How many times the CURRENT clipboard contents have been pasted so far - each paste offsets by
+  // one more step than the last (24px, 48px, 72px, ...) so repeatedly pressing Ctrl+V cascades the
+  // copies down-right instead of stacking every paste exactly on top of the last one. Reset to 0 by
+  // every fresh copy (handleCopy below) so a new Ctrl+C always starts its own cascade over from the
+  // first paste's +24/+24 - the same offset handleDuplicateNode already uses for its own single-node
+  // copy, kept identical here for a consistent "cloned things land 24px down-right" feel.
+  const pasteCountRef = useRef(0);
+
+  const handleCopy = useCallback(() => {
+    if (!page || selectedNodeIds.size === 0) return;
+    const nodes = page.nodes.filter((n) => selectedNodeIds.has(n.id));
+    // Also copy any edge BETWEEN two copied nodes (not just ones explicitly selected) - pasting a
+    // copied group should keep the connectors that ran between its own members, the same
+    // expectation copy/paste of a diagram fragment in draw.io itself sets.
+    const edges = page.edges.filter(
+      (e) =>
+        selectedEdgeIds.has(e.id) ||
+        (!!e.source.nodeId && selectedNodeIds.has(e.source.nodeId) && !!e.target.nodeId && selectedNodeIds.has(e.target.nodeId))
+    );
+    // JSON round-trip rather than holding live references - every field here is already plain
+    // JSON-serializable data (same assumption save/load already makes), and this guarantees a later
+    // edit to the original items can never silently mutate what's sitting in the clipboard.
+    clipboardRef.current = JSON.parse(JSON.stringify({ nodes, edges }));
+    pasteCountRef.current = 0;
+  }, [page, selectedNodeIds, selectedEdgeIds]);
+
+  const handlePaste = useCallback(() => {
+    const clipboard = clipboardRef.current;
+    if (!clipboard || clipboard.nodes.length === 0) return;
+    pasteCountRef.current += 1;
+    const offset = pasteCountRef.current * 24;
+    const idMap = new Map<string, string>();
+    const now = Date.now();
+    const newNodes = clipboard.nodes.map((n) => {
+      const id = crypto.randomUUID();
+      idMap.set(n.id, id);
+      return { ...n, id, x: n.x + offset, y: n.y + offset, createdAt: now, updatedAt: now };
+    });
+    // An edge whose endpoint doesn't resolve through idMap (shouldn't happen given handleCopy's own
+    // filter, but resolved defensively same as every other "stale reference" case in this feature)
+    // is dropped rather than pasted still pointing at the ORIGINAL (uncopied) node.
+    const newEdges = clipboard.edges.flatMap((e) => {
+      const sourceId = e.source.nodeId ? idMap.get(e.source.nodeId) : undefined;
+      const targetId = e.target.nodeId ? idMap.get(e.target.nodeId) : undefined;
+      if ((e.source.nodeId && !sourceId) || (e.target.nodeId && !targetId)) return [];
+      return [
+        {
+          ...e,
+          id: crypto.randomUUID(),
+          source: sourceId ? { ...e.source, nodeId: sourceId } : e.source,
+          target: targetId ? { ...e.target, nodeId: targetId } : e.target,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ];
+    });
+    store.pasteItems(newNodes, newEdges);
+    setSelectedNodeIds(new Set(newNodes.map((n) => n.id)));
+    setSelectedEdgeIds(new Set(newEdges.map((e) => e.id)));
+  }, [store]);
+
+  // ---- Keyboard shortcuts: undo/redo/copy/paste (Delete/Escape live inside WhiteboardCanvas,
+  // which owns selection-adjacent state that undo/redo doesn't need) -------------------------------
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement;
+      const isTyping = active instanceof HTMLElement && (active.isContentEditable || active.tagName === "INPUT" || active.tagName === "TEXTAREA");
+      if (isTyping) return;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === "z" && !e.shiftKey) {
+        e.preventDefault();
+        store.undo();
+      } else if (mod && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
+        e.preventDefault();
+        store.redo();
+      } else if (mod && e.key.toLowerCase() === "c") {
+        if (selectedNodeIds.size === 0) return;
+        e.preventDefault();
+        handleCopy();
+      } else if (mod && e.key.toLowerCase() === "v") {
+        e.preventDefault();
+        handlePaste();
+      } else if (e.key === "Escape" && (armedShapeType || connectorArmed || laserArmed)) {
+        deselectTools();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools, selectedNodeIds, handleCopy, handlePaste]);
 
   const handleExport = useCallback(async () => {
     if (!doc || !page) return;
@@ -1099,10 +1192,12 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           laserArmed={laserArmed}
           onQuickConnectArrowClick={(nodeId, side, point) => setQuickConnectPicker({ nodeId, side, x: point.x, y: point.y })}
           onItemContextMenu={(nodeIds, edgeIds, point) => setContextMenu({ x: point.x, y: point.y, nodeIds, edgeIds })}
+          onTableRangeChange={(nodeId, range) => setTableRangeSelection(range ? { nodeId, range } : null)}
         />
         <WhiteboardStylePanel
           selectedNodes={selectedNodes}
           selectedEdges={selectedEdges}
+          tableRangeSelection={tableRangeSelection}
           onBatchEditNodes={store.batchEditNodes}
           onEditEdge={store.editEdge}
           onDeleteNode={(node: WhiteboardNode) => {

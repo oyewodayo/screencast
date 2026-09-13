@@ -120,6 +120,18 @@ export type WhiteboardShapeType =
   // (if simplified - no cell text) grid glyph for the toolbar tile/Canvas2D export, rather than
   // just a placeholder icon.
   | "table"
+  // Arithmetic-sign glyphs (draw.io's own "Math" shape palette has the same set) - fixed icons,
+  // same "hand-tuned glyph, no parametric knob" reasoning as the science symbols above. "+" is
+  // deliberately NOT its own shapeType here - it's just "cross" (already the exact same plus-sign
+  // silhouette) offered again under a math-specific label in WhiteboardEditor.tsx's own preset list.
+  | "minusSign"
+  | "multiplySign" // "x" - the same plus-sign silhouette as "cross", rotated 45 degrees
+  | "divideSign" // a horizontal bar with a dot above and below
+  | "equalsSign" // "=" - two stacked horizontal bars
+  | "greaterThanSign"
+  | "lessThanSign" // the same chevron as "greaterThanSign", mirrored
+  | "greaterEqualSign" // the "greaterThanSign" chevron with a bar underneath
+  | "lessEqualSign" // the "lessThanSign" chevron with a bar underneath
   | "text"
   | "freehand";
 
@@ -208,6 +220,24 @@ export const MAX_TABLE_COLS = 15;
 // height/width - keeps a cell from being resized down to nothing (which would make it impossible to
 // grab again to resize back) or crossing over a neighboring divider.
 export const MIN_TABLE_CELL_FRACTION = 0.06;
+
+// A rectangular block of merged table cells - see WhiteboardNode.tableMergedCells's own doc comment.
+export interface TableMergedCell {
+  row: number;
+  col: number;
+  rowSpan: number;
+  colSpan: number;
+}
+
+// One side's line style, overriding the table's own uniform solid strokeColor/strokeWidth grid line
+// for just that side of one cell - see WhiteboardNode.tableCellBorders's own doc comment.
+export type TableBorderStyle = "solid" | "dashed" | "dotted" | "none";
+export interface TableCellBorders {
+  top?: TableBorderStyle;
+  right?: TableBorderStyle;
+  bottom?: TableBorderStyle;
+  left?: TableBorderStyle;
+}
 
 // Which curve a "functionPlot" node traces (see whiteboardHandlers.ts's evalPlotFunction/
 // FUNCTION_PLOT_DOMAINS) - a curated preset list rather than an arbitrary user-typed formula, same
@@ -443,6 +473,26 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // true (a fresh table looks like it has a header until deliberately turned off, since that's the
   // far more common case than a header-less data grid).
   tableHeaderRow?: boolean;
+  // "table" only - cells merged into one (a rectangular block of the grid rendered/edited as a
+  // single cell, anchored at its own top-left row/col). A cell "covered" by a merge (inside its
+  // rowSpan x colSpan footprint but not the anchor itself) renders nothing of its own - its text is
+  // not shown even if tableCellText still has a stray value there from before the merge. Absent/
+  // empty - no merges (every cell its own 1x1). See resolveTableGrid for how a stale/out-of-range
+  // entry (row/col/span no longer fitting the current tableRows/tableCols) gets clamped rather than
+  // crashing, same "resolve at read time" treatment every other table field gets.
+  tableMergedCells?: TableMergedCell[];
+  // "table" only - per-cell background override, tableCellFill[row][col]. null/absent at a given
+  // cell - that cell just shows the table's own fillColor, same as every cell already did before
+  // this field existed. A merged cell's override (if any) lives at its own anchor position; a
+  // covered cell's own entry, if any is somehow still there, is never read (same "covered cells
+  // render nothing of their own" rule tableMergedCells's doc comment already sets).
+  tableCellFill?: (string | null)[][];
+  // "table" only - per-cell, per-side border override, tableCellBorders[row][col]. Any side absent
+  // from a cell's own entry (or the cell having no entry at all) falls back to the table's ordinary
+  // uniform grid line (strokeColor/strokeWidth, solid) - this only ever needs to hold the sides a
+  // user has deliberately changed away from that default. "none" removes the line on that side
+  // entirely (no border drawn there at all, not even a transparent one).
+  tableCellBorders?: (TableCellBorders | null)[][];
   fontFamily: string;
   fontSize: number;
   fontColor: string;
@@ -551,7 +601,14 @@ export type WhiteboardCommand =
   | { type: "edit-edge"; before: WhiteboardEdge; after: WhiteboardEdge }
   // Full replacement order for the whole nodes array - z-order (last = topmost), same convention
   // as boardTypes.ts's own 'reorder'. Used by "Bring to front" / "Send to back".
-  | { type: "reorder-nodes"; before: WhiteboardNode[]; after: WhiteboardNode[] };
+  | { type: "reorder-nodes"; before: WhiteboardNode[]; after: WhiteboardNode[] }
+  // Clipboard paste - any number of nodes AND edges added together as ONE undo step (a multi-node
+  // copy/paste, including whatever connectors ran between the copied nodes). Deliberately a
+  // standalone pair with "delete-items" as its exact mirror (see invertCommand) rather than reusing
+  // "delete-node"'s own node+edges shape the way undoDeleteNode does - that one is scoped to
+  // exactly one node's own cascade-deleted edges, not an arbitrary set of both.
+  | { type: "paste-items"; nodes: WhiteboardNode[]; edges: WhiteboardEdge[] }
+  | { type: "delete-items"; nodes: WhiteboardNode[]; edges: WhiteboardEdge[] };
 
 // One page's worth of diagram content - see this file's own top comment for why a whiteboard is a
 // set of these rather than one flat nodes/edges pair.
@@ -675,6 +732,14 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   unitCircle: { width: 200, height: 200 },
   numberLine: { width: 280, height: 60 },
   table: { width: 360, height: 180 },
+  minusSign: { width: 140, height: 90 },
+  multiplySign: { width: 140, height: 140 },
+  divideSign: { width: 100, height: 140 },
+  equalsSign: { width: 140, height: 100 },
+  greaterThanSign: { width: 120, height: 140 },
+  lessThanSign: { width: 120, height: 140 },
+  greaterEqualSign: { width: 120, height: 170 },
+  lessEqualSign: { width: 120, height: 170 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
 };
@@ -840,6 +905,9 @@ export interface ResolvedTableGrid {
   colWidths: number[]; // fractions of node.width, length === cols, sums to 1
   rowHeights: number[]; // fractions of node.height, length === rows, sums to 1
   cellText: string[][]; // [row][col], always exactly rows x cols
+  mergedCells: TableMergedCell[]; // clamped to fit within [0,rows) x [0,cols)
+  cellFill: (string | null)[][]; // [row][col], always exactly rows x cols; null = table's own fillColor
+  cellBorders: TableCellBorders[][]; // [row][col], always exactly rows x cols; {} = every side default
 }
 
 // The one place a "table" node's own fields get resolved into a definitely-consistent grid - every
@@ -862,7 +930,98 @@ export function resolveTableGrid(node: WhiteboardNode): ResolvedTableGrid {
   const colWidths = normalize(node.tableColWidths, cols);
   const rowHeights = normalize(node.tableRowHeights, rows);
   const cellText = Array.from({ length: rows }, (_, r) => Array.from({ length: cols }, (_, c) => node.tableCellText?.[r]?.[c] ?? ""));
-  return { rows, cols, colWidths, rowHeights, cellText };
+  // Clamped to valid bounds AND, beyond that, defensively de-overlapped: two merges can never
+  // legally share a cell (each cell has exactly one anchor, or none), but a bug somewhere upstream
+  // - or a hand-edited/imported document - could still leave two overlapping entries in
+  // tableMergedCells on disk. Rather than let that corrupt the whole render (two merges both trying
+  // to claim the same cell breaks the anchor/covered bookkeeping every reader of this grid depends
+  // on), earlier entries win and any later entry that would claim an already-claimed cell is simply
+  // dropped - same "resolve bad data at read time rather than crash or misrender" treatment every
+  // other field on this type already gets. The very next structural edit through
+  // WhiteboardTable.tsx's own commitEditState (which always writes back THIS function's own output)
+  // permanently heals the stored data too, since it never re-reads the raw, unclamped node field.
+  const claimedCells = new Set<string>();
+  const mergedCells: TableMergedCell[] = [];
+  for (const m of node.tableMergedCells ?? []) {
+    const row = Math.max(0, Math.min(rows - 1, Math.round(m.row)));
+    const col = Math.max(0, Math.min(cols - 1, Math.round(m.col)));
+    const rowSpan = Math.max(1, Math.min(Math.round(m.rowSpan), rows - row));
+    const colSpan = Math.max(1, Math.min(Math.round(m.colSpan), cols - col));
+    if (rowSpan <= 1 && colSpan <= 1) continue;
+    let conflict = false;
+    for (let rr = row; rr < row + rowSpan && !conflict; rr++) for (let cc = col; cc < col + colSpan; cc++) if (claimedCells.has(`${rr}-${cc}`)) conflict = true;
+    if (conflict) continue;
+    for (let rr = row; rr < row + rowSpan; rr++) for (let cc = col; cc < col + colSpan; cc++) claimedCells.add(`${rr}-${cc}`);
+    mergedCells.push({ row, col, rowSpan, colSpan });
+  }
+  const cellFill = Array.from({ length: rows }, (_, r) => Array.from({ length: cols }, (_, c) => node.tableCellFill?.[r]?.[c] ?? null));
+  const cellBorders = Array.from({ length: rows }, (_, r) => Array.from({ length: cols }, (_, c) => node.tableCellBorders?.[r]?.[c] ?? {}));
+  return { rows, cols, colWidths, rowHeights, cellText, mergedCells, cellFill, cellBorders };
+}
+
+// Shifts/grows every merged region when a new row/column is inserted at `index` - a region entirely
+// AFTER the insertion point slides down/right by one; a region the insertion point falls INSIDE
+// (splitting it) instead grows by one along that axis, so a merge stays intact around content
+// that's now one row/column bigger, matching how a plain (unmerged) row/column's own width/height
+// fraction array already grows via insertTableFraction. Regions entirely BEFORE are untouched.
+export function adjustMergesForInsert(merges: TableMergedCell[], axis: "row" | "col", index: number): TableMergedCell[] {
+  return merges.map((m) => {
+    if (axis === "row") {
+      if (index < m.row) return { ...m, row: m.row + 1 };
+      if (index < m.row + m.rowSpan) return { ...m, rowSpan: m.rowSpan + 1 };
+      return m;
+    }
+    if (index < m.col) return { ...m, col: m.col + 1 };
+    if (index < m.col + m.colSpan) return { ...m, colSpan: m.colSpan + 1 };
+    return m;
+  });
+}
+
+// Inverse of adjustMergesForInsert - a region entirely AFTER the removed row/column slides back
+// up/left by one; a region the removed row/column falls INSIDE shrinks by one along that axis
+// (dropped entirely, via the caller's own resolveTableGrid/insert-remove plumbing, if that shrinks
+// it down to a plain 1x1 "merge" - see this function's own filter removing exactly that case).
+export function adjustMergesForRemove(merges: TableMergedCell[], axis: "row" | "col", index: number): TableMergedCell[] {
+  return merges
+    .map((m) => {
+      if (axis === "row") {
+        if (index < m.row) return { ...m, row: m.row - 1 };
+        if (index < m.row + m.rowSpan) return { ...m, rowSpan: m.rowSpan - 1 };
+        return m;
+      }
+      if (index < m.col) return { ...m, col: m.col - 1 };
+      if (index < m.col + m.colSpan) return { ...m, colSpan: m.colSpan - 1 };
+      return m;
+    })
+    .filter((m) => m.rowSpan > 0 && m.colSpan > 0 && (m.rowSpan > 1 || m.colSpan > 1));
+}
+
+// Replaces the background fill for every cell in `range` (inclusive row/col bounds) - shared by
+// WhiteboardStylePanel.tsx's "Cell background" swatch (the only current caller: it lifts the
+// active cell/row/column range up from WhiteboardTable.tsx - see that component's own onRangeChange
+// prop - since the style panel has no selection concept of its own below "which node") and, in
+// principle, any future caller that needs the same "paint this rectangle of cells" operation.
+export function withRangeFill(node: WhiteboardNode, range: { r0: number; c0: number; r1: number; c1: number }, color: string | null): Partial<WhiteboardNode> {
+  const grid = resolveTableGrid(node);
+  const next = grid.cellFill.map((row) => [...row]);
+  for (let r = range.r0; r <= range.r1; r++) for (let c = range.c0; c <= range.c1; c++) if (next[r]?.[c] !== undefined) next[r][c] = color;
+  return { tableCellFill: next };
+}
+
+// Sets one border SIDE's line style for every cell in `range` - same "style panel acts on the range
+// lifted up from WhiteboardTable.tsx" reasoning as withRangeFill above. Selecting a whole row/column
+// via its own selector handle (see WhiteboardTable.tsx) before calling this is what lets "dash the
+// bottom edge of this whole row" read as one action instead of per-cell fiddling.
+export function withRangeBorderSide(
+  node: WhiteboardNode,
+  range: { r0: number; c0: number; r1: number; c1: number },
+  side: "top" | "right" | "bottom" | "left",
+  style: TableBorderStyle
+): Partial<WhiteboardNode> {
+  const grid = resolveTableGrid(node);
+  const next = grid.cellBorders.map((row) => row.map((cell) => ({ ...cell })));
+  for (let r = range.r0; r <= range.r1; r++) for (let c = range.c0; c <= range.c1; c++) if (next[r]?.[c]) next[r][c][side] = style;
+  return { tableCellBorders: next };
 }
 
 // Inserts a new fraction at `index` sized to the average of the existing ones, rescaling the whole

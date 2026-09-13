@@ -47,11 +47,14 @@ import {
   MIN_LATTICE_SIZE,
   MIN_TABLE_COLS,
   MIN_TABLE_ROWS,
+  TableBorderStyle,
   WhiteboardEdge,
   WhiteboardNode,
   insertTableFraction,
   removeTableFraction,
   resolveTableGrid,
+  withRangeBorderSide,
+  withRangeFill,
 } from "../../utils/whiteboardTypes";
 import {
   DEFAULT_AMP_INPUT_LEAD_LENGTH,
@@ -131,6 +134,12 @@ const ROUTING_OPTIONS: { value: WhiteboardEdge["routing"]; label: string }[] = [
 interface WhiteboardStylePanelProps {
   selectedNodes: WhiteboardNode[];
   selectedEdges: WhiteboardEdge[];
+  // The active cell/row/column range within a selected "table" node (or null) - lifted up from
+  // WhiteboardTable.tsx via WhiteboardCanvas.tsx/WhiteboardEditor.tsx (see their own doc comments on
+  // this same field). Only acted on below when it names the SAME node currently selected here - a
+  // stale range left over from a table that's no longer selected shouldn't resurrect its own "Cell"
+  // controls.
+  tableRangeSelection: { nodeId: string; range: { r0: number; c0: number; r1: number; c1: number } } | null;
   onBatchEditNodes: (before: WhiteboardNode[], after: WhiteboardNode[]) => void;
   onEditEdge: (before: WhiteboardEdge, after: WhiteboardEdge) => void;
   onDeleteNode: (node: WhiteboardNode) => void;
@@ -335,9 +344,86 @@ function TableStructureFields({ node, updateNodes }: { node: WhiteboardNode; upd
   );
 }
 
+// Background + per-side border-style controls for whatever cell/row/column range is currently
+// selected INSIDE a table (see WhiteboardTableProps.onRangeChange's own doc comment for how that
+// range gets here) - a separate block from TableStructureFields above because these act on a
+// RECTANGLE of cells the table itself is tracking, not on the table node as a whole the way every
+// other field in this panel does. `updateNodes` still works unmodified as the commit path here:
+// this block only ever renders while exactly one table node is selected, so applying the same patch
+// "to every selected node" is applying it to just that one, same as TableStructureFields.
+function TableCellFields({
+  node,
+  range,
+  updateNodes,
+}: {
+  node: WhiteboardNode;
+  range: { r0: number; c0: number; r1: number; c1: number };
+  updateNodes: (patch: Partial<WhiteboardNode>) => void;
+}) {
+  const grid = resolveTableGrid(node);
+  // `range` is lifted up from WhiteboardTable.tsx's own live state (see this component's own doc
+  // comment) rather than derived fresh from `node` here, so it can go briefly stale relative to
+  // THIS render's grid - e.g. a row/column just got deleted (shrinking rows/cols) in the same tick
+  // that this panel re-renders with the OLD range still pointing past the new bounds, before that
+  // component's own onRangeChange effect has caught up and reported the clamped range back. Clamp
+  // defensively here too rather than indexing straight off a stale row/col - the CommonJS ??-chained
+  // read that follows never throws, but an un-clamped `grid.cellFill[range.r0]` could be `undefined`
+  // for an out-of-range row, and indexing INTO that for `[range.c0]` (or anchorBorders[side] below)
+  // would crash the whole style panel instead of just showing a one-tick-stale value.
+  const anchorRow = Math.min(range.r0, grid.rows - 1);
+  const anchorCol = Math.min(range.c0, grid.cols - 1);
+  const anchorFill = grid.cellFill[anchorRow][anchorCol];
+  const anchorBorders = grid.cellBorders[anchorRow][anchorCol];
+  const sideField = (label: string, side: "top" | "right" | "bottom" | "left") => (
+    <Field label={label}>
+      <select
+        value={anchorBorders[side] ?? "solid"}
+        onChange={(e) => updateNodes(withRangeBorderSide(node, range, side, e.target.value as TableBorderStyle))}
+        className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+      >
+        <option value="solid">Solid</option>
+        <option value="dashed">Dashed</option>
+        <option value="dotted">Dotted</option>
+        <option value="none">None</option>
+      </select>
+    </Field>
+  );
+  return (
+    <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">
+      <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-neutral-500">
+        {range.r0 === range.r1 && range.c0 === range.c1 ? "Cell" : "Cells"}
+      </p>
+      <Field label="Background">
+        <div className="flex items-center gap-1.5">
+          <input
+            type="color"
+            value={anchorFill ?? node.fillColor ?? "#ffffff"}
+            onChange={(e) => updateNodes(withRangeFill(node, range, e.target.value))}
+            className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent"
+          />
+          <button
+            type="button"
+            onClick={() => updateNodes(withRangeFill(node, range, null))}
+            disabled={!anchorFill}
+            className="text-[10px] text-gray-500 hover:text-gray-700 dark:text-neutral-400 dark:hover:text-neutral-200 disabled:opacity-30"
+            title="Clear override - back to the table's own background"
+          >
+            Clear
+          </button>
+        </div>
+      </Field>
+      {sideField("Top line", "top")}
+      {sideField("Right line", "right")}
+      {sideField("Bottom line", "bottom")}
+      {sideField("Left line", "left")}
+    </div>
+  );
+}
+
 const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   selectedNodes,
   selectedEdges,
+  tableRangeSelection,
   onBatchEditNodes,
   onEditEdge,
   onDeleteNode,
@@ -1014,6 +1100,9 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               specific-position all live in WhiteboardTable.tsx instead (see its own top comment). */}
           {selectedNodes.length === 1 && selectedNodes[0].shapeType === "table" && (
             <TableStructureFields node={selectedNodes[0]} updateNodes={updateNodes} />
+          )}
+          {selectedNodes.length === 1 && selectedNodes[0].shapeType === "table" && tableRangeSelection?.nodeId === selectedNodes[0].id && (
+            <TableCellFields node={selectedNodes[0]} range={tableRangeSelection.range} updateNodes={updateNodes} />
           )}
           {selectedNodes.every((n) => n.shapeType === "freehand") && (
             <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">

@@ -24,7 +24,7 @@
 // editEdge/addNode call) on pointer release - the same "stage locally, commit once" discipline
 // BoardCanvas.tsx's own liveImages uses, so a whole gesture is exactly one undo step.
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
-import { TbRotateClockwise } from "react-icons/tb";
+import { TbRotateClockwise, TbArrowsMove } from "react-icons/tb";
 import katex from "katex";
 import LatticeGaugeWidget from "./LatticeGaugeWidget";
 import WhiteboardTable from "./WhiteboardTable";
@@ -402,6 +402,12 @@ interface WhiteboardCanvasProps {
   // angle popover, the amplifier lead handles) don't need this prop at all - they already read
   // `liveNodes`/`interactionRef` directly during render.
   onLiveNodesChange?: (nodes: WhiteboardNode[] | null) => void;
+  // A "table" node's own currently-selected cell/row/column range (or null) - see
+  // WhiteboardTable.tsx's own onRangeChange prop doc comment for why this needs to reach
+  // WhiteboardStylePanel.tsx (its "Cell" background/border-style controls). Fired with the owning
+  // node's id since, unlike selectedNodeIds, only one table's own internal range is ever "live" at a
+  // time regardless of how many nodes exist.
+  onTableRangeChange?: (nodeId: string, range: { r0: number; c0: number; r1: number; c1: number } | null) => void;
 }
 
 function clampZoom(z: number): number {
@@ -519,6 +525,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   onQuickConnectArrowClick,
   onItemContextMenu,
   onLiveNodesChange,
+  onTableRangeChange,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
@@ -1613,8 +1620,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           // Hover-arrow "pick a connected shape" (see onQuickConnectArrowClick/placeConnectedShape)
           // - hidden while any tool is armed or a connector drag is underway so it doesn't compete
           // with that other intent, and (like the connection dots) only on shapes an edge can
-          // actually anchor to.
-          const showQuickConnectArrows = isConnectable && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
+          // actually anchor to. Also hidden for "table" - it sits at the exact same top/left/right/
+          // bottom-center positions as WhiteboardTable.tsx's own row/column selector handles and
+          // insert/delete affordances (both are "small chrome just outside a selected shape's own
+          // edges"), so showing both here would just overlap; a table can still be connected TO via
+          // the explicit connector tool (it's not in NON_CONNECTABLE_SHAPES), this only suppresses
+          // the automatic hover shortcut.
+          const showQuickConnectArrows =
+            isConnectable && node.shapeType !== "table" && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
           const outline = shapeOutlineFor(node.shapeType, node.width, node.height, {
             sides: node.sides,
             starPoints: node.starPoints,
@@ -1733,7 +1746,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   onSelect={() => onSelectionChange(new Set([node.id]), new Set())}
                 />
               ) : node.shapeType === "table" ? (
-                <WhiteboardTable node={node} selected={selected} canvasZoom={zoom} onCommit={(patch) => onEditNode(node, { ...node, ...patch })} />
+                <WhiteboardTable
+                  node={node}
+                  selected={selected}
+                  canvasZoom={zoom}
+                  onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
+                  onRangeChange={(range) => onTableRangeChange?.(node.id, range)}
+                />
               ) : node.shapeType === "ellipse" ? (
                 <div
                   style={{
@@ -1931,6 +1950,31 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     />
                   );
                 })}
+
+              {/* Move handle - "table" is the one shapeType whose selected-state body intercepts
+                  every pointerdown over it (WhiteboardTable.tsx drills into cell editing/range-select
+                  once selected - see that file's own top-of-file doc comment), so once selected there
+                  is no longer any place to click-drag the table itself, and no gap to click through
+                  to a table stacked underneath it either. A dedicated handle above the TOP-LEFT
+                  corner (top-right is the rotate handle's spot) hands that back: it's a plain child
+                  of this node's own div, so a pointerdown here that does nothing but call
+                  beginMoveNode behaves exactly like grabbing any other shape's body would. */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && node.shapeType === "table" && (
+                <div
+                  onPointerDown={(e) => beginMoveNode(node, e, e.shiftKey)}
+                  className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-600 text-blue-600 hover:text-white flex items-center justify-center shadow-sm"
+                  style={{
+                    left: -ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                    top: -ROTATE_HANDLE_GAP / zoom - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                    width: ROTATE_ICON_SCREEN_SIZE / zoom,
+                    height: ROTATE_ICON_SCREEN_SIZE / zoom,
+                    cursor: "grab",
+                  }}
+                  title="Drag to move this table"
+                >
+                  <TbArrowsMove size={ROTATE_ICON_SCREEN_SIZE * 0.7} style={{ width: "70%", height: "70%" }} />
+                </div>
+              )}
 
               {/* Rotate handle - a small icon button above the shape's TOP-RIGHT corner (not
                   top-center, where it used to sit): centered horizontally, it collided with the

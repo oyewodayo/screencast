@@ -43,6 +43,10 @@ export interface UseWhiteboardStoreResult {
   deleteEdge: (edge: WhiteboardEdge) => void;
   // Full replacement order for the whole nodes array - "Bring to front" / "Send to back".
   reorderNodes: (newOrder: WhiteboardNode[]) => void;
+  // Adds any number of nodes/edges (a clipboard paste) as a single undo step - see
+  // whiteboardTypes.ts's "paste-items" command doc comment. Callers own id generation/positioning
+  // (WhiteboardEditor.tsx's handlePaste) - this just dispatches the already-prepared items.
+  pasteItems: (nodes: WhiteboardNode[], edges: WhiteboardEdge[]) => void;
   setShowGrid: (show: boolean) => void;
   setSnapToGrid: (snap: boolean) => void;
   // Not an undo command - same reasoning as Board/Docs not undo-tracking a title edit.
@@ -240,6 +244,14 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
 
   const deleteEdge = useCallback((edge: WhiteboardEdge) => dispatch({ type: "delete-edge", item: edge }), [dispatch]);
 
+  const pasteItems = useCallback(
+    (nodes: WhiteboardNode[], edges: WhiteboardEdge[]) => {
+      if (nodes.length === 0) return;
+      dispatch({ type: "paste-items", nodes, edges });
+    },
+    [dispatch]
+  );
+
   const reorderNodes = useCallback(
     (newOrder: WhiteboardNode[]) => {
       const page = docRef.current?.pages.find((p) => p.id === docRef.current!.activePageId);
@@ -394,6 +406,7 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     editEdge,
     deleteEdge,
     reorderNodes,
+    pasteItems,
     setShowGrid,
     setSnapToGrid,
     renameWhiteboard,

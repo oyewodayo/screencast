@@ -24,6 +24,8 @@ import {
   WhiteboardNode,
   WhiteboardPage,
   WhiteboardShapeType,
+  TableBorderStyle,
+  TableMergedCell,
   resolveTableGrid,
 } from "../utils/whiteboardTypes";
 
@@ -911,6 +913,93 @@ function angleOutlineD(w: number, h: number, degrees: number, ray1Frac: number, 
 // shapes, so (unlike those) they keep the normal default fillColor rather than being in
 // LINE_ONLY_SHAPES.
 
+// ---- Arithmetic-sign glyphs (draw.io's own "Math" shape palette) ---------------------------------
+//
+// "+" is deliberately not among these - it's the exact same plus-sign silhouette "cross" already
+// draws, just offered again under a math-specific label (see WhiteboardEditor.tsx's own preset
+// list). These three keep the same "closed shape, normal default fillColor" treatment as the
+// general-purpose glyphs above.
+
+// The "x" glyph as the same 12-point plus-sign silhouette "cross" uses, rotated 45 degrees about
+// its own center and rescaled so the rotated shape still touches this shape's own w x h bounding
+// box (rotating first would overflow it, since a square's diagonal is longer than its side) - kept
+// as its own helper rather than parameterizing "cross" itself, to avoid any risk of shifting that
+// already-shipped shape's established look.
+function multiplySignPoints(w: number, h: number): [number, number][] {
+  const ht = 0.32; // arm half-thickness, as a fraction of the unit shape's own half-extent (1)
+  const unit: [number, number][] = [
+    [-ht, -1], [ht, -1], [ht, -ht], [1, -ht], [1, ht], [ht, ht],
+    [ht, 1], [-ht, 1], [-ht, ht], [-1, ht], [-1, -ht], [-ht, -ht],
+  ];
+  const cos45 = Math.SQRT1_2;
+  const rotated = unit.map(([x, y]): [number, number] => [(x - y) * cos45, (x + y) * cos45]);
+  const maxAbs = Math.max(...rotated.flat().map(Math.abs));
+  const scale = Math.min(w, h) / 2 / maxAbs;
+  const cx = w / 2;
+  const cy = h / 2;
+  return rotated.map(([x, y]): [number, number] => [cx + x * scale, cy + y * scale]);
+}
+
+// The division-sign glyph - a horizontal bar plus a small filled dot above and below it. Two disjoint rect/
+// circle subpaths in one "path" outline (rather than "polygon", which is a single closed ring) -
+// SVG fills each subpath independently, so the gaps between the bar and the dots stay unfilled.
+function divideSignOutlineD(w: number, h: number): string {
+  const barT = h * 0.16;
+  const cy = h / 2;
+  const dotR = h * 0.09;
+  const dotOffset = h * 0.28;
+  const cx = w / 2;
+  const circle = (ccx: number, ccy: number, r: number) => `M${ccx - r},${ccy} A${r},${r} 0 1,0 ${ccx + r},${ccy} A${r},${r} 0 1,0 ${ccx - r},${ccy} Z`;
+  return [
+    `M0,${cy - barT / 2} L${w},${cy - barT / 2} L${w},${cy + barT / 2} L0,${cy + barT / 2} Z`,
+    circle(cx, cy - dotOffset, dotR),
+    circle(cx, cy + dotOffset, dotR),
+  ].join(" ");
+}
+
+// The "=" glyph - two stacked horizontal bars, as two disjoint rect subpaths in one "path" outline
+// (same reasoning as divideSignOutlineD's own doc comment).
+function equalsSignOutlineD(w: number, h: number): string {
+  const t = h * 0.18;
+  const gap = h * 0.22;
+  const cy = h / 2;
+  const topCenter = cy - gap / 2 - t / 2;
+  const bottomCenter = cy + gap / 2 + t / 2;
+  const bar = (c: number) => `M0,${c - t / 2} L${w},${c - t / 2} L${w},${c + t / 2} L0,${c + t / 2} Z`;
+  return [bar(topCenter), bar(bottomCenter)].join(" ");
+}
+
+// The ">" glyph - a 4-point "dart": two outer corners (top-left, bottom-left) and the tip (right)
+// trace the familiar chevron silhouette, and the 4th point (pulled back left from the tip, at
+// vertical center) cuts a concave notch into it that gives the chevron its arm thickness - the same
+// simple closed-quadrilateral construction as any other filled "arrow/chevron" icon (e.g. Font
+// Awesome's solid chevrons). `mirrored` flips it into "<" by swapping which side the tip is on.
+function chevronPoints(w: number, h: number, mirrored: boolean): [number, number][] {
+  const insetX = w * 0.42; // how far the notch cuts back from the tip - controls arm thickness
+  const outerX = mirrored ? w : 0;
+  const tipX = mirrored ? 0 : w;
+  const notchX = mirrored ? w - insetX : insetX;
+  return [[outerX, 0], [tipX, h / 2], [outerX, h], [notchX, h / 2]];
+}
+
+// The "≥"/"≤" glyph - the same chevron as chevronPoints, compressed into the upper portion of the
+// box, plus a single horizontal bar underneath with a small gap - two disjoint subpaths in one
+// "path" outline (same technique as divideSignOutlineD/equalsSignOutlineD; "polygon" can only trace
+// one closed ring, and the chevron and the bar are two separate fillable regions).
+function chevronBarOutlineD(w: number, h: number, mirrored: boolean): string {
+  const chevronH = h * 0.58;
+  const gap = h * 0.1;
+  const barT = h * 0.16;
+  const insetX = w * 0.42;
+  const outerX = mirrored ? w : 0;
+  const tipX = mirrored ? 0 : w;
+  const notchX = mirrored ? w - insetX : insetX;
+  const chevron = `M${outerX},0 L${tipX},${(chevronH / 2).toFixed(2)} L${outerX},${chevronH.toFixed(2)} L${notchX.toFixed(2)},${(chevronH / 2).toFixed(2)} Z`;
+  const barCy = chevronH + gap + barT / 2;
+  const bar = `M0,${(barCy - barT / 2).toFixed(2)} L${w},${(barCy - barT / 2).toFixed(2)} L${w},${(barCy + barT / 2).toFixed(2)} L0,${(barCy + barT / 2).toFixed(2)} Z`;
+  return `${chevron} ${bar}`;
+}
+
 // Two triangles meeting at the center - traced as one continuous polygon that touches itself at
 // that shared vertex rather than crossing through it, which is what keeps this a clean bowtie
 // silhouette instead of a self-intersecting mess.
@@ -1649,6 +1738,25 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
           opts?.plotShowGrid ?? false
         ),
       };
+    case "minusSign": {
+      const t = h * 0.28;
+      const cy = h / 2;
+      return { kind: "polygon", points: [[0, cy - t / 2], [w, cy - t / 2], [w, cy + t / 2], [0, cy + t / 2]] };
+    }
+    case "multiplySign":
+      return { kind: "polygon", points: multiplySignPoints(w, h) };
+    case "divideSign":
+      return { kind: "path", d: divideSignOutlineD(w, h) };
+    case "equalsSign":
+      return { kind: "path", d: equalsSignOutlineD(w, h) };
+    case "greaterThanSign":
+      return { kind: "polygon", points: chevronPoints(w, h, false) };
+    case "lessThanSign":
+      return { kind: "polygon", points: chevronPoints(w, h, true) };
+    case "greaterEqualSign":
+      return { kind: "path", d: chevronBarOutlineD(w, h, false) };
+    case "lessEqualSign":
+      return { kind: "path", d: chevronBarOutlineD(w, h, true) };
     case "table": {
       const cols = Math.max(1, opts?.tableCols ?? DEFAULT_TABLE_COLS);
       const rows = Math.max(1, opts?.tableRows ?? DEFAULT_TABLE_ROWS);
@@ -1747,6 +1855,13 @@ export function applyCommand(page: WhiteboardPage, command: WhiteboardCommand): 
       return { ...page, edges: page.edges.map((e) => (e.id === command.after.id ? command.after : e)) };
     case "reorder-nodes":
       return { ...page, nodes: command.after };
+    case "paste-items":
+      return { ...page, nodes: [...page.nodes, ...command.nodes], edges: [...page.edges, ...command.edges] };
+    case "delete-items": {
+      const nodeIds = new Set(command.nodes.map((n) => n.id));
+      const edgeIds = new Set(command.edges.map((e) => e.id));
+      return { ...page, nodes: page.nodes.filter((n) => !nodeIds.has(n.id)), edges: page.edges.filter((e) => !edgeIds.has(e.id)) };
+    }
   }
 }
 
@@ -1777,6 +1892,13 @@ export function invertCommand(command: WhiteboardCommand): WhiteboardCommand {
       return { type: "edit-edge", before: command.after, after: command.before };
     case "reorder-nodes":
       return { type: "reorder-nodes", before: command.after, after: command.before };
+    // Exact mirror of each other - no special-casing needed in useWhiteboardStore's undo()/redo()
+    // the way "delete-node" needs (see undoDeleteNode's own doc comment): both directions of a
+    // paste/un-paste are already fully expressible as one one of these two command types.
+    case "paste-items":
+      return { type: "delete-items", nodes: command.nodes, edges: command.edges };
+    case "delete-items":
+      return { type: "paste-items", nodes: command.nodes, edges: command.edges };
   }
 }
 
@@ -2100,44 +2222,113 @@ function paintTable(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
   for (const f of grid.rowHeights) rowBounds.push(rowBounds[rowBounds.length - 1] + f * h);
   const headerRow = node.tableHeaderRow ?? true;
 
-  if (node.fillColor) {
-    ctx.fillStyle = node.fillColor;
-    ctx.fillRect(0, 0, w, h);
+  // Same anchor/covered bookkeeping as WhiteboardTable.tsx's own render loop (see its doc comment) -
+  // a merged region draws (and gets clicked/edited) as one cell stretched over its neighbors, so
+  // the export has to skip both the interior grid lines and the covered cells' own (possibly stale)
+  // text the same way the live view does.
+  const mergeAt = new Map<string, TableMergedCell>();
+  const covered = new Set<string>();
+  for (const m of grid.mergedCells) {
+    mergeAt.set(`${m.row}-${m.col}`, m);
+    for (let rr = m.row; rr < m.row + m.rowSpan; rr++)
+      for (let cc = m.col; cc < m.col + m.colSpan; cc++) if (!(rr === m.row && cc === m.col)) covered.add(`${rr}-${cc}`);
+  }
+
+  // Background - per-cell override (WhiteboardNode.tableCellFill) falling back to the table's own
+  // fillColor, same as WhiteboardTable.tsx's own per-cell backgroundColor.
+  for (let r = 0; r < grid.rows; r++) {
+    for (let c = 0; c < grid.cols; c++) {
+      if (covered.has(`${r}-${c}`)) continue;
+      const merge = mergeAt.get(`${r}-${c}`);
+      const spanRows = merge?.rowSpan ?? 1;
+      const spanCols = merge?.colSpan ?? 1;
+      const fill = grid.cellFill[r][c] ?? node.fillColor;
+      if (fill) {
+        ctx.fillStyle = fill;
+        ctx.fillRect(colBounds[c], rowBounds[r], colBounds[c + spanCols] - colBounds[c], rowBounds[r + spanRows] - rowBounds[r]);
+      }
+    }
   }
   if (headerRow && grid.rows > 0) {
     ctx.fillStyle = "rgba(0,0,0,0.06)";
     ctx.fillRect(0, 0, w, rowBounds[1]);
   }
+  // The table's own outer edges - always the plain uniform stroke (same limitation
+  // WhiteboardTable.tsx's own dedicated outer-border overlay div has: a per-cell override on an
+  // OUTER edge can still ADD a dashed/dotted line on top of this, but can't erase it via "none" -
+  // see this function's own per-cell pass below).
   if (node.strokeWidth > 0) {
     ctx.lineWidth = node.strokeWidth;
     ctx.strokeStyle = node.strokeColor;
+    ctx.setLineDash([]);
     ctx.strokeRect(0, 0, w, h);
-    ctx.beginPath();
-    for (const x of colBounds.slice(1, -1)) {
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-    }
-    for (const y of rowBounds.slice(1, -1)) {
-      ctx.moveTo(0, y);
-      ctx.lineTo(w, y);
-    }
-    ctx.stroke();
   }
+  // Per-cell interior grid lines - each honoring its own tableCellBorders override where present
+  // (dashed/dotted line style, or "none" to remove an interior line entirely), else the ordinary
+  // uniform solid stroke. Only right/bottom draw by DEFAULT (the near edge is always some other
+  // cell's own far edge, or the outer rect above - same "each cell draws its own right/bottom only"
+  // convention WhiteboardTable.tsx's CSS borders use); top/left only ever draw when explicitly
+  // overridden to something visibly different from that invisible default.
+  const dashFor = (style: TableBorderStyle): number[] => (style === "dashed" ? [6, 4] : style === "dotted" ? [1.5, 3] : []);
+  const strokeSide = (style: TableBorderStyle, x1: number, y1: number, x2: number, y2: number) => {
+    if (style === "none") return;
+    ctx.lineWidth = node.strokeWidth > 0 ? node.strokeWidth : 1;
+    ctx.strokeStyle = node.strokeColor;
+    ctx.setLineDash(dashFor(style));
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  };
+  for (let r = 0; r < grid.rows; r++) {
+    for (let c = 0; c < grid.cols; c++) {
+      if (covered.has(`${r}-${c}`)) continue;
+      const merge = mergeAt.get(`${r}-${c}`);
+      const spanRows = merge?.rowSpan ?? 1;
+      const spanCols = merge?.colSpan ?? 1;
+      const right = colBounds[c + spanCols];
+      const bottom = rowBounds[r + spanRows];
+      const overrides = grid.cellBorders[r][c];
+      // A boundary has two owners - this cell's own right/bottom (default side) and the touching
+      // neighbor's left/top (override-only, per the comment above). If that neighbor already claims
+      // the boundary via an explicit override, this cell's own default must NOT also draw it, or the
+      // export doubles up a solid line right alongside the neighbor's dashed/dotted one - same fix as
+      // WhiteboardTable.tsx's own sideBorder().
+      const neighborOverride = (nr: number, nc: number, side: "top" | "left"): TableBorderStyle | undefined => {
+        if (covered.has(`${nr}-${nc}`)) return undefined;
+        const o = grid.cellBorders[nr]?.[nc]?.[side];
+        return o && o !== "solid" ? o : undefined;
+      };
+      const rightStyle =
+        overrides.right ?? (c + spanCols < grid.cols && node.strokeWidth > 0 && !neighborOverride(r, c + spanCols, "left") ? "solid" : "none");
+      strokeSide(rightStyle, right, rowBounds[r], right, bottom);
+      const bottomStyle =
+        overrides.bottom ?? (r + spanRows < grid.rows && node.strokeWidth > 0 && !neighborOverride(r + spanRows, c, "top") ? "solid" : "none");
+      strokeSide(bottomStyle, colBounds[c], bottom, right, bottom);
+      if (overrides.top === "dashed" || overrides.top === "dotted") strokeSide(overrides.top, colBounds[c], rowBounds[r], right, rowBounds[r]);
+      if (overrides.left === "dashed" || overrides.left === "dotted") strokeSide(overrides.left, colBounds[c], rowBounds[r], colBounds[c], bottom);
+    }
+  }
+  ctx.setLineDash([]);
 
   ctx.fillStyle = node.fontColor;
   ctx.textBaseline = "middle";
   ctx.textAlign = node.textAlign;
   const paddingX = 6;
   for (let r = 0; r < grid.rows; r++) {
-    const cellH = rowBounds[r + 1] - rowBounds[r];
     const isHeaderRow = headerRow && r === 0;
     const fontStyle = node.fontStyle === "italic" ? "italic " : "";
     const fontWeight = isHeaderRow || node.fontWeight === "bold" ? "bold " : "";
     ctx.font = `${fontStyle}${fontWeight}${node.fontSize}px ${node.fontFamily || "system-ui, sans-serif"}`;
     for (let c = 0; c < grid.cols; c++) {
+      if (covered.has(`${r}-${c}`)) continue;
       const text = grid.cellText[r][c];
       if (!text) continue;
-      const cellW = colBounds[c + 1] - colBounds[c];
+      const merge = mergeAt.get(`${r}-${c}`);
+      const spanRows = merge?.rowSpan ?? 1;
+      const spanCols = merge?.colSpan ?? 1;
+      const cellW = colBounds[c + spanCols] - colBounds[c];
+      const cellH = rowBounds[r + spanRows] - rowBounds[r];
       ctx.save();
       ctx.beginPath();
       ctx.rect(colBounds[c], rowBounds[r], cellW, cellH);
