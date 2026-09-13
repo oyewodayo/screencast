@@ -105,11 +105,11 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     // inherited unchanged from the parent extension via Tiptap's extension-chain resolution, so
     // this single option flip is all that's needed to change the node's schema group.
     DocImage.configure({ inline: true, docId: docId ?? null }),
-    Table.configure({ resizable: false }),
+    Table.configure({ resizable: true, lastColumnResizable: false, allowTableNodeSelection: true }),
     TableRow,
     TableHeader,
     TableCell,
-    TextAlign.configure({ types: ["heading", "paragraph"] }),
+    TextAlign.configure({ types: ["heading", "paragraph", "tableCell", "tableHeader"] }),
     TextStyle,
     Color,
     FontFamily,
@@ -173,4 +173,12 @@ export const docProseClassName = [
   "[&_[data-page-break]::after]:content-['Page_break'] [&_[data-page-break]::after]:absolute [&_[data-page-break]::after]:left-1/2 [&_[data-page-break]::after]:-translate-x-1/2 [&_[data-page-break]::after]:-top-2.5",
   "[&_[data-page-break]::after]:bg-white dark:[&_[data-page-break]::after]:bg-neutral-900 [&_[data-page-break]::after]:px-2 [&_[data-page-break]::after]:text-[10px] [&_[data-page-break]::after]:uppercase [&_[data-page-break]::after]:tracking-wide [&_[data-page-break]::after]:text-neutral-400",
   "print:[&_[data-page-break]]:[break-after:page] print:[&_[data-page-break]]:[page-break-after:always] print:[&_[data-page-break]]:border-none print:[&_[data-page-break]::after]:hidden",
+  "[&_.tableWrapper]:overflow-x-auto [&_.tableWrapper]:w-full [&_.tableWrapper]:my-4 [&_.tableWrapper]:pb-1",
+  "[&_.ProseMirror_table]:table-fixed [&_.ProseMirror_table]:border-collapse [&_.ProseMirror_table]:w-full [&_.ProseMirror_table]:min-w-[28rem]",
+  "[&_.ProseMirror_th]:relative [&_.ProseMirror_th]:border [&_.ProseMirror_th]:border-neutral-300 dark:[&_.ProseMirror_th]:border-neutral-700 [&_.ProseMirror_th]:bg-neutral-100 dark:[&_.ProseMirror_th]:bg-neutral-800 [&_.ProseMirror_th]:px-3 [&_.ProseMirror_th]:py-2 [&_.ProseMirror_th]:align-top",
+  "[&_.ProseMirror_td]:relative [&_.ProseMirror_td]:border [&_.ProseMirror_td]:border-neutral-300 dark:[&_.ProseMirror_td]:border-neutral-700 [&_.ProseMirror_td]:px-3 [&_.ProseMirror_td]:py-2 [&_.ProseMirror_td]:align-top",
+  "[&_.ProseMirror_th>p]:my-0 [&_.ProseMirror_td>p]:my-0 [&_.ProseMirror_th>*+*]:mt-2 [&_.ProseMirror_td>*+*]:mt-2",
+  "[&_.ProseMirror_.selectedCell]:after:content-[''] [&_.ProseMirror_.selectedCell]:after:absolute [&_.ProseMirror_.selectedCell]:after:inset-0 [&_.ProseMirror_.selectedCell]:after:bg-blue-400/20 [&_.ProseMirror_.selectedCell]:after:pointer-events-none",
+  "[&_.ProseMirror_.column-resize-handle]:absolute [&_.ProseMirror_.column-resize-handle]:right-[-2px] [&_.ProseMirror_.column-resize-handle]:top-0 [&_.ProseMirror_.column-resize-handle]:bottom-0 [&_.ProseMirror_.column-resize-handle]:w-1 [&_.ProseMirror_.column-resize-handle]:bg-blue-500 [&_.ProseMirror_.column-resize-handle]:pointer-events-none",
+  "[&_.ProseMirror.resize-cursor]:cursor-col-resize",
 ].join(" ");

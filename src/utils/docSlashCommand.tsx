@@ -81,7 +81,7 @@ function buildItems(docId: string): SlashCommandItem[] {
       keywords: ["table", "grid"],
       icon: MdTableChart,
       run: (editor, range) =>
-        editor.chain().focus().deleteRange(range).insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run(),
+        editor.chain().focus().deleteRange(range).insertTable({ rows: 3, cols: 4, withHeaderRow: true }).run(),
     },
     {
       title: "Divider",

@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::async_runtime::Mutex;
 use tauri::{AppHandle, Emitter, State, Window};
 
@@ -1498,6 +1499,193 @@ pub async fn generate_captions(
         .map_err(|e| format!("whisper-cli reported success but produced no readable output: {}", e))
 }
 
+#[tauri::command]
+pub async fn transcribe_doc_audio(
+    app_handle: AppHandle,
+    audio_bytes: Vec<u8>,
+    mime_type: Option<String>,
+    language: Option<String>,
+) -> Result<String, String> {
+    if audio_bytes.is_empty() {
+        return Err("No audio was recorded".to_string());
+    }
+
+    let whisper_path = crate::services::utility::get_whisper_cli_path(&app_handle)?;
+    let model_path = crate::services::utility::get_whisper_model_path(&app_handle)?;
+    if !whisper_path.exists() {
+        return Err(format!(
+            "whisper-cli not found at {} - see README's Getting Started for how to obtain it",
+            whisper_path.display()
+        ));
+    }
+    if !model_path.exists() {
+        return Err(format!(
+            "Speech-to-text model not found at {} - see README's Getting Started for how to obtain it",
+            model_path.display()
+        ));
+    }
+
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let work_dir = std::env::temp_dir().join("briefcast_doc_dictation");
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| format!("Failed to create dictation temp directory: {}", e))?;
+
+    let input_ext = audio_extension_for_mime(mime_type.as_deref());
+    let input_path = work_dir.join(format!("dictation-{}-{}.{}", std::process::id(), stamp, input_ext));
+    let wav_path = work_dir.join(format!("dictation-{}-{}.wav", std::process::id(), stamp));
+    let output_stem = work_dir.join(format!("dictation-{}-{}", std::process::id(), stamp));
+    let output_txt = output_stem.with_extension("txt");
+
+    std::fs::write(&input_path, audio_bytes)
+        .map_err(|e| format!("Failed to write recorded audio: {}", e))?;
+
+    let result = async {
+        extract_audio_for_whisper(&ffmpeg_path, &input_path, &wav_path).await?;
+        run_whisper_text_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem, &lang).await?;
+        std::fs::read_to_string(&output_txt)
+            .map(|text| normalize_whisper_text(&text))
+            .map_err(|e| format!("whisper-cli reported success but produced no readable transcript: {}", e))
+    }
+    .await;
+
+    let _ = std::fs::remove_file(&input_path);
+    let _ = std::fs::remove_file(&wav_path);
+    let _ = std::fs::remove_file(&output_txt);
+    result
+}
+
+fn audio_extension_for_mime(mime_type: Option<&str>) -> &'static str {
+    let mime = mime_type.unwrap_or("").to_ascii_lowercase();
+    if mime.contains("mp4") || mime.contains("m4a") {
+        "m4a"
+    } else if mime.contains("ogg") {
+        "ogg"
+    } else if mime.contains("wav") {
+        "wav"
+    } else {
+        "webm"
+    }
+}
+
+fn normalize_whisper_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn whisper_language_label(code: &str) -> String {
+    match code.to_ascii_lowercase().as_str() {
+        "en" => "English",
+        "zh" => "Chinese",
+        "de" => "German",
+        "es" => "Spanish",
+        "ru" => "Russian",
+        "ko" => "Korean",
+        "fr" => "French",
+        "ja" => "Japanese",
+        "pt" => "Portuguese",
+        "tr" => "Turkish",
+        "pl" => "Polish",
+        "ca" => "Catalan",
+        "nl" => "Dutch",
+        "ar" => "Arabic",
+        "sv" => "Swedish",
+        "it" => "Italian",
+        "id" => "Indonesian",
+        "hi" => "Hindi",
+        "fi" => "Finnish",
+        "vi" => "Vietnamese",
+        "he" => "Hebrew",
+        "uk" => "Ukrainian",
+        "el" => "Greek",
+        "ms" => "Malay",
+        "cs" => "Czech",
+        "ro" => "Romanian",
+        "da" => "Danish",
+        "hu" => "Hungarian",
+        "ta" => "Tamil",
+        "no" => "Norwegian",
+        "th" => "Thai",
+        "ur" => "Urdu",
+        "hr" => "Croatian",
+        "bg" => "Bulgarian",
+        "lt" => "Lithuanian",
+        "la" => "Latin",
+        "mi" => "Maori",
+        "ml" => "Malayalam",
+        "cy" => "Welsh",
+        "sk" => "Slovak",
+        "te" => "Telugu",
+        "fa" => "Persian",
+        "lv" => "Latvian",
+        "bn" => "Bengali",
+        "sr" => "Serbian",
+        "az" => "Azerbaijani",
+        "sl" => "Slovenian",
+        "kn" => "Kannada",
+        "et" => "Estonian",
+        "mk" => "Macedonian",
+        "br" => "Breton",
+        "eu" => "Basque",
+        "is" => "Icelandic",
+        "hy" => "Armenian",
+        "ne" => "Nepali",
+        "mn" => "Mongolian",
+        "bs" => "Bosnian",
+        "kk" => "Kazakh",
+        "sq" => "Albanian",
+        "sw" => "Swahili",
+        "gl" => "Galician",
+        "mr" => "Marathi",
+        "pa" => "Punjabi",
+        "si" => "Sinhala",
+        "km" => "Khmer",
+        "sn" => "Shona",
+        "yo" => "Yoruba",
+        "so" => "Somali",
+        "af" => "Afrikaans",
+        "oc" => "Occitan",
+        "ka" => "Georgian",
+        "be" => "Belarusian",
+        "tg" => "Tajik",
+        "sd" => "Sindhi",
+        "gu" => "Gujarati",
+        "am" => "Amharic",
+        "yi" => "Yiddish",
+        "lo" => "Lao",
+        "uz" => "Uzbek",
+        "fo" => "Faroese",
+        "ht" => "Haitian Creole",
+        "ps" => "Pashto",
+        "tk" => "Turkmen",
+        "nn" => "Nynorsk",
+        "mt" => "Maltese",
+        "sa" => "Sanskrit",
+        "lb" => "Luxembourgish",
+        "my" => "Myanmar",
+        "bo" => "Tibetan",
+        "tl" => "Tagalog",
+        "mg" => "Malagasy",
+        "as" => "Assamese",
+        "tt" => "Tatar",
+        "haw" => "Hawaiian",
+        "ln" => "Lingala",
+        "ha" => "Hausa",
+        "ba" => "Bashkir",
+        "jw" => "Javanese",
+        "su" => "Sundanese",
+        _ => code,
+    }
+    .to_string()
+}
+
 async fn extract_audio_for_whisper(
     ffmpeg_path: &PathBuf,
     input: &PathBuf,
@@ -1650,6 +1838,106 @@ async fn run_whisper_cli(
             ));
         }
         let _ = app_handle.emit("captions-progress", 100.0);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Transcription task panicked: {e}"))?
+}
+
+async fn run_whisper_text_cli(
+    app_handle: &AppHandle,
+    whisper_path: &PathBuf,
+    model_path: &PathBuf,
+    wav_path: &PathBuf,
+    output_stem: &PathBuf,
+    language: &str,
+) -> Result<(), String> {
+    let app_handle = app_handle.clone();
+    let whisper_path = whisper_path.clone();
+    let model_path = model_path.clone();
+    let wav_path = wav_path.clone();
+    let output_stem = output_stem.clone();
+    let language = language.to_string();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(4);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&whisper_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-m").arg(path_to_str(&model_path)?);
+        cmd.arg("-f").arg(path_to_str(&wav_path)?);
+        cmd.args(["-otxt", "-np", "-pp", "-t", &threads.to_string(), "-l", &language]);
+        cmd.arg("-of").arg(path_to_str(&output_stem)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to start whisper-cli: {}", e))?;
+
+        let stdout = child.stdout.take().ok_or("Failed to capture whisper-cli stdout")?;
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if line.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stderr = child.stderr.take().ok_or("Failed to capture whisper-cli stderr")?;
+        let app_handle_for_stderr = app_handle.clone();
+        let stderr_thread = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let mut full_output = String::new();
+            let progress_re = regex::Regex::new(r"progress\s*=\s*(\d+)%").unwrap();
+            let language_re = regex::Regex::new(r"(?:auto-)?detected language:\s*([A-Za-z][A-Za-z_-]*)").unwrap();
+            let mut emitted_language = false;
+
+            for line in reader.lines() {
+                let Ok(line) = line else { continue };
+                full_output.push_str(&line);
+                full_output.push('\n');
+
+                if let Some(caps) = progress_re.captures(&line) {
+                    if let Ok(pct) = caps[1].parse::<f64>() {
+                        let _ = app_handle_for_stderr.emit("docs-dictation-progress", pct);
+                    }
+                }
+                if !emitted_language {
+                    if let Some(caps) = language_re.captures(&line.to_ascii_lowercase()) {
+                        let label = whisper_language_label(&caps[1]);
+                        let _ = app_handle_for_stderr.emit("docs-dictation-language", label);
+                        emitted_language = true;
+                    }
+                }
+            }
+
+            full_output
+        });
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed to wait for whisper-cli: {}", e))?;
+        let stderr_output = stderr_thread.join().unwrap_or_default();
+
+        if !status.success() {
+            let tail: Vec<&str> = stderr_output
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .rev()
+                .take(3)
+                .collect();
+            let reason: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+            return Err(format!(
+                "whisper-cli transcription failed: {}",
+                if reason.is_empty() { "unknown error".to_string() } else { reason }
+            ));
+        }
+        let _ = app_handle.emit("docs-dictation-progress", 100.0);
         Ok(())
     })
     .await
