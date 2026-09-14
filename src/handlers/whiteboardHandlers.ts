@@ -498,6 +498,7 @@ export interface ShapeOutlineOptions {
   graphShowGrid?: boolean; // "graph" only
   graphXTickInterval?: number; // "graph" only
   graphYTickInterval?: number; // "graph" only
+  graphPoints?: { x: number; y: number }[]; // "graph" only
   ampInputTopLeadLength?: number; // "amplifier" only
   ampInputBottomLeadLength?: number; // "amplifier" only
   ampOutputLeadLength?: number; // "amplifier" only
@@ -1215,7 +1216,12 @@ function formatTick(n: number): string {
 // N evenly-spaced columns above it scaled to the series' own max value - `columnX`/`baselineY`/
 // `valueToY` are exposed so each chart type only has to describe what it draws AT each column, not
 // re-derive the shared layout. `max` is exposed too so callers can build matching Y-axis tick labels.
-function chartColumnLayout(w: number, h: number, values: number[]) {
+// Exported (not just used internally by barChartOutline/lineChartOutline/scatterPlotOutline below)
+// so WhiteboardCanvas.tsx's own interactive drag handles (beginChartDataDrag - click a bar/point/dot
+// and drag it to change that one value live) can compute the exact same column positions and
+// pixels-per-unit scale the static render already used, rather than reimplementing this layout a
+// second time and risking the two drifting apart.
+export function chartColumnLayout(w: number, h: number, values: number[]) {
   const n = Math.max(1, values.length);
   const baselineY = h * 0.88;
   const topY = h * 0.08;
@@ -1802,13 +1808,57 @@ function robustGraphYRange(values: number[]): [number, number] {
   return [lo - pad, hi + pad];
 }
 
-// Samples the compiled expression densely across [xMin, xMax], auto-fitting (or, if explicitly set,
-// using) the y-range, then traces the curve as one or more SEPARATE subpaths - split wherever a
-// sample is non-finite (NaN/Infinity - e.g. sqrt of a negative number, log of zero) or jumps by more
-// than a few multiples of the plotted y-range between consecutive samples (a real discontinuity/
-// asymptote, e.g. tan(x) or 1/x crossing x=0) - a single path straight through either case would draw
-// a spurious near-vertical line connecting the two sides, which isn't part of the actual graph.
-// Otherwise mirrors functionPlotOutline's own axis-line/grid/tick-label layout exactly.
+// The screen<->data-space mapping for a "graph" node's own plot area - shared by graphOutline
+// (building every static SVG path) and WhiteboardCanvas.tsx's own live interactive point handles
+// (rendering WhiteboardNode.graphPoints' current pixel position, and inverse-mapping a drag/
+// double-click pixel back into data-space) so both always agree on exactly where a given data
+// point sits, with no risk of two independent reimplementations of the same formula drifting apart.
+export function graphCoordinateMapper(w: number, h: number, xMin: number, xMax: number, yMin: number, yMax: number) {
+  const padX = w * 0.08;
+  const padY = h * 0.08;
+  const plotW = w - padX * 2;
+  const plotH = h - padY * 2;
+  const xRange = xMax - xMin || 1;
+  const yRange = yMax - yMin || 1;
+  const mapX = (x: number) => padX + ((x - xMin) / xRange) * plotW;
+  const mapY = (y: number) => padY + plotH - ((y - yMin) / yRange) * plotH;
+  const invMapX = (px: number) => xMin + ((px - padX) / plotW) * xRange;
+  const invMapY = (py: number) => yMin + (1 - (py - padY) / plotH) * yRange;
+  return { padX, padY, plotW, plotH, mapX, mapY, invMapX, invMapY };
+}
+
+// The x/y-range WhiteboardCanvas.tsx's own manual-point handles resolve a "graph" node's axes to -
+// deliberately NOT the same as graphOutline's own y-range (which, with no explicit graphYMin/
+// graphYMax, auto-fits to the sampled FORMULA curve's values, expensive to recompute on every
+// pointermove of a point drag and moot anyway for the primary manual-plotting use case: a "Blank
+// Graph" has no formula to sample at all). Manual points instead always resolve against the
+// explicit graphYMin/graphYMax, or DEFAULT_GRAPH_Y_MIN/MAX absent those - exactly what graphOutline
+// ALSO falls back to whenever there's no formula curve to auto-fit from (see its own hasExpression
+// branch below), so the two stay pixel-consistent for the common "blank graph, manual points only"
+// case. Combining manual points with an auto-fit-Y formula curve at the same time is the one
+// scenario these can visibly disagree in - turning Auto Y range off (or using Blank Graph, which
+// never has a curve to auto-fit from) keeps them exactly in sync.
+export function resolveGraphAxisRange(node: { graphXMin?: number; graphXMax?: number; graphYMin?: number; graphYMax?: number }): { xMin: number; xMax: number; yMin: number; yMax: number } {
+  let xMin = node.graphXMin ?? DEFAULT_GRAPH_X_MIN;
+  let xMax = node.graphXMax ?? DEFAULT_GRAPH_X_MAX;
+  if (xMax <= xMin) xMax = xMin + 1;
+  let yMin = node.graphYMin ?? DEFAULT_GRAPH_Y_MIN;
+  let yMax = node.graphYMax ?? DEFAULT_GRAPH_Y_MAX;
+  if (yMax <= yMin) yMax = yMin + 1;
+  return { xMin, xMax, yMin, yMax };
+}
+
+// Samples the compiled expression (if any - an empty/blank `expression`, the "Blank Graph" preset's
+// own starting state, draws no formula curve at all, just axes/grid/manual points) densely across
+// [xMin, xMax], auto-fitting (or, if explicitly set, using) the y-range, then traces the curve as
+// one or more SEPARATE subpaths - split wherever a sample is non-finite (NaN/Infinity - e.g. sqrt of
+// a negative number, log of zero) or jumps by more than a few multiples of the plotted y-range
+// between consecutive samples (a real discontinuity/asymptote, e.g. tan(x) or 1/x crossing x=0) - a
+// single path straight through either case would draw a spurious near-vertical line connecting the
+// two sides, which isn't part of the actual graph. `manualPoints` (WhiteboardNode.graphPoints, data-
+// space) draw as their OWN additional straight-segment polyline (2+ points) or a single dot (exactly
+// 1) - independent of, and layered on top of, the formula curve. Otherwise mirrors
+// functionPlotOutline's own axis-line/grid/tick-label layout exactly.
 function graphOutline(
   w: number,
   h: number,
@@ -1820,52 +1870,61 @@ function graphOutline(
   xTickInterval: number | undefined,
   yTickInterval: number | undefined,
   showLabels = true,
-  showGrid = true
+  showGrid = true,
+  manualPoints: { x: number; y: number }[] = []
 ): { parts: ChartPart[]; labels: ChartLabel[] } {
   let xMin = xMinInput ?? DEFAULT_GRAPH_X_MIN;
   let xMax = xMaxInput ?? DEFAULT_GRAPH_X_MAX;
   if (xMax <= xMin) xMax = xMin + 1;
-  const compiled = compileGraphExpression(expression || DEFAULT_GRAPH_EXPRESSION);
+  const hasExpression = expression.trim() !== "";
+  const compiled = hasExpression ? compileGraphExpression(expression) : null;
   const raw: { x: number; y: number }[] = [];
-  for (let i = 0; i <= GRAPH_SAMPLE_COUNT; i++) {
-    const x = xMin + ((xMax - xMin) * i) / GRAPH_SAMPLE_COUNT;
-    const y = compiled.evaluate ? compiled.evaluate(x) : NaN;
-    raw.push({ x, y: Number.isFinite(y) ? y : NaN });
+  if (hasExpression) {
+    for (let i = 0; i <= GRAPH_SAMPLE_COUNT; i++) {
+      const x = xMin + ((xMax - xMin) * i) / GRAPH_SAMPLE_COUNT;
+      const y = compiled?.evaluate ? compiled.evaluate(x) : NaN;
+      raw.push({ x, y: Number.isFinite(y) ? y : NaN });
+    }
   }
-  const finiteYs = raw.map((p) => p.y).filter((y) => Number.isFinite(y));
-  const [autoYMin, autoYMax] = robustGraphYRange(finiteYs);
-  let yMin = yMinInput ?? autoYMin;
-  let yMax = yMaxInput ?? autoYMax;
+  const finiteYs = [...raw.map((p) => p.y).filter((y) => Number.isFinite(y)), ...manualPoints.map((p) => p.y)];
+  let yMin: number;
+  let yMax: number;
+  if (hasExpression) {
+    const [autoYMin, autoYMax] = robustGraphYRange(finiteYs);
+    yMin = yMinInput ?? autoYMin;
+    yMax = yMaxInput ?? autoYMax;
+  } else {
+    yMin = yMinInput ?? DEFAULT_GRAPH_Y_MIN;
+    yMax = yMaxInput ?? DEFAULT_GRAPH_Y_MAX;
+  }
   if (yMax <= yMin) yMax = yMin + 1;
   const yRange = yMax - yMin;
-  const padX = w * 0.08;
-  const padY = h * 0.08;
-  const plotW = w - padX * 2;
-  const plotH = h - padY * 2;
-  const mapX = (x: number) => padX + ((x - xMin) / (xMax - xMin)) * plotW;
-  const mapY = (y: number) => padY + plotH - ((y - yMin) / yRange) * plotH;
+  const { padX, padY, plotW, plotH, mapX, mapY } = graphCoordinateMapper(w, h, xMin, xMax, yMin, yMax);
 
-  const jumpThreshold = yRange * 2.5;
-  const subpaths: { x: number; y: number }[][] = [];
-  let current: { x: number; y: number }[] = [];
-  let prevRawY: number | null = null;
-  for (const p of raw) {
-    if (!Number.isFinite(p.y)) {
-      if (current.length > 1) subpaths.push(current);
-      current = [];
-      prevRawY = null;
-      continue;
+  let curveD = "";
+  if (hasExpression) {
+    const jumpThreshold = yRange * 2.5;
+    const subpaths: { x: number; y: number }[][] = [];
+    let current: { x: number; y: number }[] = [];
+    let prevRawY: number | null = null;
+    for (const p of raw) {
+      if (!Number.isFinite(p.y)) {
+        if (current.length > 1) subpaths.push(current);
+        current = [];
+        prevRawY = null;
+        continue;
+      }
+      if (prevRawY !== null && Math.abs(p.y - prevRawY) > jumpThreshold) {
+        if (current.length > 1) subpaths.push(current);
+        current = [];
+      }
+      const clampedY = Math.max(yMin - yRange, Math.min(yMax + yRange, p.y));
+      current.push({ x: mapX(p.x), y: mapY(clampedY) });
+      prevRawY = p.y;
     }
-    if (prevRawY !== null && Math.abs(p.y - prevRawY) > jumpThreshold) {
-      if (current.length > 1) subpaths.push(current);
-      current = [];
-    }
-    const clampedY = Math.max(yMin - yRange, Math.min(yMax + yRange, p.y));
-    current.push({ x: mapX(p.x), y: mapY(clampedY) });
-    prevRawY = p.y;
+    if (current.length > 1) subpaths.push(current);
+    curveD = subpaths.map((pts) => openPathD(pts)).join(" ");
   }
-  if (current.length > 1) subpaths.push(current);
-  const curveD = subpaths.map((pts) => openPathD(pts)).join(" ");
 
   const yAxisY = yMin <= 0 && yMax >= 0 ? mapY(0) : padY + plotH;
   const xAxisX = xMin <= 0 && xMax >= 0 ? mapX(0) : padX;
@@ -1881,6 +1940,11 @@ function graphOutline(
     if (gridLines.length > 0) parts.push({ d: gridLines.join(" "), role: "grid" });
   }
   if (curveD) parts.push({ d: curveD, role: "stroke" });
+  if (manualPoints.length >= 2) {
+    parts.push({ d: openPathD(manualPoints.map((p) => ({ x: mapX(p.x), y: mapY(p.y) }))), role: "stroke" });
+  } else if (manualPoints.length === 1) {
+    parts.push({ d: dotPathD(mapX(manualPoints[0].x), mapY(manualPoints[0].y), 3.5), role: "marker" });
+  }
   parts.push({
     d: [
       openPathD([{ x: padX, y: yAxisY }, { x: padX + plotW, y: yAxisY }]),
@@ -2201,7 +2265,8 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
           opts?.graphXTickInterval,
           opts?.graphYTickInterval,
           opts?.showChartLabels ?? true,
-          opts?.graphShowGrid ?? true
+          opts?.graphShowGrid ?? true,
+          opts?.graphPoints ?? []
         ),
       };
     case "minusSign": {
@@ -2454,6 +2519,7 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
     graphShowGrid: node.graphShowGrid,
     graphXTickInterval: node.graphXTickInterval,
     graphYTickInterval: node.graphYTickInterval,
+    graphPoints: node.graphPoints,
     ampInputTopLeadLength: node.ampInputTopLeadLength,
     ampInputBottomLeadLength: node.ampInputBottomLeadLength,
     ampOutputLeadLength: node.ampOutputLeadLength,

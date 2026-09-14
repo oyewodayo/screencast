@@ -354,32 +354,37 @@ function NudgeGrid({ onNudge }: { onNudge: (dx: number, dy: number) => void }) {
 }
 
 // Rotates a fully free-floating edge (both ends unattached to any shape - see this field's own
-// call site for the `bothFree` gate) around the bounding-box center of its own point set at the
-// moment this field first mounted - an edge has no persisted `rotation` field the way a
-// WhiteboardNode does (nothing else about an edge's rendering needs one, and its "shape" IS its
-// point coordinates, not a box with a transform layered on top), so this field tracks the angle
-// typed so far in local state and, on every change, re-derives brand-new source/target/waypoint
-// coordinates by rotating the ORIGINAL (gesture-start) points by that FULL angle - never the
-// previous angle incrementally - so repeated small adjustments can't compound floating-point drift
-// the way "rotate a bit, then rotate a bit more from wherever that landed" would. `key={edge.id}`
-// at the call site remounts this (resetting both the captured start-geometry ref and the angle
-// back to 0) whenever the selection moves to a DIFFERENT edge.
+// call site for the `bothFree` gate) around the bounding-box center of its own CURRENT point set -
+// an edge has no persisted `rotation` field the way a WhiteboardNode does (nothing else about an
+// edge's rendering needs one, and its "shape" IS its point coordinates, not a box with a transform
+// layered on top), so this field tracks the angle typed so far in local state and, on every change,
+// rotates the LIVE `edge` prop (never a cached gesture-start snapshot) by the DELTA since the last
+// commit. Rotating from the live prop every time - rather than a fixed original-geometry snapshot
+// captured once at mount - matters because this field stays mounted across unrelated edits to the
+// SAME edge (e.g. double-clicking the line to add a bend point while the panel is open): a
+// fixed-snapshot version would silently discard any such edit the next time rotation changed,
+// overwriting it with a fresh rotation of the now-stale snapshot. The tradeoff is the usual
+// incremental-rotation one (many small adjustments can compound tiny floating-point drift) - much
+// less costly than losing an edit. `key={edge.id}` at the call site remounts this (resetting the
+// angle back to 0) whenever the selection moves to a DIFFERENT edge.
 function EdgeRotateField({ edge, onCommit }: { edge: WhiteboardEdge; onCommit: (patch: Partial<WhiteboardEdge>) => void }) {
-  const startRef = React.useRef({ source: edge.source, target: edge.target, waypoints: edge.waypoints ?? [] });
   const [angle, setAngle] = React.useState(0);
+  const lastAngleRef = React.useRef(0);
   const applyRotation = (deg: number) => {
+    const delta = deg - lastAngleRef.current;
+    lastAngleRef.current = deg;
     setAngle(deg);
-    const { source, target, waypoints } = startRef.current;
+    const waypoints = edge.waypoints ?? [];
     const points = [
-      { x: source.x ?? 0, y: source.y ?? 0 },
+      { x: edge.source.x ?? 0, y: edge.source.y ?? 0 },
       ...waypoints,
-      { x: target.x ?? 0, y: target.y ?? 0 },
+      { x: edge.target.x ?? 0, y: edge.target.y ?? 0 },
     ];
     const xs = points.map((p) => p.x);
     const ys = points.map((p) => p.y);
     const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
     const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    const rad = (deg * Math.PI) / 180;
+    const rad = (delta * Math.PI) / 180;
     const cos = Math.cos(rad);
     const sin = Math.sin(rad);
     const rotate = (p: { x: number; y: number }) => ({ x: cx + (p.x - cx) * cos - (p.y - cy) * sin, y: cy + (p.x - cx) * sin + (p.y - cy) * cos });
@@ -657,6 +662,15 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               // clamping a typed 360 down to 359, which read as an arbitrary, unexplained cap.
               onCommit={(n) => updateNodes({ rotation: n === 0 || n === 360 ? undefined : n })}
               className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+            />
+          </Field>
+          <Field label="Locked">
+            <input
+              type="checkbox"
+              checked={selectedNodes.every((n) => n.locked ?? false)}
+              onChange={(e) => updateNodes({ locked: e.target.checked })}
+              className="h-3.5 w-3.5"
+              title="Prevents dragging, resizing, rotating, or nudging this shape until unlocked again - handy while manually plotting onto a graph, or annotating around a shape you don't want to bump"
             />
           </Field>
           <Field label="Flip">
@@ -1102,6 +1116,18 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   title="Faint gridlines across the whole plot at every tick, not just the axis tick marks"
                 />
               </Field>
+              {selectedNodes.length === 1 && (selectedNodes[0].graphPoints?.length ?? 0) > 0 && (
+                <Field label="Manual points">
+                  <button
+                    type="button"
+                    onClick={() => updateNodes({ graphPoints: [] })}
+                    className="h-7 px-2 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs hover:bg-gray-50 dark:hover:bg-neutral-700"
+                    title="Removes every manually-plotted point - the same points double-clicking the plot area (to add) or one of their own handles (to remove) edits directly on the canvas"
+                  >
+                    Clear ({selectedNodes[0].graphPoints?.length ?? 0})
+                  </button>
+                </Field>
+              )}
             </>
           )}
           {selectedNodes.every((n) => n.shapeType === "amplifier") && (

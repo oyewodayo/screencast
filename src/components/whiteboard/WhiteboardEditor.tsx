@@ -153,6 +153,12 @@ const CHART_SHAPE_PRESETS: ShapePreset[] = [
   // the style panel after placement (see WhiteboardStylePanel.tsx's own "graph" field block), not a
   // fixed set of starting curves worth a tile each.
   { type: "graph", label: "Graph" },
+  // A coordinate plane with no formula curve at all (WhiteboardNode.graphExpression explicitly set
+  // to "" rather than left absent, which would default to "sin(x)" - see graphOutline's own
+  // hasExpression branch) - just axes/grid to manually plot points/lines directly onto (see
+  // WhiteboardNode.graphPoints' own doc comment), the "Lock" toggle two shapes down in the style
+  // panel keeping the plane itself from being dragged out from under whatever's already placed.
+  { type: "graph", label: "Blank Graph", overrides: { graphExpression: "" } },
   { type: "barChart", label: "Bar Chart" },
   { type: "lineChart", label: "Line Chart" },
   { type: "pieChart", label: "Pie Chart" },

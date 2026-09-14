@@ -303,6 +303,16 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // Absent/false - unflipped.
   flipHorizontal?: boolean;
   flipVertical?: boolean;
+  // Prevents this node from being moved (dragged by its body or its own Move handle, keyboard-
+  // nudged, or resized/rotated via its own handles) until turned back off - a "don't disturb this
+  // while I work around/on top of it" pin, most useful for a shape a user is manually annotating
+  // in place (e.g. plotting points directly onto a "graph" node - see WhiteboardNode.graphPoints'
+  // own doc comment) where an accidental drag would misalign everything already placed. Deliberately
+  // scoped to ONLY the transform/position operations above - style edits (color, stroke, the
+  // graph's own expression/range fields, ...), text editing, and delete all still work normally
+  // while locked, since none of those risk silently shifting the shape out from under other content
+  // anchored to its current position. Absent/false - unlocked (every node's original behavior).
+  locked?: boolean;
   // Shared by every node in the same "Group" action (see WhiteboardEditor.tsx's handleGroup) -
   // clicking, selecting-via-marquee, or dragging any one member acts on every node sharing this id
   // (see WhiteboardCanvas.tsx's expandGroupSelection). Purely a selection/interaction convenience,
@@ -428,6 +438,23 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // convention as functionPlot's plotXTickInterval/plotYTickInterval.
   graphXTickInterval?: number;
   graphYTickInterval?: number;
+  // "graph" only - manually-placed points, in the graph's own DATA-space coordinates (an actual
+  // x/y value on its axes, e.g. {x: 2, y: 4} - NOT a pixel offset) rather than a fraction of the
+  // node's box the way freehand's own `points` are, since a graph's own coordinate system already
+  // has an origin and scale of its own to express positions against, and storing data-space values
+  // keeps a manually-plotted curve meaningful even after the axis range (graphXMin/graphXMax/
+  // graphYMin/graphYMax) or the node's box size changes - it re-projects onto the new scale exactly
+  // like the formula curve already does, rather than needing to be re-drawn from scratch. Lets a
+  // "graph" node work as a blank coordinate plane a user plots directly onto (see the "Blank Graph"
+  // preset, which starts with graphExpression empty - no formula curve at all) instead of only ever
+  // tracing a typed formula: 2+ points connect into a straight-segment polyline (see
+  // whiteboardHandlers.ts's graphOutline), one point alone still shows as a single dot. Each point
+  // gets its own small draggable handle when the node is selected (WhiteboardCanvas.tsx's own
+  // "graphPoint" Interaction variant) - drag to reposition, double-click a blank part of the plot
+  // to add a new one (inserted in x-ascending order, reading left-to-right like a real graph),
+  // double-click an existing point's own handle to remove it. Absent/empty - no manual points, the
+  // node falls back to tracing graphExpression's formula alone (if any).
+  graphPoints?: { x: number; y: number }[];
   // "amplifier" only - each lead's own length in ABSOLUTE doc units (not a fraction of width - see
   // whiteboardHandlers.ts's MIN/MAX/DEFAULT_AMP_*_LEAD_LENGTH for why absolute is what lets dragging
   // one terminal lengthen/shorten JUST that wire). The two input leads are always independently

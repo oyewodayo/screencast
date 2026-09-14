@@ -33,6 +33,7 @@ import {
   createDefaultWhiteboardEdge,
   createDefaultWhiteboardNode,
   createFreehandWhiteboardNode,
+  DEFAULT_CHART_DATA,
   WhiteboardAnchorSide,
   WhiteboardEdge,
   WhiteboardEndpoint,
@@ -45,6 +46,7 @@ import {
   AMP_PLUS_Y_FRAC,
   BoundsBox,
   buildEdgePath,
+  chartColumnLayout,
   clampAmpLeadTerminalY,
   computeCurveBowFromPath,
   CYLINDER_CAP_RATIO,
@@ -52,6 +54,7 @@ import {
   DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
   DEFAULT_CURVE_BOW,
   edgeBoundingBox,
+  graphCoordinateMapper,
   MAX_AMP_LEAD_LENGTH,
   MIN_AMP_LEAD_LENGTH,
   nearestSegmentInsertIndex,
@@ -60,6 +63,7 @@ import {
   resolveAmplifierGeometry,
   resolveAnchorPoint,
   resolveEdgeEndpoints,
+  resolveGraphAxisRange,
   shapeOutlineFor,
 } from "../../handlers/whiteboardHandlers";
 
@@ -270,6 +274,16 @@ type Interaction =
       anchorWorld: { x: number; y: number };
       axisLocked?: "x" | "y";
     }
+  // Dragging one of a "graph" node's own manually-plotted WhiteboardNode.graphPoints (see its own
+  // doc comment) - staged through the SAME liveNodes mechanism resize/rotate already use (the drag
+  // only ever changes this one node's own graphPoints array, so there's no need for yet another
+  // parallel live-state slice the way waypoint/moveEdge needed their own for EDGES).
+  | { mode: "graphPoint"; id: string; index: number; startClientX: number; startClientY: number; startNode: WhiteboardNode }
+  // Dragging one bar/line-point/scatter-dot of a "barChart"/"lineChart"/"scatterPlot" node's own
+  // WhiteboardNode.chartData[index] vertically to change that one value - see beginChartDataDrag's
+  // own doc comment for why `pixelsPerUnit` is captured once at gesture start rather than
+  // recomputed live from the (self-referentially scale-dependent) chart layout every frame.
+  | { mode: "chartDataPoint"; id: string; index: number; startClientY: number; startValue: number; pixelsPerUnit: number; startNode: WhiteboardNode }
   | { mode: "marquee"; startDocX: number; startDocY: number }
   | { mode: "pan"; startClientX: number; startClientY: number; startPan: { x: number; y: number } }
   | { mode: "freehand"; points: { x: number; y: number }[]; lastClientX: number; lastClientY: number }
@@ -710,7 +724,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
         const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
         if (selectedNodeIds.size > 0) {
-          const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id));
+          const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id) && !n.locked);
           if (selected.length > 0) {
             const after = selected.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
             if (after.length === 1) onEditNode(selected[0], after[0]);
@@ -754,6 +768,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         nextSelected = new Set(clickedGroup);
       }
       onSelectionChange(nextSelected, additive ? selectedEdgeIds : new Set());
+      // Locked (see WhiteboardNode.locked's own doc comment) still selects normally - just doesn't
+      // stage a "move" drag - so a locked node stays reachable to unlock again via the style panel
+      // even though clicking-and-dragging its body no longer does anything.
+      if (node.locked) return;
       const ids = nextSelected.has(node.id) ? Array.from(nextSelected) : [node.id];
       interactionRef.current = {
         mode: "move",
@@ -770,6 +788,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
 
   const beginResizeNode = useCallback(
     (node: WhiteboardNode, corner: ResizeCorner, e: React.PointerEvent) => {
+      if (node.locked) return;
       e.stopPropagation();
       onSelectionChange(new Set([node.id]), new Set());
       const anchorWorld = cornerWorldPoint(node, oppositeCorner(corner));
@@ -781,6 +800,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
 
   const beginRotateNode = useCallback(
     (node: WhiteboardNode, e: React.PointerEvent) => {
+      if (node.locked) return;
       e.stopPropagation();
       onSelectionChange(new Set([node.id]), new Set());
       const center = nodeCenter(node);
@@ -790,6 +810,84 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
     [onSelectionChange, clientToDoc]
+  );
+
+  // ---- "graph" manual point plotting (WhiteboardNode.graphPoints) -------------------------------
+  const beginGraphPointDrag = useCallback(
+    (node: WhiteboardNode, index: number, e: React.PointerEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      interactionRef.current = { mode: "graphPoint", id: node.id, index, startClientX: e.clientX, startClientY: e.clientY, startNode: node };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  // Double-clicking a blank part of a selected "graph" node's own plot area adds a new manual
+  // point there (converted from the click's pixel position back into the graph's own data-space
+  // via graphCoordinateMapper's invMapX/invMapY) - inserted in x-ascending order so a manually
+  // plotted curve reads left-to-right, the way a real graph's does, regardless of the order points
+  // happened to be added in. The symmetric remove gesture (double-click an EXISTING point's own
+  // handle) is removeGraphPoint below.
+  const addGraphPoint = useCallback(
+    (node: WhiteboardNode, e: React.MouseEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      // The double-clicked element IS the plot-area rect itself (padX..padX+plotW, not the full
+      // node box - see this callback's own JSX call site), so its own getBoundingClientRect is
+      // ALREADY exactly the plot area in screen space - no need to separately account for padX/padY
+      // here, just re-derive the local (node-space) pixel position they correspond to for invMapX/
+      // invMapY, which (unlike this rect) DO expect coordinates relative to the full node box.
+      const rect = (e.currentTarget as SVGRectElement).getBoundingClientRect();
+      const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(node);
+      const { padX, padY, plotW, plotH, invMapX, invMapY } = graphCoordinateMapper(node.width, node.height, xMin, xMax, yMin, yMax);
+      const px = padX + ((e.clientX - rect.left) / rect.width) * plotW;
+      const py = padY + ((e.clientY - rect.top) / rect.height) * plotH;
+      const point = { x: invMapX(px), y: invMapY(py) };
+      const points = [...(node.graphPoints ?? [])];
+      let insertAt = points.findIndex((p) => p.x > point.x);
+      if (insertAt === -1) insertAt = points.length;
+      points.splice(insertAt, 0, point);
+      onSelectionChange(new Set([node.id]), new Set());
+      onEditNode(node, { ...node, graphPoints: points });
+    },
+    [onSelectionChange, onEditNode]
+  );
+
+  const removeGraphPoint = useCallback(
+    (node: WhiteboardNode, index: number, e: React.MouseEvent) => {
+      e.stopPropagation();
+      const points = (node.graphPoints ?? []).filter((_, i) => i !== index);
+      onEditNode(node, { ...node, graphPoints: points });
+    },
+    [onEditNode]
+  );
+
+  // ---- Draggable chart data (barChart/lineChart/scatterPlot) ------------------------------------
+  // `pixelsPerUnit` is fixed for the WHOLE gesture, computed once from the layout chartColumnLayout
+  // produces at drag START - not recomputed live from the CURRENT (already-edited-this-gesture)
+  // data, because that layout's own scale depends on the series' own max, which is itself exactly
+  // the value being dragged whenever it's the tallest bar/highest point: recomputing live would make
+  // the cursor-to-value mapping self-referential (the scale it should be measured against changes
+  // depending on the very value it's solving for) right at the moment a value overtakes the old max.
+  // A fixed per-gesture ratio instead tracks the cursor exactly as long as the max doesn't change,
+  // and stays smooth (if not pixel-exact) once dragging past it grows the whole chart's own scale on
+  // the next render - a reasonable tradeoff for a direct-manipulation nice-to-have, not a precision
+  // data-entry tool (the style panel's own comma-separated Data field is still there for exact
+  // values).
+  const beginChartDataDrag = useCallback(
+    (node: WhiteboardNode, index: number, e: React.PointerEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      const data = node.chartData ?? DEFAULT_CHART_DATA;
+      const { baselineY, topY, max } = chartColumnLayout(node.width, node.height, data);
+      const pixelsPerUnit = (baselineY - topY) / max;
+      interactionRef.current = { mode: "chartDataPoint", id: node.id, index, startClientY: e.clientY, startValue: data[index] ?? 0, pixelsPerUnit, startNode: node };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
   );
 
   const beginAmpLeadDrag = useCallback(
@@ -1107,6 +1205,39 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         return;
       }
 
+      if (interaction.mode === "graphPoint") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        const start = interaction.startNode;
+        // Local (unrotated) pixel offset within the node's own box - like the rest of "graph"'s own
+        // rendering/interaction code, this doesn't account for WhiteboardNode.rotation, so a
+        // rotated graph's point handles will track slightly off; an acceptable scope tradeoff since
+        // rotating a coordinate-plane-style shape is a rare case, unlike dragging a point on one.
+        const localX = cur.x - start.x;
+        const localY = cur.y - start.y;
+        const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(start);
+        const { invMapX, invMapY } = graphCoordinateMapper(start.width, start.height, xMin, xMax, yMin, yMax);
+        const points = [...(start.graphPoints ?? [])];
+        points[interaction.index] = { x: invMapX(localX), y: invMapY(localY) };
+        const updated: WhiteboardNode = { ...start, graphPoints: points };
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? updated : n)));
+        return;
+      }
+
+      if (interaction.mode === "chartDataPoint") {
+        // Screen-space delta (pre-zoom-correction, same as every other drag here) - moving the
+        // pointer UP increases the value (dyScreen negative -> deltaValue positive), matching how a
+        // bar/point visually grows when dragged upward.
+        const dyScreen = (e.clientY - interaction.startClientY) / zoom;
+        const deltaValue = -dyScreen / interaction.pixelsPerUnit;
+        const newValue = Math.max(0, Math.round((interaction.startValue + deltaValue) * 100) / 100);
+        const start = interaction.startNode;
+        const data = [...(start.chartData ?? DEFAULT_CHART_DATA)];
+        data[interaction.index] = newValue;
+        const updated: WhiteboardNode = { ...start, chartData: data };
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? updated : n)));
+        return;
+      }
+
       if (interaction.mode === "ampLead") {
         const dx = (e.clientX - interaction.startClientX) / zoom;
         const dy = (e.clientY - interaction.startClientY) / zoom;
@@ -1293,6 +1424,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       } else if (interaction.mode === "rotate" && liveNodes) {
         const after = liveNodes.find((n) => n.id === interaction.id);
         if (after && after.rotation !== interaction.startNode.rotation) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "graphPoint" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "chartDataPoint" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after) onEditNode(interaction.startNode, after);
         setLiveNodes(null);
       } else if (interaction.mode === "ampLead") {
         // A plain click (axisLocked never set - see the pointer-move branch's own dead-zone check)
@@ -1734,6 +1873,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             graphShowGrid: node.graphShowGrid,
             graphXTickInterval: node.graphXTickInterval,
             graphYTickInterval: node.graphYTickInterval,
+            graphPoints: node.graphPoints,
             ampInputTopLeadLength: node.ampInputTopLeadLength,
             ampInputBottomLeadLength: node.ampInputBottomLeadLength,
             ampOutputLeadLength: node.ampOutputLeadLength,
@@ -1939,6 +2079,91 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 </svg>
               ) : null}
 
+              {/* Manual point-plotting handles for a selected, unlocked "graph" node (see
+                  WhiteboardNode.graphPoints' own doc comment) - a transparent rect over just the
+                  plot area (not the full node box, so the margin around it stays reachable for the
+                  node's own ordinary double-click-to-edit-text below) double-clicks to add a point,
+                  and each existing point gets its own small draggable/double-click-to-remove dot. */}
+              {node.shapeType === "graph" &&
+                selected &&
+                !node.locked &&
+                (() => {
+                  const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(node);
+                  const { padX, padY, plotW, plotH, mapX, mapY } = graphCoordinateMapper(node.width, node.height, xMin, xMax, yMin, yMax);
+                  const points = node.graphPoints ?? [];
+                  return (
+                    <svg
+                      width="100%"
+                      height="100%"
+                      viewBox={`0 0 ${node.width} ${node.height}`}
+                      preserveAspectRatio="none"
+                      // Sibling of the body svg above (both mount as separate children of this
+                      // node's own already-`position: absolute` div), not the only child - without
+                      // its own `position: absolute` this one would lay out in normal document FLOW
+                      // instead of overlaying the body, pushed below it and offset by whatever else
+                      // is in between (exactly what happened here before this was added: every
+                      // point handle rendered well outside the node's own visible box).
+                      style={{ position: "absolute", inset: 0, overflow: "visible" }}
+                    >
+                      <rect
+                        x={padX}
+                        y={padY}
+                        width={plotW}
+                        height={plotH}
+                        fill="transparent"
+                        style={{ pointerEvents: "all", cursor: "copy" }}
+                        onDoubleClick={(e) => addGraphPoint(node, e)}
+                      />
+                      {points.map((p, i) => (
+                        <circle
+                          key={i}
+                          cx={mapX(p.x)}
+                          cy={mapY(p.y)}
+                          r={5.5 / zoom}
+                          fill="#2563eb"
+                          stroke="#ffffff"
+                          strokeWidth={1.5 / zoom}
+                          style={{ pointerEvents: "all", cursor: "grab" }}
+                          onPointerDown={(e) => beginGraphPointDrag(node, i, e)}
+                          onDoubleClick={(e) => removeGraphPoint(node, i, e)}
+                        />
+                      ))}
+                    </svg>
+                  );
+                })()}
+
+              {/* Draggable data handles for a selected, unlocked bar/line/scatter chart (see
+                  beginChartDataDrag's own doc comment) - one small circle per WhiteboardNode.
+                  chartData entry, at the exact spot chartColumnLayout already draws it. */}
+              {(node.shapeType === "barChart" || node.shapeType === "lineChart" || node.shapeType === "scatterPlot") &&
+                selected &&
+                !node.locked &&
+                (() => {
+                  const data = node.chartData ?? DEFAULT_CHART_DATA;
+                  const { columnX, valueToY } = chartColumnLayout(node.width, node.height, data);
+                  return (
+                    // Same "needs its own position: absolute" reasoning as the graph-points overlay
+                    // just above - this is also a sibling, not the sole child, of this node's div.
+                    <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ position: "absolute", inset: 0, overflow: "visible" }}>
+                      {data.map((v, i) => (
+                        <circle
+                          key={i}
+                          cx={columnX(i)}
+                          cy={valueToY(v)}
+                          r={6 / zoom}
+                          fill="#2563eb"
+                          stroke="#ffffff"
+                          strokeWidth={1.5 / zoom}
+                          style={{ pointerEvents: "all", cursor: "ns-resize" }}
+                          onPointerDown={(e) => beginChartDataDrag(node, i, e)}
+                        >
+                          <title>{`${v}`}</title>
+                        </circle>
+                      ))}
+                    </svg>
+                  );
+                })()}
+
               {!isEditing && node.text && node.shapeType === "equation" && (
                 <div
                   className="absolute inset-0 flex px-2 overflow-visible pointer-events-none"
@@ -2024,7 +2249,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   solve for the opposite corner staying fixed in world space (see cornerWorldPoint's
                   own doc comment). Cursor icons stay screen-axis-aligned regardless of rotation -
                   a cosmetic simplification, not a functional one. */}
-              {selected && selectedNodeIds.size === 1 && !connectorArmed &&
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && !node.locked &&
                 RESIZE_CORNERS.map((corner) => {
                   const size = HANDLE_SCREEN_SIZE / zoom;
                   const left = corner.includes("w") ? -size / 2 : node.width - size / 2;
@@ -2058,6 +2283,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               {selected &&
                 selectedNodeIds.size === 1 &&
                 !connectorArmed &&
+                !node.locked &&
                 (node.shapeType === "table" || node.shapeType === "latticeGauge" || node.shapeType === "graph") && (
                   <div
                     onPointerDown={(e) => beginMoveNode(node, e, e.shiftKey)}
@@ -2081,7 +2307,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   same top-center spot, each stealing the other's clicks. Rotating along with
                   everything else in this div since it's a plain child positioned relative to the
                   (possibly already-rotated) box. */}
-              {selected && selectedNodeIds.size === 1 && !connectorArmed && (
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && !node.locked && (
                 <div
                   onPointerDown={(e) => beginRotateNode(node, e)}
                   className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-600 text-blue-600 hover:text-white flex items-center justify-center shadow-sm"
