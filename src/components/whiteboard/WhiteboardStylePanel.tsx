@@ -33,18 +33,21 @@ import {
   DEFAULT_LATTICE_SITE_RADIUS,
   DEFAULT_LATTICE_SITE_SPACING,
   DEFAULT_LATTICE_SIZE,
+  DEFAULT_LATTICE_SPIN_ARROW_SIZE,
   FunctionPlotType,
   LINE_ONLY_SHAPES,
   MAX_LATTICE_LINK_WIDTH,
   MAX_LATTICE_SITE_RADIUS,
   MAX_LATTICE_SITE_SPACING,
   MAX_LATTICE_SIZE,
+  MAX_LATTICE_SPIN_ARROW_SIZE,
   MAX_TABLE_COLS,
   MAX_TABLE_ROWS,
   MIN_LATTICE_LINK_WIDTH,
   MIN_LATTICE_SITE_RADIUS,
   MIN_LATTICE_SITE_SPACING,
   MIN_LATTICE_SIZE,
+  MIN_LATTICE_SPIN_ARROW_SIZE,
   MIN_TABLE_COLS,
   MIN_TABLE_ROWS,
   TableBorderStyle,
@@ -966,6 +969,18 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   <option value="gauge">Gauge transformation</option>
                 </select>
               </Field>
+              <Field label="Spin model">
+                <select
+                  value={selectedNodes[0].latticeSpinModel ?? "ising"}
+                  onChange={(e) => updateNodes({ latticeSpinModel: e.target.value as "ising" | "xy" | "heisenberg" })}
+                  className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="What each site's spin arrow represents - only visible while Show spins is on"
+                >
+                  <option value="ising">Ising (up/down)</option>
+                  <option value="xy">XY (planar angle)</option>
+                  <option value="heisenberg">Heisenberg (3D)</option>
+                </select>
+              </Field>
               <Field label="Lattice size">
                 <div className="flex items-center gap-1.5">
                   <ClampedNumberField
@@ -1061,6 +1076,30 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   />
                 </div>
               </Field>
+              <Field label="Spin arrow size">
+                <div className="flex items-center gap-1.5">
+                  <ClampedNumberField
+                    key={selectedNodes.map((n) => n.id).join(",")}
+                    initialValue={selectedNodes[0].latticeSpinArrowSize ?? DEFAULT_LATTICE_SPIN_ARROW_SIZE}
+                    min={MIN_LATTICE_SPIN_ARROW_SIZE}
+                    max={MAX_LATTICE_SPIN_ARROW_SIZE}
+                    step={0.01}
+                    integer={false}
+                    onCommit={(n) => updateNodes({ latticeSpinArrowSize: n })}
+                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    title="Spin-arrow length, in world units - only visible while Show spins is on"
+                  />
+                  <input
+                    type="range"
+                    min={MIN_LATTICE_SPIN_ARROW_SIZE}
+                    max={MAX_LATTICE_SPIN_ARROW_SIZE}
+                    step={0.01}
+                    value={selectedNodes[0].latticeSpinArrowSize ?? DEFAULT_LATTICE_SPIN_ARROW_SIZE}
+                    onChange={(e) => updateNodes({ latticeSpinArrowSize: Number(e.target.value) })}
+                    className="w-16"
+                  />
+                </div>
+              </Field>
               <Field label="Show quarks">
                 <input
                   type="checkbox"
@@ -1079,6 +1118,15 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   title="Gauge-link lines between neighboring sites"
                 />
               </Field>
+              <Field label="Show spins">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].latticeShowSpins ?? false}
+                  onChange={(e) => updateNodes({ latticeShowSpins: e.target.checked })}
+                  className="h-3.5 w-3.5"
+                  title="Spin-direction arrows on each site, per the Spin model above"
+                />
+              </Field>
               <Field label="Animate flux">
                 <input
                   type="checkbox"
@@ -1086,6 +1134,15 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   onChange={(e) => updateNodes({ latticeAnimateFlux: e.target.checked })}
                   className="h-3.5 w-3.5"
                   title="A traveling brightness pulse along every gauge link"
+                />
+              </Field>
+              <Field label="Animate spins">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].latticeAnimateSpins ?? false}
+                  onChange={(e) => updateNodes({ latticeAnimateSpins: e.target.checked })}
+                  className="h-3.5 w-3.5"
+                  title="Continuously re-randomizes a handful of spins at a time, suggesting live flip dynamics (illustrative only, not an actual simulation)"
                 />
               </Field>
             </>

@@ -206,6 +206,12 @@ export const MAX_LATTICE_SITE_RADIUS = 0.6;
 export const DEFAULT_LATTICE_LINK_WIDTH = 0.035;
 export const MIN_LATTICE_LINK_WIDTH = 0.005;
 export const MAX_LATTICE_LINK_WIDTH = 0.25;
+// Spin-arrow length, in world units - independent of latticeSiteRadius/latticeSiteSpacing, same
+// "own knob, not tied to another field" reasoning those two get. DEFAULT sits comfortably inside
+// one default-spacing (1) unit cell so neighboring arrows don't overlap out of the box.
+export const DEFAULT_LATTICE_SPIN_ARROW_SIZE = 0.45;
+export const MIN_LATTICE_SPIN_ARROW_SIZE = 0.1;
+export const MAX_LATTICE_SPIN_ARROW_SIZE = 1.5;
 
 // "table" node fields (WhiteboardNode.tableRows/tableCols/tableColWidths/tableRowHeights) - shared
 // here (rather than living only in WhiteboardTable.tsx/WhiteboardStylePanel.tsx) so
@@ -450,6 +456,25 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // resolves to those defaults.
   latticeSiteRadius?: number;
   latticeLinkWidth?: number;
+  // Whether spin-direction arrows are drawn at each site - a separate visualization layer from the
+  // quark spheres themselves (latticeShowQuarks), so an arrow can be shown with or without its
+  // sphere. Absent - resolves to false (an existing lattice never sprouts arrows just because this
+  // field was added).
+  latticeShowSpins?: boolean;
+  // Arrow length, in world units. Absent - resolves to DEFAULT_LATTICE_SPIN_ARROW_SIZE.
+  latticeSpinArrowSize?: number;
+  // Which spin model the per-site arrow directions illustrate (see LatticeGaugeWidget.tsx's
+  // buildSpinDirections) - "ising" arrows point straight up or down (+y/-y), the classic two-state
+  // spin; "xy" arrows lie flat in the lattice's own xz-plane at a random planar angle, a continuous
+  // U(1) spin; "heisenberg" arrows point in a fully random 3D direction, a continuous O(3) spin.
+  // Purely a display convention illustrating what each model's spins LOOK like - there's no actual
+  // spin Hamiltonian, coupling, or energy being computed here, this is a teaching glyph, not a
+  // simulation. Absent - resolves to "ising".
+  latticeSpinModel?: "ising" | "xy" | "heisenberg";
+  // Whether spin arrows continuously re-randomize a handful of sites at a time, suggesting live
+  // thermal flip dynamics - a cheap illustrative animation (see LatticeGaugeWidget.tsx's spin-
+  // animation effect), not an actual Metropolis/Monte-Carlo simulation. Absent - resolves to false.
+  latticeAnimateSpins?: boolean;
   // "table" only - grid dimensions and content (see WhiteboardTable.tsx). Absent - resolves to
   // DEFAULT_TABLE_ROWS/DEFAULT_TABLE_COLS (see resolveTableGrid below, the single place every
   // reader of these fields - the live widget, the style panel, the Canvas2D export - resolves them,

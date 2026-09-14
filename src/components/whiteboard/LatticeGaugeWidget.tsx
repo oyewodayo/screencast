@@ -28,16 +28,21 @@ import {
   DEFAULT_LATTICE_SITE_RADIUS,
   DEFAULT_LATTICE_SITE_SPACING,
   DEFAULT_LATTICE_SIZE,
+  DEFAULT_LATTICE_SPIN_ARROW_SIZE,
   MAX_LATTICE_LINK_WIDTH,
   MAX_LATTICE_SITE_RADIUS,
   MAX_LATTICE_SITE_SPACING,
   MAX_LATTICE_SIZE,
+  MAX_LATTICE_SPIN_ARROW_SIZE,
   MIN_LATTICE_LINK_WIDTH,
   MIN_LATTICE_SITE_RADIUS,
   MIN_LATTICE_SITE_SPACING,
   MIN_LATTICE_SIZE,
+  MIN_LATTICE_SPIN_ARROW_SIZE,
   WhiteboardNode,
 } from "../../utils/whiteboardTypes";
+
+type SpinModel = "ising" | "xy" | "heisenberg";
 
 export interface LatticeGaugeWidgetProps {
   node: WhiteboardNode;
@@ -314,6 +319,115 @@ function recolorLattice(
   linkHighlightAttr.needsUpdate = true;
 }
 
+// ---- Spin arrows -------------------------------------------------------------------------------
+// Per-site spin direction + color, purely a display convention (see WhiteboardNode.latticeSpinModel's
+// own doc comment) - "ising" is the classic two-state up/down spin, colored by sign; "xy" is a
+// continuous planar (U(1)) angle, arrows lying flat in the lattice's own xz-plane; "heisenberg" is a
+// continuous, fully 3D (O(3)) direction. Both continuous models are hue-colored by their azimuthal
+// angle so a glance at color alone already suggests "this one points a different way" before even
+// reading the arrow itself.
+const SPIN_UP_COLOR = new THREE.Color("#f97316");
+const SPIN_DOWN_COLOR = new THREE.Color("#3b82f6");
+const ARROW_RADIAL_SEGMENTS = 6;
+
+interface SpinField {
+  // numSites * 3 each - a site's own direction/color live at [s*3, s*3+1, s*3+2].
+  directions: Float32Array;
+  colors: Float32Array;
+}
+
+// Writes ONE site's freshly-rolled spin into `directions`/`colors` at index `s` - shared by
+// buildSpinField (every site, on a fresh model/seed) and the spin-animation effect (a handful of
+// sites at a time, re-rolled with plain Math.random() rather than the seeded rng - see that
+// effect's own doc comment for why reproducibility doesn't matter there).
+function rollSpin(rng: () => number, model: SpinModel, s: number, directions: Float32Array, colors: Float32Array) {
+  const i = s * 3;
+  if (model === "ising") {
+    const up = rng() < 0.5;
+    directions[i] = 0;
+    directions[i + 1] = up ? 1 : -1;
+    directions[i + 2] = 0;
+    const c = up ? SPIN_UP_COLOR : SPIN_DOWN_COLOR;
+    colors[i] = c.r;
+    colors[i + 1] = c.g;
+    colors[i + 2] = c.b;
+    return;
+  }
+  const phi = rng() * Math.PI * 2;
+  const tmp = new THREE.Color();
+  if (model === "xy") {
+    directions[i] = Math.cos(phi);
+    directions[i + 1] = 0;
+    directions[i + 2] = Math.sin(phi);
+    tmp.setHSL(phi / (Math.PI * 2), 0.7, 0.55);
+  } else {
+    const cosTheta = rng() * 2 - 1;
+    const sinTheta = Math.sqrt(Math.max(0, 1 - cosTheta * cosTheta));
+    directions[i] = sinTheta * Math.cos(phi);
+    directions[i + 1] = cosTheta;
+    directions[i + 2] = sinTheta * Math.sin(phi);
+    tmp.setHSL(phi / (Math.PI * 2), 0.6, 0.5 + 0.2 * cosTheta);
+  }
+  colors[i] = tmp.r;
+  colors[i + 1] = tmp.g;
+  colors[i + 2] = tmp.b;
+}
+
+function buildSpinField(numSites: number, model: SpinModel, seed: number): SpinField {
+  const rng = mulberry32(seed);
+  const directions = new Float32Array(numSites * 3);
+  const colors = new Float32Array(numSites * 3);
+  for (let s = 0; s < numSites; s++) rollSpin(rng, model, s, directions, colors);
+  return { directions, colors };
+}
+
+// Arrow shaft/head lengths+radii for a given "Spin arrow size" slider value - shaft:head length
+// ratio and head:shaft radius ratio are fixed proportions (an ArrowHelper-like silhouette), only the
+// overall scale is user-adjustable.
+function spinArrowDims(size: number) {
+  const shaftLength = size * 0.65;
+  const headLength = size * 0.35;
+  const shaftRadius = Math.max(size * 0.07, 0.01);
+  const headRadius = shaftRadius * 2.2;
+  return { shaftLength, headLength, shaftRadius, headRadius };
+}
+
+// Positions/orients/colors ONE site's shaft+head instance pair from its own spin direction - shared
+// by the full geometry rebuild, the model/seed recolor effect (every site), and the spin-animation
+// effect (just the handful of sites it re-rolled this tick).
+function applySpinInstance(
+  s: number,
+  geo: LatticeGeometry,
+  spinField: SpinField,
+  dims: ReturnType<typeof spinArrowDims>,
+  shaftMesh: THREE.InstancedMesh,
+  headMesh: THREE.InstancedMesh,
+  dummy: THREE.Object3D,
+  up: THREE.Vector3,
+  dir: THREE.Vector3,
+  color: THREE.Color
+) {
+  dir.set(spinField.directions[s * 3], spinField.directions[s * 3 + 1], spinField.directions[s * 3 + 2]);
+  color.setRGB(spinField.colors[s * 3], spinField.colors[s * 3 + 1], spinField.colors[s * 3 + 2]);
+  const bx = geo.sitePositions[s * 3];
+  const by = geo.sitePositions[s * 3 + 1];
+  const bz = geo.sitePositions[s * 3 + 2];
+  dummy.quaternion.setFromUnitVectors(up, dir);
+
+  dummy.position.set(bx + dir.x * (dims.shaftLength / 2), by + dir.y * (dims.shaftLength / 2), bz + dir.z * (dims.shaftLength / 2));
+  dummy.scale.set(dims.shaftRadius, dims.shaftLength, dims.shaftRadius);
+  dummy.updateMatrix();
+  shaftMesh.setMatrixAt(s, dummy.matrix);
+  shaftMesh.setColorAt(s, color);
+
+  const headCenter = dims.shaftLength + dims.headLength / 2;
+  dummy.position.set(bx + dir.x * headCenter, by + dir.y * headCenter, bz + dir.z * headCenter);
+  dummy.scale.set(dims.headRadius, dims.headLength, dims.headRadius);
+  dummy.updateMatrix();
+  headMesh.setMatrixAt(s, dummy.matrix);
+  headMesh.setColorAt(s, color);
+}
+
 export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelect }: LatticeGaugeWidgetProps) {
   const n = clamp(node.latticeSize ?? DEFAULT_LATTICE_SIZE, MIN_LATTICE_SIZE, MAX_LATTICE_SIZE);
   const spacing = clamp(node.latticeSiteSpacing ?? DEFAULT_LATTICE_SITE_SPACING, MIN_LATTICE_SITE_SPACING, MAX_LATTICE_SITE_SPACING);
@@ -323,6 +437,10 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
   const showGluons = node.latticeShowGluons ?? true;
   const animateFlux = node.latticeAnimateFlux ?? true;
   const mode = node.latticeTeachingMode ?? "free";
+  const showSpins = node.latticeShowSpins ?? false;
+  const spinArrowSize = clamp(node.latticeSpinArrowSize ?? DEFAULT_LATTICE_SPIN_ARROW_SIZE, MIN_LATTICE_SPIN_ARROW_SIZE, MAX_LATTICE_SPIN_ARROW_SIZE);
+  const spinModel: SpinModel = node.latticeSpinModel ?? "ising";
+  const animateSpins = node.latticeAnimateSpins ?? false;
   // Every one of these lives on the node and is edited from WhiteboardStylePanel.tsx's own
   // "latticeGauge" Field block now (see its own doc comment there) - this widget only ever READS
   // them, plus owns the one thing that has to happen inside the live 3D view itself: picking a new
@@ -342,6 +460,16 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     prevModeRef.current = mode;
   }, [mode]);
 
+  // Same "re-roll on fresh entry, not persisted" treatment as gaugeSeed above - turning "Show
+  // spins" on gets a newly-randomized configuration each time rather than replaying whatever this
+  // session's very first roll happened to be.
+  const [spinSeed, setSpinSeed] = useState(() => Math.floor(Math.random() * 1e9) || 1);
+  const prevShowSpinsRef = useRef(showSpins);
+  useEffect(() => {
+    if (showSpins && !prevShowSpinsRef.current) setSpinSeed(Math.floor(Math.random() * 1e9) || 1);
+    prevShowSpinsRef.current = showSpins;
+  }, [showSpins]);
+
   const mountRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -357,6 +485,15 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
   const linkColorARef = useRef<THREE.InstancedBufferAttribute | null>(null);
   const linkColorBRef = useRef<THREE.InstancedBufferAttribute | null>(null);
   const linkHighlightRef = useRef<THREE.InstancedBufferAttribute | null>(null);
+  // Spin arrows - a shaft + head InstancedMesh pair (one instance per site each), same "unit
+  // geometry scaled/rotated per instance" trick the gluon links use (see LINK_VERTEX_SHADER's own
+  // doc comment) rather than three's own ArrowHelper (a Group of non-instanced Line+Cone objects -
+  // fine for a handful of arrows, not for up to 262,144 sites). spinFieldRef holds the current
+  // per-site direction/color CPU-side (see SpinField) so the spin-animation effect below can
+  // re-roll a handful of sites without recomputing the rest.
+  const arrowShaftMeshRef = useRef<THREE.InstancedMesh | null>(null);
+  const arrowHeadMeshRef = useRef<THREE.InstancedMesh | null>(null);
+  const spinFieldRef = useRef<SpinField | null>(null);
   const latticeRef = useRef<LatticeGeometry | null>(null);
   const prevExtentRef = useRef<number>(0);
   // Which N the camera was last auto-refit for - see the geometry-rebuild effect's own comment on
@@ -485,6 +622,10 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
       (siteMeshRef.current?.material as THREE.Material | undefined)?.dispose();
       linkMeshRef.current?.geometry.dispose();
       linkMaterialRef.current?.dispose();
+      arrowShaftMeshRef.current?.geometry.dispose();
+      (arrowShaftMeshRef.current?.material as THREE.Material | undefined)?.dispose();
+      arrowHeadMeshRef.current?.geometry.dispose();
+      (arrowHeadMeshRef.current?.material as THREE.Material | undefined)?.dispose();
       plaquetteGroupRef.current?.children.forEach((child) => (child as THREE.Mesh).geometry.dispose());
       plaquetteMaterialRef.current?.dispose();
       renderer.dispose();
@@ -498,6 +639,9 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
       linkColorARef.current = null;
       linkColorBRef.current = null;
       linkHighlightRef.current = null;
+      arrowShaftMeshRef.current = null;
+      arrowHeadMeshRef.current = null;
+      spinFieldRef.current = null;
       plaquetteGroupRef.current = null;
       plaquetteMaterialRef.current = null;
     };
@@ -535,6 +679,16 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
       scene.remove(linkMeshRef.current);
       linkMeshRef.current.geometry.dispose();
       linkMaterialRef.current?.dispose();
+    }
+    if (arrowShaftMeshRef.current) {
+      scene.remove(arrowShaftMeshRef.current);
+      arrowShaftMeshRef.current.geometry.dispose();
+      (arrowShaftMeshRef.current.material as THREE.Material).dispose();
+    }
+    if (arrowHeadMeshRef.current) {
+      scene.remove(arrowHeadMeshRef.current);
+      arrowHeadMeshRef.current.geometry.dispose();
+      (arrowHeadMeshRef.current.material as THREE.Material).dispose();
     }
 
     const geo = buildLatticeGeometry(n, spacing);
@@ -612,6 +766,34 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     linkMeshRef.current = linkMesh;
     linkMaterialRef.current = linkMaterial;
 
+    // Spin arrows - see this file's own "Spin arrows" section above. Freshly rolled here (rather
+    // than reusing spinFieldRef.current) since this effect also runs whenever N changes, which
+    // changes numSites itself and would otherwise leave a stale-length SpinField behind.
+    const spinField = buildSpinField(geo.numSites, spinModel, spinSeed);
+    spinFieldRef.current = spinField;
+    const dims = spinArrowDims(spinArrowSize);
+    const arrowShaftGeo = new THREE.CylinderGeometry(1, 1, 1, ARROW_RADIAL_SEGMENTS, 1);
+    arrowShaftGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(arrowShaftGeo.attributes.position.count * 3).fill(1), 3));
+    const arrowHeadGeo = new THREE.ConeGeometry(1, 1, ARROW_RADIAL_SEGMENTS);
+    arrowHeadGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(arrowHeadGeo.attributes.position.count * 3).fill(1), 3));
+    const arrowShaftMesh = new THREE.InstancedMesh(arrowShaftGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0 }), geo.numSites);
+    const arrowHeadMesh = new THREE.InstancedMesh(arrowHeadGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0 }), geo.numSites);
+    const arrowDir = new THREE.Vector3();
+    const arrowColor = new THREE.Color();
+    for (let s = 0; s < geo.numSites; s++) {
+      applySpinInstance(s, geo, spinField, dims, arrowShaftMesh, arrowHeadMesh, dummy, up, arrowDir, arrowColor);
+    }
+    arrowShaftMesh.instanceMatrix.needsUpdate = true;
+    arrowHeadMesh.instanceMatrix.needsUpdate = true;
+    if (arrowShaftMesh.instanceColor) arrowShaftMesh.instanceColor.needsUpdate = true;
+    if (arrowHeadMesh.instanceColor) arrowHeadMesh.instanceColor.needsUpdate = true;
+    arrowShaftMesh.visible = showSpins;
+    arrowHeadMesh.visible = showSpins;
+    scene.add(arrowShaftMesh);
+    scene.add(arrowHeadMesh);
+    arrowShaftMeshRef.current = arrowShaftMesh;
+    arrowHeadMeshRef.current = arrowHeadMesh;
+
     recolorLattice(geo, siteMesh, linkColorA, linkColorB, linkHighlight, mode, gaugeSeed, plaquetteAnchor);
     rebuildPlaquetteOverlay(n, spacing, plaquetteAnchor);
     if (plaquetteGroupRef.current) plaquetteGroupRef.current.visible = mode === "plaquette";
@@ -639,7 +821,7 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     prevExtentRef.current = extent;
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [n, spacing, siteRadius, linkWidth]);
+  }, [n, spacing, siteRadius, linkWidth, spinArrowSize]);
 
   // ---- Instant (no rebuild) updates: visibility + mode/seed recolor + flux uniform ---------------
   useEffect(() => {
@@ -651,6 +833,81 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
   useEffect(() => {
     if (linkMaterialRef.current) linkMaterialRef.current.uniforms.uFlow.value = animateFlux ? 1 : 0;
   }, [animateFlux]);
+  useEffect(() => {
+    if (arrowShaftMeshRef.current) arrowShaftMeshRef.current.visible = showSpins;
+    if (arrowHeadMeshRef.current) arrowHeadMeshRef.current.visible = showSpins;
+  }, [showSpins]);
+
+  // Re-rolls every site's spin (not just a rebuild - the geometry/instance COUNT doesn't change,
+  // just each one's own direction/color) whenever the spin model or its seed changes, without
+  // paying for a full site/link mesh rebuild (see the geometry-rebuild effect above for why THAT one
+  // also has to do this once on its own, for the N-changed case).
+  useEffect(() => {
+    const geo = latticeRef.current;
+    const shaftMesh = arrowShaftMeshRef.current;
+    const headMesh = arrowHeadMeshRef.current;
+    if (!geo || !shaftMesh || !headMesh) return;
+    const spinField = buildSpinField(geo.numSites, spinModel, spinSeed);
+    spinFieldRef.current = spinField;
+    const dims = spinArrowDims(spinArrowSize);
+    const dummy = new THREE.Object3D();
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3();
+    const color = new THREE.Color();
+    for (let s = 0; s < geo.numSites; s++) applySpinInstance(s, geo, spinField, dims, shaftMesh, headMesh, dummy, up, dir, color);
+    shaftMesh.instanceMatrix.needsUpdate = true;
+    headMesh.instanceMatrix.needsUpdate = true;
+    if (shaftMesh.instanceColor) shaftMesh.instanceColor.needsUpdate = true;
+    if (headMesh.instanceColor) headMesh.instanceColor.needsUpdate = true;
+  }, [spinModel, spinSeed, spinArrowSize]);
+
+  // "Animate spins" - a cheap, purely illustrative suggestion of live flip dynamics, NOT an actual
+  // Metropolis/Monte-Carlo simulation (no coupling, no temperature, no energy is computed - see
+  // WhiteboardNode.latticeAnimateSpins's own doc comment). On an interval, re-rolls a small, fixed-
+  // size batch of random sites (bounded regardless of lattice size, so this stays cheap even at
+  // MAX_LATTICE_SIZE) with plain Math.random() - deliberately NOT the seeded rng spinSeed drives,
+  // since reproducibility would defeat the point of looking alive - and only touches THOSE
+  // instances' own matrix/color rather than looping over every site each tick.
+  useEffect(() => {
+    if (!animateSpins) return;
+    const dummy = new THREE.Object3D();
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3();
+    const color = new THREE.Color();
+    const rng = Math.random;
+    const interval = window.setInterval(() => {
+      // Read every ref fresh each tick (not captured at effect-setup time) - the geometry-rebuild
+      // effect can swap latticeRef.current/arrowShaftMeshRef.current/arrowHeadMeshRef.current out
+      // for brand-new objects at any point while this interval is running (e.g. dragging the "Site
+      // spacing" slider), and this effect's own deps (below) deliberately don't include n/spacing/
+      // spinArrowSize - tearing the whole interval down and recreating it on every slider tick
+      // during a drag would be wasteful. Reading refs fresh instead means a rebuild elsewhere is
+      // picked up on this interval's very next tick for free. Capturing `geo` (or the mesh refs)
+      // ONCE here instead, the way an earlier version of this effect did, silently kept animating
+      // sites against the OLD, no-longer-rendered lattice's site positions after a spacing change -
+      // each tick would re-plant a handful of arrows back at their pre-change world coordinates,
+      // and after enough ticks nearly every arrow had been dragged back out of place even though
+      // the quark/gluon meshes (rebuilt fresh, untouched by this loop) tracked the new spacing fine.
+      const geo = latticeRef.current;
+      const shaftMesh = arrowShaftMeshRef.current;
+      const headMesh = arrowHeadMeshRef.current;
+      const spinField = spinFieldRef.current;
+      if (!geo || !shaftMesh || !headMesh || !spinField) return;
+      const dims = spinArrowDims(spinArrowSize);
+      const flipsPerTick = Math.min(24, geo.numSites);
+      for (let f = 0; f < flipsPerTick; f++) {
+        const s = Math.floor(rng() * geo.numSites);
+        rollSpin(rng, spinModel, s, spinField.directions, spinField.colors);
+        applySpinInstance(s, geo, spinField, dims, shaftMesh, headMesh, dummy, up, dir, color);
+      }
+      shaftMesh.instanceMatrix.needsUpdate = true;
+      headMesh.instanceMatrix.needsUpdate = true;
+      if (shaftMesh.instanceColor) shaftMesh.instanceColor.needsUpdate = true;
+      if (headMesh.instanceColor) headMesh.instanceColor.needsUpdate = true;
+    }, 180);
+    return () => window.clearInterval(interval);
+  }, [animateSpins, spinModel, spinArrowSize]);
+
   useEffect(() => {
     const geo = latticeRef.current;
     const siteMesh = siteMeshRef.current;

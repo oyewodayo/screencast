@@ -1951,15 +1951,17 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   );
                 })}
 
-              {/* Move handle - "table" is the one shapeType whose selected-state body intercepts
-                  every pointerdown over it (WhiteboardTable.tsx drills into cell editing/range-select
-                  once selected - see that file's own top-of-file doc comment), so once selected there
-                  is no longer any place to click-drag the table itself, and no gap to click through
-                  to a table stacked underneath it either. A dedicated handle above the TOP-LEFT
-                  corner (top-right is the rotate handle's spot) hands that back: it's a plain child
-                  of this node's own div, so a pointerdown here that does nothing but call
-                  beginMoveNode behaves exactly like grabbing any other shape's body would. */}
-              {selected && selectedNodeIds.size === 1 && !connectorArmed && node.shapeType === "table" && (
+              {/* Move handle - "table" and "latticeGauge" are the shapeTypes whose selected-state
+                  body intercepts every pointerdown over it (WhiteboardTable.tsx drills into cell
+                  editing/range-select once selected - see that file's own top-of-file doc comment;
+                  LatticeGaugeWidget.tsx's own viewport stops every pointer event for its own orbit/
+                  pan/zoom gestures - see its own top-of-file doc comment), so once selected there is
+                  no longer any place to click-drag the shape itself, and no gap to click through to
+                  one stacked underneath it either. A dedicated handle above the TOP-LEFT corner
+                  (top-right is the rotate handle's spot) hands that back: it's a plain child of this
+                  node's own div, so a pointerdown here that does nothing but call beginMoveNode
+                  behaves exactly like grabbing any other shape's body would. */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && (node.shapeType === "table" || node.shapeType === "latticeGauge") && (
                 <div
                   onPointerDown={(e) => beginMoveNode(node, e, e.shiftKey)}
                   className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-600 text-blue-600 hover:text-white flex items-center justify-center shadow-sm"
@@ -1970,7 +1972,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     height: ROTATE_ICON_SCREEN_SIZE / zoom,
                     cursor: "grab",
                   }}
-                  title="Drag to move this table"
+                  title={node.shapeType === "table" ? "Drag to move this table" : "Drag to move this lattice"}
                 >
                   <TbArrowsMove size={ROTATE_ICON_SCREEN_SIZE * 0.7} style={{ width: "70%", height: "70%" }} />
                 </div>
