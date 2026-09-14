@@ -165,6 +165,35 @@ function curveControlPoints(source: ResolvedPoint, target: ResolvedPoint, bow: n
   return { c1, c2 };
 }
 
+// The document-space bounding box that's guaranteed to contain everything buildEdgePath actually
+// draws for this edge - source/target/waypoints always lie ON the drawn path, and (for "curved"
+// routing with no waypoints) the two bezier control points don't lie on the curve itself, but a
+// cubic bezier is always contained within the convex hull of its endpoints and control points, so
+// including them still yields a valid bound. Used by WhiteboardCanvas.tsx's marquee-select so a
+// rubber-band drag can actually catch a curved edge that bows well outside its own straight-line
+// source->target box - without this, a curve bowed out from the marquee's own rectangle looks
+// "inside" it (visually) but the edge never gets included in the resulting selection.
+export function edgeBoundingBox(
+  source: ResolvedPoint,
+  target: ResolvedPoint,
+  routing: EdgeRouting,
+  bow: number = DEFAULT_CURVE_BOW,
+  waypoints: { x: number; y: number }[] = []
+): { x: number; y: number; width: number; height: number } {
+  const points: { x: number; y: number }[] = [source, target, ...waypoints];
+  if (routing === "curved" && waypoints.length === 0) {
+    const { c1, c2 } = curveControlPoints(source, target, bow);
+    points.push(c1, c2);
+  }
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
 // Below this signed perpendicular distance (doc px) from the straight start->end line, a drag
 // gesture is treated as "didn't deliberately curve" - a quick, fairly direct drag still gets a
 // visibly curved connector (DEFAULT_CURVE_BOW's fixed direction) rather than an almost-straight
@@ -408,8 +437,16 @@ export interface ShapeOutlineOptions {
   plotShowGrid?: boolean; // "functionPlot" only
   plotXTickInterval?: number; // "functionPlot" only
   plotYTickInterval?: number; // "functionPlot" only
-  showChartLabels?: boolean; // "barChart"/"lineChart"/"scatterPlot"/"functionPlot" only
+  showChartLabels?: boolean; // "barChart"/"lineChart"/"scatterPlot"/"functionPlot"/"graph" only
   numberLineMax?: number; // "numberLine" only
+  graphExpression?: string; // "graph" only
+  graphXMin?: number; // "graph" only
+  graphXMax?: number; // "graph" only
+  graphYMin?: number; // "graph" only
+  graphYMax?: number; // "graph" only
+  graphShowGrid?: boolean; // "graph" only
+  graphXTickInterval?: number; // "graph" only
+  graphYTickInterval?: number; // "graph" only
   ampInputTopLeadLength?: number; // "amplifier" only
   ampInputBottomLeadLength?: number; // "amplifier" only
   ampOutputLeadLength?: number; // "amplifier" only
@@ -1454,6 +1491,367 @@ function functionPlotOutline(
   return { parts, labels };
 }
 
+// ---- "graph" shape - a user-typed formula, plotted over an explicit x/y window --------------------
+//
+// Unlike "functionPlot"'s curated FunctionPlotType preset list, "graph" lets a user type any formula
+// in terms of `x` (WhiteboardNode.graphExpression). Compiling that into something callable needs
+// EITHER `eval`/`new Function` (executes arbitrary JS - can reach `window`/`document`, spin forever,
+// or otherwise do anything JS can do, for what should only ever be an arithmetic formula) OR a real
+// (if tiny) parser whose grammar makes anything beyond arithmetic simply inexpressible. This is the
+// latter: a hand-rolled tokenizer + recursive-descent parser producing a plain `(x: number) => number`
+// closure, restricted to number literals, `x`, the constants below, the four arithmetic operators
+// (+ - * / %), `^` (power, right-associative), parentheses, implicit multiplication (e.g. "2x",
+// "3sin(x)", "x(x+1)"), and calls into the fixed GRAPH_FUNCTIONS table - there is no way to express a
+// loop, a statement, or any identifier/property access outside that fixed table.
+
+const GRAPH_FUNCTIONS: Record<string, (...args: number[]) => number> = {
+  sin: Math.sin,
+  cos: Math.cos,
+  tan: Math.tan,
+  asin: Math.asin,
+  acos: Math.acos,
+  atan: Math.atan,
+  atan2: Math.atan2,
+  sinh: Math.sinh,
+  cosh: Math.cosh,
+  tanh: Math.tanh,
+  sqrt: Math.sqrt,
+  abs: Math.abs,
+  sign: Math.sign,
+  exp: Math.exp,
+  ln: Math.log,
+  log: Math.log10,
+  log2: Math.log2,
+  floor: Math.floor,
+  ceil: Math.ceil,
+  round: Math.round,
+  min: Math.min,
+  max: Math.max,
+  pow: Math.pow,
+};
+
+const GRAPH_CONSTANTS: Record<string, number> = { pi: Math.PI, e: Math.E };
+
+type GraphToken = { type: "num"; value: number } | { type: "ident"; value: string } | { type: "op"; value: "+" | "-" | "*" | "/" | "%" | "^" } | { type: "lparen" } | { type: "rparen" } | { type: "comma" };
+
+function tokenizeGraphExpression(src: string): GraphToken[] {
+  const tokens: GraphToken[] = [];
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (/\s/.test(c)) {
+      i++;
+      continue;
+    }
+    if (/[0-9.]/.test(c)) {
+      let j = i + 1;
+      while (j < src.length && /[0-9.]/.test(src[j])) j++;
+      const numStr = src.slice(i, j);
+      if (!/^\d*\.?\d+$|^\d+\.?$/.test(numStr)) throw new Error(`Invalid number "${numStr}"`);
+      tokens.push({ type: "num", value: Number(numStr) });
+      i = j;
+      continue;
+    }
+    if (/[a-zA-Z_]/.test(c)) {
+      let j = i + 1;
+      while (j < src.length && /[a-zA-Z_0-9]/.test(src[j])) j++;
+      tokens.push({ type: "ident", value: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (c === "+" || c === "-" || c === "*" || c === "/" || c === "%" || c === "^") {
+      tokens.push({ type: "op", value: c });
+      i++;
+      continue;
+    }
+    if (c === "(") {
+      tokens.push({ type: "lparen" });
+      i++;
+      continue;
+    }
+    if (c === ")") {
+      tokens.push({ type: "rparen" });
+      i++;
+      continue;
+    }
+    if (c === ",") {
+      tokens.push({ type: "comma" });
+      i++;
+      continue;
+    }
+    throw new Error(`Unexpected character "${c}"`);
+  }
+  return tokens;
+}
+
+// Recursive-descent parser over GraphToken[] - standard precedence climbing (+/- lowest, then
+// implicit-and-explicit */÷/%, then unary +/-, then ^ highest, right-associative). Each production
+// returns a closure directly (rather than building an intermediate AST node type) since nothing here
+// needs to inspect the parsed structure afterward - only ever call it with a value for `x`.
+function parseGraphExpression(tokens: GraphToken[]): (x: number) => number {
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const next = () => tokens[pos++];
+  // Reads the operator character off a token if (and only if) it IS one - "" (a value that matches
+  // none of the operator comparisons below) otherwise. Every caller below compares this plain string
+  // return value instead of re-narrowing the GraphToken union's "op" variant itself repeatedly -
+  // simpler, and safe under strict-null-checks without needing a fresh type guard per call site
+  // (TypeScript can't assume two separate `peek()` calls return the same token, so narrowing done on
+  // one call's result doesn't carry over to a later independent call).
+  const opValue = (tok: GraphToken | undefined): string => (tok && tok.type === "op" ? tok.value : "");
+  const startsFactor = (tok: GraphToken | undefined): boolean => !!tok && (tok.type === "num" || tok.type === "ident" || tok.type === "lparen");
+
+  function parseExpression(): (x: number) => number {
+    let left = parseTerm();
+    for (let op = opValue(peek()); op === "+" || op === "-"; op = opValue(peek())) {
+      next();
+      const right = parseTerm();
+      const prevLeft = left;
+      left = op === "+" ? (x) => prevLeft(x) + right(x) : (x) => prevLeft(x) - right(x);
+    }
+    return left;
+  }
+  function parseTerm(): (x: number) => number {
+    let left = parseUnary();
+    for (;;) {
+      const tok = peek();
+      const op = opValue(tok);
+      if (op === "*" || op === "/" || op === "%") {
+        next();
+        const right = parseUnary();
+        const prevLeft = left;
+        if (op === "*") left = (x) => prevLeft(x) * right(x);
+        else if (op === "/") left = (x) => prevLeft(x) / right(x);
+        else left = (x) => prevLeft(x) % right(x);
+      } else if (startsFactor(tok)) {
+        // "2x", "3sin(x)", "x(x+1)" - implicit multiplication, the way a real graphing
+        // calculator/textbook reads a factor immediately following another with no operator between.
+        const right = parseUnary();
+        const prevLeft = left;
+        left = (x) => prevLeft(x) * right(x);
+      } else {
+        break;
+      }
+    }
+    return left;
+  }
+  function parseUnary(): (x: number) => number {
+    const op = opValue(peek());
+    if (op === "-" || op === "+") {
+      next();
+      const operand = parseUnary();
+      return op === "-" ? (x) => -operand(x) : operand;
+    }
+    return parsePower();
+  }
+  function parsePower(): (x: number) => number {
+    const base = parsePrimary();
+    if (opValue(peek()) === "^") {
+      next();
+      const exponent = parseUnary(); // right-associative: x^2^3 === x^(2^3)
+      return (x) => Math.pow(base(x), exponent(x));
+    }
+    return base;
+  }
+  function parsePrimary(): (x: number) => number {
+    const tok = peek();
+    if (!tok) throw new Error("Unexpected end of expression");
+    if (tok.type === "num") {
+      next();
+      const v = tok.value;
+      return () => v;
+    }
+    if (tok.type === "lparen") {
+      next();
+      const inner = parseExpression();
+      const closeTok = peek();
+      if (!closeTok || closeTok.type !== "rparen") throw new Error('Expected ")"');
+      next();
+      return inner;
+    }
+    if (tok.type === "ident") {
+      next();
+      const name = tok.value.toLowerCase();
+      const afterName = peek();
+      // Only treat "name(" as a function call when `name` is actually a known function - otherwise
+      // (e.g. "x(x+1)") the "(" starts an implicit-multiplication factor instead (see parseTerm).
+      if (afterName && afterName.type === "lparen" && GRAPH_FUNCTIONS[name]) {
+        next();
+        const args: ((x: number) => number)[] = [];
+        const maybeCloseTok = peek();
+        if (!maybeCloseTok || maybeCloseTok.type !== "rparen") {
+          args.push(parseExpression());
+          for (let sep = peek(); sep && sep.type === "comma"; sep = peek()) {
+            next();
+            args.push(parseExpression());
+          }
+        }
+        const closeTok = peek();
+        if (!closeTok || closeTok.type !== "rparen") throw new Error('Expected ")"');
+        next();
+        const fn = GRAPH_FUNCTIONS[name];
+        return (x) => fn(...args.map((a) => a(x)));
+      }
+      if (name === "x") return (x) => x;
+      if (name in GRAPH_CONSTANTS) {
+        const v = GRAPH_CONSTANTS[name];
+        return () => v;
+      }
+      throw new Error(`Unknown identifier "${tok.value}"`);
+    }
+    throw new Error("Unexpected token");
+  }
+
+  if (tokens.length === 0) throw new Error("Empty expression");
+  const result = parseExpression();
+  if (pos !== tokens.length) throw new Error("Unexpected trailing input");
+  return result;
+}
+
+// The one entry point every caller (graphOutline below, WhiteboardStylePanel.tsx's own inline error
+// display) uses to turn WhiteboardNode.graphExpression's raw text into something plottable - never
+// throws, always returns either a working evaluator or a human-readable parse error message.
+export type CompiledGraphExpression = { evaluate: (x: number) => number; error: null } | { evaluate: null; error: string };
+
+export function compileGraphExpression(source: string): CompiledGraphExpression {
+  try {
+    const fn = parseGraphExpression(tokenizeGraphExpression(source.trim() === "" ? "0" : source));
+    return { evaluate: fn, error: null };
+  } catch (err) {
+    return { evaluate: null, error: err instanceof Error ? err.message : "Invalid expression" };
+  }
+}
+
+// Bounds/defaults for WhiteboardNode.graphXMin/graphXMax/graphYMin/graphYMax - generous enough for
+// almost any diagram (a whiteboard, not a scientific plotting tool) while keeping the sampled domain
+// from growing so wide the curve degrades into a nearly-straight-line-per-sample facet at
+// GRAPH_SAMPLE_COUNT's fixed resolution.
+export const MIN_GRAPH_DOMAIN = -1000;
+export const MAX_GRAPH_DOMAIN = 1000;
+export const DEFAULT_GRAPH_EXPRESSION = "sin(x)";
+export const DEFAULT_GRAPH_X_MIN = -10;
+export const DEFAULT_GRAPH_X_MAX = 10;
+export const DEFAULT_GRAPH_Y_MIN = -10;
+export const DEFAULT_GRAPH_Y_MAX = 10;
+const GRAPH_SAMPLE_COUNT = 300;
+
+// Robust (percentile-based, not plain min/max) auto y-range for a sampled curve - a single sample
+// near a real asymptote (tan(x), 1/x, ln(x) as x->0, ...) can be enormous despite being finite, and a
+// plain min/max fit would let that one point flatten the entire rest of the curve to a hairline.
+// Clips to the 2nd-98th percentile instead, then pads it a bit so the curve doesn't touch the box's
+// own top/bottom edge.
+function robustGraphYRange(values: number[]): [number, number] {
+  if (values.length === 0) return [-1, 1];
+  const sorted = [...values].sort((a, b) => a - b);
+  const at = (p: number) => sorted[Math.max(0, Math.min(sorted.length - 1, Math.round(p * (sorted.length - 1))))];
+  const lo = at(0.02);
+  const hi = at(0.98);
+  if (hi - lo < 1e-9) return [lo - 1, hi + 1];
+  const pad = (hi - lo) * 0.1;
+  return [lo - pad, hi + pad];
+}
+
+// Samples the compiled expression densely across [xMin, xMax], auto-fitting (or, if explicitly set,
+// using) the y-range, then traces the curve as one or more SEPARATE subpaths - split wherever a
+// sample is non-finite (NaN/Infinity - e.g. sqrt of a negative number, log of zero) or jumps by more
+// than a few multiples of the plotted y-range between consecutive samples (a real discontinuity/
+// asymptote, e.g. tan(x) or 1/x crossing x=0) - a single path straight through either case would draw
+// a spurious near-vertical line connecting the two sides, which isn't part of the actual graph.
+// Otherwise mirrors functionPlotOutline's own axis-line/grid/tick-label layout exactly.
+function graphOutline(
+  w: number,
+  h: number,
+  expression: string,
+  xMinInput: number | undefined,
+  xMaxInput: number | undefined,
+  yMinInput: number | undefined,
+  yMaxInput: number | undefined,
+  xTickInterval: number | undefined,
+  yTickInterval: number | undefined,
+  showLabels = true,
+  showGrid = true
+): { parts: ChartPart[]; labels: ChartLabel[] } {
+  let xMin = xMinInput ?? DEFAULT_GRAPH_X_MIN;
+  let xMax = xMaxInput ?? DEFAULT_GRAPH_X_MAX;
+  if (xMax <= xMin) xMax = xMin + 1;
+  const compiled = compileGraphExpression(expression || DEFAULT_GRAPH_EXPRESSION);
+  const raw: { x: number; y: number }[] = [];
+  for (let i = 0; i <= GRAPH_SAMPLE_COUNT; i++) {
+    const x = xMin + ((xMax - xMin) * i) / GRAPH_SAMPLE_COUNT;
+    const y = compiled.evaluate ? compiled.evaluate(x) : NaN;
+    raw.push({ x, y: Number.isFinite(y) ? y : NaN });
+  }
+  const finiteYs = raw.map((p) => p.y).filter((y) => Number.isFinite(y));
+  const [autoYMin, autoYMax] = robustGraphYRange(finiteYs);
+  let yMin = yMinInput ?? autoYMin;
+  let yMax = yMaxInput ?? autoYMax;
+  if (yMax <= yMin) yMax = yMin + 1;
+  const yRange = yMax - yMin;
+  const padX = w * 0.08;
+  const padY = h * 0.08;
+  const plotW = w - padX * 2;
+  const plotH = h - padY * 2;
+  const mapX = (x: number) => padX + ((x - xMin) / (xMax - xMin)) * plotW;
+  const mapY = (y: number) => padY + plotH - ((y - yMin) / yRange) * plotH;
+
+  const jumpThreshold = yRange * 2.5;
+  const subpaths: { x: number; y: number }[][] = [];
+  let current: { x: number; y: number }[] = [];
+  let prevRawY: number | null = null;
+  for (const p of raw) {
+    if (!Number.isFinite(p.y)) {
+      if (current.length > 1) subpaths.push(current);
+      current = [];
+      prevRawY = null;
+      continue;
+    }
+    if (prevRawY !== null && Math.abs(p.y - prevRawY) > jumpThreshold) {
+      if (current.length > 1) subpaths.push(current);
+      current = [];
+    }
+    const clampedY = Math.max(yMin - yRange, Math.min(yMax + yRange, p.y));
+    current.push({ x: mapX(p.x), y: mapY(clampedY) });
+    prevRawY = p.y;
+  }
+  if (current.length > 1) subpaths.push(current);
+  const curveD = subpaths.map((pts) => openPathD(pts)).join(" ");
+
+  const yAxisY = yMin <= 0 && yMax >= 0 ? mapY(0) : padY + plotH;
+  const xAxisX = xMin <= 0 && xMax >= 0 ? mapX(0) : padX;
+  const xTicksFor = (interval: number | undefined, lo: number, hi: number) => (interval && interval > 0 ? tickValuesByInterval(lo, hi, interval) : tickValues(lo, hi, 5));
+  const parts: ChartPart[] = [];
+  if (showGrid) {
+    const gridXTicks = xTicksFor(xTickInterval, xMin, xMax);
+    const gridYTicks = xTicksFor(yTickInterval, yMin, yMax);
+    const gridLines = [
+      ...gridXTicks.map((tx) => openPathD([{ x: mapX(tx), y: padY }, { x: mapX(tx), y: padY + plotH }])),
+      ...gridYTicks.map((ty) => openPathD([{ x: padX, y: mapY(ty) }, { x: padX + plotW, y: mapY(ty) }])),
+    ];
+    if (gridLines.length > 0) parts.push({ d: gridLines.join(" "), role: "grid" });
+  }
+  if (curveD) parts.push({ d: curveD, role: "stroke" });
+  parts.push({
+    d: [
+      openPathD([{ x: padX, y: yAxisY }, { x: padX + plotW, y: yAxisY }]),
+      openPathD([{ x: xAxisX, y: padY }, { x: xAxisX, y: padY + plotH }]),
+    ].join(" "),
+    role: "axis",
+  });
+  if (!showLabels) return { parts, labels: [] };
+  const xLabelY = yAxisY < padY + plotH - 20 ? yAxisY + 12 : yAxisY - 8;
+  const yLabelNearLeft = xAxisX > padX + 20;
+  const yLabelX = yLabelNearLeft ? xAxisX - 4 : xAxisX + 4;
+  const yLabelAnchor: ChartLabel["anchor"] = yLabelNearLeft ? "end" : "start";
+  const originVisible = xMin <= 0 && xMax >= 0 && yMin <= 0 && yMax >= 0;
+  const xTicks = xTicksFor(xTickInterval, xMin, xMax).filter((t) => !originVisible || Math.abs(t) > 1e-9);
+  const yTicks = xTicksFor(yTickInterval, yMin, yMax);
+  const labels: ChartLabel[] = [
+    ...xTicks.map((tx) => ({ x: mapX(tx), y: Math.max(2, Math.min(xLabelY, h - 2)), text: formatTick(tx), anchor: "middle" as const })),
+    ...yTicks.map((ty) => ({ x: Math.max(2, Math.min(yLabelX, w - 2)), y: mapY(ty), text: formatTick(ty), anchor: yLabelAnchor })),
+  ];
+  return { parts, labels };
+}
+
 // Builds one continuous open-path `d` string tracing the given periodic waveform across a w×h box,
 // vertically centered (amplitude = 35% of h either side of the midline), repeated `cycles` times.
 // Square/triangle/sawtooth are piecewise-linear so their breakpoints are computed exactly (no
@@ -1738,6 +2136,23 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
           opts?.plotShowGrid ?? false
         ),
       };
+    case "graph":
+      return {
+        kind: "chart",
+        ...graphOutline(
+          w,
+          h,
+          opts?.graphExpression ?? DEFAULT_GRAPH_EXPRESSION,
+          opts?.graphXMin,
+          opts?.graphXMax,
+          opts?.graphYMin,
+          opts?.graphYMax,
+          opts?.graphXTickInterval,
+          opts?.graphYTickInterval,
+          opts?.showChartLabels ?? true,
+          opts?.graphShowGrid ?? true
+        ),
+      };
     case "minusSign": {
       const t = h * 0.28;
       const cy = h / 2;
@@ -1980,6 +2395,14 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
     plotYTickInterval: node.plotYTickInterval,
     showChartLabels: node.showChartLabels,
     numberLineMax: node.numberLineMax,
+    graphExpression: node.graphExpression,
+    graphXMin: node.graphXMin,
+    graphXMax: node.graphXMax,
+    graphYMin: node.graphYMin,
+    graphYMax: node.graphYMax,
+    graphShowGrid: node.graphShowGrid,
+    graphXTickInterval: node.graphXTickInterval,
+    graphYTickInterval: node.graphYTickInterval,
     ampInputTopLeadLength: node.ampInputTopLeadLength,
     ampInputBottomLeadLength: node.ampInputBottomLeadLength,
     ampOutputLeadLength: node.ampOutputLeadLength,

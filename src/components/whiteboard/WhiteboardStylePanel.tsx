@@ -65,6 +65,11 @@ import {
   DEFAULT_ANGLE_DEGREES,
   DEFAULT_ANGLE_RAY_LENGTH,
   DEFAULT_CURVE_BOW,
+  DEFAULT_GRAPH_EXPRESSION,
+  DEFAULT_GRAPH_X_MAX,
+  DEFAULT_GRAPH_X_MIN,
+  DEFAULT_GRAPH_Y_MAX,
+  DEFAULT_GRAPH_Y_MIN,
   DEFAULT_NUMBER_LINE_MAX,
   DEFAULT_PLOT_CYCLES,
   DEFAULT_PLOT_DOMAIN_SCALE,
@@ -72,6 +77,7 @@ import {
   MAX_AMP_LEAD_LENGTH,
   MAX_ANGLE_DEGREES,
   MAX_ANGLE_RAY_LENGTH,
+  MAX_GRAPH_DOMAIN,
   MAX_NUMBER_LINE_MAX,
   MAX_PLOT_CYCLES,
   MAX_PLOT_DOMAIN_SCALE,
@@ -79,10 +85,12 @@ import {
   MIN_AMP_LEAD_LENGTH,
   MIN_ANGLE_DEGREES,
   MIN_ANGLE_RAY_LENGTH,
+  MIN_GRAPH_DOMAIN,
   MIN_NUMBER_LINE_MAX,
   MIN_PLOT_CYCLES,
   MIN_PLOT_DOMAIN_SCALE,
   MIN_WAVE_CYCLES,
+  compileGraphExpression,
 } from "../../handlers/whiteboardHandlers";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
@@ -120,6 +128,25 @@ const FUNCTION_PLOT_OPTIONS: { value: FunctionPlotType; label: string }[] = [
   { value: "sqrt", label: "Square Root" },
   { value: "logarithm", label: "Logarithm" },
   { value: "absolute", label: "Absolute Value" },
+];
+
+// Quick-start formulas for a "graph" node's Expression field (see WhiteboardNode.graphExpression's
+// own doc comment) - picking one just fills the text field with that formula, it's still freely
+// editable afterward. Not an exhaustive/enforced list the way FUNCTION_PLOT_OPTIONS is for
+// "functionPlot" - "graph" accepts any formula compileGraphExpression can parse, this is only a
+// convenience starting point for the common ones.
+const GRAPH_EXPRESSION_PRESETS: { value: string; label: string }[] = [
+  { value: "x", label: "Linear: x" },
+  { value: "x^2", label: "Quadratic: x^2" },
+  { value: "x^3", label: "Cubic: x^3" },
+  { value: "sin(x)", label: "Sine: sin(x)" },
+  { value: "cos(x)", label: "Cosine: cos(x)" },
+  { value: "tan(x)", label: "Tangent: tan(x)" },
+  { value: "exp(x)", label: "Exponential: e^x" },
+  { value: "ln(x)", label: "Natural log: ln(x)" },
+  { value: "sqrt(x)", label: "Square root: sqrt(x)" },
+  { value: "abs(x)", label: "Absolute value: abs(x)" },
+  { value: "1/x", label: "Reciprocal: 1/x" },
 ];
 
 const LINE_STYLE_OPTIONS: { value: WhiteboardEdge["strokeStyle"]; label: string }[] = [
@@ -890,6 +917,134 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 />
               </div>
             </Field>
+          )}
+          {selectedNodes.every((n) => n.shapeType === "graph") && (
+            <>
+              <Field label="Preset">
+                <select
+                  value=""
+                  onChange={(e) => {
+                    if (e.target.value) updateNodes({ graphExpression: e.target.value });
+                  }}
+                  className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Fills the Expression field below with a common formula - still freely editable afterward"
+                >
+                  <option value="">Choose a preset…</option>
+                  {GRAPH_EXPRESSION_PRESETS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Expression">
+                <input
+                  type="text"
+                  value={selectedNodes[0].graphExpression ?? DEFAULT_GRAPH_EXPRESSION}
+                  onChange={(e) => updateNodes({ graphExpression: e.target.value })}
+                  placeholder="e.g. sin(x), x^2 - 3*x + 2"
+                  spellCheck={false}
+                  className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs font-mono"
+                  title="A formula in terms of x - +-*/^%, parentheses, implicit multiplication (2x), and sin/cos/tan/asin/acos/atan/atan2/sinh/cosh/tanh/sqrt/abs/sign/exp/ln/log/log2/floor/ceil/round/min/max/pow, pi, e"
+                />
+              </Field>
+              {(() => {
+                const error = compileGraphExpression(selectedNodes[0].graphExpression ?? DEFAULT_GRAPH_EXPRESSION).error;
+                return error ? <p className="text-[11px] text-red-500 dark:text-red-400 leading-snug">{error}</p> : null;
+              })()}
+              <Field label="X min">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].graphXMin ?? DEFAULT_GRAPH_X_MIN}
+                  min={MIN_GRAPH_DOMAIN}
+                  max={MAX_GRAPH_DOMAIN}
+                  integer={false}
+                  onCommit={(n) => updateNodes({ graphXMin: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+              </Field>
+              <Field label="X max">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].graphXMax ?? DEFAULT_GRAPH_X_MAX}
+                  min={MIN_GRAPH_DOMAIN}
+                  max={MAX_GRAPH_DOMAIN}
+                  integer={false}
+                  onCommit={(n) => updateNodes({ graphXMax: n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                />
+              </Field>
+              <Field label="Auto Y range">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].graphYMin === undefined && selectedNodes[0].graphYMax === undefined}
+                  onChange={(e) => updateNodes(e.target.checked ? { graphYMin: undefined, graphYMax: undefined } : { graphYMin: DEFAULT_GRAPH_Y_MIN, graphYMax: DEFAULT_GRAPH_Y_MAX })}
+                  className="h-3.5 w-3.5"
+                  title="Fit the y-axis to the curve automatically, or set an explicit range below"
+                />
+              </Field>
+              {selectedNodes.every((n) => n.graphYMin !== undefined || n.graphYMax !== undefined) && (
+                <>
+                  <Field label="Y min">
+                    <ClampedNumberField
+                      key={selectedNodes.map((n) => n.id).join(",")}
+                      initialValue={selectedNodes[0].graphYMin ?? DEFAULT_GRAPH_Y_MIN}
+                      min={MIN_GRAPH_DOMAIN}
+                      max={MAX_GRAPH_DOMAIN}
+                      integer={false}
+                      onCommit={(n) => updateNodes({ graphYMin: n })}
+                      className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    />
+                  </Field>
+                  <Field label="Y max">
+                    <ClampedNumberField
+                      key={selectedNodes.map((n) => n.id).join(",")}
+                      initialValue={selectedNodes[0].graphYMax ?? DEFAULT_GRAPH_Y_MAX}
+                      min={MIN_GRAPH_DOMAIN}
+                      max={MAX_GRAPH_DOMAIN}
+                      integer={false}
+                      onCommit={(n) => updateNodes({ graphYMax: n })}
+                      className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    />
+                  </Field>
+                </>
+              )}
+              <Field label="X interval">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].graphXTickInterval ?? 0}
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  integer={false}
+                  onCommit={(n) => updateNodes({ graphXTickInterval: n <= 0 ? undefined : n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Spacing between x-axis tick numbers, in this graph's own x units - 0 picks it automatically"
+                />
+              </Field>
+              <Field label="Y interval">
+                <ClampedNumberField
+                  key={selectedNodes.map((n) => n.id).join(",")}
+                  initialValue={selectedNodes[0].graphYTickInterval ?? 0}
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  integer={false}
+                  onCommit={(n) => updateNodes({ graphYTickInterval: n <= 0 ? undefined : n })}
+                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  title="Spacing between y-axis tick numbers, in this graph's own y units - 0 picks it automatically"
+                />
+              </Field>
+              <Field label="Show grid">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].graphShowGrid ?? true}
+                  onChange={(e) => updateNodes({ graphShowGrid: e.target.checked })}
+                  className="h-3.5 w-3.5"
+                  title="Faint gridlines across the whole plot at every tick, not just the axis tick marks"
+                />
+              </Field>
+            </>
           )}
           {selectedNodes.every((n) => n.shapeType === "amplifier") && (
             <>

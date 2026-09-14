@@ -147,6 +147,12 @@ const GENERAL_SHAPE_PRESETS: ShapePreset[] = [
 ];
 
 const CHART_SHAPE_PRESETS: ShapePreset[] = [
+  // Unlike "functionPlot"'s curated preset list below, "graph" is a single tile (same "one preset,
+  // tune it after placing" treatment PHYSICS_3D_SHAPE_PRESETS gives "latticeGauge") - its whole point
+  // is a freely-typed formula plus an explicit, independently adjustable x/y window, both edited in
+  // the style panel after placement (see WhiteboardStylePanel.tsx's own "graph" field block), not a
+  // fixed set of starting curves worth a tile each.
+  { type: "graph", label: "Graph" },
   { type: "barChart", label: "Bar Chart" },
   { type: "lineChart", label: "Line Chart" },
   { type: "pieChart", label: "Pie Chart" },
@@ -201,6 +207,12 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
     plotCycles: preset.overrides?.plotCycles,
     plotShowGrid: preset.overrides?.plotShowGrid,
     numberLineMax: preset.overrides?.numberLineMax,
+    graphExpression: preset.overrides?.graphExpression,
+    graphXMin: preset.overrides?.graphXMin,
+    graphXMax: preset.overrides?.graphXMax,
+    graphYMin: preset.overrides?.graphYMin,
+    graphYMax: preset.overrides?.graphYMax,
+    graphShowGrid: preset.overrides?.graphShowGrid,
   });
   // Line-only shapes (waves, circuit symbols, axes...) render as an open trace, not a filled
   // silhouette (matches their own default fillColor: null) - filling the preview swatch would shade
@@ -277,6 +289,7 @@ const ARROW_PRESETS: ArrowPreset[] = [
   { kind: "connector", label: "Bidirectional", overrides: { endArrowType: "triangle", startArrowType: "triangle", strokeStyle: "solid", routing: "straight" } },
   { kind: "connector", label: "Orthogonal", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "orthogonal" } },
   { kind: "connector", label: "Curved", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "curved" } },
+  { kind: "connector", label: "Curved Line", overrides: { endArrowType: "none", startArrowType: "none", strokeStyle: "solid", routing: "curved" } },
   { kind: "connector", label: "Open Arrow", overrides: { endArrowType: "triangleOpen", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },
   { kind: "connector", label: "Block Arrow", overrides: { endArrowType: "block", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },
   { kind: "connector", label: "Plain Line", overrides: { endArrowType: "none", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },

@@ -95,6 +95,13 @@ export type WhiteboardShapeType =
   | "pieChart"
   | "scatterPlot"
   | "functionPlot"
+  // A user-typed math expression graphed over an explicit, independently adjustable x/y window (see
+  // WhiteboardNode.graphExpression's own doc comment) - the "graphing calculator" counterpart to
+  // "functionPlot"'s curated preset list: any formula in terms of `x` (parsed by
+  // whiteboardHandlers.ts's own small arithmetic expression parser, not `eval`/`new Function` - see
+  // its compileGraphExpression doc comment for why), plotted with the same "chart" outline machinery
+  // (axis lines, optional gridlines, tick labels) every other chart shape already shares.
+  | "graph"
   // A typeset math formula (rendered via KaTeX - see whiteboardHandlers.ts's paintEquation and
   // WhiteboardCanvas.tsx's own KaTeX rendering) - reuses WhiteboardNode.text to hold the raw LaTeX
   // SOURCE (e.g. "E = mc^2"), the same field every other shape's label already lives in, rather than
@@ -156,6 +163,9 @@ export const LINE_ONLY_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<Whiteb
   "pieChart",
   "scatterPlot",
   "functionPlot",
+  // "graph": same reasoning as "functionPlot" immediately above - axis lines + a stroked curve, no
+  // fillable silhouette of its own.
+  "graph",
   // "diode" is deliberately NOT here - its triangle is a real fillable region, same reasoning as
   // barChart's bars.
   "vector",
@@ -257,7 +267,7 @@ export const CHART_DATA_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<White
 // The shapeTypes whose "chart" ShapeOutline can carry tick/value labels (see ChartLabel and
 // WhiteboardNode.showChartLabels) - every chart type except pieChart, which has no axis at all to
 // label (a pie's own "data" is communicated by slice size/color, not a scale).
-export const CHART_LABEL_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["barChart", "lineChart", "scatterPlot", "functionPlot", "numberLine"]);
+export const CHART_LABEL_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["barChart", "lineChart", "scatterPlot", "functionPlot", "numberLine", "graph"]);
 
 interface WhiteboardItemBase {
   id: string;
@@ -385,6 +395,39 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // numberLineOutline), so cranking this up doesn't degrade into unreadable clutter. Absent -
   // resolves to DEFAULT_NUMBER_LINE_MAX (10, the line's original fixed range).
   numberLineMax?: number;
+  // "graph" only - a formula in terms of `x` (e.g. "sin(x)", "x^2 - 3*x + 2", "1/x"), compiled by
+  // whiteboardHandlers.ts's compileGraphExpression - a small hand-rolled arithmetic parser (numbers,
+  // +-*/^%, parentheses, implicit multiplication like "2x", and a fixed table of functions/constants:
+  // sin/cos/tan/asin/acos/atan/atan2/sinh/cosh/tanh/sqrt/abs/sign/exp/ln/log/log2/floor/ceil/round/
+  // min/max/pow/pi/e), never `eval`/`new Function` - this is what lets "graph" cover any formula a
+  // user can type rather than functionPlot's own curated preset list, with no way to express
+  // anything past plain arithmetic (no loops, no access to anything outside the formula itself).
+  // Absent/empty - resolves to DEFAULT_GRAPH_EXPRESSION. An expression that fails to parse (or
+  // evaluates to non-finite everywhere) simply draws no curve - the axes/grid still render, and the
+  // style panel's Expression field shows the parse error inline rather than the shape breaking.
+  graphExpression?: string;
+  // "graph" only - the plotted x-domain, unlike functionPlot's plotDomainScale multiplier this is an
+  // explicit absolute [min, max] window (a user-typed formula has no single "natural" domain a
+  // multiplier could scale) - independently adjustable in the style panel. Absent - resolves to
+  // DEFAULT_GRAPH_X_MIN/DEFAULT_GRAPH_X_MAX.
+  graphXMin?: number;
+  graphXMax?: number;
+  // "graph" only - an explicit y-domain override. Both absent (the default) - the y-axis auto-fits
+  // to whatever the sampled curve's own range is (see whiteboardHandlers.ts's graphOutline, robust
+  // against a near-asymptote sample or two dominating the scale), same as functionPlot's own
+  // auto-fit; setting either one switches that axis to the explicit value instead, e.g. for lining
+  // up two graph shapes on the same y-scale for comparison.
+  graphYMin?: number;
+  graphYMax?: number;
+  // "graph" only - draws faint gridlines across the whole plot at every tick position (both axes),
+  // same field/rendering as functionPlot's own plotShowGrid. Absent - resolves to true (unlike
+  // functionPlot's off-by-default, a typed-formula graph reads more like reference graph paper by
+  // default).
+  graphShowGrid?: boolean;
+  // "graph" only - explicit tick spacing per axis, same "0/absent picks an automatic 5-tick spacing"
+  // convention as functionPlot's plotXTickInterval/plotYTickInterval.
+  graphXTickInterval?: number;
+  graphYTickInterval?: number;
   // "amplifier" only - each lead's own length in ABSOLUTE doc units (not a fraction of width - see
   // whiteboardHandlers.ts's MIN/MAX/DEFAULT_AMP_*_LEAD_LENGTH for why absolute is what lets dragging
   // one terminal lengthen/shorten JUST that wire). The two input leads are always independently
@@ -743,6 +786,7 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   pieChart: { width: 190, height: 190 },
   scatterPlot: { width: 220, height: 160 },
   functionPlot: { width: 200, height: 160 },
+  graph: { width: 260, height: 200 },
   equation: { width: 220, height: 70 },
   vector: { width: 160, height: 40 },
   diode: { width: 160, height: 60 },
@@ -794,6 +838,14 @@ export function createDefaultWhiteboardNode(
       | "plotYTickInterval"
       | "showChartLabels"
       | "numberLineMax"
+      | "graphExpression"
+      | "graphXMin"
+      | "graphXMax"
+      | "graphYMin"
+      | "graphYMax"
+      | "graphShowGrid"
+      | "graphXTickInterval"
+      | "graphYTickInterval"
       | "tableRows"
       | "tableCols"
     >
@@ -845,6 +897,19 @@ export function createDefaultWhiteboardNode(
     plotYTickInterval: shapeType === "functionPlot" ? overrides?.plotYTickInterval : undefined,
     showChartLabels: CHART_LABEL_SHAPES.has(shapeType) ? overrides?.showChartLabels ?? true : undefined,
     numberLineMax: shapeType === "numberLine" ? overrides?.numberLineMax ?? 10 : undefined,
+    // Literal defaults here (rather than importing whiteboardHandlers.ts's own
+    // DEFAULT_GRAPH_EXPRESSION/DEFAULT_GRAPH_X_MIN/DEFAULT_GRAPH_X_MAX) match every other chart
+    // field's own "hardcoded literal, not an imported constant" convention above (e.g.
+    // plotFunction's "sine", numberLineMax's 10) - this file is imported BY whiteboardHandlers.ts,
+    // so importing back from it would be circular.
+    graphExpression: shapeType === "graph" ? overrides?.graphExpression ?? "sin(x)" : undefined,
+    graphXMin: shapeType === "graph" ? overrides?.graphXMin ?? -10 : undefined,
+    graphXMax: shapeType === "graph" ? overrides?.graphXMax ?? 10 : undefined,
+    graphYMin: shapeType === "graph" ? overrides?.graphYMin : undefined,
+    graphYMax: shapeType === "graph" ? overrides?.graphYMax : undefined,
+    graphShowGrid: shapeType === "graph" ? overrides?.graphShowGrid ?? true : undefined,
+    graphXTickInterval: shapeType === "graph" ? overrides?.graphXTickInterval : undefined,
+    graphYTickInterval: shapeType === "graph" ? overrides?.graphYTickInterval : undefined,
     latticeSize: shapeType === "latticeGauge" ? DEFAULT_LATTICE_SIZE : undefined,
     latticeSiteSpacing: shapeType === "latticeGauge" ? DEFAULT_LATTICE_SITE_SPACING : undefined,
     latticeShowQuarks: shapeType === "latticeGauge" ? true : undefined,

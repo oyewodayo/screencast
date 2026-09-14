@@ -51,6 +51,7 @@ import {
   DEFAULT_AMP_INPUT_LEAD_LENGTH,
   DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
   DEFAULT_CURVE_BOW,
+  edgeBoundingBox,
   MAX_AMP_LEAD_LENGTH,
   MIN_AMP_LEAD_LENGTH,
   nodeCenter,
@@ -308,6 +309,21 @@ type Interaction =
       edgeId: string;
       index: number;
       startWaypoints: { x: number; y: number }[];
+    }
+  | {
+      // Dragging an edge's whole BODY (its fat invisible hit-stroke, not a specific endpoint/
+      // waypoint dot) to translate it - see beginMoveEdge. Only ever moves a FREE-FLOATING endpoint
+      // (WhiteboardEndpoint.nodeId absent); an endpoint anchored to a shape is left untouched, since
+      // its position is derived from that shape and "moving the edge" has no meaning for it (see
+      // handlePointerMove's own "moveEdge" branch). An edge with both ends anchored to shapes
+      // therefore has nothing this gesture can change at all - selecting it still works, dragging
+      // its body just does nothing, which is the correct behavior for a connector whose entire path
+      // comes from the two shapes it connects.
+      mode: "moveEdge";
+      id: string;
+      startClientX: number;
+      startClientY: number;
+      startEdge: WhiteboardEdge;
     };
 
 // Below this on-screen movement (CSS px, pre-zoom-correction) between two recorded connector-drag
@@ -557,6 +573,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // node drags, so a whole drag becomes one undo step instead of one per pointermove tick.
   const [liveWaypointsEdgeId, setLiveWaypointsEdgeId] = useState<string | null>(null);
   const [liveWaypoints, setLiveWaypoints] = useState<{ x: number; y: number }[] | null>(null);
+  // Live-in-progress position for whichever edge is currently having its whole BODY dragged (see
+  // beginMoveEdge/the "moveEdge" Interaction mode) - same "stage locally, commit once on release"
+  // pattern liveNodes uses for node drags, so a drag becomes one undo step instead of one per
+  // pointermove tick.
+  const [liveEdges, setLiveEdges] = useState<WhiteboardEdge[] | null>(null);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [connectorHoverNodeId, setConnectorHoverNodeId] = useState<string | null>(null);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
@@ -565,6 +586,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
 
   const nodes = liveNodes ?? page.nodes;
   const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
+  const edges = liveEdges ?? page.edges;
 
   const clientToDoc = useCallback(
     (clientX: number, clientY: number): { x: number; y: number } => {
@@ -884,6 +906,22 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     [onEditEdge]
   );
 
+  // Starts dragging an edge's whole BODY (a pointerdown on its own fat invisible hit-stroke, not one
+  // of the small source/target/waypoint dots) - lets a free-floating connector (drawn straight onto
+  // empty canvas, neither end attached to a shape) actually be relocated by grabbing the line
+  // itself, the same way every node can already be dragged by its body. See the "moveEdge"
+  // Interaction variant's own doc comment for why an endpoint anchored to a shape is left alone
+  // rather than dragged along with the rest.
+  const beginMoveEdge = useCallback(
+    (edge: WhiteboardEdge, e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set(), new Set([edge.id]));
+      interactionRef.current = { mode: "moveEdge", id: edge.id, startClientX: e.clientX, startClientY: e.clientY, startEdge: edge };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
   // How far (doc units) a hover-arrow-placed shape lands from the node it was placed off of - see
   // placeConnectedShape (exposed on the imperative handle below).
   const QUICK_CLONE_GAP = 80;
@@ -1136,6 +1174,26 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         return;
       }
 
+      if (interaction.mode === "moveEdge") {
+        const dx = (e.clientX - interaction.startClientX) / zoom;
+        const dy = (e.clientY - interaction.startClientY) / zoom;
+        const start = interaction.startEdge;
+        // Only a FREE-FLOATING endpoint (no nodeId) has an x/y of its own to translate - one
+        // anchored to a shape is left exactly as it was (see the "moveEdge" Interaction variant's
+        // own doc comment). Each free endpoint snaps its OWN resulting position independently
+        // (there's no single shared "anchor" the way a multi-node group move has to preserve one
+        // relative layout for).
+        const moveEndpoint = (ep: WhiteboardEndpoint): WhiteboardEndpoint => {
+          if (ep.nodeId) return ep;
+          const moved = { x: (ep.x ?? 0) + dx, y: (ep.y ?? 0) + dy };
+          const snapped = snapEnabled ? snapPoint(moved) : moved;
+          return { ...ep, x: snapped.x, y: snapped.y };
+        };
+        const moved: WhiteboardEdge = { ...start, source: moveEndpoint(start.source), target: moveEndpoint(start.target) };
+        setLiveEdges(page.edges.map((ed) => (ed.id === interaction.id ? moved : ed)));
+        return;
+      }
+
       if (interaction.mode === "marquee") {
         const cur = clientToDoc(e.clientX, e.clientY);
         setMarqueeRect({
@@ -1197,7 +1255,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
       }
     },
-    [zoom, page.nodes, clientToDoc, nodes, nodesById, onPanChange, laserArmed, snapToGrid]
+    [zoom, page.nodes, page.edges, clientToDoc, nodes, nodesById, onPanChange, laserArmed, snapToGrid]
   );
 
   const handlePointerUp = useCallback(
@@ -1238,7 +1296,16 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               n.y < marqueeRect.y + marqueeRect.height &&
               n.y + n.height > marqueeRect.y
           );
-          onSelectionChange(expandGroupSelection(new Set(enclosed.map((n) => n.id)), page.nodes), new Set());
+          // Edges (connectors) were previously never selectable via marquee at all - only page.nodes
+          // was ever filtered here. A "curved" edge with a real bow can visually pass well outside
+          // its own straight-line source->target box, so edgeBoundingBox (not a naive source/target
+          // rect) is what's tested against the marquee here, same overlap test as nodes get.
+          const enclosedEdges = page.edges.filter((edge) => {
+            const { source, target } = resolveEdgeEndpoints(edge, nodesById);
+            const box = edgeBoundingBox(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, edge.waypoints ?? []);
+            return box.x < marqueeRect.x + marqueeRect.width && box.x + box.width > marqueeRect.x && box.y < marqueeRect.y + marqueeRect.height && box.y + box.height > marqueeRect.y;
+          });
+          onSelectionChange(expandGroupSelection(new Set(enclosed.map((n) => n.id)), page.nodes), new Set(enclosedEdges.map((edge) => edge.id)));
         } else {
           onSelectionChange(new Set(), new Set());
         }
@@ -1309,9 +1376,24 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
         setLiveWaypointsEdgeId(null);
         setLiveWaypoints(null);
+      } else if (interaction.mode === "moveEdge" && liveEdges) {
+        // A plain click (no real movement) leaves the moved edge's source/target identical to
+        // interaction.startEdge's own (both endpoints anchored to shapes, or no drag ever happened)
+        // - skip committing a no-op edit, same "don't pollute undo history" reasoning the waypoint
+        // branch above already follows.
+        const after = liveEdges.find((ed) => ed.id === interaction.id);
+        const start = interaction.startEdge;
+        const moved =
+          after &&
+          (after.source.x !== start.source.x ||
+            after.source.y !== start.source.y ||
+            after.target.x !== start.target.x ||
+            after.target.y !== start.target.y);
+        if (after && moved) onEditEdge(start, after);
+        setLiveEdges(null);
       }
     },
-    [liveNodes, liveWaypoints, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
+    [liveNodes, liveWaypoints, liveEdges, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, nodesById, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
   );
 
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
@@ -1496,7 +1578,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               </marker>
             ))}
           </defs>
-          {page.edges.map((edge) => {
+          {edges.map((edge) => {
             const { source, target } = resolveEdgeEndpoints(edge, nodesById);
             const waypoints = liveWaypointsEdgeId === edge.id && liveWaypoints ? liveWaypoints : edge.waypoints ?? [];
             const d = buildEdgePath(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, waypoints);
@@ -1512,7 +1594,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   fill="none"
                   stroke="transparent"
                   strokeWidth={HIT_STROKE_SCREEN_WIDTH / zoom}
-                  style={{ pointerEvents: "stroke", cursor: "pointer" }}
+                  style={{ pointerEvents: "stroke", cursor: "grab" }}
                   onPointerDown={(e) => {
                     // Same "let an armed tool's click through to the container" reasoning as the
                     // node div's own onPointerDown guard above - an edge's fat invisible hit-stroke
@@ -1520,8 +1602,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     // place a new shape/text/stroke on top of it. laserArmed additionally means
                     // "just pointing, not editing" - clicks should do nothing at all while it's on.
                     if (armedShapeType || laserArmed) return;
-                    e.stopPropagation();
-                    onSelectionChange(new Set(), new Set([edge.id]));
+                    // beginMoveEdge both selects this edge AND stages a "moveEdge" drag - a plain
+                    // click (no real movement before pointerup) still ends up just selecting it, the
+                    // same way a node's own beginMoveNode covers both click-to-select and drag-to-
+                    // move with one gesture instead of two different handlers.
+                    beginMoveEdge(edge, e);
                   }}
                   onContextMenu={(e) => {
                     e.preventDefault();
@@ -1646,6 +1731,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             plotYTickInterval: node.plotYTickInterval,
             showChartLabels: node.showChartLabels,
             numberLineMax: node.numberLineMax,
+            graphExpression: node.graphExpression,
+            graphXMin: node.graphXMin,
+            graphXMax: node.graphXMax,
+            graphYMin: node.graphYMin,
+            graphYMax: node.graphYMax,
+            graphShowGrid: node.graphShowGrid,
+            graphXTickInterval: node.graphXTickInterval,
+            graphYTickInterval: node.graphYTickInterval,
             ampInputTopLeadLength: node.ampInputTopLeadLength,
             ampInputBottomLeadLength: node.ampInputBottomLeadLength,
             ampOutputLeadLength: node.ampOutputLeadLength,
@@ -1960,23 +2053,32 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   one stacked underneath it either. A dedicated handle above the TOP-LEFT corner
                   (top-right is the rotate handle's spot) hands that back: it's a plain child of this
                   node's own div, so a pointerdown here that does nothing but call beginMoveNode
-                  behaves exactly like grabbing any other shape's body would. */}
-              {selected && selectedNodeIds.size === 1 && !connectorArmed && (node.shapeType === "table" || node.shapeType === "latticeGauge") && (
-                <div
-                  onPointerDown={(e) => beginMoveNode(node, e, e.shiftKey)}
-                  className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-600 text-blue-600 hover:text-white flex items-center justify-center shadow-sm"
-                  style={{
-                    left: -ROTATE_ICON_SCREEN_SIZE / zoom / 2,
-                    top: -ROTATE_HANDLE_GAP / zoom - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
-                    width: ROTATE_ICON_SCREEN_SIZE / zoom,
-                    height: ROTATE_ICON_SCREEN_SIZE / zoom,
-                    cursor: "grab",
-                  }}
-                  title={node.shapeType === "table" ? "Drag to move this table" : "Drag to move this lattice"}
-                >
-                  <TbArrowsMove size={ROTATE_ICON_SCREEN_SIZE * 0.7} style={{ width: "70%", height: "70%" }} />
-                </div>
-              )}
+                  behaves exactly like grabbing any other shape's body would.
+                  "graph"'s own body doesn't intercept pointer events the way table/latticeGauge do -
+                  a click on any blank area between its axis/grid lines already falls through to this
+                  same beginMoveNode via the node div's own onPointerDown - but its curve/axis/grid
+                  lines cover enough of a typical box that finding one of those blank gaps to grab can
+                  be fiddly, especially once it's full of gridlines. Same handle, same reasoning, just
+                  for convenience rather than necessity. */}
+              {selected &&
+                selectedNodeIds.size === 1 &&
+                !connectorArmed &&
+                (node.shapeType === "table" || node.shapeType === "latticeGauge" || node.shapeType === "graph") && (
+                  <div
+                    onPointerDown={(e) => beginMoveNode(node, e, e.shiftKey)}
+                    className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-600 text-blue-600 hover:text-white flex items-center justify-center shadow-sm"
+                    style={{
+                      left: -ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                      top: -ROTATE_HANDLE_GAP / zoom - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                      width: ROTATE_ICON_SCREEN_SIZE / zoom,
+                      height: ROTATE_ICON_SCREEN_SIZE / zoom,
+                      cursor: "grab",
+                    }}
+                    title={node.shapeType === "table" ? "Drag to move this table" : node.shapeType === "latticeGauge" ? "Drag to move this lattice" : "Drag to move this graph"}
+                  >
+                    <TbArrowsMove size={ROTATE_ICON_SCREEN_SIZE * 0.7} style={{ width: "70%", height: "70%" }} />
+                  </div>
+                )}
 
               {/* Rotate handle - a small icon button above the shape's TOP-RIGHT corner (not
                   top-center, where it used to sit): centered horizontally, it collided with the
