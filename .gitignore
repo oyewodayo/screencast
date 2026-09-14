@@ -14,6 +14,9 @@ dist-ssr
 binaries/*
 target
 
+# Personal scratch notes
+/LATTICE_GAUGE_PHYSICS_NOTES.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

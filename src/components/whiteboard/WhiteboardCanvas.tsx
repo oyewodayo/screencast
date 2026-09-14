@@ -1,0 +1,2501 @@
+// components/whiteboard/WhiteboardCanvas.tsx
+//
+// The Whiteboard feature's interactive surface - an infinite pan/zoom canvas built from real DOM
+// nodes (each shape is a positioned <div>) plus one SVG layer for connectors, rather than a single
+// <canvas> buffer like BoardCanvas.tsx. That split is deliberate: connectors need to track live
+// node positions and re-route as shapes move, and inline double-click-to-edit text needs a real
+// contentEditable element - both fall out for free with DOM nodes, at the cost of writing our own
+// pan/zoom transform instead of relying on canvas's built-in scale.
+//
+// Renders exactly one WhiteboardPage at a time (the caller's currently active one) - never the
+// whole multi-page document, same "one page is one independent canvas" model useWhiteboardStore.ts
+// and whiteboardHandlers.ts's page-scoped functions already follow.
+//
+// Coordinate spaces: "doc space" is this page's own infinite coordinate plane (what every
+// WhiteboardNode/Edge's x/y/width/height is expressed in); "screen space" is CSS pixels within
+// this component's container. `pan`+`zoom` (owned by WhiteboardEditor) map one to the other:
+// screenX = docX * zoom + pan.x. Everything that needs to look a constant size on screen regardless
+// of zoom (resize handles, connection dots, stroke widths of UI chrome) divides by `zoom` even
+// though it's rendered inside the zoomed/panned group - same reasoning as BoardCanvas.tsx's own
+// HANDLE_DRAW_RADIUS/zoom convention, just applied to DOM/CSS sizes instead of canvas-buffer ones.
+//
+// Every drag gesture (move/resize/connector create-or-reattach/marquee/freehand stroke) stages its
+// result in local React state and only commits to the store (one editNode/batchEditNodes/addEdge/
+// editEdge/addNode call) on pointer release - the same "stage locally, commit once" discipline
+// BoardCanvas.tsx's own liveImages uses, so a whole gesture is exactly one undo step.
+import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { TbRotateClockwise, TbArrowsMove } from "react-icons/tb";
+import katex from "katex";
+import LatticeGaugeWidget from "./LatticeGaugeWidget";
+import WhiteboardTable from "./WhiteboardTable";
+import {
+  ArrowheadType,
+  createDefaultWhiteboardEdge,
+  createDefaultWhiteboardNode,
+  createFreehandWhiteboardNode,
+  DEFAULT_CHART_DATA,
+  WhiteboardAnchorSide,
+  WhiteboardEdge,
+  WhiteboardEndpoint,
+  WhiteboardNode,
+  WhiteboardPage,
+  WhiteboardShapeType,
+} from "../../utils/whiteboardTypes";
+import {
+  AMP_MINUS_Y_FRAC,
+  AMP_PLUS_Y_FRAC,
+  BoundsBox,
+  buildEdgePath,
+  chartColumnLayout,
+  clampAmpLeadTerminalY,
+  computeCurveBowFromPath,
+  CYLINDER_CAP_RATIO,
+  DEFAULT_AMP_INPUT_LEAD_LENGTH,
+  DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
+  DEFAULT_CURVE_BOW,
+  edgeBoundingBox,
+  graphCoordinateMapper,
+  MAX_AMP_LEAD_LENGTH,
+  MIN_AMP_LEAD_LENGTH,
+  nearestSegmentInsertIndex,
+  nodeCenter,
+  nudgeEdgeBy,
+  resolveAmplifierGeometry,
+  resolveAnchorPoint,
+  resolveEdgeEndpoints,
+  resolveGraphAxisRange,
+  shapeOutlineFor,
+} from "../../handlers/whiteboardHandlers";
+
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 4;
+const GRID_SIZE = 24;
+const HANDLE_SCREEN_SIZE = 9;
+// On-screen distance (CSS px, pre-zoom-correction) from a node's top edge out to its rotate handle.
+const ROTATE_HANDLE_GAP = 22;
+// The rotate handle renders as a small icon button, bigger than the plain resize/connection dots
+// so the glyph inside it stays legible.
+const ROTATE_ICON_SCREEN_SIZE = 18;
+const CONNECTION_DOT_SCREEN_SIZE = 9;
+const HIT_STROKE_SCREEN_WIDTH = 14;
+// Minimum on-screen movement (CSS px, pre-zoom-correction) between two recorded freehand points -
+// keeps a slow stroke from recording hundreds of near-duplicate points that would otherwise bloat
+// the saved document for no visible smoothness gain.
+const FREEHAND_MIN_POINT_DISTANCE = 3;
+// Minimum on-screen movement (CSS px, pre-zoom-correction) between two recorded laser-trail points
+// - same "don't bloat with near-duplicate points" reasoning as FREEHAND_MIN_POINT_DISTANCE, just for
+// an ephemeral trail instead of a saved stroke.
+const LASER_MIN_POINT_DISTANCE = 2;
+// How long (ms) a laser trail point stays visible before it's fully faded/pruned - the "comet tail"
+// length. Short enough that the trail reads as "where the pointer just was," not a lingering mark.
+const LASER_FADE_MS = 550;
+
+type ResizeCorner = "nw" | "ne" | "sw" | "se";
+const RESIZE_CORNERS: ResizeCorner[] = ["nw", "ne", "sw", "se"];
+
+// The lattice a move/resize/connector-endpoint/waypoint drag snaps to when snapping is active (see
+// isSnapEnabled) - the SAME GRID_SIZE the background dot-grid is drawn at (showGrid), so a snapped
+// shape's corners land visibly on the dots rather than some other, unrelated spacing.
+function snapCoord(v: number): number {
+  return Math.round(v / GRID_SIZE) * GRID_SIZE;
+}
+function snapPoint(p: { x: number; y: number }): { x: number; y: number } {
+  return { x: snapCoord(p.x), y: snapCoord(p.y) };
+}
+// Whether THIS gesture should snap - the document's own snapToGrid toggle, inverted for as long as
+// Alt is held (mirroring the rotate handle's own shiftKey-for-15deg convention: a modifier changes
+// snap behavior for the duration of the drag, rather than needing the toolbar toggle clicked first)
+// - lets a snap-on document still place one shape off-grid, and a snap-off document still snap just
+// one drag, without a trip to the toolbar either way. Alt is free to reuse here: it only means
+// anything at pointerDOWN (start a pan - see handleContainerPointerDown), never during an
+// already-captured move/resize/connector/waypoint drag.
+function isSnapEnabled(snapToGrid: boolean, e: { altKey: boolean }): boolean {
+  return snapToGrid !== e.altKey;
+}
+
+function oppositeCorner(corner: ResizeCorner): ResizeCorner {
+  return corner === "nw" ? "se" : corner === "se" ? "nw" : corner === "ne" ? "sw" : "ne";
+}
+
+// Rotates a LOCAL vector (relative to a node's own center) by `deg` to get its WORLD/doc-space
+// vector - the exact same rotation the node's own `transform: rotate(deg)` (see the node div below)
+// applies visually, so this and that CSS transform always agree on which way is which. Passing
+// `-deg` does the inverse (world -> local) - used by the resize-drag math below to figure out what
+// a screen-space pointer movement means in the shape's OWN (possibly tilted) axes.
+function rotateVector(x: number, y: number, deg: number): { x: number; y: number } {
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  return { x: x * cos - y * sin, y: x * sin + y * cos };
+}
+
+// A box corner's position relative to ITS OWN center, in local (unrotated, unflipped) space - e.g.
+// "se" is always (+width/2, +height/2) regardless of where the box actually sits or how it's
+// rotated/flipped.
+function cornerLocalOffset(width: number, height: number, corner: ResizeCorner): { x: number; y: number } {
+  return { x: (corner.includes("w") ? -width : width) / 2, y: (corner.includes("n") ? -height : height) / 2 };
+}
+
+// Mirrors a local offset vector per WhiteboardNode.flipHorizontal/flipVertical - flip is its own
+// inverse (applying it twice is a no-op), so this same function converts local -> flipped-local in
+// both directions.
+function flipVector(v: { x: number; y: number }, node: WhiteboardNode): { x: number; y: number } {
+  return { x: node.flipHorizontal ? -v.x : v.x, y: node.flipVertical ? -v.y : v.y };
+}
+
+// Converts a LOCAL offset vector (relative to a node's own center) to its WORLD/doc-space vector,
+// matching the node's own render transform exactly - see the node div's own `transform: rotate(deg)
+// scaleX(-1) scaleY(-1)` below (flip applied first/innermost, rotation second/outermost - same
+// order whiteboardHandlers.ts's Canvas2D export calls ctx.rotate/ctx.scale in). `worldToLocalVector`
+// below is its inverse.
+function localToWorldVector(v: { x: number; y: number }, node: WhiteboardNode): { x: number; y: number } {
+  const flipped = flipVector(v, node);
+  return node.rotation ? rotateVector(flipped.x, flipped.y, node.rotation) : flipped;
+}
+// Inverse of localToWorldVector - what a screen-space drag delta (already zoom-corrected) means in
+// the shape's OWN (possibly rotated AND flipped) local axes. Un-rotate first, then un-flip (flip is
+// applied INNERMOST in the forward direction, so it's the LAST step to undo, mirroring
+// localToWorldVector's own order in reverse).
+function worldToLocalVector(v: { x: number; y: number }, node: WhiteboardNode): { x: number; y: number } {
+  const unrotated = node.rotation ? rotateVector(v.x, v.y, -node.rotation) : v;
+  return flipVector(unrotated, node);
+}
+
+// A box corner's actual WORLD/doc-space position, accounting for the node's own rotation AND flip
+// (both applied about its own center, matching transformOrigin: "center" on the node's own wrapper
+// div below).
+function cornerWorldPoint(node: WhiteboardNode, corner: ResizeCorner): { x: number; y: number } {
+  const center = nodeCenter(node);
+  const offset = cornerLocalOffset(node.width, node.height, corner);
+  const world = localToWorldVector(offset, node);
+  return { x: center.x + world.x, y: center.y + world.y };
+}
+
+// Same idea as cornerLocalOffset/cornerWorldPoint above, just for the midpoint of the west/east
+// edge instead of a corner (y stays 0 - vertically centered) - what the amplifier's lead-terminal
+// drag (beginAmpLeadDrag) anchors the OPPOSITE side against, the same "solve so that point stays
+// fixed in world space" trick the resize-corner math uses, just for a one-axis (width-only) resize.
+function edgeLocalOffset(width: number, edge: "w" | "e"): { x: number; y: number } {
+  return { x: (edge === "w" ? -width : width) / 2, y: 0 };
+}
+function edgeWorldPoint(node: WhiteboardNode, edge: "w" | "e"): { x: number; y: number } {
+  const center = nodeCenter(node);
+  const offset = edgeLocalOffset(node.width, edge);
+  const world = localToWorldVector(offset, node);
+  return { x: center.x + world.x, y: center.y + world.y };
+}
+
+// Given a set of already-selected node ids, adds every OTHER node sharing a groupId with one of
+// them - a group is meant to act as one unit once formed (see WhiteboardNode.groupId's own doc
+// comment), so any selection that catches part of a group (a marquee that only overlaps some of
+// its members, e.g.) gets topped up to the whole group rather than leaving it half-selected.
+function expandGroupSelection(ids: Set<string>, nodes: WhiteboardNode[]): Set<string> {
+  const groupIds = new Set(nodes.filter((n) => n.groupId && ids.has(n.id)).map((n) => n.groupId!));
+  if (groupIds.size === 0) return ids;
+  const expanded = new Set(ids);
+  for (const n of nodes) if (n.groupId && groupIds.has(n.groupId)) expanded.add(n.id);
+  return expanded;
+}
+
+const ANCHOR_SIDES: Exclude<WhiteboardAnchorSide, "auto">[] = ["top", "right", "bottom", "left"];
+// Every shape type EXCEPT these two has a meaningful "attach a connector here" edge - a plain
+// x/y/width/height box that resolveAnchorPoint/resolveAutoSide can pick a side of, regardless of
+// which of the toolbar's palette groups (Basic/General/Waveforms/Science/Charts & Plots/...) it
+// comes from, so this is a denylist rather than an allowlist of specific shapeTypes: new shapes
+// stay connectable by default without needing to be added here. "freehand" ink and free-floating
+// "text" are the only two with no such natural anchor, so they don't show connection dots, don't
+// show the hover "quick connect" arrows, and don't accept connector drops aimed at their body (a
+// connector can still end at a free point over them, same as empty canvas).
+const NON_CONNECTABLE_SHAPES = new Set<WhiteboardShapeType>(["text", "freehand"]);
+function isConnectableShape(shapeType: WhiteboardShapeType): boolean {
+  return !NON_CONNECTABLE_SHAPES.has(shapeType);
+}
+
+type Interaction =
+  | {
+      mode: "move";
+      ids: string[];
+      startClientX: number;
+      startClientY: number;
+      startNodes: WhiteboardNode[];
+      // The actually-clicked node (always a member of startNodes) - what snapping (see
+      // isSnapEnabled) measures against when several nodes move together as a group, so the WHOLE
+      // group's relative layout is preserved (one shared dx/dy) while still landing the node the
+      // user actually grabbed on the lattice, the same "snap the thing you're dragging" feel a
+      // single-node move gets for free.
+      anchorId: string;
+    }
+  | {
+      mode: "resize";
+      id: string;
+      corner: ResizeCorner;
+      startClientX: number;
+      startClientY: number;
+      startNode: WhiteboardNode;
+      // The OPPOSITE corner's world/doc-space position, fixed at drag start - what the resize math
+      // solves new x/y against so that corner visually stays put even as the box rotates around its
+      // own (recalculated) center every render. See cornerWorldPoint's own doc comment.
+      anchorWorld: { x: number; y: number };
+    }
+  // Rotation is a DELTA from drag start: startAngle is the pointer's own angle around `center` at
+  // pointer-down, and each move adds (current pointer angle - startAngle) to the node's own
+  // startNode.rotation - see the "rotate" pointer-move branch's own doc comment for why an absolute
+  // "pointer angle IS the rotation" formula (what this used to be) breaks once the rotate handle
+  // itself doesn't rest at a fixed, predictable angle around center (rendering it at the box's
+  // top-right corner instead of top-center, for a non-square box, means its own resting angle isn't
+  // simply "straight up" anymore).
+  | { mode: "rotate"; id: string; startNode: WhiteboardNode; center: { x: number; y: number }; startAngle: number }
+  // Dragging one of an "amplifier" node's lead TERMINALS (see beginAmpLeadDrag) - a diagrams.net-
+  // style "grab the actual line" shape-specific handle, the first of its kind in this file (every
+  // other special-purpose handle so far - angle's ray lengths - is style-panel-only). A mostly-
+  // horizontal drag is structurally a one-axis (width-only) resize: it grows/shrinks the node's own
+  // width AND the lead's own length together (keeping the triangle body and the OPPOSITE edge fixed
+  // in world space, via anchorWorld - see edgeWorldPoint), so the terminal itself tracks the cursor
+  // instead of just changing a value the whole box has to rescale to visualize. A mostly-vertical
+  // drag instead bends that one lead's own yOffset, independent of width/height entirely.
+  //
+  // `axisLocked` starts undefined and is set (mutated directly on this object - see the "ampLead"
+  // pointer-move branch) the FIRST time cumulative movement crosses AMP_LEAD_INTENT_THRESHOLD, then
+  // reused for the rest of the gesture rather than re-deciding "x or y" from the live delta every
+  // frame. Two things this fixes that a naive per-frame |dx| vs |dy| comparison doesn't: (1) a real
+  // mouse's first few pixels of movement are rarely perfectly axis-aligned, so without a dead zone
+  // and a locked choice, a deliberate vertical drag could commit a stray horizontal (length) change
+  // on its very first frame before the gesture's true direction is clear; (2) a plain click (never
+  // crosses the threshold, axisLocked stays undefined for the WHOLE gesture) is then trivially
+  // distinguished from a drag at pointer-up by checking axisLocked instead of a separate raw-
+  // distance check that could disagree with whatever the move handler already decided.
+  | {
+      mode: "ampLead";
+      id: string;
+      which: "inputTop" | "inputBottom" | "output";
+      startClientX: number;
+      startClientY: number;
+      startNode: WhiteboardNode;
+      anchorWorld: { x: number; y: number };
+      axisLocked?: "x" | "y";
+    }
+  // Dragging one of a "graph" node's own manually-plotted WhiteboardNode.graphPoints (see its own
+  // doc comment) - staged through the SAME liveNodes mechanism resize/rotate already use (the drag
+  // only ever changes this one node's own graphPoints array, so there's no need for yet another
+  // parallel live-state slice the way waypoint/moveEdge needed their own for EDGES).
+  | { mode: "graphPoint"; id: string; index: number; startClientX: number; startClientY: number; startNode: WhiteboardNode }
+  // Dragging one bar/line-point/scatter-dot of a "barChart"/"lineChart"/"scatterPlot" node's own
+  // WhiteboardNode.chartData[index] vertically to change that one value - see beginChartDataDrag's
+  // own doc comment for why `pixelsPerUnit` is captured once at gesture start rather than
+  // recomputed live from the (self-referentially scale-dependent) chart layout every frame.
+  | { mode: "chartDataPoint"; id: string; index: number; startClientY: number; startValue: number; pixelsPerUnit: number; startNode: WhiteboardNode }
+  | { mode: "marquee"; startDocX: number; startDocY: number }
+  | { mode: "pan"; startClientX: number; startClientY: number; startPan: { x: number; y: number } }
+  | { mode: "freehand"; points: { x: number; y: number }[]; lastClientX: number; lastClientY: number }
+  | {
+      mode: "connector";
+      // null edgeId = creating a brand new edge; otherwise reattaching an existing one's endpoint.
+      // The rest of that edge's fields (color/style/arrows) come from page.edges.find(edgeId) at
+      // commit time, not from here - this only needs to know which end is moving and where the
+      // OTHER (fixed) end currently resolves to.
+      edgeId: string | null;
+      end: "source" | "target";
+      fixed: WhiteboardEndpoint;
+      // True when this gesture started because the Arrows toolbar tool was armed (see
+      // WhiteboardEditor's ARROW_PRESETS) - a deliberate "I want to draw a connector" action, so
+      // releasing over empty canvas still creates a free-floating arrow. False for an ad-hoc drag
+      // off a hovered node's connection dot in plain select mode, where releasing over empty space
+      // is treated as "changed my mind" and discarded instead (see handlePointerUp's own comment).
+      deliberate: boolean;
+      // A stable doc-space reference point for the FIXED end, resolved once at gesture start (a
+      // node's own center when fixed.nodeId is set, since that never moves mid-drag the way an
+      // "auto" anchor point would as the other end moves; the free point itself otherwise) - what
+      // pathPoints' deviations are measured against for computeCurveBowFromPath, so the curve's
+      // bow direction reflects the actual gesture rather than a point that was itself still moving.
+      fixedRefPoint: { x: number; y: number };
+      // The pointer's own path over the course of THIS gesture (never saved to the document - see
+      // computeCurveBowFromPath's own doc comment) - purely what decides which way a "Curved"
+      // connector's curveBow bows, so the created edge curves the direction it was actually drawn.
+      pathPoints: { x: number; y: number }[];
+      lastPathClientX: number;
+      lastPathClientY: number;
+    }
+  | {
+      // Dragging one EXISTING bend point of an edge's WhiteboardEdge.waypoints (beginWaypointDrag,
+      // `index` = its current position) - a new one is inserted directly (no drag phase) by
+      // double-clicking the edge's own body instead (see insertWaypointAtDoubleClick).
+      mode: "waypoint";
+      edgeId: string;
+      index: number;
+      startWaypoints: { x: number; y: number }[];
+    }
+  | {
+      // Dragging an edge's whole BODY (its fat invisible hit-stroke, not a specific endpoint/
+      // waypoint dot) to translate it - see beginMoveEdge. Only ever moves a FREE-FLOATING endpoint
+      // (WhiteboardEndpoint.nodeId absent); an endpoint anchored to a shape is left untouched, since
+      // its position is derived from that shape and "moving the edge" has no meaning for it (see
+      // handlePointerMove's own "moveEdge" branch). An edge with both ends anchored to shapes
+      // therefore has nothing this gesture can change at all - selecting it still works, dragging
+      // its body just does nothing, which is the correct behavior for a connector whose entire path
+      // comes from the two shapes it connects.
+      mode: "moveEdge";
+      id: string;
+      startClientX: number;
+      startClientY: number;
+      startEdge: WhiteboardEdge;
+    };
+
+// Below this on-screen movement (CSS px, pre-zoom-correction) between two recorded connector-drag
+// path points, a new one isn't recorded - same "don't bloat with near-duplicate points" reasoning
+// as FREEHAND_MIN_POINT_DISTANCE, just for the ephemeral path computeCurveBowFromPath reads instead
+// of one that gets saved to the document.
+const CURVE_PATH_MIN_POINT_DISTANCE = 4;
+
+// Below this on-screen distance (CSS px, pre-zoom-correction), a connector gesture is treated as a
+// stray click rather than a deliberate drag - keeps a plain click with the Arrows tool armed from
+// creating a zero-length arrow nobody meant to draw.
+const MIN_CONNECTOR_DRAG_DISTANCE = 6;
+
+// Below this on-screen distance (CSS px, pre-zoom-correction), an amplifier lead-terminal gesture
+// hasn't shown its intent yet - no length/bend change commits, and the drag's eventual x/y axis
+// isn't decided (see the "ampLead" Interaction variant's own axisLocked doc comment). A gesture
+// that never crosses this at all is a plain click, a no-op (there's nothing left to toggle now
+// that the two input leads are always independent) - same "stray click vs. real drag" distinction
+// MIN_CONNECTOR_DRAG_DISTANCE makes, just tighter since committing even a tiny stray length/bend
+// change here would be more noticeable than it is for a connector.
+const AMP_LEAD_INTENT_THRESHOLD = 5;
+
+export interface WhiteboardCanvasHandle {
+  zoomBy: (factor: number) => void;
+  resetView: () => void;
+  fitToContent: (bounds: BoundsBox) => void;
+  // Called by WhiteboardEditor.tsx once the user picks a shape from the quick-connect popover that
+  // opens after clicking one of a node's hover arrows (see onQuickConnectArrowClick below) - builds
+  // and places that shape, connected to the source node, in one step.
+  placeConnectedShape: (sourceNodeId: string, side: Exclude<WhiteboardAnchorSide, "auto">, shapeType: WhiteboardShapeType, overrides?: Partial<WhiteboardNode>) => void;
+}
+
+interface WhiteboardCanvasProps {
+  page: WhiteboardPage;
+  showGrid: boolean;
+  // See WhiteboardDocument.snapToGrid's own doc comment - independent of showGrid, consulted by
+  // isSnapEnabled for move/resize drags and free-floating connector endpoint/waypoint drags.
+  snapToGrid: boolean;
+  zoom: number;
+  onZoomChange: (zoom: number) => void;
+  pan: { x: number; y: number };
+  onPanChange: (pan: { x: number; y: number }) => void;
+  selectedNodeIds: Set<string>;
+  selectedEdgeIds: Set<string>;
+  onSelectionChange: (nodeIds: Set<string>, edgeIds: Set<string>) => void;
+  onAddNode: (node: WhiteboardNode) => void;
+  // Hover-arrow "quick clone + connect" (see HoverConnectArrows below) - one undo step for both.
+  onAddNodeWithEdge: (node: WhiteboardNode, edge: WhiteboardEdge) => void;
+  onEditNode: (before: WhiteboardNode, after: WhiteboardNode) => void;
+  onBatchEditNodes: (before: WhiteboardNode[], after: WhiteboardNode[]) => void;
+  onDeleteNode: (node: WhiteboardNode) => void;
+  onAddEdge: (edge: WhiteboardEdge) => void;
+  onEditEdge: (before: WhiteboardEdge, after: WhiteboardEdge) => void;
+  onDeleteEdge: (edge: WhiteboardEdge) => void;
+  // Which shape the toolbar's palette has armed, if any - the next plain click on empty canvas
+  // drops a new node of this type there. Cleared (via onShapePlaced) immediately after, EXCEPT for
+  // "freehand": the pen tool stays armed across strokes (see handlePointerUp's freehand branch) so
+  // sketching several strokes in a row doesn't need re-clicking the tool each time.
+  armedShapeType: WhiteboardShapeType | null;
+  onShapePlaced: () => void;
+  // The edge-drawing tool's own armed state, kept separate from armedShapeType so a shape and the
+  // connector tool can never both be "in progress" at once - see WhiteboardEditor's toolbar. Unlike
+  // armedShapeType, this never auto-disarms after one use (same "stays armed across uses" treatment
+  // as armedShapeType === "freehand" gets) - drawing several arrows/lines in a row is the common
+  // case, not the exception. armedConnectorOverrides is the picked preset's style (color/dash/
+  // routing/arrowheads - see WhiteboardEditor's ARROW_PRESETS), merged onto
+  // createDefaultWhiteboardEdge's own defaults both for the live drag preview and the finished edge.
+  connectorArmed: boolean;
+  armedConnectorOverrides?: Partial<WhiteboardEdge>;
+  // The laser pointer tool's armed state (see the "Laser pointer" toolbar button in
+  // WhiteboardEditor.tsx) - a purely visual, never-saved glowing trail that follows the pointer,
+  // for pointing things out live (e.g. while screen-recording a walkthrough) without marking up the
+  // actual diagram. Unlike every other tool here, it has no document-side effect at all: no node,
+  // no edge, nothing that touches undo history - see this file's own laserTrail state.
+  laserArmed: boolean;
+  // A hover arrow (see HoverConnectArrows below) was clicked - WhiteboardEditor.tsx opens its
+  // quick-connect shape-picker popover near `screenPoint` in response; the actual placement happens
+  // later, once a shape is picked, via the WhiteboardCanvasHandle's placeConnectedShape.
+  onQuickConnectArrowClick: (nodeId: string, side: Exclude<WhiteboardAnchorSide, "auto">, screenPoint: { x: number; y: number }) => void;
+  // Right-clicked a node or edge - WhiteboardEditor.tsx opens its context menu (export selection as
+  // PNG, delete) near `screenPoint`. Selection is already updated to `nodeIds`/`edgeIds` by the time
+  // this fires (see the node/edge onContextMenu handlers below: right-clicking something already
+  // part of a multi-selection keeps that whole selection; right-clicking something outside it
+  // replaces the selection with just that one item first, same convention most apps use).
+  onItemContextMenu: (nodeIds: Set<string>, edgeIds: Set<string>, screenPoint: { x: number; y: number }) => void;
+  // Mirrors `liveNodes` (this component's own in-progress-drag staging state) out to the parent -
+  // WhiteboardEditor.tsx merges it into what it hands the style panel, so numeric fields (rotation,
+  // amplifier lead lengths, position, ...) update live as a shape is dragged instead of only once
+  // the drag commits to the store on pointer-up (which is when the store itself - and hence
+  // ordinary `selectedNodes` built from it - would otherwise first see the change). `null` while no
+  // node-editing drag is in progress. On-screen readouts that live INSIDE this canvas (the rotate
+  // angle popover, the amplifier lead handles) don't need this prop at all - they already read
+  // `liveNodes`/`interactionRef` directly during render.
+  onLiveNodesChange?: (nodes: WhiteboardNode[] | null) => void;
+  // A "table" node's own currently-selected cell/row/column range (or null) - see
+  // WhiteboardTable.tsx's own onRangeChange prop doc comment for why this needs to reach
+  // WhiteboardStylePanel.tsx (its "Cell" background/border-style controls). Fired with the owning
+  // node's id since, unlike selectedNodeIds, only one table's own internal range is ever "live" at a
+  // time regardless of how many nodes exist.
+  onTableRangeChange?: (nodeId: string, range: { r0: number; c0: number; r1: number; c1: number } | null) => void;
+}
+
+function clampZoom(z: number): number {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+}
+
+// SVG <marker> content doesn't reliably inherit the stroking path's color across the WebView2
+// versions this app targets (that needs `fill="context-stroke"`, a newer addition some installs
+// won't have yet) - so instead of one shared marker, one is defined per distinct (arrowhead type,
+// edge stroke color) combination actually in use and referenced by a keyed id. Cheap in practice:
+// a whiteboard has a handful of colors and arrow types at most, not one marker per edge.
+function markerId(type: ArrowheadType, color: string): string {
+  return `wb-arrow-${type}-${color.replace(/[^a-zA-Z0-9]/g, "")}`;
+}
+
+// The actual marker content for each arrowhead type, in a shared 0..10 (x) × 0..10 (y) local box
+// with the tip at x=10 - orient="auto" rotates this so local +x points along the path's direction
+// of travel at that end, and refX/refY (set on the <marker> element itself) is deliberately a
+// touch left of the true tip so the arrowhead slightly overshoots the path's mathematical endpoint
+// rather than sitting with its base flush against it - the same convention (and refX/refY values)
+// the previous single-type marker used, just generalized across shapes. Hand-tuned to visually
+// match drawArrowhead's Canvas2D versions in whiteboardHandlers.ts (used for PNG export) so the
+// live view and the export show the same arrowheads.
+function markerContentFor(type: Exclude<ArrowheadType, "none">, color: string): React.ReactNode {
+  switch (type) {
+    case "triangle":
+      return <path d="M0,0 L10,5 L0,10 Z" fill={color} />;
+    case "block":
+      return <path d="M0,0 L10,5 L0,10 L3,5 Z" fill={color} />;
+    case "triangleOpen":
+      return <path d="M2,0 L10,5 L2,10" fill="none" stroke={color} strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />;
+    case "diamond":
+      return <path d="M0,5 L5,1.5 L10,5 L5,8.5 Z" fill={color} />;
+    case "circle":
+      return <circle cx="6" cy="5" r="4" fill={color} />;
+  }
+}
+
+const MARKER_REF: Record<Exclude<ArrowheadType, "none">, number> = {
+  triangle: 8.5,
+  block: 8.5,
+  triangleOpen: 8.5,
+  diamond: 9,
+  circle: 9,
+};
+
+// Builds a smoothed SVG path through a freehand stroke's LOCAL points (already denormalized to the
+// node's own 0..width/0..height box) - quadratic curves through consecutive midpoints, same
+// technique as whiteboardHandlers.ts's freehandPath (Canvas2D version), just emitting a `d` string
+// instead of ctx calls so the PNG export and the live DOM view render identically.
+function smoothedPathD(points: { x: number; y: number }[]): string {
+  if (points.length === 0) return "";
+  if (points.length === 1) return `M ${points[0].x} ${points[0].y} L ${points[0].x} ${points[0].y}`;
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const mid = { x: (points[i].x + points[i + 1].x) / 2, y: (points[i].y + points[i + 1].y) / 2 };
+    d += ` Q ${points[i].x} ${points[i].y} ${mid.x} ${mid.y}`;
+  }
+  const last = points[points.length - 1];
+  d += ` L ${last.x} ${last.y}`;
+  return d;
+}
+
+// Renders `source` (an "equation" node's WhiteboardNode.text, holding raw LaTeX - see that
+// shapeType's own doc comment) as real typeset math via KaTeX, memoized so retyping-unrelated
+// re-renders of the parent (panning, other nodes moving, etc.) don't re-run KaTeX every frame.
+// throwOnError:false makes malformed LaTeX render as an inline error message instead of throwing,
+// which matters here specifically because this runs on every keystroke while the source is still
+// mid-edit and often momentarily invalid (an unclosed \frac{, say) - throwing would crash the
+// canvas rather than just showing a red error span until the syntax is finished.
+function EquationDisplay({ source, fontSize, color }: { source: string; fontSize: number; color: string }) {
+  const html = useMemo(() => {
+    try {
+      return katex.renderToString(source, { throwOnError: false, displayMode: true, output: "html" });
+    } catch {
+      return "";
+    }
+  }, [source]);
+  return (
+    <div
+      // overflow visible rather than this file's usual text-label clipping - cutting a typeset
+      // formula off mid-glyph (an integral sign missing its bottom half, say) reads as broken in a
+      // way a plain truncated sentence doesn't, so a formula too big for its box is allowed to spill
+      // past the edges instead.
+      style={{ fontSize, color, lineHeight: 1.2 }}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
+}
+
+const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProps>(({
+  page,
+  showGrid,
+  snapToGrid,
+  zoom,
+  onZoomChange,
+  pan,
+  onPanChange,
+  selectedNodeIds,
+  selectedEdgeIds,
+  onSelectionChange,
+  onAddNode,
+  onAddNodeWithEdge,
+  onEditNode,
+  onBatchEditNodes,
+  onDeleteNode,
+  onAddEdge,
+  onEditEdge,
+  onDeleteEdge,
+  armedShapeType,
+  onShapePlaced,
+  connectorArmed,
+  armedConnectorOverrides,
+  laserArmed,
+  onQuickConnectArrowClick,
+  onItemContextMenu,
+  onLiveNodesChange,
+  onTableRangeChange,
+}, ref) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const interactionRef = useRef<Interaction | null>(null);
+  const [liveNodes, setLiveNodes] = useState<WhiteboardNode[] | null>(null);
+  // Mirrors liveNodes out to the parent on every change - see onLiveNodesChange's own doc comment.
+  // A plain effect rather than calling onLiveNodesChange directly alongside every setLiveNodes call
+  // site (move/resize/rotate/ampLead each have their own, plus the commit points that reset to
+  // null) - one place stays correct automatically instead of every call site needing to remember to
+  // also notify the parent.
+  useEffect(() => {
+    onLiveNodesChange?.(liveNodes);
+  }, [liveNodes, onLiveNodesChange]);
+  const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  const [connectorPreview, setConnectorPreview] = useState<{ from: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null }; to: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null } } | null>(null);
+  // Live-updated bow for connectorPreview's own curve, computed from the gesture's pathPoints so
+  // far - keeps the drag preview showing the SAME direction the committed edge will actually get,
+  // rather than a fixed placeholder direction until release (see computeCurveBowFromPath).
+  const [connectorPreviewBow, setConnectorPreviewBow] = useState<number>(DEFAULT_CURVE_BOW);
+  const [freehandPreview, setFreehandPreview] = useState<{ x: number; y: number }[] | null>(null);
+  // The laser pointer's trail - each point stamped with when it was recorded (performance.now(),
+  // ms) so rendering can age it out smoothly. Never touches the document/undo stack - see
+  // laserArmed's own doc comment on the props interface.
+  const [laserTrail, setLaserTrail] = useState<{ x: number; y: number; t: number }[]>([]);
+  // Throttles laser-point recording by on-screen distance (see LASER_MIN_POINT_DISTANCE) - a plain
+  // ref since it's pure bookkeeping for that throttle, not something a re-render needs to reflect.
+  const lastLaserClientRef = useRef<{ x: number; y: number } | null>(null);
+  // Live-in-progress waypoints for whichever edge is currently having a bend point dragged (see the
+  // "waypoint" Interaction mode) - same "stage locally, commit once" pattern liveNodes uses for
+  // node drags, so a whole drag becomes one undo step instead of one per pointermove tick.
+  const [liveWaypointsEdgeId, setLiveWaypointsEdgeId] = useState<string | null>(null);
+  const [liveWaypoints, setLiveWaypoints] = useState<{ x: number; y: number }[] | null>(null);
+  // Live-in-progress position for whichever edge is currently having its whole BODY dragged (see
+  // beginMoveEdge/the "moveEdge" Interaction mode) - same "stage locally, commit once on release"
+  // pattern liveNodes uses for node drags, so a drag becomes one undo step instead of one per
+  // pointermove tick.
+  const [liveEdges, setLiveEdges] = useState<WhiteboardEdge[] | null>(null);
+  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  const [connectorHoverNodeId, setConnectorHoverNodeId] = useState<string | null>(null);
+  const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const editorRef = useRef<HTMLDivElement>(null);
+
+  const nodes = liveNodes ?? page.nodes;
+  const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
+  const edges = liveEdges ?? page.edges;
+
+  const clientToDoc = useCallback(
+    (clientX: number, clientY: number): { x: number; y: number } => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return { x: 0, y: 0 };
+      return { x: (clientX - rect.left - pan.x) / zoom, y: (clientY - rect.top - pan.y) / zoom };
+    },
+    [pan, zoom]
+  );
+
+  // ---- Laser pointer trail fade ------------------------------------------------------------------
+  // The trail needs to keep shrinking even while the pointer sits still (a real laser dot doesn't
+  // freeze mid-fade), so this runs its own rAF loop pruning points older than LASER_FADE_MS -
+  // pointermove alone only re-renders when the pointer actually moves. Stops entirely (and clears
+  // whatever's left) the moment the tool is disarmed, so nothing lingers after switching tools.
+  useEffect(() => {
+    if (!laserArmed) {
+      setLaserTrail((prev) => (prev.length > 0 ? [] : prev));
+      return;
+    }
+    let frame: number;
+    const tick = () => {
+      // Always writes a fresh (filter()-returned) array, even on a frame where nothing actually
+      // aged out, so the render below - which computes each point's fade purely from performance.now()
+      // - gets a re-render every frame and animates smoothly instead of only updating in the choppy
+      // steps a "did anything actually change" bailout would produce. Cheap enough for a small,
+      // short-lived trail; only runs while this opt-in tool is armed.
+      const cutoff = performance.now() - LASER_FADE_MS;
+      setLaserTrail((prev) => prev.filter((p) => p.t >= cutoff));
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [laserArmed]);
+
+  // ---- Space-bar temporary pan tool (same convention as Figma/draw.io) ------------------------
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === "Space" && !e.repeat && !editingNodeId) setSpaceHeld(true);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") setSpaceHeld(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [editingNodeId]);
+
+  // Changes zoom while keeping the document point currently under (clientX, clientY) fixed on
+  // screen - the standard "zoom towards the cursor" feel. Also used (with the viewport's own
+  // center as the anchor) by the imperative handle below, so toolbar zoom buttons and fit-to-
+  // content get the exact same math as wheel-zoom.
+  const zoomAtClientPoint = useCallback(
+    (newZoom: number, clientX: number, clientY: number) => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) {
+        onZoomChange(newZoom);
+        return;
+      }
+      const clamped = clampZoom(newZoom);
+      const localX = clientX - rect.left;
+      const localY = clientY - rect.top;
+      const docX = (localX - pan.x) / zoom;
+      const docY = (localY - pan.y) / zoom;
+      onPanChange({ x: localX - docX * clamped, y: localY - docY * clamped });
+      onZoomChange(clamped);
+    },
+    [zoom, pan, onZoomChange, onPanChange]
+  );
+
+  // ---- Wheel: plain scroll pans, ctrl/cmd+scroll (or pinch, which browsers report as ctrlKey
+  // wheel events) zooms centered on the pointer ------------------------------------------------
+  const handleWheel = useCallback(
+    (e: React.WheelEvent) => {
+      e.preventDefault();
+      if (e.ctrlKey || e.metaKey) {
+        const factor = Math.exp(-e.deltaY * 0.01);
+        zoomAtClientPoint(zoom * factor, e.clientX, e.clientY);
+      } else {
+        onPanChange({ x: pan.x - e.deltaX, y: pan.y - e.deltaY });
+      }
+    },
+    [zoom, pan, zoomAtClientPoint, onPanChange]
+  );
+
+  // ---- Delete / Escape -------------------------------------------------------------------------
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement;
+      const isTyping = active instanceof HTMLElement && (active.isContentEditable || active.tagName === "INPUT" || active.tagName === "TEXTAREA");
+      if (isTyping) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        onSelectionChange(new Set(page.nodes.map((n) => n.id)), new Set(page.edges.map((ed) => ed.id)));
+        return;
+      }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0) return;
+        e.preventDefault();
+        for (const id of selectedEdgeIds) {
+          const edge = page.edges.find((ed) => ed.id === id);
+          if (edge) onDeleteEdge(edge);
+        }
+        for (const id of selectedNodeIds) {
+          const node = page.nodes.find((n) => n.id === id);
+          if (node) onDeleteNode(node);
+        }
+        onSelectionChange(new Set(), new Set());
+      } else if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        // Nudges selected nodes AND/OR edges by a fixed step in document space (1px, or 10px with
+        // Shift held - the same two-tier step the style panel's own nudge buttons use, so the
+        // keyboard shortcut and the manual on-panel control feel like the same feature rather than
+        // two different ones). An edge nudge only actually moves its FREE-FLOATING endpoints/
+        // waypoints (see nudgeEdgeBy) - one with both ends anchored to shapes has nothing to nudge.
+        if (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0) return;
+        e.preventDefault();
+        const step = e.shiftKey ? 10 : 1;
+        const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+        const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+        if (selectedNodeIds.size > 0) {
+          const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id) && !n.locked);
+          if (selected.length > 0) {
+            const after = selected.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
+            if (after.length === 1) onEditNode(selected[0], after[0]);
+            else onBatchEditNodes(selected, after);
+          }
+        }
+        for (const id of selectedEdgeIds) {
+          const edge = page.edges.find((ed) => ed.id === id);
+          if (edge) onEditEdge(edge, nudgeEdgeBy(edge, dx, dy));
+        }
+      } else if (e.key === "Escape") {
+        interactionRef.current = null;
+        setConnectorPreview(null);
+        setMarqueeRect(null);
+        setFreehandPreview(null);
+        setLiveNodes(null);
+        onSelectionChange(new Set(), new Set());
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes, onEditEdge]);
+
+  // ---- Node move / resize ----------------------------------------------------------------------
+  const beginMoveNode = useCallback(
+    (node: WhiteboardNode, e: React.PointerEvent, additive: boolean) => {
+      e.stopPropagation();
+      // A grouped node toggles/selects its WHOLE group as one unit, same "acts as one thing" idea
+      // moving it below already relies on - clicking (or shift-clicking) just one member would
+      // otherwise leave the group only partly selected, which then only partly drags.
+      const clickedGroup = node.groupId ? page.nodes.filter((n) => n.groupId === node.groupId).map((n) => n.id) : [node.id];
+      let nextSelected = selectedNodeIds;
+      if (additive) {
+        nextSelected = new Set(selectedNodeIds);
+        const alreadyIn = clickedGroup.some((id) => nextSelected.has(id));
+        for (const id of clickedGroup) {
+          if (alreadyIn) nextSelected.delete(id);
+          else nextSelected.add(id);
+        }
+      } else if (!selectedNodeIds.has(node.id)) {
+        nextSelected = new Set(clickedGroup);
+      }
+      onSelectionChange(nextSelected, additive ? selectedEdgeIds : new Set());
+      // Locked (see WhiteboardNode.locked's own doc comment) still selects normally - just doesn't
+      // stage a "move" drag - so a locked node stays reachable to unlock again via the style panel
+      // even though clicking-and-dragging its body no longer does anything.
+      if (node.locked) return;
+      const ids = nextSelected.has(node.id) ? Array.from(nextSelected) : [node.id];
+      interactionRef.current = {
+        mode: "move",
+        ids,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startNodes: page.nodes.filter((n) => ids.includes(n.id)),
+        anchorId: node.id,
+      };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [selectedNodeIds, selectedEdgeIds, onSelectionChange, page.nodes]
+  );
+
+  const beginResizeNode = useCallback(
+    (node: WhiteboardNode, corner: ResizeCorner, e: React.PointerEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      const anchorWorld = cornerWorldPoint(node, oppositeCorner(corner));
+      interactionRef.current = { mode: "resize", id: node.id, corner, startClientX: e.clientX, startClientY: e.clientY, startNode: node, anchorWorld };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  const beginRotateNode = useCallback(
+    (node: WhiteboardNode, e: React.PointerEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      const center = nodeCenter(node);
+      const startPointer = clientToDoc(e.clientX, e.clientY);
+      const startAngle = (Math.atan2(startPointer.y - center.y, startPointer.x - center.x) * 180) / Math.PI;
+      interactionRef.current = { mode: "rotate", id: node.id, startNode: node, center, startAngle };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange, clientToDoc]
+  );
+
+  // ---- "graph" manual point plotting (WhiteboardNode.graphPoints) -------------------------------
+  const beginGraphPointDrag = useCallback(
+    (node: WhiteboardNode, index: number, e: React.PointerEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      interactionRef.current = { mode: "graphPoint", id: node.id, index, startClientX: e.clientX, startClientY: e.clientY, startNode: node };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  // Double-clicking a blank part of a selected "graph" node's own plot area adds a new manual
+  // point there (converted from the click's pixel position back into the graph's own data-space
+  // via graphCoordinateMapper's invMapX/invMapY) - inserted in x-ascending order so a manually
+  // plotted curve reads left-to-right, the way a real graph's does, regardless of the order points
+  // happened to be added in. The symmetric remove gesture (double-click an EXISTING point's own
+  // handle) is removeGraphPoint below.
+  const addGraphPoint = useCallback(
+    (node: WhiteboardNode, e: React.MouseEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      // The double-clicked element IS the plot-area rect itself (padX..padX+plotW, not the full
+      // node box - see this callback's own JSX call site), so its own getBoundingClientRect is
+      // ALREADY exactly the plot area in screen space - no need to separately account for padX/padY
+      // here, just re-derive the local (node-space) pixel position they correspond to for invMapX/
+      // invMapY, which (unlike this rect) DO expect coordinates relative to the full node box.
+      const rect = (e.currentTarget as SVGRectElement).getBoundingClientRect();
+      const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(node);
+      const { padX, padY, plotW, plotH, invMapX, invMapY } = graphCoordinateMapper(node.width, node.height, xMin, xMax, yMin, yMax);
+      const px = padX + ((e.clientX - rect.left) / rect.width) * plotW;
+      const py = padY + ((e.clientY - rect.top) / rect.height) * plotH;
+      const point = { x: invMapX(px), y: invMapY(py) };
+      const points = [...(node.graphPoints ?? [])];
+      let insertAt = points.findIndex((p) => p.x > point.x);
+      if (insertAt === -1) insertAt = points.length;
+      points.splice(insertAt, 0, point);
+      onSelectionChange(new Set([node.id]), new Set());
+      onEditNode(node, { ...node, graphPoints: points });
+    },
+    [onSelectionChange, onEditNode]
+  );
+
+  const removeGraphPoint = useCallback(
+    (node: WhiteboardNode, index: number, e: React.MouseEvent) => {
+      e.stopPropagation();
+      const points = (node.graphPoints ?? []).filter((_, i) => i !== index);
+      onEditNode(node, { ...node, graphPoints: points });
+    },
+    [onEditNode]
+  );
+
+  // ---- Draggable chart data (barChart/lineChart/scatterPlot) ------------------------------------
+  // `pixelsPerUnit` is fixed for the WHOLE gesture, computed once from the layout chartColumnLayout
+  // produces at drag START - not recomputed live from the CURRENT (already-edited-this-gesture)
+  // data, because that layout's own scale depends on the series' own max, which is itself exactly
+  // the value being dragged whenever it's the tallest bar/highest point: recomputing live would make
+  // the cursor-to-value mapping self-referential (the scale it should be measured against changes
+  // depending on the very value it's solving for) right at the moment a value overtakes the old max.
+  // A fixed per-gesture ratio instead tracks the cursor exactly as long as the max doesn't change,
+  // and stays smooth (if not pixel-exact) once dragging past it grows the whole chart's own scale on
+  // the next render - a reasonable tradeoff for a direct-manipulation nice-to-have, not a precision
+  // data-entry tool (the style panel's own comma-separated Data field is still there for exact
+  // values).
+  const beginChartDataDrag = useCallback(
+    (node: WhiteboardNode, index: number, e: React.PointerEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      const data = node.chartData ?? DEFAULT_CHART_DATA;
+      const { baselineY, topY, max } = chartColumnLayout(node.width, node.height, data);
+      const pixelsPerUnit = (baselineY - topY) / max;
+      interactionRef.current = { mode: "chartDataPoint", id: node.id, index, startClientY: e.clientY, startValue: data[index] ?? 0, pixelsPerUnit, startNode: node };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  const beginAmpLeadDrag = useCallback(
+    (node: WhiteboardNode, which: "inputTop" | "inputBottom" | "output", e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      // Dragging either INPUT terminal anchors the east (right) edge fixed; the OUTPUT terminal
+      // anchors the west (left) edge - each drag only ever moves the side it's grabbing. Only
+      // consulted for a horizontal (length) drag - see the "ampLead" pointer-move branch's own
+      // dominant-axis check - but cheap enough to always compute up front regardless.
+      const anchorWorld = edgeWorldPoint(node, which === "output" ? "w" : "e");
+      interactionRef.current = { mode: "ampLead", id: node.id, which, startClientX: e.clientX, startClientY: e.clientY, startNode: node, anchorWorld };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  // ---- Connector create / reattach ---------------------------------------------------------------
+  const beginConnectorFromNode = useCallback(
+    (node: WhiteboardNode, side: WhiteboardAnchorSide, e: React.PointerEvent, deliberate: boolean) => {
+      e.stopPropagation();
+      const fixedRefPoint = nodeCenter(node);
+      interactionRef.current = {
+        mode: "connector",
+        edgeId: null,
+        end: "target",
+        fixed: { nodeId: node.id, anchor: side },
+        deliberate,
+        fixedRefPoint,
+        pathPoints: [fixedRefPoint],
+        lastPathClientX: e.clientX,
+        lastPathClientY: e.clientY,
+      };
+      const doc0 = clientToDoc(e.clientX, e.clientY);
+      setConnectorPreview({ from: resolveAnchorPoint(node, side, doc0), to: { x: doc0.x, y: doc0.y, side: null } });
+      setConnectorPreviewBow(DEFAULT_CURVE_BOW);
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [clientToDoc]
+  );
+
+  // Starts a brand new connector from a free document-space point (not anchored to any node) -
+  // only reachable while the Arrows toolbar tool is armed (see handleContainerPointerDown), which
+  // is why this is always `deliberate: true`: there's no ad-hoc/accidental way to trigger it.
+  const beginConnectorFromPoint = useCallback((point: { x: number; y: number }, e: React.PointerEvent) => {
+    interactionRef.current = {
+      mode: "connector",
+      edgeId: null,
+      end: "target",
+      fixed: { x: point.x, y: point.y },
+      deliberate: true,
+      fixedRefPoint: point,
+      pathPoints: [point],
+      lastPathClientX: e.clientX,
+      lastPathClientY: e.clientY,
+    };
+    setConnectorPreview({ from: { x: point.x, y: point.y, side: null }, to: { x: point.x, y: point.y, side: null } });
+    setConnectorPreviewBow(DEFAULT_CURVE_BOW);
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+  }, []);
+
+  const beginConnectorReattach = useCallback(
+    (edge: WhiteboardEdge, end: "source" | "target", e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set(), new Set([edge.id]));
+      const fixed = end === "source" ? edge.target : edge.source;
+      const fixedRefPoint = fixed.nodeId ? nodeCenter(nodesById.get(fixed.nodeId)!) : { x: fixed.x ?? 0, y: fixed.y ?? 0 };
+      // deliberate is meaningless for a reattach (edgeId !== null skips that check entirely at
+      // commit time), and curveBow is left untouched rather than recomputed from pathPoints (see
+      // handlePointerUp) - set both only so this interaction's shape matches the "connector"
+      // variant's required fields.
+      interactionRef.current = { mode: "connector", edgeId: edge.id, end, fixed, deliberate: true, fixedRefPoint, pathPoints: [fixedRefPoint], lastPathClientX: e.clientX, lastPathClientY: e.clientY };
+      const doc0 = clientToDoc(e.clientX, e.clientY);
+      const fixedResolved = fixed.nodeId ? resolveAnchorPoint(nodesById.get(fixed.nodeId)!, fixed.anchor ?? "auto", doc0) : { ...fixedRefPoint, side: null };
+      setConnectorPreview(end === "source" ? { from: { x: doc0.x, y: doc0.y, side: null }, to: fixedResolved } : { from: fixedResolved, to: { x: doc0.x, y: doc0.y, side: null } });
+      setConnectorPreviewBow(edge.curveBow ?? DEFAULT_CURVE_BOW);
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange, clientToDoc, nodesById]
+  );
+
+  // Starts dragging an EXISTING bend point (the small solid dot rendered at edge.waypoints[index]
+  // when the edge is selected).
+  const beginWaypointDrag = useCallback(
+    (edge: WhiteboardEdge, index: number, e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set(), new Set([edge.id]));
+      const startWaypoints = [...(edge.waypoints ?? [])];
+      interactionRef.current = { mode: "waypoint", edgeId: edge.id, index, startWaypoints };
+      setLiveWaypointsEdgeId(edge.id);
+      setLiveWaypoints(startWaypoints);
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  // Double-clicking anywhere on an edge's own body inserts a new bend point right there - the
+  // direct, symmetric counterpart to double-clicking an EXISTING point to remove it (removeWaypoint
+  // below). This used to be a small hollow "add a point here" handle permanently rendered at each
+  // segment's own midpoint, draggable out via its own pointerdown - but that dot sat exactly where
+  // a user would naturally try to grab the line to drag the WHOLE edge (see beginMoveEdge), and
+  // whichever one happened to catch the pointerdown first won, with no visual way to tell them
+  // apart before commiting to a gesture: an attempted "drag to move" that grazed the dot instead
+  // silently became "insert and drag a bend point," which could easily tangle the edge into a
+  // self-crossing mess with no clear cause. A double-click has no such ambiguity with a plain
+  // click-drag (which the hit-stroke's own onPointerDown already claims first for beginMoveEdge on
+  // every click, single or double), so "grab the line" and "add a point" can no longer race.
+  const insertWaypointAtDoubleClick = useCallback(
+    (edge: WhiteboardEdge, source: { x: number; y: number }, target: { x: number; y: number }, waypoints: { x: number; y: number }[], e: React.MouseEvent) => {
+      e.stopPropagation();
+      const point = clientToDoc(e.clientX, e.clientY);
+      const insertAt = nearestSegmentInsertIndex(point, source, target, waypoints);
+      const next = [...waypoints];
+      next.splice(insertAt, 0, point);
+      onSelectionChange(new Set(), new Set([edge.id]));
+      onEditEdge(edge, { ...edge, waypoints: next });
+    },
+    [clientToDoc, onSelectionChange, onEditEdge]
+  );
+
+  // Double-clicking an existing bend point removes it outright - the direct, symmetric counterpart
+  // to dragging one of the midpoint handles to ADD one.
+  const removeWaypoint = useCallback(
+    (edge: WhiteboardEdge, index: number, e: React.MouseEvent) => {
+      e.stopPropagation();
+      const next = (edge.waypoints ?? []).filter((_, i) => i !== index);
+      onEditEdge(edge, { ...edge, waypoints: next });
+    },
+    [onEditEdge]
+  );
+
+  // Starts dragging an edge's whole BODY (a pointerdown on its own fat invisible hit-stroke, not one
+  // of the small source/target/waypoint dots) - lets a free-floating connector (drawn straight onto
+  // empty canvas, neither end attached to a shape) actually be relocated by grabbing the line
+  // itself, the same way every node can already be dragged by its body. See the "moveEdge"
+  // Interaction variant's own doc comment for why an endpoint anchored to a shape is left alone
+  // rather than dragged along with the rest.
+  const beginMoveEdge = useCallback(
+    (edge: WhiteboardEdge, e: React.PointerEvent) => {
+      e.stopPropagation();
+      onSelectionChange(new Set(), new Set([edge.id]));
+      interactionRef.current = { mode: "moveEdge", id: edge.id, startClientX: e.clientX, startClientY: e.clientY, startEdge: edge };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  // How far (doc units) a hover-arrow-placed shape lands from the node it was placed off of - see
+  // placeConnectedShape (exposed on the imperative handle below).
+  const QUICK_CLONE_GAP = 80;
+
+  // The hover-arrow "connect a new shape" gesture (see HoverConnectArrows and
+  // WhiteboardEditor.tsx's quick-connect picker popover, which is what actually calls this via the
+  // imperative handle once the user picks a shape) - builds a fresh default-styled node of
+  // `shapeType` (own default size, not copied from the source node - a Hourglass placed off a wide
+  // Rectangle shouldn't be stretched into the Rectangle's own proportions), positioned just past
+  // `sourceNodeId` in `side`'s direction and centered on it along the other axis, plus a
+  // fresh default-styled edge connecting the two. Both added as one undo step (onAddNodeWithEdge)
+  // since from the user's perspective picking one shape from the popover is a single action.
+  const placeConnectedShape = useCallback(
+    (sourceNodeId: string, side: Exclude<WhiteboardAnchorSide, "auto">, shapeType: WhiteboardShapeType, overrides?: Partial<WhiteboardNode>) => {
+      const source = page.nodes.find((n) => n.id === sourceNodeId);
+      if (!source) return;
+      const base = createDefaultWhiteboardNode(crypto.randomUUID(), shapeType, 0, 0, {
+        sides: overrides?.sides,
+        starPoints: overrides?.starPoints,
+        starInnerRadiusRatio: overrides?.starInnerRadiusRatio,
+        waveStyle: overrides?.waveStyle,
+        waveCycles: overrides?.waveCycles,
+        angleDegrees: overrides?.angleDegrees,
+        angleRay1Length: overrides?.angleRay1Length,
+        angleRay2Length: overrides?.angleRay2Length,
+      });
+      const merged: WhiteboardNode = { ...base, ...overrides };
+      const sourceCenter = nodeCenter(source);
+      const { x, y } =
+        side === "right"
+          ? { x: source.x + source.width + QUICK_CLONE_GAP, y: sourceCenter.y - merged.height / 2 }
+          : side === "left"
+          ? { x: source.x - QUICK_CLONE_GAP - merged.width, y: sourceCenter.y - merged.height / 2 }
+          : side === "bottom"
+          ? { x: sourceCenter.x - merged.width / 2, y: source.y + source.height + QUICK_CLONE_GAP }
+          : { x: sourceCenter.x - merged.width / 2, y: source.y - QUICK_CLONE_GAP - merged.height };
+      const newNode: WhiteboardNode = { ...merged, x, y };
+      const edge = createDefaultWhiteboardEdge(crypto.randomUUID(), { nodeId: source.id, anchor: "auto" }, { nodeId: newNode.id, anchor: "auto" });
+      onAddNodeWithEdge(newNode, edge);
+      onSelectionChange(new Set([newNode.id]), new Set());
+    },
+    [page.nodes, onAddNodeWithEdge, onSelectionChange]
+  );
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      zoomBy: (factor: number) => {
+        const rect = containerRef.current?.getBoundingClientRect();
+        const cx = rect ? rect.left + rect.width / 2 : 0;
+        const cy = rect ? rect.top + rect.height / 2 : 0;
+        zoomAtClientPoint(zoom * factor, cx, cy);
+      },
+      resetView: () => {
+        onZoomChange(1);
+        onPanChange({ x: 0, y: 0 });
+      },
+      fitToContent: (bounds: BoundsBox) => {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect || rect.width === 0 || rect.height === 0) return;
+        const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
+        const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
+        const nextZoom = clampZoom(Math.min(rect.width / contentWidth, rect.height / contentHeight));
+        onZoomChange(nextZoom);
+        onPanChange({
+          x: (rect.width - contentWidth * nextZoom) / 2 - bounds.minX * nextZoom,
+          y: (rect.height - contentHeight * nextZoom) / 2 - bounds.minY * nextZoom,
+        });
+      },
+      placeConnectedShape,
+    }),
+    [zoom, zoomAtClientPoint, onZoomChange, onPanChange, placeConnectedShape]
+  );
+
+  // ---- Pointer move / up on the container --------------------------------------------------------
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      // Tracked independently of interactionRef (below) since the laser trail follows plain
+      // hover-move, not a captured drag the way every other tool here works - it needs to keep
+      // recording even when `!interaction`, so this runs before that check ever short-circuits.
+      if (laserArmed) {
+        const last = lastLaserClientRef.current;
+        if (!last || Math.hypot(e.clientX - last.x, e.clientY - last.y) >= LASER_MIN_POINT_DISTANCE) {
+          lastLaserClientRef.current = { x: e.clientX, y: e.clientY };
+          const point = clientToDoc(e.clientX, e.clientY);
+          setLaserTrail((prev) => [...prev, { x: point.x, y: point.y, t: performance.now() }]);
+        }
+      }
+
+      const interaction = interactionRef.current;
+      if (!interaction) return;
+      const snapEnabled = isSnapEnabled(snapToGrid, e);
+
+      if (interaction.mode === "pan") {
+        onPanChange({ x: interaction.startPan.x + (e.clientX - interaction.startClientX), y: interaction.startPan.y + (e.clientY - interaction.startClientY) });
+        return;
+      }
+
+      if (interaction.mode === "move") {
+        let dx = (e.clientX - interaction.startClientX) / zoom;
+        let dy = (e.clientY - interaction.startClientY) / zoom;
+        if (snapEnabled) {
+          // Snap against the ANCHOR node's own resulting position, then apply that same dx/dy to
+          // every other selected node - keeps the whole group's relative layout intact (one shared
+          // delta) while still landing the node the user actually grabbed on the lattice, rather
+          // than independently snapping each node (which would pull a multi-selection apart).
+          const anchor = interaction.startNodes.find((n) => n.id === interaction.anchorId) ?? interaction.startNodes[0];
+          if (anchor) {
+            dx = snapCoord(anchor.x + dx) - anchor.x;
+            dy = snapCoord(anchor.y + dy) - anchor.y;
+          }
+        }
+        const movedById = new Map(interaction.startNodes.map((n) => [n.id, { ...n, x: n.x + dx, y: n.y + dy }]));
+        setLiveNodes(page.nodes.map((n) => movedById.get(n.id) ?? n));
+        return;
+      }
+
+      if (interaction.mode === "resize") {
+        const dx = (e.clientX - interaction.startClientX) / zoom;
+        const dy = (e.clientY - interaction.startClientY) / zoom;
+        const start = interaction.startNode;
+        // Project the screen-space drag delta into the box's OWN (possibly rotated AND/OR flipped)
+        // axes first - dragging a rotated/flipped corner should feel like stretching along ITS
+        // edges, not the screen's (see worldToLocalVector's own doc comment).
+        const local = worldToLocalVector({ x: dx, y: dy }, start);
+        let width = interaction.corner.includes("w") ? Math.max(20, start.width - local.x) : Math.max(20, start.width + local.x);
+        let height = interaction.corner.includes("n") ? Math.max(20, start.height - local.y) : Math.max(20, start.height + local.y);
+        if (snapEnabled) {
+          // Snap the MOVING corner's own world/doc-space point to the lattice, then re-derive
+          // width/height from it and the fixed anchorWorld corner - works regardless of rotation/
+          // flip (unlike snapping width/height directly, which would only land the corner on-grid
+          // for an unrotated box) because the diagonal vector from the fixed corner to the moving
+          // one, in this box's own local axes, is exactly (±width, ±height) - see
+          // cornerLocalOffset's own doc comment for that same ± convention.
+          const diagonalLocal = { x: interaction.corner.includes("w") ? -width : width, y: interaction.corner.includes("n") ? -height : height };
+          const diagonalWorld = localToWorldVector(diagonalLocal, start);
+          const movingWorld = { x: interaction.anchorWorld.x + diagonalWorld.x, y: interaction.anchorWorld.y + diagonalWorld.y };
+          const snappedWorld = snapPoint(movingWorld);
+          const snappedLocal = worldToLocalVector({ x: snappedWorld.x - interaction.anchorWorld.x, y: snappedWorld.y - interaction.anchorWorld.y }, start);
+          width = Math.max(20, Math.abs(snappedLocal.x));
+          height = Math.max(20, Math.abs(snappedLocal.y));
+        }
+        // Solve new x/y so the OPPOSITE corner lands exactly back on anchorWorld (fixed at drag
+        // start) - see cornerWorldPoint's own doc comment for why this can't just reuse the old
+        // x/y-in-local-space approach once rotation/flip is involved.
+        const anchorOffset = cornerLocalOffset(width, height, oppositeCorner(interaction.corner));
+        const worldAnchorOffset = localToWorldVector(anchorOffset, start);
+        const x = interaction.anchorWorld.x - worldAnchorOffset.x - width / 2;
+        const y = interaction.anchorWorld.y - worldAnchorOffset.y - height / 2;
+        const resized: WhiteboardNode = { ...start, x, y, width, height };
+        setLiveNodes(page.nodes.map((n) => (n.id === start.id ? resized : n)));
+        return;
+      }
+
+      if (interaction.mode === "rotate") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        const curAngle = (Math.atan2(cur.y - interaction.center.y, cur.x - interaction.center.x) * 180) / Math.PI;
+        // DELTA from drag start (how far the pointer has swept around center), added to the node's
+        // OWN starting rotation - see the "rotate" Interaction variant's own doc comment for why
+        // this can't just be "the pointer's angle IS the rotation" (that only works if the handle
+        // always rests at a fixed, known angle around center, which stopped being true once the
+        // handle moved to the box's top-right corner instead of top-center).
+        let deg = (interaction.startNode.rotation ?? 0) + (curAngle - interaction.startAngle);
+        if (e.shiftKey) deg = Math.round(deg / 15) * 15;
+        deg = ((deg % 360) + 360) % 360;
+        const rotated: WhiteboardNode = { ...interaction.startNode, rotation: deg };
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? rotated : n)));
+        return;
+      }
+
+      if (interaction.mode === "graphPoint") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        const start = interaction.startNode;
+        // Local (unrotated) pixel offset within the node's own box - like the rest of "graph"'s own
+        // rendering/interaction code, this doesn't account for WhiteboardNode.rotation, so a
+        // rotated graph's point handles will track slightly off; an acceptable scope tradeoff since
+        // rotating a coordinate-plane-style shape is a rare case, unlike dragging a point on one.
+        const localX = cur.x - start.x;
+        const localY = cur.y - start.y;
+        const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(start);
+        const { invMapX, invMapY } = graphCoordinateMapper(start.width, start.height, xMin, xMax, yMin, yMax);
+        const points = [...(start.graphPoints ?? [])];
+        points[interaction.index] = { x: invMapX(localX), y: invMapY(localY) };
+        const updated: WhiteboardNode = { ...start, graphPoints: points };
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? updated : n)));
+        return;
+      }
+
+      if (interaction.mode === "chartDataPoint") {
+        // Screen-space delta (pre-zoom-correction, same as every other drag here) - moving the
+        // pointer UP increases the value (dyScreen negative -> deltaValue positive), matching how a
+        // bar/point visually grows when dragged upward.
+        const dyScreen = (e.clientY - interaction.startClientY) / zoom;
+        const deltaValue = -dyScreen / interaction.pixelsPerUnit;
+        const newValue = Math.max(0, Math.round((interaction.startValue + deltaValue) * 100) / 100);
+        const start = interaction.startNode;
+        const data = [...(start.chartData ?? DEFAULT_CHART_DATA)];
+        data[interaction.index] = newValue;
+        const updated: WhiteboardNode = { ...start, chartData: data };
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? updated : n)));
+        return;
+      }
+
+      if (interaction.mode === "ampLead") {
+        const dx = (e.clientX - interaction.startClientX) / zoom;
+        const dy = (e.clientY - interaction.startClientY) / zoom;
+        const start = interaction.startNode;
+        // Same screen-space -> the shape's own rotated/flipped axes projection the resize handles
+        // use - dragging a handle on a tilted/mirrored amplifier should still feel like sliding
+        // along ITS lead.
+        const local = worldToLocalVector({ x: dx, y: dy }, start);
+        const isOutput = interaction.which === "output";
+        const isTop = interaction.which === "inputTop";
+
+        // Below the intent threshold, this gesture hasn't shown whether it's a click or a drag (or
+        // which axis a drag is along) yet - don't touch liveNodes at all, so a hand that isn't
+        // perfectly still while clicking never sneaks in a stray length/bend change (see
+        // AMP_LEAD_INTENT_THRESHOLD's own doc comment).
+        if (!interaction.axisLocked) {
+          const totalMoved = Math.hypot(e.clientX - interaction.startClientX, e.clientY - interaction.startClientY);
+          if (totalMoved < AMP_LEAD_INTENT_THRESHOLD) return;
+          interaction.axisLocked = Math.abs(local.y) > Math.abs(local.x) ? "y" : "x";
+        }
+
+        if (interaction.axisLocked === "y") {
+          // Vertical drag - bend THIS ONE lead's own terminal up/down, always independent of the
+          // other lead and without touching width/height at all - the bend can freely route well
+          // outside the shape's own bounding box (see AMP_LEAD_Y_OFFSET_BOUND's own doc comment).
+          const naturalY = isOutput ? start.height / 2 : isTop ? start.height * AMP_PLUS_Y_FRAC : start.height * AMP_MINUS_Y_FRAC;
+          const oldOffset = isOutput ? start.ampOutputLeadYOffset ?? 0 : isTop ? start.ampInputTopLeadYOffset ?? 0 : start.ampInputBottomLeadYOffset ?? 0;
+          const newOffset = clampAmpLeadTerminalY(naturalY, oldOffset + local.y) - naturalY;
+          const node: WhiteboardNode = isOutput
+            ? { ...start, ampOutputLeadYOffset: newOffset }
+            : isTop
+            ? { ...start, ampInputTopLeadYOffset: newOffset }
+            : { ...start, ampInputBottomLeadYOffset: newOffset };
+          setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? node : n)));
+          return;
+        }
+
+        // Horizontal drag - lengthen/shorten THIS ONE lead, always independent of the other input
+        // lead (a real op-amp's +/- inputs are two unrelated wires - there's no scenario where you'd
+        // want dragging one to also tug the other). Structurally a one-axis resize: the input
+        // terminals sit on the box's own WEST edge (dragging right SHRINKS width), the output
+        // terminal on the EAST edge (dragging right GROWS width) - mirror images of a plain "w"/"e"
+        // resize handle. See beginAmpLeadDrag's own doc comment for the "grow the box, keep the
+        // opposite edge fixed" anchoring this reuses from the resize handles.
+        let width: number;
+        let node: WhiteboardNode;
+        if (isOutput) {
+          const oldLen = start.ampOutputLeadLength ?? DEFAULT_AMP_OUTPUT_LEAD_LENGTH;
+          const newLen = Math.max(MIN_AMP_LEAD_LENGTH, Math.min(MAX_AMP_LEAD_LENGTH, oldLen + local.x));
+          width = Math.max(20, start.width + (newLen - oldLen));
+          node = { ...start, ampOutputLeadLength: newLen };
+        } else {
+          // The box only grows/shrinks in response to changes in whichever input lead is currently
+          // LONGER (matching amplifierOutlineParts's own degenerate-guard, which reads their max -
+          // not their sum - since they share one triangle edge instead of stacking end to end), so
+          // shrinking the currently-shorter one never disturbs the other lead or the box at all.
+          const oldTop = start.ampInputTopLeadLength ?? DEFAULT_AMP_INPUT_LEAD_LENGTH;
+          const oldBottom = start.ampInputBottomLeadLength ?? DEFAULT_AMP_INPUT_LEAD_LENGTH;
+          const draggedOld = isTop ? oldTop : oldBottom;
+          const draggedNew = Math.max(MIN_AMP_LEAD_LENGTH, Math.min(MAX_AMP_LEAD_LENGTH, draggedOld - local.x));
+          const newTop = isTop ? draggedNew : oldTop;
+          const newBottom = isTop ? oldBottom : draggedNew;
+          width = Math.max(20, start.width + (Math.max(newTop, newBottom) - Math.max(oldTop, oldBottom)));
+          node = { ...start, ampInputTopLeadLength: newTop, ampInputBottomLeadLength: newBottom };
+        }
+        const anchorOffset = edgeLocalOffset(width, isOutput ? "w" : "e");
+        const worldAnchorOffset = localToWorldVector(anchorOffset, start);
+        node.x = interaction.anchorWorld.x - worldAnchorOffset.x - width / 2;
+        node.y = interaction.anchorWorld.y - worldAnchorOffset.y - start.height / 2;
+        node.width = width;
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? node : n)));
+        return;
+      }
+
+      if (interaction.mode === "waypoint") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        const next = [...interaction.startWaypoints];
+        next[interaction.index] = snapEnabled ? snapPoint(cur) : cur;
+        setLiveWaypoints(next);
+        return;
+      }
+
+      if (interaction.mode === "moveEdge") {
+        const dx = (e.clientX - interaction.startClientX) / zoom;
+        const dy = (e.clientY - interaction.startClientY) / zoom;
+        const start = interaction.startEdge;
+        // Only a FREE-FLOATING endpoint (no nodeId) has an x/y of its own to translate - one
+        // anchored to a shape is left exactly as it was (see the "moveEdge" Interaction variant's
+        // own doc comment). Each free endpoint snaps its OWN resulting position independently
+        // (there's no single shared "anchor" the way a multi-node group move has to preserve one
+        // relative layout for).
+        const moveEndpoint = (ep: WhiteboardEndpoint): WhiteboardEndpoint => {
+          if (ep.nodeId) return ep;
+          const moved = { x: (ep.x ?? 0) + dx, y: (ep.y ?? 0) + dy };
+          const snapped = snapEnabled ? snapPoint(moved) : moved;
+          return { ...ep, x: snapped.x, y: snapped.y };
+        };
+        const moved: WhiteboardEdge = { ...start, source: moveEndpoint(start.source), target: moveEndpoint(start.target) };
+        setLiveEdges(page.edges.map((ed) => (ed.id === interaction.id ? moved : ed)));
+        return;
+      }
+
+      if (interaction.mode === "marquee") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        setMarqueeRect({
+          x: Math.min(interaction.startDocX, cur.x),
+          y: Math.min(interaction.startDocY, cur.y),
+          width: Math.abs(cur.x - interaction.startDocX),
+          height: Math.abs(cur.y - interaction.startDocY),
+        });
+        return;
+      }
+
+      if (interaction.mode === "freehand") {
+        // Throttle by on-screen distance (not doc distance, which would record fewer points at
+        // low zoom and more at high zoom for the same physical mouse movement) - see this file's
+        // FREEHAND_MIN_POINT_DISTANCE doc comment.
+        const dx = e.clientX - interaction.lastClientX;
+        const dy = e.clientY - interaction.lastClientY;
+        if (Math.hypot(dx, dy) < FREEHAND_MIN_POINT_DISTANCE) return;
+        const point = clientToDoc(e.clientX, e.clientY);
+        interaction.points.push(point);
+        interaction.lastClientX = e.clientX;
+        interaction.lastClientY = e.clientY;
+        setFreehandPreview([...interaction.points]);
+        return;
+      }
+
+      if (interaction.mode === "connector") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        // Throttled the same way freehand's own points are (see FREEHAND_MIN_POINT_DISTANCE) -
+        // recorded purely to feed computeCurveBowFromPath below, never saved to the document.
+        const pdx = e.clientX - interaction.lastPathClientX;
+        const pdy = e.clientY - interaction.lastPathClientY;
+        if (Math.hypot(pdx, pdy) >= CURVE_PATH_MIN_POINT_DISTANCE) {
+          interaction.pathPoints.push(cur);
+          interaction.lastPathClientX = e.clientX;
+          interaction.lastPathClientY = e.clientY;
+        }
+        // Snap the dragged endpoint to whichever node the pointer is currently over (excluding the
+        // fixed endpoint's own node, so a self-loop back onto the same shape isn't offered).
+        const target = nodes.find(
+          (n) => n.id !== interaction.fixed.nodeId && isConnectableShape(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
+        );
+        setConnectorHoverNodeId(target?.id ?? null);
+        const fixedPoint = interaction.fixed.nodeId ? nodeCenter(nodesById.get(interaction.fixed.nodeId)!) : { x: interaction.fixed.x ?? 0, y: interaction.fixed.y ?? 0 };
+        // A free-floating endpoint (not hovering a node) snaps to the lattice; one landing ON a
+        // node instead tracks that node's own anchor point, which is never itself snapped (it
+        // follows the shape, not the grid).
+        const freePoint = snapEnabled ? snapPoint(cur) : cur;
+        const draggedResolved = target ? resolveAnchorPoint(target, "auto", fixedPoint) : { x: freePoint.x, y: freePoint.y, side: null };
+        const fixedResolved = interaction.fixed.nodeId
+          ? resolveAnchorPoint(nodesById.get(interaction.fixed.nodeId)!, interaction.fixed.anchor ?? "auto", draggedResolved)
+          : { ...fixedPoint, side: null };
+        setConnectorPreview(interaction.end === "target" ? { from: fixedResolved, to: draggedResolved } : { from: draggedResolved, to: fixedResolved });
+        // Only a brand-new edge's bow follows the drawn path live - reattaching an existing edge's
+        // endpoint (edgeId !== null) leaves its curveBow exactly as beginConnectorReattach seeded it.
+        if (interaction.edgeId === null) {
+          const endRef = target ? nodeCenter(target) : freePoint;
+          setConnectorPreviewBow(computeCurveBowFromPath(interaction.fixedRefPoint, endRef, interaction.pathPoints));
+        }
+      }
+    },
+    [zoom, page.nodes, page.edges, clientToDoc, nodes, nodesById, onPanChange, laserArmed, snapToGrid]
+  );
+
+  const handlePointerUp = useCallback(
+    (e: React.PointerEvent) => {
+      const interaction = interactionRef.current;
+      interactionRef.current = null;
+      if (!interaction) return;
+      const snapEnabled = isSnapEnabled(snapToGrid, e);
+
+      if (interaction.mode === "move" && liveNodes) {
+        const idSet = new Set(interaction.ids);
+        const after = liveNodes.filter((n) => idSet.has(n.id));
+        if (after.length === 1) onEditNode(interaction.startNodes[0], after[0]);
+        else onBatchEditNodes(interaction.startNodes, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "resize" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "rotate" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after && after.rotation !== interaction.startNode.rotation) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "graphPoint" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "chartDataPoint" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "ampLead") {
+        // A plain click (axisLocked never set - see the pointer-move branch's own dead-zone check)
+        // is a no-op: nothing was ever staged into liveNodes for it to commit.
+        if (liveNodes) {
+          const after = liveNodes.find((n) => n.id === interaction.id);
+          if (after) onEditNode(interaction.startNode, after);
+        }
+        setLiveNodes(null);
+      } else if (interaction.mode === "marquee") {
+        if (marqueeRect && (marqueeRect.width > 2 || marqueeRect.height > 2)) {
+          const enclosed = page.nodes.filter(
+            (n) =>
+              n.x < marqueeRect.x + marqueeRect.width &&
+              n.x + n.width > marqueeRect.x &&
+              n.y < marqueeRect.y + marqueeRect.height &&
+              n.y + n.height > marqueeRect.y
+          );
+          // Edges (connectors) were previously never selectable via marquee at all - only page.nodes
+          // was ever filtered here. A "curved" edge with a real bow can visually pass well outside
+          // its own straight-line source->target box, so edgeBoundingBox (not a naive source/target
+          // rect) is what's tested against the marquee here, same overlap test as nodes get.
+          const enclosedEdges = page.edges.filter((edge) => {
+            const { source, target } = resolveEdgeEndpoints(edge, nodesById);
+            const box = edgeBoundingBox(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, edge.waypoints ?? []);
+            return box.x < marqueeRect.x + marqueeRect.width && box.x + box.width > marqueeRect.x && box.y < marqueeRect.y + marqueeRect.height && box.y + box.height > marqueeRect.y;
+          });
+          onSelectionChange(expandGroupSelection(new Set(enclosed.map((n) => n.id)), page.nodes), new Set(enclosedEdges.map((edge) => edge.id)));
+        } else {
+          onSelectionChange(new Set(), new Set());
+        }
+        setMarqueeRect(null);
+      } else if (interaction.mode === "freehand") {
+        const finalPoint = clientToDoc(e.clientX, e.clientY);
+        const points = [...interaction.points, finalPoint];
+        setFreehandPreview(null);
+        // A tap with (almost) no movement isn't a meaningful stroke - drop it rather than saving a
+        // near-invisible dot, same "don't save a no-op gesture" spirit as marquee's width>2 check.
+        if (points.length >= 2) {
+          const node = createFreehandWhiteboardNode(crypto.randomUUID(), points);
+          onAddNode(node);
+          onSelectionChange(new Set([node.id]), new Set());
+        }
+        // Deliberately does NOT call onShapePlaced() - the pen tool stays armed across strokes
+        // (see this file's own top comment and armedShapeType's doc comment on the props) so
+        // sketching several strokes in a row doesn't need re-arming the tool each time.
+      } else if (interaction.mode === "connector") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        const droppedOnNode = nodes.find(
+          (n) => n.id !== interaction.fixed.nodeId && isConnectableShape(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
+        );
+        const freePoint = snapEnabled ? snapPoint(cur) : cur;
+        const draggedEndpoint: WhiteboardEndpoint = droppedOnNode ? { nodeId: droppedOnNode.id, anchor: "auto" } : { x: freePoint.x, y: freePoint.y };
+
+        if (interaction.edgeId === null) {
+          // Landing on a real node always creates a connection; landing on empty canvas only does
+          // when this gesture came from the Arrows toolbar tool being deliberately armed (a
+          // free-floating arrow is exactly what that tool is for) - an ad-hoc drag off a hovered
+          // node's connection dot in plain select mode still treats empty space as "changed my
+          // mind" and discards it, same as before. Either way, a drag too short to be a real
+          // gesture (a stray click) is dropped rather than creating a zero-length arrow.
+          if (droppedOnNode || interaction.deliberate) {
+            const fixedScreenPoint = interaction.fixed.nodeId ? null : interaction.fixed;
+            const longEnough = fixedScreenPoint ? Math.hypot(cur.x - (fixedScreenPoint.x ?? 0), cur.y - (fixedScreenPoint.y ?? 0)) * zoom >= MIN_CONNECTOR_DRAG_DISTANCE : true;
+            if (longEnough) {
+              const endRef = droppedOnNode ? nodeCenter(droppedOnNode) : freePoint;
+              const curveBow = computeCurveBowFromPath(interaction.fixedRefPoint, endRef, interaction.pathPoints);
+              const edge = { ...createDefaultWhiteboardEdge(crypto.randomUUID(), interaction.fixed, draggedEndpoint), curveBow, ...armedConnectorOverrides };
+              onAddEdge(edge);
+              onSelectionChange(new Set(), new Set([edge.id]));
+            }
+          }
+        } else {
+          const existing = page.edges.find((ed) => ed.id === interaction.edgeId);
+          if (existing) {
+            const after: WhiteboardEdge = interaction.end === "target" ? { ...existing, target: draggedEndpoint } : { ...existing, source: draggedEndpoint };
+            onEditEdge(existing, after);
+          }
+        }
+        setConnectorPreview(null);
+        setConnectorHoverNodeId(null);
+        // Deliberately does NOT disarm connectorArmed - the Arrows tool stays armed across uses,
+        // same "sketch several in a row without re-arming" treatment as the freehand pen tool gets
+        // (see WhiteboardEditor's own doc comment on this).
+      } else if (interaction.mode === "waypoint" && liveWaypoints) {
+        // A plain click with no drag in between (most likely the first half of a double-click on an
+        // existing dot, meant to remove it via removeWaypoint - see the dot's onDoubleClick) leaves
+        // liveWaypoints identical to what the gesture started with - skip committing a no-op edit
+        // for it rather than polluting undo history with two empty steps before the real removal.
+        const moved =
+          liveWaypoints.length !== interaction.startWaypoints.length ||
+          liveWaypoints.some((p, i) => p.x !== interaction.startWaypoints[i].x || p.y !== interaction.startWaypoints[i].y);
+        if (moved) {
+          const existing = page.edges.find((ed) => ed.id === interaction.edgeId);
+          if (existing) onEditEdge(existing, { ...existing, waypoints: liveWaypoints });
+        }
+        setLiveWaypointsEdgeId(null);
+        setLiveWaypoints(null);
+      } else if (interaction.mode === "moveEdge" && liveEdges) {
+        // A plain click (no real movement) leaves the moved edge's source/target identical to
+        // interaction.startEdge's own (both endpoints anchored to shapes, or no drag ever happened)
+        // - skip committing a no-op edit, same "don't pollute undo history" reasoning the waypoint
+        // branch above already follows.
+        const after = liveEdges.find((ed) => ed.id === interaction.id);
+        const start = interaction.startEdge;
+        const moved =
+          after &&
+          (after.source.x !== start.source.x ||
+            after.source.y !== start.source.y ||
+            after.target.x !== start.target.x ||
+            after.target.y !== start.target.y);
+        if (after && moved) onEditEdge(start, after);
+        setLiveEdges(null);
+      }
+    },
+    [liveNodes, liveWaypoints, liveEdges, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, nodesById, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
+  );
+
+  // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
+  const handleContainerPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.button === 1 || spaceHeld || (e.button === 0 && e.altKey)) {
+        interactionRef.current = { mode: "pan", startClientX: e.clientX, startClientY: e.clientY, startPan: pan };
+        return;
+      }
+      if (e.button !== 0) return;
+      // The laser pointer is purely for pointing, not interacting - a click while it's armed does
+      // nothing (no marquee, no placement, no selection change). Space-panning above still works so
+      // the view can be repositioned while pointing.
+      if (laserArmed) return;
+      if (editingNodeId) setEditingNodeId(null);
+
+      if (armedShapeType === "freehand") {
+        const point = clientToDoc(e.clientX, e.clientY);
+        interactionRef.current = { mode: "freehand", points: [point], lastClientX: e.clientX, lastClientY: e.clientY };
+        setFreehandPreview([point]);
+        (e.target as Element).setPointerCapture?.(e.pointerId);
+        return;
+      }
+
+      if (armedShapeType) {
+        const point = clientToDoc(e.clientX, e.clientY);
+        const node = createDefaultWhiteboardNode(crypto.randomUUID(), armedShapeType, point.x, point.y);
+        // Snaps the placed box's own top-left corner (not the click point itself) to the lattice -
+        // same "corner lands on-grid" target the resize handles snap to, so a freshly-dropped shape
+        // and one just finished being resized end up looking the same, rather than a click-point
+        // snap that (for a non-GRID_SIZE-multiple default size) would still leave the box's actual
+        // edges off-grid.
+        const placed = isSnapEnabled(snapToGrid, e) ? { ...node, x: snapCoord(node.x), y: snapCoord(node.y) } : node;
+        onAddNode(placed);
+        onSelectionChange(new Set([placed.id]), new Set());
+        onShapePlaced();
+        if (armedShapeType === "text") setEditingNodeId(placed.id);
+        return;
+      }
+
+      // The Arrows tool is armed and the click landed on empty canvas (a click that landed on a
+      // connectable node instead is already handled by that node's own onPointerDown, which calls
+      // beginConnectorFromNode directly and stopPropagation()s before this handler ever runs) -
+      // start a connector from a free floating point, exactly like starting one from a node except
+      // with no shape to snap to.
+      if (connectorArmed) {
+        const point = clientToDoc(e.clientX, e.clientY);
+        beginConnectorFromPoint(isSnapEnabled(snapToGrid, e) ? snapPoint(point) : point, e);
+        return;
+      }
+
+      // Clear any existing selection the instant this plain background click starts, rather than
+      // waiting for pointerUp's marquee-with-no-drag fallback to do it - a marquee drag that goes on
+      // to enclose nodes overwrites this with the real result anyway, so eagerly clearing here can
+      // only ever make an empty-space click FEEL more immediate, never produce a wrong final state.
+      if (selectedNodeIds.size > 0 || selectedEdgeIds.size > 0) onSelectionChange(new Set(), new Set());
+      const point = clientToDoc(e.clientX, e.clientY);
+      interactionRef.current = { mode: "marquee", startDocX: point.x, startDocY: point.y };
+      setMarqueeRect({ x: point.x, y: point.y, width: 0, height: 0 });
+    },
+    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, laserArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint, selectedNodeIds, selectedEdgeIds, snapToGrid]
+  );
+
+  // ---- Text editing ------------------------------------------------------------------------------
+  const commitTextEdit = useCallback(
+    (node: WhiteboardNode, text: string) => {
+      const trimmed = text;
+      if (trimmed !== node.text) onEditNode(node, { ...node, text: trimmed });
+      setEditingNodeId(null);
+    },
+    [onEditNode]
+  );
+
+  useEffect(() => {
+    if (!editingNodeId) return;
+    // Deferred one frame: entering edit mode straight from the text tool (armedShapeType ===
+    // "text") lands in the SAME commit as WhiteboardStylePanel mounting its own fresh DOM (it was
+    // rendering nothing before this node existed to select) - focusing synchronously here can lose
+    // a race with the browser's own post-commit focus handling for that newly-mounted subtree.
+    // Double-click-to-edit on an already-selected node never hits this (the style panel is already
+    // mounted), which is why only the create-and-immediately-type path needs the extra frame.
+    const raf = requestAnimationFrame(() => {
+      const el = editorRef.current;
+      if (!el) return;
+      el.focus();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [editingNodeId]);
+
+  // What the connector-drag preview looks like - mirrors the Arrows tool's own armed preset
+  // (color/dash/routing/arrowhead) while it's armed, so the live drag matches what actually gets
+  // created; falls back to a generic blue dashed arrow for reattach-drags on an existing edge
+  // (connectorArmed is false there - dragging one of an edge's own endpoint handles works
+  // regardless of which tool, if any, happens to be armed).
+  const previewEdgeStyle = useMemo(
+    () =>
+      connectorArmed
+        ? {
+            strokeColor: armedConnectorOverrides?.strokeColor ?? "#2563eb",
+            strokeWidth: armedConnectorOverrides?.strokeWidth ?? 2,
+            strokeStyle: armedConnectorOverrides?.strokeStyle ?? "solid",
+            routing: armedConnectorOverrides?.routing ?? "orthogonal",
+            startArrowType: armedConnectorOverrides?.startArrowType ?? "none",
+            endArrowType: armedConnectorOverrides?.endArrowType ?? "triangle",
+          }
+        : { strokeColor: "#2563eb", strokeWidth: 2, strokeStyle: "dashed" as const, routing: "orthogonal" as const, startArrowType: "none" as const, endArrowType: "triangle" as const },
+    [connectorArmed, armedConnectorOverrides]
+  );
+
+  const markerCombos = useMemo(() => {
+    // (type, color) pairs actually needed - the connector-preview's own current style is always
+    // included since it can appear regardless of what any existing edge/freehand-arrow uses.
+    const combos = new Map<string, { type: Exclude<ArrowheadType, "none">; color: string }>();
+    if (previewEdgeStyle.startArrowType !== "none") combos.set(markerId(previewEdgeStyle.startArrowType, previewEdgeStyle.strokeColor), { type: previewEdgeStyle.startArrowType, color: previewEdgeStyle.strokeColor });
+    if (previewEdgeStyle.endArrowType !== "none") combos.set(markerId(previewEdgeStyle.endArrowType, previewEdgeStyle.strokeColor), { type: previewEdgeStyle.endArrowType, color: previewEdgeStyle.strokeColor });
+    for (const edge of page.edges) {
+      if (edge.startArrowType !== "none") combos.set(markerId(edge.startArrowType, edge.strokeColor), { type: edge.startArrowType, color: edge.strokeColor });
+      if (edge.endArrowType !== "none") combos.set(markerId(edge.endArrowType, edge.strokeColor), { type: edge.endArrowType, color: edge.strokeColor });
+    }
+    for (const node of page.nodes) {
+      if (node.shapeType !== "freehand" && node.shapeType !== "vector") continue;
+      if (node.startArrowType && node.startArrowType !== "none") combos.set(markerId(node.startArrowType, node.strokeColor), { type: node.startArrowType, color: node.strokeColor });
+      if (node.endArrowType && node.endArrowType !== "none") combos.set(markerId(node.endArrowType, node.strokeColor), { type: node.endArrowType, color: node.strokeColor });
+    }
+    return Array.from(combos.values());
+  }, [page.edges, page.nodes, previewEdgeStyle]);
+
+  // Raw doc-space dash pattern for a COMMITTED edge's own rendered path - deliberately NOT divided
+  // by zoom (unlike the UI-chrome elements below: hit-test stroke, selection halo, resize/
+  // connection-dot handles), so the line's dash/dot rhythm scales with the ambient
+  // `transform: scale(zoom)` exactly like node borders and everything else that IS actual document
+  // content already does, and exactly like whiteboardHandlers.ts's Canvas2D export (which has no
+  // notion of zoom at all) always draws it. A temporary drag preview (connector/freehand) is the
+  // one exception that stays zoom-constant on purpose - see previewEdgeStyle's own reasoning.
+  const dashArrayFor = useCallback((strokeStyle: WhiteboardEdge["strokeStyle"], strokeWidth: number): string | undefined => {
+    if (strokeStyle === "solid") return undefined;
+    if (strokeStyle === "dotted") return `${strokeWidth * 0.4},${strokeWidth * 1.6 + 3}`;
+    return "8,6";
+  }, []);
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative w-full h-full overflow-hidden select-none"
+      style={{
+        backgroundColor: "var(--wb-bg, #f7f7f8)",
+        backgroundImage: showGrid ? "radial-gradient(circle, rgba(120,120,130,0.35) 1px, transparent 1px)" : undefined,
+        backgroundSize: showGrid ? `${GRID_SIZE * zoom}px ${GRID_SIZE * zoom}px` : undefined,
+        backgroundPosition: showGrid ? `${pan.x}px ${pan.y}px` : undefined,
+        cursor: laserArmed ? "none" : spaceHeld ? "grab" : armedShapeType === "freehand" || connectorArmed ? "crosshair" : "default",
+        // Without this, a touch-drag is up for grabs between this canvas's own pointer handlers and
+        // the browser's native touch gestures (panning/scrolling) - on most touchscreens the browser
+        // wins that race, so a finger stroke either scrolls the page or gets cut short by a
+        // pointercancel partway through instead of drawing. "none" hands the whole gesture to our own
+        // pointer handlers (panning/zooming here are already reimplemented via wheel/pinch and the
+        // space-drag shortcut, so there's no native touch behavior actually worth keeping).
+        touchAction: "none",
+      }}
+      onWheel={handleWheel}
+      onPointerDown={handleContainerPointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      // Right-clicking empty canvas has nothing to act on (see the node/edge handlers below for the
+      // actual context-menu trigger) - still suppress the OS's own menu here so it doesn't leak
+      // through on the one part of the canvas that isn't a node/edge.
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <div className="absolute top-0 left-0 w-0 h-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0" }}>
+        {/* Edges layer - one SVG so paths can overlap nodes correctly (drawn before nodes = behind
+            them, matching draw.io's own connector-under-shape stacking). overflow visible since
+            the svg itself has no intrinsic size; each path uses absolute doc-space coordinates. */}
+        <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none" }} width={1} height={1}>
+          <defs>
+            {markerCombos.map(({ type, color }) => (
+              <marker key={markerId(type, color)} id={markerId(type, color)} markerWidth="10" markerHeight="10" refX={MARKER_REF[type]} refY="5" orient="auto" markerUnits="userSpaceOnUse">
+                {markerContentFor(type, color)}
+              </marker>
+            ))}
+          </defs>
+          {edges.map((edge) => {
+            const { source, target } = resolveEdgeEndpoints(edge, nodesById);
+            const waypoints = liveWaypointsEdgeId === edge.id && liveWaypoints ? liveWaypoints : edge.waypoints ?? [];
+            const d = buildEdgePath(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, waypoints);
+            const selected = selectedEdgeIds.has(edge.id);
+            return (
+              <g key={edge.id}>
+                <path
+                  d={d}
+                  fill="none"
+                  stroke="transparent"
+                  strokeWidth={HIT_STROKE_SCREEN_WIDTH / zoom}
+                  style={{ pointerEvents: "stroke", cursor: "grab" }}
+                  onPointerDown={(e) => {
+                    // Same "let an armed tool's click through to the container" reasoning as the
+                    // node div's own onPointerDown guard above - an edge's fat invisible hit-stroke
+                    // is an easy, easy-to-hit-by-accident target for a click that was meant to
+                    // place a new shape/text/stroke on top of it. laserArmed additionally means
+                    // "just pointing, not editing" - clicks should do nothing at all while it's on.
+                    if (armedShapeType || laserArmed) return;
+                    // beginMoveEdge both selects this edge AND stages a "moveEdge" drag - a plain
+                    // click (no real movement before pointerup) still ends up just selecting it, the
+                    // same way a node's own beginMoveNode covers both click-to-select and drag-to-
+                    // move with one gesture instead of two different handlers.
+                    beginMoveEdge(edge, e);
+                  }}
+                  onDoubleClick={(e) => insertWaypointAtDoubleClick(edge, source, target, waypoints, e)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const nextEdgeIds = selectedEdgeIds.has(edge.id) ? selectedEdgeIds : new Set([edge.id]);
+                    const nextNodeIds = selectedEdgeIds.has(edge.id) ? selectedNodeIds : new Set<string>();
+                    onSelectionChange(nextNodeIds, nextEdgeIds);
+                    onItemContextMenu(nextNodeIds, nextEdgeIds, { x: e.clientX, y: e.clientY });
+                  }}
+                />
+                {selected && <path d={d} fill="none" stroke="#2563eb" strokeWidth={edge.strokeWidth + 5} strokeLinecap="round" opacity={0.35} />}
+                <path
+                  d={d}
+                  fill="none"
+                  stroke={edge.strokeColor}
+                  strokeWidth={edge.strokeWidth}
+                  strokeDasharray={dashArrayFor(edge.strokeStyle, edge.strokeWidth)}
+                  strokeLinecap={edge.strokeStyle === "dotted" ? "round" : "butt"}
+                  markerEnd={edge.endArrowType !== "none" ? `url(#${markerId(edge.endArrowType, edge.strokeColor)})` : undefined}
+                  markerStart={edge.startArrowType !== "none" ? `url(#${markerId(edge.startArrowType, edge.strokeColor)})` : undefined}
+                  style={{ pointerEvents: "none" }}
+                />
+                {edge.label && (
+                  <text x={(source.x + target.x) / 2} y={(source.y + target.y) / 2} fontSize={13 / zoom} fill="#374151" textAnchor="middle" style={{ pointerEvents: "none", paintOrder: "stroke" }} stroke="#f7f7f8" strokeWidth={3 / zoom}>
+                    {edge.label}
+                  </text>
+                )}
+                {selected && (
+                  <>
+                    {/* No more "drag from a midpoint dot" affordance for inserting a new bend point
+                        - see insertWaypointAtDoubleClick's own doc comment for why that competed
+                        with dragging the edge's body. Double-click anywhere on the line itself
+                        (the hit-stroke's own onDoubleClick above) does it instead. */}
+                    {waypoints.map((wp, i) => (
+                      <circle
+                        key={`wp-${i}`}
+                        cx={wp.x}
+                        cy={wp.y}
+                        r={5.5 / zoom}
+                        fill="#2563eb"
+                        stroke="#ffffff"
+                        strokeWidth={1.5 / zoom}
+                        style={{ pointerEvents: "auto", cursor: "grab" }}
+                        onPointerDown={(e) => beginWaypointDrag(edge, i, e)}
+                        onDoubleClick={(e) => removeWaypoint(edge, i, e)}
+                      />
+                    ))}
+                    <circle cx={source.x} cy={source.y} r={6 / zoom} fill="#ffffff" stroke="#2563eb" strokeWidth={2 / zoom} style={{ pointerEvents: "auto", cursor: "grab" }} onPointerDown={(e) => beginConnectorReattach(edge, "source", e)} />
+                    <circle cx={target.x} cy={target.y} r={6 / zoom} fill="#ffffff" stroke="#2563eb" strokeWidth={2 / zoom} style={{ pointerEvents: "auto", cursor: "grab" }} onPointerDown={(e) => beginConnectorReattach(edge, "target", e)} />
+                  </>
+                )}
+              </g>
+            );
+          })}
+          {connectorPreview && (
+            <path
+              d={buildEdgePath(connectorPreview.from, connectorPreview.to, previewEdgeStyle.routing, connectorPreviewBow)}
+              fill="none"
+              stroke={previewEdgeStyle.strokeColor}
+              strokeWidth={previewEdgeStyle.strokeWidth / zoom}
+              strokeDasharray={dashArrayFor(previewEdgeStyle.strokeStyle, previewEdgeStyle.strokeWidth) ?? `${6 / zoom},${4 / zoom}`}
+              markerEnd={previewEdgeStyle.endArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.endArrowType, previewEdgeStyle.strokeColor)})` : undefined}
+              markerStart={previewEdgeStyle.startArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.startArrowType, previewEdgeStyle.strokeColor)})` : undefined}
+            />
+          )}
+          {freehandPreview && freehandPreview.length > 1 && (
+            <path d={smoothedPathD(freehandPreview)} fill="none" stroke="#111111" strokeWidth={2.5 / zoom} strokeLinecap="round" strokeLinejoin="round" />
+          )}
+        </svg>
+
+        {/* Nodes layer */}
+        {nodes.map((node) => {
+          const selected = selectedNodeIds.has(node.id);
+          const isHovered = hoveredNodeId === node.id;
+          const isConnectorTarget = connectorHoverNodeId === node.id;
+          const isEditing = editingNodeId === node.id;
+          const isConnectable = isConnectableShape(node.shapeType);
+          const showConnectionDots = isConnectable && (isHovered || selected || connectorArmed);
+          // Hover-arrow "pick a connected shape" (see onQuickConnectArrowClick/placeConnectedShape)
+          // - hidden while any tool is armed or a connector drag is underway so it doesn't compete
+          // with that other intent, and (like the connection dots) only on shapes an edge can
+          // actually anchor to. Also hidden for "table" - it sits at the exact same top/left/right/
+          // bottom-center positions as WhiteboardTable.tsx's own row/column selector handles and
+          // insert/delete affordances (both are "small chrome just outside a selected shape's own
+          // edges"), so showing both here would just overlap; a table can still be connected TO via
+          // the explicit connector tool (it's not in NON_CONNECTABLE_SHAPES), this only suppresses
+          // the automatic hover shortcut.
+          const showQuickConnectArrows =
+            isConnectable && node.shapeType !== "table" && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
+          const outline = shapeOutlineFor(node.shapeType, node.width, node.height, {
+            sides: node.sides,
+            starPoints: node.starPoints,
+            starInnerRadiusRatio: node.starInnerRadiusRatio,
+            waveStyle: node.waveStyle,
+            waveCycles: node.waveCycles,
+            angleDegrees: node.angleDegrees,
+            angleRay1Length: node.angleRay1Length,
+            angleRay2Length: node.angleRay2Length,
+            chartData: node.chartData,
+            plotFunction: node.plotFunction,
+            plotDomainScale: node.plotDomainScale,
+            plotCycles: node.plotCycles,
+            plotShowGrid: node.plotShowGrid,
+            plotXTickInterval: node.plotXTickInterval,
+            plotYTickInterval: node.plotYTickInterval,
+            showChartLabels: node.showChartLabels,
+            numberLineMax: node.numberLineMax,
+            graphExpression: node.graphExpression,
+            graphXMin: node.graphXMin,
+            graphXMax: node.graphXMax,
+            graphYMin: node.graphYMin,
+            graphYMax: node.graphYMax,
+            graphShowGrid: node.graphShowGrid,
+            graphXTickInterval: node.graphXTickInterval,
+            graphYTickInterval: node.graphYTickInterval,
+            graphPoints: node.graphPoints,
+            ampInputTopLeadLength: node.ampInputTopLeadLength,
+            ampInputBottomLeadLength: node.ampInputBottomLeadLength,
+            ampOutputLeadLength: node.ampOutputLeadLength,
+            ampInputTopLeadYOffset: node.ampInputTopLeadYOffset,
+            ampInputBottomLeadYOffset: node.ampInputBottomLeadYOffset,
+            ampOutputLeadYOffset: node.ampOutputLeadYOffset,
+            ampInvertingOnTop: node.ampInvertingOnTop,
+          });
+          return (
+            <div
+              key={node.id}
+              className="absolute"
+              style={{
+                left: node.x,
+                top: node.y,
+                width: node.width,
+                height: node.height,
+                // Rotate listed FIRST, flip SECOND - CSS composes a `transform` list right-to-left
+                // (the last-listed function applies to the element's own local points first), so
+                // this ordering flips in local space BEFORE rotating the already-flipped result,
+                // matching whiteboardHandlers.ts's Canvas2D export (ctx.rotate called before
+                // ctx.scale - see WhiteboardNode.flipHorizontal's own doc comment).
+                transform:
+                  [node.rotation ? `rotate(${node.rotation}deg)` : null, node.flipHorizontal ? "scaleX(-1)" : null, node.flipVertical ? "scaleY(-1)" : null].filter(Boolean).join(" ") || undefined,
+                transformOrigin: "center",
+              }}
+              onPointerEnter={() => setHoveredNodeId(node.id)}
+              onPointerLeave={() => setHoveredNodeId((prev) => (prev === node.id ? null : prev))}
+              onPointerDown={(e) => {
+                if (connectorArmed && isConnectable) {
+                  beginConnectorFromNode(node, "auto", e, true);
+                  return;
+                }
+                // A tool being armed (shape/text/freehand) means the next click anywhere should
+                // place a new item there, even if it happens to land on top of an existing one -
+                // returning without stopPropagation lets the event bubble up to the container's
+                // handleContainerPointerDown, which owns that placement logic. Without this guard,
+                // beginMoveNode's own stopPropagation would swallow the click first and move THIS
+                // node instead, silently breaking every tool for any target that overlaps existing
+                // content (easy to hit in practice: fit-to-content's own pan/zoom can put an
+                // existing shape right under a click meant for empty canvas). laserArmed also
+                // returns here (not just from the container) so a click doesn't select/move THIS
+                // node while the laser tool is meant to be purely non-interactive.
+                if (armedShapeType || laserArmed) return;
+                beginMoveNode(node, e, e.shiftKey);
+              }}
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                // "latticeGauge" has no text concept at all (see its own shapeType doc comment) -
+                // same "nothing to edit" exclusion "freehand" ink already gets.
+                // "table" has no single node-wide text concept either - it edits per-CELL text
+                // instead (see WhiteboardTable.tsx's own double-click handler on each cell).
+                if (node.shapeType !== "freehand" && node.shapeType !== "latticeGauge" && node.shapeType !== "table") setEditingNodeId(node.id);
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const nextNodeIds = selectedNodeIds.has(node.id) ? selectedNodeIds : new Set([node.id]);
+                const nextEdgeIds = selectedNodeIds.has(node.id) ? selectedEdgeIds : new Set<string>();
+                onSelectionChange(nextNodeIds, nextEdgeIds);
+                onItemContextMenu(nextNodeIds, nextEdgeIds, { x: e.clientX, y: e.clientY });
+              }}
+            >
+              {node.shapeType === "freehand" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  <path
+                    d={smoothedPathD((node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height })))}
+                    fill="none"
+                    stroke={node.strokeColor}
+                    strokeWidth={node.strokeWidth}
+                    markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
+                    markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                </svg>
+              ) : node.shapeType === "vector" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  <line
+                    x1={0}
+                    y1={node.height / 2}
+                    x2={node.width}
+                    y2={node.height / 2}
+                    stroke={node.strokeColor}
+                    strokeWidth={node.strokeWidth}
+                    markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
+                    markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
+                    strokeLinecap="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                </svg>
+              ) : node.shapeType === "latticeGauge" ? (
+                <LatticeGaugeWidget
+                  node={node}
+                  canvasZoom={zoom}
+                  onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
+                  onSelect={() => onSelectionChange(new Set([node.id]), new Set())}
+                />
+              ) : node.shapeType === "table" ? (
+                <WhiteboardTable
+                  node={node}
+                  selected={selected}
+                  canvasZoom={zoom}
+                  onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
+                  onRangeChange={(range) => onTableRangeChange?.(node.id, range)}
+                />
+              ) : node.shapeType === "ellipse" ? (
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    backgroundColor: node.fillColor ?? "transparent",
+                    border: node.strokeWidth > 0 ? `${node.strokeWidth}px solid ${node.strokeColor}` : undefined,
+                    borderRadius: "50%",
+                    boxSizing: "border-box",
+                  }}
+                />
+              ) : node.shapeType === "rectangle" || node.shapeType === "equation" ? (
+                // "equation" reuses the plain rectangle body (background/border/corner-radius) so a
+                // formula can sit on a card/badge instead of bare on the canvas - purely optional,
+                // still transparent/borderless by default (same fillColor: null start every other
+                // "starts blank" shape gets) until the style panel's Fill/Stroke/Corner radius
+                // fields are actually used.
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    backgroundColor: node.fillColor ?? "transparent",
+                    border: node.strokeWidth > 0 ? `${node.strokeWidth}px solid ${node.strokeColor}` : undefined,
+                    borderRadius: node.cornerRadius ?? 0,
+                    boxSizing: "border-box",
+                  }}
+                />
+              ) : node.shapeType === "text" ? (
+                isHovered || selected ? <div style={{ position: "absolute", inset: 0, border: "1px dashed #9ca3af" }} /> : null
+              ) : outline.kind === "cylinder" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  <path
+                    d={`M0,${node.height * CYLINDER_CAP_RATIO} L0,${node.height * (1 - CYLINDER_CAP_RATIO)} A${node.width / 2},${node.height * CYLINDER_CAP_RATIO} 0 0,0 ${node.width},${node.height * (1 - CYLINDER_CAP_RATIO)} L${node.width},${node.height * CYLINDER_CAP_RATIO} Z`}
+                    fill={node.fillColor ?? "none"}
+                    stroke={node.strokeColor}
+                    strokeWidth={node.strokeWidth}
+                  />
+                  <ellipse
+                    cx={node.width / 2}
+                    cy={node.height * CYLINDER_CAP_RATIO}
+                    rx={node.width / 2}
+                    ry={node.height * CYLINDER_CAP_RATIO}
+                    fill={node.fillColor ?? "none"}
+                    stroke={node.strokeColor}
+                    strokeWidth={node.strokeWidth}
+                  />
+                </svg>
+              ) : outline.kind === "polygon" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  <polygon points={outline.points.map(([px, py]) => `${px},${py}`).join(" ")} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
+                  {outline.innerLines?.map((line, i) => (
+                    <polyline key={i} points={line.map(([px, py]) => `${px},${py}`).join(" ")} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
+                  ))}
+                  {outline.innerCircle && (
+                    <circle cx={outline.innerCircle.cx} cy={outline.innerCircle.cy} r={outline.innerCircle.r} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} />
+                  )}
+                </svg>
+              ) : outline.kind === "path" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  <path d={outline.d} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
+                </svg>
+              ) : outline.kind === "chart" ? (
+                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                  {outline.parts.map((part, i) =>
+                    part.role === "fill" ? (
+                      <path key={i} d={part.d} fill={node.fillColor ?? "none"} stroke="none" />
+                    ) : part.role === "marker" ? (
+                      <path key={i} d={part.d} fill={node.strokeColor} stroke="none" />
+                    ) : part.role === "slice" ? (
+                      <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={1} />
+                    ) : part.role === "axis" ? (
+                      <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={1} />
+                    ) : part.role === "grid" ? (
+                      <path key={i} d={part.d} fill="none" stroke="#e5e7eb" strokeWidth={0.75} />
+                    ) : (
+                      <path key={i} d={part.d} fill="none" stroke={node.strokeColor} strokeWidth={Math.max(1, node.strokeWidth)} strokeLinecap="round" strokeLinejoin="round" />
+                    )
+                  )}
+                  {outline.labels?.map((label, i) => (
+                    <text
+                      key={i}
+                      x={label.x}
+                      y={label.y}
+                      textAnchor={label.anchor}
+                      dominantBaseline="middle"
+                      fontFamily={node.fontFamily}
+                      fontSize={node.fontSize}
+                      fontWeight={node.fontWeight}
+                      fontStyle={node.fontStyle}
+                      textDecoration={node.textDecoration === "underline" ? "underline" : undefined}
+                      fill={node.fontColor}
+                    >
+                      {label.text}
+                    </text>
+                  ))}
+                </svg>
+              ) : null}
+
+              {/* Manual point-plotting handles for a selected, unlocked "graph" node (see
+                  WhiteboardNode.graphPoints' own doc comment) - a transparent rect over just the
+                  plot area (not the full node box, so the margin around it stays reachable for the
+                  node's own ordinary double-click-to-edit-text below) double-clicks to add a point,
+                  and each existing point gets its own small draggable/double-click-to-remove dot. */}
+              {node.shapeType === "graph" &&
+                selected &&
+                !node.locked &&
+                (() => {
+                  const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(node);
+                  const { padX, padY, plotW, plotH, mapX, mapY } = graphCoordinateMapper(node.width, node.height, xMin, xMax, yMin, yMax);
+                  const points = node.graphPoints ?? [];
+                  return (
+                    <svg
+                      width="100%"
+                      height="100%"
+                      viewBox={`0 0 ${node.width} ${node.height}`}
+                      preserveAspectRatio="none"
+                      // Sibling of the body svg above (both mount as separate children of this
+                      // node's own already-`position: absolute` div), not the only child - without
+                      // its own `position: absolute` this one would lay out in normal document FLOW
+                      // instead of overlaying the body, pushed below it and offset by whatever else
+                      // is in between (exactly what happened here before this was added: every
+                      // point handle rendered well outside the node's own visible box).
+                      style={{ position: "absolute", inset: 0, overflow: "visible" }}
+                    >
+                      <rect
+                        x={padX}
+                        y={padY}
+                        width={plotW}
+                        height={plotH}
+                        fill="transparent"
+                        style={{ pointerEvents: "all", cursor: "copy" }}
+                        onDoubleClick={(e) => addGraphPoint(node, e)}
+                      />
+                      {points.map((p, i) => (
+                        <circle
+                          key={i}
+                          cx={mapX(p.x)}
+                          cy={mapY(p.y)}
+                          r={5.5 / zoom}
+                          fill="#2563eb"
+                          stroke="#ffffff"
+                          strokeWidth={1.5 / zoom}
+                          style={{ pointerEvents: "all", cursor: "grab" }}
+                          onPointerDown={(e) => beginGraphPointDrag(node, i, e)}
+                          onDoubleClick={(e) => removeGraphPoint(node, i, e)}
+                        />
+                      ))}
+                    </svg>
+                  );
+                })()}
+
+              {/* Draggable data handles for a selected, unlocked bar/line/scatter chart (see
+                  beginChartDataDrag's own doc comment) - one small circle per WhiteboardNode.
+                  chartData entry, at the exact spot chartColumnLayout already draws it. */}
+              {(node.shapeType === "barChart" || node.shapeType === "lineChart" || node.shapeType === "scatterPlot") &&
+                selected &&
+                !node.locked &&
+                (() => {
+                  const data = node.chartData ?? DEFAULT_CHART_DATA;
+                  const { columnX, valueToY } = chartColumnLayout(node.width, node.height, data);
+                  return (
+                    // Same "needs its own position: absolute" reasoning as the graph-points overlay
+                    // just above - this is also a sibling, not the sole child, of this node's div.
+                    <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ position: "absolute", inset: 0, overflow: "visible" }}>
+                      {data.map((v, i) => (
+                        <circle
+                          key={i}
+                          cx={columnX(i)}
+                          cy={valueToY(v)}
+                          r={6 / zoom}
+                          fill="#2563eb"
+                          stroke="#ffffff"
+                          strokeWidth={1.5 / zoom}
+                          style={{ pointerEvents: "all", cursor: "ns-resize" }}
+                          onPointerDown={(e) => beginChartDataDrag(node, i, e)}
+                        >
+                          <title>{`${v}`}</title>
+                        </circle>
+                      ))}
+                    </svg>
+                  );
+                })()}
+
+              {!isEditing && node.text && node.shapeType === "equation" && (
+                <div
+                  className="absolute inset-0 flex px-2 overflow-visible pointer-events-none"
+                  style={{
+                    alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
+                    justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                  }}
+                >
+                  <EquationDisplay source={node.text} fontSize={node.fontSize} color={node.fontColor} />
+                </div>
+              )}
+              {!isEditing && node.text && node.shapeType !== "equation" && (
+                <div
+                  className="absolute inset-0 flex px-2 overflow-hidden whitespace-pre-wrap break-words"
+                  style={{
+                    alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
+                    justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                    textAlign: node.textAlign,
+                    color: node.fontColor,
+                    fontFamily: node.fontFamily,
+                    fontSize: node.fontSize,
+                    fontWeight: node.fontWeight,
+                    fontStyle: node.fontStyle,
+                    textDecoration: node.textDecoration,
+                    pointerEvents: "none",
+                  }}
+                >
+                  <span>{node.text}</span>
+                </div>
+              )}
+              {!isEditing && !node.text && (node.shapeType === "text" || node.shapeType === "equation") && (isHovered || selected) && (
+                <div className="absolute inset-0 flex items-center justify-center text-neutral-400 text-xs pointer-events-none">
+                  {node.shapeType === "equation" ? "Double-click to type LaTeX" : "Double-click to type"}
+                </div>
+              )}
+
+              {isEditing && (
+                <div
+                  ref={editorRef}
+                  contentEditable
+                  suppressContentEditableWarning
+                  className="absolute inset-0 px-2 outline-none whitespace-pre-wrap break-words overflow-hidden flex"
+                  style={{
+                    alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
+                    justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                    textAlign: node.textAlign,
+                    color: node.fontColor,
+                    // Editing shows the raw LaTeX SOURCE, not typeset math - a monospace font here
+                    // (regardless of the node's own fontFamily, which only applies once rendered)
+                    // makes braces/backslashes/subscript carets easy to see and count while typing.
+                    fontFamily: node.shapeType === "equation" ? "monospace" : node.fontFamily,
+                    fontSize: node.fontSize,
+                    fontWeight: node.fontWeight,
+                    fontStyle: node.fontStyle,
+                    textDecoration: node.textDecoration,
+                    cursor: "text",
+                  }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onBlur={(e) => commitTextEdit(node, e.currentTarget.innerText)}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      (e.currentTarget as HTMLDivElement).blur();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      (e.currentTarget as HTMLDivElement).blur();
+                    }
+                  }}
+                >
+                  {node.text}
+                </div>
+              )}
+
+              {isConnectorTarget && <div className="absolute inset-0 rounded-md ring-2 ring-blue-400 ring-offset-1 pointer-events-none" />}
+
+              {selected && !connectorArmed && (
+                <div className="absolute pointer-events-none" style={{ inset: -3 / zoom, border: `${1.5 / zoom}px dashed #2563eb` }} />
+              )}
+
+              {/* Resize handles - shown (and draggable) at any rotation; beginResizeNode/the
+                  "resize" pointer-move branch project the drag into the box's own rotated axes and
+                  solve for the opposite corner staying fixed in world space (see cornerWorldPoint's
+                  own doc comment). Cursor icons stay screen-axis-aligned regardless of rotation -
+                  a cosmetic simplification, not a functional one. */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && !node.locked &&
+                RESIZE_CORNERS.map((corner) => {
+                  const size = HANDLE_SCREEN_SIZE / zoom;
+                  const left = corner.includes("w") ? -size / 2 : node.width - size / 2;
+                  const top = corner.includes("n") ? -size / 2 : node.height - size / 2;
+                  return (
+                    <div
+                      key={corner}
+                      onPointerDown={(e) => beginResizeNode(node, corner, e)}
+                      className="absolute bg-white border border-blue-600"
+                      style={{ left, top, width: size, height: size, cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize" }}
+                    />
+                  );
+                })}
+
+              {/* Move handle - "table" and "latticeGauge" are the shapeTypes whose selected-state
+                  body intercepts every pointerdown over it (WhiteboardTable.tsx drills into cell
+                  editing/range-select once selected - see that file's own top-of-file doc comment;
+                  LatticeGaugeWidget.tsx's own viewport stops every pointer event for its own orbit/
+                  pan/zoom gestures - see its own top-of-file doc comment), so once selected there is
+                  no longer any place to click-drag the shape itself, and no gap to click through to
+                  one stacked underneath it either. A dedicated handle above the TOP-LEFT corner
+                  (top-right is the rotate handle's spot) hands that back: it's a plain child of this
+                  node's own div, so a pointerdown here that does nothing but call beginMoveNode
+                  behaves exactly like grabbing any other shape's body would.
+                  "graph"'s own body doesn't intercept pointer events the way table/latticeGauge do -
+                  a click on any blank area between its axis/grid lines already falls through to this
+                  same beginMoveNode via the node div's own onPointerDown - but its curve/axis/grid
+                  lines cover enough of a typical box that finding one of those blank gaps to grab can
+                  be fiddly, especially once it's full of gridlines. Same handle, same reasoning, just
+                  for convenience rather than necessity. */}
+              {selected &&
+                selectedNodeIds.size === 1 &&
+                !connectorArmed &&
+                !node.locked &&
+                (node.shapeType === "table" || node.shapeType === "latticeGauge" || node.shapeType === "graph") && (
+                  <div
+                    onPointerDown={(e) => beginMoveNode(node, e, e.shiftKey)}
+                    className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-600 text-blue-600 hover:text-white flex items-center justify-center shadow-sm"
+                    style={{
+                      left: -ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                      top: -ROTATE_HANDLE_GAP / zoom - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                      width: ROTATE_ICON_SCREEN_SIZE / zoom,
+                      height: ROTATE_ICON_SCREEN_SIZE / zoom,
+                      cursor: "grab",
+                    }}
+                    title={node.shapeType === "table" ? "Drag to move this table" : node.shapeType === "latticeGauge" ? "Drag to move this lattice" : "Drag to move this graph"}
+                  >
+                    <TbArrowsMove size={ROTATE_ICON_SCREEN_SIZE * 0.7} style={{ width: "70%", height: "70%" }} />
+                  </div>
+                )}
+
+              {/* Rotate handle - a small icon button above the shape's TOP-RIGHT corner (not
+                  top-center, where it used to sit): centered horizontally, it collided with the
+                  hover "quick connect" arrow (showQuickConnectArrows below) that occupies the exact
+                  same top-center spot, each stealing the other's clicks. Rotating along with
+                  everything else in this div since it's a plain child positioned relative to the
+                  (possibly already-rotated) box. */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && !node.locked && (
+                <div
+                  onPointerDown={(e) => beginRotateNode(node, e)}
+                  className="absolute rounded-full bg-white border border-blue-600 hover:bg-blue-600 text-blue-600 hover:text-white flex items-center justify-center shadow-sm"
+                  style={{
+                    left: node.width - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                    top: -ROTATE_HANDLE_GAP / zoom - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                    width: ROTATE_ICON_SCREEN_SIZE / zoom,
+                    height: ROTATE_ICON_SCREEN_SIZE / zoom,
+                    cursor: "grab",
+                  }}
+                  title="Drag to rotate (hold Shift to snap to 15°)"
+                >
+                  <TbRotateClockwise size={ROTATE_ICON_SCREEN_SIZE * 0.7} style={{ width: "70%", height: "70%" }} />
+                </div>
+              )}
+
+              {/* Live angle readout while THIS node's rotate handle is actively being dragged -
+                  reads interactionRef directly rather than needing its own state, since every
+                  pointermove of the drag already triggers a re-render via setLiveNodes above.
+                  Outer div is positioned in the node's own (pre-rotation) local space, same as the
+                  handle above; the inner div counter-rotates by -node.rotation so the number
+                  itself always reads upright regardless of how far the shape has turned. */}
+              {selected && interactionRef.current?.mode === "rotate" && interactionRef.current.id === node.id && (
+                <div
+                  className="absolute pointer-events-none"
+                  style={{
+                    left: node.width - ROTATE_ICON_SCREEN_SIZE / zoom / 2,
+                    top: -ROTATE_HANDLE_GAP / zoom - ROTATE_ICON_SCREEN_SIZE / zoom - 10 / zoom,
+                    transform: "translate(-50%, -100%)",
+                  }}
+                >
+                  <div
+                    className="bg-neutral-900 text-white rounded shadow whitespace-nowrap"
+                    style={{
+                      transform: `rotate(${-(node.rotation ?? 0)}deg)`,
+                      fontSize: 11 / zoom,
+                      lineHeight: 1,
+                      padding: `${4 / zoom}px ${6 / zoom}px`,
+                      borderRadius: 4 / zoom,
+                    }}
+                  >
+                    {Math.round(node.rotation ?? 0)}°
+                  </div>
+                </div>
+              )}
+
+              {showConnectionDots &&
+                !connectorArmed &&
+                ANCHOR_SIDES.map((side) => {
+                  const p = resolveAnchorPoint(node, side, nodeCenter(node));
+                  const size = CONNECTION_DOT_SCREEN_SIZE / zoom;
+                  return (
+                    <div
+                      key={side}
+                      onPointerDown={(e) => beginConnectorFromNode(node, side, e, false)}
+                      className="absolute rounded-full bg-white border-2 border-blue-500 hover:bg-blue-500"
+                      style={{ left: p.x - node.x - size / 2, top: p.y - node.y - size / 2, width: size, height: size, cursor: "crosshair" }}
+                      title="Drag to connect"
+                    />
+                  );
+                })}
+
+              {/* Amplifier lead-TERMINAL handles - diagrams.net-style "grab the actual line" shape-
+                  specific handles (see WhiteboardNode.ampInputTopLeadLength's own doc comment),
+                  styled amber/diamond rather than the resize corners' plain white squares so they
+                  read as "adjusts this shape's own geometry" rather than "resize the whole box".
+                  Positioned at each lead's own FAR/dangling end via resolveAmplifierGeometry (the
+                  SAME resolver amplifierOutlineParts itself uses, so a handle always sits exactly on
+                  its own rendered wire - including the degenerate-guard scaling and the shared
+                  bodyAttachX inset a shorter input lead's terminal needs) - the actual visible tip of
+                  the wire, matching where a user would naturally reach to grab it. Dragging mostly
+                  sideways lengthens/shortens (see the "ampLead" pointer-move branch's own "grow the
+                  box" mechanism); dragging mostly up/down bends it instead - and all three are always
+                  independent of one another, matching a real op-amp's +/- inputs being two unrelated
+                  wires. Rendered AFTER (so on top of, in DOM stacking order) the generic connection
+                  dots above - the "left" connection dot sits at the box's own left-edge midpoint,
+                  which can land close enough to the top/bottom input terminals to otherwise steal
+                  their clicks. */}
+              {selected && selectedNodeIds.size === 1 && !connectorArmed && node.shapeType === "amplifier" && (() => {
+                const size = HANDLE_SCREEN_SIZE / zoom;
+                const geo = resolveAmplifierGeometry(node.width, node.height, {
+                  topLeadLength: node.ampInputTopLeadLength,
+                  bottomLeadLength: node.ampInputBottomLeadLength,
+                  outputLeadLength: node.ampOutputLeadLength,
+                  topLeadYOffset: node.ampInputTopLeadYOffset,
+                  bottomLeadYOffset: node.ampInputBottomLeadYOffset,
+                  outputLeadYOffset: node.ampOutputLeadYOffset,
+                });
+                const handleStyle = (x: number, y: number): React.CSSProperties => ({
+                  left: x - size / 2,
+                  top: y - size / 2,
+                  width: size,
+                  height: size,
+                  transform: "rotate(45deg)",
+                  cursor: "move",
+                });
+                const handleClass = "absolute border border-amber-600 bg-amber-400 hover:bg-amber-500";
+                return (
+                  <>
+                    <div onPointerDown={(e) => beginAmpLeadDrag(node, "inputTop", e)} className={handleClass} style={handleStyle(geo.topTerminalX, geo.topTerminalY)} title="Drag to lengthen/shorten or bend this lead (independent of the other input lead)" />
+                    <div onPointerDown={(e) => beginAmpLeadDrag(node, "inputBottom", e)} className={handleClass} style={handleStyle(geo.bottomTerminalX, geo.bottomTerminalY)} title="Drag to lengthen/shorten or bend this lead (independent of the other input lead)" />
+                    <div onPointerDown={(e) => beginAmpLeadDrag(node, "output", e)} className={handleClass} style={handleStyle(node.width, geo.outputTerminalY)} title="Drag to lengthen/shorten or bend the output lead" />
+                  </>
+                );
+              })()}
+
+              {showQuickConnectArrows &&
+                ANCHOR_SIDES.map((side) => {
+                  const size = 22 / zoom;
+                  const margin = 14 / zoom;
+                  const style: React.CSSProperties = { position: "absolute", width: size, height: size };
+                  if (side === "top") {
+                    style.left = node.width / 2 - size / 2;
+                    style.top = -size - margin;
+                  } else if (side === "bottom") {
+                    style.left = node.width / 2 - size / 2;
+                    style.top = node.height + margin;
+                  } else if (side === "left") {
+                    style.top = node.height / 2 - size / 2;
+                    style.left = -size - margin;
+                  } else {
+                    style.top = node.height / 2 - size / 2;
+                    style.left = node.width + margin;
+                  }
+                  const glyph = side === "top" ? "↑" : side === "bottom" ? "↓" : side === "left" ? "←" : "→";
+                  return (
+                    <button
+                      key={side}
+                      type="button"
+                      style={style}
+                      className="rounded-full bg-blue-50 border border-blue-300 text-blue-500 hover:bg-blue-500 hover:text-white hover:border-blue-500 flex items-center justify-center leading-none"
+                      title="Click to pick a connected shape"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onQuickConnectArrowClick(node.id, side, { x: e.clientX, y: e.clientY });
+                      }}
+                    >
+                      <span style={{ fontSize: 13 / zoom }}>{glyph}</span>
+                    </button>
+                  );
+                })}
+            </div>
+          );
+        })}
+
+        {marqueeRect && (
+          <div
+            className="absolute border border-blue-500 bg-blue-500/10 pointer-events-none"
+            style={{ left: marqueeRect.x, top: marqueeRect.y, width: marqueeRect.width, height: marqueeRect.height }}
+          />
+        )}
+
+        {/* Laser pointer - rendered last so it always sits above every shape/edge/UI-chrome layer
+            above, matching a real presentation pointer. Sizes divide by zoom (UI-chrome convention -
+            see this file's own top comment) so the dot stays a constant screen size regardless of
+            canvas zoom, and never gets saved anywhere - see laserArmed's doc comment on the props. */}
+        {laserArmed &&
+          laserTrail.length > 0 &&
+          (() => {
+            const now = performance.now();
+            const head = laserTrail[laserTrail.length - 1];
+            return (
+              <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none" }} width={1} height={1}>
+                <circle cx={head.x} cy={head.y} r={16 / zoom} fill="#ef4444" opacity={0.18} />
+                <circle cx={head.x} cy={head.y} r={9 / zoom} fill="#ef4444" opacity={0.35} />
+                {/* Connected segments between CONSECUTIVE points, not a dot per point - a dot per
+                    point leaves visible gaps whenever two points end up more than a dot-radius
+                    apart (exactly the "broken"/dotted look), where a stroked line between them
+                    always reads as one continuous tapering trail regardless of point spacing. */}
+                {laserTrail.length > 1 && (
+                  <g fill="none" stroke="#ef4444" strokeLinecap="round">
+                    {laserTrail.slice(1).map((p, i) => {
+                      const prev = laserTrail[i];
+                      const lifeFrac = Math.max(0, 1 - (now - p.t) / LASER_FADE_MS);
+                      return <line key={i} x1={prev.x} y1={prev.y} x2={p.x} y2={p.y} strokeWidth={(1.5 + 3 * lifeFrac) / zoom} opacity={lifeFrac * 0.6} />;
+                    })}
+                  </g>
+                )}
+                <circle cx={head.x} cy={head.y} r={4 / zoom} fill="#ef4444" />
+              </svg>
+            );
+          })()}
+      </div>
+    </div>
+  );
+});
+
+WhiteboardCanvas.displayName = "WhiteboardCanvas";
+
+export default WhiteboardCanvas;

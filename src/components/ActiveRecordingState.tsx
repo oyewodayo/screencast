@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoMicCircle, IoPauseCircle, IoPlayCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline } from 'react-icons/io5'
+import { IoCameraOutline, IoMicCircle, IoPauseCircle, IoPlayCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline } from 'react-icons/io5'
 
 export type RecordSource = "screen" | "video" | "audio";
 
@@ -44,6 +44,8 @@ interface Props {
     isBoard:boolean;
     handleOpenDocs:()=>void;
     isDocs:boolean;
+    handleOpenWhiteboard:()=>void;
+    isWhiteboard:boolean;
     handleOpenSettings:()=>void;
     handleOpenExternalFile:()=>void;
     handleStopRecording: () => void;
@@ -74,7 +76,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -125,9 +127,16 @@ const ActiveRecordingState = (
         // black video behind it would make unstyled icons/text disappear entirely. The
         // gradient scrim guarantees legibility regardless of what's playing, same technique
         // the video player's own control bar uses (player.css .video-controls-container).
-        <div className="bg-gradient-to-t from-black/20 via-black/10 to-transparent pt-3">
-            <div className='mx-2 h-4' data-tauri-drag-region />
-            <div className='flex justify-between pl-2 pb-2 items-center align-middle'>
+        // pointer-events-none on this whole wrapper, with it explicitly turned back on for the
+        // drag-region strip and the actual icon row below: this bar sits at the very top of the
+        // fixed bottom docker, right where the whiteboard/board page-tab strip's own controls
+        // (e.g. the page-menu chevron) end - even though pt-4's own gap is visually empty/
+        // transparent, without this it was still a real, click-intercepting DOM element sitting
+        // on top of whatever the tab strip renders in that last sliver of space, silently
+        // swallowing clicks meant for it.
+        <div className="bg-gradient-to-t from-black/15 via-black/5 to-transparent pt-4 pointer-events-none">
+            <div className='mx-2 h-4 pointer-events-auto' data-tauri-drag-region />
+            <div className='flex justify-between pl-2 pb-2 items-center align-middle pointer-events-auto'>
                 {/* Each icon gets its own padded hit-area that darkens on hover/focus so it
                     reads clearly regardless of what's playing behind this bar (light or dark
                     video frame, or the plain home screen) - a bare white icon with no feedback
@@ -195,6 +204,18 @@ const ActiveRecordingState = (
                     title="Home"
                     >
                       <IoHomeOutline />
+                    </button>
+                    <button
+                    type="button"
+                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
+                      isWhiteboard
+                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
+                        : "hover:bg-black/40 active:bg-black/60"
+                    }`}
+                    onClick={() => handleOpenWhiteboard()}
+                    title="Whiteboard"
+                    >
+                      <IoGitNetworkOutline />
                     </button>
                     <button
                     type="button"
