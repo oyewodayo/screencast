@@ -91,6 +91,7 @@ import {
   MIN_PLOT_DOMAIN_SCALE,
   MIN_WAVE_CYCLES,
   compileGraphExpression,
+  nudgeEdgeBy,
 } from "../../handlers/whiteboardHandlers";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
@@ -303,6 +304,101 @@ function ChartDataField({ initialValue, onCommit, className }: { initialValue: n
       }}
       className={className}
     />
+  );
+}
+
+// The 4-direction nudge button grid - shared by the node section's own "Nudge" field and the
+// connector section's (see nudgeEdgeBy's own doc comment for why an edge can be nudged too, not
+// just moved by dragging its body). 1px per click, 10px with Shift held - same step sizes as the
+// arrow-key shortcut (WhiteboardCanvas.tsx's keydown handler) so both controls move a selection by
+// identical, predictable amounts.
+function NudgeGrid({ onNudge }: { onNudge: (dx: number, dy: number) => void }) {
+  return (
+    <div className="grid grid-cols-3 grid-rows-2 gap-0.5">
+      <span />
+      <button
+        type="button"
+        onClick={(e) => onNudge(0, e.shiftKey ? -10 : -1)}
+        title="Nudge up (↑, Shift for 10px)"
+        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
+      >
+        ↑
+      </button>
+      <span />
+      <button
+        type="button"
+        onClick={(e) => onNudge(e.shiftKey ? -10 : -1, 0)}
+        title="Nudge left (←, Shift for 10px)"
+        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
+      >
+        ←
+      </button>
+      <button
+        type="button"
+        onClick={(e) => onNudge(0, e.shiftKey ? 10 : 1)}
+        title="Nudge down (↓, Shift for 10px)"
+        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
+      >
+        ↓
+      </button>
+      <button
+        type="button"
+        onClick={(e) => onNudge(e.shiftKey ? 10 : 1, 0)}
+        title="Nudge right (→, Shift for 10px)"
+        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
+      >
+        →
+      </button>
+    </div>
+  );
+}
+
+// Rotates a fully free-floating edge (both ends unattached to any shape - see this field's own
+// call site for the `bothFree` gate) around the bounding-box center of its own point set at the
+// moment this field first mounted - an edge has no persisted `rotation` field the way a
+// WhiteboardNode does (nothing else about an edge's rendering needs one, and its "shape" IS its
+// point coordinates, not a box with a transform layered on top), so this field tracks the angle
+// typed so far in local state and, on every change, re-derives brand-new source/target/waypoint
+// coordinates by rotating the ORIGINAL (gesture-start) points by that FULL angle - never the
+// previous angle incrementally - so repeated small adjustments can't compound floating-point drift
+// the way "rotate a bit, then rotate a bit more from wherever that landed" would. `key={edge.id}`
+// at the call site remounts this (resetting both the captured start-geometry ref and the angle
+// back to 0) whenever the selection moves to a DIFFERENT edge.
+function EdgeRotateField({ edge, onCommit }: { edge: WhiteboardEdge; onCommit: (patch: Partial<WhiteboardEdge>) => void }) {
+  const startRef = React.useRef({ source: edge.source, target: edge.target, waypoints: edge.waypoints ?? [] });
+  const [angle, setAngle] = React.useState(0);
+  const applyRotation = (deg: number) => {
+    setAngle(deg);
+    const { source, target, waypoints } = startRef.current;
+    const points = [
+      { x: source.x ?? 0, y: source.y ?? 0 },
+      ...waypoints,
+      { x: target.x ?? 0, y: target.y ?? 0 },
+    ];
+    const xs = points.map((p) => p.x);
+    const ys = points.map((p) => p.y);
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+    const rad = (deg * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const rotate = (p: { x: number; y: number }) => ({ x: cx + (p.x - cx) * cos - (p.y - cy) * sin, y: cy + (p.x - cx) * sin + (p.y - cy) * cos });
+    const newSource = rotate(points[0]);
+    const newTarget = rotate(points[points.length - 1]);
+    const newWaypoints = waypoints.map((wp) => rotate(wp));
+    onCommit({ source: { x: newSource.x, y: newSource.y }, target: { x: newTarget.x, y: newTarget.y }, waypoints: newWaypoints });
+  };
+  return (
+    <Field label="Rotation (°)">
+      <ClampedNumberField
+        initialValue={angle}
+        min={-360}
+        max={360}
+        onCommit={applyRotation}
+        className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+        title="Rotates the whole line around its own center - only available while both ends are free-floating"
+      />
+    </Field>
   );
 }
 
@@ -521,45 +617,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             </>
           )}
           <Field label="Nudge">
-            {/* 1px per click, 10px with Shift held - same step sizes as the arrow-key shortcut
-                (WhiteboardCanvas.tsx's keydown handler) so both controls move a selection by
-                identical, predictable amounts. */}
-            <div className="grid grid-cols-3 grid-rows-2 gap-0.5">
-              <span />
-              <button
-                type="button"
-                onClick={(e) => nudgeSelected(0, e.shiftKey ? -10 : -1)}
-                title="Nudge up (↑, Shift for 10px)"
-                className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-              >
-                ↑
-              </button>
-              <span />
-              <button
-                type="button"
-                onClick={(e) => nudgeSelected(e.shiftKey ? -10 : -1, 0)}
-                title="Nudge left (←, Shift for 10px)"
-                className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-              >
-                ←
-              </button>
-              <button
-                type="button"
-                onClick={(e) => nudgeSelected(0, e.shiftKey ? 10 : 1)}
-                title="Nudge down (↓, Shift for 10px)"
-                className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-              >
-                ↓
-              </button>
-              <button
-                type="button"
-                onClick={(e) => nudgeSelected(e.shiftKey ? 10 : 1, 0)}
-                title="Nudge right (→, Shift for 10px)"
-                className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-              >
-                →
-              </button>
-            </div>
+            <NudgeGrid onNudge={nudgeSelected} />
           </Field>
 
           {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
@@ -1475,6 +1533,10 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
       {edge && (
         <>
           <p className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-neutral-500">Connector</p>
+          <Field label="Nudge">
+            <NudgeGrid onNudge={(dx, dy) => updateEdge(nudgeEdgeBy(edge, dx, dy))} />
+          </Field>
+          {!edge.source.nodeId && !edge.target.nodeId && <EdgeRotateField key={edge.id} edge={edge} onCommit={updateEdge} />}
           <Field label="Color">
             <input type="color" value={edge.strokeColor} onChange={(e) => updateEdge({ strokeColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
           </Field>

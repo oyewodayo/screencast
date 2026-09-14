@@ -111,6 +111,57 @@ export function resolveEdgeEndpoints(edge: WhiteboardEdge, nodesById: Map<string
 export type EdgeRouting = "straight" | "orthogonal" | "curved";
 type ResolvedPoint = { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null };
 
+// Shifts an edge by (dx, dy) in document space - translates every FREE-FLOATING endpoint (no
+// nodeId) and every waypoint by the same delta; an endpoint anchored to a shape is left untouched,
+// since its position is derived from that shape rather than something the edge itself can move
+// (same reasoning WhiteboardCanvas.tsx's "moveEdge" Interaction variant already follows for a
+// body-drag). Shared by the keyboard arrow-key nudge and the style panel's own Nudge buttons so
+// both stay in exact agreement rather than two independent implementations drifting apart.
+export function nudgeEdgeBy(edge: WhiteboardEdge, dx: number, dy: number): WhiteboardEdge {
+  const nudgeEndpoint = (ep: WhiteboardEndpoint): WhiteboardEndpoint => (ep.nodeId ? ep : { ...ep, x: (ep.x ?? 0) + dx, y: (ep.y ?? 0) + dy });
+  return {
+    ...edge,
+    source: nudgeEndpoint(edge.source),
+    target: nudgeEndpoint(edge.target),
+    waypoints: edge.waypoints?.map((wp) => ({ x: wp.x + dx, y: wp.y + dy })),
+  };
+}
+
+// Squared distance from `point` to the closest point on segment a->b - squared (not the real
+// distance) since every caller only ever COMPARES distances against each other to find the
+// nearest segment, so the monotonic sqrt is pure wasted work.
+function squaredDistanceToSegment(point: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }): number {
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const lenSq = abx * abx + aby * aby;
+  const t = lenSq > 0 ? Math.max(0, Math.min(1, ((point.x - a.x) * abx + (point.y - a.y) * aby) / lenSq)) : 0;
+  const closestX = a.x + t * abx;
+  const closestY = a.y + t * aby;
+  const dx = point.x - closestX;
+  const dy = point.y - closestY;
+  return dx * dx + dy * dy;
+}
+
+// Which segment of an edge's own point sequence (source -> waypoints -> target) a new bend point
+// double-clicked at `point` should be inserted into - the index (into `waypoints`, not
+// `fullSequence`) of whichever segment's straight line lies closest to `point`, so a double-click
+// near the middle of a long multi-bend edge lands the new point in the right place along the
+// sequence rather than always at the very end. Returns the insertion index for
+// `waypoints.splice(index, 0, point)`.
+export function nearestSegmentInsertIndex(point: { x: number; y: number }, source: { x: number; y: number }, target: { x: number; y: number }, waypoints: { x: number; y: number }[]): number {
+  const fullSequence = [source, ...waypoints, target];
+  let bestIndex = 0;
+  let bestDistSq = Infinity;
+  for (let i = 0; i < fullSequence.length - 1; i++) {
+    const distSq = squaredDistanceToSegment(point, fullSequence[i], fullSequence[i + 1]);
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+
 // How far a curved edge's control point extends outward from its endpoint, along that endpoint's
 // own side-normal, before bending toward the other end - large enough that the curve visibly
 // leaves perpendicular to the shape (rather than looking like a barely-bent straight line) but

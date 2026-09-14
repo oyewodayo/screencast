@@ -54,7 +54,9 @@ import {
   edgeBoundingBox,
   MAX_AMP_LEAD_LENGTH,
   MIN_AMP_LEAD_LENGTH,
+  nearestSegmentInsertIndex,
   nodeCenter,
+  nudgeEdgeBy,
   resolveAmplifierGeometry,
   resolveAnchorPoint,
   resolveEdgeEndpoints,
@@ -300,11 +302,9 @@ type Interaction =
       lastPathClientY: number;
     }
   | {
-      // Dragging one bend point of an edge's WhiteboardEdge.waypoints - either an existing one
-      // (beginWaypointDrag, `index` = its current position) or a brand-new one just spliced into
-      // `startWaypoints` at the drag's start (beginNewWaypointDrag, dragged out from a segment's
-      // midpoint handle) - either way this only ever moves the single point at `index`, so
-      // handlePointerMove doesn't need to know which case it is.
+      // Dragging one EXISTING bend point of an edge's WhiteboardEdge.waypoints (beginWaypointDrag,
+      // `index` = its current position) - a new one is inserted directly (no drag phase) by
+      // double-clicking the edge's own body instead (see insertWaypointAtDoubleClick).
       mode: "waypoint";
       edgeId: string;
       index: number;
@@ -699,19 +699,28 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
         onSelectionChange(new Set(), new Set());
       } else if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
-        // Nudges selected nodes by a fixed step in document space (1px, or 10px with Shift held -
-        // the same two-tier step the style panel's own nudge buttons use, so the keyboard shortcut
-        // and the manual on-panel control feel like the same feature rather than two different ones).
-        if (selectedNodeIds.size === 0) return;
+        // Nudges selected nodes AND/OR edges by a fixed step in document space (1px, or 10px with
+        // Shift held - the same two-tier step the style panel's own nudge buttons use, so the
+        // keyboard shortcut and the manual on-panel control feel like the same feature rather than
+        // two different ones). An edge nudge only actually moves its FREE-FLOATING endpoints/
+        // waypoints (see nudgeEdgeBy) - one with both ends anchored to shapes has nothing to nudge.
+        if (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0) return;
         e.preventDefault();
         const step = e.shiftKey ? 10 : 1;
         const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
         const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
-        const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id));
-        if (selected.length === 0) return;
-        const after = selected.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
-        if (after.length === 1) onEditNode(selected[0], after[0]);
-        else onBatchEditNodes(selected, after);
+        if (selectedNodeIds.size > 0) {
+          const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id));
+          if (selected.length > 0) {
+            const after = selected.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
+            if (after.length === 1) onEditNode(selected[0], after[0]);
+            else onBatchEditNodes(selected, after);
+          }
+        }
+        for (const id of selectedEdgeIds) {
+          const edge = page.edges.find((ed) => ed.id === id);
+          if (edge) onEditEdge(edge, nudgeEdgeBy(edge, dx, dy));
+        }
       } else if (e.key === "Escape") {
         interactionRef.current = null;
         setConnectorPreview(null);
@@ -723,7 +732,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes]);
+  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes, onEditEdge]);
 
   // ---- Node move / resize ----------------------------------------------------------------------
   const beginMoveNode = useCallback(
@@ -877,22 +886,28 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     [onSelectionChange]
   );
 
-  // Starts dragging a NEW bend point out from one of the small hollow "add a point here" handles
-  // rendered at each segment's midpoint - splices it into a copy of the waypoints array up front
-  // (at `insertAt`) so from here on it's just beginWaypointDrag's own "drag the point at this
-  // index" gesture, with no special-casing needed anywhere else.
-  const beginNewWaypointDrag = useCallback(
-    (edge: WhiteboardEdge, insertAt: number, initialPoint: { x: number; y: number }, e: React.PointerEvent) => {
+  // Double-clicking anywhere on an edge's own body inserts a new bend point right there - the
+  // direct, symmetric counterpart to double-clicking an EXISTING point to remove it (removeWaypoint
+  // below). This used to be a small hollow "add a point here" handle permanently rendered at each
+  // segment's own midpoint, draggable out via its own pointerdown - but that dot sat exactly where
+  // a user would naturally try to grab the line to drag the WHOLE edge (see beginMoveEdge), and
+  // whichever one happened to catch the pointerdown first won, with no visual way to tell them
+  // apart before commiting to a gesture: an attempted "drag to move" that grazed the dot instead
+  // silently became "insert and drag a bend point," which could easily tangle the edge into a
+  // self-crossing mess with no clear cause. A double-click has no such ambiguity with a plain
+  // click-drag (which the hit-stroke's own onPointerDown already claims first for beginMoveEdge on
+  // every click, single or double), so "grab the line" and "add a point" can no longer race.
+  const insertWaypointAtDoubleClick = useCallback(
+    (edge: WhiteboardEdge, source: { x: number; y: number }, target: { x: number; y: number }, waypoints: { x: number; y: number }[], e: React.MouseEvent) => {
       e.stopPropagation();
+      const point = clientToDoc(e.clientX, e.clientY);
+      const insertAt = nearestSegmentInsertIndex(point, source, target, waypoints);
+      const next = [...waypoints];
+      next.splice(insertAt, 0, point);
       onSelectionChange(new Set(), new Set([edge.id]));
-      const startWaypoints = [...(edge.waypoints ?? [])];
-      startWaypoints.splice(insertAt, 0, initialPoint);
-      interactionRef.current = { mode: "waypoint", edgeId: edge.id, index: insertAt, startWaypoints };
-      setLiveWaypointsEdgeId(edge.id);
-      setLiveWaypoints(startWaypoints);
-      (e.target as Element).setPointerCapture?.(e.pointerId);
+      onEditEdge(edge, { ...edge, waypoints: next });
     },
-    [onSelectionChange]
+    [clientToDoc, onSelectionChange, onEditEdge]
   );
 
   // Double-clicking an existing bend point removes it outright - the direct, symmetric counterpart
@@ -1583,10 +1598,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             const waypoints = liveWaypointsEdgeId === edge.id && liveWaypoints ? liveWaypoints : edge.waypoints ?? [];
             const d = buildEdgePath(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, waypoints);
             const selected = selectedEdgeIds.has(edge.id);
-            // The full point sequence a bend-point handle needs (segment midpoints for "add a
-            // point here", plus each real waypoint's own drag handle) - source and target included
-            // so the first/last segments get their own midpoint handle too.
-            const fullSequence = [{ x: source.x, y: source.y }, ...waypoints, { x: target.x, y: target.y }];
             return (
               <g key={edge.id}>
                 <path
@@ -1608,6 +1619,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     // move with one gesture instead of two different handlers.
                     beginMoveEdge(edge, e);
                   }}
+                  onDoubleClick={(e) => insertWaypointAtDoubleClick(edge, source, target, waypoints, e)}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -1636,27 +1648,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 )}
                 {selected && (
                   <>
-                    {/* Segment midpoint handles - drag one to insert a new bend point there. Hollow/
-                        faint so they read as "add a point" rather than competing visually with the
-                        solid waypoint dots and endpoint circles below. */}
-                    {fullSequence.slice(0, -1).map((p, i) => {
-                      const next = fullSequence[i + 1];
-                      const mid = { x: (p.x + next.x) / 2, y: (p.y + next.y) / 2 };
-                      return (
-                        <circle
-                          key={`mid-${i}`}
-                          cx={mid.x}
-                          cy={mid.y}
-                          r={5 / zoom}
-                          fill="#ffffff"
-                          fillOpacity={0.6}
-                          stroke="#93c5fd"
-                          strokeWidth={1.5 / zoom}
-                          style={{ pointerEvents: "auto", cursor: "copy" }}
-                          onPointerDown={(e) => beginNewWaypointDrag(edge, i, mid, e)}
-                        />
-                      );
-                    })}
+                    {/* No more "drag from a midpoint dot" affordance for inserting a new bend point
+                        - see insertWaypointAtDoubleClick's own doc comment for why that competed
+                        with dragging the edge's body. Double-click anywhere on the line itself
+                        (the hit-stroke's own onDoubleClick above) does it instead. */}
                     {waypoints.map((wp, i) => (
                       <circle
                         key={`wp-${i}`}
