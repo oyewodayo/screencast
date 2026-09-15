@@ -1108,7 +1108,10 @@ async fn mux_system_audio(
     args.push(path_to_str(&muxed_path)?.to_string());
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(&ffmpeg_path).args(&args).output()
+        let mut cmd = Command::new(&ffmpeg_path);
+        cmd.args(&args);
+        hide_console_window(&mut cmd);
+        cmd.output()
     })
     .await
     .map_err(|e| format!("System-audio mux task panicked: {}", e))?

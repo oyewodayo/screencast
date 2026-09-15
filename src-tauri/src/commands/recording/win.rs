@@ -1,9 +1,7 @@
 // commands/recording/win.rs
 //
 // Windows recording backend: screen via ffmpeg's `gdigrab`, camera/microphone via `dshow`.
-// Moved here verbatim from the old single-file recording.rs — no behavior change, including its
-// existing inconsistencies (recording_with_output_sva/_v spawn without silent_command, unlike
-// every other mode here; that's pre-existing, not something this move introduces or fixes).
+// Moved here verbatim from the old single-file recording.rs.
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -22,6 +20,7 @@ use super::{
     extract_ffmpeg_error, map_overlay_size, resolve_capture_target, silent_command, AppState,
     CaptureTarget, FormData, AUDIO_ENHANCE_FILTER, MAX_RECORDING_WIDTH,
 };
+use crate::services::process_job;
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
 // Downscale flag for the plain (no camera overlay) desktop-capture path - when a camera overlay
@@ -88,10 +87,10 @@ pub fn get_connected_devices(app_handle: &AppHandle) -> (Vec<String>, Vec<String
         }
     };
 
-    let output = match Command::new(&ffmpeg_path)
-        .args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
-        .output()
-    {
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
+    super::hide_console_window(&mut cmd);
+    let output = match cmd.output() {
         Ok(output) => output,
         Err(e) => {
             return (
@@ -298,13 +297,16 @@ pub async fn recording_with_output_sva(
     // and the process gets force-killed - which for a container format that needs a proper
     // finalize on exit (WebM/Matroska in particular) produces exactly the kind of corrupt,
     // unparseable file ("EBML header parsing failed") this was silently causing.
-    let child = Command::new(&ffmpeg_path)
-        .args(&args)
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    super::hide_console_window(&mut cmd);
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    process_job::assign_to_job(&child);
 
     // Store the process in state
     {
@@ -372,6 +374,7 @@ pub async fn recording_with_output_sv(
         .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    process_job::assign_to_job(&child);
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -434,6 +437,7 @@ pub async fn recording_with_output_sa(
         .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    process_job::assign_to_job(&child);
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -472,11 +476,13 @@ pub async fn recording_with_output_v(
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
 
-    let child = Command::new(&ffmpeg_path)
-        .args(&args)
-        .stdin(Stdio::piped())
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(&args).stdin(Stdio::piped());
+    super::hide_console_window(&mut cmd);
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    process_job::assign_to_job(&child);
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -522,6 +528,7 @@ pub async fn recording_with_output_a(
         .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    process_job::assign_to_job(&child);
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -566,6 +573,7 @@ pub async fn recording_with_output_va(
         .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    process_job::assign_to_job(&child);
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -618,6 +626,7 @@ pub async fn recording_with_output_s(
         .args(&args)
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    process_job::assign_to_job(&child);
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;

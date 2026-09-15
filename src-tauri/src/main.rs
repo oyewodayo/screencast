@@ -38,6 +38,11 @@ mod services {
     // Cargo dependency at all.
     #[cfg(target_os = "windows")]
     pub mod click_tracker;
+    // Windows Job Object wrapper that kills recording ffmpeg children the instant this app's own
+    // process dies for any reason (including a force-kill), so they can't outlive it holding the
+    // camera/mic open - see the module's own doc comment for the orphan this fixes.
+    #[cfg(target_os = "windows")]
+    pub mod process_job;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
     // ffmpeg build mis-decodes multi-image HEIC files (Portrait mode, Deep Fusion, etc.) as a
