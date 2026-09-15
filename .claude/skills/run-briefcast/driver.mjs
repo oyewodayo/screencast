@@ -193,6 +193,22 @@ function killTree(pid) {
   });
 }
 
+// True only if CONFIG_PATH exists, parses, and its custom_briefcast_dir is exactly FIXTURES_LIBRARY
+// - i.e. it's still what THIS skill's own launch() wrote, not the user's real config or something
+// else entirely. Deliberately fails safe (returns false) on any read/parse error, an unexpected
+// shape, or a missing file, so cmdQuit's own caller only ever deletes CONFIG_PATH when it's
+// positively confirmed to be the fixtures-pointing one, never merely because it isn't a recognized
+// backup.
+async function configPointsAtFixtures() {
+  if (!existsSync(CONFIG_PATH)) return false;
+  try {
+    const parsed = JSON.parse(await readFile(CONFIG_PATH, "utf-8"));
+    return parsed?.custom_briefcast_dir === FIXTURES_LIBRARY;
+  } catch {
+    return false;
+  }
+}
+
 async function cmdQuit() {
   const errors = [];
   if (existsSync(STATE_PATH)) {
@@ -212,9 +228,19 @@ async function cmdQuit() {
   if (existsSync(CONFIG_BACKUP_PATH)) {
     await writeFile(CONFIG_PATH, await readFile(CONFIG_BACKUP_PATH));
     await rm(CONFIG_BACKUP_PATH);
-  } else {
+  } else if (await configPointsAtFixtures()) {
+    // No backup to restore, but CONFIG_PATH still points at the fixtures library right now, so it's
+    // safe to remove (briefcast_dir() falls back to the default location with nothing there) - this
+    // is the ordinary case for a `quit` with no matching `launch` backup because a PRIOR quit in
+    // this same session already consumed it.
     await rm(CONFIG_PATH, { force: true });
   }
+  // Else: CONFIG_PATH exists, there's no backup, and it does NOT point at the fixtures library -
+  // it's already the user's real config (restored by an earlier quit, or never touched this
+  // session), so deleting it here would destroy the one surviving copy for no reason. This is
+  // exactly the failure mode a redundant/duplicate `quit` call used to hit: it happened once
+  // already (see git history around this comment) and cost a real user's ~/.briefcast/config.json,
+  // recovered only by grepping app.log for path references afterward. Leave it alone.
   return { quit: true, errors };
 }
 

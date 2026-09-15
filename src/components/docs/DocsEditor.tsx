@@ -4,8 +4,9 @@
 // useDocsEditStore instance and the Tiptap editor bound to its Y.Doc via @tiptap/extension-
 // collaboration. Much shorter than BoardEditor since there's no canvas/selection/image logic here
 // - just a title field, a formatting toolbar, and the editable content area.
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { useEditor, EditorContent } from "@tiptap/react";
 import Collaboration from "@tiptap/extension-collaboration";
@@ -43,6 +44,8 @@ import {
   MdFormatIndentIncrease,
   MdFormatIndentDecrease,
   MdAddComment,
+  MdMic,
+  MdStop,
 } from "react-icons/md";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
@@ -102,6 +105,53 @@ const FONT_FAMILIES = [
   "Playfair Display",
 ];
 
+type SpeechRecognitionCtor = new () => SpeechRecognition;
+
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+}
+
+interface SpeechRecognitionEvent {
+  resultIndex: number;
+  results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionErrorEvent {
+  error: string;
+}
+
+type DictationRange = { from: number; to: number };
+type DictationSpeechState = "idle" | "silent" | "talking";
+
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  const w = window as typeof window & {
+    SpeechRecognition?: SpeechRecognitionCtor;
+    webkitSpeechRecognition?: SpeechRecognitionCtor;
+  };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+}
+
+function preferredAudioMimeType(): string {
+  if (typeof MediaRecorder === "undefined") return "";
+  for (const type of ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"]) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return "";
+}
+
+function transcriptToTiptapContent(text: string) {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length <= 1) return { type: "text", text: lines[0] ?? text.trim() };
+  return lines.flatMap((line, index) => (index === 0 ? [{ type: "text", text: line }] : [{ type: "hardBreak" }, { type: "text", text: line }]));
+}
+
 
 const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, onOpenLinkedFile }) => {
   const store = useDocsEditStore(docId);
@@ -123,6 +173,21 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const [showCommentInput, setShowCommentInput] = useState(false);
   const [commentDraft, setCommentDraft] = useState("");
   const [showPageSetup, setShowPageSetup] = useState(false);
+  const [dictationStatus, setDictationStatus] = useState<string | null>(null);
+  const [dictationProgress, setDictationProgress] = useState<number | null>(null);
+  const [dictationSpeechState, setDictationSpeechState] = useState<DictationSpeechState>("idle");
+  const [detectedDictationLanguage, setDetectedDictationLanguage] = useState<string | null>(null);
+  const [isRecordingDictation, setIsRecordingDictation] = useState(false);
+  const [isTranscribingDictation, setIsTranscribingDictation] = useState(false);
+  const dictationRecorderRef = useRef<MediaRecorder | null>(null);
+  const dictationChunksRef = useRef<Blob[]>([]);
+  const cancelDictationRef = useRef(false);
+  const liveDictationRangeRef = useRef<DictationRange | null>(null);
+  const liveDictationTextRef = useRef("");
+  const speechRecognitionRef = useRef<SpeechRecognition | null>(null);
+  const shouldRunSpeechRecognitionRef = useRef(false);
+  const dictationAudioContextRef = useRef<AudioContext | null>(null);
+  const dictationActivityFrameRef = useRef<number | null>(null);
 
   const editor = useEditor(
     {
@@ -170,6 +235,29 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     if (!editor || store.pageSize === null) return;
     editor.commands.setPaginationPageSize(store.pageSize);
   }, [editor, store.pageSize]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenProgress: (() => void) | undefined;
+    let unlistenLanguage: (() => void) | undefined;
+    void listen<number>("docs-dictation-progress", (event) => {
+      if (!disposed) setDictationProgress(event.payload);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlistenProgress = fn;
+    });
+    void listen<string>("docs-dictation-language", (event) => {
+      if (!disposed) setDetectedDictationLanguage(event.payload);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlistenLanguage = fn;
+    });
+    return () => {
+      disposed = true;
+      unlistenProgress?.();
+      unlistenLanguage?.();
+    };
+  }, []);
 
   const handleBack = useCallback(() => {
     store.flushSave().catch((err) => console.error("Failed to save before navigating back:", err));
@@ -285,6 +373,230 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     }
   }, [editor, docId]);
 
+  const replaceDictationRange = useCallback(
+    (text: string) => {
+      if (!editor) return;
+      const trimmed = text.trim();
+      if (!trimmed) {
+        setDictationStatus("No speech detected");
+        return;
+      }
+      const range = liveDictationRangeRef.current;
+      if (range) {
+        editor.commands.insertContentAt(range, transcriptToTiptapContent(trimmed), { updateSelection: true });
+      } else {
+        editor.chain().focus().insertContent(transcriptToTiptapContent(trimmed)).run();
+      }
+      liveDictationRangeRef.current = null;
+      liveDictationTextRef.current = "";
+      setDictationStatus("Inserted");
+      setTimeout(() => setDictationStatus(null), 2500);
+    },
+    [editor]
+  );
+
+  const updateLiveDictation = useCallback(
+    (text: string) => {
+      if (!editor) return;
+      const next = text.trim();
+      if (!next || next === liveDictationTextRef.current) return;
+      const range = liveDictationRangeRef.current ?? { from: editor.state.selection.from, to: editor.state.selection.to };
+      editor.commands.insertContentAt(range, transcriptToTiptapContent(next), { updateSelection: true });
+      liveDictationRangeRef.current = { from: range.from, to: editor.state.selection.to };
+      liveDictationTextRef.current = next;
+    },
+    [editor]
+  );
+
+  const stopVoiceActivityDetection = useCallback(() => {
+    if (dictationActivityFrameRef.current !== null) {
+      cancelAnimationFrame(dictationActivityFrameRef.current);
+      dictationActivityFrameRef.current = null;
+    }
+    const ctx = dictationAudioContextRef.current;
+    dictationAudioContextRef.current = null;
+    if (ctx && ctx.state !== "closed") void ctx.close();
+    setDictationSpeechState("idle");
+  }, []);
+
+  const startVoiceActivityDetection = useCallback(
+    (stream: MediaStream) => {
+      stopVoiceActivityDetection();
+      const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextCtor) {
+        setDictationSpeechState("silent");
+        return;
+      }
+
+      const ctx = new AudioContextCtor();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      const samples = new Uint8Array(analyser.fftSize);
+      let talkingFrames = 0;
+      let silentFrames = 0;
+
+      const tick = () => {
+        analyser.getByteTimeDomainData(samples);
+        let sum = 0;
+        for (const sample of samples) {
+          const normalized = (sample - 128) / 128;
+          sum += normalized * normalized;
+        }
+        const rms = Math.sqrt(sum / samples.length);
+        if (rms > 0.035) {
+          talkingFrames += 1;
+          silentFrames = 0;
+        } else {
+          silentFrames += 1;
+          talkingFrames = 0;
+        }
+        if (talkingFrames >= 2) setDictationSpeechState("talking");
+        if (silentFrames >= 12) setDictationSpeechState("silent");
+        dictationActivityFrameRef.current = requestAnimationFrame(tick);
+      };
+
+      dictationAudioContextRef.current = ctx;
+      setDictationSpeechState("silent");
+      tick();
+    },
+    [stopVoiceActivityDetection]
+  );
+
+  const startLiveDictationPreview = useCallback(() => {
+    const Recognition = getSpeechRecognitionCtor();
+    if (!Recognition) return false;
+
+    const recognition = new Recognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = navigator.language || "en-US";
+    recognition.onresult = (event) => {
+      let spoken = "";
+      for (let i = 0; i < event.results.length; i++) {
+        spoken += event.results[i][0]?.transcript ?? "";
+      }
+      updateLiveDictation(spoken);
+    };
+    recognition.onerror = (event) => {
+      if (event.error !== "no-speech") console.warn("Live dictation preview failed:", event.error);
+    };
+    recognition.onend = () => {
+      if (!shouldRunSpeechRecognitionRef.current) return;
+      try {
+        recognition.start();
+      } catch {
+        // The recognition engine can briefly reject a restart while it is still winding down.
+      }
+    };
+    speechRecognitionRef.current = recognition;
+    shouldRunSpeechRecognitionRef.current = true;
+    recognition.start();
+    return true;
+  }, [updateLiveDictation]);
+
+  const stopLiveDictationPreview = useCallback(() => {
+    shouldRunSpeechRecognitionRef.current = false;
+    const recognition = speechRecognitionRef.current;
+    speechRecognitionRef.current = null;
+    if (!recognition) return;
+    recognition.onend = null;
+    recognition.onresult = null;
+    recognition.onerror = null;
+    try {
+      recognition.stop();
+    } catch {
+      // Already stopped.
+    }
+  }, []);
+
+  const transcribeRecordedBlob = useCallback(
+    async (blob: Blob) => {
+      if (!editor) return;
+      setIsTranscribingDictation(true);
+      setDictationProgress(0);
+      setDictationStatus("Transcribing...");
+      try {
+        const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
+        const transcript = await invoke<string>("transcribe_doc_audio", {
+          audioBytes: bytes,
+          mimeType: blob.type || null,
+          language: "auto",
+        });
+        replaceDictationRange(transcript);
+      } catch (err) {
+        console.error("Failed to transcribe dictation:", err);
+        setDictationStatus(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsTranscribingDictation(false);
+        setDictationProgress(null);
+      }
+    },
+    [editor, replaceDictationRange]
+  );
+
+  const startDictation = useCallback(async () => {
+    if (!editor || isRecordingDictation || isTranscribingDictation) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setDictationStatus("Microphone recording is not available");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = preferredAudioMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      dictationChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) dictationChunksRef.current.push(event.data);
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const blob = new Blob(dictationChunksRef.current, { type: recorder.mimeType || mimeType || "audio/webm" });
+        dictationChunksRef.current = [];
+        setIsRecordingDictation(false);
+        if (cancelDictationRef.current) return;
+        if (blob.size > 0) void transcribeRecordedBlob(blob);
+        else setDictationStatus("No audio recorded");
+      };
+      dictationRecorderRef.current = recorder;
+      cancelDictationRef.current = false;
+      liveDictationRangeRef.current = { from: editor.state.selection.from, to: editor.state.selection.to };
+      liveDictationTextRef.current = "";
+      recorder.start(1000);
+      startVoiceActivityDetection(stream);
+      const hasLivePreview = startLiveDictationPreview();
+      setIsRecordingDictation(true);
+      setDetectedDictationLanguage(null);
+      setDictationStatus(hasLivePreview ? "Listening live" : "Listening");
+    } catch (err) {
+      console.error("Failed to start dictation:", err);
+      setDictationStatus(err instanceof Error ? err.message : String(err));
+    }
+  }, [editor, isRecordingDictation, isTranscribingDictation, startLiveDictationPreview, transcribeRecordedBlob]);
+
+  const stopDictation = useCallback(() => {
+    const recorder = dictationRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") return;
+    cancelDictationRef.current = false;
+    stopLiveDictationPreview();
+    stopVoiceActivityDetection();
+    recorder.stop();
+    dictationRecorderRef.current = null;
+    setIsRecordingDictation(false);
+    setDictationStatus("Finishing...");
+  }, [stopLiveDictationPreview, stopVoiceActivityDetection]);
+
+  useEffect(() => {
+    return () => {
+      const recorder = dictationRecorderRef.current;
+      cancelDictationRef.current = true;
+      stopLiveDictationPreview();
+      stopVoiceActivityDetection();
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+    };
+  }, [stopLiveDictationPreview, stopVoiceActivityDetection]);
+
   const handleExport = useCallback(
     async (extension: "md" | "txt") => {
       if (!editor) return;
@@ -398,6 +710,18 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       <style>{`
         @page { size: ${PAGE_DIMENSIONS_IN[store.pageSize ?? "letter"].cssSize}; margin: ${PAGE_MARGIN_IN}in; }
         .doc-page-card { max-width: ${pageWidthPx(store.pageSize ?? "letter")}px; padding: ${marginPx()}px; }
+        @keyframes doc-dictation-pulse {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
+          50% { box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); }
+        }
+        @keyframes doc-dictation-caret {
+          0%, 45% { caret-color: #22c55e; }
+          46%, 100% { caret-color: transparent; }
+        }
+        .doc-live-dictation .ProseMirror {
+          caret-color: #22c55e;
+          animation: doc-dictation-caret 0.9s steps(1, end) infinite;
+        }
         @media print {
           .doc-page-card { max-width: none; padding: 0; }
         }
@@ -448,7 +772,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         )}
 
         <span className="text-xs text-neutral-400 dark:text-neutral-500 shrink-0">
-          {exportStatus ?? (store.isSaving ? "Saving…" : store.saveError ? "Save failed" : "")}
+          {dictationStatus
+            ? dictationProgress !== null
+              ? `${dictationStatus} ${Math.round(dictationProgress)}%${detectedDictationLanguage ? ` · ${detectedDictationLanguage}` : ""}`
+              : dictationStatus
+            : exportStatus ?? (store.isSaving ? "Saving…" : store.saveError ? "Save failed" : "")}
         </span>
       </div>
 
@@ -822,7 +1150,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           <button
             type="button"
             title="Insert table" aria-label="Insert table"
-            onClick={() => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()}
+            onClick={() => {
+              editor.chain().focus().insertTable({ rows: 3, cols: 4, withHeaderRow: true }).run();
+              setShowTableOptions(true);
+            }}
             className={toolbarButtonClass(false)}
           >
             <MdTableChart size={18} />
@@ -834,30 +1165,56 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                 <MdTableRows size={18} />
               </button>
               {showTableOptions && (
-                <div className="absolute left-0 top-full mt-1 z-10 w-48 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-1.5 space-y-0.5">
-                  <button type="button" onClick={() => editor.chain().focus().addRowBefore().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                    + Row above
-                  </button>
-                  <button type="button" onClick={() => editor.chain().focus().addRowAfter().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                    + Row below
-                  </button>
-                  <button type="button" onClick={() => editor.chain().focus().deleteRow().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                    Delete row
-                  </button>
-                  <button type="button" onClick={() => editor.chain().focus().addColumnBefore().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                    + Column left
-                  </button>
-                  <button type="button" onClick={() => editor.chain().focus().addColumnAfter().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                    + Column right
-                  </button>
-                  <button type="button" onClick={() => editor.chain().focus().deleteColumn().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">
-                    Delete column
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => editor.chain().focus().deleteTable().run()}
-                    className="w-full text-left px-2 py-1.5 text-xs rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 border-t border-neutral-100 dark:border-neutral-700 mt-0.5 pt-1.5"
-                  >
+                <div className="absolute left-0 top-full mt-1 z-10 w-56 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-1.5 space-y-1">
+                  {[
+                    ["Row above", () => editor.chain().focus().addRowBefore().run(), editor.can().addRowBefore()],
+                    ["Row below", () => editor.chain().focus().addRowAfter().run(), editor.can().addRowAfter()],
+                    ["Column left", () => editor.chain().focus().addColumnBefore().run(), editor.can().addColumnBefore()],
+                    ["Column right", () => editor.chain().focus().addColumnAfter().run(), editor.can().addColumnAfter()],
+                  ].map(([label, run, enabled]) => (
+                    <button
+                      key={label as string}
+                      type="button"
+                      disabled={!enabled}
+                      onClick={() => (run as () => void)()}
+                      className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700 disabled:opacity-40 disabled:hover:bg-transparent"
+                    >
+                      + {label as string}
+                    </button>
+                  ))}
+                  <div className="h-px bg-neutral-100 dark:bg-neutral-700" />
+                  {[
+                    ["Merge cells", () => editor.chain().focus().mergeCells().run(), editor.can().mergeCells()],
+                    ["Split cell", () => editor.chain().focus().splitCell().run(), editor.can().splitCell()],
+                    ["Toggle header row", () => editor.chain().focus().toggleHeaderRow().run(), editor.can().toggleHeaderRow()],
+                    ["Toggle header column", () => editor.chain().focus().toggleHeaderColumn().run(), editor.can().toggleHeaderColumn()],
+                  ].map(([label, run, enabled]) => (
+                    <button
+                      key={label as string}
+                      type="button"
+                      disabled={!enabled}
+                      onClick={() => (run as () => void)()}
+                      className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700 disabled:opacity-40 disabled:hover:bg-transparent"
+                    >
+                      {label as string}
+                    </button>
+                  ))}
+                  <div className="h-px bg-neutral-100 dark:bg-neutral-700" />
+                  {[
+                    ["Delete row", () => editor.chain().focus().deleteRow().run(), editor.can().deleteRow()],
+                    ["Delete column", () => editor.chain().focus().deleteColumn().run(), editor.can().deleteColumn()],
+                  ].map(([label, run, enabled]) => (
+                    <button
+                      key={label as string}
+                      type="button"
+                      disabled={!enabled}
+                      onClick={() => (run as () => void)()}
+                      className="w-full text-left px-2 py-1.5 text-xs rounded text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700 disabled:opacity-40 disabled:hover:bg-transparent"
+                    >
+                      {label as string}
+                    </button>
+                  ))}
+                  <button type="button" onClick={() => editor.chain().focus().deleteTable().run()} className="w-full text-left px-2 py-1.5 text-xs rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10">
                     Delete table
                   </button>
                 </div>
@@ -866,6 +1223,26 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           )}
 
           <div className="ml-auto flex items-center gap-1">
+            <div className="relative flex flex-col items-center">
+              <button
+                type="button"
+                title={isRecordingDictation ? "Stop dictation" : "Dictate into document"}
+                aria-label={isRecordingDictation ? "Stop dictation" : "Dictate into document"}
+                disabled={isTranscribingDictation}
+                onClick={() => (isRecordingDictation ? stopDictation() : void startDictation())}
+                className={`${toolbarButtonClass(isRecordingDictation || isTranscribingDictation, isTranscribingDictation)} ${
+                  isRecordingDictation ? "text-green-600 dark:text-green-300 bg-green-100 dark:bg-green-500/20 ring-1 ring-inset ring-green-300 dark:ring-green-500/40 animate-[doc-dictation-pulse_1.2s_ease-in-out_infinite]" : ""
+                }`}
+              >
+                {isRecordingDictation ? <MdStop size={18} /> : <MdMic size={18} />}
+              </button>
+              {isRecordingDictation && (
+                <span className="absolute top-full mt-0.5 text-[10px] leading-none font-medium text-green-600 dark:text-green-300">
+                  {dictationSpeechState === "talking" ? "talking" : "silent"}
+                </span>
+              )}
+            </div>
+
             <div className="relative">
               <button
                 type="button"
@@ -1090,7 +1467,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             // against this real content-area size) come from the `.doc-page-card` rule injected
             // above, whose own `@media print` override hands full-page sizing to the `@page` rule.
             <div className="doc-page-card mx-auto bg-white dark:bg-neutral-900 ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-sm min-h-[75vh] print:shadow-none print:ring-0 print:mx-0 print:min-h-0">
-              <EditorContent editor={editor} className={docProseClassName} />
+              <EditorContent editor={editor} className={`${docProseClassName} ${isRecordingDictation ? "doc-live-dictation" : ""}`} />
             </div>
           )}
         </div>

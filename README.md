@@ -120,6 +120,45 @@ original recording.
   overlays (with animations), and the mixed audio (video track + overlays, muted/
   volume-adjusted as configured) — to a single output file via FFmpeg.
 
+### Whiteboard
+
+A separate draw.io-style diagramming surface — shapes and connectors on an infinite
+pan/zoom canvas, independent of the recording/playback/PDF tools above. A whiteboard can
+have multiple pages, each with its own undo history.
+
+- **Shape library** — Basic (rectangles, ellipses, polygons, stars, flowchart symbols,
+  tables with mergeable/resizable cells), General (banners, frames, hourglasses, half
+  circles), Waveforms (sine/cosine/square/triangle/sawtooth), Science (resistors,
+  capacitors, diodes, op-amps, flasks, benzene rings, bond-line chains, unit circles,
+  number lines), Charts & Plots (bar/line/pie/scatter charts, curated function plots),
+  and a math equation shape rendered via KaTeX.
+- **Graph tool** — a genuine formula grapher: type any expression in `x` (parsed by a
+  small hand-rolled arithmetic parser, never `eval`), with explicit or auto-fitting axis
+  ranges and grid/tick controls. A "Blank Graph" preset starts with just axes, for
+  **manually plotting points and lines directly on the canvas** — double-click the plot
+  area to add a point, drag a point to reposition it, double-click a point to remove
+  it — with points staying correctly scaled if the graph is later resized or its axis
+  range changed.
+- **Lattice Gauge Theory widget** — a live, interactive 3D WebGL teaching diagram (quark
+  spheres on lattice sites, gluon links between them) with orbit/zoom/pan camera control
+  and three teaching modes (free exploration, a highlighted plaquette/Wilson loop, and a
+  gauge-transformation color demo), plus adjustable lattice size, spacing, and
+  spin-model visualization (Ising/XY/Heisenberg).
+- **Connectors** — straight, orthogonal, or curved routing; solid/dashed/dotted lines;
+  arrowhead styles per end; bend points (double-click the line to add one, drag to
+  reposition, double-click to remove); rotate and nudge a free-floating connector from
+  the style panel just like a shape.
+- **Direct data manipulation** — drag a bar chart's bar, a line chart's point, or a
+  scatter dot vertically to change its underlying value live, instead of only editing
+  the comma-separated data field.
+- **Selection & editing** — click or marquee-select (shapes and connectors both),
+  multi-select, group/ungroup, duplicate, bring-to-front/send-to-back, lock a shape to
+  keep it from being dragged/resized/rotated/nudged while you work around it,
+  snap-to-grid, and a laser pointer for presenting without leaving marks.
+- **Freehand pen** (including a freehand arrow variant) and inline text editing on any
+  shape.
+- **Export** the current page to PNG.
+
 ### Customization
 
 Settings (gear icon) is organized into sections — Appearance, Recording, Storage,
@@ -156,6 +195,12 @@ Annotation, Files, and PDF Annotator:
 | | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom in/out/reset |
 | | `[` / `]` | Decrease/increase stroke width |
+| Whiteboard | `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` | Undo / redo |
+| | `Ctrl+C` / `Ctrl+V` | Copy / paste the selected shapes |
+| | `Ctrl+A` | Select every shape and connector on the page |
+| | `Delete` / `Backspace` | Delete the selection |
+| | `←` `→` `↑` `↓` | Nudge the selection (hold Shift for 10px) |
+| | `Esc` | Deselect, or cancel the currently armed tool |
 
 ## Known limitations
 
@@ -264,6 +309,9 @@ npm run build
 - **PDF annotations** are saved alongside their source PDF.
 - **Video edits** (clips, text/image/audio overlays) are saved as a sidecar JSON next
   to the source video and reload automatically the next time you open it.
+- **Whiteboards** are saved one folder per board under
+  `%USERPROFILE%\Videos\Briefcast\Whiteboards\` (a `whiteboard.json` document plus a
+  cached `thumbnail.png`); PNG exports go to `%USERPROFILE%\Videos\Briefcast\Whiteboard\`.
 - **Logs** (`app.log`, `panic.log`) are written to the app's data directory, typically
   `%LOCALAPPDATA%\Briefcast\`.
 
@@ -277,6 +325,7 @@ screencast/
 │   │   ├── docker/                  # Bottom panel: recording setup, per-file tools, video timeline
 │   │   ├── pdf/                     # PDF toolbar, page rendering, thumbnails/outline sidebar
 │   │   ├── video/                   # Video-only overlay editing surface (text/image overlays, crop panel)
+│   │   ├── whiteboard/              # Whiteboard canvas, style panel, table/lattice widgets (see Whiteboard)
 │   │   ├── Modals/                  # Settings and recording-completed modals
 │   │   ├── custom/                  # Small shared UI primitives (toasts, dropdowns, alerts)
 │   │   ├── BottomDocker.tsx         # Switches between the docker/ panels above
@@ -284,12 +333,14 @@ screencast/
 │   │   ├── VideoPlayer.tsx          # Video/audio/image player
 │   │   └── PdfAnnotator.tsx         # PDF viewer + markup surface
 │   ├── handlers/
-│   │   └── videoEditHandlers.ts     # Pure-function overlay/clip CRUD shared by the video edit store
+│   │   ├── videoEditHandlers.ts     # Pure-function overlay/clip CRUD shared by the video edit store
+│   │   └── whiteboardHandlers.ts    # Pure-function shape geometry, connector routing, graph/chart math
 │   ├── hooks/
 │   │   ├── useVideoEditStore.ts     # Video edit state, undo/redo, export, sidecar persistence
+│   │   ├── useWhiteboardStore.ts    # Whiteboard document state, per-page undo/redo
 │   │   └── useClampedPopoverPosition.ts # Keeps floating overlay popovers inside the viewport
 │   ├── contexts/ThemeContext.tsx    # Light/dark/system theme
-│   └── utils/                       # Formatting, file-category, media-handling, and video overlay/render helpers
+│   └── utils/                       # Formatting, file-category, media-handling, video overlay/render, and whiteboard type/schema helpers
 ├── src-tauri/                        # Rust backend
 │   ├── src/
 │   │   ├── main.rs                  # Entry point, logging, window/command setup
@@ -303,7 +354,8 @@ screencast/
 │   │   │   ├── utility.rs           # Shared helpers, file/folder listing, rename, move, path utils
 │   │   │   ├── trash.rs             # Soft delete, restore, empty, auto-purge
 │   │   │   ├── pdf_annotations.rs   # PDF annotation persistence
-│   │   │   └── loopback_audio.rs    # WASAPI loopback (system audio) capture
+│   │   │   ├── loopback_audio.rs    # WASAPI loopback (system audio) capture
+│   │   │   └── whiteboards.rs       # Whiteboard document CRUD, thumbnails, PNG export
 │   │   └── views/                   # Standalone window (recording-completed popup)
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
 │   ├── binaries/heif/               # Bundled libheif (heif-dec.exe + DLLs) - HEIC/HEIF fallback decode
