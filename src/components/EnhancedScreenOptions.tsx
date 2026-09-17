@@ -70,21 +70,18 @@ const EnhancedScreenOptions = ({
     const [selectedMonitor, setSelectedMonitor] = useState<string>('');
     const [selectedWindow, setSelectedWindow] = useState<number | null>(null);
     const [isLoading, setIsLoading] = useState(false);
-    // Window enumeration/capture isn't implemented on macOS yet (see window_capture::macos's
-    // module comment on the Rust side) - hiding the option here means a macOS user never reaches
-    // that backend error in the first place, rather than offering a choice that's guaranteed to
-    // fail when picked.
-    const [isWindowCaptureSupported, setIsWindowCaptureSupported] = useState(true);
+    // Window capture is available on every platform now - macOS's own implementation
+    // (window_capture::macos, Rust side) enumerates windows via `osascript`/AppleScript and crops
+    // a full-display avfoundation capture down to the target window (avfoundation itself has no
+    // per-window capture mode at all). See that module's own doc comment for the one known caveat
+    // (a window on a second, non-primary display crops the wrong region) and its Accessibility-
+    // permission requirement, surfaced to the user as a clear error from get_windows_titles/
+    // capture_window_screenshots_by_title if it's ever denied rather than failing silently here.
+
     // Snapshot of `error` taken when a window-load starts, so the fallback below only reacts
     // to a *new* error firing during this load - not a stale, unrelated error already sitting
     // in Dashboard's error state from something else entirely.
     const loadErrorBaselineRef = useRef<string | undefined>(undefined);
-
-    useEffect(() => {
-        invoke<string>('get_platform')
-            .then((platform) => setIsWindowCaptureSupported(platform !== 'macos'))
-            .catch((err) => console.error('Failed to detect platform:', err));
-    }, []);
 
     // Load windows when entering windows mode. isLoading must be cleared here regardless of
     // whether any windows actually came back - previously it was only cleared when
@@ -236,28 +233,16 @@ const EnhancedScreenOptions = ({
                 <span className="text-sm font-medium">Monitor</span>
             </button>
 
-            {isWindowCaptureSupported ? (
-                <button
-                    onClick={() => {
-                        setMode('windows');
-                        loadWindows();
-                    }}
-                    className="flex flex-col items-center gap-2 p-4 rounded-lg border-2 border-gray-200 dark:border-neutral-700 hover:border-green-400 hover:bg-green-50 dark:hover:bg-green-500/10 transition-all"
-                >
-                    <IoApps className="text-5xl text-gray-700 dark:text-neutral-300" />
-                    <span className="text-sm font-medium">Window</span>
-                </button>
-            ) : (
-                <button
-                    className="flex flex-col items-center gap-2 p-4 rounded-lg border-2 border-gray-200 dark:border-neutral-700 opacity-50 cursor-not-allowed"
-                    disabled
-                    title="Window capture isn't implemented on macOS yet"
-                >
-                    <IoApps className="text-5xl text-gray-700 dark:text-neutral-300" />
-                    <span className="text-sm font-medium">Window</span>
-                    <span className="text-xs text-gray-500 dark:text-neutral-400">Not on macOS</span>
-                </button>
-            )}
+            <button
+                onClick={() => {
+                    setMode('windows');
+                    loadWindows();
+                }}
+                className="flex flex-col items-center gap-2 p-4 rounded-lg border-2 border-gray-200 dark:border-neutral-700 hover:border-green-400 hover:bg-green-50 dark:hover:bg-green-500/10 transition-all"
+            >
+                <IoApps className="text-5xl text-gray-700 dark:text-neutral-300" />
+                <span className="text-sm font-medium">Window</span>
+            </button>
         </div>
     );
 
@@ -497,7 +482,7 @@ const EnhancedScreenOptions = ({
                         "a"/"va"/"v" used to silently do nothing, and now that this section
                         includes a live getUserMedia preview, it would also needlessly grab the
                         webcam for a recording that will never use one. */}
-                    {(recordType === "sva" || recordType === "sv") && renderOverlaySettings()}
+                    {recordType === "sva" && renderOverlaySettings()}
                 </div>
 
                 {/* Footer */}

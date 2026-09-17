@@ -27,11 +27,32 @@ use tauri::{AppHandle, State};
 use super::{
     build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error,
     map_overlay_size, resolve_capture_target, spawn_recording, AppState, CaptureTarget, FormData,
+    MAX_RECORDING_WIDTH,
 };
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
 fn x11_display() -> String {
     env::var("DISPLAY").unwrap_or_else(|_| ":0.0".to_string())
+}
+
+// A "pure" Wayland session (no XWayland compatibility layer running) has no X11 display for
+// x11grab to attach to at all - detected via the standard Wayland/X11 session environment
+// variables rather than letting the actual x11grab invocation fail partway through with a cryptic
+// ffmpeg error (or, worse, silently produce a black recording). WAYLAND_DISPLAY is set on
+// essentially every Wayland session; DISPLAY is what XWayland (present on most, but not
+// necessarily all, Wayland desktops) sets up specifically so X11-only apps like ffmpeg's x11grab
+// still work there - its absence is what actually signals no X11 path exists at all. Camera/audio-
+// only recording (v4l2/pulse) doesn't go through this at all, so it stays unaffected either way.
+fn require_x11_display() -> Result<(), String> {
+    if env::var("WAYLAND_DISPLAY").is_ok() && env::var("DISPLAY").is_err() {
+        return Err(
+            "This desktop is running Wayland without XWayland, which x11grab (this app's Linux \
+             screen-capture method) can't attach to - screen recording isn't available on a pure \
+             Wayland session yet. Camera/audio-only recording is unaffected."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 // Resolves a CaptureTarget into x11grab's -video_size/-i arguments, mirroring win.rs's
@@ -46,6 +67,7 @@ fn x11_display() -> String {
 // string for the fullscreen case — for "monitor:monitor_0" or "window:12345" it handed ffmpeg
 // outright invalid syntax. win.rs had - and fixed - the exact same bug; this was never fixed here.
 fn x11grab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
+    require_x11_display()?;
     match target {
         CaptureTarget::FullScreen => Ok(vec!["-i".to_string(), x11_display()]),
         CaptureTarget::Monitor {
@@ -95,6 +117,94 @@ fn list_pulse_sources() -> Result<Vec<String>, String> {
         .collect();
 
     Ok(sources)
+}
+
+// PulseAudio's own convention for "what you hear" - the monitor source of the current default
+// sink (output device), auto-selected via `pactl get-default-sink` rather than requiring the user
+// to dig through list_pulse_sources' own output and manually pick out the "*.monitor" entry
+// themselves (still possible - that's what the doc comment there is about; this is the same
+// include_system_audio checkbox Windows/macOS already have, automated). Unlike Windows (no
+// built-in loopback at all, needs its own WASAPI capture thread + post-record mux - see
+// services/loopback_audio.rs) a monitor source is already just another ffmpeg-recordable
+// `-f pulse -i <name>` input, live-mixed with the mic rather than needing any separate capture
+// mechanism or post-processing pass.
+fn default_monitor_source() -> Option<String> {
+    let output = Command::new("pactl").args(["get-default-sink"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sink = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sink.is_empty() {
+        return None;
+    }
+    Some(format!("{}.monitor", sink))
+}
+
+fn resolve_system_audio_source(form_data: &FormData) -> Option<String> {
+    if !form_data.include_system_audio {
+        return None;
+    }
+    match default_monitor_source() {
+        Some(source) => Some(source),
+        None => {
+            log::warn!("include_system_audio was requested but no default PulseAudio sink could be determined - recording without system audio");
+            None
+        }
+    }
+}
+
+// Builds a plain (no camera overlay) screen capture's audio args: mic alone, the system-audio
+// monitor source alone, both mixed live via amix, or neither at all - covers
+// recording_with_output_sva's own no-camera-overlay path and recording_with_output_sa.
+// `next_input_index` is 1 in both callers (only the screen input precedes audio there).
+fn plain_audio_args(args: &mut Vec<String>, form_data: &FormData, next_input_index: usize) {
+    let has_mic = !form_data.audio_device.is_empty();
+    let system_source = resolve_system_audio_source(form_data);
+
+    match (has_mic, system_source) {
+        (false, None) => {}
+        (true, None) => {
+            args.extend(vec![
+                "-f".to_string(),
+                "pulse".to_string(),
+                "-i".to_string(),
+                form_data.audio_device.clone(),
+            ]);
+        }
+        (false, Some(source)) => {
+            args.extend(vec![
+                "-f".to_string(),
+                "pulse".to_string(),
+                "-i".to_string(),
+                source,
+            ]);
+        }
+        (true, Some(source)) => {
+            args.extend(vec![
+                "-f".to_string(),
+                "pulse".to_string(),
+                "-i".to_string(),
+                form_data.audio_device.clone(),
+                "-f".to_string(),
+                "pulse".to_string(),
+                "-i".to_string(),
+                source,
+            ]);
+            let mic_idx = next_input_index;
+            let sys_idx = next_input_index + 1;
+            args.extend(vec![
+                "-filter_complex".to_string(),
+                format!(
+                    "[{}:a][{}:a]amix=inputs=2:duration=first[aout]",
+                    mic_idx, sys_idx
+                ),
+                "-map".to_string(),
+                "0:v".to_string(),
+                "-map".to_string(),
+                "[aout]".to_string(),
+            ]);
+        }
+    }
 }
 
 // Video4Linux2 exposes every camera under /sys/class/video4linux/videoN, each with a sibling
@@ -170,6 +280,8 @@ fn add_camera_overlay_args(args: &mut Vec<String>, form_data: &FormData) -> Resu
         &form_data.overlay_position,
         &form_data.overlay_size,
         form_data.video_devices.len(),
+        MAX_RECORDING_WIDTH,
+        None,
     );
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
     Ok(())
@@ -207,61 +319,52 @@ pub async fn recording_with_output_sva(
         // in. The audio input lands right after the screen input (index 0) and however many
         // camera inputs add_camera_overlay_args just added, so its index has to be computed
         // rather than the single-camera-only hardcoded "2:a" this used to be.
-        if let Some(filter_complex_value) = args.last_mut() {
-            filter_complex_value.push_str("[vout]");
-        }
-        let audio_input_index = 1 + form_data.video_devices.len();
+        //
+        // Its index is captured here (rather than re-finding it with args.last_mut() later)
+        // because more args - the mic and, if requested, system-audio pulse inputs - get pushed
+        // in between before an amix stage might need to be appended to this same string.
+        let filter_complex_idx = args.len() - 1;
+        args[filter_complex_idx].push_str("[vout]");
+
+        let mic_input_index = 1 + form_data.video_devices.len();
         args.extend(vec![
             "-f".to_string(),
             "pulse".to_string(),
             "-i".to_string(),
             form_data.audio_device.clone(),
+        ]);
+
+        let audio_label = if let Some(source) = resolve_system_audio_source(form_data) {
+            let system_input_index = mic_input_index + 1;
+            args.extend(vec![
+                "-f".to_string(),
+                "pulse".to_string(),
+                "-i".to_string(),
+                source,
+            ]);
+            // ffmpeg accepts only one -filter_complex per invocation - append the audio mix to
+            // the video one already built above rather than adding a second, separate one, same
+            // "; "-joined multi-stage convention build_camera_overlay_filter_complex itself uses.
+            args[filter_complex_idx] = format!(
+                "{}; [{}:a][{}:a]amix=inputs=2:duration=first[aout]",
+                args[filter_complex_idx], mic_input_index, system_input_index
+            );
+            "[aout]".to_string()
+        } else {
+            format!("{}:a", mic_input_index)
+        };
+
+        args.extend(vec![
             "-map".to_string(),
             "[vout]".to_string(),
             "-map".to_string(),
-            format!("{}:a", audio_input_index),
+            audio_label,
         ]);
     } else {
-        args.extend(vec![
-            "-f".to_string(),
-            "pulse".to_string(),
-            "-i".to_string(),
-            form_data.audio_device.clone(),
-        ]);
+        plain_audio_args(&mut args, form_data, 1);
     }
 
     args.extend(codec_args_for_ext(&form_data.file_ext));
-    args.push(path_to_str(output_path)?.to_string());
-
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
-}
-
-//Screen and video overlay, no audio — mirrors win.rs's recording_with_output_sv, which (like
-// this one) is not currently reachable from the frontend (the UI's record-type options never
-// send "sv"); kept only for parity with the dispatch table in the orchestrator.
-pub async fn recording_with_output_sv(
-    app_handle: &AppHandle,
-    state: State<'_, AppState>,
-    output_path: &PathBuf,
-    form_data: &FormData,
-) -> Result<String, String> {
-    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-
-    let mut args: Vec<String> = vec![
-        "-f".to_string(),
-        "x11grab".to_string(),
-        "-framerate".to_string(),
-        "30".to_string(),
-    ];
-    args.extend(x11grab_input_args(&resolve_capture_target(
-        app_handle, form_data,
-    ))?);
-
-    if !form_data.video_devices.is_empty() {
-        add_camera_overlay_args(&mut args, form_data)?;
-    }
-
-    args.extend(vec!["-c:v".to_string(), "mpeg4".to_string()]);
     args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
@@ -285,11 +388,8 @@ pub async fn recording_with_output_sa(
     args.extend(x11grab_input_args(&resolve_capture_target(
         app_handle, form_data,
     ))?);
+    plain_audio_args(&mut args, form_data, 1);
     args.extend(vec![
-        "-f".to_string(),
-        "pulse".to_string(),
-        "-i".to_string(),
-        form_data.audio_device.clone(),
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ]);
@@ -396,6 +496,18 @@ pub async fn recording_with_output_s(
     args.extend(x11grab_input_args(&resolve_capture_target(
         app_handle, form_data,
     ))?);
+    // No mic in this mode at all (screen only) - system audio, if requested and available, is the
+    // only audio this can ever add, so there's nothing to mix; a plain second input is enough
+    // (same "each type has exactly one candidate" default stream selection recording_with_output_va
+    // already relies on for its own two-input case).
+    if let Some(source) = resolve_system_audio_source(form_data) {
+        args.extend(vec![
+            "-f".to_string(),
+            "pulse".to_string(),
+            "-i".to_string(),
+            source,
+        ]);
+    }
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
 

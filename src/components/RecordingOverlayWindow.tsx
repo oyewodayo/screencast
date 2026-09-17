@@ -22,6 +22,12 @@ const RecordingOverlayWindow = () => {
     const [isPaused, setIsPaused] = useState<boolean>(false);
     const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
     const [pausedAccumulatedMs, setPausedAccumulatedMs] = useState<number>(0);
+    // Live capture diagnostics from the backend's ffmpeg `-progress` sidecar (Windows only for
+    // now - see services/progress_watch.rs). fps/dropFrames are the two numbers that actually
+    // tell a user their capture is struggling in real time, rather than only finding out once
+    // they watch the finished file back.
+    const [captureFps, setCaptureFps] = useState<number | null>(null);
+    const [droppedFrames, setDroppedFrames] = useState<number>(0);
 
     const formatTime = (seconds: number): string => {
         const mins = Math.floor(seconds / 60);
@@ -98,8 +104,22 @@ const RecordingOverlayWindow = () => {
                 setPausedAccumulatedMs(event.payload.pausedAccumulatedMs ?? 0);
             });
 
+            const unlistenProgress = await listen<{
+                frame?: number;
+                fps?: number;
+                bitrateKbps?: number;
+                outTimeSecs?: number;
+                dupFrames?: number;
+                dropFrames?: number;
+                speed?: number;
+            }>('recording-progress', (event) => {
+                setCaptureFps(event.payload.fps ?? null);
+                setDroppedFrames(event.payload.dropFrames ?? 0);
+            });
+
             return () => {
                 unlistenRecordingState();
+                unlistenProgress();
             };
         };
 
@@ -112,6 +132,15 @@ const RecordingOverlayWindow = () => {
             if (cleanup) cleanup();
         };
     }, []);
+
+    // Clear stale diagnostics from whatever recording just ended, rather than leaving last
+    // session's fps/dropped-frame numbers on screen once a new (or no) recording starts.
+    useEffect(() => {
+        if (!isRecording) {
+            setCaptureFps(null);
+            setDroppedFrames(0);
+        }
+    }, [isRecording]);
 
     // Derive elapsed time from the shared start timestamp (see Dashboard.tsx /
     // ActiveRecordingState.tsx) so this window's timer can't drift apart from the main window's -
@@ -220,6 +249,19 @@ const RecordingOverlayWindow = () => {
                             <div className={`font-mono text-sm ml-1 ${isPaused ? "text-amber-400" : ""}`}>
                                 {formatTime(elapsedTime)}{isPaused ? " (paused)" : ""}
                             </div>
+                            {captureFps !== null && (
+                                <div className="font-mono text-[10px] text-gray-400 ml-1">
+                                    {Math.round(captureFps)}fps
+                                </div>
+                            )}
+                            {droppedFrames > 0 && (
+                                <div
+                                    className="font-mono text-[10px] text-amber-400 ml-1"
+                                    title="Frames dropped during capture - the encoder may be falling behind"
+                                >
+                                    {droppedFrames} dropped
+                                </div>
+                            )}
                         </div>
 
                         <div className='flex items-center gap-2 pl-2 border-l border-gray-600'>

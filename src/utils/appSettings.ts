@@ -41,6 +41,12 @@ export interface AppSettings {
   defaultAudioDevice: string;
   defaultVideoDevices: string[];
   defaultIncludeSystemAudio: boolean;
+  // Max output width / target capture fps for the screen-capture record types - null means "let
+  // the backend use its own default" (1920px, 60fps for sva/30fps for sa+s - see
+  // FormData.resolution_width/framerate's own doc comments, src-tauri/src/commands/recording.rs).
+  // Same "untouched setting changes nothing" reasoning as every other default here.
+  defaultResolutionWidth: number | null;
+  defaultFramerate: number | null;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -74,6 +80,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultAudioDevice: "",
   defaultVideoDevices: [],
   defaultIncludeSystemAudio: false,
+  defaultResolutionWidth: null,
+  defaultFramerate: null,
 };
 
 export function loadSettings(): AppSettings {

@@ -86,6 +86,16 @@ const FREEHAND_MIN_POINT_DISTANCE = 3;
 // - same "don't bloat with near-duplicate points" reasoning as FREEHAND_MIN_POINT_DISTANCE, just for
 // an ephemeral trail instead of a saved stroke.
 const LASER_MIN_POINT_DISTANCE = 2;
+// Minimum on-screen movement (CSS px, pre-zoom-correction) between two applied move/resize/rotate
+// updates on a node - unlike freehand/laser above, this isn't about bloating a saved point list
+// (only the final position is ever saved); it's that every update here calls setLiveNodes with a
+// brand-new `nodes` array, which forces a full re-render of every node and edge in the document
+// (nodesById rebuilds any time `nodes` changes identity). Left ungated, that used to fire on every
+// native pointermove tick - fine on its own, but the added GDI/DWM contention from an active
+// gdigrab screen recording (see win.rs's own doc comment on why it BitBlts the whole desktop) was
+// enough on top of it to stall the window's message pump entirely. A couple of pixels of gating is
+// imperceptible to drag but caps the re-render rate to something sane.
+const NODE_DRAG_MIN_POINT_DISTANCE = 2;
 // How long (ms) a laser trail point stays visible before it's fully faded/pruned - the "comet tail"
 // length. Short enough that the trail reads as "where the pointer just was," not a lingering mark.
 const LASER_FADE_MS = 550;
@@ -582,6 +592,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // Throttles laser-point recording by on-screen distance (see LASER_MIN_POINT_DISTANCE) - a plain
   // ref since it's pure bookkeeping for that throttle, not something a re-render needs to reflect.
   const lastLaserClientRef = useRef<{ x: number; y: number } | null>(null);
+  // Shared across move/resize/rotate (only one is ever active at a time) - see
+  // NODE_DRAG_MIN_POINT_DISTANCE's own doc comment for why this gating exists at all.
+  const lastDragClientRef = useRef<{ x: number; y: number } | null>(null);
   // Live-in-progress waypoints for whichever edge is currently having a bend point dragged (see the
   // "waypoint" Interaction mode) - same "stage locally, commit once" pattern liveNodes uses for
   // node drags, so a whole drag becomes one undo step instead of one per pointermove tick.
@@ -773,6 +786,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       // even though clicking-and-dragging its body no longer does anything.
       if (node.locked) return;
       const ids = nextSelected.has(node.id) ? Array.from(nextSelected) : [node.id];
+      lastDragClientRef.current = null;
       interactionRef.current = {
         mode: "move",
         ids,
@@ -792,6 +806,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       e.stopPropagation();
       onSelectionChange(new Set([node.id]), new Set());
       const anchorWorld = cornerWorldPoint(node, oppositeCorner(corner));
+      lastDragClientRef.current = null;
       interactionRef.current = { mode: "resize", id: node.id, corner, startClientX: e.clientX, startClientY: e.clientY, startNode: node, anchorWorld };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
@@ -806,6 +821,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       const center = nodeCenter(node);
       const startPointer = clientToDoc(e.clientX, e.clientY);
       const startAngle = (Math.atan2(startPointer.y - center.y, startPointer.x - center.x) * 180) / Math.PI;
+      lastDragClientRef.current = null;
       interactionRef.current = { mode: "rotate", id: node.id, startNode: node, center, startAngle };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
@@ -1134,6 +1150,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       }
 
       if (interaction.mode === "move") {
+        // See NODE_DRAG_MIN_POINT_DISTANCE's own doc comment for why this gate exists.
+        const last = lastDragClientRef.current;
+        if (last && Math.hypot(e.clientX - last.x, e.clientY - last.y) < NODE_DRAG_MIN_POINT_DISTANCE) return;
+        lastDragClientRef.current = { x: e.clientX, y: e.clientY };
         let dx = (e.clientX - interaction.startClientX) / zoom;
         let dy = (e.clientY - interaction.startClientY) / zoom;
         if (snapEnabled) {
@@ -1153,6 +1173,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       }
 
       if (interaction.mode === "resize") {
+        // See NODE_DRAG_MIN_POINT_DISTANCE's own doc comment for why this gate exists.
+        const last = lastDragClientRef.current;
+        if (last && Math.hypot(e.clientX - last.x, e.clientY - last.y) < NODE_DRAG_MIN_POINT_DISTANCE) return;
+        lastDragClientRef.current = { x: e.clientX, y: e.clientY };
         const dx = (e.clientX - interaction.startClientX) / zoom;
         const dy = (e.clientY - interaction.startClientY) / zoom;
         const start = interaction.startNode;
@@ -1190,6 +1214,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       }
 
       if (interaction.mode === "rotate") {
+        // See NODE_DRAG_MIN_POINT_DISTANCE's own doc comment for why this gate exists.
+        const last = lastDragClientRef.current;
+        if (last && Math.hypot(e.clientX - last.x, e.clientY - last.y) < NODE_DRAG_MIN_POINT_DISTANCE) return;
+        lastDragClientRef.current = { x: e.clientX, y: e.clientY };
         const cur = clientToDoc(e.clientX, e.clientY);
         const curAngle = (Math.atan2(cur.y - interaction.center.y, cur.x - interaction.center.x) * 180) / Math.PI;
         // DELTA from drag start (how far the pointer has swept around center), added to the node's

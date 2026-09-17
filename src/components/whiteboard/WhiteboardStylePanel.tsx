@@ -267,6 +267,72 @@ function ClampedNumberField({
   );
 }
 
+// Same "stage locally, commit once per gesture" discipline WhiteboardCanvas.tsx's own canvas
+// drags already use (see its top-of-file comment: a whole drag becomes exactly one undo step) -
+// a plain onChange on a <input type="range"> fires on every native `input` event mid-drag, and
+// every commit here goes through onBatchEditNodes/onEditEdge, which pushes a new undo-stack entry
+// AND triggers a full page re-render (or, for the lattice fields specifically, LatticeGaugeWidget's
+// own full 3D mesh dispose+rebuild) on EVERY tick. A single drag sweep across a slider's range can
+// fire dozens of those in well under a second - severe enough for the lattice-size slider in
+// particular (disposing/rebuilding up to tens of thousands of meshes per tick) to freeze the whole
+// app while a screen recording's own GDI capture was also active (see
+// RECORDING_UPGRADE_NOTES.md). This keeps the thumb tracking the drag in real time via local
+// `liveValue` state, but only calls `onCommit` once the gesture actually ends - pointer release, a
+// keyboard nudge, or focus leaving the control - so a whole drag becomes exactly one undo step and
+// one rebuild, not one per pixel of travel.
+function LiveRangeSlider({
+  value,
+  min,
+  max,
+  step,
+  onCommit,
+  className,
+  title,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  onCommit: (n: number) => void;
+  className?: string;
+  title?: string;
+}) {
+  const [liveValue, setLiveValue] = React.useState(value);
+  // Tracks what was last actually committed, same "don't re-dispatch an identical value" guard
+  // ClampedNumberField's own lastCommittedRef uses - onPointerUp/onKeyUp/onBlur can otherwise all
+  // fire for the same single gesture (e.g. a mouse drag that ends by tabbing away).
+  const lastCommittedRef = React.useRef(value);
+
+  // Resync when the committed value changes from elsewhere (undo/redo, another edit path) -
+  // otherwise this slider would keep showing a stale drag-in-progress value forever.
+  React.useEffect(() => {
+    setLiveValue(value);
+    lastCommittedRef.current = value;
+  }, [value]);
+
+  const commit = (n: number) => {
+    if (n === lastCommittedRef.current) return;
+    lastCommittedRef.current = n;
+    onCommit(n);
+  };
+
+  return (
+    <input
+      type="range"
+      min={min}
+      max={max}
+      step={step}
+      value={liveValue}
+      onChange={(e) => setLiveValue(Number(e.target.value))}
+      onPointerUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
+      onKeyUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
+      onBlur={(e) => commit(Number((e.target as HTMLInputElement).value))}
+      className={className}
+      title={title}
+    />
+  );
+}
+
 // Same "track raw typed text locally, commit a parsed value, never fight mid-edit" discipline as
 // ClampedNumberField above, just parsing a comma-separated number LIST instead of one number -
 // commits on every keystroke that currently parses to at least one valid number (so the chart
@@ -641,12 +707,11 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 <input type="color" value={selectedNodes[0].strokeColor} onChange={(e) => updateNodes({ strokeColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
               </Field>
               <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink width" : "Stroke width"}>
-                <input
-                  type="range"
+                <LiveRangeSlider
                   min={selectedNodes.every((n) => n.shapeType === "freehand") ? 1 : 0}
                   max={12}
                   value={selectedNodes[0].strokeWidth}
-                  onChange={(e) => updateNodes({ strokeWidth: Number(e.target.value) })}
+                  onCommit={(n) => updateNodes({ strokeWidth: n })}
                   className="w-28"
                 />
               </Field>
@@ -695,12 +760,11 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           </Field>
           {selectedNodes.every((n) => n.shapeType === "rectangle" || n.shapeType === "equation") && (
             <Field label="Corner radius">
-              <input
-                type="range"
+              <LiveRangeSlider
                 min={0}
                 max={Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2}
                 value={selectedNodes[0].cornerRadius ?? 0}
-                onChange={(e) => updateNodes({ cornerRadius: Number(e.target.value) })}
+                onCommit={(n) => updateNodes({ cornerRadius: n })}
                 className="w-28"
               />
             </Field>
@@ -742,13 +806,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 />
               </Field>
               <Field label="Spikiness">
-                <input
-                  type="range"
+                <LiveRangeSlider
                   min={0.15}
                   max={0.85}
                   step={0.05}
                   value={selectedNodes[0].starInnerRadiusRatio ?? 0.45}
-                  onChange={(e) => updateNodes({ starInnerRadiusRatio: Number(e.target.value) })}
+                  onCommit={(n) => updateNodes({ starInnerRadiusRatio: n })}
                   className="w-28"
                 />
               </Field>
@@ -805,13 +868,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     onCommit={(n) => updateNodes({ angleRay1Length: n })}
                     className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                   />
-                  <input
-                    type="range"
+                  <LiveRangeSlider
                     min={MIN_ANGLE_RAY_LENGTH}
                     max={MAX_ANGLE_RAY_LENGTH}
                     step={0.05}
                     value={selectedNodes[0].angleRay1Length ?? DEFAULT_ANGLE_RAY_LENGTH}
-                    onChange={(e) => updateNodes({ angleRay1Length: Number(e.target.value) })}
+                    onCommit={(n) => updateNodes({ angleRay1Length: n })}
                     className="w-16"
                   />
                 </div>
@@ -828,13 +890,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     onCommit={(n) => updateNodes({ angleRay2Length: n })}
                     className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                   />
-                  <input
-                    type="range"
+                  <LiveRangeSlider
                     min={MIN_ANGLE_RAY_LENGTH}
                     max={MAX_ANGLE_RAY_LENGTH}
                     step={0.05}
                     value={selectedNodes[0].angleRay2Length ?? DEFAULT_ANGLE_RAY_LENGTH}
-                    onChange={(e) => updateNodes({ angleRay2Length: Number(e.target.value) })}
+                    onCommit={(n) => updateNodes({ angleRay2Length: n })}
                     className="w-16"
                   />
                 </div>
@@ -879,13 +940,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   onCommit={(n) => updateNodes({ plotDomainScale: n })}
                   className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                 />
-                <input
-                  type="range"
+                <LiveRangeSlider
                   min={MIN_PLOT_DOMAIN_SCALE}
                   max={MAX_PLOT_DOMAIN_SCALE}
                   step={0.25}
                   value={selectedNodes[0].plotDomainScale ?? DEFAULT_PLOT_DOMAIN_SCALE}
-                  onChange={(e) => updateNodes({ plotDomainScale: Number(e.target.value) })}
+                  onCommit={(n) => updateNodes({ plotDomainScale: n })}
                   className="w-16"
                   title="How much of the x-axis is shown - below 1 zooms in, above 1 zooms out"
                 />
@@ -903,12 +963,11 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   onCommit={(n) => updateNodes({ plotCycles: n })}
                   className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                 />
-                <input
-                  type="range"
+                <LiveRangeSlider
                   min={MIN_PLOT_CYCLES}
                   max={MAX_PLOT_CYCLES}
                   value={selectedNodes[0].plotCycles ?? DEFAULT_PLOT_CYCLES}
-                  onChange={(e) => updateNodes({ plotCycles: Number(e.target.value) })}
+                  onCommit={(n) => updateNodes({ plotCycles: n })}
                   className="w-16"
                   title="How many full wave periods are shown"
                 />
@@ -978,12 +1037,11 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   className="w-14 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                   title="Line spans -this to +this"
                 />
-                <input
-                  type="range"
+                <LiveRangeSlider
                   min={MIN_NUMBER_LINE_MAX}
                   max={100}
                   value={Math.min(100, selectedNodes[0].numberLineMax ?? DEFAULT_NUMBER_LINE_MAX)}
-                  onChange={(e) => updateNodes({ numberLineMax: Number(e.target.value) })}
+                  onCommit={(n) => updateNodes({ numberLineMax: n })}
                   className="w-16"
                   title="Line spans -this to +this"
                 />
@@ -1231,13 +1289,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                     title="Sites per edge (N) - the lattice is N x N x N"
                   />
-                  <input
-                    type="range"
+                  <LiveRangeSlider
                     min={MIN_LATTICE_SIZE}
                     max={MAX_LATTICE_SIZE}
                     step={1}
                     value={selectedNodes[0].latticeSize ?? DEFAULT_LATTICE_SIZE}
-                    onChange={(e) => updateNodes({ latticeSize: Number(e.target.value) })}
+                    onCommit={(n) => updateNodes({ latticeSize: n })}
                     className="w-16"
                     title="Sites per edge (N) - the lattice is N x N x N"
                   />
@@ -1256,13 +1313,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                     title="3D-world distance between neighboring sites - purely a spread-out/compact look, unrelated to the shape's own on-canvas width/height"
                   />
-                  <input
-                    type="range"
+                  <LiveRangeSlider
                     min={MIN_LATTICE_SITE_SPACING}
                     max={MAX_LATTICE_SITE_SPACING}
                     step={0.1}
                     value={selectedNodes[0].latticeSiteSpacing ?? DEFAULT_LATTICE_SITE_SPACING}
-                    onChange={(e) => updateNodes({ latticeSiteSpacing: Number(e.target.value) })}
+                    onCommit={(n) => updateNodes({ latticeSiteSpacing: n })}
                     className="w-16"
                   />
                 </div>
@@ -1280,13 +1336,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                     title="Quark sphere radius, in world units - independent of site spacing"
                   />
-                  <input
-                    type="range"
+                  <LiveRangeSlider
                     min={MIN_LATTICE_SITE_RADIUS}
                     max={MAX_LATTICE_SITE_RADIUS}
                     step={0.01}
                     value={selectedNodes[0].latticeSiteRadius ?? DEFAULT_LATTICE_SITE_RADIUS}
-                    onChange={(e) => updateNodes({ latticeSiteRadius: Number(e.target.value) })}
+                    onCommit={(n) => updateNodes({ latticeSiteRadius: n })}
                     className="w-16"
                   />
                 </div>
@@ -1304,13 +1359,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                     title="Gauge-link line weight (radius), in world units"
                   />
-                  <input
-                    type="range"
+                  <LiveRangeSlider
                     min={MIN_LATTICE_LINK_WIDTH}
                     max={MAX_LATTICE_LINK_WIDTH}
                     step={0.005}
                     value={selectedNodes[0].latticeLinkWidth ?? DEFAULT_LATTICE_LINK_WIDTH}
-                    onChange={(e) => updateNodes({ latticeLinkWidth: Number(e.target.value) })}
+                    onCommit={(n) => updateNodes({ latticeLinkWidth: n })}
                     className="w-16"
                   />
                 </div>
@@ -1328,13 +1382,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
                     title="Spin-arrow length, in world units - only visible while Show spins is on"
                   />
-                  <input
-                    type="range"
+                  <LiveRangeSlider
                     min={MIN_LATTICE_SPIN_ARROW_SIZE}
                     max={MAX_LATTICE_SPIN_ARROW_SIZE}
                     step={0.01}
                     value={selectedNodes[0].latticeSpinArrowSize ?? DEFAULT_LATTICE_SPIN_ARROW_SIZE}
-                    onChange={(e) => updateNodes({ latticeSpinArrowSize: Number(e.target.value) })}
+                    onCommit={(n) => updateNodes({ latticeSpinArrowSize: n })}
                     className="w-16"
                   />
                 </div>
@@ -1567,7 +1620,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             <input type="color" value={edge.strokeColor} onChange={(e) => updateEdge({ strokeColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
           </Field>
           <Field label="Width">
-            <input type="range" min={1} max={8} value={edge.strokeWidth} onChange={(e) => updateEdge({ strokeWidth: Number(e.target.value) })} className="w-28" />
+            <LiveRangeSlider min={1} max={8} value={edge.strokeWidth} onCommit={(n) => updateEdge({ strokeWidth: n })} className="w-28" />
           </Field>
           <Field label="Line">
             <select
@@ -1597,13 +1650,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           </Field>
           {edge.routing === "curved" && !(edge.waypoints && edge.waypoints.length > 0) && (
             <Field label="Curve bow">
-              <input
-                type="range"
+              <LiveRangeSlider
                 min={-1}
                 max={1}
                 step={0.05}
                 value={edge.curveBow ?? DEFAULT_CURVE_BOW}
-                onChange={(e) => updateEdge({ curveBow: Number(e.target.value) })}
+                onCommit={(n) => updateEdge({ curveBow: n })}
                 className="w-28"
                 title="Which way (and how far) a free-floating end of this curve bows - only matters where the curve has no shape side to bow away from"
               />

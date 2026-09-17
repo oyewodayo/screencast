@@ -35,36 +35,53 @@ struct JobHandle(HANDLE);
 unsafe impl Send for JobHandle {}
 unsafe impl Sync for JobHandle {}
 
-static JOB: OnceLock<JobHandle> = OnceLock::new();
+// None means job-object creation itself failed (e.g. a locked-down environment that restricts
+// it) - in that case every recording just falls back to the pre-existing behavior (an ffmpeg
+// child can outlive the app if it's killed from outside), same fallback assign_to_job already
+// has for an assignment failure. That's a real but non-fatal loss of protection, not a reason to
+// crash the whole app on the first recording of the session.
+static JOB: OnceLock<Option<JobHandle>> = OnceLock::new();
 
-fn job() -> HANDLE {
+fn job() -> Option<HANDLE> {
     JOB.get_or_init(|| {
-        let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-            .expect("CreateJobObjectW failed");
+        let handle = match unsafe { CreateJobObjectW(None, PCWSTR::null()) } {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("Failed to create job object, recordings won't be force-cleaned up if the app is killed externally: {e}");
+                return None;
+            }
+        };
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        unsafe {
+        let result = unsafe {
             SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const _,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
+        };
+        if let Err(e) = result {
+            log::warn!("Failed to configure job object, recordings won't be force-cleaned up if the app is killed externally: {e}");
+            return None;
         }
-        .expect("SetInformationJobObject failed");
 
-        JobHandle(handle)
+        Some(JobHandle(handle))
     })
-    .0
+    .as_ref()
+    .map(|h| h.0)
 }
 
 // Best-effort: a failure here just means this particular recording falls back to the old
 // behavior (can outlive the app if it's killed from outside) rather than failing the recording
 // itself, which is otherwise perfectly fine.
 pub fn assign_to_job(child: &Child) {
+    let Some(job) = job() else {
+        return;
+    };
     let handle = HANDLE(child.as_raw_handle() as isize);
-    if let Err(e) = unsafe { AssignProcessToJobObject(job(), handle) } {
+    if let Err(e) = unsafe { AssignProcessToJobObject(job, handle) } {
         log::warn!("Failed to assign recording process to job object: {e}");
     }
 }

@@ -43,6 +43,18 @@ mod services {
     // camera/mic open - see the module's own doc comment for the orphan this fixes.
     #[cfg(target_os = "windows")]
     pub mod process_job;
+    // Polls ffmpeg's `-progress` sidecar file while a recording is in flight and forwards it to
+    // the frontend as a `recording-progress` event - see the module's own doc comment for why
+    // this exists (win.rs deliberately nulls ffmpeg's stdout/stderr, so there was previously no
+    // live signal at all). Windows-only for now, same reasoning as process_job above.
+    #[cfg(target_os = "windows")]
+    pub mod progress_watch;
+    // Detects a real, working hardware H.264 encoder (NVENC/QSV/AMF) via a trial encode, so
+    // recordings can offload from the CPU instead of always using software libx264 - see the
+    // module's own doc comment for why "does ffmpeg list this encoder" alone isn't good enough.
+    // Windows-only for now, same reasoning as progress_watch above.
+    #[cfg(target_os = "windows")]
+    pub mod hw_encoder;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
     // ffmpeg build mis-decodes multi-image HEIC files (Portrait mode, Deep Fusion, etc.) as a

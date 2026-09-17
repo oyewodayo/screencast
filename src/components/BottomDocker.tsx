@@ -115,6 +115,10 @@ interface Props {
   setSeparateWebcamCapture: React.Dispatch<React.SetStateAction<boolean>>;
   trackClicks: boolean;
   setTrackClicks: React.Dispatch<React.SetStateAction<boolean>>;
+  resolutionWidth: number | null;
+  setResolutionWidth: React.Dispatch<React.SetStateAction<number | null>>;
+  framerate: number | null;
+  setFramerate: React.Dispatch<React.SetStateAction<number | null>>;
   isMonitoring: boolean;
   setIsMonitoring: Dispatch<SetStateAction<boolean>>;
   windowTitles?: any[];
@@ -233,6 +237,10 @@ const BottomDocker = ({
   setSeparateWebcamCapture,
   trackClicks,
   setTrackClicks,
+  resolutionWidth,
+  setResolutionWidth,
+  framerate,
+  setFramerate,
   handleStartRecording,
   handleStopRecording,
   isPaused,
@@ -267,17 +275,18 @@ const BottomDocker = ({
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
   const [showDocker, setShowDocker] = useState(true);
-  // System audio ("what you hear") capture is WASAPI loopback, Windows-only (see
-  // start_recording's #[cfg(target_os = "windows")] block in recording.rs and
-  // services/loopback_audio.rs) - the "Include system audio" checkbox below used to render
-  // unconditionally everywhere, so a macOS/Linux user could check it and have it silently do
-  // nothing, no different from every other option they could see actually taking effect. Same
-  // get_platform check EnhancedScreenOptions.tsx already uses to hide the "Window" capture tile
-  // on macOS.
-  const [isSystemAudioSupported, setIsSystemAudioSupported] = useState(true);
+  // Click tracking (services/click_tracker.rs, a Win32 mouse hook) is still Windows-only with no
+  // equivalent elsewhere, unlike system audio ("what you hear"), which is now attempted on every
+  // platform (WASAPI on Windows, an auto-selected PulseAudio monitor source on Linux, and
+  // best-effort avfoundation + a known virtual-audio device like BlackHole on macOS - see
+  // recording/{macos,linux}.rs's own include_system_audio handling) and so no longer needs a
+  // support flag of its own. These two used to share one combined flag, which would have silently
+  // re-enabled Track clicks on macOS/Linux too once system audio no longer needed gating, letting
+  // a user check it there and have it do nothing.
+  const [isClickTrackingSupported, setIsClickTrackingSupported] = useState(true);
   useEffect(() => {
     invoke<string>('get_platform')
-      .then((platform) => setIsSystemAudioSupported(platform === 'windows'))
+      .then((platform) => setIsClickTrackingSupported(platform === 'windows'))
       .catch((err) => console.error('Failed to detect platform:', err));
   }, []);
   // This whole docker is `fixed bottom-0`, sitting on top of the video player rather than
@@ -452,6 +461,8 @@ const BottomDocker = ({
       include_system_audio: includeSystemAudio,
       separate_webcam_capture: separateWebcamCapture,
       track_clicks: trackClicks,
+      resolution_width: resolutionWidth,
+      framerate: framerate,
     };
 
     handleStartRecording(formData);
@@ -612,11 +623,15 @@ const BottomDocker = ({
             onRefreshDevices={loadDevices}
             includeSystemAudio={includeSystemAudio}
             onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
-            isSystemAudioSupported={isSystemAudioSupported}
             separateWebcamCapture={separateWebcamCapture}
             onToggleSeparateWebcamCapture={() => setSeparateWebcamCapture((prev) => !prev)}
             trackClicks={trackClicks}
             onToggleTrackClicks={() => setTrackClicks((prev) => !prev)}
+            isClickTrackingSupported={isClickTrackingSupported}
+            resolutionWidth={resolutionWidth}
+            onResolutionWidthChange={setResolutionWidth}
+            framerate={framerate}
+            onFramerateChange={setFramerate}
             isRecording={isRecording}
             isPaused={isPaused}
             onScreenshotClick={handleScreenshotClick}

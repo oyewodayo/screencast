@@ -264,6 +264,16 @@ const Dashboard = () => {
   // time+position to a "<name>.clicks.json" sidecar - the editor's own "auto zoom on click" tool
   // reads this back to suggest where to punch in. Recording with this off starts no hook at all.
   const [trackClicks, setTrackClicks] = useState<boolean>(false);
+  // Max output width for screen-capture record types - null means "use the backend's own default"
+  // (1920px, see FormData.resolution_width's own doc comment on the Rust side), so a caller that
+  // never touches this control gets byte-for-byte the same recording as before it existed. The
+  // "Native" option is represented as a very large number rather than a separate flag - see the
+  // same doc comment for why that needs no special-casing on either side.
+  const [resolutionWidth, setResolutionWidth] = useState<number | null>(() => loadSettings().defaultResolutionWidth);
+  // Target capture framerate for screen-capture record types - null means "use the backend's own
+  // per-mode default" (60 for sva, 30 for sa/s), same "untouched control changes nothing" reasoning
+  // as resolutionWidth above.
+  const [framerate, setFramerate] = useState<number | null>(() => loadSettings().defaultFramerate);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
@@ -1253,6 +1263,8 @@ const setScreen = () => {
 		setShowRecordingDocker(settings.showRecordingDocker);
 		setShowRecordingPanelButtons(settings.showRecordingPanelButtons);
 		setIncludeSystemAudio(settings.defaultIncludeSystemAudio);
+		setResolutionWidth(settings.defaultResolutionWidth);
+		setFramerate(settings.defaultFramerate);
 		if (settings.defaultAudioDevice) setAudioDevice(settings.defaultAudioDevice);
 		if (settings.defaultVideoDevices.length > 0) setVideoDevices(settings.defaultVideoDevices);
 	};
@@ -1427,12 +1439,14 @@ const setScreen = () => {
 		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 		fileName, fileExt, recordType, audioDevice, videoDevices,
 		overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
+		resolutionWidth, framerate,
 	});
 	useEffect(() => {
 		recordingHotkeyRef.current = {
 			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 			fileName, fileExt, recordType, audioDevice, videoDevices,
 			overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
+			resolutionWidth, framerate,
 		};
 	});
 
@@ -1458,6 +1472,8 @@ const setScreen = () => {
 			include_system_audio: s.includeSystemAudio,
 			separate_webcam_capture: s.separateWebcamCapture,
 			track_clicks: s.trackClicks,
+			resolution_width: s.resolutionWidth,
+			framerate: s.framerate,
 		});
 	}, []);
 
@@ -3609,6 +3625,10 @@ const setScreen = () => {
         setSeparateWebcamCapture={setSeparateWebcamCapture}
         trackClicks={trackClicks}
         setTrackClicks={setTrackClicks}
+        resolutionWidth={resolutionWidth}
+        setResolutionWidth={setResolutionWidth}
+        framerate={framerate}
+        setFramerate={setFramerate}
         selectedScreen={selectedScreen}
         setSelectedScreen={setSelectedScreen}
         windowTitles={windowTitles}

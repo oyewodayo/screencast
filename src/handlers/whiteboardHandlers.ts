@@ -28,6 +28,11 @@ import {
   TableMergedCell,
   resolveTableGrid,
 } from "../utils/whiteboardTypes";
+// Not a component import in spirit - latticeRenderOnDemand is a plain module-level Map, not React
+// state or a hook, used purely as a side-channel to force one fresh WebGL frame immediately before
+// the "latticeGauge" branch below reads the canvas (see LatticeGaugeWidget.tsx's own doc comment
+// on why its renderer no longer keeps every past frame's buffer around via preserveDrawingBuffer).
+import { latticeRenderOnDemand } from "../components/whiteboard/LatticeGaugeWidget";
 
 // ---- Node geometry ----------------------------------------------------------------------------
 
@@ -2951,16 +2956,19 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): 
     // Not just shapeOutlineFor's own placeholder glyph (a static, doesn't-look-like-anything-real
     // icon) when this node's widget is actually mounted live in the page being exported - grab an
     // ACTUAL frame of its WebGL canvas instead. LatticeGaugeWidget.tsx tags its own canvas element
-    // with this exact attribute for precisely this lookup, and sets `preserveDrawingBuffer: true`
-    // on its renderer so the buffer is still readable here (WebGL by default may discard it right
-    // after compositing, which would otherwise make drawImage/toDataURL called from an unrelated
-    // click handler - well after the animation loop's own last render() call - read back a blank
-    // frame). Falls back to the placeholder glyph if no live canvas exists to read (this page isn't
-    // the one currently open, or WebGL failed) - same DOM-reachability caveat every other
-    // export/thumbnail call site already has (they only ever run against the page actually open in
-    // the editor, so this lookup succeeds in the cases that matter).
+    // with this exact attribute for precisely this lookup. Its renderer does NOT keep
+    // `preserveDrawingBuffer: true` (that would mean paying to retain every past frame's buffer
+    // forever, just for this occasional read - see its own doc comment), so a stale/blank buffer
+    // this long after its animation loop's own last render() is called for here instead: forcing
+    // exactly one fresh render() synchronously, in the same tick as the drawImage read right below
+    // it, via latticeRenderOnDemand's callback for this node. Falls back to the placeholder glyph
+    // if no live canvas exists to read (this page isn't the one currently open, or WebGL failed) -
+    // same DOM-reachability caveat every other export/thumbnail call site already has (they only
+    // ever run against the page actually open in the editor, so this lookup succeeds in the cases
+    // that matter).
     const liveCanvas = document.querySelector<HTMLCanvasElement>(`canvas[data-lattice-node-id="${node.id}"]`);
     if (liveCanvas && liveCanvas.width > 0 && liveCanvas.height > 0) {
+      latticeRenderOnDemand.get(node.id)?.();
       ctx.drawImage(liveCanvas, 0, 0, node.width, node.height);
     } else {
       paintShapeBody(ctx, node);

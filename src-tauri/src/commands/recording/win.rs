@@ -18,20 +18,60 @@ use windows::Win32::System::Threading::{
 use super::{
     audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext,
     extract_ffmpeg_error, map_overlay_size, resolve_capture_target, silent_command, AppState,
-    CaptureTarget, FormData, AUDIO_ENHANCE_FILTER, MAX_RECORDING_WIDTH,
+    CaptureTarget, FormData, AUDIO_ENHANCE_FILTER,
 };
+use crate::services::hw_encoder;
 use crate::services::process_job;
+use crate::services::progress_watch;
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
 // Downscale flag for the plain (no camera overlay) desktop-capture path - when a camera overlay
 // IS in play, the equivalent downscale is instead the final stage of
 // build_camera_overlay_filter_complex's own filter_complex, since ffmpeg rejects a separate -vf
-// on the same output stream a -filter_complex already produces video for.
-fn desktop_scale_args() -> Vec<String> {
+// on the same output stream a -filter_complex already produces video for. `max_width` is
+// FormData.resolution_width already resolved via super::resolved_max_width - see its own doc
+// comment for how a "native" request is represented.
+fn desktop_scale_args(max_width: i32) -> Vec<String> {
     vec![
         "-vf".to_string(),
-        format!("scale='min({},iw)':-2", MAX_RECORDING_WIDTH),
+        format!("scale='min({},iw)':-2", max_width),
     ]
+}
+
+// Swaps codec_args_for_ext's software video-encode segment (`-c:v libx264 -preset ultrafast
+// [-crf N]`) for a detected hardware encoder's own, when one actually works on this machine (see
+// services/hw_encoder.rs) - CPU usage on a long/high-res recording is the single biggest
+// encoding-side complaint this app's software-only libx264 path has (see
+// RECORDING_UPGRADE_NOTES.md). Only for the h264-targeting containers that path already covers
+// (mp4/mkv/avi/mov); webm's target codec is VP8, which has no equivalent widely-available
+// hardware path, so it's left on software regardless. Finds the software segment by locating
+// "-pix_fmt" (which immediately follows it in every one of those four branches) rather than
+// hardcoding each branch's exact offset, so this stays correct if codec_args_for_ext's own args
+// ever get reordered.
+fn codec_args_for_ext_hw(ext: &str, ffmpeg_path: &std::path::Path) -> Vec<String> {
+    let args = codec_args_for_ext(ext);
+    if !matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "avi" | "mov") {
+        return args;
+    }
+    let Some(encoder) = hw_encoder::detect(ffmpeg_path) else {
+        return args;
+    };
+    let Some(cv_idx) = args.iter().position(|a| a == "-c:v") else {
+        return args;
+    };
+    let Some(pix_fmt_idx) = args.iter().position(|a| a == "-pix_fmt") else {
+        return args;
+    };
+    if pix_fmt_idx <= cv_idx {
+        return args;
+    }
+
+    let mut patched = args[..cv_idx].to_vec();
+    patched.push("-c:v".to_string());
+    patched.push(encoder.name().to_string());
+    patched.extend(encoder.quality_args());
+    patched.extend(args[pix_fmt_idx..].iter().cloned());
+    patched
 }
 
 fn desktop_crop_args(x: i32, y: i32, width: i32, height: i32) -> Vec<String> {
@@ -148,6 +188,8 @@ pub fn add_overlay_args(args: &mut Vec<String>, form_data: &FormData) {
         &form_data.overlay_position,
         &form_data.overlay_size,
         form_data.video_devices.len(),
+        super::resolved_max_width(form_data),
+        None,
     );
 
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
@@ -166,12 +208,16 @@ pub async fn recording_with_output_sva(
     }
 
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let progress_sidecar = progress_watch::progress_sidecar_path(output_path);
 
+    let max_width = super::resolved_max_width(form_data);
     let mut args: Vec<String> = vec![
+        "-progress".to_string(),
+        path_to_str(&progress_sidecar)?.to_string(),
         "-f".to_string(),
         "gdigrab".to_string(),
         "-framerate".to_string(),
-        "60".to_string(),
+        form_data.framerate.unwrap_or(60).to_string(),
     ];
 
     args.extend(gdigrab_input_args(&resolve_capture_target(
@@ -224,11 +270,11 @@ pub async fn recording_with_output_sva(
     // stage. ffmpeg rejects a -vf here alongside a -filter_complex already producing video - the
     // separate-capture case below builds its own filter_complex for exactly this reason too.
     if !has_camera_overlay {
-        args.extend(desktop_scale_args());
+        args.extend(desktop_scale_args(max_width));
     } else if separate_webcam_capture {
         args.extend(vec![
             "-filter_complex".to_string(),
-            format!("[0:v]scale='min({},iw)':-2[scr]", MAX_RECORDING_WIDTH),
+            format!("[0:v]scale='min({},iw)':-2[scr]", max_width),
         ]);
     }
 
@@ -248,7 +294,7 @@ pub async fn recording_with_output_sva(
             "2:a".to_string(),
         ]);
     }
-    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     // Evens out quiet/inconsistent mic levels - see AUDIO_ENHANCE_FILTER's doc comment.
     args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
 
@@ -307,12 +353,14 @@ pub async fn recording_with_output_sva(
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
+    let pid = child.id();
 
     // Store the process in state
     {
         let mut process_state = state.ffmpeg_process.lock().await;
         *process_state = Some(child);
     }
+    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
 
     log::debug!("FFmpeg process started successfully");
 
@@ -321,72 +369,6 @@ pub async fn recording_with_output_sva(
         output_path.display()
     ))
 }
-//Screen and video without audio
-pub async fn recording_with_output_sv(
-    app_handle: &AppHandle,
-    state: State<'_, AppState>,
-    output_path: &PathBuf,
-    form_data: &FormData,
-) -> Result<String, String> {
-    {
-        let mut app_state = state.output_path.lock().await;
-        *app_state = Some(output_path.clone());
-    }
-    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-
-    let mut args: Vec<String> = vec![
-        "-f".to_string(),
-        "dshow".to_string(),
-        "-framerate".to_string(),
-        "60".to_string(),
-    ];
-    if form_data.screen_size != "fullscreen" {
-        args.extend(vec![
-            "-video_size".to_string(),
-            form_data.screen_size.to_string(),
-        ]);
-    }
-
-    args.extend(vec!["-i".to_string(), "desktop".to_string()]);
-
-    // add_overlay_args already appends its own -filter_complex chaining every selected camera
-    // (see recording_with_output_sva) - a second hardcoded "-filter_complex" here used to follow
-    // it and silently win, ignoring the user's shape/position choice and hardcoding exactly one
-    // camera. Removed so add_overlay_args's chain is authoritative, same as sva.
-    if !form_data.video_devices.is_empty() {
-        log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
-        add_overlay_args(&mut args, form_data);
-    }
-
-    // Output command
-    args.extend(vec![
-        "-c:v".to_string(),
-        "mpeg4".to_string(),
-        "-segment_time".to_string(),
-        "10".to_string(),
-        "-segment_format".to_string(),
-        "avi".to_string(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
-    ]);
-
-    let child = silent_command(&ffmpeg_path)
-        .args(&args)
-        .spawn()
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
-    process_job::assign_to_job(&child);
-
-    {
-        let mut process_state = state.ffmpeg_process.lock().await;
-        *process_state = Some(child);
-    }
-
-    Ok(format!(
-        "Recording started. File will be saved to {}",
-        output_path.display()
-    ))
-}
-
 //Screen and audio
 pub async fn recording_with_output_sa(
     app_handle: &AppHandle,
@@ -400,16 +382,20 @@ pub async fn recording_with_output_sa(
     }
 
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let progress_sidecar = progress_watch::progress_sidecar_path(output_path);
 
     // 200 was never a real target — gdigrab can't actually deliver anywhere near that from a
     // desktop source, it just means ffmpeg burns extra CPU polling far faster than any monitor
     // refreshes, which eats into the budget the encoder needs to keep up in real time. 30fps is
-    // what screen-recording/tutorial content actually needs.
+    // what screen-recording/tutorial content actually needs, and is still the default below.
+    let max_width = super::resolved_max_width(form_data);
     let mut args: Vec<String> = vec![
+        "-progress".to_string(),
+        path_to_str(&progress_sidecar)?.to_string(),
         "-f".to_string(),
         "gdigrab".to_string(),
         "-framerate".to_string(),
-        "30".to_string(),
+        form_data.framerate.unwrap_or(30).to_string(),
     ];
     args.extend(gdigrab_input_args(&resolve_capture_target(
         app_handle, form_data,
@@ -421,11 +407,11 @@ pub async fn recording_with_output_sa(
         format!("audio={}", form_data.audio_device),
     ]);
     // Downscale the raw desktop capture - see desktop_scale_args' doc comment.
-    args.extend(desktop_scale_args());
+    args.extend(desktop_scale_args(max_width));
     // Previously had no codec flags at all here, leaving both streams to ffmpeg's per-container
     // defaults - which measured out to a 200kbps video bitrate for a 4K capture (badly
     // blocky) and default-quality MP3 audio, inconsistent with every other recording mode.
-    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
     args.extend(vec![
         "-y".to_string(),
@@ -438,11 +424,13 @@ pub async fn recording_with_output_sa(
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
+    let pid = child.id();
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
         *process_state = Some(child);
     }
+    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -462,17 +450,20 @@ pub async fn recording_with_output_v(
         *app_state = Some(output_path.clone());
     }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let progress_sidecar = progress_watch::progress_sidecar_path(output_path);
 
     log::debug!("Path {:?}", output_path);
     let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
 
     let mut args: Vec<String> = vec![
+        "-progress".to_string(),
+        path_to_str(&progress_sidecar)?.to_string(),
         "-f".to_string(),
         "dshow".to_string(),
         "-i".to_string(),
         format!("video={}", video_device),
     ];
-    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
 
@@ -483,11 +474,13 @@ pub async fn recording_with_output_v(
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
+    let pid = child.id();
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
         *process_state = Some(child);
     }
+    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
 
     Ok(format!(
         "Recording started. File will be saved to {:?}",
@@ -507,9 +500,12 @@ pub async fn recording_with_output_a(
         *app_state = Some(output_path.clone());
     }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let progress_sidecar = progress_watch::progress_sidecar_path(output_path);
 
     log::debug!("Path {:?}", output_path);
     let mut args: Vec<String> = vec![
+        "-progress".to_string(),
+        path_to_str(&progress_sidecar)?.to_string(),
         "-f".to_string(),
         "dshow".to_string(),
         "-i".to_string(),
@@ -529,11 +525,13 @@ pub async fn recording_with_output_a(
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
+    let pid = child.id();
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
         *process_state = Some(child);
     }
+    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -554,17 +552,20 @@ pub async fn recording_with_output_va(
     }
 
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let progress_sidecar = progress_watch::progress_sidecar_path(output_path);
 
     log::debug!("Path {:?}", output_path);
     let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
 
     let mut args: Vec<String> = vec![
+        "-progress".to_string(),
+        path_to_str(&progress_sidecar)?.to_string(),
         "-f".to_string(),
         "dshow".to_string(),
         "-i".to_string(),
         format!("video={}:audio={}", video_device, form_data.audio_device),
     ];
-    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
@@ -574,11 +575,13 @@ pub async fn recording_with_output_va(
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
+    let pid = child.id();
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
         *process_state = Some(child);
     }
+    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -598,24 +601,28 @@ pub async fn recording_with_output_s(
         *app_state = Some(output_path.clone());
     }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let progress_sidecar = progress_watch::progress_sidecar_path(output_path);
 
     // Same framerate fix as recording_with_output_sa - 200 was never reachable, just wasted CPU.
+    let max_width = super::resolved_max_width(form_data);
     let mut args: Vec<String> = vec![
+        "-progress".to_string(),
+        path_to_str(&progress_sidecar)?.to_string(),
         "-f".to_string(),
         "gdigrab".to_string(),
         "-framerate".to_string(),
-        "30".to_string(),
+        form_data.framerate.unwrap_or(30).to_string(),
     ];
     args.extend(gdigrab_input_args(&resolve_capture_target(
         app_handle, form_data,
     ))?);
     // Downscale the raw desktop capture - see desktop_scale_args' doc comment.
-    args.extend(desktop_scale_args());
+    args.extend(desktop_scale_args(max_width));
     // This used to have no codec flags at all, leaving the video stream to ffmpeg's implicit
     // per-container default encoder (e.g. plain mpeg4 for .mp4) instead of libx264 - a real,
     // separate cause of poor quality/efficiency for screen-only recordings specifically, not
     // just the missing downscale/framerate fix above.
-    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.extend(vec![
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
@@ -627,11 +634,13 @@ pub async fn recording_with_output_s(
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
+    let pid = child.id();
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
         *process_state = Some(child);
     }
+    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -722,13 +731,40 @@ fn for_each_process_thread(pid: u32, mut f: impl FnMut(u32)) -> Result<(), Strin
 // nothing in it can run at all until resume_process undoes this. Threads that exit between the
 // snapshot and OpenThread (ffmpeg spinning up/down a worker thread at exactly the wrong moment)
 // just fail OpenThread and are skipped - not a real failure, nothing to suspend there anymore.
+//
+// A single snapshot-then-suspend pass has the opposite race too, though: if ffmpeg spins up a
+// *new* thread between the snapshot and this loop finishing, that thread is invisible to this
+// pass and keeps running unsuspended while every other thread freezes - the process ends up only
+// partially paused. Re-snapshotting after each pass and suspending only threads not already
+// suspended converges on a fully-suspended process: once a full pass finds nothing new, nothing
+// could still be spawning threads undetected. Each thread is suspended at most once - SuspendThread
+// increments a per-thread suspend count, so suspending the same thread twice would need two
+// matching ResumeThread calls to actually wake it, which resume_process's single blanket pass
+// doesn't do. Capped at 5 passes since real convergence is 1-2 passes in practice (a thread being
+// born at exactly the wrong instant, repeatedly, isn't realistic) and this must still return
+// promptly for a UI-driven pause button.
 pub(crate) fn suspend_process(pid: u32) -> Result<(), String> {
-    for_each_process_thread(pid, |tid| unsafe {
-        if let Ok(handle) = OpenThread(THREAD_SUSPEND_RESUME, false, tid) {
-            SuspendThread(handle);
-            let _ = CloseHandle(handle);
+    use std::collections::HashSet;
+
+    let mut suspended: HashSet<u32> = HashSet::new();
+    for _ in 0..5 {
+        let mut found_new = false;
+        for_each_process_thread(pid, |tid| {
+            if suspended.insert(tid) {
+                found_new = true;
+                unsafe {
+                    if let Ok(handle) = OpenThread(THREAD_SUSPEND_RESUME, false, tid) {
+                        SuspendThread(handle);
+                        let _ = CloseHandle(handle);
+                    }
+                }
+            }
+        })?;
+        if !found_new {
+            break;
         }
-    })
+    }
+    Ok(())
 }
 
 pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
