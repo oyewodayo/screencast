@@ -29,6 +29,7 @@ import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace"
 import { BoardEditorHandle } from "../components/board/BoardEditor";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
+import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -305,6 +306,7 @@ const Dashboard = () => {
   // Which Whiteboard screen (if any) is showing in the main content pane - same null-means-off
   // pattern as boardScreen/docsScreen. See handleOpenWhiteboard.
   const [whiteboardScreen, setWhiteboardScreen] = useState<WhiteboardScreen | null>(null);
+  const [mindmapScreen, setMindmapScreen] = useState<MindmapScreen | null>(null);
   // Every doc's summary (id/title/linked_to/etc.), refreshed via refreshDocsIndex - backs both the
   // "Link to recording" picker's libraryFiles-independent state and the per-file "has linked
   // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
@@ -932,6 +934,9 @@ const setScreen = () => {
         // Send recording state to overlay - both windows derive elapsed time from this
         // same start timestamp so their displayed timers can't drift apart. Sent even while
         // hidden so the overlay is already in sync the moment the user reveals it.
+        // canSwitchView: only "sva" with separate_webcam_capture actually produces the second
+        // (camera) file the live Screen/Camera toggle needs something to switch to - see
+        // RECORDING_UPGRADE_NOTES.md's view-switching feature design.
         overlayWindow.emit('recording-state-update', {
           isRecording: true,
           recordType: formData.record_type,
@@ -939,6 +944,7 @@ const setScreen = () => {
           isPaused: false,
           pauseStartedAt: null,
           pausedAccumulatedMs: 0,
+          canSwitchView: formData.record_type === 'sva' && Boolean(formData.separate_webcam_capture),
         });
 
         if (!(await isRegistered(OVERLAY_TOGGLE_SHORTCUT))) {
@@ -1015,6 +1021,7 @@ const setScreen = () => {
         isPaused: true,
         pauseStartedAt: now,
         pausedAccumulatedMs,
+        canSwitchView: recordType === 'sva' && separateWebcamCapture,
       });
     } catch (error) {
       console.error("Error pausing recording:", error);
@@ -1042,6 +1049,7 @@ const setScreen = () => {
         isPaused: false,
         pauseStartedAt: null,
         pausedAccumulatedMs: newAccumulatedMs,
+        canSwitchView: recordType === 'sva' && separateWebcamCapture,
       });
     } catch (error) {
       console.error("Error resuming recording:", error);
@@ -1247,10 +1255,11 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); };
-	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); setWhiteboardScreen(null); };
-	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); setWhiteboardScreen(null); };
-	const handleOpenWhiteboard = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen({ mode: "home" }); };
+	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); };
+	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); };
+	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); setWhiteboardScreen(null); setMindmapScreen(null); };
+	const handleOpenWhiteboard = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen({ mode: "home" }); setMindmapScreen(null); };
+	const handleOpenMindmap = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen({ mode: "home" }); };
 	const handleOpenSettings = () => setShowSettings(true);
 	const handleCloseSettings = () => setShowSettings(false);
 	// Settings apply immediately to the current session too, not just future ones — otherwise
@@ -3216,7 +3225,15 @@ const setScreen = () => {
           )}
 
           <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center">
-          {whiteboardScreen ? (
+          {mindmapScreen ? (
+            <ErrorBoundary
+              key={mindmapScreen.mode === "editor" ? `mm-editor-${mindmapScreen.mindmapId}` : "mm-home"}
+              fallbackTitle="This mindmap ran into a problem"
+              onReset={() => setMindmapScreen({ mode: "home" })}
+            >
+              <MindmapWorkspace screen={mindmapScreen} onScreenChange={setMindmapScreen} />
+            </ErrorBoundary>
+          ) : whiteboardScreen ? (
             <ErrorBoundary
               key={whiteboardScreen.mode === "editor" ? `editor-${whiteboardScreen.whiteboardId}` : "home"}
               fallbackTitle="This whiteboard ran into a problem"
@@ -3658,13 +3675,15 @@ const setScreen = () => {
         showRecordingPanelButtons={showRecordingPanelButtons}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
-        isHome={selectedFile === null && boardScreen === null && docsScreen === null && whiteboardScreen === null}
+        isHome={selectedFile === null && boardScreen === null && docsScreen === null && whiteboardScreen === null && mindmapScreen === null}
         handleOpenBoard={handleOpenBoard}
         isBoard={boardScreen !== null}
         handleOpenDocs={handleOpenDocs}
         isDocs={docsScreen !== null}
         handleOpenWhiteboard={handleOpenWhiteboard}
         isWhiteboard={whiteboardScreen !== null}
+        handleOpenMindmap={handleOpenMindmap}
+        isMindmap={mindmapScreen !== null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}

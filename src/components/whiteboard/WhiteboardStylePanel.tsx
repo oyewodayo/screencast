@@ -7,7 +7,7 @@
 // three) - single-selection edits still go through editNode so BoardStylePanel's "just the one
 // item" case isn't paying for a batch array it doesn't need.
 import React from "react";
-import { IoCopyOutline, IoTrashOutline } from "react-icons/io5";
+import { IoCopyOutline, IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
 import {
   TbComponents,
   TbComponentsOff,
@@ -24,11 +24,24 @@ import {
   TbStackFront,
   TbUnderline,
 } from "react-icons/tb";
+import { ColormapName, COLORMAP_NAMES, colormapPalette, DEFAULT_COLORMAP } from "../../utils/colormaps";
 import {
   ArrowheadType,
+  ChartAnnotation,
+  CHART_ANNOTATION_SHAPES,
+  CHART_AXIS_TITLE_SHAPES,
   CHART_DATA_SHAPES,
   CHART_LABEL_SHAPES,
   DEFAULT_CHART_DATA,
+  DEFAULT_SERIES_OFFSET,
+  MAX_SERIES_COUNT,
+  MAX_SERIES_POINTS,
+  MAX_SERIES_OFFSET,
+  MIN_SERIES_OFFSET,
+  hasImageCrop,
+  naturalImageSize,
+  resolveImageCrop,
+  resolveSeriesData,
   DEFAULT_LATTICE_LINK_WIDTH,
   DEFAULT_LATTICE_SITE_RADIUS,
   DEFAULT_LATTICE_SITE_SPACING,
@@ -90,8 +103,15 @@ import {
   MIN_PLOT_CYCLES,
   MIN_PLOT_DOMAIN_SCALE,
   MIN_WAVE_CYCLES,
+  alignNodes,
+  AlignEdge,
+  annotationCoordinateMapper,
+  arrangeNodesInGrid,
   compileGraphExpression,
+  DEFAULT_GRID_GAP,
+  distributeNodes,
   nudgeEdgeBy,
+  outlineOptionsFor,
 } from "../../handlers/whiteboardHandlers";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
@@ -180,6 +200,19 @@ interface WhiteboardStylePanelProps {
   onSendToBack: () => void;
   onGroup: () => void;
   onUngroup: () => void;
+  // Swaps the bitmap behind an existing "image" node, keeping its box, crop and styling. Owned by
+  // WhiteboardEditor (it has the file dialog and the whiteboard id this asset is imported into);
+  // absent simply hides the "Replace image…" button rather than showing one that can't work.
+  onReplaceImage?: (node: WhiteboardNode) => void;
+  // Crop mode, owned by WhiteboardEditor so this panel's Crop button and the canvas's own
+  // double-click gesture drive the same state rather than each having their own.
+  croppingNodeId?: string | null;
+  onToggleCrop?: (node: WhiteboardNode) => void;
+  // Display-only preview of a patch applied to the current selection, for sliders to update the
+  // canvas in real time mid-drag. null clears it. Never reaches the store, so a whole drag still
+  // commits as one undo step - see LiveRangeSlider's own doc comment for why that split is
+  // load-bearing rather than a nicety.
+  onPreviewNodes?: (patch: Partial<WhiteboardNode> | null) => void;
 }
 
 // A plain `value={n}`-controlled number input re-clamps AND redraws its own text on every
@@ -280,12 +313,18 @@ function ClampedNumberField({
 // `liveValue` state, but only calls `onCommit` once the gesture actually ends - pointer release, a
 // keyboard nudge, or focus leaving the control - so a whole drag becomes exactly one undo step and
 // one rebuild, not one per pixel of travel.
+// `onPreview` is what makes the shape itself track the drag in real time WITHOUT paying the cost
+// above: it renders through the canvas's display-only preview channel (see WhiteboardCanvas's
+// previewNodes prop) and never touches the store or the undo stack, so the whole drag still commits
+// exactly once on release. A slider given no onPreview keeps the original behavior - thumb tracks,
+// shape updates at the end.
 function LiveRangeSlider({
   value,
   min,
   max,
   step,
   onCommit,
+  onPreview,
   className,
   title,
 }: {
@@ -294,6 +333,7 @@ function LiveRangeSlider({
   max: number;
   step?: number;
   onCommit: (n: number) => void;
+  onPreview?: (n: number | null) => void;
   className?: string;
   title?: string;
 }) {
@@ -302,15 +342,27 @@ function LiveRangeSlider({
   // ClampedNumberField's own lastCommittedRef uses - onPointerUp/onKeyUp/onBlur can otherwise all
   // fire for the same single gesture (e.g. a mouse drag that ends by tabbing away).
   const lastCommittedRef = React.useRef(value);
+  // True between the first input event of a drag and its commit. Needed because `value` FLOWS BACK
+  // during a live preview: the preview re-renders the selection, so this component's own `value`
+  // prop becomes the previewed number mid-drag. Without this guard the resync effect below would
+  // then record that previewed number as "last committed", and the real commit on release would see
+  // n === lastCommittedRef and skip - the drag would preview correctly and then silently snap back.
+  const draggingRef = React.useRef(false);
 
   // Resync when the committed value changes from elsewhere (undo/redo, another edit path) -
-  // otherwise this slider would keep showing a stale drag-in-progress value forever.
+  // otherwise this slider would keep showing a stale drag-in-progress value forever. Skipped while
+  // dragging, for the reason above.
   React.useEffect(() => {
+    if (draggingRef.current) return;
     setLiveValue(value);
     lastCommittedRef.current = value;
   }, [value]);
 
   const commit = (n: number) => {
+    // The preview always has to be torn down, even when the value ended up unchanged - otherwise a
+    // drag that returns to where it started would leave the canvas pinned to a preview forever.
+    draggingRef.current = false;
+    onPreview?.(null);
     if (n === lastCommittedRef.current) return;
     lastCommittedRef.current = n;
     onCommit(n);
@@ -323,13 +375,72 @@ function LiveRangeSlider({
       max={max}
       step={step}
       value={liveValue}
-      onChange={(e) => setLiveValue(Number(e.target.value))}
+      onChange={(e) => {
+        const next = Number(e.target.value);
+        draggingRef.current = true;
+        setLiveValue(next);
+        onPreview?.(next);
+      }}
       onPointerUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
       onKeyUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
       onBlur={(e) => commit(Number((e.target as HTMLInputElement).value))}
-      className={className}
+      className={className ?? SLIDER_CLASS}
       title={title}
     />
+  );
+}
+
+// A slider paired with a numeric box, the standard control shape for every numeric setting in this
+// panel. The box is not a nicety: a slider's range is a convenience for the common case, and without
+// a place to type an exact value, anything outside that range (or any precise figure) is simply
+// unreachable. Both halves drive the same commit path, and the slider previews live while dragged.
+function SliderField({
+  label,
+  value,
+  min,
+  max,
+  step = 1,
+  integer = false,
+  sliderMax,
+  onCommit,
+  onPreview,
+  title,
+  resetKey,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  integer?: boolean;
+  // Lets the slider cover a narrower, more useful span than the field accepts - e.g. stroke width
+  // sliding over a sensible range while the box still takes any value up to the hard cap.
+  sliderMax?: number;
+  onCommit: (n: number) => void;
+  onPreview?: (n: number | null) => void;
+  title?: string;
+  // Forces the numeric box to re-seed from `value` - pass the selection's identity so switching
+  // shapes reloads the field rather than leaving the previous shape's text in it.
+  resetKey?: string;
+}) {
+  const topOfSlider = sliderMax ?? max;
+  return (
+    <Field label={label}>
+      <div className="flex items-center gap-1.5">
+        <ClampedNumberField
+          key={resetKey}
+          initialValue={value}
+          min={min}
+          max={max}
+          step={step}
+          integer={integer}
+          onCommit={onCommit}
+          className={NUMBER_INPUT_CLASS}
+          title={title}
+        />
+        <LiveRangeSlider min={min} max={topOfSlider} step={step} value={Math.min(topOfSlider, Math.max(min, value))} onCommit={onCommit} onPreview={onPreview} title={title} />
+      </div>
+    </Field>
   );
 }
 
@@ -370,6 +481,634 @@ function ChartDataField({ initialValue, onCommit, className }: { initialValue: n
       }}
       className={className}
     />
+  );
+}
+
+const FIELD_INPUT_CLASS = "w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs";
+// Ceiling for a node's stroke/ink width. Not a design limit - purely a guard against a typo (an
+// accidental extra zero) producing a ring so thick it swallows the shape and leaves nothing visible
+// to click back onto in order to undo it.
+const MAX_STROKE_WIDTH = 400;
+
+// ---- Panel design tokens -------------------------------------------------------------------------
+//
+// One place for every control's appearance, so the panel reads as a single designed surface rather
+// than a pile of independently-styled inputs. Anything added here should reuse these rather than
+// spelling out its own border/height/radius - that drift is exactly what made the panel look
+// assembled rather than designed.
+const NUMBER_INPUT_CLASS =
+  "w-14 h-7 px-2 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs tabular-nums outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 transition";
+const SELECT_CLASS =
+  "w-36 h-7 px-2 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 transition";
+const TEXT_INPUT_CLASS =
+  "w-36 h-7 px-2 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 transition";
+const SLIDER_CLASS = "w-[72px] accent-blue-600 cursor-pointer";
+const SWATCH_CLASS = "w-7 h-7 rounded-md border border-gray-200 dark:border-neutral-700 bg-transparent cursor-pointer p-0.5";
+const CHECKBOX_CLASS = "h-4 w-4 rounded accent-blue-600 cursor-pointer";
+
+// Readable names for the header. Only the shapeTypes whose raw identifier doesn't already read as a
+// name need an entry - everything else falls back to its own camelCase split into words, which is
+// correct for "rectangle", "ellipse", "hexagon" and the rest without listing all seventy of them.
+const SHAPE_DISPLAY_NAME: Partial<Record<WhiteboardNode["shapeType"], string>> = {
+  waterfallChart: "Waterfall plot",
+  barChart: "Bar chart",
+  lineChart: "Line chart",
+  pieChart: "Pie chart",
+  scatterPlot: "Scatter plot",
+  functionPlot: "Function plot",
+  numberLine: "Number line",
+  latticeGauge: "Lattice gauge",
+  bondLine: "Bond-line chain",
+  unitCircle: "Unit circle",
+  benzeneRing: "Benzene ring",
+  predefinedProcess: "Predefined process",
+  manualInput: "Manual input",
+  internalStorage: "Internal storage",
+  lightningBolt: "Lightning bolt",
+  halfCircle: "Half circle",
+  minusSign: "Minus",
+  multiplySign: "Multiply",
+  divideSign: "Divide",
+  equalsSign: "Equals",
+  greaterThanSign: "Greater than",
+  lessThanSign: "Less than",
+  greaterEqualSign: "Greater or equal",
+  lessEqualSign: "Less or equal",
+  equation: "Equation",
+  freehand: "Ink stroke",
+  image: "Image",
+};
+
+function shapeLabel(shapeType: WhiteboardNode["shapeType"]): string {
+  const named = SHAPE_DISPLAY_NAME[shapeType];
+  if (named) return named;
+  const words = shapeType.replace(/([A-Z])/g, " $1").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+// A titled group of related rows. Sections are what turn a long scroll of controls into something
+// skimmable - without them every field competes equally for attention regardless of how often it's
+// actually reached for.
+function Section({ title, children, dense }: { title?: string; children: React.ReactNode; dense?: boolean }) {
+  return (
+    <section className={`flex flex-col ${dense ? "gap-1.5" : "gap-2"}`}>
+      {title && <h3 className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-neutral-500 select-none">{title}</h3>}
+      {children}
+    </section>
+  );
+}
+
+// A bordered sub-panel for a cluster that needs to read as one unit (crop, figure layout, one
+// annotation's settings) rather than as loose rows in its parent section.
+function Card({ children }: { children: React.ReactNode }) {
+  return <div className="flex flex-col gap-1.5 rounded-lg border border-gray-200 dark:border-neutral-700/80 bg-gray-50/60 dark:bg-neutral-800/40 p-2">{children}</div>;
+}
+
+const MINI_BUTTON_CLASS =
+  "px-2.5 h-7 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs font-medium hover:bg-gray-50 dark:hover:bg-neutral-700 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition";
+
+// The chart title / x-axis / y-axis caption inputs. Committed on every keystroke (rather than on
+// blur) to match how the "graph" Expression field next to it already behaves - a caption is short
+// enough that the per-keystroke re-render costs nothing, and seeing it appear as you type is the
+// point.
+function ChartTitleFields({ node, updateNodes }: { node: WhiteboardNode; updateNodes: (patch: Partial<WhiteboardNode>) => void }) {
+  return (
+    <>
+      <Field label="Title">
+        <input
+          type="text"
+          value={node.chartTitle ?? ""}
+          placeholder="(none)"
+          onChange={(e) => updateNodes({ chartTitle: e.target.value })}
+          className={FIELD_INPUT_CLASS}
+          title="Drawn above the plot - leave empty for no title"
+        />
+      </Field>
+      <Field label="X axis label">
+        <input
+          type="text"
+          value={node.axisXTitle ?? ""}
+          placeholder="e.g. Wavenumber [cm⁻¹]"
+          onChange={(e) => updateNodes({ axisXTitle: e.target.value })}
+          className={FIELD_INPUT_CLASS}
+        />
+      </Field>
+      <Field label="Y axis label">
+        <input
+          type="text"
+          value={node.axisYTitle ?? ""}
+          placeholder="e.g. Intensity [norm.]"
+          onChange={(e) => updateNodes({ axisYTitle: e.target.value })}
+          className={FIELD_INPUT_CLASS}
+          title="Drawn rotated up the plot's left edge"
+        />
+      </Field>
+    </>
+  );
+}
+
+// The multi-series data editor for a "waterfallChart" - one trace per line, values separated by
+// commas or whitespace, which is what pasting a column-per-trace export or a row of readings out of
+// any analysis tool actually looks like.
+//
+// Unlike every other field in this panel, this one commits on an explicit Apply (or blur) rather
+// than per keystroke: a realistic paste here is thousands of numbers, and re-parsing all of them
+// plus rebuilding every trace's path on each keystroke is exactly the kind of work that makes a
+// panel feel stuck. Local text state also means a half-typed line can't blank out the figure.
+function SeriesDataField({ node, updateNodes }: { node: WhiteboardNode; updateNodes: (patch: Partial<WhiteboardNode>) => void }) {
+  const resolved = resolveSeriesData(node);
+  const toText = React.useCallback((series: number[][]) => series.map((t) => t.join(", ")).join("\n"), []);
+  const [text, setText] = React.useState(() => toText(resolved.series));
+  const [error, setError] = React.useState<string | null>(null);
+  const [dirty, setDirty] = React.useState(false);
+
+  // Resync from the node whenever its data changes from somewhere else (undo/redo, a colormap
+  // preset, another panel field) - but never while the user has unapplied edits in the box, which
+  // would throw their typing away mid-edit.
+  const nodeText = toText(resolved.series);
+  const lastNodeTextRef = React.useRef(nodeText);
+  React.useEffect(() => {
+    if (nodeText !== lastNodeTextRef.current) {
+      lastNodeTextRef.current = nodeText;
+      if (!dirty) setText(nodeText);
+    }
+  }, [nodeText, dirty]);
+
+  const apply = () => {
+    const parsed = text
+      .split("\n")
+      .map((line) => line.split(/[,\s]+/).map((s) => Number(s.trim())).filter((n) => Number.isFinite(n)))
+      .filter((t) => t.length > 0);
+    if (parsed.length === 0) {
+      setError("No numbers found - one trace per line, values separated by commas or spaces.");
+      return;
+    }
+    if (parsed.length > MAX_SERIES_COUNT) {
+      setError(`Too many traces (${parsed.length}); the limit is ${MAX_SERIES_COUNT}.`);
+      return;
+    }
+    const tooLong = parsed.find((t) => t.length > MAX_SERIES_POINTS);
+    if (tooLong) {
+      setError(`A trace has ${tooLong.length} points; the limit is ${MAX_SERIES_POINTS}.`);
+      return;
+    }
+    setError(null);
+    setDirty(false);
+    lastNodeTextRef.current = toText(parsed);
+    // Per-trace color overrides are indexed positionally, so a replacement with a different trace
+    // count would leave them pointing at the wrong traces - dropping them re-derives every color
+    // from the colormap, which is the only interpretation that can't be silently wrong.
+    updateNodes(parsed.length === resolved.series.length ? { seriesData: parsed } : { seriesData: parsed, seriesColors: undefined });
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between text-xs text-gray-600 dark:text-neutral-300">
+        <span>Data</span>
+        <span className="text-[10px] text-gray-400 dark:text-neutral-500">
+          {resolved.series.length} traces × {resolved.series.reduce((m, t) => Math.max(m, t.length), 0)} pts
+        </span>
+      </div>
+      <textarea
+        value={text}
+        spellCheck={false}
+        onChange={(e) => {
+          setText(e.target.value);
+          setDirty(true);
+        }}
+        onBlur={apply}
+        rows={5}
+        className="w-full px-1.5 py-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px] font-mono resize-y"
+        placeholder={"1, 4, 9, 4, 1\n2, 6, 12, 6, 2"}
+        title="One trace per line; values separated by commas or spaces"
+      />
+      <div className="flex items-center gap-1.5">
+        <button type="button" onClick={apply} disabled={!dirty} className={MINI_BUTTON_CLASS}>
+          Apply
+        </button>
+        {dirty && <span className="text-[10px] text-amber-600 dark:text-amber-400">unapplied edits</span>}
+      </div>
+      {error && <span className="text-[10px] text-red-600 dark:text-red-400">{error}</span>}
+    </div>
+  );
+}
+
+// Per-trace color overrides. Only rendered for a manageable number of traces - past that the
+// colormap IS the encoding (a continuous scale you read as a progression), and a 100-row swatch list
+// would be both unusable and a lot of DOM for no benefit.
+const MAX_TRACE_COLOR_ROWS = 24;
+
+function SeriesColorList({ node, updateNodes }: { node: WhiteboardNode; updateNodes: (patch: Partial<WhiteboardNode>) => void }) {
+  const resolved = resolveSeriesData(node);
+  if (resolved.series.length > MAX_TRACE_COLOR_ROWS) {
+    return (
+      <div className="text-[10px] text-gray-400 dark:text-neutral-500">
+        {resolved.series.length} traces - per-trace colors are only editable up to {MAX_TRACE_COLOR_ROWS}. Use the colormap above.
+      </div>
+    );
+  }
+  const setColor = (index: number, color: string | null) => {
+    const next = Array.from({ length: resolved.series.length }, (_, i) => node.seriesColors?.[i] ?? null);
+    next[index] = color;
+    // All overrides cleared - drop the array entirely rather than storing a row of nulls, so the
+    // node goes back to looking exactly like one that never had an override set.
+    updateNodes({ seriesColors: next.every((c) => c === null) ? undefined : next });
+  };
+  return (
+    <div className="flex flex-col gap-1 max-h-40 overflow-y-auto pr-1">
+      {resolved.series.map((_, i) => (
+        <div key={i} className="flex items-center gap-1.5">
+          <input
+            type="color"
+            value={resolved.colors[i]}
+            onChange={(e) => setColor(i, e.target.value)}
+            className="h-6 w-8 rounded border border-gray-200 dark:border-neutral-700 bg-transparent"
+            title={`Trace ${i + 1} color`}
+          />
+          <input
+            type="text"
+            value={node.seriesLabels?.[i] ?? ""}
+            placeholder={`Series ${i + 1}`}
+            onChange={(e) => {
+              const next = Array.from({ length: resolved.series.length }, (_, j) => node.seriesLabels?.[j] ?? "");
+              next[i] = e.target.value;
+              updateNodes({ seriesLabels: next });
+            }}
+            className="flex-1 min-w-0 h-6 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px]"
+          />
+          <button
+            type="button"
+            onClick={() => setColor(i, null)}
+            disabled={!node.seriesColors?.[i]}
+            className="px-1 h-6 rounded text-[10px] border border-gray-200 dark:border-neutral-700 disabled:opacity-30"
+            title="Back to this trace's colormap color"
+          >
+            ↺
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// A small preview strip of a colormap, so the dropdown is picked by eye rather than by remembering
+// what "cividis" looks like. Built from the same sampler the traces themselves use, so the swatch
+// can never show colors the plot won't.
+function ColormapSwatch({ name, reversed }: { name: ColormapName; reversed: boolean }) {
+  const stops = colormapPalette(name, 24, reversed);
+  return (
+    <div className="flex h-3 w-full overflow-hidden rounded border border-gray-200 dark:border-neutral-700">
+      {stops.map((c, i) => (
+        <div key={i} className="flex-1" style={{ backgroundColor: c }} />
+      ))}
+    </div>
+  );
+}
+
+// The data-space callout list (see whiteboardTypes.ts's ChartAnnotation). Each row edits one
+// callout's text/marker/color; its POSITION is set by dragging its handle on the canvas rather than
+// by typing coordinates here, which is both faster and the only way to place one accurately against
+// the data it is marking.
+function AnnotationFields({ node, updateNodes }: { node: WhiteboardNode; updateNodes: (patch: Partial<WhiteboardNode>) => void }) {
+  const annotations = node.chartAnnotations ?? [];
+  const update = (index: number, patch: Partial<ChartAnnotation>) =>
+    updateNodes({ chartAnnotations: annotations.map((a, i) => (i === index ? { ...a, ...patch } : a)) });
+  const add = () => {
+    // Placed at the middle of the current axis window rather than at the origin, which for a plot
+    // whose range doesn't include 0 would drop the new callout off-screen where it can't be grabbed.
+    const mapper = annotationCoordinateMapper(node.shapeType, node.width, node.height, outlineOptionsFor(node));
+    updateNodes({
+      chartAnnotations: [
+        ...annotations,
+        { x: mapper.invMapX(mapper.padX + mapper.plotW / 2), y: mapper.invMapY(mapper.padY + mapper.plotH / 2), text: "Label", marker: "dot", color: node.strokeColor },
+      ],
+    });
+  };
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between text-xs text-gray-600 dark:text-neutral-300">
+        <span>Annotations</span>
+        <button type="button" onClick={add} className={MINI_BUTTON_CLASS}>
+          + Add
+        </button>
+      </div>
+      {annotations.length === 0 && <span className="text-[10px] text-gray-400 dark:text-neutral-500">None. Add one, then drag its ring on the canvas to place it.</span>}
+      {annotations.map((a, i) => (
+        <div key={i} className="flex flex-col gap-1 rounded-lg border border-gray-200 dark:border-neutral-700/80 bg-gray-50/60 dark:bg-neutral-800/40 p-2">
+          <div className="flex items-center gap-1.5">
+            <input
+              type="text"
+              value={a.text ?? ""}
+              placeholder="(marker only)"
+              onChange={(e) => update(i, { text: e.target.value })}
+              className="flex-1 min-w-0 h-6 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px]"
+            />
+            <button
+              type="button"
+              onClick={() => updateNodes({ chartAnnotations: annotations.filter((_, j) => j !== i) })}
+              className="px-1.5 h-6 rounded text-[10px] border border-gray-200 dark:border-neutral-700 text-red-600 dark:text-red-400"
+              title="Remove this annotation"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <select
+              value={a.marker ?? "dot"}
+              onChange={(e) => update(i, { marker: e.target.value as NonNullable<ChartAnnotation["marker"]> })}
+              className="h-6 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px]"
+            >
+              <option value="dot">Dot</option>
+              <option value="ring">Ring</option>
+              <option value="square">Square</option>
+              <option value="cross">Cross</option>
+              <option value="none">No marker</option>
+            </select>
+            <input
+              type="color"
+              value={a.color ?? node.strokeColor}
+              onChange={(e) => update(i, { color: e.target.value })}
+              className="h-6 w-8 rounded border border-gray-200 dark:border-neutral-700 bg-transparent"
+              title="Marker and label color"
+            />
+            <label className="flex items-center gap-1 text-[10px] text-gray-600 dark:text-neutral-300" title="Draw a thin line from the marker to its label">
+              <input type="checkbox" checked={a.leader ?? false} onChange={(e) => update(i, { leader: e.target.checked })} className="h-3 w-3" />
+              Leader
+            </label>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Align / distribute / arrange-into-a-grid for a multi-node selection - the "make these panels into
+// a figure" controls. Every action routes through the existing batchEditNodes path, so each one is a
+// single undo step and needs no command type of its own (see whiteboardHandlers.ts's own figure-
+// layout section for the pure functions behind these buttons).
+function FigureLayoutFields({
+  nodes,
+  onBatchEditNodes,
+}: {
+  nodes: WhiteboardNode[];
+  onBatchEditNodes: (before: WhiteboardNode[], after: WhiteboardNode[]) => void;
+}) {
+  const [columns, setColumns] = React.useState(2);
+  const [gap, setGap] = React.useState(DEFAULT_GRID_GAP);
+  const [uniform, setUniform] = React.useState(true);
+
+  // The layout functions return only the nodes they actually moved (locked ones are skipped), so the
+  // matching `before` array has to be looked up by id rather than assumed to be the whole selection.
+  const apply = (after: WhiteboardNode[]) => {
+    if (after.length === 0) return;
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const before = after.map((n) => byId.get(n.id)).filter((n): n is WhiteboardNode => Boolean(n));
+    if (before.length !== after.length) return;
+    onBatchEditNodes(before, after);
+  };
+
+  const alignButtons: { edge: AlignEdge; label: string; title: string }[] = [
+    { edge: "left", label: "⇤", title: "Align left edges" },
+    { edge: "centerX", label: "⇹", title: "Align horizontal centers" },
+    { edge: "right", label: "⇥", title: "Align right edges" },
+    { edge: "top", label: "⤒", title: "Align top edges" },
+    { edge: "centerY", label: "⇳", title: "Align vertical centers" },
+    { edge: "bottom", label: "⤓", title: "Align bottom edges" },
+  ];
+
+  return (
+    <Card>
+      <span className="text-xs font-medium text-gray-600 dark:text-neutral-300">Figure layout</span>
+      <div className="grid grid-cols-6 gap-1">
+        {alignButtons.map((b) => (
+          <button key={b.edge} type="button" onClick={() => apply(alignNodes(nodes, b.edge))} className="h-7 rounded border border-gray-200 dark:border-neutral-700 text-xs hover:bg-gray-50 dark:hover:bg-neutral-700" title={b.title}>
+            {b.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => apply(distributeNodes(nodes, "horizontal"))}
+          disabled={nodes.length < 3}
+          className={`flex-1 ${MINI_BUTTON_CLASS}`}
+          title="Equalize the horizontal gaps, keeping the outermost two shapes where they are (needs 3+)"
+        >
+          Spread H
+        </button>
+        <button
+          type="button"
+          onClick={() => apply(distributeNodes(nodes, "vertical"))}
+          disabled={nodes.length < 3}
+          className={`flex-1 ${MINI_BUTTON_CLASS}`}
+          title="Equalize the vertical gaps, keeping the outermost two shapes where they are (needs 3+)"
+        >
+          Spread V
+        </button>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <label className="flex items-center gap-1 text-[10px] text-gray-600 dark:text-neutral-300">
+          Cols
+          <input
+            type="number"
+            min={1}
+            max={nodes.length}
+            value={columns}
+            onChange={(e) => setColumns(Math.max(1, Math.min(nodes.length, Number(e.target.value) || 1)))}
+            className={NUMBER_INPUT_CLASS}
+          />
+        </label>
+        <label className="flex items-center gap-1 text-[10px] text-gray-600 dark:text-neutral-300">
+          Gap
+          <input
+            type="number"
+            min={0}
+            max={400}
+            value={gap}
+            onChange={(e) => setGap(Math.max(0, Math.min(400, Number(e.target.value) || 0)))}
+            className={NUMBER_INPUT_CLASS}
+          />
+        </label>
+      </div>
+      <label className="flex items-center gap-1.5 text-[10px] text-gray-600 dark:text-neutral-300" title="Resize every panel to the largest one, so the subplots match">
+        <input type="checkbox" checked={uniform} onChange={(e) => setUniform(e.target.checked)} className="h-3 w-3" />
+        Equal panel sizes
+      </label>
+      <button
+        type="button"
+        onClick={() => apply(arrangeNodesInGrid(nodes, { columns, gapX: gap, gapY: gap, sizing: uniform ? "uniform" : "keep" }))}
+        className={MINI_BUTTON_CLASS}
+        title="Lays the selected shapes out row by row into a subplot grid, anchored at their current top-left"
+      >
+        Arrange in grid
+      </button>
+    </Card>
+  );
+}
+
+// Everything specific to an "image" node. The ring border and the matte behind a "contain" fit are
+// deliberately NOT here - those are the node's ordinary Stroke and Fill controls, which already
+// appear above for every shape; an image reusing them (rather than getting its own duplicate pair)
+// is what makes "circular photo with a thick orange ring" a two-control change instead of a
+// dedicated shape type.
+function ImageFields({
+  node,
+  updateNodes,
+  onReplace,
+  cropping,
+  onToggleCrop,
+  previewField,
+}: {
+  node: WhiteboardNode;
+  updateNodes: (patch: Partial<WhiteboardNode>) => void;
+  onReplace: () => void;
+  cropping: boolean;
+  onToggleCrop?: () => void;
+  previewField: (key: keyof WhiteboardNode) => (n: number | null) => void;
+}) {
+  const crop = resolveImageCrop(node);
+  const natural = naturalImageSize(node);
+  // Percent, because a crop reads far more naturally as "trim 10% off the left" than as 0.1 - and
+  // the four values are stored as fractions precisely so they survive a source swap (see
+  // WhiteboardNode.imageCropX's own doc comment).
+  const pct = (v: number) => Math.round(v * 1000) / 10;
+  const setCrop = (patch: Partial<{ x: number; y: number; w: number; h: number }>) => {
+    const next = { ...crop, ...patch };
+    updateNodes({ imageCropX: next.x, imageCropY: next.y, imageCropW: next.w, imageCropH: next.h });
+  };
+  return (
+    <>
+      <Field label="Fit">
+        <select
+          value={node.imageFit ?? "cover"}
+          onChange={(e) => updateNodes({ imageFit: e.target.value as NonNullable<WhiteboardNode["imageFit"]> })}
+          className={FIELD_INPUT_CLASS}
+          title="Cover fills the box and crops the overflow; Contain fits the whole image inside, showing Fill in the margin; Stretch ignores aspect ratio"
+        >
+          <option value="cover">Cover (crop to fill)</option>
+          <option value="contain">Contain (fit inside)</option>
+          <option value="fill">Stretch</option>
+        </select>
+      </Field>
+      <Field label="Shape">
+        <select
+          value={node.imageMask ?? "rect"}
+          onChange={(e) => updateNodes({ imageMask: e.target.value as NonNullable<WhiteboardNode["imageMask"]> })}
+          className={FIELD_INPUT_CLASS}
+          title="The silhouette the photo is cut to - the Stroke controls above then draw a ring following that same edge"
+        >
+          <option value="rect">Rectangle</option>
+          <option value="rounded">Rounded</option>
+          <option value="ellipse">Circle / ellipse</option>
+        </select>
+      </Field>
+      <SliderField
+        label="Opacity"
+        resetKey={`op-${node.id}`}
+        value={node.imageOpacity ?? 1}
+        min={0}
+        max={1}
+        step={0.05}
+        onCommit={(n) => updateNodes({ imageOpacity: n })}
+        onPreview={previewField("imageOpacity")}
+      />
+      <Field label="Grayscale">
+        <input
+          type="checkbox"
+          checked={node.imageGrayscale ?? false}
+          onChange={(e) => updateNodes({ imageGrayscale: e.target.checked })}
+          className={CHECKBOX_CLASS}
+          title="Desaturates the photo - keeps a reference figure from competing with annotation drawn over it"
+        />
+      </Field>
+
+      <Card>
+        <div className="flex items-center justify-between text-xs text-gray-600 dark:text-neutral-300">
+          <span className="font-medium">Crop (%)</span>
+          <button
+            type="button"
+            onClick={() => updateNodes({ imageCropX: undefined, imageCropY: undefined, imageCropW: undefined, imageCropH: undefined })}
+            disabled={!hasImageCrop(node)}
+            className={MINI_BUTTON_CLASS}
+            title="Show the whole image again"
+          >
+            Reset
+          </button>
+        </div>
+        <button
+          type="button"
+          onClick={onToggleCrop}
+          disabled={!onToggleCrop || node.locked}
+          className={`${MINI_BUTTON_CLASS} ${cropping ? "ring-1 ring-blue-500 bg-blue-50 dark:bg-blue-500/20" : ""}`}
+          title="Shows the whole picture with a draggable crop rectangle - drag its corners to crop at any angle, or drag inside it to reframe"
+        >
+          {cropping ? "Done cropping" : "Crop image"}
+        </button>
+        <span className="text-[10px] text-gray-400 dark:text-neutral-500">Drag the corners to crop freely, or inside the box to reframe. Double-clicking the image does the same.</span>
+        <div className="grid grid-cols-2 gap-1">
+          {([
+            ["Left", crop.x, (v: number) => setCrop({ x: Math.min(v, crop.x + crop.w - 0.01), w: crop.w + (crop.x - Math.min(v, crop.x + crop.w - 0.01)) })],
+            ["Top", crop.y, (v: number) => setCrop({ y: Math.min(v, crop.y + crop.h - 0.01), h: crop.h + (crop.y - Math.min(v, crop.y + crop.h - 0.01)) })],
+            ["Width", crop.w, (v: number) => setCrop({ w: Math.max(0.01, Math.min(v, 1 - crop.x)) })],
+            ["Height", crop.h, (v: number) => setCrop({ h: Math.max(0.01, Math.min(v, 1 - crop.y)) })],
+          ] as [string, number, (v: number) => void][]).map(([label, value, apply]) => (
+            <label key={label} className="flex items-center gap-1 text-[10px] text-gray-600 dark:text-neutral-300">
+              {label}
+              <ClampedNumberField
+                key={`${label}-${node.id}-${Math.round(value * 1000)}`}
+                initialValue={pct(value)}
+                min={0}
+                max={100}
+                step={1}
+                integer={false}
+                onCommit={(n) => apply(n / 100)}
+                className="w-12 h-6 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px]"
+              />
+            </label>
+          ))}
+        </div>
+      </Card>
+
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => {
+            if (natural) updateNodes({ width: natural.width, height: natural.height });
+          }}
+          disabled={!natural}
+          className={`flex-1 ${MINI_BUTTON_CLASS}`}
+          title={natural ? `Resize the box to ${natural.width} x ${natural.height} px - the cropped image's own pixel size` : "Source size unknown"}
+        >
+          Natural size
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            // Height follows width, so the box matches the cropped source's aspect ratio without
+            // changing how big the node currently is on the canvas.
+            if (!natural) return;
+            updateNodes({ height: Math.max(1, Math.round((node.width * natural.height) / natural.width)) });
+          }}
+          disabled={!natural}
+          className={`flex-1 ${MINI_BUTTON_CLASS}`}
+          title="Adjust the height so the box matches the image's aspect ratio, keeping the current width"
+        >
+          Fix aspect
+        </button>
+      </div>
+      {/* Full-width with an icon rather than another plain text button: this is the one action in
+          the image section that opens a file dialog and swaps the underlying asset, so it should
+          read as a distinct, deliberate action rather than another small toggle in the row above. */}
+      <button
+        type="button"
+        onClick={onReplace}
+        title="Swap in a different picture, keeping this node's size, crop and styling"
+        className="w-full h-8 flex items-center justify-center gap-1.5 rounded-md border border-dashed border-gray-300 dark:border-neutral-600 text-xs font-medium text-gray-600 dark:text-neutral-300 hover:border-blue-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 active:scale-[0.99] transition"
+      >
+        <IoSwapHorizontalOutline size={14} />
+        Replace image
+      </button>
+    </>
   );
 }
 
@@ -466,7 +1205,7 @@ function EdgeRotateField({ edge, onCommit }: { edge: WhiteboardEdge; onCommit: (
         min={-360}
         max={360}
         onCommit={applyRotation}
-        className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+        className={NUMBER_INPUT_CLASS}
         title="Rotates the whole line around its own center - only available while both ends are free-floating"
       />
     </Field>
@@ -475,8 +1214,12 @@ function EdgeRotateField({ edge, onCommit }: { edge: WhiteboardEdge; onCommit: (
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <label className="flex items-center justify-between gap-2 text-xs text-gray-600 dark:text-neutral-300">
-      <span>{label}</span>
+    <label className="flex items-center justify-between gap-2 min-h-[28px] text-xs text-gray-600 dark:text-neutral-300">
+      {/* The label truncates rather than wrapping: a two-line label would break the even row rhythm
+          that makes a long panel scannable, and the full text is still reachable on hover. */}
+      <span className="truncate" title={label}>
+        {label}
+      </span>
       {children}
     </label>
   );
@@ -535,7 +1278,7 @@ function TableStructureFields({ node, updateNodes }: { node: WhiteboardNode; upd
         </div>
       </Field>
       <Field label="Header row">
-        <input type="checkbox" checked={node.tableHeaderRow ?? true} onChange={(e) => updateNodes({ tableHeaderRow: e.target.checked })} className="h-3.5 w-3.5" />
+        <input type="checkbox" checked={node.tableHeaderRow ?? true} onChange={(e) => updateNodes({ tableHeaderRow: e.target.checked })} className={CHECKBOX_CLASS} />
       </Field>
     </>
   );
@@ -596,7 +1339,7 @@ function TableCellFields({
             type="color"
             value={anchorFill ?? node.fillColor ?? "#ffffff"}
             onChange={(e) => updateNodes(withRangeFill(node, range, e.target.value))}
-            className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent"
+            className={SWATCH_CLASS}
           />
           <button
             type="button"
@@ -630,11 +1373,20 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   onSendToBack,
   onGroup,
   onUngroup,
+  onReplaceImage,
+  croppingNodeId,
+  onToggleCrop,
+  onPreviewNodes,
 }) => {
   const updateNodes = (patch: Partial<WhiteboardNode>) => {
     if (selectedNodes.length === 0) return;
     onBatchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, ...patch })));
   };
+
+  // Builds the live-preview callback for one node field - every slider gets one, so dragging updates
+  // the shape on the canvas immediately while still committing exactly once on release.
+  const previewField = (key: keyof WhiteboardNode) => (n: number | null) =>
+    onPreviewNodes?.(n === null ? null : ({ [key]: n } as Partial<WhiteboardNode>));
 
   // Shifts every selected node by the same (dx, dy) in document space - the manual on-panel
   // counterpart to WhiteboardCanvas.tsx's arrow-key nudge (same 1px/10px-with-Shift step sizing),
@@ -656,13 +1408,24 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   if (selectedNodes.length === 0 && selectedEdges.length === 0) return null;
 
   return (
-    <div className="absolute top-2 right-2 bottom-2 w-60 bg-white/95 dark:bg-neutral-900/95 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-lg p-3 flex flex-col gap-3 overflow-y-auto text-neutral-800 dark:text-neutral-200">
+    <div className="absolute top-3 right-3 bottom-3 w-72 bg-white/90 dark:bg-neutral-900/90 backdrop-blur-xl border border-gray-200/80 dark:border-neutral-700/80 rounded-xl shadow-xl shadow-black/5 flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200">
+      {/* Sticky header - a long panel scrolls well past its own top, and without this there's no
+          persistent indication of WHAT the controls below are acting on. */}
+      <div className="shrink-0 px-3 py-2.5 border-b border-gray-100 dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/70">
+        <p className="text-xs font-semibold tracking-tight">
+          {selectedNodes.length > 1
+            ? `${selectedNodes.length} shapes selected`
+            : selectedNodes.length === 1
+              ? shapeLabel(selectedNodes[0].shapeType)
+              : selectedEdges.length > 1
+                ? `${selectedEdges.length} connectors`
+                : "Connector"}
+        </p>
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-3 flex flex-col gap-4">
       {selectedNodes.length > 0 && (
         <>
-          <p className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-neutral-500">
-            {selectedNodes.length > 1 ? `${selectedNodes.length} shapes` : "Shape"}
-          </p>
-
+          <Section title="Position" dense>
           {selectedNodes.length === 1 && (
             <>
               <Field label="X">
@@ -672,7 +1435,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={-100000}
                   max={100000}
                   onCommit={(n) => updateNodes({ x: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
               </Field>
               <Field label="Y">
@@ -682,7 +1445,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={-100000}
                   max={100000}
                   onCommit={(n) => updateNodes({ y: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
               </Field>
             </>
@@ -691,30 +1454,50 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             <NudgeGrid onNudge={nudgeSelected} />
           </Field>
 
+          {selectedNodes.length > 1 && <FigureLayoutFields nodes={selectedNodes} onBatchEditNodes={onBatchEditNodes} />}
+          </Section>
+
+          <Section title="Appearance" dense>
           {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
             <Field label="Fill">
               <input
                 type="color"
                 value={selectedNodes[0].fillColor ?? "#ffffff"}
                 onChange={(e) => updateNodes({ fillColor: e.target.value })}
-                className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent"
+                className={SWATCH_CLASS}
               />
             </Field>
           )}
           {selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
             <>
               <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink color" : "Stroke color"}>
-                <input type="color" value={selectedNodes[0].strokeColor} onChange={(e) => updateNodes({ strokeColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
+                <input type="color" value={selectedNodes[0].strokeColor} onChange={(e) => updateNodes({ strokeColor: e.target.value })} className={SWATCH_CLASS} />
               </Field>
-              <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink width" : "Stroke width"}>
-                <LiveRangeSlider
-                  min={selectedNodes.every((n) => n.shapeType === "freehand") ? 1 : 0}
-                  max={12}
-                  value={selectedNodes[0].strokeWidth}
-                  onCommit={(n) => updateNodes({ strokeWidth: n })}
-                  className="w-28"
-                />
-              </Field>
+              {/* The slider's top end scales with the shape itself. A fixed max of 12 is right for a
+                  flowchart box, but meaningless on a 3000px-wide imported screenshot, where a 12px
+                  ring is a hairline - the control looked like it was doing nothing. Quarter of the
+                  shorter side is the point past which a ring stops reading as a border and starts
+                  eating the shape. The numeric field beside it accepts any value regardless, so the
+                  slider's range is a convenience, never a ceiling. */}
+              {(() => {
+                const minWidth = selectedNodes.every((n) => n.shapeType === "freehand") ? 1 : 0;
+                const shortestSide = Math.min(...selectedNodes.map((n) => Math.min(n.width, n.height)));
+                const sliderMax = Math.max(12, Math.round(shortestSide / 4));
+                return (
+                  <SliderField
+                    label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink width" : "Stroke width"}
+                    resetKey={`sw-${selectedNodes.map((n) => n.id).join(",")}`}
+                    value={selectedNodes[0].strokeWidth}
+                    min={minWidth}
+                    max={MAX_STROKE_WIDTH}
+                    sliderMax={sliderMax}
+                    step={sliderMax > 40 ? 1 : 0.5}
+                    onCommit={(n) => updateNodes({ strokeWidth: n })}
+                    onPreview={previewField("strokeWidth")}
+                    title="Exact width in document units - type any value; the slider beside it is only a convenience range"
+                  />
+                );
+              })()}
             </>
           )}
           <Field label="Rotation (°)">
@@ -726,7 +1509,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               // 360 is visually identical to 0 (no rotation) - normalize both to "unset" rather than
               // clamping a typed 360 down to 359, which read as an arbitrary, unexplained cap.
               onCommit={(n) => updateNodes({ rotation: n === 0 || n === 360 ? undefined : n })}
-              className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+              className={NUMBER_INPUT_CLASS}
             />
           </Field>
           <Field label="Locked">
@@ -734,7 +1517,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               type="checkbox"
               checked={selectedNodes.every((n) => n.locked ?? false)}
               onChange={(e) => updateNodes({ locked: e.target.checked })}
-              className="h-3.5 w-3.5"
+              className={CHECKBOX_CLASS}
               title="Prevents dragging, resizing, rotating, or nudging this shape until unlocked again - handy while manually plotting onto a graph, or annotating around a shape you don't want to bump"
             />
           </Field>
@@ -758,16 +1541,21 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               </button>
             </div>
           </Field>
-          {selectedNodes.every((n) => n.shapeType === "rectangle" || n.shapeType === "equation") && (
-            <Field label="Corner radius">
-              <LiveRangeSlider
-                min={0}
-                max={Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2}
-                value={selectedNodes[0].cornerRadius ?? 0}
-                onCommit={(n) => updateNodes({ cornerRadius: n })}
-                className="w-28"
-              />
-            </Field>
+          {/* An image only uses cornerRadius when its mask is "rounded" - showing the slider for a
+              rect/ellipse-masked image would be a control with no visible effect. */}
+          {selectedNodes.every(
+            (n) => n.shapeType === "rectangle" || n.shapeType === "equation" || (n.shapeType === "image" && (n.imageMask ?? "rect") === "rounded")
+          ) && (
+            <SliderField
+              label="Corner radius"
+              resetKey={`cr-${selectedNodes.map((n) => n.id).join(",")}`}
+              value={selectedNodes[0].cornerRadius ?? 0}
+              min={0}
+              max={Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2}
+              step={1}
+              onCommit={(n) => updateNodes({ cornerRadius: n })}
+              onPreview={previewField("cornerRadius")}
+            />
           )}
           {selectedNodes.every((n) => n.shapeType === "polygon") && (
             <Field label="Sides">
@@ -777,7 +1565,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 max={12}
                 value={selectedNodes[0].sides ?? 5}
                 onChange={(e) => updateNodes({ sides: Math.max(3, Math.min(12, Number(e.target.value))) })}
-                className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                className={NUMBER_INPUT_CLASS}
               />
             </Field>
           )}
@@ -789,7 +1577,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 max={20}
                 value={selectedNodes[0].sides ?? 5}
                 onChange={(e) => updateNodes({ sides: Math.max(1, Math.min(20, Number(e.target.value))) })}
-                className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                className={NUMBER_INPUT_CLASS}
               />
             </Field>
           )}
@@ -802,19 +1590,19 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   max={12}
                   value={selectedNodes[0].starPoints ?? 5}
                   onChange={(e) => updateNodes({ starPoints: Math.max(3, Math.min(12, Number(e.target.value))) })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
               </Field>
-              <Field label="Spikiness">
-                <LiveRangeSlider
-                  min={0.15}
-                  max={0.85}
-                  step={0.05}
-                  value={selectedNodes[0].starInnerRadiusRatio ?? 0.45}
-                  onCommit={(n) => updateNodes({ starInnerRadiusRatio: n })}
-                  className="w-28"
-                />
-              </Field>
+              <SliderField
+                label="Spikiness"
+                resetKey={`sp-${selectedNodes.map((n) => n.id).join(",")}`}
+                value={selectedNodes[0].starInnerRadiusRatio ?? 0.45}
+                min={0.15}
+                max={0.85}
+                step={0.05}
+                onCommit={(n) => updateNodes({ starInnerRadiusRatio: n })}
+                onPreview={previewField("starInnerRadiusRatio")}
+              />
             </>
           )}
           {selectedNodes.every((n) => n.shapeType === "wave") && (
@@ -839,7 +1627,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={MIN_WAVE_CYCLES}
                   max={MAX_WAVE_CYCLES}
                   onCommit={(n) => updateNodes({ waveCycles: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
               </Field>
             </>
@@ -853,7 +1641,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={MIN_ANGLE_DEGREES}
                   max={MAX_ANGLE_DEGREES}
                   onCommit={(n) => updateNodes({ angleDegrees: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
               </Field>
               <Field label="Side 1">
@@ -866,7 +1654,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.05}
                     integer={false}
                     onCommit={(n) => updateNodes({ angleRay1Length: n })}
-                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    className={NUMBER_INPUT_CLASS}
                   />
                   <LiveRangeSlider
                     min={MIN_ANGLE_RAY_LENGTH}
@@ -874,7 +1662,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.05}
                     value={selectedNodes[0].angleRay1Length ?? DEFAULT_ANGLE_RAY_LENGTH}
                     onCommit={(n) => updateNodes({ angleRay1Length: n })}
-                    className="w-16"
+                  onPreview={previewField("angleRay1Length")}
+                    className={SLIDER_CLASS}
                   />
                 </div>
               </Field>
@@ -888,7 +1677,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.05}
                     integer={false}
                     onCommit={(n) => updateNodes({ angleRay2Length: n })}
-                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    className={NUMBER_INPUT_CLASS}
                   />
                   <LiveRangeSlider
                     min={MIN_ANGLE_RAY_LENGTH}
@@ -896,7 +1685,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.05}
                     value={selectedNodes[0].angleRay2Length ?? DEFAULT_ANGLE_RAY_LENGTH}
                     onCommit={(n) => updateNodes({ angleRay2Length: n })}
-                    className="w-16"
+                  onPreview={previewField("angleRay2Length")}
+                    className={SLIDER_CLASS}
                   />
                 </div>
               </Field>
@@ -908,7 +1698,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 key={selectedNodes.map((n) => n.id).join(",")}
                 initialValue={selectedNodes[0].chartData ?? DEFAULT_CHART_DATA}
                 onCommit={(values) => updateNodes({ chartData: values })}
-                className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                className={SELECT_CLASS}
               />
             </Field>
           )}
@@ -917,7 +1707,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               <select
                 value={selectedNodes[0].plotFunction ?? "sine"}
                 onChange={(e) => updateNodes({ plotFunction: e.target.value as FunctionPlotType })}
-                className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                className={SELECT_CLASS}
               >
                 {FUNCTION_PLOT_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
@@ -938,7 +1728,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   step={0.25}
                   integer={false}
                   onCommit={(n) => updateNodes({ plotDomainScale: n })}
-                  className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
                 <LiveRangeSlider
                   min={MIN_PLOT_DOMAIN_SCALE}
@@ -946,7 +1736,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   step={0.25}
                   value={selectedNodes[0].plotDomainScale ?? DEFAULT_PLOT_DOMAIN_SCALE}
                   onCommit={(n) => updateNodes({ plotDomainScale: n })}
-                  className="w-16"
+                  onPreview={previewField("plotDomainScale")}
+                  className={SLIDER_CLASS}
                   title="How much of the x-axis is shown - below 1 zooms in, above 1 zooms out"
                 />
               </div>
@@ -961,14 +1752,15 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={MIN_PLOT_CYCLES}
                   max={MAX_PLOT_CYCLES}
                   onCommit={(n) => updateNodes({ plotCycles: n })}
-                  className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
                 <LiveRangeSlider
                   min={MIN_PLOT_CYCLES}
                   max={MAX_PLOT_CYCLES}
                   value={selectedNodes[0].plotCycles ?? DEFAULT_PLOT_CYCLES}
                   onCommit={(n) => updateNodes({ plotCycles: n })}
-                  className="w-16"
+                  onPreview={previewField("plotCycles")}
+                  className={SLIDER_CLASS}
                   title="How many full wave periods are shown"
                 />
               </div>
@@ -985,7 +1777,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   step={0.1}
                   integer={false}
                   onCommit={(n) => updateNodes({ plotXTickInterval: n <= 0 ? undefined : n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                   title="Spacing between x-axis tick numbers, in this plot's own x units - 0 picks it automatically"
                 />
               </Field>
@@ -998,7 +1790,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   step={0.1}
                   integer={false}
                   onCommit={(n) => updateNodes({ plotYTickInterval: n <= 0 ? undefined : n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                   title="Spacing between y-axis tick numbers, in this plot's own y units - 0 picks it automatically"
                 />
               </Field>
@@ -1010,7 +1802,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 type="checkbox"
                 checked={selectedNodes[0].showChartLabels ?? true}
                 onChange={(e) => updateNodes({ showChartLabels: e.target.checked })}
-                className="h-3.5 w-3.5"
+                className={CHECKBOX_CLASS}
               />
             </Field>
           )}
@@ -1020,7 +1812,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 type="checkbox"
                 checked={selectedNodes[0].plotShowGrid ?? false}
                 onChange={(e) => updateNodes({ plotShowGrid: e.target.checked })}
-                className="h-3.5 w-3.5"
+                className={CHECKBOX_CLASS}
                 title="Faint gridlines across the whole plot at every tick, not just the axis tick marks"
               />
             </Field>
@@ -1034,7 +1826,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={MIN_NUMBER_LINE_MAX}
                   max={MAX_NUMBER_LINE_MAX}
                   onCommit={(n) => updateNodes({ numberLineMax: n })}
-                  className="w-14 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                   title="Line spans -this to +this"
                 />
                 <LiveRangeSlider
@@ -1042,7 +1834,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   max={100}
                   value={Math.min(100, selectedNodes[0].numberLineMax ?? DEFAULT_NUMBER_LINE_MAX)}
                   onCommit={(n) => updateNodes({ numberLineMax: n })}
-                  className="w-16"
+                  onPreview={previewField("numberLineMax")}
+                  className={SLIDER_CLASS}
                   title="Line spans -this to +this"
                 />
               </div>
@@ -1056,7 +1849,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   onChange={(e) => {
                     if (e.target.value) updateNodes({ graphExpression: e.target.value });
                   }}
-                  className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={SELECT_CLASS}
                   title="Fills the Expression field below with a common formula - still freely editable afterward"
                 >
                   <option value="">Choose a preset…</option>
@@ -1090,7 +1883,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   max={MAX_GRAPH_DOMAIN}
                   integer={false}
                   onCommit={(n) => updateNodes({ graphXMin: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
               </Field>
               <Field label="X max">
@@ -1101,7 +1894,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   max={MAX_GRAPH_DOMAIN}
                   integer={false}
                   onCommit={(n) => updateNodes({ graphXMax: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
               </Field>
               <Field label="Auto Y range">
@@ -1109,7 +1902,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   type="checkbox"
                   checked={selectedNodes[0].graphYMin === undefined && selectedNodes[0].graphYMax === undefined}
                   onChange={(e) => updateNodes(e.target.checked ? { graphYMin: undefined, graphYMax: undefined } : { graphYMin: DEFAULT_GRAPH_Y_MIN, graphYMax: DEFAULT_GRAPH_Y_MAX })}
-                  className="h-3.5 w-3.5"
+                  className={CHECKBOX_CLASS}
                   title="Fit the y-axis to the curve automatically, or set an explicit range below"
                 />
               </Field>
@@ -1123,7 +1916,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                       max={MAX_GRAPH_DOMAIN}
                       integer={false}
                       onCommit={(n) => updateNodes({ graphYMin: n })}
-                      className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                      className={NUMBER_INPUT_CLASS}
                     />
                   </Field>
                   <Field label="Y max">
@@ -1134,7 +1927,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                       max={MAX_GRAPH_DOMAIN}
                       integer={false}
                       onCommit={(n) => updateNodes({ graphYMax: n })}
-                      className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                      className={NUMBER_INPUT_CLASS}
                     />
                   </Field>
                 </>
@@ -1148,7 +1941,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   step={0.1}
                   integer={false}
                   onCommit={(n) => updateNodes({ graphXTickInterval: n <= 0 ? undefined : n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                   title="Spacing between x-axis tick numbers, in this graph's own x units - 0 picks it automatically"
                 />
               </Field>
@@ -1161,7 +1954,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   step={0.1}
                   integer={false}
                   onCommit={(n) => updateNodes({ graphYTickInterval: n <= 0 ? undefined : n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                   title="Spacing between y-axis tick numbers, in this graph's own y units - 0 picks it automatically"
                 />
               </Field>
@@ -1170,7 +1963,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   type="checkbox"
                   checked={selectedNodes[0].graphShowGrid ?? true}
                   onChange={(e) => updateNodes({ graphShowGrid: e.target.checked })}
-                  className="h-3.5 w-3.5"
+                  className={CHECKBOX_CLASS}
                   title="Faint gridlines across the whole plot at every tick, not just the axis tick marks"
                 />
               </Field>
@@ -1188,6 +1981,138 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               )}
             </>
           )}
+          {selectedNodes.every((n) => n.shapeType === "image") && selectedNodes.length === 1 && onReplaceImage && (
+            <ImageFields
+              node={selectedNodes[0]}
+              updateNodes={updateNodes}
+              onReplace={() => onReplaceImage(selectedNodes[0])}
+              cropping={croppingNodeId === selectedNodes[0].id}
+              onToggleCrop={onToggleCrop ? () => onToggleCrop(selectedNodes[0]) : undefined}
+              previewField={previewField}
+            />
+          )}
+          {selectedNodes.every((n) => n.shapeType === "waterfallChart") && (
+            <>
+              <Field label="Colormap">
+                <select
+                  value={selectedNodes[0].seriesColormap ?? DEFAULT_COLORMAP}
+                  onChange={(e) => updateNodes({ seriesColormap: e.target.value as ColormapName })}
+                  className={FIELD_INPUT_CLASS}
+                  title="Colors every trace by its position in the stack - perceptually uniform maps (viridis, cividis) are the colorblind-safe choices"
+                >
+                  {COLORMAP_NAMES.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <ColormapSwatch name={selectedNodes[0].seriesColormap ?? DEFAULT_COLORMAP} reversed={selectedNodes[0].seriesColorsReversed ?? false} />
+              <Field label="Reverse colors">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].seriesColorsReversed ?? false}
+                  onChange={(e) => updateNodes({ seriesColorsReversed: e.target.checked })}
+                  className={CHECKBOX_CLASS}
+                  title="Walks the colormap from its high end down - puts a dark end at the bottom of the stack"
+                />
+              </Field>
+              <Field label="Trace spacing">
+                <div className="flex items-center gap-1.5">
+                  <ClampedNumberField
+                    key={`off-${selectedNodes.map((n) => n.id).join(",")}`}
+                    initialValue={selectedNodes[0].seriesOffset ?? DEFAULT_SERIES_OFFSET}
+                    min={MIN_SERIES_OFFSET}
+                    max={MAX_SERIES_OFFSET}
+                    step={0.05}
+                    integer={false}
+                    onCommit={(n) => updateNodes({ seriesOffset: n })}
+                    className={NUMBER_INPUT_CLASS}
+                    title="Gap between traces, as a multiple of one trace's own height - 0 overlays them all on a shared baseline"
+                  />
+                  <LiveRangeSlider
+                    min={MIN_SERIES_OFFSET}
+                    max={2}
+                    step={0.05}
+                    value={Math.min(2, selectedNodes[0].seriesOffset ?? DEFAULT_SERIES_OFFSET)}
+                    onCommit={(n) => updateNodes({ seriesOffset: n })}
+                  onPreview={previewField("seriesOffset")}
+                    className={SLIDER_CLASS}
+                    title="0 overlays every trace; 1 stacks them with no overlap"
+                  />
+                </div>
+              </Field>
+              <Field label="X range">
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    value={selectedNodes[0].seriesXMin ?? ""}
+                    placeholder="auto"
+                    onChange={(e) => updateNodes({ seriesXMin: e.target.value === "" ? undefined : Number(e.target.value) })}
+                    className={NUMBER_INPUT_CLASS}
+                    title="Left edge of the x-axis in your own units - empty labels the axis by sample index"
+                  />
+                  <span className="text-[10px] text-gray-400">to</span>
+                  <input
+                    type="number"
+                    value={selectedNodes[0].seriesXMax ?? ""}
+                    placeholder="auto"
+                    onChange={(e) => updateNodes({ seriesXMax: e.target.value === "" ? undefined : Number(e.target.value) })}
+                    className={NUMBER_INPUT_CLASS}
+                  />
+                </div>
+              </Field>
+              <Field label="Fill under">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].seriesFillUnder ?? false}
+                  onChange={(e) => updateNodes({ seriesFillUnder: e.target.checked })}
+                  className={CHECKBOX_CLASS}
+                  title="Shades each trace down to its own baseline - the filled ridgeline/joyplot look"
+                />
+              </Field>
+              <Field label="Baselines">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].seriesShowBaselines ?? false}
+                  onChange={(e) => updateNodes({ seriesShowBaselines: e.target.checked })}
+                  className={CHECKBOX_CLASS}
+                  title="A faint zero line under each trace"
+                />
+              </Field>
+              <Field label="Show grid">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].seriesShowGrid ?? false}
+                  onChange={(e) => updateNodes({ seriesShowGrid: e.target.checked })}
+                  className={CHECKBOX_CLASS}
+                />
+              </Field>
+              <Field label="Legend">
+                <input
+                  type="checkbox"
+                  checked={selectedNodes[0].seriesShowLegend ?? false}
+                  onChange={(e) => updateNodes({ seriesShowLegend: e.target.checked })}
+                  className={CHECKBOX_CLASS}
+                  title="Keys each trace's name to its color - best kept off for a many-trace stack, where the colormap itself is the scale"
+                />
+              </Field>
+              {selectedNodes.length === 1 && (
+                <>
+                  <SeriesDataField node={selectedNodes[0]} updateNodes={updateNodes} />
+                  <SeriesColorList node={selectedNodes[0]} updateNodes={updateNodes} />
+                </>
+              )}
+            </>
+          )}
+          {/* Titles and callouts sit AFTER each chart type's own data fields - they're the finishing
+              pass on a figure whose data is already set up, and every chart type shares them. */}
+          {selectedNodes.every((n) => CHART_AXIS_TITLE_SHAPES.has(n.shapeType)) && selectedNodes.length === 1 && (
+            <ChartTitleFields node={selectedNodes[0]} updateNodes={updateNodes} />
+          )}
+          {selectedNodes.every((n) => CHART_ANNOTATION_SHAPES.has(n.shapeType)) && selectedNodes.length === 1 && (
+            <AnnotationFields node={selectedNodes[0]} updateNodes={updateNodes} />
+          )}
           {selectedNodes.every((n) => n.shapeType === "amplifier") && (
             <>
               <Field label="Swap +/-">
@@ -1195,7 +2120,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   type="checkbox"
                   checked={selectedNodes[0].ampInvertingOnTop ?? false}
                   onChange={(e) => updateNodes({ ampInvertingOnTop: e.target.checked })}
-                  className="h-3.5 w-3.5"
+                  className={CHECKBOX_CLASS}
                   title="Draw the inverting (-) input on top and the non-inverting (+) input on bottom, instead of the usual + on top / - on bottom - a pure label swap, the leads themselves don't move"
                 />
               </Field>
@@ -1206,7 +2131,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={MIN_AMP_LEAD_LENGTH}
                   max={MAX_AMP_LEAD_LENGTH}
                   onCommit={(n) => updateNodes({ ampInputTopLeadLength: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                   title="Length of the top input lead - same value the diamond handle on the canvas drags"
                 />
               </Field>
@@ -1217,7 +2142,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={MIN_AMP_LEAD_LENGTH}
                   max={MAX_AMP_LEAD_LENGTH}
                   onCommit={(n) => updateNodes({ ampInputBottomLeadLength: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                   title="Length of the bottom input lead - same value the diamond handle on the canvas drags"
                 />
               </Field>
@@ -1228,7 +2153,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   min={MIN_AMP_LEAD_LENGTH}
                   max={MAX_AMP_LEAD_LENGTH}
                   onCommit={(n) => updateNodes({ ampOutputLeadLength: n })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                   title="Length of the output lead - same value the diamond handle on the canvas drags"
                 />
               </Field>
@@ -1259,7 +2184,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 <select
                   value={selectedNodes[0].latticeTeachingMode ?? "free"}
                   onChange={(e) => updateNodes({ latticeTeachingMode: e.target.value as "free" | "plaquette" | "gauge" })}
-                  className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={SELECT_CLASS}
                 >
                   <option value="free">Free explore</option>
                   <option value="plaquette">Plaquette loop U□</option>
@@ -1270,7 +2195,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 <select
                   value={selectedNodes[0].latticeSpinModel ?? "ising"}
                   onChange={(e) => updateNodes({ latticeSpinModel: e.target.value as "ising" | "xy" | "heisenberg" })}
-                  className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={SELECT_CLASS}
                   title="What each site's spin arrow represents - only visible while Show spins is on"
                 >
                   <option value="ising">Ising (up/down)</option>
@@ -1286,7 +2211,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     min={MIN_LATTICE_SIZE}
                     max={MAX_LATTICE_SIZE}
                     onCommit={(n) => updateNodes({ latticeSize: n })}
-                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    className={NUMBER_INPUT_CLASS}
                     title="Sites per edge (N) - the lattice is N x N x N"
                   />
                   <LiveRangeSlider
@@ -1295,7 +2220,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={1}
                     value={selectedNodes[0].latticeSize ?? DEFAULT_LATTICE_SIZE}
                     onCommit={(n) => updateNodes({ latticeSize: n })}
-                    className="w-16"
+                  onPreview={previewField("latticeSize")}
+                    className={SLIDER_CLASS}
                     title="Sites per edge (N) - the lattice is N x N x N"
                   />
                 </div>
@@ -1310,7 +2236,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.1}
                     integer={false}
                     onCommit={(n) => updateNodes({ latticeSiteSpacing: n })}
-                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    className={NUMBER_INPUT_CLASS}
                     title="3D-world distance between neighboring sites - purely a spread-out/compact look, unrelated to the shape's own on-canvas width/height"
                   />
                   <LiveRangeSlider
@@ -1319,7 +2245,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.1}
                     value={selectedNodes[0].latticeSiteSpacing ?? DEFAULT_LATTICE_SITE_SPACING}
                     onCommit={(n) => updateNodes({ latticeSiteSpacing: n })}
-                    className="w-16"
+                  onPreview={previewField("latticeSiteSpacing")}
+                    className={SLIDER_CLASS}
                   />
                 </div>
               </Field>
@@ -1333,7 +2260,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.01}
                     integer={false}
                     onCommit={(n) => updateNodes({ latticeSiteRadius: n })}
-                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    className={NUMBER_INPUT_CLASS}
                     title="Quark sphere radius, in world units - independent of site spacing"
                   />
                   <LiveRangeSlider
@@ -1342,7 +2269,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.01}
                     value={selectedNodes[0].latticeSiteRadius ?? DEFAULT_LATTICE_SITE_RADIUS}
                     onCommit={(n) => updateNodes({ latticeSiteRadius: n })}
-                    className="w-16"
+                  onPreview={previewField("latticeSiteRadius")}
+                    className={SLIDER_CLASS}
                   />
                 </div>
               </Field>
@@ -1356,7 +2284,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.005}
                     integer={false}
                     onCommit={(n) => updateNodes({ latticeLinkWidth: n })}
-                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    className={NUMBER_INPUT_CLASS}
                     title="Gauge-link line weight (radius), in world units"
                   />
                   <LiveRangeSlider
@@ -1365,7 +2293,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.005}
                     value={selectedNodes[0].latticeLinkWidth ?? DEFAULT_LATTICE_LINK_WIDTH}
                     onCommit={(n) => updateNodes({ latticeLinkWidth: n })}
-                    className="w-16"
+                  onPreview={previewField("latticeLinkWidth")}
+                    className={SLIDER_CLASS}
                   />
                 </div>
               </Field>
@@ -1379,7 +2308,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.01}
                     integer={false}
                     onCommit={(n) => updateNodes({ latticeSpinArrowSize: n })}
-                    className="w-11 h-7 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                    className={NUMBER_INPUT_CLASS}
                     title="Spin-arrow length, in world units - only visible while Show spins is on"
                   />
                   <LiveRangeSlider
@@ -1388,7 +2317,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                     step={0.01}
                     value={selectedNodes[0].latticeSpinArrowSize ?? DEFAULT_LATTICE_SPIN_ARROW_SIZE}
                     onCommit={(n) => updateNodes({ latticeSpinArrowSize: n })}
-                    className="w-16"
+                  onPreview={previewField("latticeSpinArrowSize")}
+                    className={SLIDER_CLASS}
                   />
                 </div>
               </Field>
@@ -1397,7 +2327,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   type="checkbox"
                   checked={selectedNodes[0].latticeShowQuarks ?? true}
                   onChange={(e) => updateNodes({ latticeShowQuarks: e.target.checked })}
-                  className="h-3.5 w-3.5"
+                  className={CHECKBOX_CLASS}
                   title="Matter-field spheres on each site"
                 />
               </Field>
@@ -1406,7 +2336,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   type="checkbox"
                   checked={selectedNodes[0].latticeShowGluons ?? true}
                   onChange={(e) => updateNodes({ latticeShowGluons: e.target.checked })}
-                  className="h-3.5 w-3.5"
+                  className={CHECKBOX_CLASS}
                   title="Gauge-link lines between neighboring sites"
                 />
               </Field>
@@ -1415,7 +2345,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   type="checkbox"
                   checked={selectedNodes[0].latticeShowSpins ?? false}
                   onChange={(e) => updateNodes({ latticeShowSpins: e.target.checked })}
-                  className="h-3.5 w-3.5"
+                  className={CHECKBOX_CLASS}
                   title="Spin-direction arrows on each site, per the Spin model above"
                 />
               </Field>
@@ -1424,7 +2354,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   type="checkbox"
                   checked={selectedNodes[0].latticeAnimateFlux ?? true}
                   onChange={(e) => updateNodes({ latticeAnimateFlux: e.target.checked })}
-                  className="h-3.5 w-3.5"
+                  className={CHECKBOX_CLASS}
                   title="A traveling brightness pulse along every gauge link"
                 />
               </Field>
@@ -1433,7 +2363,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   type="checkbox"
                   checked={selectedNodes[0].latticeAnimateSpins ?? false}
                   onChange={(e) => updateNodes({ latticeAnimateSpins: e.target.checked })}
-                  className="h-3.5 w-3.5"
+                  className={CHECKBOX_CLASS}
                   title="Continuously re-randomizes a handful of spins at a time, suggesting live flip dynamics (illustrative only, not an actual simulation)"
                 />
               </Field>
@@ -1485,8 +2415,10 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             </div>
           )}
 
+          </Section>
+
           {selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge") && (
-            <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex flex-col gap-2">
+            <Section title="Text" dense>
               {/* Font family/Bold/Italic/Underline are meaningless for "equation" - KaTeX typesets
                   with its own math font regardless, so these controls would sit there doing nothing
                   visible if shown. Font size/color and Align DO still apply (see EquationDisplay/
@@ -1513,11 +2445,11 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   max={96}
                   value={selectedNodes[0].fontSize}
                   onChange={(e) => updateNodes({ fontSize: Number(e.target.value) })}
-                  className="w-16 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={NUMBER_INPUT_CLASS}
                 />
               </Field>
               <Field label="Font color">
-                <input type="color" value={selectedNodes[0].fontColor} onChange={(e) => updateNodes({ fontColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
+                <input type="color" value={selectedNodes[0].fontColor} onChange={(e) => updateNodes({ fontColor: e.target.value })} className={SWATCH_CLASS} />
               </Field>
               {selectedNodes.every((n) => n.shapeType !== "equation") && (
                 <div className="flex items-center justify-between">
@@ -1572,10 +2504,10 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   ))}
                 </div>
               </div>
-            </div>
+            </Section>
           )}
 
-          <div className="border-t border-gray-100 dark:border-neutral-700/70 pt-2 flex items-center gap-2">
+          <div className="border-t border-gray-100 dark:border-neutral-800 pt-3 flex items-center gap-1">
             <button type="button" onClick={onBringToFront} title="Bring to front" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
               <TbStackFront size={16} />
             </button>
@@ -1617,11 +2549,11 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           </Field>
           {!edge.source.nodeId && !edge.target.nodeId && <EdgeRotateField key={edge.id} edge={edge} onCommit={updateEdge} />}
           <Field label="Color">
-            <input type="color" value={edge.strokeColor} onChange={(e) => updateEdge({ strokeColor: e.target.value })} className="w-8 h-6 rounded border border-gray-300 dark:border-neutral-600 bg-transparent" />
+            <input type="color" value={edge.strokeColor} onChange={(e) => updateEdge({ strokeColor: e.target.value })} className={SWATCH_CLASS} />
           </Field>
-          <Field label="Width">
-            <LiveRangeSlider min={1} max={8} value={edge.strokeWidth} onCommit={(n) => updateEdge({ strokeWidth: n })} className="w-28" />
-          </Field>
+          {/* No live preview here: previewNodes only replaces NODES, and an edge's width isn't part
+              of that channel. The thumb still tracks the drag, and the width commits on release. */}
+          <SliderField label="Width" resetKey={edge.id} value={edge.strokeWidth} min={0.5} max={40} sliderMax={12} step={0.5} onCommit={(n) => updateEdge({ strokeWidth: n })} />
           <Field label="Line">
             <select
               value={edge.strokeStyle}
@@ -1656,7 +2588,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 step={0.05}
                 value={edge.curveBow ?? DEFAULT_CURVE_BOW}
                 onCommit={(n) => updateEdge({ curveBow: n })}
-                className="w-28"
+                className={SLIDER_CLASS}
                 title="Which way (and how far) a free-floating end of this curve bows - only matters where the curve has no shape side to bow away from"
               />
             </Field>
@@ -1704,18 +2636,19 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             value={edge.label}
             placeholder="Label"
             onChange={(e) => updateEdge({ label: e.target.value })}
-            className="w-full h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+            className={`w-full ${TEXT_INPUT_CLASS}`}
           />
           <button
             type="button"
             onClick={() => onDeleteEdge(edge)}
             title="Delete"
-            className="self-start p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 text-red-600 dark:text-red-400"
+            className="self-start p-1.5 rounded-md hover:bg-red-50 dark:hover:bg-red-500/10 text-red-600 dark:text-red-400 transition"
           >
             <IoTrashOutline size={16} />
           </button>
         </>
       )}
+      </div>
     </div>
   );
 };

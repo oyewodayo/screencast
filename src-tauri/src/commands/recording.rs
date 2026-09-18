@@ -67,6 +67,29 @@ pub struct AppState {
     // stops it and writes its collected clicks to a sidecar JSON file next to the finished video.
     #[cfg(target_os = "windows")]
     click_capture: Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
+    // Screen<->camera view-switch events for the recording currently in progress, logged by the
+    // record_view_switch command as the user toggles the live recording bar's "Screen"/"Camera"
+    // control - see that command's own doc comment. Not Windows-only by construction (unlike
+    // click_capture above): this is plain event bookkeeping, not an OS-specific capture mechanism,
+    // so nothing here stops it from working wherever separate_webcam_capture eventually produces a
+    // second file to switch to. Cleared at the start of every recording and written out (if
+    // non-empty) as a sidecar JSON by stop_recording, same convention as click_capture's own
+    // sidecar.
+    view_switches: Arc<Mutex<Vec<ViewSwitchEvent>>>,
+}
+
+// One user-initiated toggle between "Screen" and "Camera" as the primary view during a recording
+// that has both a screen and a separate camera stream to switch between (see
+// FormData.separate_webcam_capture) - the editor and export step read the full sequence back to
+// know when to cut from one to the other. `elapsed_secs` is computed by the FRONTEND (from the
+// same recording-start timestamp its own live timer already uses, see RecordingOverlayWindow.tsx)
+// rather than a backend Instant, so it lines up with what the user actually sees on the timer
+// rather than a slightly-different backend notion of "when recording started."
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSwitchEvent {
+    pub elapsed_secs: f64,
+    pub mode: String,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -233,6 +256,75 @@ pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> 
     fs::read_to_string(&sidecar)
         .map(Some)
         .map_err(|e| format!("Failed to read click-tracking sidecar: {}", e))
+}
+
+// Same sidecar convention as click_sidecar_path above, for the screen<->camera view-switch
+// timeline instead of clicks.
+fn view_switch_sidecar_path(video_path: &Path) -> PathBuf {
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording");
+    video_path.with_file_name(format!("{}.viewswitch.json", stem))
+}
+
+// Reads back whatever view_switch_sidecar_path holds for `video_path`, if anything - None (not an
+// error) when the video was never recorded with any view switches, same convention
+// load_click_sidecar above uses.
+#[tauri::command]
+pub fn load_view_switch_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let sidecar = view_switch_sidecar_path(&PathBuf::from(&video_path));
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&sidecar)
+        .map(Some)
+        .map_err(|e| format!("Failed to read view-switch sidecar: {}", e))
+}
+
+// Where a "record webcam separately" recording's own second file lives, if it has one - the
+// naming convention win.rs's recording_with_output_sva establishes (`<stem>_webcam.mp4`). The
+// editor calls this to find the file a view-switch timeline should cut TO. Returns None (not an
+// error) if no such file exists - the normal case for any recording that didn't have
+// FormData.separate_webcam_capture on, same "missing is fine" convention load_click_sidecar and
+// load_view_switch_sidecar both use.
+#[tauri::command]
+pub fn get_webcam_sidecar_path(video_path: String) -> Option<String> {
+    let path = PathBuf::from(&video_path);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
+    let webcam_path = path.with_file_name(format!("{}_webcam.mp4", stem));
+    if webcam_path.exists() {
+        path_to_str(&webcam_path).ok().map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+// Called by the live recording bar every time the user toggles between "Screen" and "Camera" as
+// the primary view - just appends to AppState's own in-memory log, written out as a sidecar once
+// the recording actually finishes (stop_recording). `elapsed_secs` is frontend-computed - see
+// ViewSwitchEvent's own doc comment for why. No-ops rather than erroring if no recording is
+// currently in progress (state.output_path is None) or mode isn't recognized - a stray/late call
+// (e.g. a click landing right as the recording is already stopping) shouldn't surface a visible
+// error for something this minor.
+#[tauri::command]
+pub async fn record_view_switch(
+    state: State<'_, AppState>,
+    elapsed_secs: f64,
+    mode: String,
+) -> Result<(), String> {
+    if mode != "screen" && mode != "camera" {
+        return Ok(());
+    }
+    if state.output_path.lock().await.is_none() {
+        return Ok(());
+    }
+    state
+        .view_switches
+        .lock()
+        .await
+        .push(ViewSwitchEvent { elapsed_secs, mode });
+    Ok(())
 }
 
 // ffmpeg's stderr always leads with its multi-hundred-character build banner (version, compile
@@ -796,6 +888,11 @@ pub async fn start_recording(
 
     let output_path = resolve_recording_output_path(&form_data)?;
 
+    // A new recording starting - any view-switch events left over from a previous one (there
+    // shouldn't be, stop_recording already clears this, but a recording that failed to start
+    // cleanly could in principle skip that) must not leak into this one's sidecar.
+    state.view_switches.lock().await.clear();
+
     // Cloned before the match below moves `state` into whichever platform::recording_with_output_*
     // arm actually runs - these are Arc<Mutex<..>> clones of the same shared AppState fields, so
     // this doesn't lose access to whatever that arm stores into them. Needed so the liveness check
@@ -1081,6 +1178,25 @@ pub async fn stop_recording(
                     }
                     Err(e) => warn!("Failed to serialize click-tracking data: {}", e),
                 }
+            }
+        }
+    }
+
+    // Same idea as the click-tracking sidecar just above, for this recording's own screen<->camera
+    // view-switch timeline (see record_view_switch's own doc comment) - written once the file's
+    // already confirmed non-empty above, then cleared either way so a future recording never
+    // inherits stale switches from this one.
+    {
+        let switches = std::mem::take(&mut *state.view_switches.lock().await);
+        if !switches.is_empty() {
+            let switches_path = view_switch_sidecar_path(&output_path);
+            match serde_json::to_string(&switches) {
+                Ok(json) => {
+                    if let Err(e) = fs::write(&switches_path, json) {
+                        warn!("Failed to write view-switch sidecar: {}", e);
+                    }
+                }
+                Err(e) => warn!("Failed to serialize view-switch data: {}", e),
             }
         }
     }

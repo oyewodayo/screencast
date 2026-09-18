@@ -12,6 +12,8 @@
 // page has its own nodes/edges and its own undo history (see useWhiteboardStore.ts's setActivePage
 // doc comment for why undo is per-page rather than a single global stack).
 
+import { ColormapName, colormapPalette, DEFAULT_COLORMAP } from "./colormaps";
+
 export type WhiteboardShapeType =
   | "rectangle"
   | "ellipse"
@@ -102,6 +104,16 @@ export type WhiteboardShapeType =
   // its compileGraphExpression doc comment for why), plotted with the same "chart" outline machinery
   // (axis lines, optional gridlines, tick labels) every other chart shape already shares.
   | "graph"
+  // A stack of many independently-colored traces sharing one x-axis (WhiteboardNode.seriesData) -
+  // the "waterfall"/"stacked spectra" plot a spectroscopy or time-series figure is built from, where
+  // the point is comparing how a whole FAMILY of measurements evolves rather than reading one curve.
+  // Deliberately its own shapeType rather than another chartData-driven variant: every other chart
+  // shape here holds exactly one series in WhiteboardNode.chartData and takes its single color from
+  // the node's own strokeColor, and neither of those generalizes to N series that each need their
+  // own color. Setting seriesOffset to 0 collapses the stack into a plain overlaid multi-series line
+  // chart (all traces on a shared baseline), so this one shapeType covers both layouts rather than
+  // needing a separate "overlay" type - see seriesOffset's own doc comment.
+  | "waterfallChart"
   // A typeset math formula (rendered via KaTeX - see whiteboardHandlers.ts's paintEquation and
   // WhiteboardCanvas.tsx's own KaTeX rendering) - reuses WhiteboardNode.text to hold the raw LaTeX
   // SOURCE (e.g. "E = mc^2"), the same field every other shape's label already lives in, rather than
@@ -139,6 +151,14 @@ export type WhiteboardShapeType =
   | "lessThanSign" // the same chevron as "greaterThanSign", mirrored
   | "greaterEqualSign" // the "greaterThanSign" chevron with a bar underneath
   | "lessEqualSign" // the "lessThanSign" chevron with a bar underneath
+  // A photo/bitmap placed on the canvas - the source file is COPIED into this whiteboard's own
+  // assets/ folder at import time (see WhiteboardNode.assetFileName), never referenced in place, so
+  // a diagram keeps working after the original is moved, renamed or deleted. Gets every transform
+  // (move/resize/rotate/flip/lock/group/z-order) for free from the shared node box, exactly like
+  // every vector shape here; what's specific to it is how the bitmap is fitted into that box
+  // (imageFit), what silhouette it's cut to (imageMask), and which part of the source is shown
+  // (imageCrop*) - see each field's own doc comment.
+  | "image"
   | "text"
   | "freehand";
 
@@ -166,6 +186,11 @@ export const LINE_ONLY_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<Whiteb
   // "graph": same reasoning as "functionPlot" immediately above - axis lines + a stroked curve, no
   // fillable silhouette of its own.
   "graph",
+  // "waterfallChart": every trace carries its own colormap-derived color (see
+  // WhiteboardNode.seriesColormap), so node.fillColor has nothing to apply to - same reasoning as
+  // "pieChart" above. Its optional under-trace shading (seriesFillUnder) tints each trace with that
+  // trace's OWN color, not the node's fill.
+  "waterfallChart",
   // "diode" is deliberately NOT here - its triangle is a real fillable region, same reasoning as
   // barChart's bars.
   "vector",
@@ -267,7 +292,234 @@ export const CHART_DATA_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<White
 // The shapeTypes whose "chart" ShapeOutline can carry tick/value labels (see ChartLabel and
 // WhiteboardNode.showChartLabels) - every chart type except pieChart, which has no axis at all to
 // label (a pie's own "data" is communicated by slice size/color, not a scale).
-export const CHART_LABEL_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["barChart", "lineChart", "scatterPlot", "functionPlot", "numberLine", "graph"]);
+export const CHART_LABEL_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>([
+  "barChart",
+  "lineChart",
+  "scatterPlot",
+  "functionPlot",
+  "numberLine",
+  "graph",
+  "waterfallChart",
+]);
+
+// The shapeTypes that can carry a chart title and x/y axis titles (WhiteboardNode.chartTitle/
+// axisXTitle/axisYTitle) - every chart with a real labeled axis. pieChart is excluded for the same
+// reason it's excluded from CHART_LABEL_SHAPES (no axis to title); numberLine takes only the x title
+// in practice, but is included rather than special-cased since a y title on it simply resolves to
+// nothing being drawn (see whiteboardHandlers.ts's chartTitleLabels).
+//
+// These exist so a subplot figure is built from self-contained chart nodes instead of a chart plus
+// three separately-positioned "text" nodes that have to be re-nudged by hand every time the chart is
+// moved or resized - the whole reason arranging a multi-panel figure used to be tedious.
+export const CHART_AXIS_TITLE_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>([
+  "barChart",
+  "lineChart",
+  "scatterPlot",
+  "functionPlot",
+  "numberLine",
+  "graph",
+  "waterfallChart",
+]);
+
+// The shapeTypes that can carry data-space annotations (WhiteboardNode.chartAnnotations) - scoped to
+// the two whose axes resolve to an explicit [min,max] window with no sampling involved, so an
+// annotation's stored data coordinates map to one unambiguous pixel position and can be inverse-
+// mapped back when dragged (see whiteboardHandlers.ts's graphCoordinateMapper/resolveGraphAxisRange).
+// functionPlot is deliberately NOT here despite also having axes: its y-range auto-fits to whatever
+// the sampled curve happens to span, so the same annotation would silently jump whenever the domain
+// scale or cycle count changed - the identical mismatch resolveGraphAxisRange's own doc comment
+// already describes for manual graph points.
+export const CHART_ANNOTATION_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>(["graph", "waterfallChart"]);
+
+// One labeled point called out on a chart, positioned in the chart's own DATA space (an x/y value on
+// its axes, not a pixel offset) - the same "store data coordinates, re-project at render time"
+// convention WhiteboardNode.graphPoints already uses, and for the same reason: the callout stays
+// attached to the feature it's marking when the axis range or the node's box changes.
+//
+// Deliberately a first-class field rather than "place a small ellipse next to a text node": those
+// two are unrelated free-floating shapes that silently come apart the moment the chart is moved,
+// resized, or rescaled, which is exactly what makes hand-annotating a figure tedious and fragile.
+export interface ChartAnnotation {
+  x: number;
+  y: number;
+  // Shown next to the marker - empty/absent draws the marker alone (a bare "this point" dot).
+  text?: string;
+  // Label offset from the marker, in PIXELS rather than data units - a callout sits a fixed visual
+  // distance from its point regardless of how the axes are scaled, which is what keeps it clear of
+  // the marker at every zoom level (a data-unit offset would collapse onto the dot as the range
+  // widened). Absent - resolves to DEFAULT_ANNOTATION_LABEL_DX/DY.
+  labelDx?: number;
+  labelDy?: number;
+  // Marker glyph and color. `color` absent - resolves to the node's own strokeColor, so an
+  // un-customized annotation still matches the chart it's on. "none" draws the label with no marker
+  // (a floating in-plot text note anchored to a data coordinate).
+  marker?: "dot" | "ring" | "square" | "cross" | "none";
+  color?: string;
+  // Radius/half-size of the marker glyph in pixels. Absent - resolves to DEFAULT_ANNOTATION_MARKER_SIZE.
+  size?: number;
+  // Draws a thin leader line from the marker to the label - worth having whenever the label has to
+  // sit far enough away to clear dense data. Absent - resolves to false.
+  leader?: boolean;
+}
+
+export const DEFAULT_ANNOTATION_LABEL_DX = 8;
+export const DEFAULT_ANNOTATION_LABEL_DY = -10;
+export const DEFAULT_ANNOTATION_MARKER_SIZE = 4;
+
+// ---- Multi-series ("waterfallChart") ------------------------------------------------------------
+
+// Hard ceilings on what WhiteboardNode.seriesData can hold. These are not stylistic limits - every
+// trace is a separate SVG <path> whose `d` string is rebuilt whenever the outline is recomputed, so
+// an unbounded import (a stray 10,000-row CSV paste) would build megabytes of path text per frame
+// and lock the canvas up mid-drag. MAX_SERIES_COUNT is generously past any readable stacked figure
+// (a 200-trace waterfall is a solid block of ink long before it's a slow one); MAX_SERIES_POINTS is
+// per trace, well past typical spectral resolution, and is a storage cap only - what actually keeps
+// rendering cheap regardless of how many points are stored is the min/max decimation in
+// whiteboardHandlers.ts's decimateSeries, which caps the DRAWN vertex count to roughly the plot's
+// own pixel width no matter how dense the underlying data is.
+export const MAX_SERIES_COUNT = 200;
+export const MAX_SERIES_POINTS = 20000;
+
+// WhiteboardNode.seriesOffset bounds - see its own doc comment for what the number means.
+export const DEFAULT_SERIES_OFFSET = 0.55;
+export const MIN_SERIES_OFFSET = 0;
+export const MAX_SERIES_OFFSET = 5;
+
+// Deterministic PRNG (mulberry32) - the sample data below has to be byte-identical every time this
+// module loads, since a freshly placed waterfall node's data is written straight into the saved
+// document: seeding it from Math.random would mean two users placing the "same" starting shape get
+// different documents, and re-running it would silently change an existing figure.
+function seededRandom(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// The sample stack a fresh "waterfallChart" starts with - a synthetic frequency comb whose mode
+// envelope walks across the traces, which is what makes a stacked plot worth looking at in the first
+// place (a family of measurements evolving) rather than N copies of one curve. Generated rather than
+// written out as a literal purely for file size: the equivalent literal is ~4,000 numbers.
+//
+// This is decorative placeholder data with no physical meaning - it exists so a newly placed shape
+// reads as a real figure immediately instead of an empty box, exactly like DEFAULT_CHART_DATA does
+// for the single-series charts, and is meant to be replaced by the user's own measurements.
+function buildDefaultWaterfallSeries(): number[][] {
+  const traces = 18;
+  const samples = 240;
+  const rand = seededRandom(0x5eed);
+  return Array.from({ length: traces }, (_, t) => {
+    // Envelope center sweeps left-to-right across the stack; width breathes a little with it.
+    const center = 0.34 + 0.3 * (t / (traces - 1));
+    const envWidth = 0.1 + 0.05 * Math.sin((t / traces) * Math.PI);
+    return Array.from({ length: samples }, (_, i) => {
+      const u = i / (samples - 1);
+      // A comb of evenly spaced modes under a Gaussian envelope - the shape a mode-locked spectrum
+      // actually has, and the reason the traces read as "spectra" rather than generic wiggles.
+      const comb = Math.pow(Math.abs(Math.cos(u * Math.PI * 46)), 26);
+      const envelope = Math.exp(-((u - center) ** 2) / (2 * envWidth ** 2));
+      const secondary = 0.35 * Math.exp(-((u - center + 0.16) ** 2) / (2 * (envWidth * 0.55) ** 2));
+      return (comb * (envelope + secondary) + rand() * 0.012) * 100;
+    });
+  });
+}
+
+export const DEFAULT_WATERFALL_SERIES: number[][] = buildDefaultWaterfallSeries();
+
+export interface ResolvedSeries {
+  // Sanitized traces - every entry finite, every trace non-empty, count/length within the
+  // MAX_SERIES_COUNT/MAX_SERIES_POINTS caps.
+  series: number[][];
+  // One color per trace, already resolving seriesColors overrides against the colormap.
+  colors: string[];
+  labels: string[];
+  xMin: number;
+  xMax: number;
+  // The amplitude window ONE trace spans, before stacking.
+  yMin: number;
+  yMax: number;
+  // Vertical gap between consecutive trace baselines, in the same y units as yMin/yMax (already
+  // resolved from the relative seriesOffset multiplier).
+  offsetStep: number;
+  // The full stacked y-extent, what the y-axis actually has to span: yMin to yMax + (n-1)*offsetStep.
+  stackedYMin: number;
+  stackedYMax: number;
+}
+
+// The one place a "waterfallChart" node's series fields get resolved into a definitely-consistent
+// plot description - every reader (the live SVG render, the Canvas2D export, the style panel's
+// trace list) goes through this rather than reading seriesData/seriesColors/seriesOffset off the
+// node directly, so malformed or stale data (a NaN from a bad CSV paste, a seriesColors array left
+// longer than seriesData after traces were deleted, an all-identical trace with zero range) can
+// never desync one reader from another, produce a divide-by-zero, or throw. Same "resolve absent/
+// stale data at read time" convention resolveTableGrid already sets for tables.
+// Structurally typed to just the fields it reads rather than a whole WhiteboardNode, so
+// whiteboardHandlers.ts's ShapeOutlineOptions (which mirrors node fields one-by-one and has no real
+// node behind it when previewing a toolbar tile) can be passed straight in.
+export type SeriesSource = Pick<
+  WhiteboardNode,
+  "seriesData" | "seriesXMin" | "seriesXMax" | "seriesYMin" | "seriesYMax" | "seriesOffset" | "seriesColormap" | "seriesColorsReversed" | "seriesColors" | "seriesLabels"
+>;
+
+export function resolveSeriesData(node: SeriesSource): ResolvedSeries {
+  const raw = node.seriesData && node.seriesData.length > 0 ? node.seriesData : DEFAULT_WATERFALL_SERIES;
+  const series = raw
+    .slice(0, MAX_SERIES_COUNT)
+    .map((trace) => (Array.isArray(trace) ? trace.slice(0, MAX_SERIES_POINTS).filter((v) => Number.isFinite(v)) : []))
+    .filter((trace) => trace.length > 0);
+  // Every trace was empty or malformed - fall back rather than returning a zero-trace plot that
+  // every downstream mapper would then have to special-case.
+  const safe = series.length > 0 ? series : DEFAULT_WATERFALL_SERIES;
+
+  let dataMin = Infinity;
+  let dataMax = -Infinity;
+  for (const trace of safe) {
+    for (const v of trace) {
+      if (v < dataMin) dataMin = v;
+      if (v > dataMax) dataMax = v;
+    }
+  }
+  let yMin = node.seriesYMin ?? dataMin;
+  let yMax = node.seriesYMax ?? dataMax;
+  // A perfectly flat trace (every sample identical) has zero range, which would make every
+  // data-to-pixel division below a 0/0 - give it a nominal unit window instead so it draws as a
+  // straight line at its own value rather than vanishing.
+  if (!Number.isFinite(yMin) || !Number.isFinite(yMax) || yMax <= yMin) {
+    const mid = Number.isFinite(yMin) ? yMin : 0;
+    yMin = mid - 0.5;
+    yMax = mid + 0.5;
+  }
+
+  const longest = safe.reduce((m, t) => Math.max(m, t.length), 0);
+  let xMin = node.seriesXMin ?? 0;
+  let xMax = node.seriesXMax ?? Math.max(1, longest - 1);
+  if (!Number.isFinite(xMin)) xMin = 0;
+  if (!Number.isFinite(xMax) || xMax <= xMin) xMax = xMin + 1;
+
+  const offsetMultiplier = Math.max(MIN_SERIES_OFFSET, Math.min(MAX_SERIES_OFFSET, node.seriesOffset ?? DEFAULT_SERIES_OFFSET));
+  const offsetStep = (yMax - yMin) * offsetMultiplier;
+
+  const colormap = node.seriesColormap ?? DEFAULT_COLORMAP;
+  const palette = colormapPalette(colormap, safe.length, node.seriesColorsReversed ?? false);
+  const colors = safe.map((_, i) => node.seriesColors?.[i] ?? palette[i]);
+  const labels = safe.map((_, i) => node.seriesLabels?.[i] ?? `Series ${i + 1}`);
+
+  return {
+    series: safe,
+    colors,
+    labels,
+    xMin,
+    xMax,
+    yMin,
+    yMax,
+    offsetStep,
+    stackedYMin: yMin,
+    stackedYMax: yMax + offsetStep * (safe.length - 1),
+  };
+}
 
 interface WhiteboardItemBase {
   id: string;
@@ -455,6 +707,128 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // double-click an existing point's own handle to remove it. Absent/empty - no manual points, the
   // node falls back to tracing graphExpression's formula alone (if any).
   graphPoints?: { x: number; y: number }[];
+  // "waterfallChart" only - the traces, seriesData[seriesIndex][sampleIndex] = a y value. Every
+  // trace shares the one x-axis (see seriesXMin/seriesXMax), with sample i of a trace of length L
+  // sitting at the fraction i/(L-1) across that axis - so traces of DIFFERENT lengths still line up
+  // correctly end-to-end rather than needing to be resampled to a common grid first, which is what
+  // lets measurements taken at different resolutions be stacked in one figure.
+  //
+  // A nested array rather than a flat array plus a stride: the ragged-length support above needs it,
+  // and it also makes "delete trace 7" an ordinary splice instead of index arithmetic. Absent/empty
+  // - resolves to DEFAULT_WATERFALL_SERIES (see resolveSeriesData, the single place every reader
+  // goes through - same "resolve absent/stale data at read time" convention resolveTableGrid sets).
+  seriesData?: number[][];
+  // "waterfallChart" only - the x-axis window the samples span, in the measurement's own units
+  // (wavenumber, delay, frequency, ...). Both absent - the axis is labeled by sample INDEX
+  // (0 to longest-trace-length - 1), which is always self-consistent with whatever data is loaded
+  // and is the only meaningful default before a user says what the x units actually are.
+  seriesXMin?: number;
+  seriesXMax?: number;
+  // "waterfallChart" only - an explicit y-window override for the trace amplitudes, before stacking.
+  // Both absent - auto-fits to the data's own global min/max across every trace (a SHARED scale, so
+  // relative amplitudes between traces stay honest - per-trace normalization would make a weak
+  // spectrum look as strong as an intense one).
+  seriesYMin?: number;
+  seriesYMax?: number;
+  // "waterfallChart" only - the vertical stacking gap between consecutive traces, as a MULTIPLE of
+  // one trace's own full amplitude range rather than an absolute y value: 1 means each trace's
+  // baseline sits exactly one trace-height above the previous (no overlap at all), the default 0.55
+  // lets neighbors overlap a little the way a real stacked-spectra figure does, and 0 collapses
+  // every trace onto a shared baseline - a plain overlaid multi-series line chart. Relative rather
+  // than absolute so the stack keeps its proportions when the underlying data is swapped for a
+  // series with a completely different magnitude. Absent - resolves to DEFAULT_SERIES_OFFSET.
+  seriesOffset?: number;
+  // "waterfallChart" only - which color scale the per-trace colors are sampled from, evenly spaced
+  // across however many traces there are (see colormaps.ts). Absent - resolves to DEFAULT_COLORMAP.
+  seriesColormap?: ColormapName;
+  // "waterfallChart" only - walks the colormap from its high end down to its low end instead. A
+  // stack is drawn with trace 0 at the BOTTOM, so this is what puts a colormap's dark end at the
+  // bottom of the figure rather than the top. Absent - resolves to false.
+  seriesColorsReversed?: boolean;
+  // "waterfallChart" only - per-trace color overrides, parallel to seriesData by index. An entry
+  // that's null/absent (including a short array, the common case where only one trace was recolored)
+  // falls back to that trace's own colormap color, so this only ever has to hold the traces a user
+  // deliberately changed - the same "only store the deliberate deviations" convention
+  // tableCellFill/tableCellBorders already use.
+  seriesColors?: (string | null)[];
+  // "waterfallChart" only - shades the region between each trace and its own baseline in that
+  // trace's own color at low opacity. The "filled ridgeline/joyplot" look, which reads more clearly
+  // than bare lines when traces overlap heavily. Absent - resolves to false.
+  seriesFillUnder?: boolean;
+  // "waterfallChart" only - draws a faint horizontal baseline under each trace at its own offset
+  // level, marking that trace's own zero. Absent - resolves to false.
+  seriesShowBaselines?: boolean;
+  // "waterfallChart" only - per-trace names, parallel to seriesData by index. Used for the optional
+  // legend (seriesShowLegend) and nothing else; a trace with no name falls back to "Series N".
+  seriesLabels?: string[];
+  // "waterfallChart" only - draws a small legend keying each trace's color to its seriesLabels name.
+  // Off by default: a stacked figure with dozens of traces communicates via the colormap as a
+  // continuous scale, where a 40-entry legend is noise rather than information.
+  seriesShowLegend?: boolean;
+  // "waterfallChart" only - faint gridlines at every tick, same field meaning as functionPlot's own
+  // plotShowGrid. Absent - resolves to false.
+  seriesShowGrid?: boolean;
+  // "waterfallChart" only - explicit tick spacing per axis, same "0/absent picks an automatic 5-tick
+  // spacing" convention as graphXTickInterval/graphYTickInterval.
+  seriesXTickInterval?: number;
+  seriesYTickInterval?: number;
+  // Every CHART_AXIS_TITLE_SHAPES member - the figure's own title and axis captions (e.g.
+  // "Wavenumber [cm^-1]"), drawn by the chart itself rather than as separately-placed "text" nodes
+  // (see CHART_AXIS_TITLE_SHAPES' own doc comment for why). The y title renders rotated 90 degrees
+  // up the left edge, the standard plotting convention. Each absent/empty - that caption simply
+  // isn't drawn, and the space it would have taken is given back to the plot area.
+  chartTitle?: string;
+  axisXTitle?: string;
+  axisYTitle?: string;
+  // Every CHART_ANNOTATION_SHAPES member - labeled callouts pinned to data coordinates (see
+  // ChartAnnotation). Each gets its own draggable handle when the node is selected, the same
+  // interaction "graph"'s manual points already have. Absent/empty - none.
+  chartAnnotations?: ChartAnnotation[];
+  // ---- "image" only -----------------------------------------------------------------------------
+  // Filename only, relative to this whiteboard's own Whiteboards/<id>/assets/ folder - never an
+  // absolute path and never the original source file's path. Images are copied in at import time
+  // (see whiteboards.rs's import_whiteboard_image/save_whiteboard_image), the same convention
+  // boardTypes.ts's BoardImage.assetFileName already uses and for the same reason: a diagram that
+  // silently breaks because someone tidied up their Downloads folder is not a diagram you can rely
+  // on. An asset that has genuinely gone missing renders as a labeled placeholder rather than
+  // breaking the node (see WhiteboardCanvas.tsx's own image branch).
+  assetFileName?: string;
+  // The source bitmap's own pixel dimensions, captured at import. Kept on the node (rather than
+  // read off the decoded image every time) so aspect-ratio operations - the starting box, "reset to
+  // natural size", aspect-locked resize - work synchronously and identically in every renderer,
+  // including the Canvas2D export path, without waiting on a decode.
+  naturalWidth?: number;
+  naturalHeight?: number;
+  // How the bitmap fills its box. "cover" crops to fill the whole box (no letterboxing, the usual
+  // choice for a photo in a fixed frame); "contain" fits the whole image inside, showing the node's
+  // own fillColor in the leftover margin; "fill" stretches to the box exactly, ignoring aspect
+  // ratio. Absent - resolves to "cover".
+  imageFit?: "cover" | "contain" | "fill";
+  // The silhouette the image is cut to. "rect" is the plain box; "rounded" uses the node's own
+  // cornerRadius (the same field a rectangle shape already has, rather than a second radius field);
+  // "ellipse" inscribes an ellipse in the box, which on a square box is the circle a portrait/
+  // micrograph callout wants. The node's strokeColor/strokeWidth draw as a ring following whichever
+  // silhouette is active - that combination (ellipse mask + a thick colored stroke) is what makes
+  // the circular ringed photo treatment a plain style setting rather than a special shape type.
+  // Absent - resolves to "rect".
+  imageMask?: "rect" | "rounded" | "ellipse";
+  // Which rectangle of the SOURCE image is shown, as fractions (0-1) of its natural size - x/y are
+  // the top-left corner, w/h the extent. Fractions rather than pixels so a crop survives the source
+  // being swapped for a different-resolution version of the same picture, the same resize-safe
+  // reasoning WhiteboardNode.points uses for freehand strokes. Absent - the whole image
+  // (0,0,1,1). Note this composes with imageFit: the crop selects a sub-image, then that sub-image
+  // is fitted into the box.
+  imageCropX?: number;
+  imageCropY?: number;
+  imageCropW?: number;
+  imageCropH?: number;
+  // 0-1. Absent - resolves to 1 (fully opaque). Useful for a watermark/underlay a diagram is traced
+  // over, which is otherwise impossible to draw on top of legibly.
+  imageOpacity?: number;
+  // Renders the image desaturated - the standard treatment for a reference figure reproduced
+  // alongside new work, where color would compete with the annotation drawn over it. Absent -
+  // resolves to false.
+  imageGrayscale?: boolean;
   // "amplifier" only - each lead's own length in ABSOLUTE doc units (not a fraction of width - see
   // whiteboardHandlers.ts's MIN/MAX/DEFAULT_AMP_*_LEAD_LENGTH for why absolute is what lets dragging
   // one terminal lengthen/shorten JUST that wire). The two input leads are always independently
@@ -814,6 +1188,10 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   scatterPlot: { width: 220, height: 160 },
   functionPlot: { width: 200, height: 160 },
   graph: { width: 260, height: 200 },
+  // Tall and wide - a stacked figure needs vertical room for the traces to separate and horizontal
+  // room for the spectral detail, and starting it at another 220x160 chart tile would put 18 traces
+  // in ~100px of plot area where they'd read as a solid block.
+  waterfallChart: { width: 380, height: 420 },
   equation: { width: 220, height: 70 },
   vector: { width: 160, height: 40 },
   diode: { width: 160, height: 60 },
@@ -838,7 +1216,20 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   lessEqualSign: { width: 120, height: 170 },
   text: { width: 160, height: 40 },
   freehand: { width: 160, height: 160 },
+  // Only a fallback - every real image node is created through createImageWhiteboardNode below,
+  // which sizes the box to the source's own aspect ratio. This is what an "image" node would get if
+  // one were ever created through the generic factory with no bitmap behind it (the toolbar preview
+  // tile's placeholder glyph, for instance).
+  image: { width: 240, height: 180 },
 };
+
+// The longest edge a freshly imported image's box starts at, in document units. A modern camera or
+// screenshot is several thousand pixels across; dropping one in at its own natural size would place
+// a node far larger than the visible canvas, leaving the user zoomed inside a wall of photo with no
+// obvious way back out. Scaling the long edge down to this keeps the whole image on screen at a
+// typical zoom while preserving its aspect ratio exactly - and since nothing is resampled, dragging
+// a corner back out restores full detail.
+export const DEFAULT_IMAGE_MAX_EDGE = 420;
 
 export function createDefaultWhiteboardNode(
   id: string,
@@ -873,6 +1264,18 @@ export function createDefaultWhiteboardNode(
       | "graphShowGrid"
       | "graphXTickInterval"
       | "graphYTickInterval"
+      | "seriesData"
+      | "seriesXMin"
+      | "seriesXMax"
+      | "seriesOffset"
+      | "seriesColormap"
+      | "seriesColorsReversed"
+      | "seriesFillUnder"
+      | "seriesShowBaselines"
+      | "seriesShowGrid"
+      | "chartTitle"
+      | "axisXTitle"
+      | "axisYTitle"
       | "tableRows"
       | "tableCols"
     >
@@ -902,7 +1305,9 @@ export function createDefaultWhiteboardNode(
     // 0 rather than the usual 2 - a fresh equation should still look like just the formula (no
     // border) until the user deliberately turns Stroke width up in the style panel, not gain a
     // visible box around it the instant it becomes possible to have one.
-    strokeWidth: shapeType === "equation" ? 0 : 2,
+    // A stacked figure draws dozens of overlapping traces - at the usual 2 they merge into a solid
+    // block, so a waterfall starts at the thin line weight a real spectral figure uses.
+    strokeWidth: shapeType === "equation" ? 0 : shapeType === "waterfallChart" ? 1.2 : 2,
     cornerRadius: 0,
     // "bondLine" reuses `sides` for its own one number (how many zigzag bonds/segments) - same
     // "no dedicated field for a shape that only needs one integer" convention "polygon" already
@@ -937,6 +1342,21 @@ export function createDefaultWhiteboardNode(
     graphShowGrid: shapeType === "graph" ? overrides?.graphShowGrid ?? true : undefined,
     graphXTickInterval: shapeType === "graph" ? overrides?.graphXTickInterval : undefined,
     graphYTickInterval: shapeType === "graph" ? overrides?.graphYTickInterval : undefined,
+    // Seeded with the sample stack (not left absent) so the node saves as a self-contained figure a
+    // user can immediately edit trace-by-trace, rather than one that silently re-reads a module
+    // constant every render and would change under them if that constant ever did.
+    seriesData: shapeType === "waterfallChart" ? overrides?.seriesData ?? DEFAULT_WATERFALL_SERIES.map((t) => [...t]) : undefined,
+    seriesXMin: shapeType === "waterfallChart" ? overrides?.seriesXMin : undefined,
+    seriesXMax: shapeType === "waterfallChart" ? overrides?.seriesXMax : undefined,
+    seriesOffset: shapeType === "waterfallChart" ? overrides?.seriesOffset ?? DEFAULT_SERIES_OFFSET : undefined,
+    seriesColormap: shapeType === "waterfallChart" ? overrides?.seriesColormap ?? DEFAULT_COLORMAP : undefined,
+    seriesColorsReversed: shapeType === "waterfallChart" ? overrides?.seriesColorsReversed ?? false : undefined,
+    seriesFillUnder: shapeType === "waterfallChart" ? overrides?.seriesFillUnder ?? false : undefined,
+    seriesShowBaselines: shapeType === "waterfallChart" ? overrides?.seriesShowBaselines ?? false : undefined,
+    seriesShowGrid: shapeType === "waterfallChart" ? overrides?.seriesShowGrid ?? false : undefined,
+    chartTitle: CHART_AXIS_TITLE_SHAPES.has(shapeType) ? overrides?.chartTitle : undefined,
+    axisXTitle: CHART_AXIS_TITLE_SHAPES.has(shapeType) ? overrides?.axisXTitle : undefined,
+    axisYTitle: CHART_AXIS_TITLE_SHAPES.has(shapeType) ? overrides?.axisYTitle : undefined,
     latticeSize: shapeType === "latticeGauge" ? DEFAULT_LATTICE_SIZE : undefined,
     latticeSiteSpacing: shapeType === "latticeGauge" ? DEFAULT_LATTICE_SITE_SPACING : undefined,
     latticeShowQuarks: shapeType === "latticeGauge" ? true : undefined,
@@ -955,7 +1375,10 @@ export function createDefaultWhiteboardNode(
         : undefined,
     tableHeaderRow: shapeType === "table" ? true : undefined,
     fontFamily: "system-ui, sans-serif",
-    fontSize: 16,
+    // Tick numbers and axis captions on a dense multi-panel figure - 16 (every other shape's label
+    // size) overwhelms a plot this size, where the text is scaffolding around the data rather than
+    // the content itself.
+    fontSize: shapeType === "waterfallChart" ? 11 : 16,
     fontColor: "#111111",
     fontWeight: "normal",
     fontStyle: "normal",
@@ -972,6 +1395,92 @@ export function createDefaultWhiteboardNode(
     createdAt: now,
     updatedAt: now,
   };
+}
+
+// Builds an image node centered on (x, y), with its box scaled to the source's own aspect ratio
+// (capped at DEFAULT_IMAGE_MAX_EDGE on the long edge). Its own factory rather than an overrides
+// argument to createDefaultWhiteboardNode, exactly like createFreehandWhiteboardNode: both derive
+// their geometry from real content rather than a fixed per-shapeType default size, which is the one
+// thing that generic factory can't express.
+export function createImageWhiteboardNode(
+  id: string,
+  assetFileName: string,
+  naturalWidth: number,
+  naturalHeight: number,
+  centerX: number,
+  centerY: number
+): WhiteboardNode {
+  const now = Date.now();
+  const safeW = Number.isFinite(naturalWidth) && naturalWidth > 0 ? naturalWidth : 1;
+  const safeH = Number.isFinite(naturalHeight) && naturalHeight > 0 ? naturalHeight : 1;
+  const scale = Math.min(1, DEFAULT_IMAGE_MAX_EDGE / Math.max(safeW, safeH));
+  const width = Math.max(1, Math.round(safeW * scale));
+  const height = Math.max(1, Math.round(safeH * scale));
+  return {
+    kind: "node",
+    id,
+    shapeType: "image",
+    x: centerX - width / 2,
+    y: centerY - height / 2,
+    width,
+    height,
+    text: "",
+    assetFileName,
+    naturalWidth: safeW,
+    naturalHeight: safeH,
+    imageFit: "cover",
+    imageMask: "rect",
+    imageOpacity: 1,
+    // No ring and no matte out of the box - an imported photo should look like the photo, with the
+    // border/mask treatments available in the style panel rather than applied uncommanded.
+    fillColor: null,
+    strokeColor: "#000000",
+    strokeWidth: 0,
+    cornerRadius: 0,
+    fontFamily: "system-ui, sans-serif",
+    fontSize: 16,
+    fontColor: "#111111",
+    fontWeight: "normal",
+    fontStyle: "normal",
+    textDecoration: "none",
+    textAlign: "center",
+    verticalAlign: "middle",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+// The source rectangle an "image" node actually shows, resolved to safe fractions. Every reader
+// (the live <img> transform, the Canvas2D export's drawImage source rect, the style panel's crop
+// readout) goes through this rather than reading imageCropX/Y/W/H directly, so a malformed or stale
+// crop - inverted, zero-sized, out of bounds, left over from a since-replaced source - can never
+// produce a NaN transform or an exception inside drawImage. Same "resolve absent/stale data at read
+// time" convention resolveTableGrid and resolveSeriesData already follow.
+export function resolveImageCrop(node: WhiteboardNode): { x: number; y: number; w: number; h: number } {
+  const clamp01 = (v: number | undefined, fallback: number) => (Number.isFinite(v) ? Math.max(0, Math.min(1, v as number)) : fallback);
+  const x = clamp01(node.imageCropX, 0);
+  const y = clamp01(node.imageCropY, 0);
+  // A crop can never extend past the source's own right/bottom edge, and can never be zero-width -
+  // a zero-width source rect makes drawImage throw rather than draw nothing.
+  const w = Math.max(0.001, Math.min(1 - x, clamp01(node.imageCropW, 1)));
+  const h = Math.max(0.001, Math.min(1 - y, clamp01(node.imageCropH, 1)));
+  return { x, y, w, h };
+}
+
+// Whether this node's crop is the whole image - lets the style panel show "Reset crop" only when
+// there is actually a crop to reset.
+export function hasImageCrop(node: WhiteboardNode): boolean {
+  const c = resolveImageCrop(node);
+  return c.x > 0 || c.y > 0 || c.w < 1 || c.h < 1;
+}
+
+// The node box that shows this image's CROPPED region at its natural pixel size - what "Reset to
+// natural size" restores. Returns null for a node with no measured source (an asset that failed to
+// decode), where there is no natural size to reset to.
+export function naturalImageSize(node: WhiteboardNode): { width: number; height: number } | null {
+  if (!node.naturalWidth || !node.naturalHeight) return null;
+  const crop = resolveImageCrop(node);
+  return { width: Math.max(1, Math.round(node.naturalWidth * crop.w)), height: Math.max(1, Math.round(node.naturalHeight * crop.h)) };
 }
 
 const FREEHAND_MIN_SIZE = 8;

@@ -410,6 +410,7 @@ export interface VideoEditCommand {
     | "add-pip"
     | "edit-pip"
     | "delete-pip"
+    | "view-switch-cut"
     | "edit-track-audio";
 }
 

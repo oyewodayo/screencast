@@ -26,6 +26,7 @@ mod services {
     pub mod trash;
     pub mod utility;
     pub mod video_edits;
+    pub mod mindmaps;
     pub mod whiteboards;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
@@ -276,6 +277,9 @@ fn main() {
             commands::recording::start_recording,
             commands::recording::stop_recording,
             commands::recording::load_click_sidecar,
+            commands::recording::load_view_switch_sidecar,
+            commands::recording::record_view_switch,
+            commands::recording::get_webcam_sidecar_path,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,
@@ -349,15 +353,26 @@ fn main() {
             services::boards::save_board_thumbnail,
             services::boards::export_board_png,
             services::boards::export_board_png_to_path,
+            services::mindmaps::list_mindmaps,
+            services::mindmaps::create_mindmap,
+            services::mindmaps::duplicate_mindmap,
+            services::mindmaps::save_mindmap,
+            services::mindmaps::load_mindmap,
+            services::mindmaps::delete_mindmap,
+            services::mindmaps::save_mindmap_thumbnail,
+            services::mindmaps::export_mindmap_file,
+            services::mindmaps::export_mindmap_to_path,
             services::whiteboards::list_whiteboards,
             services::whiteboards::create_whiteboard,
             services::whiteboards::duplicate_whiteboard,
             services::whiteboards::save_whiteboard,
             services::whiteboards::load_whiteboard,
             services::whiteboards::delete_whiteboard,
+            services::whiteboards::import_whiteboard_image,
+            services::whiteboards::save_whiteboard_image,
             services::whiteboards::save_whiteboard_thumbnail,
-            services::whiteboards::export_whiteboard_png,
-            services::whiteboards::export_whiteboard_png_to_path,
+            services::whiteboards::export_whiteboard_file,
+            services::whiteboards::export_whiteboard_to_path,
             services::docs::list_docs,
             services::docs::create_doc,
             services::docs::save_doc,

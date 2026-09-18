@@ -14,7 +14,7 @@ import { createPortal } from "react-dom";
 // document by the time it runs - see paintEquation's own doc comment).
 import "katex/dist/katex.min.css";
 import { invoke } from "@tauri-apps/api/core";
-import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   IoAdd,
   IoArrowBack,
@@ -29,7 +29,10 @@ import {
   IoDownloadOutline,
   IoGitNetworkOutline,
   IoGridOutline,
+  IoCropOutline,
   IoImageOutline,
+  IoRefreshOutline,
+  IoSwapHorizontalOutline,
   IoMagnetOutline,
   IoPencilOutline,
   IoRemove,
@@ -38,13 +41,27 @@ import {
 } from "react-icons/io5";
 import { TbPointer } from "react-icons/tb";
 import useWhiteboardStore from "../../hooks/useWhiteboardStore";
-import { ArrowheadType, LINE_ONLY_SHAPES, WhiteboardAnchorSide, WhiteboardEdge, WhiteboardNode, WhiteboardPage, WhiteboardShapeType } from "../../utils/whiteboardTypes";
-import { canvasToPngBytes } from "../../handlers/pdfExportHandlers";
-import { computeContentBounds, renderWhiteboardToCanvas, shapeOutlineFor, CYLINDER_CAP_RATIO } from "../../handlers/whiteboardHandlers";
+import {
+  ArrowheadType,
+  createImageWhiteboardNode,
+  hasImageCrop,
+  LINE_ONLY_SHAPES,
+  WhiteboardAnchorSide,
+  WhiteboardEdge,
+  WhiteboardNode,
+  WhiteboardPage,
+  WhiteboardShapeType,
+} from "../../utils/whiteboardTypes";
+import { canvasToPdfBytes, canvasToPngBytes } from "../../handlers/pdfExportHandlers";
+import { computeContentBounds, renderWhiteboardToCanvas, shapeOutlineFor, CYLINDER_CAP_RATIO, SERIES_FILL_OPACITY } from "../../handlers/whiteboardHandlers";
+import { importImageFromBlob, importImageFromPath, measureImage, whiteboardAssetUrl } from "../../utils/whiteboardImageCache";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
 import WhiteboardStylePanel from "./WhiteboardStylePanel";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
+
+// PNG for dropping into a slide or a chat; PDF for something printed or shared as a document.
+type WhiteboardExportFormat = "png" | "pdf";
 
 interface WhiteboardEditorProps {
   whiteboardId: string;
@@ -175,6 +192,38 @@ const CHART_SHAPE_PRESETS: ShapePreset[] = [
   { type: "functionPlot", label: "Normal Distribution", overrides: { plotFunction: "normal" } },
 ];
 
+// Multi-trace figures - all one shapeType ("waterfallChart") at different spacing/colormap/fill
+// settings, the same "one type, several presets" convention the wave and function-plot groups above
+// already use. They're a separate palette group rather than more tiles in "Charts & Plots" because
+// they answer a different question: those plot ONE series, these compare MANY.
+const MULTI_SERIES_SHAPE_PRESETS: ShapePreset[] = [
+  { type: "waterfallChart", label: "Waterfall / Stacked Spectra" },
+  // Every trace on a shared baseline (seriesOffset 0) - a plain overlaid multi-series line chart.
+  { type: "waterfallChart", label: "Overlaid Series", overrides: { seriesOffset: 0, seriesColormap: "turbo" } },
+  // Heavily overlapped + shaded: the ridgeline/joyplot look, for showing a distribution evolving.
+  { type: "waterfallChart", label: "Ridgeline (filled)", overrides: { seriesOffset: 0.3, seriesFillUnder: true, seriesColormap: "viridis" } },
+  { type: "waterfallChart", label: "Separated Traces", overrides: { seriesOffset: 1, seriesShowBaselines: true, seriesColormap: "cividis" } },
+];
+
+// Figure-annotation furniture: the unfilled boxes you draw AROUND content to call it out, plus the
+// labeled pointers. All plain existing shapeTypes at a particular fill/stroke - a "highlight frame"
+// is not a new kind of geometry, it's a rectangle that starts transparent with a heavy colored
+// border, and making it a preset rather than a shapeType keeps every existing rectangle control
+// (corner radius, resize, rotate) working on it unchanged.
+//
+// These are placed on TOP of whatever they frame, which is why the transparent fill matters: a
+// default white-filled rectangle would hide the panel it was meant to highlight.
+const ANNOTATION_SHAPE_PRESETS: ShapePreset[] = [
+  { type: "rectangle", label: "Highlight Frame", overrides: { fillColor: null, strokeColor: "#16a34a", strokeWidth: 3, cornerRadius: 4 } },
+  { type: "rectangle", label: "Panel Box", overrides: { fillColor: null, strokeColor: "#111111", strokeWidth: 1.5, cornerRadius: 0 } },
+  { type: "ellipse", label: "Circle Highlight", overrides: { fillColor: null, strokeColor: "#ea580c", strokeWidth: 3 } },
+  // A filled dot with no border - the standalone counterpart to a chart's own data-bound annotation
+  // markers, for calling out a point on something that isn't a chart at all (a micrograph, a photo).
+  { type: "ellipse", label: "Marker Dot", overrides: { fillColor: "#ea580c", strokeWidth: 0 } },
+  { type: "vector", label: "Labeled Arrow", overrides: { strokeColor: "#111111", strokeWidth: 2 } },
+  { type: "callout", label: "Callout", overrides: { fillColor: "#fef9c3", strokeColor: "#a16207" } },
+];
+
 // Just the one preset for now - unlike every other group, a "latticeGauge" node has no size/style
 // variants worth offering as separate tiles (its own on-canvas control panel is where N, spacing,
 // and every other knob actually live - see LatticeGaugeWidget.tsx).
@@ -186,6 +235,8 @@ const SHAPE_PRESET_GROUPS: { label: string; presets: ShapePreset[] }[] = [
   { label: "Waveforms", presets: WAVE_SHAPE_PRESETS },
   { label: "Science", presets: SCIENCE_SHAPE_PRESETS },
   { label: "Charts & Plots", presets: CHART_SHAPE_PRESETS },
+  { label: "Multi-series", presets: MULTI_SERIES_SHAPE_PRESETS },
+  { label: "Annotation", presets: ANNOTATION_SHAPE_PRESETS },
   { label: "Physics 3D", presets: PHYSICS_3D_SHAPE_PRESETS },
 ];
 
@@ -198,36 +249,23 @@ const TILE_H = 32;
 function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
   const w = TILE_W - 4;
   const h = TILE_H - 4;
-  const outline = shapeOutlineFor(preset.type, w, h, {
-    sides: preset.overrides?.sides,
-    starPoints: preset.overrides?.starPoints,
-    starInnerRadiusRatio: preset.overrides?.starInnerRadiusRatio,
-    waveStyle: preset.overrides?.waveStyle,
-    waveCycles: preset.overrides?.waveCycles,
-    angleDegrees: preset.overrides?.angleDegrees,
-    angleRay1Length: preset.overrides?.angleRay1Length,
-    angleRay2Length: preset.overrides?.angleRay2Length,
-    chartData: preset.overrides?.chartData,
-    plotFunction: preset.overrides?.plotFunction,
-    plotDomainScale: preset.overrides?.plotDomainScale,
-    plotCycles: preset.overrides?.plotCycles,
-    plotShowGrid: preset.overrides?.plotShowGrid,
-    numberLineMax: preset.overrides?.numberLineMax,
-    graphExpression: preset.overrides?.graphExpression,
-    graphXMin: preset.overrides?.graphXMin,
-    graphXMax: preset.overrides?.graphXMax,
-    graphYMin: preset.overrides?.graphYMin,
-    graphYMax: preset.overrides?.graphYMax,
-    graphShowGrid: preset.overrides?.graphShowGrid,
-  });
+  // A preset's overrides are exactly the WhiteboardNode fields that will be spread onto the created
+  // node (see this toolbar's own onAddNode), and ShapeOutlineOptions names every shape field to
+  // match WhiteboardNode's - so spreading them straight in previews precisely what clicking the tile
+  // produces, with no per-field list here to fall out of date as new shape fields are added (which
+  // is what left several existing fields missing from this preview before).
+  const outline = shapeOutlineFor(preset.type, w, h, { ...preset.overrides });
   // Line-only shapes (waves, circuit symbols, axes...) render as an open trace, not a filled
   // silhouette (matches their own default fillColor: null) - filling the preview swatch would shade
   // the implicit-close area under the trace instead of just showing the line shape the tile places.
   // Fill is a light gray rather than the real default (white - see createDefaultWhiteboardNode)
   // purely so the swatch stays visible against this popover's own white background; the stroke
   // does match the real black default, since that's the part actually worth previewing accurately.
-  const fill = LINE_ONLY_SHAPES.has(preset.type) ? "none" : "#f3f4f6";
-  const stroke = "#000000";
+  // A preset that explicitly sets fillColor: null (the highlight/panel frames) is previewed unfilled
+  // too - otherwise a tile for "an empty box you put around things" would show as a solid swatch,
+  // the exact opposite of what it places.
+  const fill = LINE_ONLY_SHAPES.has(preset.type) || preset.overrides?.fillColor === null ? "none" : "#f3f4f6";
+  const stroke = preset.overrides?.strokeColor ?? "#000000";
   // Thinner and miter-jointed (sharp corners) rather than the real canvas's own strokeWidth/round
   // joins - at this tile's ~40x28px size a 2px round-jointed stroke reads as a heavy, bulbous
   // outline (a plain triangle looks like it has rounded corners purely from the stroke thickness),
@@ -267,6 +305,14 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
               <path key={i} d={part.d} fill={stroke} stroke="none" />
             ) : part.role === "slice" ? (
               <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={sw} />
+            ) : part.role === "series" ? (
+              // Thinner than the real canvas's own trace weight for the same reason `sw` is thinner
+              // than a real stroke here: at ~40x28px a stack of full-weight traces is a solid block.
+              <path key={i} d={part.d} fill="none" stroke={part.color} strokeWidth={0.6} strokeLinejoin="round" />
+            ) : part.role === "seriesFill" ? (
+              <path key={i} d={part.d} fill={part.color} fillOpacity={SERIES_FILL_OPACITY} stroke="none" />
+            ) : part.role === "annotation" ? (
+              <path key={i} d={part.d} fill={part.color} stroke="none" />
             ) : part.role === "axis" ? (
               <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={sw} />
             ) : part.role === "grid" ? (
@@ -567,7 +613,39 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [shapesMenuOpen, setShapesMenuOpen] = useState(false);
   const [arrowsMenuOpen, setArrowsMenuOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  // Image import failures (unsupported type, unreadable source, backend write error). Its own banner
+  // rather than sharing exportError's - the two are unrelated operations, and a stale export error
+  // sitting there while an import fails (or vice versa) would point at the wrong thing.
+  const [imageError, setImageError] = useState<string | null>(null);
+  // Resolved once - the Briefcast library root every image asset path is built from (see
+  // whiteboardImageCache.ts's whiteboardAssetPath). Null until it arrives, which is why
+  // imageSrcFor below can return null and the image body renders a "Loading image…" placeholder
+  // rather than a broken one for the first frame or two after mount.
+  const [briefcastDir, setBriefcastDir] = useState<string | null>(null);
+  // The element the canvas fills - measured to convert "the middle of the visible canvas" into
+  // document space when placing an image that arrived without a position of its own (file dialog,
+  // clipboard paste).
+  const canvasHostRef = useRef<HTMLDivElement>(null);
+  // Which image node is in crop mode. Lives here rather than inside WhiteboardCanvas because three
+  // separate surfaces drive it - the canvas's double-click, the style panel's Crop button, and the
+  // right-click menu - and they all have to agree on one mode.
+  const [croppingNodeId, setCroppingNodeId] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<string>("get_briefcast_dir")
+      .then(setBriefcastDir)
+      .catch((err) => console.error("Failed to resolve Briefcast folder:", err));
+  }, []);
+
+  // Shared by the live canvas and every renderWhiteboardToCanvas call (PNG export, thumbnail,
+  // export-selection), so an exported image is sourced from exactly the same file the canvas showed.
+  const imageSrcFor = useCallback(
+    (node: WhiteboardNode): string | null =>
+      briefcastDir && node.assetFileName ? whiteboardAssetUrl(briefcastDir, whiteboardId, node.assetFileName) : null,
+    [briefcastDir, whiteboardId]
+  );
 
   // Drops back to plain selection mode - clears every armed tool (shape/text/equation/freehand/
   // connector/laser) at once. Exists as its own dedicated toolbar button rather than relying solely
@@ -594,12 +672,21 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   // until release.
   const [liveNodesOverride, setLiveNodesOverride] = useState<WhiteboardNode[] | null>(null);
 
+  // The mirror image of liveNodesOverride: nodes the STYLE PANEL is previewing while one of its
+  // sliders is mid-drag, pushed down into the canvas for display only. Committing on every tick
+  // instead would be one undo entry (and one full rebuild) per pixel of travel - see
+  // WhiteboardCanvas's previewNodes prop and LiveRangeSlider's own doc comment.
+  const [previewNodes, setPreviewNodes] = useState<WhiteboardNode[] | null>(null);
+
+  // Applied to the panel's own view of the selection too, so a slider's paired numeric field tracks
+  // the drag rather than sitting at the last committed value until release.
   const selectedNodes = useMemo(() => {
     const list = page ? page.nodes.filter((n) => selectedNodeIds.has(n.id)) : [];
-    if (!liveNodesOverride) return list;
-    const liveById = new Map(liveNodesOverride.map((n) => [n.id, n]));
+    const override = liveNodesOverride ?? previewNodes;
+    if (!override) return list;
+    const liveById = new Map(override.map((n) => [n.id, n]));
     return list.map((n) => liveById.get(n.id) ?? n);
-  }, [page, selectedNodeIds, liveNodesOverride]);
+  }, [page, selectedNodeIds, liveNodesOverride, previewNodes]);
   const selectedEdges = useMemo(() => (page ? page.edges.filter((e) => selectedEdgeIds.has(e.id)) : []), [page, selectedEdgeIds]);
 
   useEffect(() => {
@@ -752,6 +839,123 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     setSelectedEdgeIds(new Set(newEdges.map((e) => e.id)));
   }, [store]);
 
+  // ---- Image nodes -------------------------------------------------------------------------------
+  //
+  // Every insert path (file dialog, clipboard paste, drag-and-drop) funnels through addImageNode
+  // below, so all three produce an identically-shaped node and share one error path. The asset is
+  // copied into this whiteboard's own assets/ folder first (see whiteboardImageCache.ts), then
+  // measured, then placed - measuring before placing is what lets the node start at the source's own
+  // aspect ratio instead of a fixed box the user has to reshape by hand.
+
+  // The document-space point at the middle of what's currently on screen - where a file-dialog or
+  // pasted image lands, since neither gesture carries a position of its own the way a drop does.
+  const viewportCenterDocPoint = useCallback((): { x: number; y: number } => {
+    const rect = canvasHostRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    return { x: (rect.width / 2 - pan.x) / zoom, y: (rect.height / 2 - pan.y) / zoom };
+  }, [pan, zoom]);
+
+  const addImageNode = useCallback(
+    async (assetFileName: string, at: { x: number; y: number }) => {
+      if (!briefcastDir) throw new Error("Briefcast folder is not available yet");
+      const url = whiteboardAssetUrl(briefcastDir, whiteboardId, assetFileName);
+      const { width, height } = await measureImage(url);
+      const node = createImageWhiteboardNode(crypto.randomUUID(), assetFileName, width, height, at.x, at.y);
+      store.addNode(node);
+      setSelectedNodeIds(new Set([node.id]));
+      setSelectedEdgeIds(new Set());
+    },
+    [briefcastDir, whiteboardId, store]
+  );
+
+  // Several dropped/pasted files are placed in a short cascade rather than stacked exactly on top of
+  // each other, so a multi-file drop doesn't look like it imported only one.
+  const addImagesFromBlobs = useCallback(
+    async (files: (File | Blob)[], at: { x: number; y: number }) => {
+      for (let i = 0; i < files.length; i++) {
+        try {
+          const assetFileName = await importImageFromBlob(whiteboardId, files[i]);
+          await addImageNode(assetFileName, { x: at.x + i * 24, y: at.y + i * 24 });
+        } catch (err) {
+          console.error("Failed to import dropped image:", err);
+          setImageError(err instanceof Error ? err.message : "Failed to import image");
+        }
+      }
+    },
+    [whiteboardId, addImageNode]
+  );
+
+  const handleInsertImage = useCallback(async () => {
+    try {
+      const picked = await openFileDialog({
+        multiple: true,
+        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"] }],
+      });
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+      const at = viewportCenterDocPoint();
+      for (let i = 0; i < paths.length; i++) {
+        const assetFileName = await importImageFromPath(whiteboardId, paths[i]);
+        await addImageNode(assetFileName, { x: at.x + i * 24, y: at.y + i * 24 });
+      }
+    } catch (err) {
+      console.error("Failed to insert image:", err);
+      setImageError(err instanceof Error ? err.message : "Failed to insert image");
+    }
+  }, [whiteboardId, addImageNode, viewportCenterDocPoint]);
+
+  // Swaps the bitmap behind an existing image node. Everything else about the node is preserved -
+  // its box, rotation, mask, ring, opacity - because the point of "replace" is fixing the picture,
+  // not rebuilding the styling around it. The CROP is deliberately preserved too: it is stored as
+  // fractions precisely so it stays meaningful across a source swap (see WhiteboardNode.imageCropX),
+  // which is what makes re-exporting a figure with an updated version of the same plot a one-click
+  // operation rather than a re-crop.
+  //
+  // The old asset file is intentionally left on disk rather than deleted: undo restores the node
+  // pointing back at it, and a delete here would leave that undo showing a permanently broken image.
+  // Assets are small and go away with the whiteboard itself (see whiteboards.rs).
+  const handleReplaceImage = useCallback(
+    async (node: WhiteboardNode) => {
+      try {
+        const picked = await openFileDialog({
+          multiple: false,
+          filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"] }],
+        });
+        if (!picked || Array.isArray(picked)) return;
+        if (!briefcastDir) throw new Error("Briefcast folder is not available yet");
+        const assetFileName = await importImageFromPath(whiteboardId, picked);
+        const { width, height } = await measureImage(whiteboardAssetUrl(briefcastDir, whiteboardId, assetFileName));
+        store.editNode(node, { ...node, assetFileName, naturalWidth: width, naturalHeight: height, updatedAt: Date.now() });
+      } catch (err) {
+        console.error("Failed to replace image:", err);
+        setImageError(err instanceof Error ? err.message : "Failed to replace image");
+      }
+    },
+    [briefcastDir, whiteboardId, store]
+  );
+
+  // A real bitmap on the system clipboard (a screenshot, an image copied out of a browser) - handled
+  // as a native paste event rather than inside the Ctrl+V keyboard shortcut below, because only the
+  // event carries clipboardData. Falls through to the shape clipboard when the paste has no image,
+  // so copying shapes and copying a picture both keep working through the same keystroke.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && (active.isContentEditable || active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const files = Array.from(items)
+        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter((f): f is File => f !== null);
+      if (files.length === 0) return;
+      e.preventDefault();
+      void addImagesFromBlobs(files, viewportCenterDocPoint());
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [addImagesFromBlobs, viewportCenterDocPoint]);
+
   // ---- Keyboard shortcuts: undo/redo/copy/paste (Delete/Escape live inside WhiteboardCanvas,
   // which owns selection-adjacent state that undo/redo doesn't need) -------------------------------
   useEffect(() => {
@@ -781,46 +985,66 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools, selectedNodeIds, handleCopy, handlePaste]);
 
-  const handleExport = useCallback(async () => {
-    if (!doc || !page) return;
-    setIsExporting(true);
-    setExportError(null);
-    try {
-      const canvas = await renderWhiteboardToCanvas(page);
-      const bytes = await canvasToPngBytes(canvas);
-      await invoke<string>("export_whiteboard_png", { whiteboardName: doc.name, bytes: Array.from(bytes) });
-    } catch (err) {
-      console.error("Failed to export whiteboard:", err);
-      setExportError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setIsExporting(false);
-    }
-  }, [doc, page]);
+  // PNG and PDF share the one renderer - the PDF is that same canvas wrapped in a single page (see
+  // canvasToPdfBytes), so the two formats can't drift into showing different diagrams.
+  const encodeAs = useCallback(
+    async (format: WhiteboardExportFormat): Promise<Uint8Array> => {
+      if (!page) throw new Error("No page to export");
+      const canvas = await renderWhiteboardToCanvas(page, undefined, imageSrcFor);
+      return format === "pdf" ? canvasToPdfBytes(canvas) : canvasToPngBytes(canvas);
+    },
+    [page, imageSrcFor]
+  );
 
-  const handleSaveAs = useCallback(async () => {
-    if (!doc || !page) return;
-    setIsExporting(true);
-    setExportError(null);
-    try {
-      const canvas = await renderWhiteboardToCanvas(page);
-      const bytes = await canvasToPngBytes(canvas);
-      const safeName = doc.name.trim().replace(/[^a-zA-Z0-9 _-]/g, "_") || "Whiteboard";
-      const destPath = await saveFileDialog({ defaultPath: `${safeName}.png`, filters: [{ name: "PNG Image", extensions: ["png"] }] });
-      if (!destPath) return;
-      await invoke("export_whiteboard_png_to_path", { destPath, bytes: Array.from(bytes) });
-    } catch (err) {
-      console.error("Failed to save whiteboard:", err);
-      setExportError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setIsExporting(false);
-    }
-  }, [doc, page]);
+  const handleExport = useCallback(
+    async (format: WhiteboardExportFormat) => {
+      if (!doc || !page) return;
+      setExportMenuOpen(false);
+      setIsExporting(true);
+      setExportError(null);
+      try {
+        const bytes = await encodeAs(format);
+        await invoke<string>("export_whiteboard_file", { whiteboardName: doc.name, extension: format, bytes: Array.from(bytes) });
+      } catch (err) {
+        console.error("Failed to export whiteboard:", err);
+        setExportError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsExporting(false);
+      }
+    },
+    [doc, page, encodeAs]
+  );
+
+  const handleSaveAs = useCallback(
+    async (format: WhiteboardExportFormat) => {
+      if (!doc || !page) return;
+      setExportMenuOpen(false);
+      setExportError(null);
+      try {
+        const safeName = doc.name.trim().replace(/[^a-zA-Z0-9 _-]/g, "_") || "Whiteboard";
+        const destPath = await saveFileDialog({
+          defaultPath: `${safeName}.${format}`,
+          filters: [format === "pdf" ? { name: "PDF Document", extensions: ["pdf"] } : { name: "PNG Image", extensions: ["png"] }],
+        });
+        if (!destPath) return;
+        setIsExporting(true);
+        const bytes = await encodeAs(format);
+        await invoke("export_whiteboard_to_path", { destPath, bytes: Array.from(bytes) });
+      } catch (err) {
+        console.error("Failed to save whiteboard:", err);
+        setExportError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsExporting(false);
+      }
+    },
+    [doc, page, encodeAs]
+  );
 
   const handleBack = useCallback(async () => {
     store.flushSave();
     if (page) {
       try {
-        const thumb = await renderWhiteboardToCanvas(page, THUMBNAIL_MAX_DIMENSION);
+        const thumb = await renderWhiteboardToCanvas(page, THUMBNAIL_MAX_DIMENSION, imageSrcFor);
         const bytes = await canvasToPngBytes(thumb);
         await invoke("save_whiteboard_thumbnail", { whiteboardId, bytes: Array.from(bytes) });
       } catch (err) {
@@ -856,12 +1080,12 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           edges: page.edges.filter((e) => edgeIds.has(e.id)),
         };
         if (selectionPage.nodes.length === 0 && selectionPage.edges.length === 0) return;
-        const canvas = await renderWhiteboardToCanvas(selectionPage);
+        const canvas = await renderWhiteboardToCanvas(selectionPage, undefined, imageSrcFor);
         const bytes = await canvasToPngBytes(canvas);
         const safeName = doc.name.trim().replace(/[^a-zA-Z0-9 _-]/g, "_") || "Whiteboard";
         const destPath = await saveFileDialog({ defaultPath: `${safeName} - selection.png`, filters: [{ name: "PNG Image", extensions: ["png"] }] });
         if (!destPath) return;
-        await invoke("export_whiteboard_png_to_path", { destPath, bytes: Array.from(bytes) });
+        await invoke("export_whiteboard_to_path", { destPath, bytes: Array.from(bytes) });
       } catch (err) {
         console.error("Failed to export selection:", err);
         setExportError(err instanceof Error ? err.message : String(err));
@@ -1047,6 +1271,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         >
           <IoCalculatorOutline size={18} />
         </ToolbarButton>
+        {/* Not an armable tool like the shape/text buttons around it - an image needs a file picked
+            before there is anything to place, so this acts immediately and drops the result at the
+            middle of the current view. Dragging a file onto the canvas or pasting one places it at
+            the drop point/view center instead (see addImagesFromBlobs). */}
+        <ToolbarButton title="Insert image…" active={false} onClick={() => void handleInsertImage()}>
+          <IoImageOutline size={18} />
+        </ToolbarButton>
         <ToolbarButton
           title="Pen (freehand)"
           active={armedShapeType === "freehand" && !armedNodeOverrides?.endArrowType}
@@ -1150,22 +1381,62 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         <div className="flex-1" />
         {store.isSaving && <span className="text-xs text-gray-400 dark:text-neutral-500 mr-2">Saving…</span>}
         {exportError && <span className="text-xs text-red-500 dark:text-red-400 mr-2">{exportError}</span>}
-        <ToolbarButton title="Save As PNG…" disabled={isExporting} onClick={() => void handleSaveAs()}>
-          <IoDownloadOutline size={18} />
-        </ToolbarButton>
-        <button
-          type="button"
-          disabled={isExporting}
-          onClick={() => void handleExport()}
-          className="ml-1 flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
-        >
-          {isExporting ? "Exporting…" : "Export PNG"}
-        </button>
+        {imageError && (
+          <button
+            type="button"
+            onClick={() => setImageError(null)}
+            className="text-xs text-red-500 dark:text-red-400 mr-2 underline decoration-dotted"
+            title="Dismiss"
+          >
+            {imageError}
+          </button>
+        )}
+        {/* One menu rather than four buttons - format (PNG/PDF) and destination (library or a chosen
+            path) are independent choices, and all four spelled out would crowd the toolbar. Mirrors
+            the Mindmap editor's own export menu so the two features behave the same way. */}
+        <div className="relative ml-1">
+          <button
+            type="button"
+            disabled={isExporting}
+            onClick={() => setExportMenuOpen((v) => !v)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+          >
+            <IoDownloadOutline size={15} />
+            {isExporting ? "Exporting…" : "Export"}
+          </button>
+          {exportMenuOpen && (
+            <>
+              <div className="fixed inset-0 z-20" onClick={() => setExportMenuOpen(false)} />
+              <div className="absolute right-0 top-9 z-30 w-52 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200">
+                <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400">Save to library</p>
+                <button type="button" onClick={() => void handleExport("png")} className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700">
+                  PNG image
+                </button>
+                <button type="button" onClick={() => void handleExport("pdf")} className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700">
+                  PDF document
+                </button>
+                <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
+                <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400">Save as…</p>
+                <button type="button" onClick={() => void handleSaveAs("png")} className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700">
+                  PNG image…
+                </button>
+                <button type="button" onClick={() => void handleSaveAs("pdf")} className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700">
+                  PDF document…
+                </button>
+              </div>
+            </>
+          )}
+        </div>
       </div>
 
-      <div className="relative flex-1 min-h-0">
+      <div className="relative flex-1 min-h-0" ref={canvasHostRef}>
         <WhiteboardCanvas
           ref={canvasRef}
+          imageSrcFor={imageSrcFor}
+          onImageDrop={(files, docPoint) => void addImagesFromBlobs(files, docPoint)}
+          croppingNodeId={croppingNodeId}
+          setCroppingNodeId={setCroppingNodeId}
+          previewNodes={previewNodes}
           page={page}
           showGrid={doc.showGrid}
           snapToGrid={doc.snapToGrid}
@@ -1232,6 +1503,14 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onSendToBack={() => handleReorder(false)}
           onGroup={handleGroup}
           onUngroup={handleUngroup}
+          onReplaceImage={(node) => void handleReplaceImage(node)}
+          croppingNodeId={croppingNodeId}
+          onToggleCrop={(node) => setCroppingNodeId((prev) => (prev === node.id ? null : node.id))}
+          // null ends the preview (the slider released, or the pointer left it) and lets the
+          // committed store state show through again.
+          onPreviewNodes={(patch) =>
+            setPreviewNodes(patch === null ? null : (page ? page.nodes.filter((n) => selectedNodeIds.has(n.id)) : []).map((n) => ({ ...n, ...patch })))
+          }
         />
       </div>
 
@@ -1303,6 +1582,53 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           >
             <IoImageOutline size={14} /> {exportingSelection ? "Exporting…" : "Export selection as PNG"}
           </button>
+          {/* Image-specific actions, shown only when the right-click landed on exactly one image
+              node - both act on a single node, so offering them for a mixed or multi-node selection
+              would be ambiguous about which image they meant. */}
+          {(() => {
+            if (contextMenu.nodeIds.size !== 1 || contextMenu.edgeIds.size > 0) return null;
+            const id = [...contextMenu.nodeIds][0];
+            const node = page?.nodes.find((n) => n.id === id);
+            if (!node || node.shapeType !== "image") return null;
+            return (
+              <>
+                <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setContextMenu(null);
+                    void handleReplaceImage(node);
+                  }}
+                  className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                >
+                  <IoSwapHorizontalOutline size={14} /> Replace image…
+                </button>
+                <button
+                  type="button"
+                  disabled={node.locked}
+                  onClick={() => {
+                    setContextMenu(null);
+                    setCroppingNodeId((prev) => (prev === node.id ? null : node.id));
+                  }}
+                  className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+                >
+                  <IoCropOutline size={14} /> {croppingNodeId === node.id ? "Finish cropping" : "Crop image"}
+                </button>
+                {hasImageCrop(node) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setContextMenu(null);
+                      store.editNode(node, { ...node, imageCropX: undefined, imageCropY: undefined, imageCropW: undefined, imageCropH: undefined, updatedAt: Date.now() });
+                    }}
+                    className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                  >
+                    <IoRefreshOutline size={14} /> Reset crop
+                  </button>
+                )}
+              </>
+            );
+          })()}
           <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
           <button
             type="button"

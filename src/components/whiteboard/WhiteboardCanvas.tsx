@@ -30,9 +30,11 @@ import LatticeGaugeWidget from "./LatticeGaugeWidget";
 import WhiteboardTable from "./WhiteboardTable";
 import {
   ArrowheadType,
+  CHART_ANNOTATION_SHAPES,
   createDefaultWhiteboardEdge,
   createDefaultWhiteboardNode,
   createFreehandWhiteboardNode,
+  resolveImageCrop,
   DEFAULT_CHART_DATA,
   WhiteboardAnchorSide,
   WhiteboardEdge,
@@ -44,6 +46,7 @@ import {
 import {
   AMP_MINUS_Y_FRAC,
   AMP_PLUS_Y_FRAC,
+  annotationCoordinateMapper,
   BoundsBox,
   buildEdgePath,
   chartColumnLayout,
@@ -54,18 +57,235 @@ import {
   DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
   DEFAULT_CURVE_BOW,
   edgeBoundingBox,
-  graphCoordinateMapper,
+  imageDestRect,
   MAX_AMP_LEAD_LENGTH,
   MIN_AMP_LEAD_LENGTH,
   nearestSegmentInsertIndex,
   nodeCenter,
   nudgeEdgeBy,
+  outlineOptionsFor,
   resolveAmplifierGeometry,
   resolveAnchorPoint,
   resolveEdgeEndpoints,
-  resolveGraphAxisRange,
+  SERIES_FILL_OPACITY,
   shapeOutlineFor,
+  ChartLabel,
+  ShapeOutline,
+  ShapeOutlineOptions,
 } from "../../handlers/whiteboardHandlers";
+
+// ---- Shape outline memo cache -------------------------------------------------------------------
+//
+// shapeOutlineFor is a pure function of (shapeType, width, height, options), but it is called for
+// EVERY node on EVERY render - and React re-renders this canvas on every pointermove of a drag, on
+// hover, on selection change. For most shapes that is a handful of arithmetic and nobody notices.
+// For the data-heavy ones it is not: a "waterfallChart" with a few dozen traces rebuilds a few dozen
+// SVG path strings of a few thousand characters each, and doing that 60 times a second while a node
+// is being dragged is exactly the kind of thing that turns a canvas into a slideshow.
+//
+// The cache below makes that recompute happen only when something the outline actually DEPENDS on
+// changed. Note what is deliberately NOT in the key: node.x/node.y. Outlines are built in node-local
+// coordinates (see whiteboardHandlers.ts's ShapeOutline doc comment), so dragging a shape around -
+// the single most common continuous interaction there is - never invalidates its outline at all.
+//
+// Options are compared field-by-field with ===, not deep-equal. That is exact rather than
+// approximate here because whiteboard nodes are immutable: an edit to seriesData/graphPoints/
+// chartData always produces a NEW array (the store spreads rather than mutating), so reference
+// equality means "genuinely unchanged" - while a deep comparison of a 20,000-point series would cost
+// more than the rebuild it is trying to avoid.
+const outlineCache = new Map<string, { shapeType: WhiteboardShapeType; width: number; height: number; opts: ShapeOutlineOptions; outline: ShapeOutline }>();
+
+// Entries are keyed by node id and replaced in place, so this only grows when genuinely new nodes
+// appear - but a long session that creates and deletes thousands of shapes would still accumulate
+// entries for ids that no longer exist. Dropping everything once past the cap is fine: the cache is
+// a pure optimization with no correctness role, so the worst case is one slower frame while it
+// refills.
+const OUTLINE_CACHE_MAX_ENTRIES = 4000;
+
+function shallowEqualOptions(a: ShapeOutlineOptions, b: ShapeOutlineOptions): boolean {
+  for (const key of Object.keys(a) as (keyof ShapeOutlineOptions)[]) if (a[key] !== b[key]) return false;
+  for (const key of Object.keys(b) as (keyof ShapeOutlineOptions)[]) if (a[key] !== b[key]) return false;
+  return true;
+}
+
+function cachedShapeOutline(node: WhiteboardNode): ShapeOutline {
+  const opts = outlineOptionsFor(node);
+  const hit = outlineCache.get(node.id);
+  if (hit && hit.shapeType === node.shapeType && hit.width === node.width && hit.height === node.height && shallowEqualOptions(hit.opts, opts)) {
+    return hit.outline;
+  }
+  const outline = shapeOutlineFor(node.shapeType, node.width, node.height, opts);
+  if (outlineCache.size >= OUTLINE_CACHE_MAX_ENTRIES) outlineCache.clear();
+  outlineCache.set(node.id, { shapeType: node.shapeType, width: node.width, height: node.height, opts, outline });
+  return outline;
+}
+
+// One tick number, axis caption, legend entry or annotation label on a "chart" shape. Its own
+// component (rather than inline JSX at both of the two places chart labels are drawn - inside the
+// inset group and outside it for titles) so the per-label overrides a ChartLabel can carry - its own
+// color, a font-size multiplier, a weight, a rotation - are resolved against the node's base text
+// style in exactly one place.
+function ChartLabelText({ label, node }: { label: ChartLabel; node: WhiteboardNode }) {
+  return (
+    <text
+      x={label.x}
+      y={label.y}
+      // SVG rotates about the origin unless given a center - passing the label's own anchor point
+      // keeps a rotated y-axis caption pivoting in place rather than swinging off the shape.
+      transform={label.rotate ? `rotate(${label.rotate},${label.x},${label.y})` : undefined}
+      textAnchor={label.anchor}
+      dominantBaseline="middle"
+      fontFamily={node.fontFamily}
+      fontSize={node.fontSize * (label.fontScale ?? 1)}
+      fontWeight={label.weight ?? node.fontWeight}
+      fontStyle={node.fontStyle}
+      textDecoration={node.textDecoration === "underline" ? "underline" : undefined}
+      fill={label.color ?? node.fontColor}
+      style={{ pointerEvents: "none" }}
+    >
+      {label.text}
+    </text>
+  );
+}
+
+// The live body of an "image" node. Rendered as a real <img> rather than drawn into a canvas: the
+// browser already handles decoding, progressive paint, GPU-side scaling and (critically) redrawing
+// during a resize drag far better than re-rasterizing a multi-megapixel bitmap on the main thread
+// would - which is the same reason this node kind is the one place the whiteboard's own
+// shapeOutlineFor machinery is bypassed entirely.
+//
+// The mask, the crop, and the fit mode are all expressed as plain CSS so none of them costs a
+// repaint of our own: `borderRadius` cuts the silhouette, an `inset` box-shadow draws the ring flush
+// inside that silhouette (a real border would sit outside the mask and square off an ellipse's
+// corners), and the crop is a scaled/translated `object-fit` image inside an `overflow: hidden` box.
+// whiteboardHandlers.ts's paintImageNode reproduces exactly this geometry for the PNG export.
+function WhiteboardImageBody({ node, src, cropping }: { node: WhiteboardNode; src: string | null; cropping?: boolean }) {
+  const [failed, setFailed] = React.useState(false);
+  // A changed src is a different asset (image replaced, or the library root resolved late) - clear
+  // the stale failure so the new one gets its own chance to load.
+  React.useEffect(() => setFailed(false), [src]);
+
+  const mask = node.imageMask ?? "rect";
+  const borderRadius = mask === "ellipse" ? "50%" : mask === "rounded" ? `${Math.max(0, node.cornerRadius ?? 0)}px` : undefined;
+  const crop = resolveImageCrop(node);
+  const fit = node.imageFit ?? "cover";
+
+  const frameStyle: React.CSSProperties = {
+    position: "absolute",
+    inset: 0,
+    overflow: "hidden",
+    borderRadius,
+    backgroundColor: node.fillColor ?? "transparent",
+  };
+
+  // The ring is its OWN empty overlay rather than an inset box-shadow on the frame, because an inset
+  // shadow paints beneath its element's descendants - put it on the frame and the photo inside
+  // covers it completely. An empty element has no descendants to be covered by, so its shadow lands
+  // on top. Inset (not a border) so the ring hugs the mask edge and never grows the node's box,
+  // matching how every other shape's stroke behaves and what paintImageNode draws on export.
+  const ring =
+    node.strokeWidth > 0 ? (
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          borderRadius,
+          boxShadow: `inset 0 0 0 ${node.strokeWidth}px ${node.strokeColor}`,
+          pointerEvents: "none",
+        }}
+      />
+    ) : null;
+
+  if (!src || failed) {
+    return (
+      <div style={{ ...frameStyle, border: "1.5px dashed #9ca3af", backgroundColor: "#f3f4f6", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ fontSize: 12, color: "#6b7280", fontFamily: "system-ui, sans-serif", textAlign: "center", padding: 4 }}>
+          {src ? "Image missing" : "Loading image…"}
+        </span>
+      </div>
+    );
+  }
+
+  // While cropping, the WHOLE source is shown stretched across the node's box (no mask, no fit, no
+  // crop applied) so the user can see and reach the parts currently being cropped away - the kept
+  // region is marked by the overlay drawn on top of this. That flat 1:1 box mapping is also exactly
+  // what the crop drag's own pointer math assumes (see the "imageCrop" pointer-move branch).
+  if (cropping) {
+    return (
+      <div style={{ ...frameStyle, borderRadius: undefined, boxShadow: undefined }}>
+        <img src={src} alt="" draggable={false} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "fill", pointerEvents: "none" }} />
+      </div>
+    );
+  }
+
+  const tint: React.CSSProperties = {
+    opacity: node.imageOpacity ?? 1,
+    filter: node.imageGrayscale ? "grayscale(1)" : undefined,
+    pointerEvents: "none",
+    // Tailwind's preflight applies `img { max-width: 100% }` globally. A cropped image is
+    // deliberately scaled PAST its container (that is how the kept region is made to fill the frame
+    // - see the crop math below), and without this the width silently clamps back to 100% while the
+    // height scales as asked, shearing the picture. Cost a real debugging session; do not remove.
+    maxWidth: "none",
+    maxHeight: "none",
+  };
+
+  // Crop and fit are two separate stages, and they have to be applied in that order or they fight
+  // each other: the crop selects a sub-image, and only THEN is that sub-image fitted into the box.
+  // Expressing both with a single object-fit on one <img> silently gets this wrong (object-fit would
+  // be fitting the whole source, not the cropped region), so the two stages get one element each -
+  // an inner box positioned at exactly the rect imageDestRect computes, holding an image scaled so
+  // the kept region fills it.
+  //
+  // Going through imageDestRect (rather than re-deriving the placement in CSS) is what guarantees
+  // the canvas and the exported PNG frame the photo identically - paintImageNode calls the very same
+  // function for its drawImage destination.
+  const natural = node.naturalWidth && node.naturalHeight ? { w: node.naturalWidth, h: node.naturalHeight } : null;
+
+  if (!natural) {
+    // No measured source (an older node, or a decode that never completed) - fall back to a plain
+    // object-fit with no crop, which is still correct for the overwhelmingly common uncropped case.
+    return (
+      <div style={frameStyle}>
+        <img
+          src={src}
+          alt=""
+          draggable={false}
+          onError={() => setFailed(true)}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: fit === "fill" ? "fill" : fit, ...tint }}
+        />
+        {ring}
+      </div>
+    );
+  }
+
+  const dest = imageDestRect(node, natural.w * crop.w, natural.h * crop.h);
+  return (
+    <div style={frameStyle}>
+      <div style={{ position: "absolute", left: dest.x, top: dest.y, width: dest.width, height: dest.height, overflow: "hidden" }}>
+        <img
+          src={src}
+          alt=""
+          draggable={false}
+          onError={() => setFailed(true)}
+          style={{
+            position: "absolute",
+            // Percentages are relative to the inner box, which IS the cropped region's footprint -
+            // so scaling by 1/crop and shifting by -cropOrigin/crop lands the kept region exactly on
+            // it. objectFit is "fill" here because the fitting already happened, above.
+            left: `${(-crop.x / crop.w) * 100}%`,
+            top: `${(-crop.y / crop.h) * 100}%`,
+            width: `${(1 / crop.w) * 100}%`,
+            height: `${(1 / crop.h) * 100}%`,
+            objectFit: "fill",
+            ...tint,
+          }}
+        />
+      </div>
+      {ring}
+    </div>
+  );
+}
 
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
@@ -289,6 +509,16 @@ type Interaction =
   // only ever changes this one node's own graphPoints array, so there's no need for yet another
   // parallel live-state slice the way waypoint/moveEdge needed their own for EDGES).
   | { mode: "graphPoint"; id: string; index: number; startClientX: number; startClientY: number; startNode: WhiteboardNode }
+  // Dragging one of a chart's data-space annotation markers (see whiteboardTypes.ts's
+  // ChartAnnotation) - same shape as "graphPoint" above and for the same reason: it only ever
+  // rewrites this one node's own chartAnnotations array.
+  | { mode: "chartAnnotation"; id: string; index: number; startClientX: number; startClientY: number; startNode: WhiteboardNode }
+  // Dragging a handle on an image node's crop rectangle while that node is in crop mode (see
+  // croppingNodeId). A side handle moves one edge with the opposite one pinned; a CORNER handle
+  // moves two edges at once, which is what lets a crop be dragged at any angle rather than one axis
+  // at a time. `inside` instead pans the whole crop rectangle without resizing it - dragging the
+  // kept region around to reframe, the other half of what a crop tool has to do.
+  | { mode: "imageCrop"; id: string; handle: CropHandle; startNode: WhiteboardNode; startPointer: { x: number; y: number } }
   // Dragging one bar/line-point/scatter-dot of a "barChart"/"lineChart"/"scatterPlot" node's own
   // WhiteboardNode.chartData[index] vertically to change that one value - see beginChartDataDrag's
   // own doc comment for why `pixelsPerUnit` is captured once at gesture start rather than
@@ -349,6 +579,10 @@ type Interaction =
       startClientY: number;
       startEdge: WhiteboardEdge;
     };
+
+// The eight resize grips plus "inside" (pan the whole crop) - see the "imageCrop" Interaction
+// variant. Corner names follow the compass convention every resize handle in this file already uses.
+type CropHandle = "left" | "right" | "top" | "bottom" | "nw" | "ne" | "sw" | "se" | "inside";
 
 // Below this on-screen movement (CSS px, pre-zoom-correction) between two recorded connector-drag
 // path points, a new one isn't recorded - same "don't bloat with near-duplicate points" reasoning
@@ -448,6 +682,31 @@ interface WhiteboardCanvasProps {
   // node's id since, unlike selectedNodeIds, only one table's own internal range is ever "live" at a
   // time regardless of how many nodes exist.
   onTableRangeChange?: (nodeId: string, range: { r0: number; c0: number; r1: number; c1: number } | null) => void;
+  // Resolves an "image" node's stored asset filename to a URL this WebView can actually load.
+  // Supplied by WhiteboardEditor (which knows the library root and this whiteboard's id) rather than
+  // computed here, exactly like the same resolver renderWhiteboardToCanvas takes - a canvas shouldn't
+  // need to know where the Briefcast folder lives to draw a photo. Returns null while the library
+  // root is still resolving, which renders as the "Loading image…" placeholder.
+  imageSrcFor?: (node: WhiteboardNode) => string | null;
+  // Raw image bytes dropped onto the canvas, with the document-space point they landed on - the
+  // editor owns the actual import (it has the whiteboard id and the undo stack); this just reports
+  // the gesture. Returning without a handler leaves drops to the browser's default (nothing).
+  onImageDrop?: (files: File[], docPoint: { x: number; y: number }) => void;
+  // Which image node is in crop mode, owned by WhiteboardEditor rather than locally here so the
+  // style panel's own Crop button can drive the same state this canvas's double-click gesture does -
+  // two entry points into one mode, not two modes. Transient view state, never saved: the crop
+  // itself lives on the node, "I am adjusting it right now" does not.
+  croppingNodeId: string | null;
+  setCroppingNodeId: (id: string | null) => void;
+  // A full replacement nodes array the style panel is previewing mid-slider-drag - rendered instead
+  // of page.nodes, but never written to the store. This is what lets a slider update the shape in
+  // real time while still producing exactly ONE undo entry on release.
+  //
+  // It has to be a display-only channel rather than just committing on every tick: committing per
+  // tick pushes an undo entry and triggers a full re-render (and, for the lattice fields, a complete
+  // 3D mesh rebuild) on every pixel of travel - see LiveRangeSlider's own doc comment in
+  // WhiteboardStylePanel.tsx for the incident that established this.
+  previewNodes?: WhiteboardNode[] | null;
 }
 
 function clampZoom(z: number): number {
@@ -566,6 +825,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   onItemContextMenu,
   onLiveNodesChange,
   onTableRangeChange,
+  imageSrcFor,
+  onImageDrop,
+  croppingNodeId,
+  setCroppingNodeId,
+  previewNodes,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
@@ -608,10 +872,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [connectorHoverNodeId, setConnectorHoverNodeId] = useState<string | null>(null);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  // Leaving the node selected is the only state in which crop mode makes sense - selecting something
+  // else (or clearing the selection) should drop it, or the overlay would sit on a node the user has
+  // visibly moved on from and keep swallowing pointer events over it.
+  useEffect(() => {
+    if (croppingNodeId && !selectedNodeIds.has(croppingNodeId)) setCroppingNodeId(null);
+  }, [croppingNodeId, selectedNodeIds, setCroppingNodeId]);
   const [spaceHeld, setSpaceHeld] = useState(false);
   const editorRef = useRef<HTMLDivElement>(null);
 
-  const nodes = liveNodes ?? page.nodes;
+  // An in-progress canvas drag wins over a style-panel preview: both are "uncommitted display-only
+  // state", but only one gesture can be happening at a time, and the drag is the one the pointer is
+  // currently driving.
+  const nodes = liveNodes ?? previewNodes ?? page.nodes;
   const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const edges = liveEdges ?? page.edges;
 
@@ -754,6 +1027,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         setMarqueeRect(null);
         setFreehandPreview(null);
         setLiveNodes(null);
+        setCroppingNodeId(null);
         onSelectionChange(new Set(), new Set());
       }
     };
@@ -856,8 +1130,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       // here, just re-derive the local (node-space) pixel position they correspond to for invMapX/
       // invMapY, which (unlike this rect) DO expect coordinates relative to the full node box.
       const rect = (e.currentTarget as SVGRectElement).getBoundingClientRect();
-      const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(node);
-      const { padX, padY, plotW, plotH, invMapX, invMapY } = graphCoordinateMapper(node.width, node.height, xMin, xMax, yMin, yMax);
+      const { padX, padY, plotW, plotH, invMapX, invMapY } = annotationCoordinateMapper(node.shapeType, node.width, node.height, outlineOptionsFor(node));
       const px = padX + ((e.clientX - rect.left) / rect.width) * plotW;
       const py = padY + ((e.clientY - rect.top) / rect.height) * plotH;
       const point = { x: invMapX(px), y: invMapY(py) };
@@ -878,6 +1151,47 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       onEditNode(node, { ...node, graphPoints: points });
     },
     [onEditNode]
+  );
+
+  // ---- Data-space annotations (WhiteboardNode.chartAnnotations) ---------------------------------
+  // Drag to reposition, double-click to remove - the same two gestures a "graph" node's own manual
+  // points already have, so the two kinds of draggable in-plot handle behave identically. Adding is
+  // deliberately NOT double-click-on-empty-plot here (that gesture already means "add a manual
+  // point" on a "graph" node, and silently doing two different things depending on shapeType would
+  // be worse than one explicit button) - annotations are added from the style panel instead.
+  const beginAnnotationDrag = useCallback(
+    (node: WhiteboardNode, index: number, e: React.PointerEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      onSelectionChange(new Set([node.id]), new Set());
+      interactionRef.current = { mode: "chartAnnotation", id: node.id, index, startClientX: e.clientX, startClientY: e.clientY, startNode: node };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [onSelectionChange]
+  );
+
+  const removeAnnotation = useCallback(
+    (node: WhiteboardNode, index: number, e: React.MouseEvent) => {
+      e.stopPropagation();
+      onEditNode(node, { ...node, chartAnnotations: (node.chartAnnotations ?? []).filter((_, i) => i !== index) });
+    },
+    [onEditNode]
+  );
+
+  // ---- Image cropping --------------------------------------------------------------------------
+  // Double-clicking an image node enters crop mode: the FULL source is shown faded inside the node's
+  // box with the kept region highlighted and one draggable handle per edge. Double-click is free for
+  // this shapeType (an image has no text to edit, which is what that gesture does everywhere else)
+  // and is the same way photo editors already open a crop. Purely local view state - which node is
+  // being cropped is a transient UI mode, not document content, so it never reaches the store.
+  const beginImageCropDrag = useCallback(
+    (node: WhiteboardNode, handle: CropHandle, e: React.PointerEvent) => {
+      if (node.locked) return;
+      e.stopPropagation();
+      interactionRef.current = { mode: "imageCrop", id: node.id, handle, startNode: node, startPointer: clientToDoc(e.clientX, e.clientY) };
+      (e.target as Element).setPointerCapture?.(e.pointerId);
+    },
+    [clientToDoc]
   );
 
   // ---- Draggable chart data (barChart/lineChart/scatterPlot) ------------------------------------
@@ -1240,13 +1554,76 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // rendering/interaction code, this doesn't account for WhiteboardNode.rotation, so a
         // rotated graph's point handles will track slightly off; an acceptable scope tradeoff since
         // rotating a coordinate-plane-style shape is a rare case, unlike dragging a point on one.
-        const localX = cur.x - start.x;
-        const localY = cur.y - start.y;
-        const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(start);
-        const { invMapX, invMapY } = graphCoordinateMapper(start.width, start.height, xMin, xMax, yMin, yMax);
+        const mapper = annotationCoordinateMapper(start.shapeType, start.width, start.height, outlineOptionsFor(start));
+        const localX = cur.x - start.x - mapper.offsetX;
+        const localY = cur.y - start.y - mapper.offsetY;
+        const { invMapX, invMapY } = mapper;
         const points = [...(start.graphPoints ?? [])];
         points[interaction.index] = { x: invMapX(localX), y: invMapY(localY) };
         const updated: WhiteboardNode = { ...start, graphPoints: points };
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? updated : n)));
+        return;
+      }
+
+      if (interaction.mode === "chartAnnotation") {
+        const cur = clientToDoc(e.clientX, e.clientY);
+        const start = interaction.startNode;
+        const mapper = annotationCoordinateMapper(start.shapeType, start.width, start.height, outlineOptionsFor(start));
+        // Same unrotated-local-pixel assumption (and same scope tradeoff) as the "graphPoint" branch
+        // above, minus the title margins the plot box is shifted by.
+        const localX = cur.x - start.x - mapper.offsetX;
+        const localY = cur.y - start.y - mapper.offsetY;
+        const annotations = [...(start.chartAnnotations ?? [])];
+        annotations[interaction.index] = { ...annotations[interaction.index], x: mapper.invMapX(localX), y: mapper.invMapY(localY) };
+        const updated: WhiteboardNode = { ...start, chartAnnotations: annotations };
+        setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? updated : n)));
+        return;
+      }
+
+      if (interaction.mode === "imageCrop") {
+        const start = interaction.startNode;
+        const cur = clientToDoc(e.clientX, e.clientY);
+        // In crop mode the FULL source is displayed stretched across the node's box, so a pointer
+        // position maps to a source fraction by plain proportion - no fit-mode math needed, which is
+        // exactly why crop mode shows the image that way rather than in its normal fit.
+        const toFx = (x: number) => (x - start.x) / Math.max(1, start.width);
+        const toFy = (y: number) => (y - start.y) / Math.max(1, start.height);
+        const fx = Math.max(0, Math.min(1, toFx(cur.x)));
+        const fy = Math.max(0, Math.min(1, toFy(cur.y)));
+        const c = resolveImageCrop(start);
+        // No edge may cross its opposite - a crop can never invert or collapse to nothing, both of
+        // which make drawImage throw rather than draw.
+        const MIN = 0.02;
+        const h = interaction.handle;
+        let next = { x: c.x, y: c.y, w: c.w, h: c.h };
+
+        if (h === "inside") {
+          // Pan: shift the whole rectangle by the pointer's own travel, clamped so it stays fully
+          // inside the source rather than sliding off and silently shrinking.
+          const dx = toFx(cur.x) - toFx(interaction.startPointer.x);
+          const dy = toFy(cur.y) - toFy(interaction.startPointer.y);
+          next = { ...next, x: Math.max(0, Math.min(1 - c.w, c.x + dx)), y: Math.max(0, Math.min(1 - c.h, c.y + dy)) };
+        } else {
+          // A corner is just its two sides moving together, so the eight handles are expressed as
+          // two independent axis tests rather than eight separate cases.
+          const movesLeft = h === "left" || h === "nw" || h === "sw";
+          const movesRight = h === "right" || h === "ne" || h === "se";
+          const movesTop = h === "top" || h === "nw" || h === "ne";
+          const movesBottom = h === "bottom" || h === "sw" || h === "se";
+          if (movesLeft) {
+            const nx = Math.min(fx, c.x + c.w - MIN);
+            next = { ...next, x: nx, w: c.x + c.w - nx };
+          } else if (movesRight) {
+            next = { ...next, w: Math.max(MIN, Math.min(1 - c.x, fx - c.x)) };
+          }
+          if (movesTop) {
+            const ny = Math.min(fy, c.y + c.h - MIN);
+            next = { ...next, y: ny, h: c.y + c.h - ny };
+          } else if (movesBottom) {
+            next = { ...next, h: Math.max(MIN, Math.min(1 - c.y, fy - c.y)) };
+          }
+        }
+        const updated: WhiteboardNode = { ...start, imageCropX: next.x, imageCropY: next.y, imageCropW: next.w, imageCropH: next.h };
         setLiveNodes(page.nodes.map((n) => (n.id === interaction.id ? updated : n)));
         return;
       }
@@ -1454,6 +1831,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         if (after && after.rotation !== interaction.startNode.rotation) onEditNode(interaction.startNode, after);
         setLiveNodes(null);
       } else if (interaction.mode === "graphPoint" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "chartAnnotation" && liveNodes) {
+        const after = liveNodes.find((n) => n.id === interaction.id);
+        if (after) onEditNode(interaction.startNode, after);
+        setLiveNodes(null);
+      } else if (interaction.mode === "imageCrop" && liveNodes) {
         const after = liveNodes.find((n) => n.id === interaction.id);
         if (after) onEditNode(interaction.startNode, after);
         setLiveNodes(null);
@@ -1747,6 +2132,22 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       // actual context-menu trigger) - still suppress the OS's own menu here so it doesn't leak
       // through on the one part of the canvas that isn't a node/edge.
       onContextMenu={(e) => e.preventDefault()}
+      // Dropping image files anywhere on the canvas imports them at the drop point. dragOver must
+      // preventDefault or the browser refuses the drop outright and navigates to the file instead -
+      // and it's gated on the drag actually carrying files so dragging something else over the
+      // canvas doesn't advertise a drop target that would do nothing.
+      onDragOver={(e) => {
+        if (!onImageDrop || !e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+      }}
+      onDrop={(e) => {
+        if (!onImageDrop) return;
+        const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
+        if (files.length === 0) return;
+        e.preventDefault();
+        onImageDrop(files, clientToDoc(e.clientX, e.clientY));
+      }}
     >
       <div className="absolute top-0 left-0 w-0 h-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0" }}>
         {/* Edges layer - one SVG so paths can overlap nodes correctly (drawn before nodes = behind
@@ -1875,41 +2276,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           // the automatic hover shortcut.
           const showQuickConnectArrows =
             isConnectable && node.shapeType !== "table" && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
-          const outline = shapeOutlineFor(node.shapeType, node.width, node.height, {
-            sides: node.sides,
-            starPoints: node.starPoints,
-            starInnerRadiusRatio: node.starInnerRadiusRatio,
-            waveStyle: node.waveStyle,
-            waveCycles: node.waveCycles,
-            angleDegrees: node.angleDegrees,
-            angleRay1Length: node.angleRay1Length,
-            angleRay2Length: node.angleRay2Length,
-            chartData: node.chartData,
-            plotFunction: node.plotFunction,
-            plotDomainScale: node.plotDomainScale,
-            plotCycles: node.plotCycles,
-            plotShowGrid: node.plotShowGrid,
-            plotXTickInterval: node.plotXTickInterval,
-            plotYTickInterval: node.plotYTickInterval,
-            showChartLabels: node.showChartLabels,
-            numberLineMax: node.numberLineMax,
-            graphExpression: node.graphExpression,
-            graphXMin: node.graphXMin,
-            graphXMax: node.graphXMax,
-            graphYMin: node.graphYMin,
-            graphYMax: node.graphYMax,
-            graphShowGrid: node.graphShowGrid,
-            graphXTickInterval: node.graphXTickInterval,
-            graphYTickInterval: node.graphYTickInterval,
-            graphPoints: node.graphPoints,
-            ampInputTopLeadLength: node.ampInputTopLeadLength,
-            ampInputBottomLeadLength: node.ampInputBottomLeadLength,
-            ampOutputLeadLength: node.ampOutputLeadLength,
-            ampInputTopLeadYOffset: node.ampInputTopLeadYOffset,
-            ampInputBottomLeadYOffset: node.ampInputBottomLeadYOffset,
-            ampOutputLeadYOffset: node.ampOutputLeadYOffset,
-            ampInvertingOnTop: node.ampInvertingOnTop,
-          });
+          const outline = cachedShapeOutline(node);
           return (
             <div
               key={node.id}
@@ -1950,6 +2317,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               }}
               onDoubleClick={(e) => {
                 e.stopPropagation();
+                // "image" has no text either, so the gesture is free to mean something else here -
+                // it toggles crop mode, matching what double-clicking a photo does in every editor
+                // that has a crop tool at all.
+                if (node.shapeType === "image") {
+                  if (!node.locked) setCroppingNodeId(croppingNodeId === node.id ? null : node.id);
+                  return;
+                }
                 // "latticeGauge" has no text concept at all (see its own shapeType doc comment) -
                 // same "nothing to edit" exclusion "freehand" ink already gets.
                 // "table" has no single node-wide text concept either - it edits per-CELL text
@@ -2001,6 +2375,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
                   onSelect={() => onSelectionChange(new Set([node.id]), new Set())}
                 />
+              ) : node.shapeType === "image" ? (
+                <WhiteboardImageBody node={node} src={imageSrcFor?.(node) ?? null} cropping={croppingNodeId === node.id} />
               ) : node.shapeType === "table" ? (
                 <WhiteboardTable
                   node={node}
@@ -2072,37 +2448,40 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 </svg>
               ) : outline.kind === "chart" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  {outline.parts.map((part, i) =>
-                    part.role === "fill" ? (
-                      <path key={i} d={part.d} fill={node.fillColor ?? "none"} stroke="none" />
-                    ) : part.role === "marker" ? (
-                      <path key={i} d={part.d} fill={node.strokeColor} stroke="none" />
-                    ) : part.role === "slice" ? (
-                      <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={1} />
-                    ) : part.role === "axis" ? (
-                      <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={1} />
-                    ) : part.role === "grid" ? (
-                      <path key={i} d={part.d} fill="none" stroke="#e5e7eb" strokeWidth={0.75} />
-                    ) : (
-                      <path key={i} d={part.d} fill="none" stroke={node.strokeColor} strokeWidth={Math.max(1, node.strokeWidth)} strokeLinecap="round" strokeLinejoin="round" />
-                    )
-                  )}
-                  {outline.labels?.map((label, i) => (
-                    <text
-                      key={i}
-                      x={label.x}
-                      y={label.y}
-                      textAnchor={label.anchor}
-                      dominantBaseline="middle"
-                      fontFamily={node.fontFamily}
-                      fontSize={node.fontSize}
-                      fontWeight={node.fontWeight}
-                      fontStyle={node.fontStyle}
-                      textDecoration={node.textDecoration === "underline" ? "underline" : undefined}
-                      fill={node.fontColor}
-                    >
-                      {label.text}
-                    </text>
+                  {/* parts/labels are built in the plot box's own coordinates and shifted into place
+                      by `inset`; the title captions in overlayLabels are already node-local and sit
+                      OUTSIDE this group - see whiteboardHandlers.ts's ShapeOutline "chart" variant. */}
+                  <g transform={outline.inset ? `translate(${outline.inset.dx},${outline.inset.dy})` : undefined}>
+                    {outline.parts.map((part, i) =>
+                      part.role === "fill" ? (
+                        <path key={i} d={part.d} fill={node.fillColor ?? "none"} stroke="none" />
+                      ) : part.role === "marker" ? (
+                        <path key={i} d={part.d} fill={node.strokeColor} stroke="none" />
+                      ) : part.role === "slice" ? (
+                        <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={1} />
+                      ) : part.role === "series" ? (
+                        <path key={i} d={part.d} fill="none" stroke={part.color} strokeWidth={Math.max(0.5, part.width)} strokeLinecap="round" strokeLinejoin="round" />
+                      ) : part.role === "seriesFill" ? (
+                        <path key={i} d={part.d} fill={part.color} fillOpacity={SERIES_FILL_OPACITY} stroke="none" />
+                      ) : part.role === "annotation" ? (
+                        // Filled for the marker glyphs AND stroked so a leader line (a zero-area
+                        // path that would fill to nothing) still draws - matching the Canvas2D
+                        // export's own annotation branch exactly.
+                        <path key={i} d={part.d} fill={part.color} stroke={part.color} strokeWidth={1} strokeLinecap="round" />
+                      ) : part.role === "axis" ? (
+                        <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={1} />
+                      ) : part.role === "grid" ? (
+                        <path key={i} d={part.d} fill="none" stroke="#e5e7eb" strokeWidth={0.75} />
+                      ) : (
+                        <path key={i} d={part.d} fill="none" stroke={node.strokeColor} strokeWidth={Math.max(1, node.strokeWidth)} strokeLinecap="round" strokeLinejoin="round" />
+                      )
+                    )}
+                    {outline.labels?.map((label, i) => (
+                      <ChartLabelText key={i} label={label} node={node} />
+                    ))}
+                  </g>
+                  {outline.overlayLabels?.map((label, i) => (
+                    <ChartLabelText key={`t${i}`} label={label} node={node} />
                   ))}
                 </svg>
               ) : null}
@@ -2116,8 +2495,17 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 selected &&
                 !node.locked &&
                 (() => {
-                  const { xMin, xMax, yMin, yMax } = resolveGraphAxisRange(node);
-                  const { padX, padY, plotW, plotH, mapX, mapY } = graphCoordinateMapper(node.width, node.height, xMin, xMax, yMin, yMax);
+                  // annotationCoordinateMapper rather than graphCoordinateMapper directly: for a
+                  // "graph" it resolves the identical axis window (resolveGraphAxisRange), but it
+                  // ALSO accounts for the margins any axis/chart titles reserve - without which
+                  // every handle here would sit offset from the curve by exactly those margins the
+                  // moment a title was set.
+                  const { padX, padY, plotW, plotH, mapX, mapY, offsetX, offsetY } = annotationCoordinateMapper(
+                    node.shapeType,
+                    node.width,
+                    node.height,
+                    outlineOptionsFor(node)
+                  );
                   const points = node.graphPoints ?? [];
                   return (
                     <svg
@@ -2133,29 +2521,171 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       // point handle rendered well outside the node's own visible box).
                       style={{ position: "absolute", inset: 0, overflow: "visible" }}
                     >
-                      <rect
-                        x={padX}
-                        y={padY}
-                        width={plotW}
-                        height={plotH}
-                        fill="transparent"
-                        style={{ pointerEvents: "all", cursor: "copy" }}
-                        onDoubleClick={(e) => addGraphPoint(node, e)}
+                      <g transform={`translate(${offsetX},${offsetY})`}>
+                        <rect
+                          x={padX}
+                          y={padY}
+                          width={plotW}
+                          height={plotH}
+                          fill="transparent"
+                          style={{ pointerEvents: "all", cursor: "copy" }}
+                          onDoubleClick={(e) => addGraphPoint(node, e)}
+                        />
+                        {points.map((p, i) => (
+                          <circle
+                            key={i}
+                            cx={mapX(p.x)}
+                            cy={mapY(p.y)}
+                            r={5.5 / zoom}
+                            fill="#2563eb"
+                            stroke="#ffffff"
+                            strokeWidth={1.5 / zoom}
+                            style={{ pointerEvents: "all", cursor: "grab" }}
+                            onPointerDown={(e) => beginGraphPointDrag(node, i, e)}
+                            onDoubleClick={(e) => removeGraphPoint(node, i, e)}
+                          />
+                        ))}
+                      </g>
+                    </svg>
+                  );
+                })()}
+
+              {/* Crop overlay for an image node in crop mode (double-click to enter, Escape or a
+                  click elsewhere to leave). The body behind this is showing the FULL source; this
+                  dims everything outside the kept rectangle and puts a drag handle on each of its
+                  four edges. */}
+              {node.shapeType === "image" &&
+                croppingNodeId === node.id &&
+                !node.locked &&
+                (() => {
+                  const c = resolveImageCrop(node);
+                  const left = c.x * node.width;
+                  const top = c.y * node.height;
+                  const w = c.w * node.width;
+                  const h = c.h * node.height;
+                  const grip = 9 / zoom;
+                  // Corners are listed AFTER the sides so they paint (and hit-test) on top where the
+                  // two overlap - dragging a corner is the more specific intent.
+                  const handles: { handle: CropHandle; x: number; y: number; width: number; height: number; cursor: string }[] = [
+                    { handle: "left", x: left - grip / 2, y: top, width: grip, height: h, cursor: "ew-resize" },
+                    { handle: "right", x: left + w - grip / 2, y: top, width: grip, height: h, cursor: "ew-resize" },
+                    { handle: "top", x: left, y: top - grip / 2, width: w, height: grip, cursor: "ns-resize" },
+                    { handle: "bottom", x: left, y: top + h - grip / 2, width: w, height: grip, cursor: "ns-resize" },
+                    { handle: "nw", x: left - grip, y: top - grip, width: grip * 2, height: grip * 2, cursor: "nwse-resize" },
+                    { handle: "ne", x: left + w - grip, y: top - grip, width: grip * 2, height: grip * 2, cursor: "nesw-resize" },
+                    { handle: "sw", x: left - grip, y: top + h - grip, width: grip * 2, height: grip * 2, cursor: "nesw-resize" },
+                    { handle: "se", x: left + w - grip, y: top + h - grip, width: grip * 2, height: grip * 2, cursor: "nwse-resize" },
+                  ];
+                  const corners: [number, number][] = [
+                    [left, top],
+                    [left + w, top],
+                    [left, top + h],
+                    [left + w, top + h],
+                  ];
+                  return (
+                    <svg
+                      width="100%"
+                      height="100%"
+                      viewBox={`0 0 ${node.width} ${node.height}`}
+                      preserveAspectRatio="none"
+                      style={{ position: "absolute", inset: 0, overflow: "visible" }}
+                    >
+                      {/* The dimmed region is the whole box minus the kept rect - drawn as one path
+                          with an inner subpath wound the opposite way so the even-odd rule punches
+                          the keeper out, rather than as four separate edge rectangles. */}
+                      <path
+                        d={`M0,0 H${node.width} V${node.height} H0 Z M${left},${top} V${top + h} H${left + w} V${top} Z`}
+                        fill="rgba(17,24,39,0.55)"
+                        fillRule="evenodd"
+                        style={{ pointerEvents: "none" }}
                       />
-                      {points.map((p, i) => (
-                        <circle
-                          key={i}
-                          cx={mapX(p.x)}
-                          cy={mapY(p.y)}
-                          r={5.5 / zoom}
-                          fill="#2563eb"
-                          stroke="#ffffff"
-                          strokeWidth={1.5 / zoom}
-                          style={{ pointerEvents: "all", cursor: "grab" }}
-                          onPointerDown={(e) => beginGraphPointDrag(node, i, e)}
-                          onDoubleClick={(e) => removeGraphPoint(node, i, e)}
+                      {/* Dragging anywhere inside the kept region pans the crop without resizing
+                          it. Listed before the edge/corner grips so those win where they overlap. */}
+                      <rect
+                        x={left}
+                        y={top}
+                        width={w}
+                        height={h}
+                        fill="transparent"
+                        style={{ pointerEvents: "all", cursor: "move" }}
+                        onPointerDown={(e) => beginImageCropDrag(node, "inside", e)}
+                      />
+                      <rect x={left} y={top} width={w} height={h} fill="none" stroke="#ffffff" strokeWidth={1.5 / zoom} style={{ pointerEvents: "none" }} />
+                      {/* Rule-of-thirds guides, the standard crop-tool framing aid. */}
+                      {[1, 2].map((i) => (
+                        <React.Fragment key={`g${i}`}>
+                          <line x1={left + (w * i) / 3} y1={top} x2={left + (w * i) / 3} y2={top + h} stroke="rgba(255,255,255,0.4)" strokeWidth={1 / zoom} style={{ pointerEvents: "none" }} />
+                          <line x1={left} y1={top + (h * i) / 3} x2={left + w} y2={top + (h * i) / 3} stroke="rgba(255,255,255,0.4)" strokeWidth={1 / zoom} style={{ pointerEvents: "none" }} />
+                        </React.Fragment>
+                      ))}
+                      {handles.map((handle) => (
+                        <rect
+                          key={handle.handle}
+                          x={handle.x}
+                          y={handle.y}
+                          width={Math.max(handle.width, grip)}
+                          height={Math.max(handle.height, grip)}
+                          fill="transparent"
+                          style={{ pointerEvents: "all", cursor: handle.cursor }}
+                          onPointerDown={(e) => beginImageCropDrag(node, handle.handle, e)}
                         />
                       ))}
+                      {/* Visible corner marks - the grips themselves are transparent hit areas, so
+                          without these there is nothing showing the corners can be grabbed. */}
+                      {corners.map(([cx, cy], i) => (
+                        <rect
+                          key={`c${i}`}
+                          x={cx - grip / 2}
+                          y={cy - grip / 2}
+                          width={grip}
+                          height={grip}
+                          fill="#ffffff"
+                          stroke="#111827"
+                          strokeWidth={1 / zoom}
+                          style={{ pointerEvents: "none" }}
+                        />
+                      ))}
+                    </svg>
+                  );
+                })()}
+
+              {/* Draggable handles for a selected, unlocked chart's data-space annotations (see
+                  WhiteboardNode.chartAnnotations) - drag to move the callout to a different data
+                  coordinate, double-click to delete it. Rendered as a hollow ring around wherever
+                  the annotation's own marker already draws, so the handle reads as "grab this
+                  callout" without hiding the marker it belongs to. */}
+              {CHART_ANNOTATION_SHAPES.has(node.shapeType) &&
+                selected &&
+                !node.locked &&
+                (node.chartAnnotations?.length ?? 0) > 0 &&
+                (() => {
+                  const mapper = annotationCoordinateMapper(node.shapeType, node.width, node.height, outlineOptionsFor(node));
+                  return (
+                    <svg
+                      width="100%"
+                      height="100%"
+                      viewBox={`0 0 ${node.width} ${node.height}`}
+                      preserveAspectRatio="none"
+                      style={{ position: "absolute", inset: 0, overflow: "visible" }}
+                    >
+                      {/* Shifted by the title margins for the same reason the outline's own parts
+                          are - see annotationCoordinateMapper's offsetX/offsetY doc comment. */}
+                      <g transform={`translate(${mapper.offsetX},${mapper.offsetY})`}>
+                        {(node.chartAnnotations ?? []).map((a, i) => (
+                          <circle
+                            key={i}
+                            cx={mapper.mapX(a.x)}
+                            cy={mapper.mapY(a.y)}
+                            r={7 / zoom}
+                            fill="transparent"
+                            stroke="#2563eb"
+                            strokeWidth={1.5 / zoom}
+                            style={{ pointerEvents: "all", cursor: "grab" }}
+                            onPointerDown={(e) => beginAnnotationDrag(node, i, e)}
+                            onDoubleClick={(e) => removeAnnotation(node, i, e)}
+                          />
+                        ))}
+                      </g>
                     </svg>
                   );
                 })()}
