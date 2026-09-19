@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<!--
+  The page Briefcast serves to the phone (services/phone_camera.rs embeds this with include_str!).
+
+  This is the whole "no extra software" half of the feature: the phone's own browser is the
+  capture device. It grabs the camera with getUserMedia and pushes it to the desktop over
+  WebRTC, with services/phone_camera.rs acting only as the signalling relay - once the peer
+  connection is up, video bytes go phone -> PC directly and never pass through the Rust server.
+
+  Deliberately dependency-free and inlined into one file: it's served off a self-signed origin
+  the phone has just been warned about, so pulling anything from a CDN would both fail offline
+  (the usual case - PC and phone on the same LAN with no internet) and be a bad idea anyway.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Briefcast Camera</title>
+<style>
+  :root {
+    --bg: #0b0b0d;
+    --panel: #17171b;
+    --border: #2a2a31;
+    --text: #f4f4f5;
+    --muted: #a1a1aa;
+    --accent: #ef4444;
+    --ok: #22c55e;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overscroll-behavior: none;
+  }
+  body { display: flex; flex-direction: column; }
+
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; padding-top: max(12px, env(safe-area-inset-top));
+    border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  .brand { font-weight: 600; font-size: 15px; letter-spacing: -0.01em; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 4px rgba(34,197,94,.18); }
+  .dot.err  { background: var(--accent); box-shadow: 0 0 0 4px rgba(239,68,68,.18); }
+  #status { margin-left: auto; font-size: 12.5px; color: var(--muted); text-align: right; }
+
+  main { flex: 1; position: relative; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; }
+
+  /* Shown before the user taps Start - getUserMedia must be triggered by a real gesture on
+     iOS Safari, and asking up front also means the permission prompt isn't a surprise. */
+  #gate {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px; padding: 28px; text-align: center;
+  }
+  #gate h1 { font-size: 19px; margin: 0; font-weight: 600; }
+  #gate p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; max-width: 300px; }
+  #gate.hidden { display: none; }
+
+  button {
+    font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 11px;
+    padding: 12px 18px; cursor: pointer; transition: background .15s;
+  }
+  button:active { background: #23232a; }
+  button:disabled { opacity: .45; }
+  .primary { background: #fff; color: #000; border-color: #fff; font-weight: 600; padding: 14px 30px; font-size: 16px; }
+
+  footer {
+    display: flex; gap: 10px; padding: 12px 16px;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border); background: var(--panel);
+  }
+  footer button { flex: 1; font-size: 14px; }
+  #err {
+    display: none; margin: 12px 16px; padding: 12px 14px; border-radius: 10px;
+    background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.35);
+    color: #fecaca; font-size: 13px; line-height: 1.5;
+  }
+  #err.show { display: block; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <span class="brand">Briefcast Camera</span>
+  <span id="status">Connecting…</span>
+</header>
+
+<div id="err"></div>
+
+<main>
+  <video id="preview" playsinline autoplay muted></video>
+  <div id="gate">
+    <h1>Use this phone as a camera</h1>
+    <p>Briefcast is waiting on your computer. Tap below and allow camera access.</p>
+    <button class="primary" id="start">Start camera</button>
+  </div>
+</main>
+
+<footer>
+  <button id="flip" disabled>Flip camera</button>
+  <button id="stop" disabled>Stop</button>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var preview = document.getElementById("preview");
+  var statusEl = document.getElementById("status");
+  var dot = document.getElementById("dot");
+  var errEl = document.getElementById("err");
+  var gate = document.getElementById("gate");
+  var startBtn = document.getElementById("start");
+  var flipBtn = document.getElementById("flip");
+  var stopBtn = document.getElementById("stop");
+
+  var ws = null;
+  var pc = null;
+  var stream = null;
+  var facing = "environment";   // rear camera by default - the useful one for a desk/document shot
+  // The desktop starts trickling ICE the instant it has built its answer, so candidates routinely
+  // arrive before setRemoteDescription(answer) has resolved here. addIceCandidate throws in that
+  // window, and a dropped candidate shows up later as an intermittent failure to connect - so
+  // they're queued and flushed once the answer is actually applied.
+  var pendingCandidates = [];
+  var remoteReady = false;
+  var running = false;
+  var reconnectTimer = null;
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    dot.className = "dot" + (kind ? " " + kind : "");
+  }
+
+  function showError(msg) {
+    errEl.textContent = msg;
+    errEl.classList.add("show");
+  }
+
+  function clearError() {
+    errEl.classList.remove("show");
+  }
+
+  // Keeps the screen awake while streaming. Without this the phone dims and, on many Androids,
+  // throttles the capture pipeline a minute or two in - which looks exactly like a dropped
+  // connection from the desktop side.
+  var wakeLock = null;
+  function acquireWakeLock() {
+    if (!navigator.wakeLock) return;
+    navigator.wakeLock.request("screen").then(function (l) {
+      wakeLock = l;
+      l.addEventListener("release", function () { wakeLock = null; });
+    }).catch(function () { /* non-fatal - it just means the screen may dim */ });
+  }
+  function releaseWakeLock() {
+    if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible" && running && !wakeLock) acquireWakeLock();
+  });
+
+  function send(msg) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  }
+
+  function connectSignalling() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(proto + "//" + location.host + "/ws?role=phone");
+
+    ws.onopen = function () {
+      clearError();
+      setStatus(running ? "Streaming" : "Ready", running ? "live" : null);
+      send({ type: "hello", role: "phone" });
+    };
+
+    ws.onclose = function () {
+      setStatus("Disconnected", "err");
+      // The desktop may simply have closed the pairing panel; retry quietly so walking back
+      // into range or reopening the panel picks the phone straight back up.
+      if (!reconnectTimer) {
+        reconnectTimer = setTimeout(function () {
+          reconnectTimer = null;
+          connectSignalling();
+        }, 2000);
+      }
+    };
+
+    ws.onerror = function () { setStatus("Connection error", "err"); };
+
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+
+      if (msg.type === "answer") {
+        pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).then(function () {
+          remoteReady = true;
+          var queued = pendingCandidates;
+          pendingCandidates = [];
+          queued.forEach(function (c) {
+            pc.addIceCandidate(c).catch(function () { /* unusable candidate - ICE has others */ });
+          });
+        }).catch(function (e) {
+          showError("Could not complete the connection: " + e.message);
+        });
+      } else if (msg.type === "ice" && msg.candidate) {
+        if (!pc || !remoteReady) {
+          pendingCandidates.push(msg.candidate);
+          return;
+        }
+        pc.addIceCandidate(msg.candidate).catch(function () { /* stale candidate - harmless */ });
+      } else if (msg.type === "desktop-ready" && running) {
+        // Desktop reopened the panel after we were already streaming - renegotiate so it
+        // gets a fresh offer rather than waiting for a stream that's already flowing.
+        negotiate();
+      }
+    };
+  }
+
+  function negotiate() {
+    if (!stream) return;
+
+    if (pc) { try { pc.close(); } catch (e) {} }
+    pendingCandidates = [];
+    remoteReady = false;
+    // No ICE servers: the phone and the PC are on the same network by construction (the phone
+    // had to reach this page to get here), so host candidates alone connect. That also keeps
+    // the whole feature working with no internet access at all.
+    pc = new RTCPeerConnection({ iceServers: [] });
+
+    stream.getTracks().forEach(function (t) { pc.addTrack(t, stream); });
+
+    pc.onicecandidate = function (e) {
+      if (e.candidate) send({ type: "ice", candidate: e.candidate.toJSON() });
+    };
+
+    pc.onconnectionstatechange = function () {
+      var s = pc.connectionState;
+      if (s === "connected") { setStatus("Streaming", "live"); clearError(); }
+      else if (s === "failed") { setStatus("Connection failed", "err"); showError("Lost the direct connection to your computer. Check that both are on the same Wi-Fi network."); }
+      else if (s === "disconnected") setStatus("Reconnecting…", "err");
+    };
+
+    pc.createOffer()
+      .then(function (offer) { return pc.setLocalDescription(offer); })
+      .then(function () { send({ type: "offer", sdp: pc.localDescription.sdp }); })
+      .catch(function (e) { showError("Could not start streaming: " + e.message); });
+  }
+
+  function startCamera() {
+    clearError();
+    startBtn.disabled = true;
+    setStatus("Requesting camera…");
+
+    // Ideal (not exact) constraints: a phone that can't do 1080p should fall back rather than
+    // fail outright, and `facingMode` is ideal so single-camera devices still work.
+    var constraints = {
+      video: {
+        facingMode: { ideal: facing },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 30 }
+      },
+      audio: false   // mic stays on the PC's own selected audio device
+    };
+
+    navigator.mediaDevices.getUserMedia(constraints)
+      .then(function (s) {
+        stream = s;
+        preview.srcObject = s;
+        running = true;
+        gate.classList.add("hidden");
+        flipBtn.disabled = false;
+        stopBtn.disabled = false;
+        acquireWakeLock();
+        negotiate();
+      })
+      .catch(function (e) {
+        startBtn.disabled = false;
+        setStatus("Camera blocked", "err");
+        if (e.name === "NotAllowedError") {
+          showError("Camera permission was denied. Allow camera access for this page in your browser settings, then tap Start camera again.");
+        } else if (e.name === "NotFoundError") {
+          showError("No camera was found on this phone.");
+        } else if (e.name === "NotReadableError") {
+          showError("The camera is already in use by another app. Close it and try again.");
+        } else {
+          showError(e.name + ": " + e.message);
+        }
+      });
+  }
+
+  function stopCamera() {
+    running = false;
+    releaseWakeLock();
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+    if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+    preview.srcObject = null;
+    send({ type: "bye" });
+    gate.classList.remove("hidden");
+    startBtn.disabled = false;
+    flipBtn.disabled = true;
+    stopBtn.disabled = true;
+    setStatus("Stopped");
+  }
+
+  function flipCamera() {
+    if (!running) return;
+    facing = (facing === "environment") ? "user" : "environment";
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+    // Re-acquire at the new facing, then renegotiate so the desktop picks up the new track.
+    startBtn.disabled = true;
+    startCamera();
+  }
+
+  startBtn.addEventListener("click", startCamera);
+  stopBtn.addEventListener("click", stopCamera);
+  flipBtn.addEventListener("click", flipCamera);
+  window.addEventListener("pagehide", function () { send({ type: "bye" }); });
+
+  // getUserMedia is absent entirely on a non-secure origin, which is the one failure worth
+  // explaining in full: it means the page was reached over plain http, not https.
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    startBtn.disabled = true;
+    setStatus("Unsupported", "err");
+    showError("This browser won't allow camera access on this page. Make sure the address starts with https:// - browsers block the camera on insecure connections.");
+  } else {
+    connectSignalling();
+  }
+})();
+</script>
+</body>
+</html>

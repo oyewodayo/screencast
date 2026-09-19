@@ -1,6 +1,7 @@
 // components/docker/RecordingDocker.tsx
 import React from "react";
-import { IoInformationCircle, IoRefresh } from "react-icons/io5";
+import { IoInformationCircle, IoRefresh, IoPhonePortraitOutline } from "react-icons/io5";
+import { PHONE_CAMERA_DEVICE, PHONE_CAMERA_LABEL } from "../../services/phoneCamera";
 
 // Represents "Native" (no downscale) as a plain width rather than a separate value/flag - see
 // FormData.resolution_width's own doc comment (recording.rs) for why the backend already expects
@@ -23,6 +24,10 @@ interface RecordingDockerProps {
   videoDevices: string[];
   onToggleVideoDevice: (device: string) => void;
   onRefreshDevices: () => void;
+  // Opens the pairing panel for the phone-camera entry below. That entry is always listed (a
+  // phone can never show up in device detection), so it needs its own way in.
+  onOpenPhoneCamera: () => void;
+  isPhoneCameraConnected: boolean;
   // System/"what you hear" audio capture - attempted on every platform now (WASAPI on Windows, a
   // PulseAudio monitor source on Linux, avfoundation + a known virtual-audio device on macOS),
   // only offered for the screen-capture record types (sva/sa/s), see this component's own render
@@ -79,6 +84,8 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   videoDevices,
   onToggleVideoDevice,
   onRefreshDevices,
+  onOpenPhoneCamera,
+  isPhoneCameraConnected,
   includeSystemAudio,
   onToggleIncludeSystemAudio,
   isClickTrackingSupported,
@@ -276,16 +283,46 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             <div className="docker-field-label p-1 text-sm">Video device(s)</div>
             <div className="docker-video-devices p-2 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 max-h-28 overflow-y-auto min-w-[180px]">
               {connectedCameraDevices && connectedCameraDevices.length > 0 ? (
-                connectedCameraDevices.map((device, index) => (
-                  <label key={index} className="flex items-center gap-2 py-0.5 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={videoDevices.includes(device)}
-                      onChange={() => onToggleVideoDevice(device)}
-                    />
-                    <span className="truncate">{device}</span>
-                  </label>
-                ))
+                connectedCameraDevices.map((device, index) => {
+                  // The phone entry is always present but only usable once paired, so it carries
+                  // its own label, status and a way into the pairing panel rather than pretending
+                  // to be just another detected device.
+                  const isPhone = device === PHONE_CAMERA_DEVICE;
+                  return (
+                    <label key={index} className="flex items-center gap-2 py-0.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={videoDevices.includes(device)}
+                        onChange={() => {
+                          // Ticking an unpaired phone can't arm anything, so send the user where
+                          // they can actually pair it instead of silently doing nothing.
+                          if (isPhone && !isPhoneCameraConnected) {
+                            onOpenPhoneCamera();
+                            return;
+                          }
+                          onToggleVideoDevice(device);
+                        }}
+                      />
+                      {isPhone ? (
+                        <span className="flex items-center gap-1.5 min-w-0">
+                          <IoPhonePortraitOutline className="shrink-0 text-neutral-500" size={13} />
+                          <span className="truncate">{PHONE_CAMERA_LABEL}</span>
+                          <span
+                            className={`shrink-0 text-[10px] px-1.5 py-px rounded-full ${
+                              isPhoneCameraConnected
+                                ? "bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-400"
+                                : "bg-neutral-100 text-neutral-500 dark:bg-neutral-700 dark:text-neutral-400"
+                            }`}
+                          >
+                            {isPhoneCameraConnected ? "Connected" : "Set up"}
+                          </span>
+                        </span>
+                      ) : (
+                        <span className="truncate">{device}</span>
+                      )}
+                    </label>
+                  );
+                })
               ) : (
                 <span className="text-neutral-500">No video cameras detected</span>
               )}
@@ -308,7 +345,9 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             <div className="docker-field-label p-1 text-sm">&nbsp;</div>
             <label
               title={
-                videoDevices.length === 1
+                videoDevices.includes(PHONE_CAMERA_DEVICE)
+                  ? "The phone camera is always recorded as its own separate file, so this setting doesn't apply while it's selected."
+                  : videoDevices.length === 1
                   ? "Records the webcam as its own separate file instead of baking it into the screen recording, so you can reposition/resize/reshape it later in the editor's picture-in-picture layer."
                   : "Only supported with exactly one camera selected."
               }

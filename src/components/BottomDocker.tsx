@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import ActiveRecordingState, { RecordSource, SOURCE_FLAGS } from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
+import { PHONE_CAMERA_DEVICE } from "../services/phoneCamera";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
@@ -141,6 +142,10 @@ interface Props {
     track_clicks: boolean;
   }) => void;
   handleStopRecording: () => void;
+  // Opens the phone-camera pairing panel (PhoneCameraModal) - owned by Dashboard, which is where
+  // the modal is mounted, since BottomDocker has no modal layer of its own.
+  onOpenPhoneCamera: () => void;
+  isPhoneCameraConnected: boolean;
   isRecording: boolean;
   recordingStartTime: number | null;
   // Pause/resume timing model - see Dashboard.tsx's own doc comment on these three fields for the
@@ -273,6 +278,8 @@ const BottomDocker = ({
   videoDevices,
   setVideoDevices,
   showRecordingDocker,
+  onOpenPhoneCamera,
+  isPhoneCameraConnected,
   showRecordingPanelButtons
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
@@ -364,7 +371,13 @@ const BottomDocker = ({
 
     invoke<ConnectedDevice>("get_connected_cameras")
       .then((devices) => {
-        setConnectedCameraDevices(devices);
+        // The phone is appended rather than detected: it can never appear in get_connected_cameras
+        // (that enumerates DirectShow devices, and a phone isn't one - see
+        // src-tauri/src/services/phone_camera.rs), so the entry has to be offered unconditionally
+        // and is paired on demand from the panel behind it.
+        setConnectedCameraDevices([...devices, PHONE_CAMERA_DEVICE]);
+        // Defaults are chosen from the REAL cameras only - auto-selecting the phone on a machine
+        // with no webcam would arm a source that isn't paired yet and record nothing.
         if (devices.length > 0) {
           const preferred = settings.defaultVideoDevices.filter((d) => devices.includes(d));
           setVideoDevices(preferred.length > 0 ? preferred : [devices[0]]); // Default to the first detected camera
@@ -396,6 +409,15 @@ const BottomDocker = ({
     event: React.ChangeEvent<HTMLSelectElement>
   ) => {
     setRecordType(event.target.value);
+  };
+
+  // Same thing, for callers that already have the value rather than a <select> event - currently
+  // the screen-selection modal's own "Change" control. Clearing previousRecordType matters:
+  // closeModalScreen restores it on close, so without this, deliberately switching type inside
+  // the modal during a screenshot flow would be silently undone the moment it closed.
+  const handleRecordTypeSelected = (value: string) => {
+    setPreviousRecordType(null);
+    setRecordType(value);
   };
 
   const handleFileExtChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
@@ -540,6 +562,7 @@ const BottomDocker = ({
       onCloseScreen={closeModalScreen} 
       onStartRecording={onStartRecording} 
       setOpen={setModalOpenScreen}
+      onRecordTypeChange={handleRecordTypeSelected}
     />
     <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
      
@@ -633,6 +656,8 @@ const BottomDocker = ({
             videoDevices={videoDevices}
             onToggleVideoDevice={toggleVideoDevice}
             onRefreshDevices={loadDevices}
+            onOpenPhoneCamera={onOpenPhoneCamera}
+            isPhoneCameraConnected={isPhoneCameraConnected}
             includeSystemAudio={includeSystemAudio}
             onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
             separateWebcamCapture={separateWebcamCapture}

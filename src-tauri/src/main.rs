@@ -23,6 +23,10 @@ mod services {
     pub mod file_watcher;
     pub mod image_annotations;
     pub mod pdf_annotations;
+    // Serves a phone's browser as a camera source over the LAN - see the module's own doc
+    // comment for why a webcam driver (DroidCam/Iriun/Camo) is otherwise the only way to get a
+    // phone into a DirectShow device list, and why this needs to be an HTTPS server to avoid one.
+    pub mod phone_camera;
     pub mod trash;
     pub mod utility;
     pub mod video_edits;
@@ -254,6 +258,7 @@ fn main() {
         .manage(commands::conversion::ConversionState::default())
         .manage(commands::native_playback::NativePlaybackState::default())
         .manage(services::file_watcher::FileWatcherState::default())
+        .manage(services::phone_camera::PhoneCameraState::default())
         .setup(|app| {
             // Start watching the Briefcast folder for external changes right away, so the sidebar
             // stays live without needing a restart or a manual refresh click - see
@@ -280,6 +285,12 @@ fn main() {
             commands::recording::load_view_switch_sidecar,
             commands::recording::record_view_switch,
             commands::recording::get_webcam_sidecar_path,
+            commands::recording::phone_camera_capture_chunk,
+            commands::recording::save_phone_camera_capture,
+            services::phone_camera::start_phone_camera_server,
+            services::phone_camera::stop_phone_camera_server,
+            services::phone_camera::phone_camera_status,
+            services::phone_camera::phone_camera_send_signal,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,

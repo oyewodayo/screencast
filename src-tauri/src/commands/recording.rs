@@ -6,6 +6,7 @@
 // platform module (win/macos/linux) implements the same set of `recording_with_output_*`
 // functions plus `get_connected_devices`, using whatever ffmpeg input format that OS needs
 // (dshow / avfoundation / x11grab+pulse+v4l2) — see each module for details.
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::Utc;
 use log::{info, warn};
 use std::ffi::OsStr;
@@ -41,9 +42,27 @@ use macos as platform;
 #[cfg(target_os = "windows")]
 use win as platform;
 
+// The in-flight phone-camera capture's paths, held in AppState for the life of one recording.
+#[derive(Clone)]
+pub struct PhoneCaptureTarget {
+    // The screen recording this camera file belongs beside - decides the `_webcam.mp4` name.
+    video_path: PathBuf,
+    // Where MediaRecorder's bytes are being appended as they arrive.
+    raw_path: PathBuf,
+}
+
 #[derive(Default)]
 pub struct AppState {
     output_path: Arc<Mutex<Option<PathBuf>>>,
+    // Where the phone camera's own recording is accumulating, for the recording in progress.
+    //
+    // Resolved once, on the first chunk, from output_path below - NOT passed in from the
+    // frontend. start_recording returns a human-readable message ("Recording started. File will
+    // be saved as:\n<path>"), not a bare path, and an earlier version of this feature handed that
+    // whole string back as the video path: every chunk write then tried to open a file named after
+    // a sentence. Deriving it here means the frontend never has to know the path at all, so it
+    // cannot get it wrong.
+    phone_capture: Arc<Mutex<Option<PhoneCaptureTarget>>>,
     ffmpeg_process: Arc<Mutex<Option<Child>>>, // NEW: Store the process
     // Whether the in-progress recording is currently paused (see pause_recording/resume_recording
     // below). Kept separately from ffmpeg_process's mere presence since "a process is running" and
@@ -140,6 +159,28 @@ pub struct FormData {
     // per-mode default exactly (60 for sva, 30 for sa/s).
     #[serde(default)]
     framerate: Option<i32>,
+}
+
+impl FormData {
+    // Removes the phone-camera sentinel (services/phone_camera.rs) from video_devices, reporting
+    // whether it was there.
+    //
+    // This MUST run before any platform::recording_with_output_* sees the FormData. Every one of
+    // them treats video_devices as a list of real capture-device names and interpolates them
+    // straight into ffmpeg input args (`-f dshow -i video=<name>` on Windows, and the avfoundation
+    // /v4l2 equivalents elsewhere), so leaving the sentinel in would hand ffmpeg a device that
+    // cannot exist and kill the whole recording - not just the camera.
+    //
+    // The phone's video never reaches ffmpeg at record time at all: it arrives over WebRTC in the
+    // WebView, which records it itself and hands the finished file to save_phone_camera_capture
+    // below. So as far as the ffmpeg side is concerned, stripping the sentinel leaves exactly the
+    // right thing behind - the real cameras, if any, and nothing else.
+    fn strip_phone_camera(&mut self) -> bool {
+        let before = self.video_devices.len();
+        self.video_devices
+            .retain(|d| d != crate::services::phone_camera::PHONE_DEVICE_SENTINEL);
+        before != self.video_devices.len()
+    }
 }
 
 // What a "screen" capture should actually point ffmpeg at, resolved once from FormData.screen_size
@@ -298,6 +339,226 @@ pub fn get_webcam_sidecar_path(video_path: String) -> Option<String> {
     } else {
         None
     }
+}
+
+// Where the phone-camera capture accumulates on disk while it's still being recorded. Next to
+// the recording itself rather than in a temp dir so it's on the same volume as its final output.
+fn phone_capture_raw_path(video_path: &Path, mime_type: &str) -> PathBuf {
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording");
+    // MediaRecorder hands back webm, or fragmented mp4 on newer Chromium.
+    let ext = if mime_type.contains("mp4") { "mp4" } else { "webm" };
+    video_path.with_file_name(format!("{}_webcam_raw.{}", stem, ext))
+}
+
+// Appends one MediaRecorder chunk to the in-progress phone capture.
+//
+// The recording is streamed to disk a chunk at a time rather than handed over in one piece at the
+// end, because the whole thing has to cross Tauri's IPC boundary as JSON. A few minutes of 1080p
+// is well into the hundreds of megabytes; as a JSON array of byte-numbers that inflates roughly
+// fourfold and has to be held in memory whole on both sides at once - enough to wedge or kill the
+// WebView outright. Per-chunk base64 keeps each message around a megabyte, bounds memory to one
+// chunk, and means a crash mid-recording leaves everything already written still on disk.
+//
+// `first` truncates rather than appends, so a previous run's leftovers can't be prefixed onto this
+// one - the frontend sets it on the first chunk of each recording.
+#[tauri::command]
+pub async fn phone_camera_capture_chunk(
+    state: State<'_, AppState>,
+    mime_type: String,
+    chunk_b64: String,
+    first: bool,
+) -> Result<(), String> {
+    let bytes = BASE64
+        .decode(chunk_b64.as_bytes())
+        .map_err(|e| format!("Malformed phone camera chunk: {e}"))?;
+
+    // On the first chunk, resolve the destination from the recording that's actually in progress
+    // and remember it; every later chunk reuses it, so the answer can't drift mid-recording (and
+    // stop_recording clearing output_path can't strand the final flush).
+    let target = {
+        let mut guard = state.phone_capture.lock().await;
+        if first || guard.is_none() {
+            let video_path = state
+                .output_path
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| {
+                    "No recording is in progress, so there's nowhere to save the phone camera \
+                     video."
+                        .to_string()
+                })?;
+            let resolved = PhoneCaptureTarget {
+                raw_path: phone_capture_raw_path(&video_path, &mime_type),
+                video_path,
+            };
+            *guard = Some(resolved.clone());
+            resolved
+        } else {
+            guard.as_ref().unwrap().clone()
+        }
+    };
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(first)
+        .append(!first)
+        .open(&target.raw_path)
+        .map_err(|e| {
+            format!(
+                "Failed to open the phone camera capture file at {}: {e}",
+                target.raw_path.display()
+            )
+        })?;
+    file.write_all(&bytes)
+        .map_err(|e| format!("Failed to write the phone camera recording: {e}"))
+}
+
+// Finishes the phone-camera recording accumulated by phone_camera_capture_chunk, landing it as
+// the `<stem>_webcam.mp4` sidecar that get_webcam_sidecar_path (above) and the editor's PiP layer
+// already know how to find - so a phone ends up indistinguishable from a real webcam recorded
+// with FormData.separate_webcam_capture, and needs no new editor code at all.
+//
+// `start_offset_ms` is how long after ffmpeg started that the WebView's MediaRecorder actually
+// began producing frames. It's never zero: start_recording has to spawn ffmpeg and wait out its
+// own early-exit check before the frontend can even begin recording the phone stream. Rather than
+// leaving the editor to reconcile two files with different zero points, the gap is padded onto the
+// front of the camera file here so both share a t=0 - which is exactly what the PiP overlay and
+// the view-switch timeline (buildViewSwitchOverlays, videoEditHandlers.ts) already assume.
+#[tauri::command]
+pub async fn save_phone_camera_capture(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    start_offset_ms: f64,
+) -> Result<String, String> {
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+
+    // Taken, not borrowed: this capture is finished either way, and leaving it behind would let a
+    // later recording pick up a stale target.
+    let capture = state
+        .phone_capture
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| "The phone camera never recorded anything.".to_string())?;
+
+    let target = capture.video_path;
+    let raw_path = capture.raw_path;
+    let stem = target
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording")
+        .to_string();
+    let webcam_path = target.with_file_name(format!("{}_webcam.mp4", stem));
+
+    match fs::metadata(&raw_path) {
+        Ok(meta) if meta.len() > 0 => {}
+        _ => {
+            let _ = fs::remove_file(&raw_path);
+            return Err("The phone camera recording came back empty.".to_string());
+        }
+    }
+
+    let raw_str = path_to_str(&raw_path)?.to_string();
+    let out_str = path_to_str(&webcam_path)?.to_string();
+
+    let mut args: Vec<String> = vec!["-y".into(), "-i".into(), raw_str];
+
+    // Pad the head so the camera file starts at the same instant as the screen file. Sub-frame
+    // offsets aren't worth a filter pass, and tpad with a zero duration is a no-op anyway.
+    let offset_secs = (start_offset_ms / 1000.0).max(0.0);
+    if offset_secs > 0.02 {
+        args.push("-vf".into());
+        args.push(format!(
+            "tpad=start_duration={:.3}:start_mode=add:color=black",
+            offset_secs
+        ));
+    }
+
+    // A WebRTC-sourced MediaRecorder file is variable-frame-rate and, for webm, carries no
+    // duration in its header at all (it was written as a live stream). Both are re-encoded away
+    // here into a plain CFR mp4, which is what the editor's seeking assumes. Hardware encoding
+    // when the machine has it, for the same reason the main recording path uses it.
+    #[cfg(target_os = "windows")]
+    let hw = crate::services::hw_encoder::detect(&ffmpeg_path);
+    #[cfg(not(target_os = "windows"))]
+    let hw: Option<()> = None;
+
+    match hw {
+        #[cfg(target_os = "windows")]
+        Some(encoder) => {
+            args.push("-c:v".into());
+            args.push(encoder.name().to_string());
+            args.extend(encoder.quality_args());
+        }
+        _ => {
+            args.push("-c:v".into());
+            args.push("libx264".into());
+            args.push("-preset".into());
+            args.push("veryfast".into());
+            args.push("-crf".into());
+            args.push("23".into());
+        }
+    }
+
+    args.extend([
+        "-fps_mode".to_string(),
+        "cfr".to_string(),
+        "-r".to_string(),
+        "30".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        // The editor scrubs this file; without a relocated moov it has to read to the end first.
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        // The phone sends video only (the page requests audio:false - the mic stays whichever
+        // device the user picked on the PC), so there is deliberately no audio stream to map.
+        "-an".to_string(),
+        out_str,
+    ]);
+
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(&args);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    hide_console_window(&mut cmd);
+
+    let output = tauri::async_runtime::spawn_blocking(move || cmd.output())
+        .await
+        .map_err(|e| format!("Failed to run ffmpeg for the phone camera recording: {e}"))?
+        .map_err(|e| format!("Failed to run ffmpeg for the phone camera recording: {e}"))?;
+
+    if !output.status.success() {
+        // Deliberately NOT cleaned up on failure. The raw file is the only copy of footage the
+        // user cannot re-shoot - whatever went wrong in the conversion, throwing the recording
+        // away on top of it is strictly worse. Tell them where it is instead.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::error!(
+            "Phone camera conversion failed, raw capture kept at {:?}: {}",
+            raw_path,
+            stderr
+        );
+        return Err(format!(
+            "Couldn't convert the phone camera recording ({}). The raw footage was kept at {} - \
+             it will play in VLC, and Briefcast can import it.",
+            stderr.lines().last().unwrap_or("unknown ffmpeg error"),
+            raw_path.display()
+        ));
+    }
+
+    let _ = fs::remove_file(&raw_path);
+    info!("Phone camera recording saved to {:?}", webcam_path);
+    out_str_owned(&webcam_path)
+}
+
+// Small helper so save_phone_camera_capture can return an owned path string without borrowing a
+// temporary - path_to_str hands back a &str tied to its argument.
+fn out_str_owned(path: &Path) -> Result<String, String> {
+    path_to_str(path).map(|s| s.to_string())
 }
 
 // Called by the live recording bar every time the user toggles between "Screen" and "Camera" as
@@ -879,6 +1140,33 @@ pub async fn start_recording(
     state: State<'_, AppState>,
     form_data: FormData,
 ) -> Result<String, String> {
+    // Taken by value, so this local shadow is the only copy anything downstream will see - see
+    // FormData::strip_phone_camera for why the sentinel must never reach an ffmpeg arg builder.
+    let mut form_data = form_data;
+    let uses_phone_camera = form_data.strip_phone_camera();
+
+    // The phone rides along as a separately-recorded PiP file written by the WebView, which only
+    // makes sense when ffmpeg is capturing a screen for it to sit on top of. The camera-only modes
+    // ("v"/"va") would have nothing left to record once the sentinel is stripped, so rather than
+    // silently producing a recording with no picture, say so.
+    if uses_phone_camera && !matches!(form_data.record_type.as_str(), "sva" | "sa" | "s") {
+        return Err(
+            "The phone camera can only be used with a screen-recording mode. Pick a \"Screen…\" \
+             recording option, or select a camera attached to this computer instead."
+                .to_string(),
+        );
+    }
+
+    // The phone claims the `<stem>_webcam.mp4` sidecar slot (save_phone_camera_capture writes
+    // it), and win.rs's separate-webcam path writes to that exact same name. With the phone AND a
+    // single real camera both selected, the strip above leaves video_devices.len() == 1, which is
+    // precisely what that path's gate looks for - so without this, two writers would race for one
+    // file. The phone wins and the real camera falls back to being baked in as an overlay, which
+    // is also the more predictable reading of "I picked both".
+    if uses_phone_camera {
+        form_data.separate_webcam_capture = false;
+    }
+
     log::debug!("Form data {:?}", form_data);
     #[cfg(target_os = "windows")]
     log::debug!(
@@ -892,6 +1180,9 @@ pub async fn start_recording(
     // shouldn't be, stop_recording already clears this, but a recording that failed to start
     // cleanly could in principle skip that) must not leak into this one's sidecar.
     state.view_switches.lock().await.clear();
+    // Same reasoning as the view-switch log above: a previous recording that failed partway could
+    // otherwise leave a phone-capture target behind for this one to append to.
+    *state.phone_capture.lock().await = None;
 
     // Cloned before the match below moves `state` into whichever platform::recording_with_output_*
     // arm actually runs - these are Arc<Mutex<..>> clones of the same shared AppState fields, so

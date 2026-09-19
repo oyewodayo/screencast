@@ -38,6 +38,24 @@ notify-debouncer-mini = "0.7"
 # named "fts5" at all, in this or any version - confirmed directly against its own Cargo.toml and
 # libsqlite3-sys's build.rs after cargo's dependency resolution rejected that name outright.)
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Backs services/phone_camera.rs - lets a phone act as a camera with nothing installed on it.
+# The phone's browser is the capture device, so Briefcast has to BE a web server it can reach:
+# getUserMedia is gated to secure contexts, and a LAN address is never one over plain http, so
+# this has to be HTTPS with a self-signed cert (rcgen) rather than a plain socket. axum carries
+# both the phone page and the WebSocket that relays WebRTC signalling; tokio/hyper/tower were
+# already in the tree via tauri, so only axum itself is genuinely new weight here.
+axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros"] }
+rcgen = "0.13"
+# Already in the tree via tauri/hyper; named directly so phone_camera.rs can split an axum
+# WebSocket into its read and write halves (StreamExt/SinkExt).
+futures-util = "0.3"
+# Renders the pairing URL as a QR the phone's camera can scan - typing an https:// LAN address
+# with a port by hand on a phone keyboard is the single worst step in this flow.
+qrcode = "0.14"
+# Picks the LAN interface address the phone should dial. std alone can't enumerate interfaces.
+local-ip-address = "0.6"
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 

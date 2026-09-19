@@ -34,6 +34,13 @@ import VideoEditorHome from "../components/video/VideoEditorHome";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
+import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
+import {
+  PHONE_CAMERA_DEVICE,
+  startPhoneCapture,
+  subscribePhoneCamera,
+  type PhoneCaptureHandle,
+} from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
@@ -250,6 +257,20 @@ const Dashboard = () => {
      const [overlayShape, setOverlayShape] = useState("rounded"); // ADD THIS
   const [overlayPosition, setOverlayPosition] = useState("bottom_right"); // ADD THIS
   const [overlaySize, setOverlaySize] = useState("small"); // ADD THIS
+  // Phone-as-camera (see src/services/phoneCamera.ts). Only the connected flag lives in React
+  // state here - the stream itself is held by the service singleton, because the pairing modal,
+  // the overlay preview and the recorder below all need the same one.
+  const [showPhoneCamera, setShowPhoneCamera] = useState(false);
+  const [isPhoneCameraConnected, setIsPhoneCameraConnected] = useState(false);
+  // The in-flight phone recording, if any. A ref rather than state: handleStopRecording has to
+  // read it synchronously, and nothing renders from it.
+  const phoneCaptureRef = useRef<PhoneCaptureHandle | null>(null);
+
+  useEffect(
+    () => subscribePhoneCamera((s) => setIsPhoneCameraConnected(s.status === "live")),
+    []
+  );
+
   // WASAPI loopback ("what you hear") capture, Windows-only - see start_recording's handling of
   // FormData.include_system_audio and services/loopback_audio.rs for why this exists (dshow alone
   // can't capture system audio on a machine with no Stereo Mix-equivalent device). Only
@@ -914,8 +935,26 @@ const setScreen = () => {
 
         await playAudioNotification();
 
+        // Timestamped before start_recording so the offset handed to the backend covers the
+        // whole gap - spawning ffmpeg plus its own half-second early-exit check - rather than
+        // only the part after it returns. save_phone_camera_capture pads the camera file by this
+        // much so both files share a t=0.
+        const recordingLaunchedAt = Date.now();
         const response = await invoke<string>("start_recording", { formData });
         const startTime = Date.now();
+
+        // The phone records in this WebView, not in ffmpeg: its frames arrive over WebRTC and
+        // never reach the backend as a capture device (start_recording strips the sentinel out of
+        // video_devices for exactly that reason). The result lands as the same `<stem>_webcam.mp4`
+        // sidecar a real separately-captured webcam produces, so the editor needs no new path.
+        if (formData.video_devices?.includes(PHONE_CAMERA_DEVICE)) {
+          phoneCaptureRef.current = startPhoneCapture(recordingLaunchedAt, (msg) => setError(msg));
+          if (!phoneCaptureRef.current) {
+            setError(
+              "The screen recording started, but the phone camera wasn't connected so it isn't being recorded."
+            );
+          }
+        }
         setIsRecording(true);
         setRecordingStartTime(startTime);
         setIsPaused(false);
@@ -948,7 +987,11 @@ const setScreen = () => {
         // Send recording state to overlay - both windows derive elapsed time from this
         // same start timestamp so their displayed timers can't drift apart. Sent even while
         // hidden so the overlay is already in sync the moment the user reveals it.
-        // canSwitchView: only "sva" with separate_webcam_capture actually produces the second
+        // canSwitchView: the toggle needs a second (camera) file to cut to. Two things produce
+        // one: separate_webcam_capture, and the phone camera - which always records to that same
+        // `<stem>_webcam.mp4` sidecar (save_phone_camera_capture, recording.rs) even though
+        // start_recording deliberately clears separate_webcam_capture for it, since the phone
+        // owns that slot. So the phone gets live view-switching on exactly the same terms.
         // (camera) file the live Screen/Camera toggle needs something to switch to - see
         // RECORDING_UPGRADE_NOTES.md's view-switching feature design.
         overlayWindow.emit('recording-state-update', {
@@ -958,7 +1001,10 @@ const setScreen = () => {
           isPaused: false,
           pauseStartedAt: null,
           pausedAccumulatedMs: 0,
-          canSwitchView: formData.record_type === 'sva' && Boolean(formData.separate_webcam_capture),
+          canSwitchView:
+            formData.record_type === 'sva' &&
+            (Boolean(formData.separate_webcam_capture) ||
+              Boolean(formData.video_devices?.includes(PHONE_CAMERA_DEVICE))),
         });
 
         if (!(await isRegistered(OVERLAY_TOGGLE_SHORTCUT))) {
@@ -976,6 +1022,19 @@ const setScreen = () => {
   
   let handleStopRecording = async () => {
     setError("");
+
+    // Flushed and written BEFORE stop_recording, so the finished camera file is already on disk
+    // next to the screen recording by the time the completion UI points the user at it.
+    if (phoneCaptureRef.current) {
+      const capture = phoneCaptureRef.current;
+      phoneCaptureRef.current = null;
+      try {
+        await capture.stop();
+      } catch (e) {
+        console.error("Error saving phone camera recording:", e);
+      }
+    }
+
     try {
       const response = await invoke<string>("stop_recording");
       const audio = new Audio("/sounds/option-3.mp3");
@@ -1035,7 +1094,8 @@ const setScreen = () => {
         isPaused: true,
         pauseStartedAt: now,
         pausedAccumulatedMs,
-        canSwitchView: recordType === 'sva' && separateWebcamCapture,
+        canSwitchView:
+          recordType === 'sva' && (separateWebcamCapture || videoDevices.includes(PHONE_CAMERA_DEVICE)),
       });
     } catch (error) {
       console.error("Error pausing recording:", error);
@@ -1063,7 +1123,8 @@ const setScreen = () => {
         isPaused: false,
         pauseStartedAt: null,
         pausedAccumulatedMs: newAccumulatedMs,
-        canSwitchView: recordType === 'sva' && separateWebcamCapture,
+        canSwitchView:
+          recordType === 'sva' && (separateWebcamCapture || videoDevices.includes(PHONE_CAMERA_DEVICE)),
       });
     } catch (error) {
       console.error("Error resuming recording:", error);
@@ -3741,6 +3802,8 @@ const setScreen = () => {
         recordingStartTime={recordingStartTime}
         handleStartRecording={handleStartRecording}
         handleStopRecording={handleStopRecording}
+        onOpenPhoneCamera={() => setShowPhoneCamera(true)}
+        isPhoneCameraConnected={isPhoneCameraConnected}
         isPaused={isPaused}
         pauseStartedAt={pauseStartedAt}
         pausedAccumulatedMs={pausedAccumulatedMs}
@@ -3779,6 +3842,18 @@ const setScreen = () => {
       )}
 
       {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} onStorageChanged={handleStorageChanged} />}
+      {showPhoneCamera && (
+        <PhoneCameraModal
+          onClose={() => setShowPhoneCamera(false)}
+          onConnected={() => {
+            // Arm the phone the moment it's actually usable, so pairing and selecting it aren't
+            // two separate chores.
+            setVideoDevices((prev) =>
+              prev.includes(PHONE_CAMERA_DEVICE) ? prev : [...prev, PHONE_CAMERA_DEVICE]
+            );
+          }}
+        />
+      )}
 
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
         {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}
