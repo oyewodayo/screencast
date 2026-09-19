@@ -67,6 +67,29 @@ pub struct AppState {
     // stops it and writes its collected clicks to a sidecar JSON file next to the finished video.
     #[cfg(target_os = "windows")]
     click_capture: Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
+    // Screen<->camera view-switch events for the recording currently in progress, logged by the
+    // record_view_switch command as the user toggles the live recording bar's "Screen"/"Camera"
+    // control - see that command's own doc comment. Not Windows-only by construction (unlike
+    // click_capture above): this is plain event bookkeeping, not an OS-specific capture mechanism,
+    // so nothing here stops it from working wherever separate_webcam_capture eventually produces a
+    // second file to switch to. Cleared at the start of every recording and written out (if
+    // non-empty) as a sidecar JSON by stop_recording, same convention as click_capture's own
+    // sidecar.
+    view_switches: Arc<Mutex<Vec<ViewSwitchEvent>>>,
+}
+
+// One user-initiated toggle between "Screen" and "Camera" as the primary view during a recording
+// that has both a screen and a separate camera stream to switch between (see
+// FormData.separate_webcam_capture) - the editor and export step read the full sequence back to
+// know when to cut from one to the other. `elapsed_secs` is computed by the FRONTEND (from the
+// same recording-start timestamp its own live timer already uses, see RecordingOverlayWindow.tsx)
+// rather than a backend Instant, so it lines up with what the user actually sees on the timer
+// rather than a slightly-different backend notion of "when recording started."
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSwitchEvent {
+    pub elapsed_secs: f64,
+    pub mode: String,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -98,10 +121,25 @@ pub struct FormData {
     #[serde(default)]
     separate_webcam_capture: bool,
     // Opt-in (default false), Windows-only - see services/click_tracker.rs and start_recording's
-    // own handling of this field. Only meaningful for the screen-capture modes (sva/sv/sa/s), same
+    // own handling of this field. Only meaningful for the screen-capture modes (sva/sa/s), same
     // as include_system_audio above.
     #[serde(default)]
     track_clicks: bool,
+    // Max output width in px for screen-capture modes (sva/sa/s) - None reproduces the previous
+    // hardcoded behavior exactly (MAX_RECORDING_WIDTH, 1920). The frontend's "native" option sends
+    // a very large value (comfortably above any realistic display) rather than a separate sentinel/
+    // boolean, so `min(iw, resolution_width)` in the scale filter naturally means "don't downscale"
+    // without a second code path - same reasoning MAX_RECORDING_WIDTH's own doc comment gives for
+    // why a cap exists at all (a software/marginal-hardware decode path struggling with an
+    // undownscaled 4K/5K capture), now genuinely optional since hardware encoding (see
+    // services/hw_encoder.rs) makes a higher-resolution capture far more feasible than when this
+    // was software-libx264-only.
+    #[serde(default)]
+    resolution_width: Option<i32>,
+    // Target capture framerate for screen-capture modes - None reproduces the previous hardcoded
+    // per-mode default exactly (60 for sva, 30 for sa/s).
+    #[serde(default)]
+    framerate: Option<i32>,
 }
 
 // What a "screen" capture should actually point ffmpeg at, resolved once from FormData.screen_size
@@ -220,6 +258,75 @@ pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> 
         .map_err(|e| format!("Failed to read click-tracking sidecar: {}", e))
 }
 
+// Same sidecar convention as click_sidecar_path above, for the screen<->camera view-switch
+// timeline instead of clicks.
+fn view_switch_sidecar_path(video_path: &Path) -> PathBuf {
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording");
+    video_path.with_file_name(format!("{}.viewswitch.json", stem))
+}
+
+// Reads back whatever view_switch_sidecar_path holds for `video_path`, if anything - None (not an
+// error) when the video was never recorded with any view switches, same convention
+// load_click_sidecar above uses.
+#[tauri::command]
+pub fn load_view_switch_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let sidecar = view_switch_sidecar_path(&PathBuf::from(&video_path));
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&sidecar)
+        .map(Some)
+        .map_err(|e| format!("Failed to read view-switch sidecar: {}", e))
+}
+
+// Where a "record webcam separately" recording's own second file lives, if it has one - the
+// naming convention win.rs's recording_with_output_sva establishes (`<stem>_webcam.mp4`). The
+// editor calls this to find the file a view-switch timeline should cut TO. Returns None (not an
+// error) if no such file exists - the normal case for any recording that didn't have
+// FormData.separate_webcam_capture on, same "missing is fine" convention load_click_sidecar and
+// load_view_switch_sidecar both use.
+#[tauri::command]
+pub fn get_webcam_sidecar_path(video_path: String) -> Option<String> {
+    let path = PathBuf::from(&video_path);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
+    let webcam_path = path.with_file_name(format!("{}_webcam.mp4", stem));
+    if webcam_path.exists() {
+        path_to_str(&webcam_path).ok().map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+// Called by the live recording bar every time the user toggles between "Screen" and "Camera" as
+// the primary view - just appends to AppState's own in-memory log, written out as a sidecar once
+// the recording actually finishes (stop_recording). `elapsed_secs` is frontend-computed - see
+// ViewSwitchEvent's own doc comment for why. No-ops rather than erroring if no recording is
+// currently in progress (state.output_path is None) or mode isn't recognized - a stray/late call
+// (e.g. a click landing right as the recording is already stopping) shouldn't surface a visible
+// error for something this minor.
+#[tauri::command]
+pub async fn record_view_switch(
+    state: State<'_, AppState>,
+    elapsed_secs: f64,
+    mode: String,
+) -> Result<(), String> {
+    if mode != "screen" && mode != "camera" {
+        return Ok(());
+    }
+    if state.output_path.lock().await.is_none() {
+        return Ok(());
+    }
+    state
+        .view_switches
+        .lock()
+        .await
+        .push(ViewSwitchEvent { elapsed_secs, mode });
+    Ok(())
+}
+
 // ffmpeg's stderr always leads with its multi-hundred-character build banner (version, compile
 // flags, bundled library list) before it ever gets to the actual failure, so dumping the whole
 // thing as the error - as every take_screenshot used to - buries the one line anyone can act on
@@ -248,6 +355,25 @@ pub(crate) fn extract_ffmpeg_error(stderr: &str) -> String {
 // handles smoothly, and is still sharp for typical screencast content even downscaled from 4K.
 // Only ever downscales (ffmpeg's scale filter leaves a source already <= this width untouched).
 pub(crate) const MAX_RECORDING_WIDTH: i32 = 1920;
+
+// Floor for FormData.resolution_width - below this a "downscale" would start looking more like a
+// thumbnail than a screen recording, regardless of what a caller sends. No explicit ceiling: a
+// user-requested "native" capture intentionally sends something far above any real display's own
+// width (see FormData.resolution_width's own doc comment) - clamping that down would silently
+// defeat the one thing that option is for.
+const MIN_RESOLUTION_WIDTH: i32 = 640;
+
+// Resolves FormData.resolution_width to a real scale-filter target, clamping a too-small explicit
+// request rather than trusting it outright, and falling back to the previous hardcoded
+// MAX_RECORDING_WIDTH when the caller didn't ask for anything in particular (every pre-existing
+// caller, and every macOS/Linux one - see codec_args_for_ext_hw's own doc comment on why hardware-
+// specific changes in this session stay Windows-only).
+pub(crate) fn resolved_max_width(form_data: &FormData) -> i32 {
+    form_data
+        .resolution_width
+        .map(|w| w.max(MIN_RESOLUTION_WIDTH))
+        .unwrap_or(MAX_RECORDING_WIDTH)
+}
 
 // libx264 defaults to a ~250-frame GOP when -g is unset, which at these recording framerates
 // (30-60fps) is 4-8+ seconds between keyframes - fine for straight-through decode, but expensive
@@ -391,19 +517,38 @@ fn overlay_stage_filter(
 // Builds the full filter_complex chaining one overlay stage per camera - two or more cameras
 // each get masked/shaped independently and composited onto the running result in sequence
 // ([0:v] + cam0 -> tmp1, tmp1 + cam1 -> tmp2, ...), then a final downscale stage capping the
-// composited output at MAX_RECORDING_WIDTH (left unlabeled so ffmpeg picks it automatically as
-// this output's video stream, same as the old last overlay stage did before this one existed).
-// Every overlay stage is labeled now (including what used to be the final, unlabeled one) since
-// the downscale stage needs a named input to read the finished composite from.
+// composited output at `max_width` (left unlabeled so ffmpeg picks it automatically as this
+// output's video stream, same as the old last overlay stage did before this one existed). Every
+// overlay stage is labeled now (including what used to be the final, unlabeled one) since the
+// downscale stage needs a named input to read the finished composite from. `max_width` is caller-
+// resolved (see resolved_max_width) rather than always MAX_RECORDING_WIDTH so Windows callers can
+// honor FormData.resolution_width - macOS/Linux callers still just pass MAX_RECORDING_WIDTH,
+// unchanged from before this parameter existed.
+//
+// `crop` (w, h, x, y) is Some only for macOS's own window-capture path: avfoundation has no
+// per-window capture mode at all (only whole displays or camera devices - unlike gdigrab, which
+// at least offers one even though win.rs deliberately doesn't use it either), so a specific
+// window has to be cropped out of a full-display capture instead - see
+// window_capture::macos::get_window_rect_by_title's own doc comment for how that rect is
+// obtained and its known multi-monitor caveat. Windows/Linux callers always pass None - their own
+// window-region cropping happens at the input-arg level (offset_x/video_size, x11grab's own
+// video_size+i), before any camera overlay is ever composited on top, so they never needed this.
 pub fn build_camera_overlay_filter_complex(
     shape: &str,
     position: &str,
     size: &str,
     camera_count: usize,
+    max_width: i32,
+    crop: Option<(i32, i32, i32, i32)>,
 ) -> String {
     let (cam_w, cam_h) = overlay_pixel_dimensions(shape, size);
-    let mut stages: Vec<String> = Vec::with_capacity(camera_count + 1);
+    let mut stages: Vec<String> = Vec::with_capacity(camera_count + 2);
     let mut prev_label = "[0:v]".to_string();
+
+    if let Some((w, h, x, y)) = crop {
+        stages.push(format!("[0:v]crop={}:{}:{}:{}[cropped]", w, h, x, y));
+        prev_label = "[cropped]".to_string();
+    }
 
     for index in 0..camera_count {
         let input_label = format!("[{}:v]", index + 1);
@@ -424,7 +569,7 @@ pub fn build_camera_overlay_filter_complex(
 
     stages.push(format!(
         "{}scale='min({},iw)':-2",
-        prev_label, MAX_RECORDING_WIDTH
+        prev_label, max_width
     ));
 
     stages.join("; ")
@@ -672,14 +817,13 @@ pub fn get_connected_cameras(app_handle: AppHandle) -> Vec<String> {
     get_connected_devices(app_handle).0
 }
 
-// Shared by start_recording and take_screenshot — both need "figure out where this file goes,
-// creating the Briefcast folder and dodging an existing same-named file along the way", neither
-// cares how the bytes that eventually land there get produced.
-fn resolve_output_path(form_data: &FormData) -> Result<PathBuf, String> {
+// Shared by resolve_output_path and resolve_recording_output_path below - both need "figure out
+// where this file goes, creating the target folder and dodging an existing same-named file along
+// the way", neither cares how the bytes that eventually land there get produced. Split out so
+// each caller only has to say WHICH folder, not reimplement the naming/dodge logic.
+fn resolve_output_path_in(target_dir: PathBuf, form_data: &FormData) -> Result<PathBuf, String> {
     let mut output_file: String;
     let current_date = Utc::now().format("%Y_%m%d_%H_%M_%S");
-
-    let briefcast_dir = crate::services::utility::briefcast_dir()?;
 
     output_file = format!(
         "{}_recording_{}.{}",
@@ -692,22 +836,41 @@ fn resolve_output_path(form_data: &FormData) -> Result<PathBuf, String> {
         output_file = format!("{}.{}", form_data.file_name, form_data.file_ext);
     }
 
-    let output_path: PathBuf = briefcast_dir.join(&output_file);
+    let output_path: PathBuf = target_dir.join(&output_file);
 
-    // Ensure the Briefcast directory exists, create it if it doesn't
-    if !briefcast_dir.exists() {
-        if let Err(err) = fs::create_dir_all(&briefcast_dir) {
-            return Err(format!("Failed to create Briefcast directory: {}", err));
+    // Ensure the target directory exists, create it if it doesn't
+    if !target_dir.exists() {
+        if let Err(err) = fs::create_dir_all(&target_dir) {
+            return Err(format!("Failed to create output directory: {}", err));
         }
     }
 
     // Check if the file exists
     if output_path.exists() {
         output_file = format!("Recording_{}.{}", current_date, form_data.file_ext);
-        Ok(briefcast_dir.join(&output_file))
+        Ok(target_dir.join(&output_file))
     } else {
         Ok(output_path)
     }
+}
+
+// Used by take_screenshot - screenshots get their own "screenshots" subfolder, same reasoning
+// (and same shared helper) as recordings getting "recordings" below.
+fn resolve_screenshot_output_path(form_data: &FormData) -> Result<PathBuf, String> {
+    resolve_output_path_in(
+        crate::services::utility::briefcast_dir()?.join("screenshots"),
+        form_data,
+    )
+}
+
+// Used by start_recording - every actual audio/video recording (not screenshots) lands in its
+// own "recordings" subfolder of the Briefcast directory instead of alongside screenshots and
+// everything else Briefcast manages, so a folder of recordings stays a folder of recordings.
+fn resolve_recording_output_path(form_data: &FormData) -> Result<PathBuf, String> {
+    resolve_output_path_in(
+        crate::services::utility::briefcast_dir()?.join("recordings"),
+        form_data,
+    )
 }
 
 #[tauri::command]
@@ -723,7 +886,24 @@ pub async fn start_recording(
         crate::commands::window_capture::win::get_all_open_windows_titles()
     );
 
-    let output_path = resolve_output_path(&form_data)?;
+    let output_path = resolve_recording_output_path(&form_data)?;
+
+    // A new recording starting - any view-switch events left over from a previous one (there
+    // shouldn't be, stop_recording already clears this, but a recording that failed to start
+    // cleanly could in principle skip that) must not leak into this one's sidecar.
+    state.view_switches.lock().await.clear();
+
+    // Cloned before the match below moves `state` into whichever platform::recording_with_output_*
+    // arm actually runs - these are Arc<Mutex<..>> clones of the same shared AppState fields, so
+    // this doesn't lose access to whatever that arm stores into them. Needed so the liveness check
+    // after the match (see its own comment) and, on Windows, its early-failure cleanup can still
+    // reach them.
+    let ffmpeg_process = state.ffmpeg_process.clone();
+    let output_path_state = state.output_path.clone();
+    #[cfg(target_os = "windows")]
+    let loopback_capture = state.loopback_capture.clone();
+    #[cfg(target_os = "windows")]
+    let click_capture = state.click_capture.clone();
 
     // System audio (WASAPI loopback), Windows-only and only for the screen-capture modes this was
     // actually built for. Started before dispatching to the platform-specific ffmpeg spawn below
@@ -759,7 +939,7 @@ pub async fn start_recording(
         // doesn't need duplicating across every one of them for a concern that has nothing to do
         // with which ffmpeg args a given mode builds.
         let wants_click_tracking = form_data.track_clicks
-            && matches!(form_data.record_type.as_str(), "sva" | "sv" | "sa" | "s");
+            && matches!(form_data.record_type.as_str(), "sva" | "sa" | "s");
         if wants_click_tracking {
             match capture_region_bounds(&resolve_capture_target(&app_handle, &form_data)) {
                 Some((x, y, width, height)) => match crate::services::click_tracker::ClickCapture::start((x, y), (width, height)) {
@@ -771,12 +951,9 @@ pub async fn start_recording(
         }
     }
 
-    match form_data.record_type.as_str() {
+    let result = match form_data.record_type.as_str() {
         "sva" => {
             platform::recording_with_output_sva(&app_handle, state, &output_path, &form_data).await
-        }
-        "sv" => {
-            platform::recording_with_output_sv(&app_handle, state, &output_path, &form_data).await
         }
         "sa" => {
             platform::recording_with_output_sa(&app_handle, state, &output_path, &form_data).await
@@ -798,7 +975,51 @@ pub async fn start_recording(
                 .to_string(),
         ),
         _ => Err("Invalid recording type".to_string()),
+    };
+    let output = result?;
+
+    // ffmpeg's Command::spawn() only fails if the executable itself can't launch - a bad device
+    // name, a device already in use, or a permission error all still let spawn() succeed, then
+    // exit ffmpeg almost immediately with nothing useful written to output_path. Previously that
+    // failure was completely silent until the user hit Stop and stop_recording's own end-of-run
+    // empty-file check (below) finally caught it - wasting however long they thought they were
+    // recording. A short wait-then-check here catches the common "died immediately" case while
+    // still returning quickly for the (overwhelming majority) success case. Plain
+    // std::thread::sleep inside spawn_blocking rather than an async sleep, matching how
+    // stop_recording's own polling loop below waits without a direct tokio dependency.
+    let _ = tauri::async_runtime::spawn_blocking(|| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    })
+    .await;
+    let early_exit_status = {
+        let mut process_guard = ffmpeg_process.lock().await;
+        match process_guard.as_mut().and_then(|child| child.try_wait().ok().flatten()) {
+            Some(status) => {
+                *process_guard = None;
+                Some(status)
+            }
+            None => None,
+        }
+    };
+
+    if let Some(status) = early_exit_status {
+        *output_path_state.lock().await = None;
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(capture) = loopback_capture.lock().await.take() {
+                let _ = capture.stop();
+            }
+            if let Some(capture) = click_capture.lock().await.take() {
+                let _ = capture.stop();
+            }
+        }
+        return Err(format!(
+            "Recording failed to start (ffmpeg exited immediately with {}). The selected device may be in use by another app, or unavailable.",
+            status
+        ));
     }
+
+    Ok(output)
 }
 
 // A real instant screenshot: one ffmpeg invocation that grabs a single frame and exits on its
@@ -812,7 +1033,7 @@ pub async fn start_recording(
 pub async fn take_screenshot(app_handle: AppHandle, form_data: FormData) -> Result<String, String> {
     log::debug!("Screenshot form data {:?}", form_data);
 
-    let output_path = resolve_output_path(&form_data)?;
+    let output_path = resolve_screenshot_output_path(&form_data)?;
     let result = platform::take_screenshot(&app_handle, &output_path, &form_data).await;
 
     if result.is_ok() {
@@ -957,6 +1178,25 @@ pub async fn stop_recording(
                     }
                     Err(e) => warn!("Failed to serialize click-tracking data: {}", e),
                 }
+            }
+        }
+    }
+
+    // Same idea as the click-tracking sidecar just above, for this recording's own screen<->camera
+    // view-switch timeline (see record_view_switch's own doc comment) - written once the file's
+    // already confirmed non-empty above, then cleared either way so a future recording never
+    // inherits stale switches from this one.
+    {
+        let switches = std::mem::take(&mut *state.view_switches.lock().await);
+        if !switches.is_empty() {
+            let switches_path = view_switch_sidecar_path(&output_path);
+            match serde_json::to_string(&switches) {
+                Ok(json) => {
+                    if let Err(e) = fs::write(&switches_path, json) {
+                        warn!("Failed to write view-switch sidecar: {}", e);
+                    }
+                }
+                Err(e) => warn!("Failed to serialize view-switch data: {}", e),
             }
         }
     }
@@ -1108,7 +1348,10 @@ async fn mux_system_audio(
     args.push(path_to_str(&muxed_path)?.to_string());
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(&ffmpeg_path).args(&args).output()
+        let mut cmd = Command::new(&ffmpeg_path);
+        cmd.args(&args);
+        hide_console_window(&mut cmd);
+        cmd.output()
     })
     .await
     .map_err(|e| format!("System-audio mux task panicked: {}", e))?

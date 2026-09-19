@@ -41,6 +41,12 @@ export interface AppSettings {
   defaultAudioDevice: string;
   defaultVideoDevices: string[];
   defaultIncludeSystemAudio: boolean;
+  // Max output width / target capture fps for the screen-capture record types - null means "let
+  // the backend use its own default" (1920px, 60fps for sva/30fps for sa+s - see
+  // FormData.resolution_width/framerate's own doc comments, src-tauri/src/commands/recording.rs).
+  // Same "untouched setting changes nothing" reasoning as every other default here.
+  defaultResolutionWidth: number | null;
+  defaultFramerate: number | null;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -74,13 +80,38 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultAudioDevice: "",
   defaultVideoDevices: [],
   defaultIncludeSystemAudio: false,
+  defaultResolutionWidth: null,
+  defaultFramerate: null,
 };
+
+// One-time correction for installs whose settings were saved back when "avi" was still the coded
+// default (see defaultFileExt's own doc comment above for why that was a real problem - no
+// WebView2 container support at all, forcing a blocking re-encode on the very first playback of
+// the very first recording). Without this, such an install carries "avi" forward as an explicit
+// stored choice forever, even after the coded default moved to mp4 - merging saved-over-defaults
+// in loadSettings below always lets an explicit stored value win. Gated on its own one-time flag
+// (rather than correcting "avi" -> "mp4" unconditionally on every load) so a user who deliberately
+// re-selects avi in Settings AFTER this fix ships has that choice actually stick, instead of it
+// silently reverting to mp4 on the next launch.
+const AVI_DEFAULT_MIGRATION_KEY = "briefcast.settings.aviDefaultMigrated.v1";
 
 export function loadSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    const merged: AppSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+
+    if (merged.defaultFileExt === "avi" && !localStorage.getItem(AVI_DEFAULT_MIGRATION_KEY)) {
+      merged.defaultFileExt = DEFAULT_SETTINGS.defaultFileExt;
+      try {
+        localStorage.setItem(AVI_DEFAULT_MIGRATION_KEY, "1");
+        saveSettings(merged);
+      } catch {
+        // Best-effort - the in-memory correction above still applies for this call either way.
+      }
+    }
+
+    return merged;
   } catch (err) {
     console.error("Failed to load settings, using defaults:", err);
     return { ...DEFAULT_SETTINGS };

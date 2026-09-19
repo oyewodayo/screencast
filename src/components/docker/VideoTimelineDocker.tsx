@@ -26,6 +26,7 @@ import {
   IoEllipsisHorizontal,
   IoFolderOpenOutline,
   IoSwapHorizontalOutline,
+  IoSwapHorizontal,
   IoChevronDown,
   IoSaveOutline,
   IoPlay,
@@ -42,7 +43,8 @@ import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEdit
 import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, PipOverlay, TextOverlay } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
-import { overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
+import { buildViewSwitchOverlays, overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
+import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover from "./ClipEffectsPopover";
@@ -52,6 +54,7 @@ import ExtractAudioPopover from "./ExtractAudioPopover";
 import ExportOptionsPopover from "./ExportOptionsPopover";
 import SilenceDetectionPopover, { SilenceDetectionState } from "./SilenceDetectionPopover";
 import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
+import ViewSwitchPopover, { ViewSwitchDetectState } from "./ViewSwitchPopover";
 import ToolModePopover, { TimelineToolMode } from "./ToolModePopover";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 
@@ -646,6 +649,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [autoZoomAnchor, setAutoZoomAnchor] = useState<{ left: number; top: number } | null>(null);
   const [autoZoomState, setAutoZoomState] = useState<AutoZoomState>({ status: "loading" });
   const autoZoomButtonRef = useRef<HTMLButtonElement>(null);
+
+  // Apply View Switches toolbar button - same shape/gating as Auto Zoom above, reading
+  // get_webcam_sidecar_path + load_view_switch_sidecar (recording.rs) instead of
+  // load_click_sidecar. viewSwitchDataRef holds the raw events + webcam path detect resolved,
+  // since handleApplyViewSwitch needs them again (editStore.applyViewSwitchOverlays re-derives the
+  // actual overlays itself, same "detect shows a preview, apply re-runs the real logic on the
+  // original data" split handleDetectAutoZoom/handleApplyAutoZoom already use) but
+  // ViewSwitchDetectState's own "results" variant only carries a count for display.
+  const [viewSwitchAnchor, setViewSwitchAnchor] = useState<{ left: number; top: number } | null>(null);
+  const [viewSwitchState, setViewSwitchState] = useState<ViewSwitchDetectState>({ status: "loading" });
+  const viewSwitchButtonRef = useRef<HTMLButtonElement>(null);
+  const viewSwitchDataRef = useRef<{ events: ViewSwitchEvent[]; webcamPath: string; clipOutputStart: number } | null>(null);
 
   // Live drag state for resizing a single clip's start/end edge - delta-based (pixels moved since
   // the drag began, converted to a time delta) rather than re-deriving from click position, so it
@@ -1649,6 +1664,52 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     setAutoZoomAnchor(null);
   };
 
+  // Reads back get_webcam_sidecar_path + load_view_switch_sidecar (recording.rs) for the selected
+  // clip's own source file - both None/empty is normal (no separate_webcam_capture, or the toggle
+  // was simply never used), not an error. clipOutputStart comes straight from the ambient
+  // outputStarts/clipDurations this component already computes for every clip on the timeline
+  // (see their own doc comment above) - buildViewSwitchOverlays needs it to place the resulting
+  // PipOverlays in OUTPUT-timeline coordinates rather than this clip's own source-time ones.
+  const handleDetectViewSwitch = async () => {
+    if (!selectedClip) return;
+    const rect = viewSwitchButtonRef.current?.getBoundingClientRect();
+    if (rect) setViewSwitchAnchor({ left: rect.left, top: rect.bottom + 4 });
+    setViewSwitchState({ status: "loading" });
+    try {
+      const webcamPath = await invoke<string | null>("get_webcam_sidecar_path", { videoPath: selectedClip.sourcePath });
+      if (!webcamPath) {
+        setViewSwitchState({ status: "empty", reason: "no-webcam-file" });
+        return;
+      }
+      const json = await invoke<string | null>("load_view_switch_sidecar", { videoPath: selectedClip.sourcePath });
+      if (!json) {
+        setViewSwitchState({ status: "empty", reason: "no-sidecar" });
+        return;
+      }
+      const events: ViewSwitchEvent[] = JSON.parse(json).map((e: { elapsedSecs: number; mode: string }) => ({
+        time: e.elapsedSecs,
+        mode: e.mode,
+      }));
+      const clipIndex = renderClips.findIndex((c) => c.id === selectedClip.id);
+      const clipOutputStart = clipIndex >= 0 ? outputStarts[clipIndex] : 0;
+      const overlays = buildViewSwitchOverlays(events, selectedClip.start, selectedClip.end, clipOutputStart, selectedClip.speed, webcamPath);
+      if (overlays.length === 0) {
+        setViewSwitchState({ status: "empty", reason: "no-switches-in-range" });
+        return;
+      }
+      viewSwitchDataRef.current = { events, webcamPath, clipOutputStart };
+      setViewSwitchState({ status: "results", intervalCount: overlays.length });
+    } catch (err) {
+      setViewSwitchState({ status: "error", message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+  const handleApplyViewSwitch = () => {
+    if (!selectedClip || viewSwitchState.status !== "results" || !viewSwitchDataRef.current) return;
+    const { events, webcamPath, clipOutputStart } = viewSwitchDataRef.current;
+    editStore.applyViewSwitchOverlays(selectedClip.id, events, webcamPath, clipOutputStart);
+    setViewSwitchAnchor(null);
+  };
+
   // Drag-in: a file dropped on the track, from either the Briefcast sidebar (draggingLibraryFile,
   // native HTML5 onDrop right below - reliable here since this drag never leaves the webview) or
   // Explorer (pendingTimelineInsert, routed here by Dashboard once its cursor-position polling
@@ -2057,6 +2118,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             }`}
           >
             <IoLocateOutline size={15} />
+          </button>
+          <button
+            ref={viewSwitchButtonRef}
+            type="button"
+            title={selectedClipId ? "Cut to the camera during recorded screen/camera view switches in this clip" : "Select a clip to apply view switches"}
+            disabled={!selectedClipId}
+            onClick={() => {
+              if (viewSwitchAnchor) {
+                setViewSwitchAnchor(null);
+                return;
+              }
+              void handleDetectViewSwitch();
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors disabled:text-neutral-600 disabled:cursor-default ${
+              viewSwitchAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoSwapHorizontal size={15} />
           </button>
           <ActionButton
             title={isPlacingText ? "Click the video preview to place text" : "Add text overlay"}
@@ -2781,6 +2860,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
       {autoZoomAnchor && (
         <AutoZoomPopover anchor={autoZoomAnchor} state={autoZoomState} onApply={handleApplyAutoZoom} onClose={() => setAutoZoomAnchor(null)} />
+      )}
+
+      {viewSwitchAnchor && (
+        <ViewSwitchPopover anchor={viewSwitchAnchor} state={viewSwitchState} onApply={handleApplyViewSwitch} onClose={() => setViewSwitchAnchor(null)} />
       )}
 
       {selectedClipId &&

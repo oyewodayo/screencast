@@ -8,10 +8,15 @@
 //                      an opaque string here (this file only ever peeks at a few top-level fields
 //                      via serde_json::Value for list_whiteboards - the document shape is
 //                      FE-owned, same philosophy as boards.rs treating BoardDocument as opaque)
+//   assets/<id>.ext - copies of every image placed on the whiteboard (see
+//                      import_whiteboard_image/save_whiteboard_image) so the whiteboard keeps
+//                      working even if the original source file is later moved, renamed, or deleted
+//                      elsewhere in the user's library - identical convention to boards.rs
 //   thumbnail.png   - small preview PNG for the whiteboard-picker grid (see save_whiteboard_thumbnail)
 //
-// No assets/ subfolder (unlike boards.rs) - a whiteboard's nodes are vector shapes/text, nothing
-// that needs a copied-in source file.
+// The assets/ folder needs no lifecycle code of its own: duplicate_whiteboard already copies whole
+// subdirectories (see copy_dir_recursive) and delete_whiteboard already removes the project folder
+// wholesale, so assets follow their whiteboard automatically in both cases.
 //
 // Write-then-rename on every save, same crash-safety convention as boards.rs/image_annotations.rs.
 use super::utility::briefcast_dir;
@@ -172,6 +177,78 @@ pub fn delete_whiteboard(id: String) -> Result<(), String> {
     fs::remove_dir_all(&dir).map_err(|e| format!("Failed to delete whiteboard: {}", e))
 }
 
+// Image extensions accepted into a whiteboard's assets/ folder. Shared by both import paths below:
+// save_whiteboard_image gets its "extension" from a clipboard MIME type rather than a real file
+// name, so it can't be trusted verbatim, and import_whiteboard_image reads it off a user-picked
+// path - neither is a reason to let an arbitrary extension be written into the project folder.
+// Kept in step with docs.rs's save_doc_image ALLOWED list, plus the vector/modern formats a
+// diagramming surface is more likely to be handed than a rich-text document is.
+const ALLOWED_IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"];
+
+fn whiteboard_assets_dir(whiteboard_id: &str) -> Result<PathBuf, String> {
+    let assets_dir = whiteboard_dir(whiteboard_id)?.join("assets");
+    fs::create_dir_all(&assets_dir)
+        .map_err(|e| format!("Failed to create assets folder: {}", e))?;
+    Ok(assets_dir)
+}
+
+// Copies an arbitrary source image (already chosen via the frontend's file dialog) into this
+// whiteboard's own assets/ folder under a fresh name, so the whiteboard keeps working even if the
+// original file later moves/is renamed/deleted. Always copies (never moves) - the source lives
+// outside this whiteboard's folder and must be left untouched. asset_id comes from the frontend's
+// own crypto.randomUUID(), same reasoning as boards.rs's import_board_image.
+#[command]
+pub fn import_whiteboard_image(
+    whiteboard_id: String,
+    source_path: String,
+    asset_id: String,
+) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err(format!("Image does not exist: {}", source_path));
+    }
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ALLOWED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!("Unsupported image type: \"{}\"", ext));
+    }
+    let assets_dir = whiteboard_assets_dir(&whiteboard_id)?;
+    let asset_file_name = format!("{}.{}", asset_id, ext);
+    fs::copy(&source, assets_dir.join(&asset_file_name))
+        .map_err(|e| format!("Failed to copy image: {}", e))?;
+    Ok(asset_file_name)
+}
+
+// In-memory counterpart to import_whiteboard_image - for a clipboard paste or a drag-and-drop,
+// where the bytes exist only in the browser and there is no source path on disk to copy from.
+// Returns the asset FILE NAME (not the full path) so both import paths hand the frontend the same
+// thing to store in WhiteboardNode.assetFileName; the frontend resolves it to a real path itself
+// (see whiteboardImageCache.ts's whiteboardAssetPath), exactly as it already does for boards.
+#[command]
+pub fn save_whiteboard_image(
+    whiteboard_id: String,
+    asset_id: String,
+    extension: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    let ext = extension.to_ascii_lowercase();
+    if !ALLOWED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!("Unsupported image extension: {}", ext));
+    }
+    let assets_dir = whiteboard_assets_dir(&whiteboard_id)?;
+    let asset_file_name = format!("{}.{}", asset_id, ext);
+    // Write-then-rename, same crash-safety convention as every other write in this file - a reader
+    // can never observe a half-written asset under its final name.
+    let target = assets_dir.join(&asset_file_name);
+    let tmp = assets_dir.join(format!("{}.tmp", asset_file_name));
+    fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write image: {}", e))?;
+    fs::rename(&tmp, &target).map_err(|e| format!("Failed to save image: {}", e))?;
+    Ok(asset_file_name)
+}
+
 #[command]
 pub fn save_whiteboard_thumbnail(whiteboard_id: String, bytes: Vec<u8>) -> Result<(), String> {
     let dir = whiteboard_dir(&whiteboard_id)?;
@@ -190,8 +267,20 @@ pub fn save_whiteboard_thumbnail(whiteboard_id: String, bytes: Vec<u8>) -> Resul
 // internal project storage, excluded from the sidebar entirely; this is a normal, browsable
 // library folder, just like any the user creates themselves. Timestamp-suffixed so repeat exports
 // of the same whiteboard never collide.
+// `extension` is what lets this serve both the PNG and PDF exports from one implementation.
+// Whitelisted rather than trusted: a command is directly reachable, and this decides a filename on
+// disk. Same shape as mindmaps.rs's own export_mindmap_file.
 #[command]
-pub fn export_whiteboard_png(whiteboard_name: String, bytes: Vec<u8>) -> Result<String, String> {
+pub fn export_whiteboard_file(
+    whiteboard_name: String,
+    extension: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    const ALLOWED: [&str; 2] = ["png", "pdf"];
+    let ext = extension.to_ascii_lowercase();
+    if !ALLOWED.contains(&ext.as_str()) {
+        return Err(format!("Unsupported export type: {}", ext));
+    }
     let root = briefcast_dir()?.join("Whiteboard");
     fs::create_dir_all(&root).map_err(|e| format!("Failed to create Whiteboard folder: {}", e))?;
 
@@ -211,7 +300,7 @@ pub fn export_whiteboard_png(whiteboard_name: String, bytes: Vec<u8>) -> Result<
         safe_name
     };
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
-    let output = root.join(format!("{} {}.png", safe_name, stamp));
+    let output = root.join(format!("{} {}.{}", safe_name, stamp, ext));
 
     let tmp_file_name = format!("{}.tmp", output.file_name().unwrap().to_string_lossy());
     let tmp = output.with_file_name(tmp_file_name);
@@ -225,7 +314,7 @@ pub fn export_whiteboard_png(whiteboard_name: String, bytes: Vec<u8>) -> Result<
 // briefcast_dir()/Whiteboard/. Same write-then-rename crash-safety convention as every other save
 // in this file.
 #[command]
-pub fn export_whiteboard_png_to_path(dest_path: String, bytes: Vec<u8>) -> Result<(), String> {
+pub fn export_whiteboard_to_path(dest_path: String, bytes: Vec<u8>) -> Result<(), String> {
     let dest = PathBuf::from(&dest_path);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)

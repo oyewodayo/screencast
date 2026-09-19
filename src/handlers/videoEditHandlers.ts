@@ -468,6 +468,101 @@ export function makePipOverlay(
   };
 }
 
+// One screen<->camera toggle recorded during a "sva" + separate_webcam_capture recording (see
+// record_view_switch, recording.rs) - already resolved to this clip's own SOURCE-time coordinate
+// space (same space Clip.start/end occupy), same "backend records raw events, frontend resolves
+// them against the selected clip" split AutoZoomClick above uses for click data.
+export interface ViewSwitchEvent {
+  time: number;
+  mode: "screen" | "camera";
+}
+
+// Turns an alternating sequence of screen/camera toggle events into the camera-active [start,end)
+// intervals within clipId's own [start,end) range, one full-frame PipOverlay per interval cutting
+// to `webcamPath` - see RECORDING_UPGRADE_NOTES.md's view-switching feature design for why a
+// full-frame PipOverlay (rather than a Clip-level cut) is the right representation: export's own
+// pip_overlay_chain (conversion.rs) already produces exactly the time-gated
+// `overlay=...:enable='between(t,t1,t2)'` a hard cut needs, with zero new Rust filter logic.
+//
+// `events` should be every switch the recording ever logged, not pre-filtered to this clip - the
+// mode active AT clipStart has to be inferred from the last event at or before it (a clip trimmed
+// to start mid-camera-view has no "screen" event of its own inside its own range to say so).
+// Defaults to "screen" if no such event exists (either the recording predates the very first
+// switch, or - the common case - the user never switched away from the screen view at all before
+// this clip's own start).
+//
+// `clipOutputStart` is where clipId's own [start,end) source range begins on the OUTPUT timeline
+// (PipOverlay.startTime/endTime's own coordinate space - see its doc comment, videoEditTypes.ts -
+// unlike Clip.start/end, which are source-time) - the caller already has this on hand from its own
+// outputStarts/clipDurations arrays (see VideoTimelineDocker.tsx's own doc comment on those), so
+// it's taken as a parameter rather than recomputed here from a full clip list this function has no
+// other reason to need. `clipSpeed` (Clip.speed, undefined means 1) converts a source-time span
+// into the OUTPUT-time span it actually occupies, same conversion outputStarts/clipDurations
+// themselves already apply - a camera interval inside a 2x-speed clip plays back in half the
+// source-time span it spans.
+export function buildViewSwitchOverlays(
+  events: ViewSwitchEvent[],
+  clipStart: number,
+  clipEnd: number,
+  clipOutputStart: number,
+  clipSpeed: number | undefined,
+  webcamPath: string
+): PipOverlay[] {
+  const speed = clipSpeed ?? 1;
+  const toOutputTime = (sourceTime: number) => clipOutputStart + (sourceTime - clipStart) / speed;
+
+  const sorted = [...events].sort((a, b) => a.time - b.time);
+  let currentMode: "screen" | "camera" = "screen";
+  let i = 0;
+  while (i < sorted.length && sorted[i].time <= clipStart) {
+    currentMode = sorted[i].mode;
+    i++;
+  }
+
+  const intervals: { start: number; end: number }[] = [];
+  let intervalStart: number | null = currentMode === "camera" ? clipStart : null;
+  for (; i < sorted.length && sorted[i].time < clipEnd; i++) {
+    const ev = sorted[i];
+    if (ev.mode === "camera" && intervalStart === null) {
+      intervalStart = Math.max(ev.time, clipStart);
+    } else if (ev.mode === "screen" && intervalStart !== null) {
+      intervals.push({ start: intervalStart, end: ev.time });
+      intervalStart = null;
+    }
+  }
+  if (intervalStart !== null) {
+    intervals.push({ start: intervalStart, end: clipEnd });
+  }
+
+  const now = Date.now();
+  return intervals
+    .filter(({ start, end }) => end > start)
+    .map(({ start, end }) => ({
+      id: crypto.randomUUID(),
+      sourcePath: webcamPath,
+      // Reads the webcam file starting at the SAME position within it as this interval's own
+      // position within the main recording - both files started rolling at the same instant (one
+      // ffmpeg process, two outputs - see win.rs's recording_with_output_sva), so source-time in
+      // one is source-time in the other.
+      trimStart: start,
+      sourceDuration: end - start,
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      shape: "rectangle" as const,
+      startTime: toOutputTime(start),
+      endTime: toOutputTime(end),
+      // Muted - the mic (if any) already went to the main track during recording (win.rs's own
+      // comment on why a separately-captured webcam file never has its own audio track to begin
+      // with), same reasoning makePipOverlay's own `muted: true` default documents.
+      volume: 0,
+      muted: true,
+      createdAt: now,
+      updatedAt: now,
+    }));
+}
+
 // Drags one edge of a PiP overlay's time range - same trim-into-source reasoning as
 // resizeAudioOverlayTime above (a PipOverlay is a real video source too, not an abstract
 // stretchable box like text/image/blur), copied rather than shared with it since the two types

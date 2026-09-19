@@ -35,6 +35,19 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+      # tauri.conf.json's `bundle.resources` globs binaries/{ffmpeg,heif,whisper}/*, and
+      # tauri-build FAILS the build script outright when a resource glob matches nothing:
+      #   "glob pattern binaries/ffmpeg/* path not found or didn't match any files"
+      # Those binaries are gitignored (`binaries/*` in .gitignore), so a CI checkout never has
+      # them - which broke `cargo test` on every platform, inside the build script, before a
+      # single test compiled or ran. Nothing in CI bundles, so one placeholder file per folder is
+      # all the glob needs. The filename must NOT start with a dot, and `shell: bash` is explicit
+      # because windows-latest defaults to pwsh, where `mkdir -p` and `touch` don't exist.
+      - name: Satisfy bundle.resources globs (binaries/ are gitignored)
+        shell: bash
+        run: |
+          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper
+          touch binaries/ffmpeg/placeholder binaries/heif/placeholder binaries/whisper/placeholder
       # Not `tauri build`/`--features custom-protocol` - that needs the bundled ffmpeg/heif binary
       # resources and the full Tauri bundling toolchain, neither of which this test suite (pure
       # unit tests only, see conversion.rs's own #[cfg(test)] module) actually needs.
@@ -64,9 +77,27 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      # Provides heif-convert/heif-thumbnailer/heif-enc - see heic_unix.rs's own doc comment for
-      # why this app shells out to a system install rather than bundling/linking libheif itself.
-      - run: sudo apt-get update && sudo apt-get install -y libheif-examples
+      # libheif-examples provides heif-convert/heif-thumbnailer/heif-enc - see heic_unix.rs's own
+      # doc comment for why this app shells out to a system install rather than bundling/linking
+      # libheif itself.
+      #
+      # Everything after it is Tauri v2's own Linux build prerequisite set, which this job was
+      # missing entirely: the crate graph pulls in webkit2gtk-sys 2.x, soup3-sys and glib-sys (see
+      # Cargo.lock), and their build scripts pkg-config against system libraries ubuntu-latest
+      # does not ship by default. Note 4.1/3.0 - the 4.0/2.4 packages are Tauri v1's and do not
+      # satisfy v2.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libheif-examples libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev \
+            libssl-dev build-essential curl wget file
+      # See the `rust` job's copy of this step for why it exists.
+      - name: Satisfy bundle.resources globs (binaries/ are gitignored)
+        shell: bash
+        run: |
+          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper
+          touch binaries/ffmpeg/placeholder binaries/heif/placeholder binaries/whisper/placeholder
       - run: cargo test
 
   rust-macos:
@@ -87,4 +118,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       - run: brew install libheif
+      # See the `rust` job's copy of this step for why it exists.
+      - name: Satisfy bundle.resources globs (binaries/ are gitignored)
+        shell: bash
+        run: |
+          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper
+          touch binaries/ffmpeg/placeholder binaries/heif/placeholder binaries/whisper/placeholder
       - run: cargo test

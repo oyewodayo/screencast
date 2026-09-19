@@ -93,6 +93,16 @@ text, image, and audio overlays are stored as an ordered edit list next to the s
 file and only baked into pixels/audio at export time, so nothing here ever touches the
 original recording.
 
+There are two ways in. Open a video from the sidebar and toggle the wrench icon, as with
+any other file type; or click the **scissors icon** in the bottom icon bar to open the
+video editor as a standalone tool, the same way Whiteboard and Mindmap open. The tool
+starts on a landing screen that lists every video in your library (with poster-frame
+thumbnails), the ones you opened most recently, and an **Open video from anywhere**
+button for editing a file that was never imported into Briefcast. Picking one there
+opens it with the timeline already showing — no wrench click — and leaves a "Back to
+video editor" button to return to the list. Both routes are the same editor on the same
+edit list; the tool icon just means you don't have to find and open a file first.
+
 - **Timeline & clips** — a scrubbable, zoomable filmstrip of real thumbnails with a
   playhead synced to the actual player; split, trim, reorder, and delete clips; drag a
   file straight from the sidebar onto the timeline to insert it as a new clip.
@@ -159,6 +169,52 @@ have multiple pages, each with its own undo history.
   shape.
 - **Export** the current page to PNG.
 
+### Mindmap
+
+A structured learning-roadmap builder in the shape of [roadmap.sh](https://roadmap.sh),
+opened from its own icon in the bottom bar. Where the whiteboard treats a box as a
+*drawing*, a mindmap node is a *curriculum entry*: it has a semantic type, a slot in a
+hierarchy, its own curated list of learning resources, and a progress state you tick off
+as you work through it. Each mindmap is a single infinite canvas with a document-wide
+undo history, autosaved as you go.
+
+- **Typed components** — drag from the left-hand palette to place a Title, Topic,
+  Sub-topic, Paragraph, Label, Button, Image, Checklist, Links Group, Section backdrop,
+  or a horizontal/vertical divider. Each type arrives at a sensible size, colour, and
+  text weight for what it is, so a roadmap stays visually coherent without per-node
+  styling work.
+- **Directional add-topic arrows** — hover a node and click the arrow on any side to
+  create a connected child in that direction. Repeated adds fan out along the
+  perpendicular axis instead of stacking, so a topic's sub-topics lay themselves out.
+- **Connectors** — drag between node sides to link them, solid or dashed (roadmap.sh's
+  own convention: dashed for "belongs to", solid for "go here next"). Sides are explicit
+  and never silently re-route, because the lines are part of the diagram's meaning.
+- **Content & Links** — the inspector's second tab, and the reason the feature exists.
+  Give a topic a description and a curated resource list, each entry typed as
+  article/video/course/docs/book/tool/feed/open-source and optionally flagged
+  "official", so a reader can tell a 40-minute video from a two-minute reference page
+  before clicking.
+- **Progress tracking** — mark a topic pending, in progress, done, or skipped; the
+  canvas and reader view both reflect it.
+- **Live View** — a one-click read-only rendering of the roadmap the way someone
+  following it would see it: clicking a topic opens its description and resources in a
+  drawer, and progress can be set from there. Nothing can be moved or restyled by
+  accident.
+- **Checklists and link groups** — multi-row nodes for prerequisites and inline link
+  lists, with per-node checkmark glyph (tick, cross, dot, square) and colour so several
+  checklists in one roadmap can mean different things at a glance.
+- **Images** are imported into the mindmap's own `assets/` folder rather than linked by
+  URL, so a roadmap keeps working if the original file moves. (The app's
+  content-security policy only permits `asset:`/`data:` images, so remote URLs are
+  blocked by the webview.)
+- **Canvas controls** — pan/zoom (space-drag, pinch, Ctrl+wheel), fit-to-content,
+  optional grid and snap-to-grid, marquee and multi-select, auto-size a box to its own
+  text, layering, and per-node lock.
+- **Starter template** — a new mindmap opens with an editable skeleton roadmap whose
+  instruction panel documents the editor's own gestures, rather than a blank grid.
+- **Export** the roadmap to PNG or PDF, either straight into your library or to a path
+  you pick.
+
 ### Customization
 
 Settings (gear icon) is organized into sections — Appearance, Recording, Storage,
@@ -201,6 +257,10 @@ Annotation, Files, and PDF Annotator:
 | | `Delete` / `Backspace` | Delete the selection |
 | | `←` `→` `↑` `↓` | Nudge the selection (hold Shift for 10px) |
 | | `Esc` | Deselect, or cancel the currently armed tool |
+| Mindmap | `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` | Undo / redo |
+| | `Delete` / `Backspace` | Delete the selection |
+| | `Space` (hold) | Drag to pan the canvas |
+| | `Esc` | Deselect, or leave the inline label editor |
 
 ## Known limitations
 
@@ -312,6 +372,10 @@ npm run build
 - **Whiteboards** are saved one folder per board under
   `%USERPROFILE%\Videos\Briefcast\Whiteboards\` (a `whiteboard.json` document plus a
   cached `thumbnail.png`); PNG exports go to `%USERPROFILE%\Videos\Briefcast\Whiteboard\`.
+- **Mindmaps** follow the same pattern, one folder per mindmap under
+  `%USERPROFILE%\Videos\Briefcast\Mindmaps\` (a `mindmap.json` document, a cached
+  `thumbnail.png`, and an `assets/` folder holding a copy of every image placed on it);
+  PNG/PDF exports go to `%USERPROFILE%\Videos\Briefcast\Mindmap\`.
 - **Logs** (`app.log`, `panic.log`) are written to the app's data directory, typically
   `%LOCALAPPDATA%\Briefcast\`.
 
@@ -324,23 +388,26 @@ screencast/
 │   ├── components/
 │   │   ├── docker/                  # Bottom panel: recording setup, per-file tools, video timeline
 │   │   ├── pdf/                     # PDF toolbar, page rendering, thumbnails/outline sidebar
-│   │   ├── video/                   # Video-only overlay editing surface (text/image overlays, crop panel)
+│   │   ├── video/                   # Video editor landing screen + overlay editing surface (text/image overlays, crop panel)
 │   │   ├── whiteboard/              # Whiteboard canvas, style panel, table/lattice widgets (see Whiteboard)
+│   │   ├── mindmap/                 # Mindmap canvas, component palette, inspector, Live View (see Mindmap)
 │   │   ├── Modals/                  # Settings and recording-completed modals
 │   │   ├── custom/                  # Small shared UI primitives (toasts, dropdowns, alerts)
 │   │   ├── BottomDocker.tsx         # Switches between the docker/ panels above
-│   │   ├── ActiveRecordingState.tsx # Fixed bottom icon bar (folder/open/home/settings) + recording controls
+│   │   ├── ActiveRecordingState.tsx # Fixed bottom icon bar (folder/open/home/tools/settings) + recording controls
 │   │   ├── VideoPlayer.tsx          # Video/audio/image player
 │   │   └── PdfAnnotator.tsx         # PDF viewer + markup surface
 │   ├── handlers/
 │   │   ├── videoEditHandlers.ts     # Pure-function overlay/clip CRUD shared by the video edit store
-│   │   └── whiteboardHandlers.ts    # Pure-function shape geometry, connector routing, graph/chart math
+│   │   ├── whiteboardHandlers.ts    # Pure-function shape geometry, connector routing, graph/chart math
+│   │   └── mindmapHandlers.ts       # Pure-function mindmap geometry, edge routing, add-topic placement
 │   ├── hooks/
 │   │   ├── useVideoEditStore.ts     # Video edit state, undo/redo, export, sidecar persistence
 │   │   ├── useWhiteboardStore.ts    # Whiteboard document state, per-page undo/redo
+│   │   ├── useMindmapStore.ts       # Mindmap document state, undo/redo, debounced autosave
 │   │   └── useClampedPopoverPosition.ts # Keeps floating overlay popovers inside the viewport
 │   ├── contexts/ThemeContext.tsx    # Light/dark/system theme
-│   └── utils/                       # Formatting, file-category, media-handling, video overlay/render, and whiteboard type/schema helpers
+│   └── utils/                       # Formatting, file-category, media-handling, video overlay/render, and whiteboard/mindmap type/schema helpers
 ├── src-tauri/                        # Rust backend
 │   ├── src/
 │   │   ├── main.rs                  # Entry point, logging, window/command setup
@@ -355,7 +422,8 @@ screencast/
 │   │   │   ├── trash.rs             # Soft delete, restore, empty, auto-purge
 │   │   │   ├── pdf_annotations.rs   # PDF annotation persistence
 │   │   │   ├── loopback_audio.rs    # WASAPI loopback (system audio) capture
-│   │   │   └── whiteboards.rs       # Whiteboard document CRUD, thumbnails, PNG export
+│   │   │   ├── whiteboards.rs       # Whiteboard document CRUD, thumbnails, PNG export
+│   │   │   └── mindmaps.rs          # Mindmap document CRUD, thumbnails, image assets, PNG/PDF export
 │   │   └── views/                   # Standalone window (recording-completed popup)
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
 │   ├── binaries/heif/               # Bundled libheif (heif-dec.exe + DLLs) - HEIC/HEIF fallback decode

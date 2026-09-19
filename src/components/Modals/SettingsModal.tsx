@@ -151,16 +151,6 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<string[] | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<string[] | null>(null);
 
-  // WASAPI loopback ("system audio") is Windows-only - see BottomDocker.tsx's identical check
-  // for why the equivalent checkbox in the recording panel is gated the same way. Without this,
-  // the default here could be turned on for a macOS/Linux install and never do anything.
-  const [isSystemAudioSupported, setIsSystemAudioSupported] = useState(true);
-  useEffect(() => {
-    invoke<string>('get_platform')
-      .then((platform) => setIsSystemAudioSupported(platform === 'windows'))
-      .catch((err) => console.error('Failed to detect platform:', err));
-  }, []);
-
   const loadDevices = (): void => {
     invoke<string[]>("get_connected_audios").then(setConnectedAudioDevices).catch(console.error);
     invoke<string[]>("get_connected_cameras").then(setConnectedCameraDevices).catch(console.error);
@@ -461,22 +451,57 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     ))}
                   </select>
                 </Field>
+                {/* System audio ("what you hear") is now attempted on every platform - WASAPI
+                    loopback on Windows, an auto-selected PulseAudio monitor source on Linux, and
+                    (best-effort - only if the user already has a known virtual-audio-loopback
+                    device like BlackHole installed, since macOS has no built-in loopback at all)
+                    avfoundation on macOS. See recording/{macos,linux}.rs's own
+                    include_system_audio handling on the Rust side. */}
                 {(settings.defaultRecordType === "sva" || settings.defaultRecordType === "sa" || settings.defaultRecordType === "s") && (
                   <Field label="Include system audio">
                     <input
                       type="checkbox"
-                      checked={settings.defaultIncludeSystemAudio && isSystemAudioSupported}
-                      disabled={!isSystemAudioSupported}
-                      title={isSystemAudioSupported ? undefined : "System audio capture is Windows-only for now - not available on this platform."}
+                      checked={settings.defaultIncludeSystemAudio}
                       onChange={(e) => update("defaultIncludeSystemAudio", e.target.checked)}
-                      className="w-4 h-4 accent-blue-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
+                      className="w-4 h-4 accent-blue-500 cursor-pointer"
                     />
                   </Field>
                 )}
-                {(settings.defaultRecordType === "sva" || settings.defaultRecordType === "sa" || settings.defaultRecordType === "s") && !isSystemAudioSupported && (
-                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
-                    System audio capture (WASAPI loopback) isn't available on this platform yet.
-                  </p>
+                {(settings.defaultRecordType === "sva" || settings.defaultRecordType === "sa" || settings.defaultRecordType === "s") && (
+                  <>
+                    <Field label="Resolution">
+                      <select
+                        className={fieldInputClass}
+                        value={settings.defaultResolutionWidth ?? ""}
+                        onChange={(e) => update("defaultResolutionWidth", e.target.value ? Number(e.target.value) : null)}
+                      >
+                        <option value="">1080p (default)</option>
+                        <option value="1280">720p</option>
+                        <option value="1920">1080p</option>
+                        <option value="2560">1440p</option>
+                        {/* A very large width rather than a separate "native" flag - see
+                            RecordingDocker.tsx's NATIVE_RESOLUTION_WIDTH and FormData.resolution_width's
+                            own doc comment (recording.rs) for why. */}
+                        <option value={7680}>Native</option>
+                      </select>
+                    </Field>
+                    <Field label="Frame rate">
+                      <select
+                        className={fieldInputClass}
+                        value={settings.defaultFramerate ?? ""}
+                        onChange={(e) => update("defaultFramerate", e.target.value ? Number(e.target.value) : null)}
+                      >
+                        <option value="">Default (60fps for Screen+Video+Audio, 30fps otherwise)</option>
+                        <option value="24">24 fps</option>
+                        <option value="30">30 fps</option>
+                        <option value="60">60 fps</option>
+                      </select>
+                    </Field>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                      Recordings automatically use hardware-accelerated encoding (NVENC/Quick Sync/AMF) when your
+                      GPU and driver support it, falling back to software encoding otherwise - nothing to configure.
+                    </p>
+                  </>
                 )}
                 <div className="flex items-start justify-between gap-4">
                   <span className="text-sm text-neutral-700 dark:text-neutral-300 pt-1.5">Video device(s)</span>

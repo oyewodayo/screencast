@@ -22,6 +22,20 @@ const RecordingOverlayWindow = () => {
     const [isPaused, setIsPaused] = useState<boolean>(false);
     const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
     const [pausedAccumulatedMs, setPausedAccumulatedMs] = useState<number>(0);
+    // Live capture diagnostics from the backend's ffmpeg `-progress` sidecar (Windows only for
+    // now - see services/progress_watch.rs). fps/dropFrames are the two numbers that actually
+    // tell a user their capture is struggling in real time, rather than only finding out once
+    // they watch the finished file back.
+    const [captureFps, setCaptureFps] = useState<number | null>(null);
+    const [droppedFrames, setDroppedFrames] = useState<number>(0);
+    // Live screen<->camera view switching - only meaningful for "sva" recordings with
+    // separate_webcam_capture on (see FormData's own doc comment, recording.rs), which is the one
+    // combination that actually produces a second (camera) file to switch to. canSwitchView comes
+    // from the main window (Dashboard.tsx) alongside every other recording-state-update field;
+    // viewMode is purely local UI state - the backend only cares about the *events* (see
+    // handleSwitchView below), not which mode is "current" at any given moment.
+    const [canSwitchView, setCanSwitchView] = useState<boolean>(false);
+    const [viewMode, setViewMode] = useState<'screen' | 'camera'>('screen');
 
     const formatTime = (seconds: number): string => {
         const mins = Math.floor(seconds / 60);
@@ -89,6 +103,7 @@ const RecordingOverlayWindow = () => {
                 isPaused?: boolean;
                 pauseStartedAt?: number | null;
                 pausedAccumulatedMs?: number;
+                canSwitchView?: boolean;
             }>('recording-state-update', (event) => {
                 setIsRecording(event.payload.isRecording);
                 setRecordType(event.payload.recordType);
@@ -96,10 +111,25 @@ const RecordingOverlayWindow = () => {
                 setIsPaused(event.payload.isPaused ?? false);
                 setPauseStartedAt(event.payload.pauseStartedAt ?? null);
                 setPausedAccumulatedMs(event.payload.pausedAccumulatedMs ?? 0);
+                setCanSwitchView(event.payload.canSwitchView ?? false);
+            });
+
+            const unlistenProgress = await listen<{
+                frame?: number;
+                fps?: number;
+                bitrateKbps?: number;
+                outTimeSecs?: number;
+                dupFrames?: number;
+                dropFrames?: number;
+                speed?: number;
+            }>('recording-progress', (event) => {
+                setCaptureFps(event.payload.fps ?? null);
+                setDroppedFrames(event.payload.dropFrames ?? 0);
             });
 
             return () => {
                 unlistenRecordingState();
+                unlistenProgress();
             };
         };
 
@@ -112,6 +142,43 @@ const RecordingOverlayWindow = () => {
             if (cleanup) cleanup();
         };
     }, []);
+
+    // Clear stale diagnostics from whatever recording just ended, rather than leaving last
+    // session's fps/dropped-frame numbers on screen once a new (or no) recording starts.
+    useEffect(() => {
+        if (!isRecording) {
+            setCaptureFps(null);
+            setDroppedFrames(0);
+        }
+    }, [isRecording]);
+
+    // Every new recording starts on "screen" by construction (that's what recording_with_output_sva
+    // actually captures as the main file's baked-in frame) - reset local UI state so a previous
+    // recording's last-picked view doesn't carry over and look wrong from the very first frame.
+    // Keyed on startTime (unique per recording) rather than isRecording, which wouldn't change
+    // between two recordings started back to back without ever passing through "not recording".
+    useEffect(() => {
+        setViewMode('screen');
+    }, [startTime]);
+
+    // Logs a screen<->camera switch to the backend's own in-memory timeline (written out as a
+    // sidecar once the recording stops - see record_view_switch's own doc comment, recording.rs)
+    // and flips the local button state immediately for responsive feedback, independent of
+    // whether the backend call actually lands. elapsedSecs uses the exact same pause-aware formula
+    // the timer above derives from (effectiveNow frozen at pauseStartedAt while paused) so a switch
+    // logged mid-pause still lines up with what the displayed timer read at that moment.
+    const handleSwitchView = async (mode: 'screen' | 'camera') => {
+        if (mode === viewMode) return;
+        setViewMode(mode);
+        if (!startTime) return;
+        const effectiveNow = isPaused && pauseStartedAt ? pauseStartedAt : Date.now();
+        const elapsedSecs = Math.max(0, (effectiveNow - startTime - pausedAccumulatedMs) / 1000);
+        try {
+            await invoke('record_view_switch', { elapsedSecs, mode });
+        } catch (error) {
+            console.error('Error recording view switch:', error);
+        }
+    };
 
     // Derive elapsed time from the shared start timestamp (see Dashboard.tsx /
     // ActiveRecordingState.tsx) so this window's timer can't drift apart from the main window's -
@@ -220,10 +287,44 @@ const RecordingOverlayWindow = () => {
                             <div className={`font-mono text-sm ml-1 ${isPaused ? "text-amber-400" : ""}`}>
                                 {formatTime(elapsedTime)}{isPaused ? " (paused)" : ""}
                             </div>
+                            {captureFps !== null && (
+                                <div className="font-mono text-[10px] text-gray-400 ml-1">
+                                    {Math.round(captureFps)}fps
+                                </div>
+                            )}
+                            {droppedFrames > 0 && (
+                                <div
+                                    className="font-mono text-[10px] text-amber-400 ml-1"
+                                    title="Frames dropped during capture - the encoder may be falling behind"
+                                >
+                                    {droppedFrames} dropped
+                                </div>
+                            )}
                         </div>
 
                         <div className='flex items-center gap-2 pl-2 border-l border-gray-600'>
-                            {recordType === "sva" && (
+                            {canSwitchView ? (
+                                // Interactive - which one is "live" as the main view right now,
+                                // not just a static "here's what this recording captures" readout
+                                // the plain icons below are for every other mode. See
+                                // handleSwitchView's own doc comment for what a click here does.
+                                <div className="flex gap-1" title="Switch the main view between screen and camera">
+                                    <button
+                                        onClick={() => handleSwitchView('screen')}
+                                        className={`p-1 rounded ${viewMode === 'screen' ? 'bg-green-500/30 text-green-400' : 'text-gray-500 hover:text-gray-300'}`}
+                                        title="Show screen as the main view"
+                                    >
+                                        <IoScanSharp className="text-base" />
+                                    </button>
+                                    <button
+                                        onClick={() => handleSwitchView('camera')}
+                                        className={`p-1 rounded ${viewMode === 'camera' ? 'bg-green-500/30 text-green-400' : 'text-gray-500 hover:text-gray-300'}`}
+                                        title="Show camera as the main view"
+                                    >
+                                        <IoVideocam className="text-base" />
+                                    </button>
+                                </div>
+                            ) : recordType === "sva" && (
                                 <div className="flex gap-2">
                                     <IoScanSharp className="text-green-500 text-base" />
                                     <IoVideocam className="text-green-500 text-base" />
