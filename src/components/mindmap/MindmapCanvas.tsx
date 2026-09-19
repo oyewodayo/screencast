@@ -10,6 +10,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IoTrashOutline } from "react-icons/io5";
 import { TbGripVertical } from "react-icons/tb";
+import useCanvasWheel from "../../hooks/useCanvasWheel";
 import {
   MINDMAP_CHECK_GLYPH,
   MINDMAP_FONT_PX,
@@ -70,6 +71,19 @@ interface MindmapCanvasProps {
   // Fired by the directional arrows on a hovered/selected node - the editor owns id generation and
   // the actual add (it has the store), this just reports which node and which way.
   onAddTopic: (parent: MindmapNode, side: MindmapSide) => void;
+  // Mirrors the in-progress drag/resize out to the editor purely for DISPLAY. Without it the
+  // inspector's X/Y/W/H fields read from the committed document and so sit frozen at the pre-drag
+  // values until the pointer is released - which makes them look broken while you are dragging,
+  // the one moment you are most likely to be watching them.
+  onLiveNodesChange?: (nodes: MindmapNode[] | null) => void;
+  // Resolves an "image" node to a URL this webview can actually load - an imported asset becomes an
+  // asset: URL, a raw imageUrl is passed through. Owned by the editor because it needs the library
+  // root and this mindmap's id, neither of which a canvas should have to know.
+  imageSrcFor?: (node: MindmapNode) => string | null;
+  // Undo/redo live in the store, above this component; the canvas only owns the key handler because
+  // it is the thing that knows whether the user is typing into a node label at the time.
+  onUndo?: () => void;
+  onRedo?: () => void;
   zoom: number;
   onZoomChange: (zoom: number) => void;
   pan: { x: number; y: number };
@@ -77,7 +91,7 @@ interface MindmapCanvasProps {
 }
 
 const MindmapCanvas = React.forwardRef<MindmapCanvasHandle, MindmapCanvasProps>(function MindmapCanvas(
-  { doc, selectedIds, onSelectionChange, onEditNodes, onAddEdge, onDeleteSelection, onAddTopic, zoom, onZoomChange, pan, onPanChange },
+  { doc, selectedIds, onSelectionChange, onEditNodes, onAddEdge, onDeleteSelection, onAddTopic, onLiveNodesChange, imageSrcFor, onUndo, onRedo, zoom, onZoomChange, pan, onPanChange },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -90,6 +104,10 @@ const MindmapCanvas = React.forwardRef<MindmapCanvasHandle, MindmapCanvasProps>(
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [spaceHeld, setSpaceHeld] = useState(false);
+
+  useEffect(() => {
+    onLiveNodesChange?.(liveNodes);
+  }, [liveNodes, onLiveNodesChange]);
 
   const nodes = liveNodes ?? doc.nodes;
   const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
@@ -158,6 +176,14 @@ const MindmapCanvas = React.forwardRef<MindmapCanvasHandle, MindmapCanvasProps>(
       } else if (e.key === "Escape") {
         onSelectionChange(new Set());
         setEditingId(null);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+        e.preventDefault();
+        onUndo?.();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
+        // Ctrl+Y and Ctrl+Shift+Z both redo: the first is the Windows convention, the second what
+        // anyone arriving from a Mac or a design tool reaches for. Matches the whiteboard.
+        e.preventDefault();
+        onRedo?.();
       }
     };
     const up = (e: KeyboardEvent) => {
@@ -169,27 +195,18 @@ const MindmapCanvas = React.forwardRef<MindmapCanvasHandle, MindmapCanvasProps>(
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
     };
-  }, [selectedIds, onDeleteSelection, onSelectionChange]);
+  }, [selectedIds, onDeleteSelection, onSelectionChange, onUndo, onRedo]);
 
-  const handleWheel = useCallback(
-    (e: React.WheelEvent) => {
-      // Ctrl/Cmd+wheel zooms about the pointer; plain wheel pans, matching every other canvas in
-      // this app and the platform convention for a document surface.
-      if (e.ctrlKey || e.metaKey) {
-        const rect = containerRef.current?.getBoundingClientRect();
-        if (!rect) return;
-        const px = e.clientX - rect.left;
-        const py = e.clientY - rect.top;
-        const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
-        // Keep whatever is under the cursor pinned there as the scale changes.
-        onPanChange({ x: px - ((px - pan.x) / zoom) * next, y: py - ((py - pan.y) / zoom) * next });
-        onZoomChange(next);
-      } else {
-        onPanChange({ x: pan.x - e.deltaX, y: pan.y - e.deltaY });
-      }
-    },
-    [zoom, pan, onZoomChange, onPanChange]
-  );
+  // Pinch/Ctrl+wheel to zoom, two fingers to pan. A hook rather than an onWheel prop because the
+  // listener has to be non-passive to stop the webview zooming itself - see useCanvasWheel.
+  useCanvasWheel(containerRef, {
+    zoom,
+    pan,
+    minZoom: MIN_ZOOM,
+    maxZoom: MAX_ZOOM,
+    onZoomChange,
+    onPanChange,
+  });
 
   const beginMove = useCallback(
     (node: MindmapNode, e: React.PointerEvent) => {
@@ -406,7 +423,6 @@ const MindmapCanvas = React.forwardRef<MindmapCanvasHandle, MindmapCanvasProps>(
         cursor: spaceHeld ? "grab" : "default",
         touchAction: "none",
       }}
-      onWheel={handleWheel}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
@@ -484,7 +500,7 @@ const MindmapCanvas = React.forwardRef<MindmapCanvasHandle, MindmapCanvasProps>(
                 />
               )}
 
-              <MindmapNodeBody node={node} editing={editingId === node.id} onCommitLabel={(text) => commitLabel(node, text)} onToggleItem={(itemId) => toggleItem(node, itemId)} />
+              <MindmapNodeBody node={node} editing={editingId === node.id} onCommitLabel={(text) => commitLabel(node, text)} onToggleItem={(itemId) => toggleItem(node, itemId)} imageSrc={imageSrcFor?.(node) ?? null} />
 
               {/* Progress tick - only topic-ish nodes carry one, and only when it's been set, so an
                   untouched roadmap isn't covered in empty checkboxes. */}
@@ -679,11 +695,13 @@ function MindmapNodeBody({
   editing,
   onCommitLabel,
   onToggleItem,
+  imageSrc,
 }: {
   node: MindmapNode;
   editing: boolean;
   onCommitLabel: (text: string) => void;
   onToggleItem?: (itemId: string) => void;
+  imageSrc?: string | null;
 }) {
   const palette = MINDMAP_PALETTE[node.colorKey];
   const fontPx = MINDMAP_FONT_PX[node.fontSize];
@@ -716,6 +734,63 @@ function MindmapNodeBody({
     return (
       <div style={{ ...base, alignItems: node.type === "paragraph" ? "flex-start" : "center", background: "transparent" }}>
         {editing ? <InlineEditor value={node.label} fontPx={fontPx} onCommit={onCommitLabel} /> : node.label}
+      </div>
+    );
+  }
+
+  // A section is a labelled backdrop - drawn as a soft tinted panel with its heading in the corner,
+  // deliberately low-contrast so the topics sitting on top of it stay the thing you read first.
+  if (node.type === "section") {
+    return (
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          background: `${palette.background}66`,
+          border: `2px dashed ${palette.border}`,
+          borderRadius: 8,
+          padding: "6px 10px",
+          overflow: "hidden",
+        }}
+      >
+        <div style={{ fontSize: fontPx, fontWeight: node.bold ? 700 : 400, color: palette.text, opacity: 0.85 }}>
+          {editing ? <InlineEditor value={node.label} fontPx={fontPx} onCommit={onCommitLabel} /> : node.label}
+        </div>
+      </div>
+    );
+  }
+
+  if (node.type === "image") {
+    const url = imageSrc ?? "";
+    return (
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          overflow: "hidden",
+          borderRadius: 6,
+          border: url ? "none" : `1.5px dashed ${palette.border}`,
+          background: url ? "transparent" : "#f4f4f5",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        {url ? (
+          // draggable={false} or the browser's own image drag would fight the node's move gesture.
+          // maxWidth:none because Tailwind's preflight caps images at 100% of their container, which
+          // silently defeats object-fit here (the same trap the whiteboard's image node hit).
+          <img
+            src={url}
+            alt={node.label}
+            draggable={false}
+            style={{ width: "100%", height: "100%", objectFit: "contain", maxWidth: "none", maxHeight: "none", pointerEvents: "none" }}
+          />
+        ) : (
+          <span style={{ fontSize: Math.min(fontPx, 12), color: "#9ca3af", textAlign: "center", padding: 6 }}>
+            {editing ? <InlineEditor value={node.label} fontPx={fontPx} onCommit={onCommitLabel} /> : "Choose an image in the panel"}
+          </span>
+        )}
       </div>
     );
   }

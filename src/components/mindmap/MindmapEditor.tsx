@@ -9,9 +9,28 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { IoArrowBack, IoArrowRedo, IoArrowUndo, IoDownloadOutline, IoEyeOutline, IoPencilOutline } from "react-icons/io5";
-import { TbGridDots, TbMagnet, TbZoomIn, TbZoomOut, TbMaximize } from "react-icons/tb";
+import {
+  TbAlignLeft,
+  TbFrame,
+  TbGridDots,
+  TbHandClick,
+  TbHeading,
+  TbLineDashed,
+  TbLink,
+  TbListCheck,
+  TbMagnet,
+  TbMaximize,
+  TbMinus,
+  TbPhoto,
+  TbSeparatorVertical,
+  TbSquare,
+  TbTag,
+  TbZoomIn,
+  TbZoomOut,
+} from "react-icons/tb";
 import useMindmapStore from "../../hooks/useMindmapStore";
 import {
   MINDMAP_COMPONENT_ORDER,
@@ -29,6 +48,7 @@ import {
   resolveCheckStyle,
 } from "../../utils/mindmapTypes";
 import { autoSizedBox, buildAddTopic, canAutoSize, computeContentBounds } from "../../handlers/mindmapHandlers";
+import { wrapTextToWidth } from "../../utils/canvasText";
 import { canvasToPdfBytes, canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import MindmapCanvas, { MindmapCanvasHandle } from "./MindmapCanvas";
 import MindmapPanel from "./MindmapPanel";
@@ -50,6 +70,24 @@ type ExportFormat = "png" | "pdf";
 const LIST_ROW_ICON_WIDTH = 20;
 // Vertical gap between rows, matching the same layout's `gap: 4`.
 const LIST_ROW_GAP = 4;
+
+// One icon per component type for the palette. A coloured square only answers "what colour is it",
+// which is not the question a palette has to answer - the icon says what the thing IS, and it is
+// tinted with the type's own default colour at the call site so the palette still previews that too.
+const MINDMAP_TYPE_ICON: Record<MindmapNodeType, React.ReactNode> = {
+  title: <TbHeading size={16} />,
+  topic: <TbSquare size={16} />,
+  subtopic: <TbLineDashed size={16} />,
+  paragraph: <TbAlignLeft size={16} />,
+  label: <TbTag size={16} />,
+  button: <TbHandClick size={16} />,
+  image: <TbPhoto size={16} />,
+  checklist: <TbListCheck size={16} />,
+  linksGroup: <TbLink size={16} />,
+  section: <TbFrame size={16} />,
+  horizontalLine: <TbMinus size={16} />,
+  verticalLine: <TbSeparatorVertical size={16} />,
+};
 
 interface MindmapEditorProps {
   mindmapId: string;
@@ -85,7 +123,16 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
   const [liveView, setLiveView] = useState(false);
 
   const doc = store.doc;
-  const selectedNodes = useMemo(() => (doc ? doc.nodes.filter((n) => selectedIds.has(n.id)) : []), [doc, selectedIds]);
+  // The canvas's in-progress drag/resize, for display only (see its onLiveNodesChange prop). Applied
+  // over the committed selection so the inspector's geometry fields track the drag live instead of
+  // waiting for pointer-up.
+  const [liveNodesOverride, setLiveNodesOverride] = useState<MindmapNode[] | null>(null);
+  const selectedNodes = useMemo(() => {
+    const list = doc ? doc.nodes.filter((n) => selectedIds.has(n.id)) : [];
+    if (!liveNodesOverride) return list;
+    const liveById = new Map(liveNodesOverride.map((n) => [n.id, n]));
+    return list.map((n) => liveById.get(n.id) ?? n);
+  }, [doc, selectedIds, liveNodesOverride]);
 
   // The document point at the middle of the visible canvas - where a clicked (rather than dragged)
   // palette tile lands.
@@ -99,6 +146,49 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
   // mindmap opens at 100% with the viewport parked at the origin, so the template - the entire point
   // of which is to show you what a roadmap looks like - is mostly off-screen on arrival. Guarded by a
   // ref rather than a dependency list so it never re-fires and yanks the view back while editing.
+  // The Briefcast library root, needed to turn a stored asset filename into a loadable asset: URL.
+  // Null until it arrives, which renders an imported image as its placeholder for the first frame.
+  const [briefcastDir, setBriefcastDir] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<string>("get_briefcast_dir")
+      .then(setBriefcastDir)
+      .catch((err) => console.error("Failed to resolve Briefcast folder:", err));
+  }, []);
+
+  // One resolver shared by the canvas, the reader view and the export, so all three load the same
+  // bytes. An imported asset wins over a raw URL: if a node has both, the import is the deliberate
+  // one (see MindmapNode.assetFileName).
+  const imageSrcFor = useCallback(
+    (node: MindmapNode): string | null => {
+      if (node.assetFileName && briefcastDir) {
+        const sep = briefcastDir.includes("\\") ? "\\" : "/";
+        const root = briefcastDir.replace(/[\\/]+$/, "");
+        return convertFileSrc([root, "Mindmaps", mindmapId, "assets", node.assetFileName].join(sep));
+      }
+      return node.imageUrl?.trim() || null;
+    },
+    [briefcastDir, mindmapId]
+  );
+
+  // Imports a picture into this mindmap's own assets/ folder and points the node at it.
+  const handleChooseImage = useCallback(
+    async (node: MindmapNode) => {
+      try {
+        const picked = await openFileDialog({
+          multiple: false,
+          filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"] }],
+        });
+        if (!picked || Array.isArray(picked)) return;
+        const assetFileName = await invoke<string>("import_mindmap_image", { mindmapId, sourcePath: picked, assetId: crypto.randomUUID() });
+        store.editNodes([node], [{ ...node, assetFileName }]);
+      } catch (err) {
+        console.error("Failed to import image:", err);
+        setExportError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [mindmapId, store]
+  );
+
   const didFitRef = useRef(false);
   useEffect(() => {
     if (didFitRef.current || !doc || doc.nodes.length === 0) return;
@@ -137,7 +227,10 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
   const handlePaletteDrop = useCallback(
     (type: MindmapNodeType, point: { x: number; y: number }) => {
       const node = createMindmapNode(crypto.randomUUID(), type, point.x, point.y);
-      store.addNodes([node]);
+      // A section is a backdrop, so it goes to the BACK of the z-order (index 0). Dropped on top
+      // like every other node it would cover whatever it was meant to sit behind, and the first
+      // thing anyone would have to do is send it backwards.
+      store.addNodes([node], [], type === "section" ? [0] : undefined);
       setSelectedIds(new Set([node.id]));
     },
     [store]
@@ -302,52 +395,97 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
         }
         ctx.textBaseline = "middle";
 
+        // Everything below matches MindmapNodeBody's own CSS box: 10px of horizontal padding, 4px
+        // vertical for a single-line node and 8px for the stacked ones, lineHeight 1.3, and
+        // `overflow: hidden`. The clip is what makes that last one true here - without it a label too
+        // tall for its node spills across the roadmap in the export while staying neatly cut off on
+        // screen. Long labels wrap (rather than running off the shape) for the same reason: the DOM
+        // renderer sets `word-break: break-word`, so wrapping is what the user already sees.
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(node.x, node.y, node.width, node.height);
+        ctx.clip();
+        const padX = 10;
+        const innerW = node.width - padX * 2;
+
         // A checklist/links group is a heading plus its rows - drawing only the heading would export
         // an empty-looking box, matching neither the canvas nor the reader view.
         const rows = nodeItems(node);
         if (rows.length > 0) {
           const checkColor = resolveCheckColor(node);
           const glyph = MINDMAP_CHECK_GLYPH[resolveCheckStyle(node)];
+          const rowFontPx = fontPx - 1;
+          const headLineH = fontPx * 1.3;
+          const rowLineH = rowFontPx * 1.3;
+          const ROW_GAP = 4;
+          const MARKER_W = 12;
+          const MARKER_GAP = 6;
+          const textLeft = node.x + padX + MARKER_W + MARKER_GAP;
+          const textW = node.width - padX - MARKER_W - MARKER_GAP - padX;
           ctx.textAlign = "left";
+
+          // Heading, wrapped. `y` then walks down the rows the way the flex column does, advancing by
+          // each row's OWN measured height - a fixed step per row would have a wrapped two-line item
+          // sit on top of the next one.
           ctx.font = `700 ${fontPx}px system-ui, sans-serif`;
           ctx.fillStyle = palette.text;
-          ctx.fillText(node.label, node.x + 4, node.y + 14);
-          rows.forEach((item, i) => {
-            const rowY = node.y + 14 + (i + 1) * (fontPx * 1.45);
-            const boxSize = fontPx * 0.8;
+          const headLines = wrapTextToWidth(ctx, node.label, innerW);
+          let y = node.y + 8;
+          for (const line of headLines) {
+            ctx.fillText(line, node.x + padX, y + headLineH / 2);
+            y += headLineH;
+          }
+          y += ROW_GAP;
+
+          for (const item of rows) {
+            ctx.font = `${rowFontPx}px system-ui, sans-serif`;
+            const itemLines = wrapTextToWidth(ctx, item.text, textW);
+            const blockH = Math.max(MARKER_W, itemLines.length * rowLineH);
+            // The marker is centered against the whole row, matching `alignItems: center`.
+            const markerCY = y + blockH / 2;
             if (node.type === "checklist") {
               ctx.strokeStyle = item.checked ? checkColor : palette.border;
               ctx.lineWidth = 1.5;
-              ctx.strokeRect(node.x + 4, rowY - boxSize * 0.85, boxSize, boxSize);
+              ctx.strokeRect(node.x + padX, markerCY - MARKER_W / 2, MARKER_W, MARKER_W);
               if (item.checked) {
                 ctx.fillStyle = checkColor;
-                ctx.font = `${fontPx * 0.7}px system-ui, sans-serif`;
+                ctx.font = `9px system-ui, sans-serif`;
                 ctx.textAlign = "center";
-                ctx.fillText(glyph, node.x + 4 + boxSize / 2, rowY - boxSize * 0.35);
+                ctx.fillText(glyph, node.x + padX + MARKER_W / 2, markerCY);
                 ctx.textAlign = "left";
               }
             } else {
               ctx.fillStyle = "#2b7fff";
-              ctx.font = `${fontPx}px system-ui, sans-serif`;
-              ctx.fillText("\u203A", node.x + 4, rowY);
+              ctx.font = `${rowFontPx}px system-ui, sans-serif`;
+              ctx.fillText("\u203A", node.x + padX, markerCY);
             }
             ctx.fillStyle = node.type === "linksGroup" ? "#2b7fff" : palette.text;
-            ctx.globalAlpha = node.type === "checklist" && item.checked ? 0.55 : 1;
-            ctx.font = `${fontPx - 1}px system-ui, sans-serif`;
-            ctx.fillText(item.text, node.x + 4 + fontPx * 1.3, rowY);
+            // 0.85 is the row opacity the canvas gives every item; a ticked one reads fainter still.
+            ctx.globalAlpha = (node.type === "checklist" && item.checked ? 0.55 : 1) * 0.85;
+            ctx.font = `${rowFontPx}px system-ui, sans-serif`;
+            itemLines.forEach((line, i) => ctx.fillText(line, textLeft, y + rowLineH / 2 + i * rowLineH));
             ctx.globalAlpha = 1;
-          });
+            y += blockH + ROW_GAP;
+          }
+          ctx.restore();
           continue;
         }
 
         ctx.fillStyle = palette.text;
         ctx.font = `${node.italic ? "italic " : ""}${node.bold ? "700 " : ""}${fontPx}px system-ui, sans-serif`;
-        ctx.textAlign = boxed ? "center" : "left";
-        const cx = boxed ? node.x + node.width / 2 : node.x + 4;
-        const lines = node.label.split("\n");
+        // A paragraph is the only left-aligned, top-anchored kind; a title or label is centered text
+        // with no box, and a boxed node centers in both axes (see MindmapNodeBody's `base`).
+        const leftAligned = node.type === "paragraph" || node.type === "section";
+        ctx.textAlign = leftAligned ? "left" : "center";
+        const cx = leftAligned ? node.x + padX : node.x + node.width / 2;
+        const lines = wrapTextToWidth(ctx, node.label, innerW);
         const lineH = fontPx * 1.3;
-        const startY = boxed ? node.y + node.height / 2 - ((lines.length - 1) * lineH) / 2 : node.y + lineH / 2 + 4;
+        const padY = leftAligned ? 8 : 4;
+        const startY = leftAligned
+          ? node.y + padY + lineH / 2
+          : node.y + node.height / 2 - ((lines.length - 1) * lineH) / 2;
         lines.forEach((line, i) => ctx.fillText(line, cx, startY + i * lineH));
+        ctx.restore();
       }
       return canvas;
     },
@@ -544,7 +682,7 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
       )}
       {liveView ? (
         <div className="flex-1 min-h-0">
-          <MindmapLiveView doc={doc} onSetProgress={(node, progress) => store.editNodes([node], [{ ...node, progress }])} />
+          <MindmapLiveView doc={doc} imageSrcFor={imageSrcFor} onSetProgress={(node, progress) => store.editNodes([node], [{ ...node, progress }])} />
         </div>
       ) : (
       <div className="flex-1 min-h-0 flex">
@@ -556,8 +694,7 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
             Components <span className="font-normal normal-case tracking-normal">(drag &amp; drop)</span>
           </p>
           {MINDMAP_COMPONENT_ORDER.map((type) => {
-            const d = MINDMAP_TYPE_DEFAULTS[type];
-            const palette = MINDMAP_PALETTE[d.colorKey];
+            const palette = MINDMAP_PALETTE[MINDMAP_TYPE_DEFAULTS[type].colorKey];
             return (
               <div
                 key={type}
@@ -568,17 +705,13 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
                 className="flex items-center gap-2 px-2.5 py-2 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs cursor-grab active:cursor-grabbing hover:border-violet-400 hover:shadow-sm transition select-none"
                 title={`Drag "${MINDMAP_TYPE_LABEL[type]}" onto the canvas, or click to drop it in the middle`}
               >
-                <span
-                  className="shrink-0 rounded"
-                  style={{
-                    width: 18,
-                    height: type === "horizontalLine" ? 2 : type === "verticalLine" ? 18 : 12,
-                    background: type === "label" || type === "paragraph" || type === "checklist" || type === "linksGroup" ? "transparent" : palette.background,
-                    border: type === "horizontalLine" || type === "verticalLine" ? "none" : `1.5px solid ${palette.border}`,
-                    borderBottom: type === "horizontalLine" ? `2px solid ${palette.border}` : undefined,
-                    borderLeft: type === "verticalLine" ? `2px solid ${palette.border}` : undefined,
-                  }}
-                />
+                {/* A typed icon rather than a colour chip - "what is this component" is the
+                    question the palette has to answer, and a coloured square only answers "what
+                    colour is it". The icon is tinted with the type's own default colour so the
+                    palette still previews that too. */}
+                <span className="shrink-0 flex items-center justify-center w-4 h-4" style={{ color: palette.border }}>
+                  {MINDMAP_TYPE_ICON[type]}
+                </span>
                 {MINDMAP_TYPE_LABEL[type]}
               </div>
             );
@@ -595,6 +728,10 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
             onAddEdge={store.addEdge}
             onDeleteSelection={handleDeleteSelection}
             onAddTopic={handleAddTopic}
+            onLiveNodesChange={setLiveNodesOverride}
+            imageSrcFor={imageSrcFor}
+            onUndo={store.undo}
+            onRedo={store.redo}
             zoom={zoom}
             onZoomChange={setZoom}
             pan={pan}
@@ -608,6 +745,7 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
             onBringToFront={() => reorder(true)}
             onSendToBack={() => reorder(false)}
             onDelete={handleDeleteSelection}
+            onChooseImage={handleChooseImage}
           />
         </div>
       </div>

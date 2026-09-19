@@ -35,6 +35,18 @@ export type MindmapNodeType =
   // A checklist of short items - the "prerequisites" / "you should know" block roadmap.sh uses
   // above a section. Items live in MindmapNode.items.
   | "checklist"
+  // A picture, addressed by URL rather than imported as a file. A roadmap's images are almost always
+  // something already on the web (a diagram, a logo, a screenshot from the docs it is pointing at),
+  // and a URL keeps the document portable - it stays a single JSON file with no sidecar assets to
+  // carry around. Optionally clickable via MindmapNode.linkUrl.
+  | "image"
+  // A titled container drawn BEHIND everything else - the way a roadmap groups a run of related
+  // topics under one heading ("Fundamentals", "Tooling") without connecting them. Purely visual: it
+  // has no parent/child relationship to whatever sits on top of it, so moving a section does not
+  // move its contents. That is a deliberate scope choice - real containment would mean a parent link
+  // on every node and hit-testing that respects it, for a feature whose whole job is a labelled
+  // backdrop.
+  | "section"
   // A titled list of links rendered inline on the canvas (as opposed to MindmapNode.resources,
   // which are hidden behind a topic and only shown when it's opened). Also uses `items`, with each
   // item carrying a url.
@@ -171,6 +183,18 @@ export interface MindmapNode {
   description?: string;
   // "checklist"/"linksGroup" only.
   items?: MindmapListItem[];
+  // "image" only. `assetFileName` is a picture imported into this mindmap's own assets/ folder and
+  // is the normal case; `imageUrl` is a raw URL for the rare one. They are two fields rather than
+  // one because an imported asset has to be resolved against the library root at render time, while
+  // a URL is used verbatim - collapsing them would mean guessing which kind a string is.
+  //
+  // Note the app's content-security policy only permits images from `asset:` and `data:`, so a
+  // remote https:// URL is blocked by the webview and renders as nothing. That is why importing is
+  // the primary path here, and why the panel says so rather than letting it fail silently.
+  assetFileName?: string;
+  imageUrl?: string;
+  // Opened when the image is clicked in the reader view. A plain hyperlink, so no CSP involvement.
+  linkUrl?: string;
   // "checklist" only - which glyph a ticked row shows, and in what colour. Per-node rather than
   // global because a roadmap often has several checklists meaning different things (prerequisites
   // you must have vs. optional extras vs. things to avoid), and the glyph is what distinguishes
@@ -198,6 +222,10 @@ export const MINDMAP_TYPE_DEFAULTS: Record<
   button: { width: 170, height: 40, fontSize: "M", colorKey: "E", bold: true, label: "Visit resource" },
   checklist: { width: 240, height: 130, fontSize: "M", colorKey: "A", bold: false, label: "Before you start" },
   linksGroup: { width: 240, height: 130, fontSize: "M", colorKey: "A", bold: false, label: "Useful links" },
+  image: { width: 240, height: 180, fontSize: "S", colorKey: "A", bold: false, label: "Image" },
+  // Large by default - a section is a backdrop several topics sit inside, so a small one would have
+  // to be resized before it could do its job.
+  section: { width: 460, height: 320, fontSize: "L", colorKey: "F", bold: true, label: "Section" },
   horizontalLine: { width: 220, height: 2, fontSize: "M", colorKey: "A", bold: false, label: "" },
   verticalLine: { width: 2, height: 200, fontSize: "M", colorKey: "A", bold: false, label: "" },
 };
@@ -211,8 +239,10 @@ export const MINDMAP_COMPONENT_ORDER: MindmapNodeType[] = [
   "paragraph",
   "label",
   "button",
+  "image",
   "checklist",
   "linksGroup",
+  "section",
   "horizontalLine",
   "verticalLine",
 ];
@@ -224,8 +254,10 @@ export const MINDMAP_TYPE_LABEL: Record<MindmapNodeType, string> = {
   paragraph: "Paragraph",
   label: "Label",
   button: "Button",
+  image: "Image",
   checklist: "Checklist",
   linksGroup: "Links Group",
+  section: "Section",
   horizontalLine: "Horizontal Line",
   verticalLine: "Vertical Line",
 };

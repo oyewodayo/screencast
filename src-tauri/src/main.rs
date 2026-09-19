@@ -359,6 +359,7 @@ fn main() {
             services::mindmaps::save_mindmap,
             services::mindmaps::load_mindmap,
             services::mindmaps::delete_mindmap,
+            services::mindmaps::import_mindmap_image,
             services::mindmaps::save_mindmap_thumbnail,
             services::mindmaps::export_mindmap_file,
             services::mindmaps::export_mindmap_to_path,

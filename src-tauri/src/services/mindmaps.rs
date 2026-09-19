@@ -9,9 +9,14 @@
 //                      same philosophy whiteboards.rs and boards.rs both apply to theirs)
 //   thumbnail.png   - small preview PNG for the mindmap-picker grid
 //
-// No assets/ subfolder: a mindmap's nodes are typed text boxes and links, with no copied-in binary
-// content of their own. (Should images ever land on this canvas, follow whiteboards.rs's own
-// import_whiteboard_image convention rather than inventing a second one.)
+//   assets/<id>.ext - copies of every image placed on the mindmap (see import_mindmap_image), so a
+//                      roadmap keeps working even if the original file is later moved or deleted.
+//                      Local copies rather than remote URLs because this app's own content-security
+//                      policy only permits images from `asset:`/`data:` - a pasted https:// URL is
+//                      silently blocked by the webview and renders as nothing.
+//
+// The assets/ folder needs no lifecycle code of its own: duplicate_mindmap already copies whole
+// subdirectories and delete_mindmap removes the project folder wholesale.
 //
 // Write-then-rename on every save, same crash-safety convention as every other service here.
 use super::utility::briefcast_dir;
@@ -181,6 +186,41 @@ pub fn load_mindmap(id: String) -> Result<String, String> {
 pub fn delete_mindmap(id: String) -> Result<(), String> {
     let dir = mindmap_dir(&id)?;
     fs::remove_dir_all(&dir).map_err(|e| format!("Failed to delete mindmap: {}", e))
+}
+
+// Image extensions accepted into a mindmap's assets/ folder. Whitelisted rather than trusted: a
+// command is directly reachable, and this decides a filename on disk.
+const ALLOWED_IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"];
+
+// Copies a user-picked image into this mindmap's own assets/ folder and returns the stored file
+// name, which is what the node persists. Always copies, never moves - the source lives outside this
+// project folder and must be left untouched. Same convention as whiteboards.rs's
+// import_whiteboard_image.
+#[command]
+pub fn import_mindmap_image(
+    mindmap_id: String,
+    source_path: String,
+    asset_id: String,
+) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err(format!("Image does not exist: {}", source_path));
+    }
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ALLOWED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!("Unsupported image type: \"{}\"", ext));
+    }
+    let assets_dir = mindmap_dir(&mindmap_id)?.join("assets");
+    fs::create_dir_all(&assets_dir)
+        .map_err(|e| format!("Failed to create assets folder: {}", e))?;
+    let asset_file_name = format!("{}.{}", asset_id, ext);
+    fs::copy(&source, assets_dir.join(&asset_file_name))
+        .map_err(|e| format!("Failed to copy image: {}", e))?;
+    Ok(asset_file_name)
 }
 
 #[command]

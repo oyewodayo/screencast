@@ -3,7 +3,9 @@ import {
   DEFAULT_CHECK_COLOR,
   MINDMAP_CHECK_GLYPH,
   MINDMAP_CHECK_STYLES,
+  MINDMAP_COMPONENT_ORDER,
   MINDMAP_TYPE_DEFAULTS,
+  MINDMAP_TYPE_LABEL,
   MindmapNode,
   createEmptyMindmapDocument,
   createMindmapNode,
@@ -309,5 +311,43 @@ describe("checklist items", () => {
     for (const style of MINDMAP_CHECK_STYLES) {
       expect(MINDMAP_CHECK_GLYPH[style]).toBeTruthy();
     }
+  });
+});
+
+describe("image and section node types", () => {
+  it("creates an image with no URL, so it renders a placeholder rather than a broken image", () => {
+    const node = createMindmapNode("a", "image", 0, 0);
+    expect(node.imageUrl).toBeUndefined();
+    expect(node.linkUrl).toBeUndefined();
+  });
+
+  it("gives a section a large default box, since it is a backdrop several topics sit inside", () => {
+    const node = createMindmapNode("a", "section", 0, 0);
+    expect(node.width).toBeGreaterThan(400);
+    expect(node.height).toBeGreaterThan(250);
+  });
+
+  it("neither type is a topic, so neither carries resources or progress", () => {
+    for (const type of ["image", "section"] as const) {
+      const node = createMindmapNode("a", type, 0, 0);
+      expect(nodeResources({ ...node, resources: [{ id: "r", type: "article", label: "x", url: "u" }] })).toEqual([]);
+      expect(resolveProgress({ ...node, progress: "done" })).toBe("pending");
+    }
+  });
+
+  it("both appear in the palette with a readable name", () => {
+    expect(MINDMAP_COMPONENT_ORDER).toContain("image");
+    expect(MINDMAP_COMPONENT_ORDER).toContain("section");
+    expect(MINDMAP_TYPE_LABEL.image).toBe("Image");
+    expect(MINDMAP_TYPE_LABEL.section).toBe("Section");
+  });
+
+  // A section dropped on top would cover whatever it was meant to sit behind, so it is inserted at
+  // index 0 - this checks the command honours that placement.
+  it("inserts a section at the back of the z-order", () => {
+    const doc = { ...createEmptyMindmapDocument("d", "D"), nodes: [topic({ id: "a" }), topic({ id: "b" })] };
+    const section = createMindmapNode("s", "section", 0, 0);
+    const after = applyMindmapCommand(doc, { type: "add-nodes", nodes: [section], edges: [], indices: [0] });
+    expect(after.nodes.map((n) => n.id)).toEqual(["s", "a", "b"]);
   });
 });

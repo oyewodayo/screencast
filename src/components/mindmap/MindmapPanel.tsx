@@ -81,9 +81,12 @@ interface MindmapPanelProps {
   onBringToFront: () => void;
   onSendToBack: () => void;
   onDelete: () => void;
+  // Opens a file picker and imports the chosen image into this mindmap's assets folder. Owned by the
+  // editor, which has the mindmap id and the store.
+  onChooseImage?: (node: MindmapNode) => void;
 }
 
-const MindmapPanel: React.FC<MindmapPanelProps> = ({ selected, onUpdate, onAddTopic, onAutoSize, onBringToFront, onSendToBack, onDelete }) => {
+const MindmapPanel: React.FC<MindmapPanelProps> = ({ selected, onUpdate, onAddTopic, onAutoSize, onBringToFront, onSendToBack, onDelete, onChooseImage }) => {
   const [tab, setTab] = React.useState<"properties" | "content">("properties");
   if (selected.length === 0) return null;
   const node = selected[0];
@@ -247,6 +250,31 @@ const MindmapPanel: React.FC<MindmapPanelProps> = ({ selected, onUpdate, onAddTo
                 })}
               </div>
             </div>
+
+            {single && node.type === "image" && (
+              <div className="flex flex-col gap-1.5">
+                <SectionLabel>Image</SectionLabel>
+                <button
+                  type="button"
+                  onClick={() => onChooseImage?.(node)}
+                  disabled={!onChooseImage}
+                  className="w-full h-8 flex items-center justify-center gap-1.5 rounded-md border border-dashed border-gray-300 dark:border-neutral-600 text-xs font-medium text-gray-600 dark:text-neutral-300 hover:border-violet-400 hover:text-violet-600 dark:hover:text-violet-400 hover:bg-violet-50/50 dark:hover:bg-violet-500/10 transition disabled:opacity-40"
+                >
+                  {node.assetFileName ? "Replace image…" : "Choose image…"}
+                </button>
+                {node.assetFileName && <p className="text-[10px] text-gray-400 dark:text-neutral-500 truncate">Imported into this roadmap.</p>}
+                <label className="flex flex-col gap-1 text-[11px] text-gray-500 dark:text-neutral-400">
+                  Link URL
+                  <input
+                    type="url"
+                    value={node.linkUrl ?? ""}
+                    placeholder="Opens when clicked in Live View"
+                    onChange={(e) => onUpdate({ linkUrl: e.target.value })}
+                    className={INPUT_CLASS}
+                  />
+                </label>
+              </div>
+            )}
 
             {single && isList && (
               <div className="flex flex-col gap-1.5">

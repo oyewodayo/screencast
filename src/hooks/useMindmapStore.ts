@@ -15,7 +15,8 @@ export interface UseMindmapStoreResult {
   doc: MindmapDocument | null;
   loading: boolean;
   loadError: string | null;
-  addNodes: (nodes: MindmapNode[], edges?: MindmapEdge[]) => void;
+  // `indices` places each node at a specific z-position; omitted appends (topmost).
+  addNodes: (nodes: MindmapNode[], edges?: MindmapEdge[], indices?: number[]) => void;
   editNodes: (before: MindmapNode[], after: MindmapNode[]) => void;
   // Deletes nodes AND every connector touching them, as one undo step - an edge pointing at a
   // removed node has nothing to resolve its endpoint against.
@@ -132,7 +133,7 @@ export default function useMindmapStore(mindmapId: string | undefined): UseMindm
     [scheduleAutosave]
   );
 
-  const addNodes = useCallback((nodes: MindmapNode[], edges: MindmapEdge[] = []) => dispatch({ type: "add-nodes", nodes, edges }), [dispatch]);
+  const addNodes = useCallback((nodes: MindmapNode[], edges: MindmapEdge[] = [], indices?: number[]) => dispatch({ type: "add-nodes", nodes, edges, indices }), [dispatch]);
   const editNodes = useCallback((before: MindmapNode[], after: MindmapNode[]) => dispatch({ type: "edit-nodes", before, after }), [dispatch]);
   const addEdge = useCallback((edge: MindmapEdge) => dispatch({ type: "add-edge", edge }), [dispatch]);
   const editEdge = useCallback((before: MindmapEdge, after: MindmapEdge) => dispatch({ type: "edit-edge", before, after }), [dispatch]);

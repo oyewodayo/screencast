@@ -95,6 +95,8 @@ interface Props {
   isWhiteboard: boolean;
   handleOpenMindmap: () => void;
   isMindmap: boolean;
+  handleOpenVideoEditor: () => void;
+  isVideoEditor: boolean;
   handleOpenSettings: () => void;
   handleOpenExternalFile: () => void;
   showFileList: boolean;
@@ -219,6 +221,8 @@ const BottomDocker = ({
   isWhiteboard,
   handleOpenMindmap,
   isMindmap,
+  handleOpenVideoEditor,
+  isVideoEditor,
   handleOpenSettings,
   handleOpenExternalFile,
   showFileList,
@@ -554,6 +558,8 @@ const BottomDocker = ({
             isWhiteboard={isWhiteboard}
             handleOpenMindmap={handleOpenMindmap}
             isMindmap={isMindmap}
+            handleOpenVideoEditor={handleOpenVideoEditor}
+            isVideoEditor={isVideoEditor}
             handleOpenSettings={handleOpenSettings}
             handleOpenExternalFile={handleOpenExternalFile}
             handleStopRecording={handleStopRecording}

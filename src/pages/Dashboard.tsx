@@ -30,6 +30,7 @@ import { BoardEditorHandle } from "../components/board/BoardEditor";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
+import VideoEditorHome from "../components/video/VideoEditorHome";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -184,6 +185,11 @@ interface FileMap {
     [folder: string]: FileEntry[]
 }
 
+// The Video Editor tool's two states - its landing screen (pick a video), and "a video picked
+// there is now open in the editor". See videoEditorScreen's own doc comment below for why the
+// second carries no payload of its own.
+type VideoEditorScreen = { mode: "home" } | { mode: "editing" };
+
 const Dashboard = () => {
   const [message, setMessage] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
@@ -307,6 +313,14 @@ const Dashboard = () => {
   // pattern as boardScreen/docsScreen. See handleOpenWhiteboard.
   const [whiteboardScreen, setWhiteboardScreen] = useState<WhiteboardScreen | null>(null);
   const [mindmapScreen, setMindmapScreen] = useState<MindmapScreen | null>(null);
+  // Which Video Editor screen (if any) is active - same null-means-off pattern as the tool
+  // screens above, but with one deliberate difference: "editing" renders nothing of its own. The
+  // video editor has always been "an open video in VideoPlayer + FileToolsDocker's video tools",
+  // so this state's only job in that mode is to remember that the user got here through the Video
+  // Editor tool rather than by clicking a file - which is what keeps the docker's Video Editor
+  // icon lit and gives the open video a "Back to video editor" way out. See
+  // components/video/VideoEditorHome.tsx's own doc comment.
+  const [videoEditorScreen, setVideoEditorScreen] = useState<VideoEditorScreen | null>(null);
   // Every doc's summary (id/title/linked_to/etc.), refreshed via refreshDocsIndex - backs both the
   // "Link to recording" picker's libraryFiles-independent state and the per-file "has linked
   // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
@@ -1255,11 +1269,49 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); };
-	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); };
-	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); setWhiteboardScreen(null); setMindmapScreen(null); };
-	const handleOpenWhiteboard = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen({ mode: "home" }); setMindmapScreen(null); };
-	const handleOpenMindmap = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen({ mode: "home" }); };
+	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
+	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
+	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
+	const handleOpenWhiteboard = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen({ mode: "home" }); setMindmapScreen(null); setVideoEditorScreen(null); };
+	const handleOpenMindmap = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen({ mode: "home" }); setVideoEditorScreen(null); };
+	const handleOpenVideoEditor = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen({ mode: "home" }); };
+	// Opening a video from the Video Editor's landing screen: exactly the same load the sidebar
+	// does, then two extra beats - stay in the editor (so the tool icon stays lit and "Back to
+	// video editor" is offered), and open the tools panel straight away, since arriving via the
+	// Video Editor already said "I'm here to edit" and shouldn't need the separate
+	// "show tools for this file" click. Ordered after the await because loadFileForPlayback
+	// resolves videoEditorScreen itself (see its own handling below).
+	const handleOpenVideoInEditor = async (file: { path: string; name: string }): Promise<void> => {
+		await loadFileForPlayback(file.path, file.name);
+		setVideoEditorScreen({ mode: "editing" });
+		setDockerMode("file-tools");
+	};
+	// The Video Editor's "Open video from anywhere" - same OS picker as the docker's own
+	// open-from-anywhere button, but filtered to video only, since anything else can't be edited
+	// by the tool the user is standing in.
+	const handleOpenExternalVideoForEditing = async (): Promise<void> => {
+		try {
+			const selected = await openFileDialog({
+				multiple: false,
+				filters: [{ name: "Video", extensions: FILE_CATEGORY_EXTENSIONS.video }],
+			});
+			if (!selected || Array.isArray(selected)) return; // cancelled
+
+			const name = selected.split(/[\/]/).pop() ?? selected;
+			if (getFileCategory(name) !== "video") {
+				await showMessageDialog(`"${name}" isn't a video file the editor can open.`, {
+					title: 'Unsupported file',
+					kind: 'warning',
+				});
+				return;
+			}
+
+			await handleOpenVideoInEditor({ path: selected, name });
+		} catch (error) {
+			console.error('Error opening video for editing:', error);
+			setError(`Failed to open video: ${error}`);
+		}
+	};
 	const handleOpenSettings = () => setShowSettings(true);
 	const handleCloseSettings = () => setShowSettings(false);
 	// Settings apply immediately to the current session too, not just future ones — otherwise
@@ -1544,6 +1596,10 @@ const setScreen = () => {
 		setBoardScreen(null);
 		setDocsScreen(null);
 		setWhiteboardScreen(null);
+		// Opening another video while the Video Editor is open stays in the editor (jumping from
+		// clip to clip is ordinary editing); opening anything it can't edit - an image, a PDF -
+		// leaves it, since the tool has nothing to do with what's now on screen.
+		setVideoEditorScreen((prev) => (prev && getFileCategory(fileName) === "video" ? { mode: "editing" } : null));
 		setRecentPaths(recordFileOpened(filePath));
 
 		console.log('File selected for playback:', fileName);
@@ -2782,6 +2838,9 @@ const setScreen = () => {
                               setBoardScreen(null);
                               setDocsScreen(null);
                               setWhiteboardScreen(null);
+                              // The main board is about to show this folder's gallery, so no tool
+                              // screen can still be the thing on it.
+                              setVideoEditorScreen(null);
                             }
                           }}
                         >
@@ -3171,6 +3230,8 @@ const setScreen = () => {
                   setBoardScreen(null);
                   setDocsScreen(null);
                   setWhiteboardScreen(null);
+                  // Same stay-in-the-editor-only-for-videos rule loadFileForPlayback applies.
+                  setVideoEditorScreen((prev) => (prev && getFileCategory(newFileName) === "video" ? { mode: "editing" } : null));
                 } catch (error) {
                   console.error('Error loading converted file:', error);
                 }
@@ -3211,12 +3272,29 @@ const setScreen = () => {
               directly: only the filename's tail end still peeked out past this button's right
               edge). Stacking it as its own shrink-0 row instead means every viewer's own header,
               image/pdf included, renders in the space actually left for it. */}
-          {selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
-            <div className="shrink-0 px-3 pt-3">
+          {/* relative z-20 + the pointer-events dance: VideoPlayer's own wrapper is h-screen inside
+              a shorter, items-center pane below this row, so it overflows *upward* and paints over
+              this strip - without a stacking context of its own the button here renders behind the
+              <video> and can't be clicked at all (elementFromPoint over it returns VIDEO). The row
+              is full-width, so only the button itself takes pointer events back; the rest of the
+              strip stays click-through to the player underneath. */}
+          {videoEditorScreen?.mode === "editing" && selectedFile ? (
+            <div className="shrink-0 px-3 pt-3 relative z-20 pointer-events-none">
+              <button
+                type="button"
+                onClick={() => { setSelectedFile(null); setVideoEditorScreen({ mode: "home" }); }}
+                className="pointer-events-auto flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
+              >
+                <IoChevronBack size={14} />
+                Back to video editor
+              </button>
+            </div>
+          ) : selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
+            <div className="shrink-0 px-3 pt-3 relative z-20 pointer-events-none">
               <button
                 type="button"
                 onClick={() => setSelectedFile(null)}
-                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
+                className="pointer-events-auto flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
               >
                 <IoChevronBack size={14} />
                 Back to {folderDisplayName(selectedFolder)}
@@ -3225,7 +3303,15 @@ const setScreen = () => {
           )}
 
           <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center">
-          {mindmapScreen ? (
+          {videoEditorScreen?.mode === "home" ? (
+            <VideoEditorHome
+              videos={allLibraryFiles.filter((file) => getFileCategory(file.name) === "video")}
+              recentPaths={recentPaths}
+              resolveThumbnailUrl={resolveVideoThumbnailUrl}
+              onOpenVideo={(file) => void handleOpenVideoInEditor(file)}
+              onOpenExternalVideo={() => void handleOpenExternalVideoForEditing()}
+            />
+          ) : mindmapScreen ? (
             <ErrorBoundary
               key={mindmapScreen.mode === "editor" ? `mm-editor-${mindmapScreen.mindmapId}` : "mm-home"}
               fallbackTitle="This mindmap ran into a problem"
@@ -3675,7 +3761,7 @@ const setScreen = () => {
         showRecordingPanelButtons={showRecordingPanelButtons}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
-        isHome={selectedFile === null && boardScreen === null && docsScreen === null && whiteboardScreen === null && mindmapScreen === null}
+        isHome={selectedFile === null && boardScreen === null && docsScreen === null && whiteboardScreen === null && mindmapScreen === null && videoEditorScreen === null}
         handleOpenBoard={handleOpenBoard}
         isBoard={boardScreen !== null}
         handleOpenDocs={handleOpenDocs}
@@ -3684,6 +3770,8 @@ const setScreen = () => {
         isWhiteboard={whiteboardScreen !== null}
         handleOpenMindmap={handleOpenMindmap}
         isMindmap={mindmapScreen !== null}
+        handleOpenVideoEditor={handleOpenVideoEditor}
+        isVideoEditor={videoEditorScreen !== null}
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}

@@ -10,6 +10,7 @@
 // active (see useWhiteboardStore.ts), and export/bounds/undo are all naturally per-page too since
 // draw.io-style pages are independent canvases, not one shared coordinate space.
 
+import { wrapTextToWidth } from "../utils/canvasText";
 import katex from "katex";
 import {
   ArrowheadType,
@@ -3445,24 +3446,6 @@ function polylineOpenPath2D(points: [number, number][]): Path2D {
   return path;
 }
 
-function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
-  const lines: string[] = [];
-  for (const rawLine of text.split("\n")) {
-    const words = rawLine.split(" ");
-    let current = "";
-    for (const word of words) {
-      const candidate = current ? `${current} ${word}` : word;
-      if (ctx.measureText(candidate).width > maxWidth && current) {
-        lines.push(current);
-        current = word;
-      } else {
-        current = candidate;
-      }
-    }
-    lines.push(current);
-  }
-  return lines;
-}
 
 // Renders text in node-local coordinates (0,0 at top-left) - caller has already
 // ctx.translate(node.x, node.y), same convention as paintShapeBody above.
@@ -3479,7 +3462,7 @@ function paintNodeText(ctx: CanvasRenderingContext2D, node: WhiteboardNode): voi
   ctx.textAlign = node.textAlign;
   ctx.textBaseline = "middle";
   const paddingX = 8;
-  const lines = wrapText(ctx, node.text, node.width - paddingX * 2);
+  const lines = wrapTextToWidth(ctx, node.text, node.width - paddingX * 2);
   const lineHeight = node.fontSize * 1.25;
   const totalHeight = lines.length * lineHeight;
   const startY =
@@ -3669,7 +3652,7 @@ function paintTable(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
       ctx.clip();
       const x = node.textAlign === "left" ? colBounds[c] + paddingX : node.textAlign === "right" ? colBounds[c] + cellW - paddingX : colBounds[c] + cellW / 2;
       const lineHeight = node.fontSize * 1.25;
-      const lines = wrapText(ctx, text, cellW - paddingX * 2);
+      const lines = wrapTextToWidth(ctx, text, cellW - paddingX * 2);
       const totalHeight = lines.length * lineHeight;
       const startY =
         node.verticalAlign === "top"

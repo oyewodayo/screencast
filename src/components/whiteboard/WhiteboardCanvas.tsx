@@ -26,6 +26,7 @@
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { TbRotateClockwise, TbArrowsMove } from "react-icons/tb";
 import katex from "katex";
+import useCanvasWheel from "../../hooks/useCanvasWheel";
 import LatticeGaugeWidget from "./LatticeGaugeWidget";
 import WhiteboardTable from "./WhiteboardTable";
 import {
@@ -960,20 +961,17 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     [zoom, pan, onZoomChange, onPanChange]
   );
 
-  // ---- Wheel: plain scroll pans, ctrl/cmd+scroll (or pinch, which browsers report as ctrlKey
-  // wheel events) zooms centered on the pointer ------------------------------------------------
-  const handleWheel = useCallback(
-    (e: React.WheelEvent) => {
-      e.preventDefault();
-      if (e.ctrlKey || e.metaKey) {
-        const factor = Math.exp(-e.deltaY * 0.01);
-        zoomAtClientPoint(zoom * factor, e.clientX, e.clientY);
-      } else {
-        onPanChange({ x: pan.x - e.deltaX, y: pan.y - e.deltaY });
-      }
-    },
-    [zoom, pan, zoomAtClientPoint, onPanChange]
-  );
+  // ---- Wheel: two fingers pan, pinch or ctrl/cmd+scroll zooms about the pointer ------------------
+  // This used to be a React onWheel calling preventDefault(), which never actually took effect (React
+  // registers wheel passively) - so a pinch zoomed the whole app chrome. See useCanvasWheel.
+  useCanvasWheel(containerRef, {
+    zoom,
+    pan,
+    minZoom: MIN_ZOOM,
+    maxZoom: MAX_ZOOM,
+    onZoomChange,
+    onPanChange,
+  });
 
   // ---- Delete / Escape -------------------------------------------------------------------------
   useEffect(() => {
@@ -2124,7 +2122,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // space-drag shortcut, so there's no native touch behavior actually worth keeping).
         touchAction: "none",
       }}
-      onWheel={handleWheel}
       onPointerDown={handleContainerPointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
