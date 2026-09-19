@@ -47,7 +47,7 @@ two-process dance.
 
 ```
 npm run build                              # tsc && vite build -> dist/   (~45s-2min)
-npx tauri build --debug --bundles none     # NOT --no-bundle, that flag doesn't exist
+npx tauri build --debug --no-bundle        # `--bundles` only accepts msi/nsis/updater, not "none"
 ```
 
 The second command recompiles the whole `tauri`/`tauri-macros` crate graph the first time this
@@ -170,7 +170,7 @@ for a person, useless for scripted screenshots since nothing but a human can see
 
 | Symptom | Fix |
 |---|---|
-| `unexpected argument '--no-bundle'` from `tauri build` | The flag is `--bundles none`, not `--no-bundle`. |
+| `invalid value 'none' for '--bundles'` from `tauri build` | Use the dedicated `--no-bundle` flag; `--bundles` only takes `msi`/`nsis`/`updater`. |
 | `launch` fails with "port 47813 is already held" | A Briefcast instance (real or a leaked prior test run) is running. Confirm which with `Get-Process Briefcast`, close it, retry. |
 | `tauri-driver did not come up on :4444` | `tools/msedgedriver.exe` missing/wrong path, or its version doesn't match the installed WebView2 runtime (re-check the registry version and re-download). |
 | A `click`/`eval` call errors "Cannot read properties of undefined (reading 'click')" | The selector found nothing - usually the home-screen-vs-tools-tree DOM-shape gotcha above. Re-probe with a broader `querySelectorAll` first. |

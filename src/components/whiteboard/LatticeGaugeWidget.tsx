@@ -23,6 +23,15 @@
 // own pan/zoom resets per session rather than being saved into the document.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+
+// Lets whiteboardHandlers.ts's export/thumbnail readback (the "latticeGauge" branch of
+// renderNode, which does ctx.drawImage(liveCanvas, ...) on this widget's own <canvas> from a
+// completely separate module, well after this component's own last render() call) force a fresh
+// frame immediately before reading it, instead of relying on the renderer keeping every past
+// frame's buffer around via `preserveDrawingBuffer: true` (removed below - see the mount effect's
+// own comment for why that was a real, permanent per-frame GPU/compositor cost, not a one-time
+// one). Keyed by node.id, same lookup key the live canvas itself is already tagged with.
+export const latticeRenderOnDemand = new Map<string, () => void>();
 import {
   DEFAULT_LATTICE_LINK_WIDTH,
   DEFAULT_LATTICE_SITE_RADIUS,
@@ -524,13 +533,18 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     if (!container) return;
     let renderer: THREE.WebGLRenderer;
     try {
-      // preserveDrawingBuffer: true - without it, WebGL is free to discard the drawing buffer
-      // right after compositing each frame, so a canvas.drawImage/toDataURL call made well after
-      // the animation loop's last render() (e.g. from an "Export PNG" click, seconds later) can
-      // read back blank. See whiteboardHandlers.ts's renderNode "latticeGauge" branch, which is
-      // exactly that kind of later, unrelated read - it's what makes the exported PNG show this
-      // node's actual live 3D view instead of just its shapeOutlineFor placeholder glyph.
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "low-power", preserveDrawingBuffer: true });
+      // NOT preserveDrawingBuffer: true - that flag forces the browser to retain/copy the drawing
+      // buffer after EVERY frame, forever, for as long as this widget is mounted (this scene's own
+      // animate() loop below never stops on its own - a time-driven gluon-flux shader and a pulsing
+      // plaquette highlight keep it rendering continuously even when nothing is being dragged),
+      // which is a real, standing per-frame GPU/compositor cost - one a concurrent screen recording
+      // (gdigrab's own full-desktop BitBlt capture, see win.rs) has to contend with the whole time
+      // this widget is simply visible on the page. whiteboardHandlers.ts's renderNode "latticeGauge"
+      // branch still needs a live frame to drawImage/toDataURL from well after this loop's last
+      // render() (an "Export PNG" click, seconds later) - it gets one via latticeRenderOnDemand's
+      // callback for this node, forcing exactly one fresh render() synchronously in the same tick as
+      // the read, instead of paying to keep every past frame's buffer around.
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "low-power" });
     } catch {
       setWebglError(true);
       return;
@@ -596,8 +610,24 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     const observer = new ResizeObserver(resize);
     observer.observe(container);
 
+    const renderNow = () => renderer.render(scene, camera);
+    latticeRenderOnDemand.set(node.id, renderNow);
+
     let raf = 0;
-    const animate = () => {
+    let lastFrameTime = 0;
+    // Caps this scene's own continuous rendering to ~60fps regardless of the display's actual
+    // refresh rate - a 120/144Hz monitor otherwise renders this every 8.3ms/6.9ms forever (see
+    // this effect's own preserveDrawingBuffer comment for why that's a real, standing cost), for
+    // a purely cosmetic time-driven pulse/shimmer that reads identically at 60fps. Still requests
+    // a new frame every tick (so orbit/pan stays exactly as responsive between throttle windows -
+    // the camera math below is a fresh recompute from orbitRef each call, nothing accumulates),
+    // just skips the render()+uniform-update work when called again too soon.
+    const TARGET_FRAME_INTERVAL_MS = 1000 / 60;
+    const animate = (now: number) => {
+      raf = requestAnimationFrame(animate);
+      if (now - lastFrameTime < TARGET_FRAME_INTERVAL_MS) return;
+      lastFrameTime = now;
+
       const orbit = orbitRef.current;
       const x = orbit.target.x + orbit.radius * Math.sin(orbit.polar) * Math.cos(orbit.azimuth);
       const y = orbit.target.y + orbit.radius * Math.cos(orbit.polar);
@@ -605,17 +635,17 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
       camera.position.set(x, y, z);
       camera.up.set(0, 1, 0);
       camera.lookAt(orbit.target);
-      const t = performance.now() / 1000;
+      const t = now / 1000;
       if (linkMaterialRef.current) linkMaterialRef.current.uniforms.uTime.value = t;
       // Pulses regardless of the group's own visibility - cheap (one float), and simpler than
       // gating it on teaching mode for no real benefit.
       plaquetteMaterial.opacity = 0.75 + 0.25 * Math.sin(t * 3.0);
-      renderer.render(scene, camera);
-      raf = requestAnimationFrame(animate);
+      renderNow();
     };
     raf = requestAnimationFrame(animate);
 
     return () => {
+      latticeRenderOnDemand.delete(node.id);
       cancelAnimationFrame(raf);
       observer.disconnect();
       siteMeshRef.current?.geometry.dispose();

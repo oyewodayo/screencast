@@ -555,6 +555,7 @@ fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<File
                 || dir_name == Some(super::boards::BOARDS_DIR_NAME)
                 || dir_name == Some(super::docs::DOCS_DIR_NAME)
                 || dir_name == Some(super::whiteboards::WHITEBOARDS_DIR_NAME)
+                || dir_name == Some(super::mindmaps::MINDMAPS_DIR_NAME)
             {
                 continue;
             }

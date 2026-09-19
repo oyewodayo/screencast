@@ -10,6 +10,8 @@ import {
   addOverlay,
   applyAutoZoomAtClicks as applyAutoZoomAtClicksHandler,
   AutoZoomClick,
+  buildViewSwitchOverlays,
+  ViewSwitchEvent,
   bringOverlayToFront,
   deleteClipAt as deleteClipAtHandler,
   deleteOverlay,
@@ -206,6 +208,15 @@ export interface UseVideoEditStoreResult {
   // zoom-out Ken Burns pair around each click in a single undo step - see applyAutoZoomAtClicks,
   // videoEditHandlers.ts.
   applyAutoZoomAtClicks: (clipId: string, clicks: AutoZoomClick[]) => void;
+  // Applies a recorded screen<->camera view-switch timeline to one clip as a batch of full-frame
+  // PipOverlays cutting to `webcamPath`, one per camera-active interval, in a single undo step -
+  // see buildViewSwitchOverlays, videoEditHandlers.ts, for the actual interval math.
+  applyViewSwitchOverlays: (
+    clipId: string,
+    events: ViewSwitchEvent[],
+    webcamPath: string,
+    clipOutputStart: number
+  ) => void;
   // Inserts a whole new clip - from the Briefcast library or an external file dropped onto the
   // timeline - at `atIndex`, fetching its duration first if not already known. Resolves once the
   // clip has actually been added (or been skipped, if the duration lookup failed).
@@ -499,6 +510,20 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const clips = applyAutoZoomAtClicksHandler(current.clips, clipId, clicks);
       if (clips === current.clips) return;
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "auto-zoom");
+    },
+    [pushCommand]
+  );
+
+  const applyViewSwitchOverlays = useCallback(
+    (clipId: string, events: ViewSwitchEvent[], webcamPath: string, clipOutputStart: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clip = current.clips.find((c) => c.id === clipId);
+      if (!clip) return;
+      const newOverlays = buildViewSwitchOverlays(events, clip.start, clip.end, clipOutputStart, clip.speed, webcamPath);
+      if (newOverlays.length === 0) return;
+      const pipOverlays = [...current.pipOverlays, ...newOverlays];
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "view-switch-cut");
     },
     [pushCommand]
   );
@@ -1182,6 +1207,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     movePipOverlayTime,
     deletePipOverlay,
     duplicatePipOverlay,
+    applyViewSwitchOverlays,
     videoAudioMuted: state?.videoAudioMuted ?? false,
     videoAudioVolume: state?.videoAudioVolume ?? 1,
     setVideoAudioMuted,

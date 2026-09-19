@@ -2,6 +2,12 @@
 import React from "react";
 import { IoInformationCircle, IoRefresh } from "react-icons/io5";
 
+// Represents "Native" (no downscale) as a plain width rather than a separate value/flag - see
+// FormData.resolution_width's own doc comment (recording.rs) for why the backend already expects
+// exactly this: comfortably above any realistic display's own width, so `min(iw, this)` in the
+// scale filter always resolves to the source's actual width.
+const NATIVE_RESOLUTION_WIDTH = 7680;
+
 interface RecordingDockerProps {
   fileName: string;
   onFileNameChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
@@ -17,13 +23,15 @@ interface RecordingDockerProps {
   videoDevices: string[];
   onToggleVideoDevice: (device: string) => void;
   onRefreshDevices: () => void;
-  // WASAPI loopback ("what you hear") capture, Windows-only - only offered for the screen-
-  // capture record types (sva/sa/s), see this component's own render logic below and
-  // start_recording's handling of FormData.include_system_audio on the backend.
+  // System/"what you hear" audio capture - attempted on every platform now (WASAPI on Windows, a
+  // PulseAudio monitor source on Linux, avfoundation + a known virtual-audio device on macOS),
+  // only offered for the screen-capture record types (sva/sa/s), see this component's own render
+  // logic below and start_recording's handling of FormData.include_system_audio on the backend.
   includeSystemAudio: boolean;
   onToggleIncludeSystemAudio: () => void;
-  // WASAPI loopback is Windows-only - see BottomDocker.tsx's own doc comment on this same prop.
-  isSystemAudioSupported: boolean;
+  // Click tracking (services/click_tracker.rs, a Win32 mouse hook) is still Windows-only with no
+  // equivalent elsewhere - see BottomDocker.tsx's own doc comment on this prop.
+  isClickTrackingSupported: boolean;
   // Records the (single) selected webcam as its own separate file instead of baking it into the
   // screen recording - see Dashboard.tsx's own doc comment on this state and
   // recording_with_output_sva (win.rs) for why it only applies to record_type "sva" with exactly
@@ -35,6 +43,14 @@ interface RecordingDockerProps {
   // types as includeSystemAudio above.
   trackClicks: boolean;
   onToggleTrackClicks: () => void;
+  // Max output width / target capture fps for the screen-capture record types - null means "let
+  // the backend use its own default" (see FormData.resolution_width/framerate's own doc comments,
+  // recording.rs). Only offered for the same record types includeSystemAudio/trackClicks above
+  // are, since "va"/"v"/"a" never touch the screen at all.
+  resolutionWidth: number | null;
+  onResolutionWidthChange: (width: number | null) => void;
+  framerate: number | null;
+  onFramerateChange: (fps: number | null) => void;
   isRecording: boolean;
   isPaused: boolean;
   onScreenshotClick: () => void;
@@ -65,11 +81,15 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   onRefreshDevices,
   includeSystemAudio,
   onToggleIncludeSystemAudio,
-  isSystemAudioSupported,
+  isClickTrackingSupported,
   separateWebcamCapture,
   onToggleSeparateWebcamCapture,
   trackClicks,
   onToggleTrackClicks,
+  resolutionWidth,
+  onResolutionWidthChange,
+  framerate,
+  onFramerateChange,
   isRecording,
   isPaused,
   onScreenshotClick,
@@ -178,21 +198,12 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
           <div>
             <div className="docker-field-label p-1 text-sm">&nbsp;</div>
             <label
-              title={
-                isSystemAudioSupported
-                  ? "Captures whatever's playing through your speakers (e.g. a video open in another app) via WASAPI loopback, alongside the screen capture."
-                  : "System audio capture is Windows-only for now - not available on this platform."
-              }
-              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
-                isSystemAudioSupported
-                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
-                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
-              }`}
+              title="Captures whatever's playing through your speakers (e.g. a video open in another app) alongside the screen capture. On macOS this needs a virtual-audio-loopback device (e.g. BlackHole) already installed."
+              className="docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
             >
               <input
                 type="checkbox"
-                checked={includeSystemAudio && isSystemAudioSupported}
-                disabled={!isSystemAudioSupported}
+                checked={includeSystemAudio}
                 onChange={onToggleIncludeSystemAudio}
               />
               System audio
@@ -203,25 +214,61 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
         {/* Same screen-capturing record types click_tracker.rs's own gate uses (start_recording,
             recording.rs) - "va"/"v"/"a" never touch the screen at all, so there's nothing to click
             "on" in a meaningful sense for them. */}
-        {(recordType === "sva" || recordType === "sv" || recordType === "sa" || recordType === "s") && (
+        {(recordType === "sva" || recordType === "sa" || recordType === "s") && (
           <div>
             <div className="docker-field-label p-1 text-sm">&nbsp;</div>
             <label
               title={
-                isSystemAudioSupported
+                isClickTrackingSupported
                   ? "Records where and when you click during the recording, so the editor can suggest zooming in on each one afterward."
                   : "Click tracking is Windows-only for now - not available on this platform."
               }
               className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
-                isSystemAudioSupported
+                isClickTrackingSupported
                   ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
                   : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
               }`}
             >
-              <input type="checkbox" checked={trackClicks && isSystemAudioSupported} disabled={!isSystemAudioSupported} onChange={onToggleTrackClicks} />
+              <input type="checkbox" checked={trackClicks && isClickTrackingSupported} disabled={!isClickTrackingSupported} onChange={onToggleTrackClicks} />
               Track clicks (auto-zoom)
             </label>
           </div>
+        )}
+
+        {/* Same screen-capturing record types as System audio/Track clicks above - resolution and
+            framerate only mean anything when the screen is actually part of the capture. */}
+        {(recordType === "sva" || recordType === "sa" || recordType === "s") && (
+          <>
+            <div>
+              <div className="docker-field-label p-1 text-sm">Resolution</div>
+              <select
+                className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
+                value={resolutionWidth ?? ""}
+                onChange={(e) => onResolutionWidthChange(e.target.value ? Number(e.target.value) : null)}
+                title="Downscales the recording to this max width - lower is smaller and easier to edit/share; Native keeps the display's own resolution"
+              >
+                <option value="">1080p (default)</option>
+                <option value="1280">720p</option>
+                <option value="1920">1080p</option>
+                <option value="2560">1440p</option>
+                <option value={NATIVE_RESOLUTION_WIDTH}>Native</option>
+              </select>
+            </div>
+            <div>
+              <div className="docker-field-label p-1 text-sm">Frame rate</div>
+              <select
+                className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
+                value={framerate ?? ""}
+                onChange={(e) => onFramerateChange(e.target.value ? Number(e.target.value) : null)}
+                title="Capture framerate - default is 60fps for Screen+Video+Audio, 30fps for other screen modes"
+              >
+                <option value="">Default</option>
+                <option value="24">24 fps</option>
+                <option value="30">30 fps</option>
+                <option value="60">60 fps</option>
+              </select>
+            </div>
+          </>
         )}
 
         <div className="flex items-end gap-1">

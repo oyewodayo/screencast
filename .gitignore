@@ -22,6 +22,7 @@ target
 !.vscode/extensions.json
 .idea
 .DS_Store
+RECORDING_UPGRADE_NOTES.md
 *.suo
 *.ntvs*
 *.njsproj

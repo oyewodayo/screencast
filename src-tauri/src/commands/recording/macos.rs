@@ -20,7 +20,7 @@ use tauri::{AppHandle, State};
 
 use super::{
     build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error,
-    map_overlay_size, spawn_recording, AppState, FormData,
+    map_overlay_size, spawn_recording, AppState, FormData, MAX_RECORDING_WIDTH,
 };
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
@@ -132,11 +132,14 @@ fn av_input_spec(video_index: Option<u32>, audio_index: Option<u32>) -> String {
 // av_input_spec normally would (that only ever made sense for exactly one camera): with N cameras
 // each occupying its own video-only input, build_camera_overlay_filter_complex's [1:v]..[N:v]
 // indexing lines up regardless of camera count, and callers add mic audio as its own separate
-// input afterward.
+// input afterward. `crop` is Some only for a window-capture target - see
+// build_camera_overlay_filter_complex's own doc comment for why cropping has to be baked into
+// this same filter_complex rather than a separate -vf.
 fn add_camera_overlay_args(
     args: &mut Vec<String>,
     form_data: &FormData,
     video_devices: &[AvDevice],
+    crop: Option<(i32, i32, i32, i32)>,
 ) -> Result<(), String> {
     let overlay_size = map_overlay_size(&form_data.overlay_size);
 
@@ -158,9 +161,139 @@ fn add_camera_overlay_args(
         &form_data.overlay_position,
         &form_data.overlay_size,
         form_data.video_devices.len(),
+        MAX_RECORDING_WIDTH,
+        crop.map(|(x, y, w, h)| (w, h, x, y)),
     );
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
     Ok(())
+}
+
+// Common, well-known virtual-audio-loopback device names, checked in roughly descending order of
+// real-world prevalence so the first one actually installed wins. macOS has no built-in system-
+// audio loopback the way Windows (WASAPI) or Linux (a PulseAudio monitor source) do, and
+// avfoundation itself cannot record "what you hear" from a real output device at all - genuine
+// loopback capture here needs either a virtual audio device rerouting output back as an input
+// (this), or ScreenCaptureKit's own audio-capture API (macOS 13+), which would need real Swift/
+// Objective-C integration well beyond what a pass with no way to compile or test macOS-specific
+// code should attempt (see window_capture::macos's own module comment on why raw FFI is avoided
+// here generally). If the user already has one of these installed - a common, well-known
+// workaround plenty of existing macOS recording tools also lean on for exactly this reason - it's
+// picked up automatically; if not, include_system_audio just doesn't add anything, the same
+// "best effort, silently proceed without it" fallback Windows' own loopback capture already has
+// for its own failure cases (see services/loopback_audio.rs).
+const KNOWN_LOOPBACK_AUDIO_DEVICES: &[&str] = &[
+    "BlackHole 2ch",
+    "BlackHole 16ch",
+    "BlackHole 64ch",
+    "Loopback Audio",
+    "Soundflower (2ch)",
+    "Soundflower (64ch)",
+];
+
+fn detect_system_audio_device(audio_devices: &[AvDevice]) -> Option<&AvDevice> {
+    KNOWN_LOOPBACK_AUDIO_DEVICES
+        .iter()
+        .find_map(|&known| audio_devices.iter().find(|d| d.name == known))
+}
+
+// Builds the -i/-filter_complex/-map args for a plain screen capture (no camera overlay) with an
+// optional window-crop and/or system-audio mix - recording_with_output_sva's own no-camera-overlay
+// path, recording_with_output_sa, and recording_with_output_s all reduce to exactly this same
+// problem once a camera overlay isn't in the picture, so it's written once here. `mic_index` is
+// None for the modes with no microphone input at all (recording_with_output_s).
+fn screen_capture_args(
+    screen_index: u32,
+    crop: Option<(i32, i32, i32, i32)>,
+    mic_index: Option<u32>,
+    system_audio_index: Option<u32>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-capture_cursor".to_string(),
+        "1".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
+        "-i".to_string(),
+        av_input_spec(
+            Some(screen_index),
+            if system_audio_index.is_some() {
+                None
+            } else {
+                mic_index
+            },
+        ),
+    ];
+
+    let Some(sys_index) = system_audio_index else {
+        // No system audio to mix in - mic (if any) already travels with the screen's own input
+        // above (av_input_spec, right above); only a crop, if any, is still needed.
+        if let Some((x, y, w, h)) = crop {
+            args.extend(vec![
+                "-vf".to_string(),
+                format!("crop={}:{}:{}:{}", w, h, x, y),
+            ]);
+        }
+        return args;
+    };
+
+    let mic_input_idx: Option<u32> = if let Some(index) = mic_index {
+        args.extend(vec![
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-i".to_string(),
+            av_input_spec(None, Some(index)),
+        ]);
+        Some(1)
+    } else {
+        None
+    };
+    args.extend(vec![
+        "-f".to_string(),
+        "avfoundation".to_string(),
+        "-i".to_string(),
+        av_input_spec(None, Some(sys_index)),
+    ]);
+    let system_input_idx = if mic_input_idx.is_some() { 2 } else { 1 };
+
+    let video_label = if let Some((x, y, w, h)) = crop {
+        args.extend(vec![
+            "-filter_complex".to_string(),
+            format!("[0:v]crop={}:{}:{}:{}[vout]", w, h, x, y),
+        ]);
+        "[vout]".to_string()
+    } else {
+        "0:v".to_string()
+    };
+
+    let audio_filter = match mic_input_idx {
+        Some(mic) => format!(
+            "[{}:a][{}:a]amix=inputs=2:duration=first[aout]",
+            mic, system_input_idx
+        ),
+        // A single source still needs to land on the same [aout] label the -map below expects,
+        // even with nothing to actually mix - `anull` is a plain passthrough for exactly that.
+        None => format!("[{}:a]anull[aout]", system_input_idx),
+    };
+
+    // ffmpeg accepts only one -filter_complex per invocation - append rather than add a second
+    // one when the crop stage above already opened one, same multi-stage-chain convention
+    // build_camera_overlay_filter_complex's own "; "-joined stages use.
+    if crop.is_some() {
+        let last = args.len() - 1;
+        args[last] = format!("{}; {}", args[last], audio_filter);
+    } else {
+        args.extend(vec!["-filter_complex".to_string(), audio_filter]);
+    }
+
+    args.extend(vec![
+        "-map".to_string(),
+        video_label,
+        "-map".to_string(),
+        "[aout]".to_string(),
+    ]);
+
+    args
 }
 
 fn require_screen_index(video_devices: &[AvDevice]) -> Result<u32, String> {
@@ -183,22 +316,38 @@ fn resolve_screen_index(video_devices: &[AvDevice], monitor_id: &str) -> Option<
         .map(|d| d.index)
 }
 
-// Resolves form_data.screen_size into the avfoundation screen index to actually pass to -i.
-// Previously every screen-capturing function here ignored screen_size entirely (form_data was
-// unused) and always grabbed require_screen_index's first screen - meaning picking a specific
-// Monitor silently recorded/screenshotted the *wrong* one instead of the one actually selected.
-// "window:..." isn't supported (see window_capture::macos's module comment for why) and errors
-// clearly instead of falling back to some screen, which would be the same silent-wrong-capture
-// bug in a different shape.
-fn resolve_screen_target(video_devices: &[AvDevice], form_data: &FormData) -> Result<u32, String> {
-    if form_data.screen_size.starts_with("window:") {
-        return Err("Window-specific capture isn't implemented on macOS yet — pick Full Screen or a Monitor instead.".to_string());
+// Resolves form_data.screen_size into (the avfoundation screen index to actually pass to -i, an
+// optional (x, y, width, height) crop rect to apply afterward). Previously every screen-capturing
+// function here ignored screen_size entirely (form_data was unused) and always grabbed
+// require_screen_index's first screen - meaning picking a specific Monitor silently recorded/
+// screenshotted the *wrong* one instead of the one actually selected.
+//
+// "window:..." now crops a full-display capture down to the target window instead of erroring -
+// avfoundation has no per-window capture mode at all, so this is the only way to record just one
+// window (see window_capture::macos::get_window_rect_by_title's own doc comment, including its
+// multi-monitor caveat). Always captures require_screen_index's first screen (the primary
+// display's own avfoundation device) for a window target specifically - that's the one case the
+// caveat doesn't bite, since macOS's global coordinate origin coincides with the primary
+// display's own top-left.
+fn resolve_screen_target(
+    video_devices: &[AvDevice],
+    form_data: &FormData,
+) -> Result<(u32, Option<(i32, i32, i32, i32)>), String> {
+    if let Some(title) = form_data.screen_size.strip_prefix("window:") {
+        let title = if form_data.window_title.is_empty() {
+            title
+        } else {
+            &form_data.window_title
+        };
+        let rect = crate::commands::window_capture::macos::get_window_rect_by_title(title)?;
+        return Ok((require_screen_index(video_devices)?, Some(rect)));
     }
     if let Some(monitor_id) = form_data.screen_size.strip_prefix("monitor:") {
         return resolve_screen_index(video_devices, monitor_id)
+            .map(|i| (i, None))
             .ok_or_else(|| format!("Monitor '{}' not found", monitor_id));
     }
-    require_screen_index(video_devices)
+    Ok((require_screen_index(video_devices)?, None))
 }
 
 //Screen, optional camera overlay, and audio
@@ -210,31 +359,42 @@ pub async fn recording_with_output_sva(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = resolve_screen_target(&video_devices, form_data)?;
+    let (screen_index, crop) = resolve_screen_target(&video_devices, form_data)?;
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
-
     let has_camera_overlay = !form_data.video_devices.is_empty();
-    let mut args: Vec<String> = vec![
-        "-f".to_string(),
-        "avfoundation".to_string(),
-        "-capture_cursor".to_string(),
-        "1".to_string(),
-        "-framerate".to_string(),
-        "30".to_string(),
-        "-i".to_string(),
-        av_input_spec(
-            Some(screen_index),
-            if has_camera_overlay {
+    // See detect_system_audio_device's own doc comment for why this can't just always work the
+    // way it does on Windows/Linux. Skipped entirely alongside a camera overlay - mixing a THIRD
+    // source (mic + system audio) into an already-composited camera-overlay filter_complex is a
+    // rare enough combination that it's not worth the added risk in a pass with no way to test any
+    // of it; falls back to mic-only, same as if no loopback device had been found at all.
+    let system_audio_index = if form_data.include_system_audio && !has_camera_overlay {
+        match detect_system_audio_device(&audio_devices) {
+            Some(d) => Some(d.index),
+            None => {
+                log::warn!("include_system_audio was requested but no known loopback device (BlackHole/Loopback/Soundflower) was found - recording without system audio");
                 None
-            } else {
-                audio_index
-            },
-        ),
-    ];
+            }
+        }
+    } else {
+        if form_data.include_system_audio && has_camera_overlay {
+            log::warn!("include_system_audio isn't supported together with a camera overlay on macOS yet - recording with mic audio only");
+        }
+        None
+    };
 
-    if has_camera_overlay {
+    let mut args = if has_camera_overlay {
+        let mut args: Vec<String> = vec![
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-capture_cursor".to_string(),
+            "1".to_string(),
+            "-framerate".to_string(),
+            "30".to_string(),
+            "-i".to_string(),
+            av_input_spec(Some(screen_index), None),
+        ];
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
-        add_camera_overlay_args(&mut args, form_data, &video_devices)?;
+        add_camera_overlay_args(&mut args, form_data, &video_devices, crop)?;
         // The screen input above was left audio-less (its side of av_input_spec was None) so the
         // mic gets its own dedicated input instead - same reasoning as win.rs's sva mode keeping
         // camera and audio as separate dshow inputs rather than trying to bundle mic audio onto
@@ -247,41 +407,12 @@ pub async fn recording_with_output_sva(
                 av_input_spec(None, Some(index)),
             ]);
         }
-    }
+        args
+    } else {
+        screen_capture_args(screen_index, crop, audio_index, system_audio_index)
+    };
 
     args.extend(codec_args_for_ext(&form_data.file_ext));
-    args.push(path_to_str(output_path)?.to_string());
-
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
-}
-
-//Screen and video overlay, no audio — mirrors win.rs's recording_with_output_sv, which (like
-// this one) is not currently reachable from the frontend (the UI's record-type options never
-// send "sv"); kept only for parity with the dispatch table in the orchestrator.
-pub async fn recording_with_output_sv(
-    app_handle: &AppHandle,
-    state: State<'_, AppState>,
-    output_path: &PathBuf,
-    form_data: &FormData,
-) -> Result<String, String> {
-    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-    let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = resolve_screen_target(&video_devices, form_data)?;
-
-    let mut args: Vec<String> = vec![
-        "-f".to_string(),
-        "avfoundation".to_string(),
-        "-framerate".to_string(),
-        "30".to_string(),
-        "-i".to_string(),
-        av_input_spec(Some(screen_index), None),
-    ];
-
-    if !form_data.video_devices.is_empty() {
-        add_camera_overlay_args(&mut args, form_data, &video_devices)?;
-    }
-
-    args.extend(vec!["-c:v".to_string(), "mpeg4".to_string()]);
     args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
@@ -296,21 +427,25 @@ pub async fn recording_with_output_sa(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = resolve_screen_target(&video_devices, form_data)?;
+    let (screen_index, crop) = resolve_screen_target(&video_devices, form_data)?;
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
+    let system_audio_index = if form_data.include_system_audio {
+        match detect_system_audio_device(&audio_devices) {
+            Some(d) => Some(d.index),
+            None => {
+                log::warn!("include_system_audio was requested but no known loopback device (BlackHole/Loopback/Soundflower) was found - recording without system audio");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let args: Vec<String> = vec![
-        "-f".to_string(),
-        "avfoundation".to_string(),
-        "-capture_cursor".to_string(),
-        "1".to_string(),
-        "-framerate".to_string(),
-        "30".to_string(),
-        "-i".to_string(),
-        av_input_spec(Some(screen_index), audio_index),
+    let mut args = screen_capture_args(screen_index, crop, audio_index, system_audio_index);
+    args.extend(vec![
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
-    ];
+    ]);
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }
@@ -405,21 +540,27 @@ pub async fn recording_with_output_s(
     form_data: &FormData,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-    let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = resolve_screen_target(&video_devices, form_data)?;
+    let (video_devices, audio_devices) = list_avfoundation_devices(app_handle)?;
+    let (screen_index, crop) = resolve_screen_target(&video_devices, form_data)?;
+    // No mic in this mode at all (screen only) - system audio, if requested and found, becomes
+    // the sole audio track rather than something to mix.
+    let system_audio_index = if form_data.include_system_audio {
+        match detect_system_audio_device(&audio_devices) {
+            Some(d) => Some(d.index),
+            None => {
+                log::warn!("include_system_audio was requested but no known loopback device (BlackHole/Loopback/Soundflower) was found - recording without system audio");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let args: Vec<String> = vec![
-        "-f".to_string(),
-        "avfoundation".to_string(),
-        "-capture_cursor".to_string(),
-        "1".to_string(),
-        "-framerate".to_string(),
-        "30".to_string(),
-        "-i".to_string(),
-        av_input_spec(Some(screen_index), None),
+    let mut args = screen_capture_args(screen_index, crop, None, system_audio_index);
+    args.extend(vec![
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
-    ];
+    ]);
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }
@@ -436,22 +577,30 @@ pub async fn take_screenshot(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
-    let screen_index = resolve_screen_target(&video_devices, form_data)?;
+    let (screen_index, crop) = resolve_screen_target(&video_devices, form_data)?;
     let output_path = output_path.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let args: Vec<String> = vec![
+        let mut args: Vec<String> = vec![
             "-f".to_string(),
             "avfoundation".to_string(),
             "-capture_cursor".to_string(),
             "1".to_string(),
             "-i".to_string(),
             av_input_spec(Some(screen_index), None),
+        ];
+        if let Some((x, y, w, h)) = crop {
+            args.extend(vec![
+                "-vf".to_string(),
+                format!("crop={}:{}:{}:{}", w, h, x, y),
+            ]);
+        }
+        args.extend(vec![
             "-frames:v".to_string(),
             "1".to_string(),
             "-y".to_string(),
             path_to_str(&output_path)?.to_string(),
-        ];
+        ]);
 
         let output = Command::new(&ffmpeg_path)
             .args(&args)

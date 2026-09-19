@@ -26,6 +26,7 @@ mod services {
     pub mod trash;
     pub mod utility;
     pub mod video_edits;
+    pub mod mindmaps;
     pub mod whiteboards;
     // WASAPI is Windows-only - see the module's own doc comment for why this exists (no Stereo
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
@@ -38,6 +39,23 @@ mod services {
     // Cargo dependency at all.
     #[cfg(target_os = "windows")]
     pub mod click_tracker;
+    // Windows Job Object wrapper that kills recording ffmpeg children the instant this app's own
+    // process dies for any reason (including a force-kill), so they can't outlive it holding the
+    // camera/mic open - see the module's own doc comment for the orphan this fixes.
+    #[cfg(target_os = "windows")]
+    pub mod process_job;
+    // Polls ffmpeg's `-progress` sidecar file while a recording is in flight and forwards it to
+    // the frontend as a `recording-progress` event - see the module's own doc comment for why
+    // this exists (win.rs deliberately nulls ffmpeg's stdout/stderr, so there was previously no
+    // live signal at all). Windows-only for now, same reasoning as process_job above.
+    #[cfg(target_os = "windows")]
+    pub mod progress_watch;
+    // Detects a real, working hardware H.264 encoder (NVENC/QSV/AMF) via a trial encode, so
+    // recordings can offload from the CPU instead of always using software libx264 - see the
+    // module's own doc comment for why "does ffmpeg list this encoder" alone isn't good enough.
+    // Windows-only for now, same reasoning as progress_watch above.
+    #[cfg(target_os = "windows")]
+    pub mod hw_encoder;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
     // ffmpeg build mis-decodes multi-image HEIC files (Portrait mode, Deep Fusion, etc.) as a
@@ -259,6 +277,9 @@ fn main() {
             commands::recording::start_recording,
             commands::recording::stop_recording,
             commands::recording::load_click_sidecar,
+            commands::recording::load_view_switch_sidecar,
+            commands::recording::record_view_switch,
+            commands::recording::get_webcam_sidecar_path,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,
@@ -332,15 +353,27 @@ fn main() {
             services::boards::save_board_thumbnail,
             services::boards::export_board_png,
             services::boards::export_board_png_to_path,
+            services::mindmaps::list_mindmaps,
+            services::mindmaps::create_mindmap,
+            services::mindmaps::duplicate_mindmap,
+            services::mindmaps::save_mindmap,
+            services::mindmaps::load_mindmap,
+            services::mindmaps::delete_mindmap,
+            services::mindmaps::import_mindmap_image,
+            services::mindmaps::save_mindmap_thumbnail,
+            services::mindmaps::export_mindmap_file,
+            services::mindmaps::export_mindmap_to_path,
             services::whiteboards::list_whiteboards,
             services::whiteboards::create_whiteboard,
             services::whiteboards::duplicate_whiteboard,
             services::whiteboards::save_whiteboard,
             services::whiteboards::load_whiteboard,
             services::whiteboards::delete_whiteboard,
+            services::whiteboards::import_whiteboard_image,
+            services::whiteboards::save_whiteboard_image,
             services::whiteboards::save_whiteboard_thumbnail,
-            services::whiteboards::export_whiteboard_png,
-            services::whiteboards::export_whiteboard_png_to_path,
+            services::whiteboards::export_whiteboard_file,
+            services::whiteboards::export_whiteboard_to_path,
             services::docs::list_docs,
             services::docs::create_doc,
             services::docs::save_doc,

@@ -30,6 +30,24 @@ export function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array>
   });
 }
 
+// Wraps one already-rendered canvas in a single-page PDF sized exactly to it. Shared by any feature
+// that can draw itself to a canvas and wants a PDF rather than a PNG (the Mindmap and Whiteboard
+// exports) - so "export as PDF" never means reimplementing a second renderer, just re-wrapping the
+// one that already produces the PNG.
+//
+// The page is sized in POINTS at 1px = 1pt, which keeps the drawing's own aspect ratio exactly and
+// gives a sensibly-sized page for the diagram dimensions this app produces. Deliberately not scaled
+// to fit A4: a wide roadmap letterboxed onto portrait A4 wastes most of the page, and a diagram has
+// no inherent reason to match a paper size the way a text document does.
+export async function canvasToPdfBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
+  const pngBytes = await canvasToPngBytes(canvas);
+  const pdf = await PDFDocument.create();
+  const image = await pdf.embedPng(pngBytes);
+  const page = pdf.addPage([image.width, image.height]);
+  page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+  return pdf.save();
+}
+
 // Renders one page's bitmap + its annotation objects onto a single offscreen canvas, PNG-encoded
 // — `widthPts`/`heightPts` are the page's actual PDF-space size (1 unit = 1/72in), which is what
 // pdf-lib needs to size the corresponding output page so the flattened image isn't stretched.

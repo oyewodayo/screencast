@@ -10,13 +10,21 @@
 // active (see useWhiteboardStore.ts), and export/bounds/undo are all naturally per-page too since
 // draw.io-style pages are independent canvases, not one shared coordinate space.
 
+import { wrapTextToWidth } from "../utils/canvasText";
 import katex from "katex";
 import {
   ArrowheadType,
+  ChartAnnotation,
+  CHART_ANNOTATION_SHAPES,
+  CHART_AXIS_TITLE_SHAPES,
+  DEFAULT_ANNOTATION_LABEL_DX,
+  DEFAULT_ANNOTATION_LABEL_DY,
+  DEFAULT_ANNOTATION_MARKER_SIZE,
   DEFAULT_CHART_DATA,
   DEFAULT_TABLE_COLS,
   DEFAULT_TABLE_ROWS,
   FunctionPlotType,
+  ResolvedSeries,
   WhiteboardAnchorSide,
   WhiteboardCommand,
   WhiteboardEdge,
@@ -26,8 +34,16 @@ import {
   WhiteboardShapeType,
   TableBorderStyle,
   TableMergedCell,
+  resolveImageCrop,
+  resolveSeriesData,
   resolveTableGrid,
 } from "../utils/whiteboardTypes";
+import { getCachedWhiteboardImage, preloadWhiteboardImage } from "../utils/whiteboardImageCache";
+// Not a component import in spirit - latticeRenderOnDemand is a plain module-level Map, not React
+// state or a hook, used purely as a side-channel to force one fresh WebGL frame immediately before
+// the "latticeGauge" branch below reads the canvas (see LatticeGaugeWidget.tsx's own doc comment
+// on why its renderer no longer keeps every past frame's buffer around via preserveDrawingBuffer).
+import { latticeRenderOnDemand } from "../components/whiteboard/LatticeGaugeWidget";
 
 // ---- Node geometry ----------------------------------------------------------------------------
 
@@ -437,7 +453,14 @@ export type ShapeOutline =
   // `labels` - small text annotations (axis scale numbers, per-bar values) neither Path2D nor an
   // SVG <path> can express, so they're kept as plain position+text objects the renderer draws with
   // <text>/ctx.fillText instead - see ChartLabel's own doc comment.
-  | { kind: "chart"; parts: ChartPart[]; labels?: ChartLabel[] };
+  // `inset` shifts `parts`/`labels` (which are built in the PLOT box's own coordinates) to their
+  // real position inside the node, making room in the margins for the title captions in
+  // `overlayLabels` (which are already in node-local coordinates and are NOT shifted). Splitting it
+  // this way means every chart-outline builder below still works in a plain 0,0-to-w,h plot box and
+  // knows nothing about titles - the alternative, re-parsing and translating each built SVG path `d`
+  // string, would mean every builder either threading a margin through all of its own math or having
+  // its output rewritten by a path parser. Absent - no margins, nothing shifted.
+  | { kind: "chart"; parts: ChartPart[]; labels?: ChartLabel[]; inset?: { dx: number; dy: number }; overlayLabels?: ChartLabel[] };
 
 // One small text annotation on a "chart" shape - axis tick numbers/values, styled with the node's
 // own Font/Font size/Font color/Bold/Italic/Underline style-panel fields (the same ones any other
@@ -450,6 +473,17 @@ export interface ChartLabel {
   y: number;
   text: string;
   anchor: "start" | "middle" | "end";
+  // Degrees, clockwise, about this label's own (x, y) - what draws a y-axis caption reading bottom-
+  // to-top up the left edge (rotate: -90), the standard plotting convention. Absent/0 - horizontal.
+  rotate?: number;
+  // Overrides the node's own fontColor for just this label - a series legend entry keyed to its own
+  // trace color, an annotation callout matching its marker. Absent - the node's fontColor.
+  color?: string;
+  // Multiplies the node's own fontSize for just this label - a chart title reads larger than the
+  // tick numbers around it without needing a second font-size field on the node. Absent - 1.
+  fontScale?: number;
+  // Overrides the node's own fontWeight. Absent - the node's own.
+  weight?: "normal" | "bold";
 }
 
 // How one piece of a "chart" ShapeOutline gets colored - resolved by the renderer (both
@@ -470,7 +504,27 @@ export interface ChartLabel {
 //              more prominent x=0/y=0 reference even with the full grid turned on.
 //   "slice"  - `color` is REQUIRED and used as-is (a pie chart's per-slice palette color - see
 //              PIE_PALETTE) - the one role where node.fillColor/strokeColor play no part at all.
-export type ChartPart = { d: string; role: "fill" | "stroke" | "axis" | "marker" | "grid" } | { d: string; role: "slice"; color: string };
+//   "series" - `color` REQUIRED, stroked (not filled) at `width` - one trace of a multi-series plot,
+//              colored from its own colormap position rather than the node's single strokeColor
+//              (see whiteboardTypes.ts's resolveSeriesData). Same "the node's own color pair can't
+//              express N independently-colored parts" reasoning as "slice", just stroked instead of
+//              filled.
+//   "seriesFill" - `color` REQUIRED, filled at low opacity - the optional shading between a trace
+//              and its own baseline (WhiteboardNode.seriesFillUnder). Its own role rather than
+//              reusing "slice" so the renderers can apply the opacity in one place.
+//   "annotation" - `color` REQUIRED, filled solid - a data-space callout's marker glyph (see
+//              whiteboardTypes.ts's ChartAnnotation), which carries its own color independent of
+//              both the node's stroke and any series palette.
+export type ChartPart =
+  | { d: string; role: "fill" | "stroke" | "axis" | "marker" | "grid" }
+  | { d: string; role: "slice"; color: string }
+  | { d: string; role: "series"; color: string; width: number }
+  | { d: string; role: "seriesFill"; color: string }
+  | { d: string; role: "annotation"; color: string };
+
+// Opacity the "seriesFill" role shades with - low enough that traces stacked on top of each other
+// stay individually readable through the shading, which is the whole reason the fill is optional.
+export const SERIES_FILL_OPACITY = 0.35;
 
 export interface ShapeOutlineOptions {
   sides?: number; // "polygon" only
@@ -499,6 +553,39 @@ export interface ShapeOutlineOptions {
   graphXTickInterval?: number; // "graph" only
   graphYTickInterval?: number; // "graph" only
   graphPoints?: { x: number; y: number }[]; // "graph" only
+  // "waterfallChart" only - named to match WhiteboardNode's own fields exactly so this options
+  // object structurally satisfies whiteboardTypes.ts's SeriesSource and can be handed straight to
+  // resolveSeriesData, rather than being copied field-by-field into a second object first.
+  seriesData?: number[][];
+  seriesXMin?: number;
+  seriesXMax?: number;
+  seriesYMin?: number;
+  seriesYMax?: number;
+  seriesOffset?: number;
+  seriesColormap?: WhiteboardNode["seriesColormap"];
+  seriesColorsReversed?: boolean;
+  seriesColors?: (string | null)[];
+  seriesLabels?: string[];
+  seriesFillUnder?: boolean;
+  seriesShowBaselines?: boolean;
+  seriesShowLegend?: boolean;
+  seriesShowGrid?: boolean;
+  seriesXTickInterval?: number;
+  seriesYTickInterval?: number;
+  // Every CHART_AXIS_TITLE_SHAPES member - see chartTitleLayout. `fontSize` is only consulted to
+  // size the margins those titles reserve (the renderers apply the real font themselves).
+  chartTitle?: string;
+  axisXTitle?: string;
+  axisYTitle?: string;
+  fontSize?: number;
+  // Every CHART_ANNOTATION_SHAPES member. `strokeColor` is the fallback an annotation with no color
+  // of its own takes.
+  chartAnnotations?: ChartAnnotation[];
+  strokeColor?: string;
+  // "waterfallChart" only - the per-trace line weight, taken from the node's own strokeWidth (the
+  // "series" ChartPart role carries its own width rather than the renderer applying node.strokeWidth,
+  // since a legend swatch or a future per-trace weight needs to differ from it).
+  strokeWidth?: number;
   ampInputTopLeadLength?: number; // "amplifier" only
   ampInputBottomLeadLength?: number; // "amplifier" only
   ampOutputLeadLength?: number; // "amplifier" only
@@ -1202,6 +1289,18 @@ function openPathD(points: { x: number; y: number }[]): string {
 // trick teardropOutlineD/halfCircleOutlineD already use, just closed into a full loop this time.
 function dotPathD(cx: number, cy: number, r: number): string {
   return `M${(cx - r).toFixed(2)},${cy.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 1,0 ${(cx + r).toFixed(2)},${cy.toFixed(2)} A${r.toFixed(2)},${r.toFixed(2)} 0 1,0 ${(cx - r).toFixed(2)},${cy.toFixed(2)}`;
+}
+
+// A hollow ring as ONE fillable path - the outer circle and the inner circle wound in OPPOSITE
+// directions (arc sweep flag 0 vs 1), which is what makes the default nonzero fill rule cancel the
+// middle out. Two same-wound circles (what dotPathD twice would give) fill as a solid disc instead,
+// since their winding numbers add rather than cancel. Built as a filled path rather than a stroked
+// circle so it can share the "annotation" ChartPart role with the solid marker glyphs, which both
+// renderers fill.
+function ringPathD(cx: number, cy: number, rOuter: number, rInner: number): string {
+  const outer = `M${(cx - rOuter).toFixed(2)},${cy.toFixed(2)} A${rOuter.toFixed(2)},${rOuter.toFixed(2)} 0 1,0 ${(cx + rOuter).toFixed(2)},${cy.toFixed(2)} A${rOuter.toFixed(2)},${rOuter.toFixed(2)} 0 1,0 ${(cx - rOuter).toFixed(2)},${cy.toFixed(2)} Z`;
+  const inner = `M${(cx - rInner).toFixed(2)},${cy.toFixed(2)} A${rInner.toFixed(2)},${rInner.toFixed(2)} 0 1,1 ${(cx + rInner).toFixed(2)},${cy.toFixed(2)} A${rInner.toFixed(2)},${rInner.toFixed(2)} 0 1,1 ${(cx - rInner).toFixed(2)},${cy.toFixed(2)} Z`;
+  return `${outer} ${inner}`;
 }
 
 // Formats a tick/data-value number for display: rounds to 2 decimal places (clears float noise like
@@ -1967,6 +2066,291 @@ function graphOutline(
   return { parts, labels };
 }
 
+// ---- Multi-series / waterfall -------------------------------------------------------------------
+
+// Peak-preserving decimation: reduces a trace to at most ~2 points per horizontal pixel by splitting
+// it into `buckets` equal spans and emitting each span's MINIMUM and MAXIMUM sample (in whichever
+// order they occur), rather than every Nth sample.
+//
+// Stride sampling would be simpler and is what most naive plotters do, but it is wrong for exactly
+// the data this shape exists for: a spectral line one or two samples wide sits BETWEEN two strides
+// and disappears entirely, silently deleting the feature a spectroscopist is looking at. Emitting
+// each bucket's min and max instead reproduces the drawn envelope pixel-for-pixel - a peak that
+// reaches a given height still reaches it - while capping the vertex count at roughly the plot's own
+// pixel width no matter how dense the source data is. That cap is what keeps a 60-trace x 20,000-
+// point figure interactive: without it the SVG path strings alone would be tens of megabytes per
+// rebuild.
+//
+// Returns the ORIGINAL array when it is already short enough, so the common small-data case pays
+// nothing (not even a copy).
+function decimateSeries(values: number[], buckets: number): number[] | { i: number; v: number }[] {
+  if (buckets <= 0 || values.length <= buckets * 2) return values;
+  const out: { i: number; v: number }[] = [];
+  const span = values.length / buckets;
+  for (let b = 0; b < buckets; b++) {
+    const start = Math.floor(b * span);
+    const end = Math.min(values.length, Math.floor((b + 1) * span));
+    if (end <= start) continue;
+    let minI = start;
+    let maxI = start;
+    for (let i = start + 1; i < end; i++) {
+      if (values[i] < values[minI]) minI = i;
+      if (values[i] > values[maxI]) maxI = i;
+    }
+    // Emitted in the order they actually occur in the source, so the drawn line still travels in the
+    // direction the data does within the bucket rather than zigzagging backwards.
+    if (minI <= maxI) out.push({ i: minI, v: values[minI] }, { i: maxI, v: values[maxI] });
+    else out.push({ i: maxI, v: values[maxI] }, { i: minI, v: values[minI] });
+  }
+  return out;
+}
+
+// A stack of N independently-colored traces over one shared x-axis - see WhiteboardNode.seriesData.
+// Trace 0 draws at the BOTTOM of the stack (baseline offset 0) and each subsequent trace is lifted
+// another `offsetStep` in data units, matching how a stacked-spectra figure is conventionally read
+// (earliest/lowest parameter value at the bottom). With seriesOffset 0 every trace shares one
+// baseline and this degenerates into a plain overlaid multi-series line chart, deliberately - see
+// that field's own doc comment.
+function waterfallOutline(
+  w: number,
+  h: number,
+  resolved: ResolvedSeries,
+  opts: {
+    showLabels: boolean;
+    showGrid: boolean;
+    fillUnder: boolean;
+    showBaselines: boolean;
+    showLegend: boolean;
+    xTickInterval?: number;
+    yTickInterval?: number;
+    strokeWidth: number;
+    fontSize: number;
+  }
+): { parts: ChartPart[]; labels: ChartLabel[] } {
+  const { series, colors, labels: seriesNames, xMin, xMax, yMin, offsetStep, stackedYMin, stackedYMax } = resolved;
+  const { padX, padY, plotW, plotH, mapX, mapY } = graphCoordinateMapper(w, h, xMin, xMax, stackedYMin, stackedYMax);
+
+  // One bucket per ~half pixel of plot width - the Nyquist-ish limit past which extra vertices are
+  // invisible at the current on-screen size but still cost full path-string and rasterization time.
+  const buckets = Math.max(16, Math.round(plotW * 2));
+
+  // How many ticks actually FIT, rather than a fixed five. A stacked plot's numbers are wide (the y
+  // axis sums every trace beneath it; the x axis carries real measurement units), so five of them
+  // across a narrow panel overlap into an unreadable smear - which is precisely the size a panel
+  // ends up at once several are arranged into a subplot grid. Width is estimated from the widest
+  // ENDPOINT label, since the extremes are the longest numbers in a linear tick sequence.
+  const widestXLabel = Math.max(estimatedTextWidth(formatTick(xMin), opts.fontSize), estimatedTextWidth(formatTick(xMax), opts.fontSize));
+  const maxXTicks = Math.max(2, Math.min(5, Math.floor(plotW / (widestXLabel + 10))));
+  const maxYTicks = Math.max(2, Math.min(5, Math.floor(plotH / (opts.fontSize * 1.8))));
+  const xTicksFor = () => (opts.xTickInterval && opts.xTickInterval > 0 ? tickValuesByInterval(xMin, xMax, opts.xTickInterval) : tickValues(xMin, xMax, maxXTicks));
+  const yTicksFor = () =>
+    opts.yTickInterval && opts.yTickInterval > 0 ? tickValuesByInterval(stackedYMin, stackedYMax, opts.yTickInterval) : tickValues(stackedYMin, stackedYMax, maxYTicks);
+
+  const parts: ChartPart[] = [];
+  if (opts.showGrid) {
+    const gridX = xTicksFor();
+    const gridY = yTicksFor();
+    const gridLines = [
+      ...gridX.map((tx) => openPathD([{ x: mapX(tx), y: padY }, { x: mapX(tx), y: padY + plotH }])),
+      ...gridY.map((ty) => openPathD([{ x: padX, y: mapY(ty) }, { x: padX + plotW, y: mapY(ty) }])),
+    ];
+    if (gridLines.length > 0) parts.push({ d: gridLines.join(" "), role: "grid" });
+  }
+
+  if (opts.showBaselines) {
+    const baselines = series.map((_, s) => openPathD([{ x: padX, y: mapY(yMin + offsetStep * s) }, { x: padX + plotW, y: mapY(yMin + offsetStep * s) }]));
+    if (baselines.length > 0) parts.push({ d: baselines.join(" "), role: "grid" });
+  }
+
+  // Drawn back-to-front (topmost trace LAST) so a higher trace overlaps the one behind it, the way a
+  // real stacked figure occludes - with negative-space overlap that ordering is what makes the stack
+  // read as depth rather than as a tangle.
+  for (let s = 0; s < series.length; s++) {
+    const trace = series[s];
+    const lift = offsetStep * s;
+    const denom = trace.length > 1 ? trace.length - 1 : 1;
+    const decimated = decimateSeries(trace, buckets);
+    const pts: { x: number; y: number }[] =
+      typeof decimated[0] === "number"
+        ? (decimated as number[]).map((v, i) => ({ x: mapX(xMin + ((xMax - xMin) * i) / denom), y: mapY(v + lift) }))
+        : (decimated as { i: number; v: number }[]).map((p) => ({ x: mapX(xMin + ((xMax - xMin) * p.i) / denom), y: mapY(p.v + lift) }));
+    if (pts.length === 0) continue;
+    if (opts.fillUnder) {
+      const base = mapY(yMin + lift);
+      parts.push({
+        d: `${openPathD(pts)} L${pts[pts.length - 1].x.toFixed(2)},${base.toFixed(2)} L${pts[0].x.toFixed(2)},${base.toFixed(2)} Z`,
+        role: "seriesFill",
+        color: colors[s],
+      });
+    }
+    parts.push({ d: openPathD(pts), role: "series", color: colors[s], width: opts.strokeWidth });
+  }
+
+  parts.push({
+    d: [
+      openPathD([{ x: padX, y: padY + plotH }, { x: padX + plotW, y: padY + plotH }]),
+      openPathD([{ x: padX, y: padY }, { x: padX, y: padY + plotH }]),
+    ].join(" "),
+    role: "axis",
+  });
+
+  const labels: ChartLabel[] = [];
+  if (opts.showLabels) {
+    const xTicks = xTicksFor();
+    const yTicks = yTicksFor();
+    labels.push(
+      ...xTicks.map((tx) => ({ x: mapX(tx), y: Math.min(h - 2, padY + plotH + 12), text: formatTick(tx), anchor: "middle" as const })),
+      ...yTicks.map((ty) => ({ x: Math.max(2, padX - 4), y: mapY(ty), text: formatTick(ty), anchor: "end" as const }))
+    );
+  }
+  if (opts.showLegend) {
+    // Top-right of the plot area, one row per trace in its own trace color - the swatch IS the
+    // colored text rather than a separate square, which keeps a many-entry legend from eating the
+    // plot area it sits on top of.
+    const rowH = 12;
+    labels.push(
+      ...series.map((_, s) => ({
+        x: padX + plotW - 4,
+        y: padY + 8 + s * rowH,
+        text: seriesNames[s],
+        anchor: "end" as const,
+        color: colors[s],
+        fontScale: 0.85,
+      }))
+    );
+  }
+  return { parts, labels };
+}
+
+// ---- Chart titles and data-space annotations ----------------------------------------------------
+
+// How much room each title caption reserves around the plot box, as a multiple of the node's own
+// fontSize - a caption needs its own line height plus a little breathing room from the tick numbers
+// it sits outside of.
+const TITLE_MARGIN_SCALE = 1.7;
+const CHART_TITLE_FONT_SCALE = 1.15;
+
+// Rough width of a string at a given font size. There is no text metrics API available here (this
+// module is pure and runs with no canvas or DOM), so this approximates with an average glyph
+// advance. 0.58em is a deliberate slight OVER-estimate for the digit-and-decimal-point strings this
+// is used on, since reserving a few pixels too many merely shifts the plot over a touch, while
+// under-reserving clips the label - the failure this exists to prevent.
+function estimatedTextWidth(text: string, fontSize: number): number {
+  return text.length * fontSize * 0.58;
+}
+
+// A waterfall's y tick numbers are the stacked totals of every trace beneath them, so they run much
+// larger (and wider) than a normal plot's - a stack of 18 traces peaking at 100 labels its top tick
+// "1090.83". Those labels are drawn to the LEFT of the axis, so without a gutter sized to the widest
+// of them they simply run off the node's left edge and get clipped, which is exactly what happened
+// before this existed. Capped at 40% of the width so a pathological label can't squeeze the plot
+// itself down to nothing.
+function waterfallYTickGutter(resolved: ResolvedSeries, fontSize: number, yTickInterval?: number): number {
+  const ticks =
+    yTickInterval && yTickInterval > 0 ? tickValuesByInterval(resolved.stackedYMin, resolved.stackedYMax, yTickInterval) : tickValues(resolved.stackedYMin, resolved.stackedYMax, 5);
+  if (ticks.length === 0) return 0;
+  const widest = Math.max(...ticks.map((t) => estimatedTextWidth(formatTick(t), fontSize)));
+  return widest + 6;
+}
+
+// Every margin a chart reserves around its own plot box, and the caption labels that live in them.
+// The ONE place this is computed - shapeOutlineFor (laying the plot out) and
+// annotationCoordinateMapper (placing draggable handles over it) both call this rather than deriving
+// margins separately, since a disagreement between them shows up as handles that don't sit on the
+// data they belong to.
+//
+// Returns all-zero margins and no labels for a chart with no titles and no oversized tick labels, so
+// such a chart is laid out (and rendered) byte-identically to before any of this existed.
+function chartMargins(shapeType: WhiteboardShapeType, w: number, h: number, opts: ShapeOutlineOptions): { left: number; top: number; bottom: number; labels: ChartLabel[] } {
+  const fontSize = opts.fontSize ?? 16;
+  const title = opts.chartTitle?.trim() ?? "";
+  const xTitle = opts.axisXTitle?.trim() ?? "";
+  const yTitle = opts.axisYTitle?.trim() ?? "";
+  const unit = fontSize * TITLE_MARGIN_SCALE;
+  const tickGutter = shapeType === "waterfallChart" && (opts.showChartLabels ?? true) ? waterfallYTickGutter(resolveSeriesData(opts), fontSize, opts.seriesYTickInterval) : 0;
+  const left = Math.min(w * 0.4, (yTitle ? unit : 0) + tickGutter);
+  const top = title ? unit * CHART_TITLE_FONT_SCALE : 0;
+  const bottom = xTitle ? unit : 0;
+  const innerW = Math.max(1, w - left);
+  const innerH = Math.max(1, h - top - bottom);
+  const labels: ChartLabel[] = [];
+  if (title) labels.push({ x: left + innerW / 2, y: top / 2, text: title, anchor: "middle", fontScale: CHART_TITLE_FONT_SCALE, weight: "bold" });
+  if (xTitle) labels.push({ x: left + innerW / 2, y: h - bottom / 2, text: xTitle, anchor: "middle" });
+  // Rotated -90 about its own anchor point. Sits in the y-title's own share of the left margin -
+  // OUTSIDE the tick-number gutter, so the caption and the numbers it describes never overlap.
+  if (yTitle) labels.push({ x: Math.max(1, left - tickGutter) / 2, y: top + innerH / 2, text: yTitle, anchor: "middle", rotate: -90 });
+  return { left, top, bottom, labels };
+}
+
+// Where a chart's data-space annotations map to in node-local pixels, and back. Exported and shared
+// by BOTH the outline builder (placing each marker) and WhiteboardCanvas.tsx's own drag handles
+// (rendering a handle at that marker and inverse-mapping a drag back into data space) - the same
+// "one function owns this layout so two readers can't drift apart" reasoning graphCoordinateMapper's
+// own doc comment gives.
+//
+// `offsetX`/`offsetY` are the title margins: annotations are positioned inside the PLOT box, which
+// title captions shift down/right from the node's own top-left corner. The outline builder gets that
+// shift for free from the ShapeOutline `inset` group it is already drawn inside; the canvas's drag
+// handles are NOT inside that group, so they add it themselves.
+export function annotationCoordinateMapper(shapeType: WhiteboardShapeType, w: number, h: number, opts: ShapeOutlineOptions) {
+  const margins = chartMargins(shapeType, w, h, opts);
+  const innerW = Math.max(1, w - margins.left);
+  const innerH = Math.max(1, h - margins.top - margins.bottom);
+  const range =
+    shapeType === "waterfallChart"
+      ? (() => {
+          const r = resolveSeriesData(opts);
+          return { xMin: r.xMin, xMax: r.xMax, yMin: r.stackedYMin, yMax: r.stackedYMax };
+        })()
+      : resolveGraphAxisRange(opts);
+  return { ...graphCoordinateMapper(innerW, innerH, range.xMin, range.xMax, range.yMin, range.yMax), offsetX: margins.left, offsetY: margins.top };
+}
+
+// The marker glyph + label for each data-space callout on a chart (see whiteboardTypes.ts's
+// ChartAnnotation), projected through the same mapper the chart's own data already went through -
+// which is what keeps a callout pinned to its feature when the axis range or the node's box changes.
+function annotationOutline(
+  annotations: ChartAnnotation[],
+  mapX: (x: number) => number,
+  mapY: (y: number) => number,
+  fallbackColor: string
+): { parts: ChartPart[]; labels: ChartLabel[] } {
+  const parts: ChartPart[] = [];
+  const labels: ChartLabel[] = [];
+  for (const a of annotations) {
+    if (!Number.isFinite(a.x) || !Number.isFinite(a.y)) continue;
+    const px = mapX(a.x);
+    const py = mapY(a.y);
+    const color = a.color ?? fallbackColor;
+    const r = a.size ?? DEFAULT_ANNOTATION_MARKER_SIZE;
+    const marker = a.marker ?? "dot";
+    if (marker === "dot") {
+      parts.push({ d: dotPathD(px, py, r), role: "annotation", color });
+    } else if (marker === "ring") {
+      parts.push({ d: ringPathD(px, py, r, Math.max(0.4, r - 1.5)), role: "annotation", color });
+    } else if (marker === "square") {
+      parts.push({ d: `M${(px - r).toFixed(2)},${(py - r).toFixed(2)} L${(px + r).toFixed(2)},${(py - r).toFixed(2)} L${(px + r).toFixed(2)},${(py + r).toFixed(2)} L${(px - r).toFixed(2)},${(py + r).toFixed(2)} Z`, role: "annotation", color });
+    } else if (marker === "cross") {
+      const t = Math.max(0.6, r * 0.32);
+      parts.push({
+        d: [
+          `M${(px - r).toFixed(2)},${(py - t).toFixed(2)} L${(px + r).toFixed(2)},${(py - t).toFixed(2)} L${(px + r).toFixed(2)},${(py + t).toFixed(2)} L${(px - r).toFixed(2)},${(py + t).toFixed(2)} Z`,
+          `M${(px - t).toFixed(2)},${(py - r).toFixed(2)} L${(px + t).toFixed(2)},${(py - r).toFixed(2)} L${(px + t).toFixed(2)},${(py + r).toFixed(2)} L${(px - t).toFixed(2)},${(py + r).toFixed(2)} Z`,
+        ].join(" "),
+        role: "annotation",
+        color,
+      });
+    }
+    const text = a.text?.trim() ?? "";
+    if (!text) continue;
+    const dx = a.labelDx ?? DEFAULT_ANNOTATION_LABEL_DX;
+    const dy = a.labelDy ?? DEFAULT_ANNOTATION_LABEL_DY;
+    if (a.leader) parts.push({ d: openPathD([{ x: px, y: py }, { x: px + dx, y: py + dy }]), role: "annotation", color });
+    labels.push({ x: px + dx, y: py + dy, text, anchor: dx < 0 ? "end" : "start", color });
+  }
+  return { parts, labels };
+}
+
 // Builds one continuous open-path `d` string tracing the given periodic waveform across a w×h box,
 // vertically centered (amplitude = 35% of h either side of the midline), repeated `cycles` times.
 // Square/triangle/sawtooth are piecewise-linear so their breakpoints are computed exactly (no
@@ -2043,7 +2427,11 @@ function tableGridInnerLines(w: number, h: number, colWidths: number[], rowHeigh
   return lines;
 }
 
-export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: number, opts?: ShapeOutlineOptions): ShapeOutline {
+// The raw per-shapeType geometry, built in a plain 0,0-to-w,h box that knows nothing about title
+// margins or data-space annotations - shapeOutlineFor below is what layers those on. Split out so
+// every chart builder in this file can keep working in its own full box (see the ShapeOutline
+// "chart" variant's own `inset` doc comment for why that split beats threading margins through).
+function baseShapeOutline(shapeType: WhiteboardShapeType, w: number, h: number, opts?: ShapeOutlineOptions): ShapeOutline {
   switch (shapeType) {
     case "ellipse":
       return { kind: "ellipse" };
@@ -2269,6 +2657,23 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
           opts?.graphPoints ?? []
         ),
       };
+    case "waterfallChart":
+      // `opts` is handed straight to resolveSeriesData rather than copied field-by-field - see
+      // ShapeOutlineOptions' own series-field doc comment for why the names match exactly.
+      return {
+        kind: "chart",
+        ...waterfallOutline(w, h, resolveSeriesData(opts ?? {}), {
+          showLabels: opts?.showChartLabels ?? true,
+          showGrid: opts?.seriesShowGrid ?? false,
+          fillUnder: opts?.seriesFillUnder ?? false,
+          showBaselines: opts?.seriesShowBaselines ?? false,
+          showLegend: opts?.seriesShowLegend ?? false,
+          xTickInterval: opts?.seriesXTickInterval,
+          yTickInterval: opts?.seriesYTickInterval,
+          strokeWidth: opts?.strokeWidth ?? 1.2,
+          fontSize: opts?.fontSize ?? 11,
+        }),
+      };
     case "minusSign": {
       const t = h * 0.28;
       const cy = h / 2;
@@ -2301,6 +2706,119 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
     default:
       return { kind: "rect" };
   }
+}
+
+// Every shape's outline, in node-local coordinates. For the chart shapes this additionally reserves
+// margins for whatever title captions are set (shrinking the plot box to fit, rather than letting a
+// caption overlap the data) and projects any data-space annotations through the same coordinate
+// mapper the chart's own data used.
+//
+// A non-chart shape, or a chart with no titles and no annotations, returns baseShapeOutline's result
+// unchanged - byte-identical to what this function returned before either feature existed, so
+// nothing about an existing diagram shifts by a pixel.
+export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: number, opts?: ShapeOutlineOptions): ShapeOutline {
+  const annotations = CHART_ANNOTATION_SHAPES.has(shapeType) ? opts?.chartAnnotations ?? [] : [];
+  const margins = CHART_AXIS_TITLE_SHAPES.has(shapeType) ? chartMargins(shapeType, w, h, opts ?? {}) : { left: 0, top: 0, bottom: 0, labels: [] as ChartLabel[] };
+  const hasMargins = margins.left > 0 || margins.top > 0 || margins.bottom > 0;
+  if (!hasMargins && annotations.length === 0) return baseShapeOutline(shapeType, w, h, opts);
+
+  const innerW = Math.max(1, w - margins.left);
+  const innerH = Math.max(1, h - margins.top - margins.bottom);
+  const outline = baseShapeOutline(shapeType, innerW, innerH, opts);
+  // Margins/annotations are only meaningful on a "chart"-kind outline (every CHART_AXIS_TITLE_SHAPES
+  // member produces one); anything else falls back to its plain full-size outline rather than
+  // silently rendering a caption with no plot to caption.
+  if (outline.kind !== "chart") return baseShapeOutline(shapeType, w, h, opts);
+
+  const parts = [...outline.parts];
+  const labels = [...(outline.labels ?? [])];
+  if (annotations.length > 0) {
+    // Annotations map through the SAME axis window the shape's own data did - resolveGraphAxisRange
+    // for "graph", the stacked series extent for "waterfallChart" - so a callout lands exactly on
+    // the feature it names rather than on a second, independently-derived scale.
+    const { mapX, mapY } = annotationCoordinateMapper(shapeType, w, h, opts ?? {});
+    const built = annotationOutline(annotations, mapX, mapY, opts?.strokeColor ?? "#111111");
+    parts.push(...built.parts);
+    labels.push(...built.labels);
+  }
+  return {
+    kind: "chart",
+    parts,
+    labels,
+    inset: margins.left || margins.top ? { dx: margins.left, dy: margins.top } : undefined,
+    overlayLabels: margins.labels.length > 0 ? margins.labels : undefined,
+  };
+}
+
+// Every shape-specific field a node carries, as the options object shapeOutlineFor reads. One
+// shared builder because THREE separate callers need the identical mapping - the live SVG canvas
+// (WhiteboardCanvas.tsx), the Canvas2D/PNG export (paintShapeBody below), and the toolbar's shape-
+// preset preview tiles (WhiteboardEditor.tsx) - and each one hand-listing ~40 fields meant a field
+// added for one renderer was silently missing from the others until someone noticed the two drawing
+// the same shape differently. Adding a shape field now means adding it here once.
+export function outlineOptionsFor(node: WhiteboardNode): ShapeOutlineOptions {
+  return {
+    sides: node.sides,
+    starPoints: node.starPoints,
+    starInnerRadiusRatio: node.starInnerRadiusRatio,
+    waveStyle: node.waveStyle,
+    waveCycles: node.waveCycles,
+    angleDegrees: node.angleDegrees,
+    angleRay1Length: node.angleRay1Length,
+    angleRay2Length: node.angleRay2Length,
+    chartData: node.chartData,
+    plotFunction: node.plotFunction,
+    plotDomainScale: node.plotDomainScale,
+    plotCycles: node.plotCycles,
+    plotShowGrid: node.plotShowGrid,
+    plotXTickInterval: node.plotXTickInterval,
+    plotYTickInterval: node.plotYTickInterval,
+    showChartLabels: node.showChartLabels,
+    numberLineMax: node.numberLineMax,
+    graphExpression: node.graphExpression,
+    graphXMin: node.graphXMin,
+    graphXMax: node.graphXMax,
+    graphYMin: node.graphYMin,
+    graphYMax: node.graphYMax,
+    graphShowGrid: node.graphShowGrid,
+    graphXTickInterval: node.graphXTickInterval,
+    graphYTickInterval: node.graphYTickInterval,
+    graphPoints: node.graphPoints,
+    seriesData: node.seriesData,
+    seriesXMin: node.seriesXMin,
+    seriesXMax: node.seriesXMax,
+    seriesYMin: node.seriesYMin,
+    seriesYMax: node.seriesYMax,
+    seriesOffset: node.seriesOffset,
+    seriesColormap: node.seriesColormap,
+    seriesColorsReversed: node.seriesColorsReversed,
+    seriesColors: node.seriesColors,
+    seriesLabels: node.seriesLabels,
+    seriesFillUnder: node.seriesFillUnder,
+    seriesShowBaselines: node.seriesShowBaselines,
+    seriesShowLegend: node.seriesShowLegend,
+    seriesShowGrid: node.seriesShowGrid,
+    seriesXTickInterval: node.seriesXTickInterval,
+    seriesYTickInterval: node.seriesYTickInterval,
+    chartTitle: node.chartTitle,
+    axisXTitle: node.axisXTitle,
+    axisYTitle: node.axisYTitle,
+    chartAnnotations: node.chartAnnotations,
+    fontSize: node.fontSize,
+    strokeColor: node.strokeColor,
+    strokeWidth: node.strokeWidth,
+    ampInputTopLeadLength: node.ampInputTopLeadLength,
+    ampInputBottomLeadLength: node.ampInputBottomLeadLength,
+    ampOutputLeadLength: node.ampOutputLeadLength,
+    ampInputTopLeadYOffset: node.ampInputTopLeadYOffset,
+    ampInputBottomLeadYOffset: node.ampInputBottomLeadYOffset,
+    ampOutputLeadYOffset: node.ampOutputLeadYOffset,
+    ampInvertingOnTop: node.ampInvertingOnTop,
+    tableRows: node.tableRows,
+    tableCols: node.tableCols,
+    tableColWidths: node.tableColWidths,
+    tableRowHeights: node.tableRowHeights,
+  };
 }
 
 // The cylinder's cap ellipse height, as a fraction of the node's own height - shared by both
@@ -2354,6 +2872,276 @@ export function computeContentBounds(page: WhiteboardPage): BoundsBox {
   }
   const pad = 60;
   return { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad };
+}
+
+// ---- Image nodes ---------------------------------------------------------------------------------
+
+// Where the (already cropped) source bitmap lands inside the node's box, in node-local pixels, for
+// a given fit mode. The ONE place this is decided - the live <img> (via an object-fit/object-position
+// equivalent), the Canvas2D export's drawImage destination rect, and the crop overlay all read it -
+// so the exported PNG can't frame a photo differently from what the canvas showed.
+//
+// "cover" scales to the LARGER ratio so the box is fully covered and the overflow is clipped away;
+// "contain" scales to the smaller so the whole image fits and the node's fillColor shows through the
+// leftover margin; "fill" ignores aspect entirely. Both centered, matching CSS object-position's own
+// default of 50% 50%.
+export function imageDestRect(
+  node: WhiteboardNode,
+  sourceW: number,
+  sourceH: number
+): { x: number; y: number; width: number; height: number } {
+  const fit = node.imageFit ?? "cover";
+  const boxW = node.width;
+  const boxH = node.height;
+  if (fit === "fill" || sourceW <= 0 || sourceH <= 0) return { x: 0, y: 0, width: boxW, height: boxH };
+  const scale = fit === "cover" ? Math.max(boxW / sourceW, boxH / sourceH) : Math.min(boxW / sourceW, boxH / sourceH);
+  const width = sourceW * scale;
+  const height = sourceH * scale;
+  return { x: (boxW - width) / 2, y: (boxH - height) / 2, width, height };
+}
+
+// The mask silhouette an image is cut to, as a Path2D in node-local coordinates - shared by the
+// export's clip region and its ring stroke so the two can never disagree about where the edge is.
+// The live DOM renderer expresses the same three shapes as a CSS border-radius instead (see
+// WhiteboardCanvas.tsx's own image branch), since clipping an <img> that way is free there.
+function imageMaskPath(node: WhiteboardNode): Path2D {
+  const path = new Path2D();
+  const mask = node.imageMask ?? "rect";
+  const { width: w, height: h } = node;
+  if (mask === "ellipse") {
+    path.ellipse(w / 2, h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+    return path;
+  }
+  if (mask === "rounded") {
+    // Clamped to half the shorter side - a radius past that is geometrically meaningless and
+    // renders as a malformed path rather than a rounder box.
+    const r = Math.max(0, Math.min(node.cornerRadius ?? 0, Math.min(w, h) / 2));
+    path.roundRect(0, 0, w, h, r);
+    return path;
+  }
+  path.rect(0, 0, w, h);
+  return path;
+}
+
+// Paints an image node into the export canvas: the node's own fill as a matte behind it (visible
+// only where a "contain" fit leaves margin), the cropped bitmap clipped to the mask, then the ring
+// stroke along that same mask edge.
+//
+// `image` is null when the asset is missing or hasn't decoded - the node then draws the same dashed
+// placeholder box the live canvas shows, rather than silently exporting a hole where a photo was.
+export function paintImageNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, image: CanvasImageSource | null, sourceW: number, sourceH: number): void {
+  const maskPath = imageMaskPath(node);
+
+  if (node.fillColor) {
+    ctx.save();
+    ctx.clip(maskPath);
+    ctx.fillStyle = node.fillColor;
+    ctx.fillRect(0, 0, node.width, node.height);
+    ctx.restore();
+  }
+
+  if (image && sourceW > 0 && sourceH > 0) {
+    const crop = resolveImageCrop(node);
+    const sx = crop.x * sourceW;
+    const sy = crop.y * sourceH;
+    const sw = crop.w * sourceW;
+    const sh = crop.h * sourceH;
+    const dest = imageDestRect(node, sw, sh);
+    ctx.save();
+    ctx.clip(maskPath);
+    ctx.globalAlpha = Math.max(0, Math.min(1, node.imageOpacity ?? 1));
+    // Canvas2D has no per-drawImage color filter, so grayscale goes through ctx.filter. It is
+    // widely supported but not universally, and a browser that ignores it simply draws the image in
+    // full color - a cosmetic difference, never a failed export, so no fallback path is warranted.
+    if (node.imageGrayscale) ctx.filter = "grayscale(1)";
+    ctx.drawImage(image, sx, sy, sw, sh, dest.x, dest.y, dest.width, dest.height);
+    ctx.filter = "none";
+    ctx.restore();
+  } else {
+    // Missing-asset placeholder - a dashed outline plus a caption, matching the live canvas.
+    ctx.save();
+    ctx.clip(maskPath);
+    ctx.fillStyle = "#f3f4f6";
+    ctx.fillRect(0, 0, node.width, node.height);
+    ctx.restore();
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = "#9ca3af";
+    ctx.lineWidth = 1.5;
+    ctx.stroke(maskPath);
+    ctx.fillStyle = "#6b7280";
+    ctx.font = `12px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Image missing", node.width / 2, node.height / 2);
+    ctx.restore();
+  }
+
+  if (node.strokeWidth > 0) {
+    ctx.save();
+    // The ring is centered on the mask edge, so half of it would spill outside the node's box.
+    // Clipping to the mask keeps it flush with the silhouette - the same inset ring the live
+    // renderer's own `box-shadow: inset` produces.
+    ctx.clip(maskPath);
+    ctx.lineWidth = node.strokeWidth * 2;
+    ctx.strokeStyle = node.strokeColor;
+    ctx.stroke(maskPath);
+    ctx.restore();
+  }
+}
+
+// ---- Figure layout (grid / align / distribute) --------------------------------------------------
+//
+// Pure "given these nodes, where should each one end up" functions. Every one returns a NEW array of
+// updated nodes and mutates nothing, so the caller commits the result as an ordinary
+// "batch-edit-nodes" command - which means undo/redo works for free and no new command type is
+// needed, the same reasoning grouping already relies on (see WhiteboardNode.groupId).
+//
+// A locked node (WhiteboardNode.locked) is never moved or resized by any of these - it is skipped
+// and, in the grid case, does not consume a cell either. Lock exists precisely so a user can pin
+// the thing they are arranging other content around, and having "Arrange" quietly shove it aside
+// would defeat that.
+
+export interface GridArrangeOptions {
+  columns: number;
+  gapX: number;
+  gapY: number;
+  // "uniform" resizes every panel to the largest one's box - what a real multi-panel figure wants,
+  // since panels of different sizes read as an accident rather than a comparison. "keep" preserves
+  // each node's own size and only repositions, for arranging mixed content (a chart beside a note
+  // beside an equation) where forcing one size would be wrong.
+  sizing: "uniform" | "keep";
+}
+
+export const DEFAULT_GRID_GAP = 24;
+
+// Row-major placement into `columns` columns, in the nodes' own current reading order (top-to-bottom,
+// then left-to-right) rather than z-order or selection order - so "arrange these into 2 columns"
+// keeps roughly the arrangement the user already had in mind instead of shuffling panels to wherever
+// they happen to sit in the document array.
+//
+// Each row is as tall as its own tallest member and each column as wide as its own widest, so a grid
+// of differently-sized panels still lines up on both axes. The whole block is anchored at the
+// selection's existing top-left corner, keeping the result where the content already was.
+export function arrangeNodesInGrid(nodes: WhiteboardNode[], opts: GridArrangeOptions): WhiteboardNode[] {
+  const movable = nodes.filter((n) => !n.locked);
+  if (movable.length === 0) return [];
+  const columns = Math.max(1, Math.min(movable.length, Math.round(opts.columns)));
+  const originX = Math.min(...movable.map((n) => n.x));
+  const originY = Math.min(...movable.map((n) => n.y));
+
+  // Reading order, with a row tolerance so panels that are roughly side by side (never pixel-exact
+  // after hand placement) sort left-to-right rather than by a few pixels of vertical jitter.
+  const rowTolerance = Math.max(...movable.map((n) => n.height)) * 0.5;
+  const ordered = [...movable].sort((a, b) => (Math.abs(a.y - b.y) > rowTolerance ? a.y - b.y : a.x - b.x));
+
+  const uniformW = opts.sizing === "uniform" ? Math.max(...ordered.map((n) => n.width)) : 0;
+  const uniformH = opts.sizing === "uniform" ? Math.max(...ordered.map((n) => n.height)) : 0;
+  const cellW = (n: WhiteboardNode) => (opts.sizing === "uniform" ? uniformW : n.width);
+  const cellH = (n: WhiteboardNode) => (opts.sizing === "uniform" ? uniformH : n.height);
+
+  const rows = Math.ceil(ordered.length / columns);
+  const colWidths = Array.from({ length: columns }, (_, c) => {
+    let max = 0;
+    for (let r = 0; r < rows; r++) {
+      const n = ordered[r * columns + c];
+      if (n) max = Math.max(max, cellW(n));
+    }
+    return max;
+  });
+  const rowHeights = Array.from({ length: rows }, (_, r) => {
+    let max = 0;
+    for (let c = 0; c < columns; c++) {
+      const n = ordered[r * columns + c];
+      if (n) max = Math.max(max, cellH(n));
+    }
+    return max;
+  });
+
+  const colX: number[] = [];
+  let runningX = originX;
+  for (let c = 0; c < columns; c++) {
+    colX.push(runningX);
+    runningX += colWidths[c] + opts.gapX;
+  }
+  const rowY: number[] = [];
+  let runningY = originY;
+  for (let r = 0; r < rows; r++) {
+    rowY.push(runningY);
+    runningY += rowHeights[r] + opts.gapY;
+  }
+
+  const now = Date.now();
+  return ordered.map((node, i) => {
+    const r = Math.floor(i / columns);
+    const c = i % columns;
+    const width = opts.sizing === "uniform" ? uniformW : node.width;
+    const height = opts.sizing === "uniform" ? uniformH : node.height;
+    // Centered within its cell, so a "keep"-sized node smaller than its row/column still sits
+    // visually balanced rather than jammed into the corner.
+    return {
+      ...node,
+      x: colX[c] + (colWidths[c] - width) / 2,
+      y: rowY[r] + (rowHeights[r] - height) / 2,
+      width,
+      height,
+      updatedAt: now,
+    };
+  });
+}
+
+export type AlignEdge = "left" | "right" | "top" | "bottom" | "centerX" | "centerY";
+
+// Aligns every node to the selection's own extreme edge (the leftmost node's left edge, etc.) rather
+// than to the first-selected or the largest node - the extreme is what "align left" means everywhere
+// else and needs no selection-order convention to explain.
+export function alignNodes(nodes: WhiteboardNode[], edge: AlignEdge): WhiteboardNode[] {
+  const movable = nodes.filter((n) => !n.locked);
+  if (movable.length < 2) return [];
+  const now = Date.now();
+  const left = Math.min(...movable.map((n) => n.x));
+  const right = Math.max(...movable.map((n) => n.x + n.width));
+  const top = Math.min(...movable.map((n) => n.y));
+  const bottom = Math.max(...movable.map((n) => n.y + n.height));
+  return movable.map((n) => {
+    switch (edge) {
+      case "left":
+        return { ...n, x: left, updatedAt: now };
+      case "right":
+        return { ...n, x: right - n.width, updatedAt: now };
+      case "top":
+        return { ...n, y: top, updatedAt: now };
+      case "bottom":
+        return { ...n, y: bottom - n.height, updatedAt: now };
+      case "centerX":
+        return { ...n, x: (left + right) / 2 - n.width / 2, updatedAt: now };
+      case "centerY":
+        return { ...n, y: (top + bottom) / 2 - n.height / 2, updatedAt: now };
+    }
+  });
+}
+
+// Equalizes the GAPS between consecutive nodes along one axis, keeping the two extreme nodes exactly
+// where they are. Spacing gaps rather than centers is what keeps differently-sized panels looking
+// evenly placed - equal center spacing would visually crowd a wide panel against its neighbors.
+export function distributeNodes(nodes: WhiteboardNode[], axis: "horizontal" | "vertical"): WhiteboardNode[] {
+  const movable = nodes.filter((n) => !n.locked);
+  if (movable.length < 3) return [];
+  const now = Date.now();
+  const pos = (n: WhiteboardNode) => (axis === "horizontal" ? n.x : n.y);
+  const size = (n: WhiteboardNode) => (axis === "horizontal" ? n.width : n.height);
+  const ordered = [...movable].sort((a, b) => pos(a) - pos(b));
+  const first = ordered[0];
+  const last = ordered[ordered.length - 1];
+  const span = pos(last) + size(last) - pos(first);
+  const totalSize = ordered.reduce((sum, n) => sum + size(n), 0);
+  const gap = (span - totalSize) / (ordered.length - 1);
+  let cursor = pos(first);
+  return ordered.map((n) => {
+    const placed = axis === "horizontal" ? { ...n, x: cursor, updatedAt: now } : { ...n, y: cursor, updatedAt: now };
+    cursor += size(n) + gap;
+    return placed;
+  });
 }
 
 // ---- Command apply/invert (scoped to one page) ---------------------------------------------------
@@ -2493,41 +3281,7 @@ function polygonPath2D(points: [number, number][]): Path2D {
 // file's own ShapeOutline doc comment), so nothing here ever touches node.x/y again.
 function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
   const { width: w, height: h } = node;
-  const outline = shapeOutlineFor(node.shapeType, w, h, {
-    sides: node.sides,
-    starPoints: node.starPoints,
-    starInnerRadiusRatio: node.starInnerRadiusRatio,
-    waveStyle: node.waveStyle,
-    waveCycles: node.waveCycles,
-    angleDegrees: node.angleDegrees,
-    angleRay1Length: node.angleRay1Length,
-    angleRay2Length: node.angleRay2Length,
-    chartData: node.chartData,
-    plotFunction: node.plotFunction,
-    plotDomainScale: node.plotDomainScale,
-    plotCycles: node.plotCycles,
-    plotShowGrid: node.plotShowGrid,
-    plotXTickInterval: node.plotXTickInterval,
-    plotYTickInterval: node.plotYTickInterval,
-    showChartLabels: node.showChartLabels,
-    numberLineMax: node.numberLineMax,
-    graphExpression: node.graphExpression,
-    graphXMin: node.graphXMin,
-    graphXMax: node.graphXMax,
-    graphYMin: node.graphYMin,
-    graphYMax: node.graphYMax,
-    graphShowGrid: node.graphShowGrid,
-    graphXTickInterval: node.graphXTickInterval,
-    graphYTickInterval: node.graphYTickInterval,
-    graphPoints: node.graphPoints,
-    ampInputTopLeadLength: node.ampInputTopLeadLength,
-    ampInputBottomLeadLength: node.ampInputBottomLeadLength,
-    ampOutputLeadLength: node.ampOutputLeadLength,
-    ampInputTopLeadYOffset: node.ampInputTopLeadYOffset,
-    ampInputBottomLeadYOffset: node.ampInputBottomLeadYOffset,
-    ampOutputLeadYOffset: node.ampOutputLeadYOffset,
-    ampInvertingOnTop: node.ampInvertingOnTop,
-  });
+  const outline = shapeOutlineFor(node.shapeType, w, h, outlineOptionsFor(node));
 
   const fillAndStroke = (path: Path2D) => {
     if (node.fillColor) {
@@ -2588,6 +3342,49 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
       fillAndStroke(new Path2D(outline.d));
       return;
     case "chart": {
+      // One shared label painter for both the in-plot labels (drawn inside the inset translate) and
+      // the title captions (drawn outside it) - see the ShapeOutline "chart" variant's own `inset`
+      // doc comment for why those are two separate lists.
+      const paintChartLabels = (labels: ChartLabel[]) => {
+        const labelFontStyle = node.fontStyle === "italic" ? "italic " : "";
+        ctx.textBaseline = "middle";
+        for (const label of labels) {
+          const size = node.fontSize * (label.fontScale ?? 1);
+          const weight = (label.weight ?? node.fontWeight) === "bold" ? "bold " : "";
+          ctx.font = `${labelFontStyle}${weight}${size}px ${node.fontFamily || "system-ui, sans-serif"}`;
+          ctx.fillStyle = label.color ?? node.fontColor;
+          // SVG's text-anchor="middle" is Canvas2D's textAlign="center" - everything else lines up.
+          ctx.textAlign = label.anchor === "middle" ? "center" : label.anchor;
+          // A rotated label (the y-axis caption) is drawn about its own anchor point, matching the
+          // SVG renderer's rotate(deg, x, y): translate there, rotate, then draw at the origin.
+          const rotated = Boolean(label.rotate);
+          if (rotated) {
+            ctx.save();
+            ctx.translate(label.x, label.y);
+            ctx.rotate((label.rotate! * Math.PI) / 180);
+          }
+          const tx = rotated ? 0 : label.x;
+          const ty = rotated ? 0 : label.y;
+          ctx.fillText(label.text, tx, ty);
+          if (node.textDecoration === "underline") {
+            const metrics = ctx.measureText(label.text);
+            const underlineY = ty + size * 0.35;
+            const startX = label.anchor === "start" ? tx : label.anchor === "end" ? tx - metrics.width : tx - metrics.width / 2;
+            ctx.save();
+            ctx.strokeStyle = label.color ?? node.fontColor;
+            ctx.lineWidth = Math.max(1, size / 16);
+            ctx.beginPath();
+            ctx.moveTo(startX, underlineY);
+            ctx.lineTo(startX + metrics.width, underlineY);
+            ctx.stroke();
+            ctx.restore();
+          }
+          if (rotated) ctx.restore();
+        }
+      };
+
+      ctx.save();
+      if (outline.inset) ctx.translate(outline.inset.dx, outline.inset.dy);
       for (const part of outline.parts) {
         const path = new Path2D(part.d);
         if (part.role === "fill") {
@@ -2604,6 +3401,26 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
           ctx.lineWidth = 1;
           ctx.strokeStyle = "#ffffff";
           ctx.stroke(path);
+        } else if (part.role === "series") {
+          ctx.lineWidth = Math.max(0.5, part.width);
+          ctx.strokeStyle = part.color;
+          ctx.lineJoin = "round";
+          ctx.lineCap = "round";
+          ctx.stroke(path);
+        } else if (part.role === "seriesFill") {
+          ctx.save();
+          ctx.globalAlpha = SERIES_FILL_OPACITY;
+          ctx.fillStyle = part.color;
+          ctx.fill(path);
+          ctx.restore();
+        } else if (part.role === "annotation") {
+          // Filled for the marker glyphs, and stroked too so a leader line (a degenerate,
+          // zero-area path that would fill to nothing) still shows.
+          ctx.fillStyle = part.color;
+          ctx.fill(path);
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = part.color;
+          ctx.stroke(path);
         } else if (part.role === "grid") {
           ctx.lineWidth = 0.5;
           ctx.strokeStyle = "#e5e7eb";
@@ -2615,31 +3432,9 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
           ctx.stroke(path);
         }
       }
-      if (outline.labels && outline.labels.length > 0) {
-        const labelFontStyle = node.fontStyle === "italic" ? "italic " : "";
-        const labelFontWeight = node.fontWeight === "bold" ? "bold " : "";
-        ctx.font = `${labelFontStyle}${labelFontWeight}${node.fontSize}px ${node.fontFamily || "system-ui, sans-serif"}`;
-        ctx.fillStyle = node.fontColor;
-        ctx.textBaseline = "middle";
-        for (const label of outline.labels) {
-          // SVG's text-anchor="middle" is Canvas2D's textAlign="center" - everything else lines up.
-          ctx.textAlign = label.anchor === "middle" ? "center" : label.anchor;
-          ctx.fillText(label.text, label.x, label.y);
-          if (node.textDecoration === "underline") {
-            const metrics = ctx.measureText(label.text);
-            const underlineY = label.y + node.fontSize * 0.35;
-            const startX = label.anchor === "start" ? label.x : label.anchor === "end" ? label.x - metrics.width : label.x - metrics.width / 2;
-            ctx.save();
-            ctx.strokeStyle = node.fontColor;
-            ctx.lineWidth = Math.max(1, node.fontSize / 16);
-            ctx.beginPath();
-            ctx.moveTo(startX, underlineY);
-            ctx.lineTo(startX + metrics.width, underlineY);
-            ctx.stroke();
-            ctx.restore();
-          }
-        }
-      }
+      if (outline.labels && outline.labels.length > 0) paintChartLabels(outline.labels);
+      ctx.restore();
+      if (outline.overlayLabels && outline.overlayLabels.length > 0) paintChartLabels(outline.overlayLabels);
       return;
     }
   }
@@ -2651,24 +3446,6 @@ function polylineOpenPath2D(points: [number, number][]): Path2D {
   return path;
 }
 
-function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
-  const lines: string[] = [];
-  for (const rawLine of text.split("\n")) {
-    const words = rawLine.split(" ");
-    let current = "";
-    for (const word of words) {
-      const candidate = current ? `${current} ${word}` : word;
-      if (ctx.measureText(candidate).width > maxWidth && current) {
-        lines.push(current);
-        current = word;
-      } else {
-        current = candidate;
-      }
-    }
-    lines.push(current);
-  }
-  return lines;
-}
 
 // Renders text in node-local coordinates (0,0 at top-left) - caller has already
 // ctx.translate(node.x, node.y), same convention as paintShapeBody above.
@@ -2685,7 +3462,7 @@ function paintNodeText(ctx: CanvasRenderingContext2D, node: WhiteboardNode): voi
   ctx.textAlign = node.textAlign;
   ctx.textBaseline = "middle";
   const paddingX = 8;
-  const lines = wrapText(ctx, node.text, node.width - paddingX * 2);
+  const lines = wrapTextToWidth(ctx, node.text, node.width - paddingX * 2);
   const lineHeight = node.fontSize * 1.25;
   const totalHeight = lines.length * lineHeight;
   const startY =
@@ -2875,7 +3652,7 @@ function paintTable(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
       ctx.clip();
       const x = node.textAlign === "left" ? colBounds[c] + paddingX : node.textAlign === "right" ? colBounds[c] + cellW - paddingX : colBounds[c] + cellW / 2;
       const lineHeight = node.fontSize * 1.25;
-      const lines = wrapText(ctx, text, cellW - paddingX * 2);
+      const lines = wrapTextToWidth(ctx, text, cellW - paddingX * 2);
       const totalHeight = lines.length * lineHeight;
       const startY =
         node.verticalAlign === "top"
@@ -2889,7 +3666,7 @@ function paintTable(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
   }
 }
 
-async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): Promise<void> {
+async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, imageSrcFor?: ImageSrcResolver): Promise<void> {
   ctx.save();
   ctx.translate(node.x, node.y);
   // Matches WhiteboardCanvas.tsx's own `transform: rotate(deg) scaleX(-1) scaleY(-1); transform-
@@ -2951,22 +3728,32 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode): 
     // Not just shapeOutlineFor's own placeholder glyph (a static, doesn't-look-like-anything-real
     // icon) when this node's widget is actually mounted live in the page being exported - grab an
     // ACTUAL frame of its WebGL canvas instead. LatticeGaugeWidget.tsx tags its own canvas element
-    // with this exact attribute for precisely this lookup, and sets `preserveDrawingBuffer: true`
-    // on its renderer so the buffer is still readable here (WebGL by default may discard it right
-    // after compositing, which would otherwise make drawImage/toDataURL called from an unrelated
-    // click handler - well after the animation loop's own last render() call - read back a blank
-    // frame). Falls back to the placeholder glyph if no live canvas exists to read (this page isn't
-    // the one currently open, or WebGL failed) - same DOM-reachability caveat every other
-    // export/thumbnail call site already has (they only ever run against the page actually open in
-    // the editor, so this lookup succeeds in the cases that matter).
+    // with this exact attribute for precisely this lookup. Its renderer does NOT keep
+    // `preserveDrawingBuffer: true` (that would mean paying to retain every past frame's buffer
+    // forever, just for this occasional read - see its own doc comment), so a stale/blank buffer
+    // this long after its animation loop's own last render() is called for here instead: forcing
+    // exactly one fresh render() synchronously, in the same tick as the drawImage read right below
+    // it, via latticeRenderOnDemand's callback for this node. Falls back to the placeholder glyph
+    // if no live canvas exists to read (this page isn't the one currently open, or WebGL failed) -
+    // same DOM-reachability caveat every other export/thumbnail call site already has (they only
+    // ever run against the page actually open in the editor, so this lookup succeeds in the cases
+    // that matter).
     const liveCanvas = document.querySelector<HTMLCanvasElement>(`canvas[data-lattice-node-id="${node.id}"]`);
     if (liveCanvas && liveCanvas.width > 0 && liveCanvas.height > 0) {
+      latticeRenderOnDemand.get(node.id)?.();
       ctx.drawImage(liveCanvas, 0, 0, node.width, node.height);
     } else {
       paintShapeBody(ctx, node);
     }
   } else if (node.shapeType === "table") {
     paintTable(ctx, node);
+  } else if (node.shapeType === "image") {
+    // renderWhiteboardToCanvas has already awaited every image node's decode before reaching here,
+    // so this cache lookup is a hit for any asset that exists; anything still missing (deleted from
+    // disk, corrupt) draws paintImageNode's placeholder rather than failing the whole export.
+    const src = imageSrcFor?.(node) ?? null;
+    const decoded = src ? getCachedWhiteboardImage(src) : null;
+    paintImageNode(ctx, node, decoded, decoded?.naturalWidth ?? 0, decoded?.naturalHeight ?? 0);
   } else {
     if (node.shapeType !== "text") paintShapeBody(ctx, node);
     paintNodeText(ctx, node);
@@ -3075,7 +3862,14 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
 // typeset math has no synchronous path) - every existing caller already awaits this inside an async
 // handler (export/save-as/thumbnail), so this didn't need to change anything at those call sites
 // beyond adding `await`.
-export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimension?: number): Promise<HTMLCanvasElement> {
+// Maps an "image" node to the URL its asset is served from. Supplied by the caller rather than
+// derived here because it needs the Briefcast library root and the whiteboard's own id - neither of
+// which this pure module knows, and neither of which it should have to learn just to draw a photo.
+// Omitting it (the thumbnail path for a whiteboard with no images, say) simply renders every image
+// node as its missing-asset placeholder.
+export type ImageSrcResolver = (node: WhiteboardNode) => string | null;
+
+export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimension?: number, imageSrcFor?: ImageSrcResolver): Promise<HTMLCanvasElement> {
   const bounds = computeContentBounds(page);
   const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
   const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
@@ -3093,11 +3887,27 @@ export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimensio
   ctx.scale(scale, scale);
   ctx.translate(-bounds.minX, -bounds.minY);
 
+  // Decode every image asset BEFORE painting anything. renderNode is synchronous once it reaches a
+  // given node's draw call, so an undecoded bitmap there would export as a placeholder - doing it
+  // here (rather than leaving it to each caller) means no export path can forget to, and unlike the
+  // per-node rendering below these genuinely are independent, so they run concurrently. A rejection
+  // is swallowed deliberately: a single missing asset should cost that one node its placeholder, not
+  // fail the whole export.
+  if (imageSrcFor) {
+    const srcs = new Set<string>();
+    for (const node of page.nodes) {
+      if (node.shapeType !== "image") continue;
+      const src = imageSrcFor(node);
+      if (src) srcs.add(src);
+    }
+    await Promise.all([...srcs].map((src) => preloadWhiteboardImage(src).catch(() => null)));
+  }
+
   const nodesById = new Map(page.nodes.map((n) => [n.id, n]));
   for (const edge of page.edges) renderEdge(ctx, edge, nodesById);
   // Sequential awaits, not Promise.all - every node shares this one ctx (save/translate/restore),
   // so two renderNode calls running concurrently would interleave their transform stacks.
-  for (const node of page.nodes) await renderNode(ctx, node);
+  for (const node of page.nodes) await renderNode(ctx, node, imageSrcFor);
 
   return canvas;
 }

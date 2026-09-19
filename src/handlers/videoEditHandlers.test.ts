@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyAutoZoomAtClicks,
+  buildViewSwitchOverlays,
   bringOverlayToFront,
   clipIndexAt,
   deleteClipAt,
@@ -200,6 +201,112 @@ describe("applyAutoZoomAtClicks", () => {
   it("ignores clicks outside the clip's own [start,end) range", () => {
     const clips = [makeClip({ start: 5, end: 10 })];
     expect(applyAutoZoomAtClicks(clips, "clip-1", [{ time: 2, x: 0.5, y: 0.5 }])).toBe(clips);
+  });
+});
+
+describe("buildViewSwitchOverlays", () => {
+  it("pairs a screen->camera->screen sequence into one full-frame camera interval", () => {
+    const overlays = buildViewSwitchOverlays(
+      [
+        { time: 2, mode: "camera" },
+        { time: 6, mode: "screen" },
+      ],
+      0,
+      10,
+      0,
+      undefined,
+      "webcam.mp4"
+    );
+    expect(overlays).toHaveLength(1);
+    expect(overlays[0]).toMatchObject({
+      sourcePath: "webcam.mp4",
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      shape: "rectangle",
+      trimStart: 2,
+      sourceDuration: 4,
+      startTime: 2,
+      endTime: 6,
+      muted: true,
+      volume: 0,
+    });
+  });
+
+  it("infers camera as already active at clipStart from the last event before it", () => {
+    // Switched to camera at t=1 (before this clip even starts) and never switched back - the
+    // whole clip should come back as one camera interval starting at its own clipStart (source
+    // time 5), which - since this clip starts at output time 0 (clipOutputStart=0) - maps to
+    // output time 0 through clipEnd-clipStart=5.
+    const overlays = buildViewSwitchOverlays([{ time: 1, mode: "camera" }], 5, 10, 0, undefined, "webcam.mp4");
+    expect(overlays).toHaveLength(1);
+    expect(overlays[0]).toMatchObject({ trimStart: 5, sourceDuration: 5, startTime: 0, endTime: 5 });
+  });
+
+  it("clamps a camera interval still active at clip end to clipEnd", () => {
+    const overlays = buildViewSwitchOverlays([{ time: 3, mode: "camera" }], 0, 10, 0, undefined, "webcam.mp4");
+    expect(overlays).toHaveLength(1);
+    expect(overlays[0]).toMatchObject({ startTime: 3, endTime: 10 });
+  });
+
+  it("returns nothing when the recording never left the screen view during this clip", () => {
+    const overlays = buildViewSwitchOverlays([], 0, 10, 0, undefined, "webcam.mp4");
+    expect(overlays).toHaveLength(0);
+  });
+
+  it("supports multiple non-overlapping camera intervals", () => {
+    const overlays = buildViewSwitchOverlays(
+      [
+        { time: 1, mode: "camera" },
+        { time: 2, mode: "screen" },
+        { time: 4, mode: "camera" },
+        { time: 5, mode: "screen" },
+      ],
+      0,
+      10,
+      0,
+      undefined,
+      "webcam.mp4"
+    );
+    expect(overlays).toHaveLength(2);
+    expect(overlays.map((o) => [o.startTime, o.endTime])).toEqual([
+      [1, 2],
+      [4, 5],
+    ]);
+  });
+
+  it("places intervals in OUTPUT-timeline coordinates via clipOutputStart, independent of source-time clipStart", () => {
+    // This clip's own source range is [20,30) but it's the SECOND clip on the timeline, starting
+    // at output second 10 - a camera interval at source t=22..24 should land at output t=12..14.
+    const overlays = buildViewSwitchOverlays(
+      [
+        { time: 22, mode: "camera" },
+        { time: 24, mode: "screen" },
+      ],
+      20,
+      30,
+      10,
+      undefined,
+      "webcam.mp4"
+    );
+    expect(overlays[0]).toMatchObject({ startTime: 12, endTime: 14, trimStart: 22, sourceDuration: 2 });
+  });
+
+  it("converts source-time intervals to output-time using the clip's own speed", () => {
+    // 2x speed: a 4-second source interval plays back in 2 output seconds.
+    const overlays = buildViewSwitchOverlays(
+      [
+        { time: 2, mode: "camera" },
+        { time: 6, mode: "screen" },
+      ],
+      0,
+      10,
+      0,
+      2,
+      "webcam.mp4"
+    );
+    expect(overlays[0]).toMatchObject({ trimStart: 2, sourceDuration: 4, startTime: 1, endTime: 3 });
   });
 });
 
