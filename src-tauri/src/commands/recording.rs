@@ -16,6 +16,7 @@ use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::async_runtime::Mutex;
 use tauri::AppHandle;
 use tauri::Emitter;
@@ -633,6 +634,140 @@ pub async fn get_recording_preview_frame(
     Ok(tauri::ipc::Response::new(frame.unwrap_or_default()))
 }
 
+// Waits for ffmpeg to finish writing after it has been asked to stop, force-killing only once it
+// is demonstrably no longer making progress. Returns whether it had to resort to the kill.
+//
+// The previous version waited a flat two seconds and then killed unconditionally, which is the
+// wrong shape for this problem: finalizing is not a fixed-cost operation. How long ffmpeg needs
+// after 'q' scales with the recording - flushing encoder queues, writing an index, and for some
+// containers rewriting structure at the head of the file - so a long or high-resolution capture
+// can legitimately need far longer than two seconds, and killing it mid-write is precisely what
+// corrupts the output. The frag-mp4 flags limit the damage for mp4 (the file stays playable up to
+// the last complete fragment) but do nothing for avi/mkv/mov, and even for mp4 they only bound
+// the loss rather than prevent it.
+//
+// So the timeout is on *progress*, not on elapsed time: as long as the output file keeps growing,
+// ffmpeg is still doing the work it was asked to do and is left alone. Only when it has stopped
+// both exiting and writing for IDLE_GRACE is it considered hung. A hard cap still exists so this
+// can never wait forever on a pathological process.
+fn wait_for_ffmpeg_to_finalize(process: &mut Child, output_path: &Path) -> bool {
+    const POLL: Duration = Duration::from_millis(100);
+    // No growth for this long, with the process still alive, means it is stuck rather than busy.
+    // Matches the old flat timeout, which is a reasonable "it really isn't doing anything" bar.
+    const IDLE_GRACE: Duration = Duration::from_secs(2);
+    // Absolute ceiling, so a process that somehow keeps touching the file can't hold Stop open
+    // indefinitely. Generous enough that only a genuinely stuck ffmpeg should ever reach it.
+    const HARD_CAP: Duration = Duration::from_secs(120);
+
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut last_size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+
+    loop {
+        match process.try_wait() {
+            // Exited on its own - the file was finalized properly.
+            Ok(Some(_)) => return false,
+            Ok(None) => {}
+            // Can't observe it any more; nothing useful left to do here.
+            Err(_) => return false,
+        }
+
+        let size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(last_size);
+        if size != last_size {
+            last_size = size;
+            last_progress = Instant::now();
+        }
+
+        if started.elapsed() >= HARD_CAP {
+            warn!(
+                "ffmpeg still running {}s after being asked to stop, force-killing - the recording may be incomplete",
+                HARD_CAP.as_secs()
+            );
+            let _ = process.kill();
+            return true;
+        }
+
+        if last_progress.elapsed() >= IDLE_GRACE {
+            warn!(
+                "ffmpeg stopped writing {}s ago but hasn't exited, force-killing - the recording may be incomplete",
+                IDLE_GRACE.as_secs()
+            );
+            let _ = process.kill();
+            return true;
+        }
+
+        std::thread::sleep(POLL);
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod shutdown_tests {
+    use super::*;
+    use std::process::Stdio;
+
+    fn ps(script: &str) -> Child {
+        Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn powershell")
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("briefcast_shutdown_test_{name}"));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn a_process_that_exits_promptly_is_not_killed() {
+        let path = temp("quick");
+        fs::write(&path, b"done").unwrap();
+        let mut child = ps("exit 0");
+        assert!(!wait_for_ffmpeg_to_finalize(&mut child, &path));
+        let _ = fs::remove_file(&path);
+    }
+
+    // The regression this whole change exists for: ffmpeg still writing when the old flat
+    // two-second timeout would have expired must be left alone, not killed mid-write.
+    #[test]
+    fn a_slow_but_still_writing_process_is_left_alone() {
+        let path = temp("writing");
+        fs::write(&path, b"").unwrap();
+        let script = format!(
+            "1..24 | ForEach-Object {{ Add-Content -LiteralPath '{}' -Value 'x'; Start-Sleep -Milliseconds 200 }}",
+            path.display()
+        );
+        let mut child = ps(&script);
+        let started = Instant::now();
+        let killed = wait_for_ffmpeg_to_finalize(&mut child, &path);
+        assert!(!killed, "a process still growing the output file must not be force-killed");
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "should have waited out the writes rather than giving up at the old 2s mark"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    // The other half: alive but doing nothing is exactly what the kill is for.
+    #[test]
+    fn a_hung_process_is_killed_after_the_idle_grace() {
+        let path = temp("hung");
+        fs::write(&path, b"stalled").unwrap();
+        let mut child = ps("Start-Sleep -Seconds 30");
+        let started = Instant::now();
+        assert!(wait_for_ffmpeg_to_finalize(&mut child, &path));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "should give up shortly after the idle grace, not wait for the hard cap"
+        );
+        let _ = child.wait();
+        let _ = fs::remove_file(&path);
+    }
+}
+
 // Called by the live recording bar every time the user toggles between "Screen" and "Camera" as
 // the primary view - just appends to AppState's own in-memory log, written out as a sidecar once
 // the recording actually finishes (stop_recording). `elapsed_secs` is frontend-computed - see
@@ -953,6 +1088,10 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             // fix as the "mp4"/"mov"/"webm"/fallback branches, just closing this one gap.
             "-b:a".into(),
             "192k".into(),
+            // Same live-capture interleaving stall the "avi" branch above documents - measured
+            // 5.7 fps written into mkv against 59.5 into mp4 for the same capture.
+            "-max_interleave_delta".into(),
+            "0".into(),
         ],
         "avi" => vec![
             "-c:v".into(),
@@ -965,6 +1104,19 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             KEYFRAME_INTERVAL.into(),
             "-c:a".into(),
             "pcm_s16le".into(), // Better audio codec for AVI
+            // AVI interleaves audio and video strictly, and with a *live* capture whose audio
+            // arrives in bursts the muxer ends up holding video back waiting for audio to catch
+            // up. Measured on a 4K desktop capture with a microphone: 4.7 fps written, against
+            // 59.5 fps for the same capture into mp4. Relaxing the interleave constraint recovers
+            // most of it (10.4 fps) - the muxer writes each packet when it has it instead of
+            // stalling for its counterpart.
+            //
+            // It does not close the gap entirely: AVI caps out around 11-12 fps here even with no
+            // audio at all, where mp4 sustains 60. AVI is simply a poor container for a live
+            // high-resolution capture, which is why mp4 is the default (see defaultFileExt in
+            // src/utils/appSettings.ts) - this only makes the explicit choice less punishing.
+            "-max_interleave_delta".into(),
+            "0".into(),
         ],
         "mov" => vec![
             "-c:v".into(),
@@ -1461,24 +1613,19 @@ pub async fn stop_recording(
     // to be a Windows-only `taskkill` fallback here too, which was both redundant (kill() already
     // ran) and the one piece of this function that wasn't portable.
     let mut process_state = state.ffmpeg_process.lock().await;
+    let mut force_killed = false;
     if let Some(mut process) = process_state.take() {
         if let Some(stdin) = process.stdin.as_mut() {
             let _ = stdin.write_all(b"q");
             let _ = stdin.flush();
         }
 
-        let _ = tauri::async_runtime::spawn_blocking(move || {
-            for _ in 0..20 {
-                match process.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
-                    Err(_) => return,
-                }
-            }
-            warn!("Graceful ffmpeg shutdown timed out, force-killing");
-            let _ = process.kill();
+        let wait_path = output_path.clone();
+        force_killed = tauri::async_runtime::spawn_blocking(move || {
+            wait_for_ffmpeg_to_finalize(&mut process, &wait_path)
         })
-        .await;
+        .await
+        .unwrap_or(false);
     }
     drop(process_state);
 
@@ -1526,6 +1673,14 @@ pub async fn stop_recording(
     // failure is otherwise silent: the caller would get back an apparent success and the
     // completed-recording popup would open pointing at a file that was never created. Checking
     // for a real, non-empty file here is what turns that into a visible error instead.
+    // A force-killed ffmpeg may have been interrupted mid-write. The file is usually still
+    // playable (especially mp4, whose fragment flags bound the loss to the last fragment), so
+    // this is a warning on an otherwise successful stop rather than an error - but it must not
+    // pass silently, because the damage is at the end of the file where it is easy to miss.
+    if force_killed {
+        warn!("Recording was force-stopped; the end of {:?} may be truncated", output_path);
+    }
+
     match fs::metadata(&output_path) {
         Ok(meta) if meta.len() > 0 => {}
         Ok(_) => {
@@ -1588,8 +1743,11 @@ pub async fn stop_recording(
         warn!("Failed to emit refresh-file-list: {}", e);
     }
 
+    // A cosmetic popup must not turn a successful recording into a failed stop. The file is
+    // already written and verified by this point; reporting "Failed to stop recording" because a
+    // window wouldn't open tells the user their recording is lost when it is sitting on disk.
     if let Err(e) = create_or_replace_rec_completed_modal(app_handle, output_str).await {
-        return Err(format!("Failed to show completion modal: {}", e));
+        warn!("Recording saved, but the completion popup could not be shown: {}", e);
     }
 
     Ok(output_str.to_string())
@@ -1781,9 +1939,23 @@ async fn create_or_replace_rec_completed_modal(
     // calling either from a command already on the main thread self-deadlocks. Running both on a
     // real background thread guarantees neither is ever called from the main thread either way.
     tauri::async_runtime::spawn_blocking(move || {
+        // Closing is a request, not a completed act: it marshals onto the main thread and the
+        // label stays registered until the window is really gone. Building immediately after
+        // therefore raced it and failed with "a webview with label `completed_recording` already
+        // exists" - which, before the caller stopped treating that as fatal, reported a perfectly
+        // good recording as a failed stop. Reproduced by stopping a second recording while the
+        // first recording's popup was still open.
         if let Some(modal_window) = app_handle.get_webview_window("completed_recording") {
             if let Err(e) = modal_window.close() {
                 return Err(format!("Failed to close existing modal window: {}", e));
+            }
+            // Poll rather than sleep a fixed amount: usually gone within a tick, and the cap is
+            // only there so a window that refuses to close can't wedge this thread.
+            for _ in 0..50 {
+                if app_handle.get_webview_window("completed_recording").is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
 

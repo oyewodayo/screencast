@@ -127,6 +127,9 @@ pub fn get_connected_devices(app_handle: &AppHandle) -> (Vec<String>, Vec<String
         }
     };
 
+    // Not silent_command, for the same reason take_screenshot below isn't: this *needs* ffmpeg's
+    // stderr, because -list_devices writes the device list there rather than to stdout. Only the
+    // console-hiding half is wanted here.
     let mut cmd = Command::new(&ffmpeg_path);
     cmd.args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
     super::hide_console_window(&mut cmd);
@@ -193,6 +196,69 @@ pub fn add_overlay_args(args: &mut Vec<String>, form_data: &FormData) {
     );
 
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
+}
+
+// Starts the recording ffmpeg and wires up everything a Windows recording needs, so that no
+// individual mode has to reassemble it.
+//
+// This was six near-identical copies of the same sequence: build a Command with the right stdio,
+// hide the console, spawn, assign to the orphan-kill Job Object, stash the child in AppState, and
+// start the progress watcher. Keeping six copies in step is exactly the trap it sounds like - one
+// of them had already drifted to a non-piped stdin, which meant stop_recording's graceful "q"
+// went nowhere and that mode could only ever be force-killed.
+//
+// `capture_preview` is for the camera-only modes, whose ffmpeg writes a live MJPEG preview to its
+// stdout (see preview_output_args). Only those pipe stdout at all: a mode with no preview output
+// has nothing to read there, and piping it anyway would leave a thread parked on a pipe that
+// never delivers a byte.
+async fn start_recording_process(
+    app_handle: &AppHandle,
+    state: &State<'_, AppState>,
+    ffmpeg_path: &std::path::Path,
+    args: &[String],
+    progress_sidecar: std::path::PathBuf,
+    capture_preview: bool,
+) -> Result<(), String> {
+    log::debug!("FFmpeg args: {:?}", args);
+
+    // silent_command is the single place stdio and console-hiding are decided; the only override
+    // is stdout, and only for the modes that actually stream something through it.
+    let mut cmd = silent_command(ffmpeg_path);
+    cmd.args(args);
+    if capture_preview {
+        cmd.stdout(Stdio::piped());
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start recording: {}", e))?;
+    process_job::assign_to_job(&child);
+    let pid = child.id();
+
+    if capture_preview {
+        if let Some(stdout) = child.stdout.take() {
+            let slot = state.preview_frame_handle();
+            // Must keep draining for as long as ffmpeg runs: a full pipe blocks its writes, and
+            // because ffmpeg advances all of its outputs together that would stall the recording
+            // itself rather than just the preview.
+            std::thread::spawn(move || {
+                crate::services::preview_stream::pump(stdout, slot);
+            });
+        }
+    }
+
+    {
+        let mut process_state = state.ffmpeg_process.lock().await;
+        *process_state = Some(child);
+    }
+    progress_watch::watch(
+        app_handle.clone(),
+        progress_sidecar,
+        state.ffmpeg_process.clone(),
+        pid,
+    );
+
+    Ok(())
 }
 
 //Screen video and audio
@@ -338,26 +404,7 @@ pub async fn recording_with_output_sva(
     // and the process gets force-killed - which for a container format that needs a proper
     // finalize on exit (WebM/Matroska in particular) produces exactly the kind of corrupt,
     // unparseable file ("EBML header parsing failed") this was silently causing.
-    let mut cmd = Command::new(&ffmpeg_path);
-    cmd.args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    super::hide_console_window(&mut cmd);
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
-    process_job::assign_to_job(&child);
-    let pid = child.id();
-
-    // Store the process in state
-    {
-        let mut process_state = state.ffmpeg_process.lock().await;
-        *process_state = Some(child);
-    }
-    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
-
-    log::debug!("FFmpeg process started successfully");
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false).await?;
 
     Ok(format!(
         "Recording started. File will be saved as:\n{}",
@@ -412,26 +459,7 @@ pub async fn recording_with_output_sa(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    let mut child = silent_command(&ffmpeg_path)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
-    process_job::assign_to_job(&child);
-    let pid = child.id();
-
-    if let Some(stdout) = child.stdout.take() {
-        let slot = state.preview_frame_handle();
-        std::thread::spawn(move || {
-            crate::services::preview_stream::pump(stdout, slot);
-        });
-    }
-
-    {
-        let mut process_state = state.ffmpeg_process.lock().await;
-        *process_state = Some(child);
-    }
-    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -483,30 +511,7 @@ pub async fn recording_with_output_v(
     // stdout carries the live preview stream for this mode (see preview_output_args), so it is
     // captured and drained rather than inherited - left inherited it would write raw JPEG bytes
     // to whatever console the app was launched from.
-    let mut cmd = Command::new(&ffmpeg_path);
-    cmd.args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    super::hide_console_window(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
-    process_job::assign_to_job(&child);
-    let pid = child.id();
-
-    if let Some(stdout) = child.stdout.take() {
-        let slot = state.preview_frame_handle();
-        std::thread::spawn(move || {
-            crate::services::preview_stream::pump(stdout, slot);
-        });
-    }
-
-    {
-        let mut process_state = state.ffmpeg_process.lock().await;
-        *process_state = Some(child);
-    }
-    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {:?}",
@@ -546,26 +551,7 @@ pub async fn recording_with_output_a(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    let mut child = silent_command(&ffmpeg_path)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
-    process_job::assign_to_job(&child);
-    let pid = child.id();
-
-    if let Some(stdout) = child.stdout.take() {
-        let slot = state.preview_frame_handle();
-        std::thread::spawn(move || {
-            crate::services::preview_stream::pump(stdout, slot);
-        });
-    }
-
-    {
-        let mut process_state = state.ffmpeg_process.lock().await;
-        *process_state = Some(child);
-    }
-    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -745,26 +731,7 @@ pub async fn recording_with_output_va(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    let mut child = silent_command(&ffmpeg_path)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
-    process_job::assign_to_job(&child);
-    let pid = child.id();
-
-    if let Some(stdout) = child.stdout.take() {
-        let slot = state.preview_frame_handle();
-        std::thread::spawn(move || {
-            crate::services::preview_stream::pump(stdout, slot);
-        });
-    }
-
-    {
-        let mut process_state = state.ffmpeg_process.lock().await;
-        *process_state = Some(child);
-    }
-    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -815,26 +782,7 @@ pub async fn recording_with_output_s(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    let mut child = silent_command(&ffmpeg_path)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
-    process_job::assign_to_job(&child);
-    let pid = child.id();
-
-    if let Some(stdout) = child.stdout.take() {
-        let slot = state.preview_frame_handle();
-        std::thread::spawn(move || {
-            crate::services::preview_stream::pump(stdout, slot);
-        });
-    }
-
-    {
-        let mut process_state = state.ffmpeg_process.lock().await;
-        *process_state = Some(child);
-    }
-    progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {}",
