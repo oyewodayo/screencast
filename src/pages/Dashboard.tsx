@@ -35,6 +35,11 @@ import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
+import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
+
+// Record types that capture cameras and no screen (win.rs recording_with_output_va/_v). Mirrors
+// CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
+const CAMERA_ONLY_RECORD_TYPES = ["va", "v"];
 import {
   PHONE_CAMERA_DEVICE,
   startPhoneCapture,
@@ -787,6 +792,36 @@ useEffect(() => {
       if (unlistenFn) {
         unlistenFn();
       }
+    };
+  }, []);
+
+  // The "Play" button in the same recording-completed popup. That window has no player of its
+  // own, so it hands the path over here and closes itself - the same arrangement
+  // 'open-conversion-dialog' above uses.
+  //
+  // setFocus matters: this window is behind the popup, so without it the file would load out of
+  // sight and clicking Play would look like it did nothing.
+  useEffect(() => {
+    const setupListener = async () => {
+      return await listen<string>('open-recording-playback', async (event) => {
+        const path = event.payload;
+        const name = path.split(/[\\/]/).pop() || path;
+        try {
+          await getCurrentWebviewWindow().setFocus();
+        } catch {
+          /* focus is a nicety - never let it stop the file from loading */
+        }
+        await loadFileForPlayback(path, name);
+      });
+    };
+
+    let unlistenFn: (() => void) | undefined;
+    setupListener().then((fn) => {
+      unlistenFn = fn;
+    });
+
+    return () => {
+      if (unlistenFn) unlistenFn();
     };
   }, []);
 
@@ -3676,6 +3711,12 @@ const setScreen = () => {
                 </div>
               )}
 
+              {/* A camera-only recording captures no screen, so this otherwise-idle home area is
+                  the natural place to show what the cameras are actually sending - see
+                  LiveCameraRecordingView for why it's polled frames rather than a MediaStream. */}
+              {isRecording && CAMERA_ONLY_RECORD_TYPES.includes(recordType) ? (
+                <LiveCameraRecordingView videoDevices={videoDevices} isPaused={isPaused} />
+              ) : (
               <div className="relative flex flex-col items-center gap-3 text-center">
                 <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
                   <IoVideocam size={28} />
@@ -3694,6 +3735,7 @@ const setScreen = () => {
                   Open a file
                 </button>
               </div>
+              )}
 
               {libraryPreviewFiles.length > 0 && (
                 <div className="relative w-full max-w-md">

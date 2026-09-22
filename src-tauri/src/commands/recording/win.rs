@@ -258,12 +258,7 @@ pub async fn recording_with_output_sva(
 
     // Audio is now always its own standalone input - previously it was bundled into the single
     // camera's dshow input line (video=X:audio=Y), which only worked for exactly one camera.
-    args.extend(vec![
-        "-f".to_string(),
-        "dshow".to_string(),
-        "-i".to_string(),
-        format!("audio={}", form_data.audio_device),
-    ]);
+    args.extend(mic_input_args(&form_data.audio_device));
 
     // Downscale the raw desktop capture - only when there's no BAKED-IN camera overlay, whose own
     // filter_complex (add_overlay_args, above) already ends with this same downscale as its final
@@ -400,12 +395,7 @@ pub async fn recording_with_output_sa(
     args.extend(gdigrab_input_args(&resolve_capture_target(
         app_handle, form_data,
     ))?);
-    args.extend(vec![
-        "-f".to_string(),
-        "dshow".to_string(),
-        "-i".to_string(),
-        format!("audio={}", form_data.audio_device),
-    ]);
+    args.extend(mic_input_args(&form_data.audio_device));
     // Downscale the raw desktop capture - see desktop_scale_args' doc comment.
     args.extend(desktop_scale_args(max_width));
     // Previously had no codec flags at all here, leaving both streams to ffmpeg's per-container
@@ -419,12 +409,23 @@ pub async fn recording_with_output_sa(
     ]);
 
     log::debug!("Path {:?}", output_path);
-    let child = silent_command(&ffmpeg_path)
+    // stdout is captured rather than discarded here: for the camera-only modes it carries the
+    // live preview stream (see preview_output_args). The reader thread below must start before
+    // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
+    let mut child = silent_command(&ffmpeg_path)
         .args(&args)
+        .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
     let pid = child.id();
+
+    if let Some(stdout) = child.stdout.take() {
+        let slot = state.preview_frame_handle();
+        std::thread::spawn(move || {
+            crate::services::preview_stream::pump(stdout, slot);
+        });
+    }
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -453,28 +454,53 @@ pub async fn recording_with_output_v(
     let progress_sidecar = progress_watch::progress_sidecar_path(output_path);
 
     log::debug!("Path {:?}", output_path);
-    let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
+
+    // Same multi-camera treatment as recording_with_output_va above, just with no audio input.
+    let cameras = &form_data.video_devices;
 
     let mut args: Vec<String> = vec![
         "-progress".to_string(),
         path_to_str(&progress_sidecar)?.to_string(),
-        "-f".to_string(),
-        "dshow".to_string(),
-        "-i".to_string(),
-        format!("video={}", video_device),
     ];
+    for camera in cameras {
+        args.extend(vec![
+            "-f".to_string(),
+            "dshow".to_string(),
+            "-i".to_string(),
+            format!("video={}", camera),
+        ]);
+    }
+    args.extend(vec![
+        "-filter_complex".to_string(),
+        camera_only_filter_complex(cameras.len()),
+    ]);
+    args.extend(vec!["-map".to_string(), "[vout]".to_string()]);
     args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
+    args.extend(preview_output_args());
 
+    // stdout carries the live preview stream for this mode (see preview_output_args), so it is
+    // captured and drained rather than inherited - left inherited it would write raw JPEG bytes
+    // to whatever console the app was launched from.
     let mut cmd = Command::new(&ffmpeg_path);
-    cmd.args(&args).stdin(Stdio::piped());
+    cmd.args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     super::hide_console_window(&mut cmd);
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
     let pid = child.id();
+
+    if let Some(stdout) = child.stdout.take() {
+        let slot = state.preview_frame_handle();
+        std::thread::spawn(move || {
+            crate::services::preview_stream::pump(stdout, slot);
+        });
+    }
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -506,11 +532,8 @@ pub async fn recording_with_output_a(
     let mut args: Vec<String> = vec![
         "-progress".to_string(),
         path_to_str(&progress_sidecar)?.to_string(),
-        "-f".to_string(),
-        "dshow".to_string(),
-        "-i".to_string(),
-        format!("audio={}", form_data.audio_device),
     ];
+    args.extend(mic_input_args(&form_data.audio_device));
     // Previously had no codec flags at all - left to ffmpeg's per-container default, which for
     // .mp3 measured out to 128k, same gap as every other mode fixed above.
     args.extend(audio_codec_args_for_ext(&form_data.file_ext));
@@ -520,12 +543,23 @@ pub async fn recording_with_output_a(
         path_to_str(output_path)?.to_string(),
     ]);
 
-    let child = silent_command(&ffmpeg_path)
+    // stdout is captured rather than discarded here: for the camera-only modes it carries the
+    // live preview stream (see preview_output_args). The reader thread below must start before
+    // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
+    let mut child = silent_command(&ffmpeg_path)
         .args(&args)
+        .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
     let pid = child.id();
+
+    if let Some(stdout) = child.stdout.take() {
+        let slot = state.preview_frame_handle();
+        std::thread::spawn(move || {
+            crate::services::preview_stream::pump(stdout, slot);
+        });
+    }
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -540,6 +574,118 @@ pub async fn recording_with_output_a(
 }
 
 //Video and audio
+// Height every camera is normalised to before they're stacked side by side. hstack requires all
+// its inputs share a height, and the cameras' own resolutions aren't known without probing each
+// device first - so they're all scaled to a fixed, typical-webcam height instead. Width is left
+// to follow each camera's own aspect ratio (-2 keeps it even, which H.264 requires).
+// How much audio dshow buffers before handing it to ffmpeg, in milliseconds.
+//
+// Measured, not guessed. ffmpeg advances all of its inputs together, so the audio device's buffer
+// sets the cadence for the *whole* pipeline - including the live preview's writes. At the driver
+// default this pushed the preview through in bursts: a preview asked for 12fps delivered barely 4
+// distinct frames a second, because the frames in between were overwritten before anything could
+// read them. Dropping the buffer to 50ms restored the full 12fps, matching what the same command
+// achieves with no audio input at all, and the recorded audio stream is unchanged either way
+// (still aac 44.1kHz stereo). It also cuts the capture latency at the head of every recording.
+const AUDIO_BUFFER_MS: &str = "50";
+
+// One dshow microphone input, with the buffer size above applied. Every mic input goes through
+// here so the setting can't drift between recording modes.
+fn mic_input_args(audio_device: &str) -> Vec<String> {
+    vec![
+        "-f".to_string(),
+        "dshow".to_string(),
+        "-audio_buffer_size".to_string(),
+        AUDIO_BUFFER_MS.to_string(),
+        "-i".to_string(),
+        format!("audio={}", audio_device),
+    ]
+}
+
+const CAMERA_STACK_HEIGHT: i32 = 720;
+// The live preview ffmpeg writes alongside a camera-only recording. Still deliberately small -
+// every pixel of it is CPU taken from the recording it sits beside - but sized to be watchable
+// rather than merely indicative, now that it no longer costs a base64 round trip per frame.
+const PREVIEW_WIDTH: i32 = 640;
+// 12fps. The rate was cut to 3 when the preview lived in the user's own recordings folder, where
+// each frame's create+rename was something Windows' real-time scanner opened - that churn was
+// measurably degrading the whole app. Moving the file to the OS temp directory removed that cost,
+// and 3fps reads as a slideshow rather than a live view, which defeats the point of having it.
+//
+// 12 is chosen from measurement, not taste: asking for more than ~10 delivered frames a second
+// produced no additional distinct frames at the consumer, so anything higher is encoding work that
+// nothing ever sees.
+const PREVIEW_FPS: i32 = 12;
+
+// Builds the -filter_complex for a camera-only recording: stacks the cameras left to right (when
+// there's more than one), then splits the result so the same picture feeds both the recording and
+// the live preview. `[vout]` is the recording's video, `[vpout]` the preview's.
+//
+// The split is deliberately after the stack, so the preview shows exactly the composite being
+// recorded rather than just the first camera.
+fn camera_only_filter_complex(camera_count: usize) -> String {
+    let mut fc = String::new();
+
+    if camera_count > 1 {
+        for i in 0..camera_count {
+            fc.push_str(&format!(
+                "[{i}:v]scale=-2:{h},setsar=1[c{i}];",
+                i = i,
+                h = CAMERA_STACK_HEIGHT
+            ));
+        }
+        for i in 0..camera_count {
+            fc.push_str(&format!("[c{}]", i));
+        }
+        fc.push_str(&format!("hstack=inputs={}[stacked];", camera_count));
+        fc.push_str("[stacked]split=2[vout][vp];");
+    } else {
+        // Single camera: no scaling at all, so the recording keeps the camera's native
+        // resolution exactly as it did before multi-camera support existed. split is a
+        // passthrough, so this costs the output nothing.
+        fc.push_str("[0:v]split=2[vout][vp];");
+    }
+
+    fc.push_str(&format!(
+        "[vp]fps={fps},scale={w}:-2[vpout]",
+        fps = PREVIEW_FPS,
+        w = PREVIEW_WIDTH
+    ));
+    fc
+}
+
+// The trailing output args that make ffmpeg keep one small JPEG up to date for the live preview.
+// -update overwrites a single file instead of writing a numbered sequence; -atomic_writing makes
+// each overwrite a write-to-temp-then-rename, so a reader polling this file can never catch a
+// half-written frame.
+// The trailing output args that stream the live preview out of ffmpeg's stdout as MJPEG.
+//
+// stdout, not a file. A file meant a create-plus-rename per frame (-atomic_writing, needed so a
+// reader couldn't catch a half-written frame), which put every frame in front of Windows'
+// real-time scanner and had the reader and writer contending over one path - measured delivery
+// swung between roughly 4 and 12 frames a second across identical runs. A pipe has none of that:
+// no disk, no tearing, nothing stranded in temp when a recording ends abnormally.
+//
+// The consumer (services/preview_stream.rs) must keep draining this for as long as ffmpeg runs -
+// pipes have a finite buffer, and a full one would block ffmpeg's writes and stall the recording
+// itself, since ffmpeg advances all of its outputs together.
+fn preview_output_args() -> Vec<String> {
+    vec![
+        "-map".to_string(),
+        "[vpout]".to_string(),
+        "-f".to_string(),
+        "mjpeg".to_string(),
+        // Quality is set explicitly because mjpeg's default is soft enough to look like a problem
+        // with the camera rather than with the preview. 2-31, lower is better.
+        "-q:v".to_string(),
+        "6".to_string(),
+        // Hand each frame to the pipe as it is produced rather than letting it wait in the muxer.
+        "-flush_packets".to_string(),
+        "1".to_string(),
+        "pipe:1".to_string(),
+    ]
+}
+
 pub async fn recording_with_output_va(
     app_handle: &AppHandle,
     state: State<'_, AppState>,
@@ -555,27 +701,64 @@ pub async fn recording_with_output_va(
     let progress_sidecar = progress_watch::progress_sidecar_path(output_path);
 
     log::debug!("Path {:?}", output_path);
-    let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
+
+    // Every selected camera is recorded, not just the first. They're stacked left to right into
+    // one file by camera_only_filter_complex above.
+    let cameras = &form_data.video_devices;
 
     let mut args: Vec<String> = vec![
         "-progress".to_string(),
         path_to_str(&progress_sidecar)?.to_string(),
-        "-f".to_string(),
-        "dshow".to_string(),
-        "-i".to_string(),
-        format!("video={}:audio={}", video_device, form_data.audio_device),
     ];
+
+    for camera in cameras {
+        args.extend(vec![
+            "-f".to_string(),
+            "dshow".to_string(),
+            "-i".to_string(),
+            format!("video={}", camera),
+        ]);
+    }
+
+    // The microphone is its own input rather than being bundled onto a camera's input line
+    // (`video=X:audio=Y`), which only ever worked when there was exactly one camera to bundle it
+    // onto - the same reasoning recording_with_output_sva already applies for its own mic.
+    args.extend(mic_input_args(&form_data.audio_device));
+    let audio_input_index = cameras.len();
+
+    args.extend(vec![
+        "-filter_complex".to_string(),
+        camera_only_filter_complex(cameras.len()),
+    ]);
+    args.extend(vec![
+        "-map".to_string(),
+        "[vout]".to_string(),
+        "-map".to_string(),
+        format!("{}:a", audio_input_index),
+    ]);
     args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
+    args.extend(preview_output_args());
 
-    let child = silent_command(&ffmpeg_path)
+    // stdout is captured rather than discarded here: for the camera-only modes it carries the
+    // live preview stream (see preview_output_args). The reader thread below must start before
+    // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
+    let mut child = silent_command(&ffmpeg_path)
         .args(&args)
+        .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
     let pid = child.id();
+
+    if let Some(stdout) = child.stdout.take() {
+        let slot = state.preview_frame_handle();
+        std::thread::spawn(move || {
+            crate::services::preview_stream::pump(stdout, slot);
+        });
+    }
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -629,12 +812,23 @@ pub async fn recording_with_output_s(
     ]);
 
     log::debug!("Path {:?}", output_path);
-    let child = silent_command(&ffmpeg_path)
+    // stdout is captured rather than discarded here: for the camera-only modes it carries the
+    // live preview stream (see preview_output_args). The reader thread below must start before
+    // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
+    let mut child = silent_command(&ffmpeg_path)
         .args(&args)
+        .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     process_job::assign_to_job(&child);
     let pid = child.id();
+
+    if let Some(stdout) = child.stdout.take() {
+        let slot = state.preview_frame_handle();
+        std::thread::spawn(move || {
+            crate::services::preview_stream::pump(stdout, slot);
+        });
+    }
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;

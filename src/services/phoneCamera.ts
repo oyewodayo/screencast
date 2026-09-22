@@ -127,6 +127,23 @@ const handleOffer = async (sdp: string) => {
     pc = new RTCPeerConnection({ iceServers: [] });
 
     pc.ontrack = (event) => {
+        // Shrink the receiver's jitter buffer. Chromium sizes it for smooth playback of a stream
+        // that may arrive over the open internet, which on a LAN buys nothing and costs a few
+        // hundred milliseconds of visible lag - the phone preview running noticeably behind the
+        // real world is largely this. Both spellings are set because the property was renamed
+        // (playoutDelayHint -> jitterBufferTarget) partway through Chromium's support for it,
+        // and neither being present is fatal.
+        try {
+            const receiver = event.receiver as RTCRtpReceiver & {
+                playoutDelayHint?: number;
+                jitterBufferTarget?: number;
+            };
+            receiver.playoutDelayHint = 0;
+            receiver.jitterBufferTarget = 0;
+        } catch {
+            /* older WebView - it just keeps the default buffer */
+        }
+
         const [incoming] = event.streams;
         if (incoming) setState({ stream: incoming, status: "live", error: "" });
     };
@@ -253,8 +270,16 @@ export const stopPhoneCamera = async (): Promise<void> => {
 // straight into mp4, which lets the Rust side skip a re-encode; older builds only do webm. Both
 // are handled by save_phone_camera_capture, so this is purely an optimisation.
 const pickMimeType = (): string => {
+    // Ordered best-first, and the codec strings matter. "video/mp4;codecs=h264" reads naturally
+    // but this WebView reports it unsupported, so it was silently never matching - the real
+    // spelling MediaRecorder accepts is the RFC 6381 form, "avc1.42E01E" (H.264 baseline).
+    //
+    // H.264 ahead of VP9/VP8 because the file is re-encoded to H.264 mp4 afterwards anyway: a
+    // matching codec keeps that step cheap, and on this hardware it is what the phone's own
+    // encoder produces natively.
     const candidates = [
-        "video/mp4;codecs=h264",
+        "video/mp4;codecs=avc1.42E01E",
+        "video/mp4",
         "video/webm;codecs=h264",
         "video/webm;codecs=vp9",
         "video/webm;codecs=vp8",
@@ -288,7 +313,12 @@ export const startPhoneCapture = (
     const mimeType = pickMimeType();
     let recorder: MediaRecorder;
     try {
-        recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 6_000_000 } : undefined);
+        // 8 Mbps. This was cut to 2.5 when every chunk had to cross Tauri's IPC as base64 inside a
+        // JSON document, which made bitrate a throughput problem rather than a quality decision.
+        // Chunks are raw bytes now (see phone_camera_capture_chunk), so the constraint is gone and
+        // this can be set for how the footage should actually look - 8 Mbps is comfortable for
+        // 1080p30 and leaves headroom for the re-encode that follows.
+        recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 8_000_000 } : undefined);
     } catch (e) {
         onError?.(`Could not record the phone camera: ${e}`);
         return null;
@@ -307,18 +337,6 @@ export const startPhoneCapture = (
     // and these are appends to one file, where order is the entire content.
     let writeChain: Promise<void> = Promise.resolve();
 
-    const toBase64 = (buffer: ArrayBuffer): string => {
-        const bytes = new Uint8Array(buffer);
-        let binary = "";
-        // Chunked through String.fromCharCode because spreading a megabyte-plus array blows the
-        // argument limit.
-        const STEP = 0x8000;
-        for (let i = 0; i < bytes.length; i += STEP) {
-            binary += String.fromCharCode(...bytes.subarray(i, i + STEP));
-        }
-        return btoa(binary);
-    };
-
     recorder.ondataavailable = (e) => {
         if (e.data.size === 0 || writeFailed) return;
         const isFirst = chunkCount === 0;
@@ -326,12 +344,19 @@ export const startPhoneCapture = (
         writeChain = writeChain.then(async () => {
             if (writeFailed) return;
             try {
-                const buffer = await e.data.arrayBuffer();
-                await invoke("phone_camera_capture_chunk", {
-                    mimeType: effectiveMime,
-                    chunkB64: toBase64(buffer),
-                    first: isFirst,
-                });
+                // The chunk goes over as its own raw body, with the metadata that used to travel
+                // beside it in JSON moved into headers. No base64, no string building on the main
+                // thread, and a third fewer bytes on the wire than the previous encoding.
+                await invoke(
+                    "phone_camera_capture_chunk",
+                    await e.data.arrayBuffer(),
+                    {
+                        headers: {
+                            "x-briefcast-mime": effectiveMime,
+                            "x-briefcast-first": isFirst ? "1" : "0",
+                        },
+                    }
+                );
             } catch (err) {
                 // Stop after the first failure: every later chunk appends to the same file, so
                 // continuing past a gap would produce a silently corrupt recording.
@@ -359,8 +384,9 @@ export const startPhoneCapture = (
         };
     });
 
-    // One chunk per second: small enough that each IPC message stays around a megabyte, frequent
-    // enough that little is lost if the app dies mid-recording.
+    // One chunk a second. The interval was stretched to two to halve the cost of the base64 IPC
+    // path; with raw chunks that cost is low enough that the shorter window - which bounds how much
+    // footage is lost if the app dies mid-recording - is worth having back.
     recorder.start(1000);
 
     return {

@@ -27,6 +27,9 @@ mod services {
     // comment for why a webcam driver (DroidCam/Iriun/Camo) is otherwise the only way to get a
     // phone into a DirectShow device list, and why this needs to be an HTTPS server to avoid one.
     pub mod phone_camera;
+    // Carries the live recording preview from ffmpeg's stdout to the UI without touching the
+    // disk - see the module's own doc comment for the file-based approach this replaced and why.
+    pub mod preview_stream;
     pub mod trash;
     pub mod utility;
     pub mod video_edits;
@@ -286,6 +289,7 @@ fn main() {
             commands::recording::record_view_switch,
             commands::recording::get_webcam_sidecar_path,
             commands::recording::phone_camera_capture_chunk,
+            commands::recording::get_recording_preview_frame,
             commands::recording::save_phone_camera_capture,
             services::phone_camera::start_phone_camera_server,
             services::phone_camera::stop_phone_camera_server,

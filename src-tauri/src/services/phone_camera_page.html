@@ -45,6 +45,13 @@
   .dot.live { background: var(--ok); box-shadow: 0 0 0 4px rgba(34,197,94,.18); }
   .dot.err  { background: var(--accent); box-shadow: 0 0 0 4px rgba(239,68,68,.18); }
   #status { margin-left: auto; font-size: 12.5px; color: var(--muted); text-align: right; }
+  /* The status turns into a real button whenever there's something to retry, so a dropped
+     connection is something the user can act on rather than just be told about. */
+  #status.actionable {
+    color: var(--text); background: #23232a; border: 1px solid var(--border);
+    border-radius: 999px; padding: 7px 14px; cursor: pointer; font-weight: 600;
+  }
+  #status.actionable:active { background: #2d2d36; }
 
   main { flex: 1; position: relative; background: #000; overflow: hidden; }
   video { width: 100%; height: 100%; object-fit: contain; display: block; }
@@ -66,6 +73,10 @@
   }
   button:active { background: #23232a; }
   button:disabled { opacity: .45; }
+  /* Status starts life as a bare label; only .actionable above makes it look clickable. */
+  #status:not(.actionable) {
+    background: none; border: none; padding: 0; cursor: default; font-weight: 400;
+  }
   .primary { background: #fff; color: #000; border-color: #fff; font-weight: 600; padding: 14px 30px; font-size: 16px; }
 
   footer {
@@ -86,7 +97,7 @@
 <header>
   <span class="dot" id="dot"></span>
   <span class="brand">Briefcast Camera</span>
-  <span id="status">Connecting…</span>
+  <button type="button" id="status">Connecting…</button>
 </header>
 
 <div id="err"></div>
@@ -130,10 +141,15 @@
   var remoteReady = false;
   var running = false;
   var reconnectTimer = null;
+  var retryDelay = 2000;
+  var MAX_RETRY_DELAY = 20000;
 
-  function setStatus(text, kind) {
+  // `retry` makes the status itself the reconnect control - see #status.actionable.
+  function setStatus(text, kind, retry) {
     statusEl.textContent = text;
     dot.className = "dot" + (kind ? " " + kind : "");
+    if (retry) statusEl.classList.add("actionable");
+    else statusEl.classList.remove("actionable");
   }
 
   function showError(msg) {
@@ -167,29 +183,58 @@
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   }
 
+  // Automatic retries back off so a phone left on a desk with the computer shut down isn't
+  // hammering a dead address every two seconds for an hour.
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      connectSignalling();
+    }, retryDelay);
+    retryDelay = Math.min(retryDelay * 1.6, MAX_RETRY_DELAY);
+  }
+
+  // Tapping the status when it's offering a retry: drop whatever timer is pending and try now.
+  function reconnectNow() {
+    if (!statusEl.classList.contains("actionable")) return;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    retryDelay = 2000;
+    setStatus("Reconnecting…", null);
+    if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
+    connectSignalling();
+  }
+
   function connectSignalling() {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(proto + "//" + location.host + "/ws?role=phone");
 
     ws.onopen = function () {
       clearError();
-      setStatus(running ? "Streaming" : "Ready", running ? "live" : null);
+      retryDelay = 2000;
       send({ type: "hello", role: "phone" });
-    };
 
-    ws.onclose = function () {
-      setStatus("Disconnected", "err");
-      // The desktop may simply have closed the pairing panel; retry quietly so walking back
-      // into range or reopening the panel picks the phone straight back up.
-      if (!reconnectTimer) {
-        reconnectTimer = setTimeout(function () {
-          reconnectTimer = null;
-          connectSignalling();
-        }, 2000);
+      // Re-offer if the camera is still running. The peer connection does NOT survive the
+      // signalling socket dropping - the desktop tears its side down when the socket closes, so
+      // without a fresh offer here the page would sit showing a live local preview while the
+      // computer received nothing. That mismatch is exactly what "Disconnected" over a moving
+      // picture looks like.
+      if (running) {
+        setStatus("Reconnecting…", null);
+        negotiate();
+      } else {
+        setStatus("Ready", null);
       }
     };
 
-    ws.onerror = function () { setStatus("Connection error", "err"); };
+    ws.onclose = function () {
+      // Offer the retry immediately rather than only after the automatic attempts - the usual
+      // cause is the computer's end going away (panel closed, app restarted, laptop asleep), and
+      // that comes back on the user's schedule, not on a timer's.
+      setStatus("Disconnected - tap to reconnect", "err", true);
+      scheduleReconnect();
+    };
+
+    ws.onerror = function () { setStatus("Connection error - tap to retry", "err", true); };
 
     ws.onmessage = function (ev) {
       var msg;
@@ -231,7 +276,52 @@
     // the whole feature working with no internet access at all.
     pc = new RTCPeerConnection({ iceServers: [] });
 
-    stream.getTracks().forEach(function (t) { pc.addTrack(t, stream); });
+    // Bitrate is set explicitly, and this is the single biggest lever on how the phone layer
+    // actually looks. WebRTC is built for the open internet, so Chromium starts a single video
+    // stream conservatively and ramps cautiously - well under what this link can carry. Everything
+    // downstream inherits that ceiling: the desktop records what WebRTC delivered, so a
+    // MediaRecorder set to 8 Mbps cannot put back detail the sender never encoded.
+    //
+    // `maintain-framerate` because this is a camera feed, not a slide: under pressure it should
+    // shed sharpness rather than start stuttering, which is the artefact people actually notice.
+    // `contentHint = "motion"` tells the encoder the same thing.
+    stream.getTracks().forEach(function (t) {
+      if (t.kind === "video") {
+        try { t.contentHint = "motion"; } catch (e) {}
+      }
+      try {
+        pc.addTransceiver(t, {
+          direction: "sendonly",
+          streams: [stream],
+          sendEncodings: [{ maxBitrate: 8000000, maxFramerate: 30 }],
+        });
+      } catch (e) {
+        // Older WebView without sendEncodings support - fall back to addTrack and apply the
+        // same ceiling afterwards through setParameters.
+        var sender = pc.addTrack(t, stream);
+        try {
+          var params = sender.getParameters();
+          if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+          params.encodings[0].maxBitrate = 8000000;
+          params.encodings[0].maxFramerate = 30;
+          params.degradationPreference = "maintain-framerate";
+          sender.setParameters(params).catch(function () {});
+        } catch (e2) { /* keep the browser's defaults */ }
+      }
+    });
+
+    // degradationPreference is only settable through setParameters, so apply it to whatever
+    // senders ended up being created above.
+    pc.getSenders().forEach(function (sender) {
+      if (!sender.track || sender.track.kind !== "video") return;
+      try {
+        var p = sender.getParameters();
+        p.degradationPreference = "maintain-framerate";
+        if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+        if (!p.encodings[0].maxBitrate) p.encodings[0].maxBitrate = 8000000;
+        sender.setParameters(p).catch(function () {});
+      } catch (e) { /* keep the browser's defaults */ }
+    });
 
     pc.onicecandidate = function (e) {
       if (e.candidate) send({ type: "ice", candidate: e.candidate.toJSON() });
@@ -316,6 +406,7 @@
     startCamera();
   }
 
+  statusEl.addEventListener("click", reconnectNow);
   startBtn.addEventListener("click", startCamera);
   stopBtn.addEventListener("click", stopCamera);
   flipBtn.addEventListener("click", flipCamera);

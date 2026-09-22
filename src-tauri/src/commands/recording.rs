@@ -6,7 +6,6 @@
 // platform module (win/macos/linux) implements the same set of `recording_with_output_*`
 // functions plus `get_connected_devices`, using whatever ffmpeg input format that OS needs
 // (dshow / avfoundation / x11grab+pulse+v4l2) — see each module for details.
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::Utc;
 use log::{info, warn};
 use std::ffi::OsStr;
@@ -54,6 +53,10 @@ pub struct PhoneCaptureTarget {
 #[derive(Default)]
 pub struct AppState {
     output_path: Arc<Mutex<Option<PathBuf>>>,
+    // Newest live-preview frame for the recording in progress, fed straight from ffmpeg's stdout
+    // by services/preview_stream.rs. Not behind the async Mutex the rest of this struct uses: the
+    // producer is a blocking reader thread with no runtime to yield to.
+    preview_frame: crate::services::preview_stream::PreviewFrame,
     // Where the phone camera's own recording is accumulating, for the recording in progress.
     //
     // Resolved once, on the first chunk, from output_path below - NOT passed in from the
@@ -159,6 +162,16 @@ pub struct FormData {
     // per-mode default exactly (60 for sva, 30 for sa/s).
     #[serde(default)]
     framerate: Option<i32>,
+}
+
+impl AppState {
+    /// A handle on the live-preview slot, for the reader thread that fills it.
+    ///
+    /// Cloning the Arc rather than lending a reference matters: the thread outlives this call and
+    /// runs until ffmpeg closes its stdout.
+    pub(crate) fn preview_frame_handle(&self) -> crate::services::preview_stream::PreviewFrame {
+        self.preview_frame.clone()
+    }
 }
 
 impl FormData {
@@ -367,14 +380,30 @@ fn phone_capture_raw_path(video_path: &Path, mime_type: &str) -> PathBuf {
 #[tauri::command]
 pub async fn phone_camera_capture_chunk(
     state: State<'_, AppState>,
-    mime_type: String,
-    chunk_b64: String,
-    first: bool,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<(), String> {
-    let bytes = BASE64
-        .decode(chunk_b64.as_bytes())
-        .map_err(|e| format!("Malformed phone camera chunk: {e}"))?;
-
+    // The chunk arrives as a raw body with its metadata in headers, rather than as base64 inside a
+    // JSON object. Video is the one thing that genuinely does not belong in Tauri's JSON IPC: at
+    // the bitrates that look good, base64 inflates every chunk by a third, has to be built as a
+    // string on the WebView's main thread, and parsed back out of a multi-megabyte JSON document
+    // on this side - once every couple of seconds, for the whole recording. That overhead was what
+    // forced the capture bitrate down in the first place; removing it is what lets the phone layer
+    // record at full quality again.
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("Phone camera chunk arrived as JSON rather than raw bytes.".to_string())
+        }
+    };
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string())
+    };
+    let mime_type = header("x-briefcast-mime").unwrap_or_else(|| "video/webm".to_string());
+    let first = header("x-briefcast-first").as_deref() == Some("1");
     // On the first chunk, resolve the destination from the recording that's actually in progress
     // and remember it; every later chunk reuses it, so the answer can't drift mid-recording (and
     // stop_recording clearing output_path can't strand the final flush).
@@ -402,20 +431,27 @@ pub async fn phone_camera_capture_chunk(
         }
     };
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(first)
-        .append(!first)
-        .open(&target.raw_path)
-        .map_err(|e| {
-            format!(
-                "Failed to open the phone camera capture file at {}: {e}",
-                target.raw_path.display()
-            )
-        })?;
-    file.write_all(&bytes)
-        .map_err(|e| format!("Failed to write the phone camera recording: {e}"))
+    // Write on a blocking thread, for the same reason get_recording_preview_frame does above:
+    // synchronous file I/O on the async runtime's workers starves it, and a starved runtime means
+    // every other IPC call - including the ones the UI is waiting on - queues behind this one.
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(first)
+            .append(!first)
+            .open(&target.raw_path)
+            .map_err(|e| {
+                format!(
+                    "Failed to open the phone camera capture file at {}: {e}",
+                    target.raw_path.display()
+                )
+            })?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("Failed to write the phone camera recording: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Failed to save the phone camera recording: {e}"))?
 }
 
 // Finishes the phone-camera recording accumulated by phone_camera_capture_chunk, landing it as
@@ -488,28 +524,41 @@ pub async fn save_phone_camera_capture(
     #[cfg(not(target_os = "windows"))]
     let hw: Option<()> = None;
 
+    // Quality here is deliberately higher than the main recording's.
+    //
+    // This is a *second* encode of footage the phone already compressed once, so whatever it
+    // spends is spent on top of an existing generation loss. The main recording encodes camera
+    // frames straight from the sensor and can afford an ordinary quality target; this one is
+    // re-compressing an H.264 stream, where the same target would visibly stack artefacts.
+    //
+    // (A straight `-c copy` would avoid the second encode entirely - measured at 9x faster and
+    // half the size with every frame preserved - but it can only express the start offset below as
+    // a container start_time, which the editor's PiP layer assumes is zero. Not worth trading
+    // correct A/V alignment for, so the re-encode stays and simply pays for quality instead.)
     match hw {
         #[cfg(target_os = "windows")]
         Some(encoder) => {
             args.push("-c:v".into());
             args.push(encoder.name().to_string());
-            args.extend(encoder.quality_args());
+            args.extend(encoder.high_quality_args());
         }
         _ => {
             args.push("-c:v".into());
             args.push("libx264".into());
             args.push("-preset".into());
-            args.push("veryfast".into());
+            args.push("faster".into());
             args.push("-crf".into());
-            args.push("23".into());
+            args.push("18".into());
         }
     }
 
     args.extend([
+        // CFR, but at whatever rate the source actually ran at rather than a hardcoded 30 - a
+        // phone sending 60fps was previously having half its frames thrown away here. `-fps_mode
+        // cfr` alone still produces a constant rate (which is what the editor's seeking wants),
+        // it just derives it from the input instead of overriding it.
         "-fps_mode".to_string(),
         "cfr".to_string(),
-        "-r".to_string(),
-        "30".to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         // The editor scrubs this file; without a relocated moov it has to read to the end first.
@@ -559,6 +608,29 @@ pub async fn save_phone_camera_capture(
 // temporary - path_to_str hands back a &str tied to its argument.
 fn out_str_owned(path: &Path) -> Result<String, String> {
     path_to_str(path).map(|s| s.to_string())
+}
+
+// Hands the frontend the newest live-preview frame, as raw JPEG bytes.
+//
+// The frame comes from memory, not from disk: ffmpeg streams the preview as MJPEG on its stdout
+// and services/preview_stream.rs keeps the latest complete frame. So this is a buffer copy, which
+// is what makes it safe to poll many times a second for the whole length of a recording.
+//
+// Raw, not a base64 data URL - base64 would cost 33% more bytes across the IPC boundary plus an
+// encode here and a decode there, all of it to hand the frontend something it immediately turns
+// back into binary. An empty response means "nothing to show yet", which covers both "no recording
+// in progress" and "ffmpeg hasn't produced a frame yet"; a polling caller has no use for the
+// distinction.
+#[tauri::command]
+pub async fn get_recording_preview_frame(
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let frame = state
+        .preview_frame
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or(None);
+    Ok(tauri::ipc::Response::new(frame.unwrap_or_default()))
 }
 
 // Called by the live recording bar every time the user toggles between "Screen" and "Camera" as
@@ -1145,14 +1217,22 @@ pub async fn start_recording(
     let mut form_data = form_data;
     let uses_phone_camera = form_data.strip_phone_camera();
 
-    // The phone rides along as a separately-recorded PiP file written by the WebView, which only
-    // makes sense when ffmpeg is capturing a screen for it to sit on top of. The camera-only modes
-    // ("v"/"va") would have nothing left to record once the sentinel is stripped, so rather than
-    // silently producing a recording with no picture, say so.
-    if uses_phone_camera && !matches!(form_data.record_type.as_str(), "sva" | "sa" | "s") {
+    // The phone is always recorded by the WebView into the `<stem>_webcam.mp4` sidecar, never by
+    // ffmpeg (it isn't a capture device ffmpeg can open - see FormData::strip_phone_camera). That
+    // works alongside any mode where ffmpeg still has a picture of its own to record: a screen for
+    // the screen modes, or a computer camera for the camera-only ones.
+    //
+    // The single case that genuinely cannot work is a camera-only recording where the phone is the
+    // ONLY camera selected: stripping the sentinel leaves ffmpeg with no video input at all, so
+    // the main recording would have no picture. Everything else is now allowed.
+    if uses_phone_camera
+        && matches!(form_data.record_type.as_str(), "v" | "va")
+        && form_data.video_devices.is_empty()
+    {
         return Err(
-            "The phone camera can only be used with a screen-recording mode. Pick a \"Screen…\" \
-             recording option, or select a camera attached to this computer instead."
+            "The phone can't be the only camera for this recording type yet. Also tick a camera \
+             attached to this computer, or pick a \"Screen…\" recording option - either way the \
+             phone is recorded as its own layer you can position in the editor."
                 .to_string(),
         );
     }
@@ -1183,6 +1263,9 @@ pub async fn start_recording(
     // Same reasoning as the view-switch log above: a previous recording that failed partway could
     // otherwise leave a phone-capture target behind for this one to append to.
     *state.phone_capture.lock().await = None;
+    if let Ok(mut guard) = state.preview_frame.lock() {
+        *guard = None;
+    }
 
     // Cloned before the match below moves `state` into whichever platform::recording_with_output_*
     // arm actually runs - these are Arc<Mutex<..>> clones of the same shared AppState fields, so
@@ -1408,6 +1491,13 @@ pub async fn stop_recording(
     }
 
     info!("Recording stopped");
+
+    // Drop the last preview frame now that there is nothing live to preview. The reader thread
+    // has already ended with ffmpeg's stdout closing; this just stops the final frame lingering
+    // into whatever recording comes next.
+    if let Ok(mut guard) = state.preview_frame.lock() {
+        *guard = None;
+    }
 
     // Stop the system-audio capture (if this recording had one running) and mux it into the
     // just-finished file. Must happen after ffmpeg has actually exited above - muxing stream-
@@ -1676,8 +1766,11 @@ async fn create_or_replace_rec_completed_modal(
     // below returns, and even then its webview/JS hasn't loaded far enough to have registered
     // a listener. An event fired here would always be missed. A URL query param has no such
     // race: the page reads it on its very first render.
+    // Root-relative: the entry HTML sits beside index.html (see vite.config.ts's rollup input for
+    // why it can't live under src-tauri/), which is where both the dev server and the bundled
+    // frontend serve it from.
     let url = format!(
-        "src-tauri/src/views/completed_recording.html?path={}",
+        "completed_recording.html?path={}",
         urlencoding::encode(file_path)
     );
 

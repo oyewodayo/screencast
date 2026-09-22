@@ -46,6 +46,17 @@ impl HwEncoder {
     // reasonable quality" encode - detect()'s test-encode step validates whichever is actually
     // used before a real recording ever depends on it, so a wrong guess here just means that
     // candidate fails its own probe and detection falls through to the next one (or to software).
+    // For re-encoding already-compressed footage, where the ordinary target below would stack a
+    // second generation of artefacts on top of the first. See save_phone_camera_capture.
+    pub fn high_quality_args(self) -> Vec<String> {
+        let raw: &[&str] = match self {
+            HwEncoder::Nvenc => &["-preset", "p5", "-rc", "vbr", "-cq", "18", "-b:v", "0"],
+            HwEncoder::Qsv => &["-preset", "slow", "-global_quality", "18"],
+            HwEncoder::Amf => &["-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "18"],
+        };
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
     pub fn quality_args(self) -> Vec<String> {
         let raw: &[&str] = match self {
             HwEncoder::Nvenc => &["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
