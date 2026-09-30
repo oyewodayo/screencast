@@ -407,9 +407,29 @@ export function sendOverlayToBack<T extends { id: string }>(overlays: T[], id: s
 // (drag the chip body) is exactly "shift startTime/endTime together, leave everything else alone"
 // regardless of overlay kind.
 
-export function makeAudioOverlay(src: string, sourceDuration: number, startTime: number, endTime: number): AudioOverlay {
+export function makeAudioOverlay(src: string, sourceDuration: number, startTime: number, endTime: number, label?: string): AudioOverlay {
   const now = Date.now();
-  return { id: crypto.randomUUID(), src, sourceDuration, startTime, endTime, trimStart: 0, volume: 1, createdAt: now, updatedAt: now };
+  return { id: crypto.randomUUID(), src, sourceDuration, startTime, endTime, trimStart: 0, volume: 1, ...(label ? { label } : {}), createdAt: now, updatedAt: now };
+}
+
+// Stacks audio overlays into rows so overlapping ones (e.g. a detached voice and music pair, or
+// several detached streams) get their own row instead of drawing on top of each other. Greedy
+// by start time: each overlay takes the first row whose last overlay has already ended.
+export function packAudioRows(overlays: AudioOverlay[]): { rowOf: Map<string, number>; rowCount: number } {
+  const rowEnds: number[] = [];
+  const rowOf = new Map<string, number>();
+  const sorted = [...overlays].sort((a, b) => a.startTime - b.startTime || a.createdAt - b.createdAt);
+  for (const o of sorted) {
+    let row = rowEnds.findIndex((end) => end <= o.startTime + 1e-6);
+    if (row === -1) {
+      row = rowEnds.length;
+      rowEnds.push(o.endTime);
+    } else {
+      rowEnds[row] = o.endTime;
+    }
+    rowOf.set(o.id, row);
+  }
+  return { rowOf, rowCount: rowEnds.length };
 }
 
 // Drags one edge of an audio overlay's time range - unlike resizeOverlayTime (text/image, which

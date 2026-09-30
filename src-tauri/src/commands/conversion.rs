@@ -3519,11 +3519,19 @@ pub async fn extract_clip_audio(
     volume: f64,
     output_format: String, // "mp3" | "wav" | "aac"
     output_path: String,
+    // Which audio stream to take (`0:a:N`, see audio_tracks::probe_audio_streams). None keeps
+    // ffmpeg's own default pick - the single "best" audio stream - which silently ignores any
+    // others in a multi-track file.
+    stream_index: Option<u32>,
 ) -> Result<String, String> {
     if end <= start {
         return Err("End must be after start".to_string());
     }
     let speed = speed.max(0.25).min(4.0);
+    // "Detach audio" writes into the app cache dir, which may not exist yet on a fresh install.
+    if let Some(parent) = PathBuf::from(&output_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create output folder: {}", e))?;
+    }
 
     let mut af_parts = vec![format!(
         "atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS",
@@ -3548,7 +3556,11 @@ pub async fn extract_clip_audio(
         _ => return Err(format!("Unsupported audio format: {}", output_format)),
     };
 
-    let mut owned_args: Vec<String> = vec!["-vn".into(), "-af".into(), af_parts.join(",")];
+    let mut owned_args: Vec<String> = Vec::new();
+    if let Some(n) = stream_index {
+        owned_args.extend(["-map".to_string(), format!("0:a:{}", n)]);
+    }
+    owned_args.extend(["-vn".to_string(), "-af".to_string(), af_parts.join(",")]);
     owned_args.extend(codec_args.iter().map(|s| s.to_string()));
     let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
 

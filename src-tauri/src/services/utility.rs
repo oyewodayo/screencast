@@ -26,7 +26,7 @@ pub fn get_platform() -> &'static str {
 //
 // Deliberately hand-rolled rather than pulling in a `which` crate for one short function: the
 // rule is simple and the dependency wouldn't be.
-fn find_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
     // Windows needs the extension appended; Unix uses the bare name.
     #[cfg(windows)]

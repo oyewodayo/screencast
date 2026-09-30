@@ -166,6 +166,10 @@ export interface UseVideoEditStoreResult {
   moveAudioOverlayTime: (id: string, newStartTime: number) => void;
   deleteAudioOverlay: (id: string) => void;
   duplicateAudioOverlay: (id: string) => string;
+  // "Unlink" the primary video's own sound: adds one audio overlay per already-extracted clip
+  // audio file AND mutes the video track, as a single undo step - so the result can be trimmed,
+  // lowered, muted or deleted per piece without touching the picture.
+  detachVideoAudio: (tracks: { src: string; sourceDuration: number; startTime: number; endTime: number; label?: string }[]) => void;
   // Picture-in-picture video layers (e.g. a separately-recorded webcam - see FormData.
   // separate_webcam_capture, recording.rs) - same "real source file, trims into it" shape as audio
   // overlays above, plus frame-relative geometry/shape like image overlays. See PipOverlay's own
@@ -830,6 +834,17 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const detachVideoAudio = useCallback(
+    (tracks: { src: string; sourceDuration: number; startTime: number; endTime: number; label?: string }[]) => {
+      const current = stateRef.current;
+      if (!current || tracks.length === 0) return;
+      let audioOverlays = current.audioOverlays;
+      for (const t of tracks) audioOverlays = addOverlay(audioOverlays, makeAudioOverlay(t.src, t.sourceDuration, t.startTime, t.endTime, t.label));
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays, videoAudioMuted: true }), "detach-audio");
+    },
+    [pushCommand]
+  );
+
   const updateAudioOverlayContent = useCallback(
     (id: string, patch: AudioOverlayContentPatch) => {
       const current = stateRef.current;
@@ -1196,6 +1211,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     deleteBlurOverlay,
     duplicateBlurOverlay,
     addAudioOverlay,
+    detachVideoAudio,
     updateAudioOverlayContent,
     resizeAudioOverlayTime: resizeAudioOverlayTimeCb,
     moveAudioOverlayTime,

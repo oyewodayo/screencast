@@ -10,6 +10,7 @@ use tauri::Manager;
 
 mod commands {
     pub mod annotation;
+    pub mod audio_tracks;
     pub mod conversion;
     pub mod native_playback;
     pub mod recording;
@@ -330,6 +331,12 @@ fn main() {
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
             commands::conversion::extract_clip_audio,
+            commands::audio_tracks::probe_audio_streams,
+            commands::audio_tracks::get_separation_engine,
+            commands::audio_tracks::separate_voice_music,
+            commands::audio_tracks::download_separation_engine,
+            commands::audio_tracks::cancel_separation_engine_download,
+            commands::audio_tracks::cancel_voice_music_separation,
             commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,
