@@ -30,6 +30,10 @@ mod services {
     // Carries the live recording preview from ffmpeg's stdout to the UI without touching the
     // disk - see the module's own doc comment for the file-based approach this replaced and why.
     pub mod preview_stream;
+    // Makes a recording's ffmpeg child die with the app instead of outliving it, holding the
+    // camera open and competing for the machine - Job Object on Windows, PR_SET_PDEATHSIG on
+    // Linux. See the module's own comment for the macOS gap.
+    pub mod orphan_guard;
     pub mod trash;
     pub mod utility;
     pub mod video_edits;
@@ -57,11 +61,12 @@ mod services {
     // live signal at all). Windows-only for now, same reasoning as process_job above.
     #[cfg(target_os = "windows")]
     pub mod progress_watch;
-    // Detects a real, working hardware H.264 encoder (NVENC/QSV/AMF) via a trial encode, so
-    // recordings can offload from the CPU instead of always using software libx264 - see the
-    // module's own doc comment for why "does ffmpeg list this encoder" alone isn't good enough.
-    // Windows-only for now, same reasoning as progress_watch above.
-    #[cfg(target_os = "windows")]
+    // Detects a real, working hardware H.264 encoder via a trial encode, so recordings can
+    // offload from the CPU instead of always using software libx264 - see the module's own doc
+    // comment for why "does ffmpeg list this encoder" alone isn't good enough. Cross-platform:
+    // NVENC/QSV/AMF on Windows, VideoToolbox on macOS, NVENC on Linux. The detection mechanism is
+    // a real subprocess encode with the exact intended flags, which is platform-agnostic by
+    // construction - nothing here needed to be Windows-specific.
     pub mod hw_encoder;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled

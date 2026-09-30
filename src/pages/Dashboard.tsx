@@ -59,6 +59,17 @@ import {
   forgetFile,
 } from "../utils/homeScreenFiles";
 import {
+  getResumeTime,
+  recordPlaybackPosition,
+  clearPlaybackPosition,
+  flushPlaybackPositions,
+  getLastOpenedFile,
+  recordLastOpenedFile,
+  forgetLastOpenedFile,
+  repathPlaybackState,
+  forgetPlaybackState,
+} from "../utils/playbackResume";
+import {
   IoVideocam,
   IoMusicalNotes,
   IoImage,
@@ -538,6 +549,11 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     // left the player pointed at some *other* file's asset URL - opening a genuinely different
     // file here always starts fresh, so the "what's actually loaded" tracker needs to reset too.
     previewSourcePathRef.current = selectedFile?.sourcePath ?? null;
+    // Closing/replacing the open file is exactly the moment where the position updates still
+    // sitting in playbackResume's write-behind buffer matter most (leaving for Docs/home unmounts
+    // the player, so no further ticks are coming), so force them out instead of waiting for the
+    // timer. Runs on unmount too, via the cleanup.
+    return flushPlaybackPositions;
   }, [selectedFile?.path]);
 
   // Asset URLs for files referenced by a timeline clip other than the one currently open -
@@ -678,10 +694,9 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // hiding a window the user just turned drawing back on for.
   const annotationHideTimeoutRef = useRef<number | null>(null);
 
-  // Last known playback position per audio file (keyed by sourcePath), so switching away and
-  // back — including by accident via prev/next — resumes instead of restarting at 0. A ref, not
-  // state: it's written on every timeupdate tick and shouldn't trigger re-renders.
-  const audioPositionsRef = useRef<Record<string, number>>({});
+  // Playback positions used to live here as an audio-only ref; they're now in
+  // utils/playbackResume.ts, which covers video too and survives an app restart. See
+  // handleMediaTimeUpdate below for the write side and the `initialTime` prop for the read side.
   // Sourcepaths visited while shuffle is on, so "previous" can undo a shuffled "next" instead of
   // computing a sequential-order previous that wouldn't match what was actually just played.
   const shuffleHistoryRef = useRef<string[]>([]);
@@ -1295,6 +1310,7 @@ const setScreen = () => {
 			const { pinned, recent } = forgetFile(file.path);
 			setPinnedPaths(pinned);
 			setRecentPaths(recent);
+			forgetPlaybackState(file.path);
 			await handleDirectoryFiles();
 			setMessage(`Moved to trash: ${formatFileName(file.name)}`);
 		} catch (error) {
@@ -1697,6 +1713,11 @@ const setScreen = () => {
 		// leaves it, since the tool has nothing to do with what's now on screen.
 		setVideoEditorScreen((prev) => (prev && getFileCategory(fileName) === "video" ? { mode: "editing" } : null));
 		setRecentPaths(recordFileOpened(filePath));
+		// Remembered per category so clicking the sidebar's Video/Audio/Image/Pdf/Documents tab can
+		// bring this file back later (see restoreLastOpenedForCategory below), rather than leaving
+		// whatever unrelated file happens to be on screen when the tab changes.
+		const openedCategory = getFileCategory(fileName);
+		if (openedCategory) recordLastOpenedFile(openedCategory, { path: filePath, name: fileName });
 
 		console.log('File selected for playback:', fileName);
 	} catch (error) {
@@ -1774,6 +1795,37 @@ const setScreen = () => {
 			.flat()
 			.filter((file) => getFileCategory(file.name) === category);
 
+	// Switching to a sidebar category tab reopens whatever was last open under it, so the tabs
+	// behave like the per-type workspaces they look like rather than only re-filtering the file
+	// list while some unrelated file stays on screen. Paired with the resume positions above, that
+	// means clicking Video mid-way through a podcast and clicking back to Audio lands exactly where
+	// each was left.
+	//
+	// Deliberately conservative about *not* acting:
+	//   - nothing remembered for the category, or the file list hasn't loaded yet: leave the main
+	//     pane exactly as it is, rather than blanking out whatever the user is looking at.
+	//   - the remembered file is gone from disk (deleted/moved outside the app): drop the entry so
+	//     the tab stops trying, and leave the pane alone this time.
+	//   - it's already what's open: don't reload it, which would restart playback from the resume
+	//     point and throw away the live player's position.
+	const restoreLastOpenedForCategory = async (category: FileCategory) => {
+		const last = getLastOpenedFile(category);
+		if (!last) return;
+
+		const categoryFiles = getFlatFilesForCategory(category);
+		// An empty list here means "not loaded yet" as often as it means "none left", and forgetting
+		// the entry on the former would quietly lose it, so only treat a *populated* list that's
+		// missing the file as proof it's gone.
+		if (categoryFiles.length === 0) return;
+		if (!categoryFiles.some((file) => file.path === last.path)) {
+			forgetLastOpenedFile(category);
+			return;
+		}
+
+		if (selectedFileRef.current?.sourcePath === last.path) return;
+		await loadFileForPlayback(last.path, last.name);
+	};
+
 	// Cycles to the previous/next image relative to whatever's currently selected, wrapping
 	// around at either end (matches how most image viewers handle prev/next at the boundaries).
 	//
@@ -1797,15 +1849,19 @@ const setScreen = () => {
 		loadFileForPlayback(next.path, next.name);
 	};
 
-	// Persists the currently-playing audio file's position on every tick, keyed by its
-	// filesystem path — read back in the `initialTime` passed to VideoPlayer below so navigating
-	// away and back (including by an accidental prev/next tap) resumes instead of restarting.
-	// Stable identity (empty deps) so VideoPlayer's own timeupdate listener doesn't get torn
-	// down and re-attached on every unrelated Dashboard re-render.
-	const handleAudioTimeUpdate = useCallback((time: number) => {
+	// Persists the currently-playing file's position on every tick, keyed by its filesystem path —
+	// read back in the `initialTime` passed to VideoPlayer below so navigating away and back
+	// (leaving for Docs/Board/home, switching sidebar tabs, or an accidental prev/next tap)
+	// resumes instead of restarting. Applies to video and audio alike; the persistence itself,
+	// including the throttling that keeps ~4 ticks/sec off localStorage, lives in
+	// utils/playbackResume.ts. Stable identity (empty deps) so VideoPlayer's own timeupdate
+	// listener doesn't get torn down and re-attached on every unrelated Dashboard re-render.
+	const handleMediaTimeUpdate = useCallback((time: number) => {
 		const current = selectedFileRef.current;
-		if (current && getFileCategory(current.name) === "audio") {
-			audioPositionsRef.current[current.sourcePath] = time;
+		if (!current) return;
+		const category = getFileCategory(current.name);
+		if (category === "video" || category === "audio") {
+			recordPlaybackPosition(current.sourcePath, time);
 		}
 	}, []);
 
@@ -1907,6 +1963,11 @@ const setScreen = () => {
 	// handlers above bails immediately if the file that just ended isn't its category, so exactly
 	// one of them actually does anything on any given call.
 	const handleMediaEnded = useCallback(() => {
+		// A file watched to the end has no position worth resuming - without this it would reopen a
+		// second before the end and immediately end again. Done before the auto-advance handlers
+		// below, which may change what selectedFileRef points at.
+		const finished = selectedFileRef.current;
+		if (finished) clearPlaybackPosition(finished.sourcePath);
 		handleAudioEnded();
 		handleVideoEnded();
 	}, [handleAudioEnded, handleVideoEnded]);
@@ -2186,6 +2247,7 @@ const setScreen = () => {
 					const { pinned, recent } = repathFile(toMove[i].path, result.value);
 					setPinnedPaths(pinned);
 					setRecentPaths(recent);
+					repathPlaybackState(toMove[i].path, result.value);
 				}
 			});
 
@@ -2251,6 +2313,7 @@ const setScreen = () => {
 					const { pinned, recent } = forgetFile(fileList[i].path);
 					setPinnedPaths(pinned);
 					setRecentPaths(recent);
+					forgetPlaybackState(fileList[i].path);
 				}
 			});
 			await handleDirectoryFiles();
@@ -2424,6 +2487,7 @@ const setScreen = () => {
 			const { pinned, recent } = repathFile(file.path, newPath);
 			setPinnedPaths(pinned);
 			setRecentPaths(recent);
+			repathPlaybackState(file.path, newPath);
 			try {
 				await invoke("relink_doc_path", { oldPath: file.path, newPath });
 				await refreshDocsIndex();
@@ -2519,6 +2583,7 @@ const setScreen = () => {
                         setActiveFileCategory(category);
                         setSelectedFilePaths(new Set());
                         setSelectedFolder(null);
+                        void restoreLastOpenedForCategory(category);
                       }}
                       className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
                         activeFileCategory === category
@@ -3489,10 +3554,10 @@ const setScreen = () => {
                 filePath={selectedFile.sourcePath}
                 title={selectedFile.name}
                 autoPlay={true}
-                initialTime={isAudioSelected ? audioPositionsRef.current[selectedFile.sourcePath] : undefined}
+                initialTime={getResumeTime(selectedFile.sourcePath)}
                 loop={isAudioSelected && audioRepeatMode === "one"}
                 onTimeUpdate={(time) => {
-                  handleAudioTimeUpdate(time);
+                  handleMediaTimeUpdate(time);
                   setPlayerCurrentTime(time);
                 }}
                 onPlayStateChange={setPlayerIsPlaying}

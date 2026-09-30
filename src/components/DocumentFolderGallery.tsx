@@ -102,6 +102,11 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
   const [contextMenu, setContextMenu] = useState<{ file: GalleryFile; x: number; y: number } | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
   const [bulkMoveOpen, setBulkMoveOpen] = useState<boolean>(false);
+  // Whether the right-click menu's own "Move to" row is expanded into its folder list. Separate
+  // from bulkMoveOpen above, which belongs to the multi-select panel's Move to - the two menus can
+  // never be open at once, but they're independent bits of UI with independent targets (one file
+  // vs the whole selection), so they don't share a flag.
+  const [ctxMoveOpen, setCtxMoveOpen] = useState<boolean>(false);
   const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Anchor for Shift-click range-select - the index of the last tile clicked WITHOUT Shift (a
   // plain or Ctrl/Cmd click). A ref, not state: it only needs to be read back on a later click,
@@ -116,6 +121,12 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
     const close = () => setContextMenu(null);
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
+  }, [contextMenu]);
+
+  // Collapses the context menu's folder list whenever the menu itself opens on another tile (or
+  // closes), so a later right-click never comes up already expanded from the previous one.
+  useEffect(() => {
+    setCtxMoveOpen(false);
   }, [contextMenu]);
 
   useEffect(() => () => {
@@ -143,6 +154,9 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
   };
 
   const selectedInFolder = files.filter((file) => selectedFilePaths.has(file.path));
+  // Every folder this file could move TO - i.e. all of them except the one already being shown.
+  // Shared by the multi-select panel's "Move to" and the per-file one in the right-click menu.
+  const otherFolders = folderOptions.filter((folder) => folder.key !== currentFolder);
 
   if (files.length === 0) {
     return (
@@ -322,25 +336,23 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
                 </button>
                 {bulkMoveOpen && (
                   <div className="mt-1 max-h-40 overflow-y-auto border border-gray-200 dark:border-neutral-700 rounded-lg bg-white dark:bg-neutral-900 shadow-inner">
-                    {folderOptions.filter((folder) => folder.key !== currentFolder).length === 0 ? (
+                    {otherFolders.length === 0 ? (
                       <p className="px-3 py-1.5 text-xs text-neutral-400 dark:text-neutral-500 italic">No other folders</p>
                     ) : (
-                      folderOptions
-                        .filter((folder) => folder.key !== currentFolder)
-                        .map((folder) => (
-                          <button
-                            key={folder.key || "__root__"}
-                            type="button"
-                            title={folder.key || "Briefcast"}
-                            className="w-full text-left px-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                            onClick={() => {
-                              onMoveFiles(selectedInFolder, folder.key);
-                              setBulkMoveOpen(false);
-                            }}
-                          >
-                            {folder.label}
-                          </button>
-                        ))
+                      otherFolders.map((folder) => (
+                        <button
+                          key={folder.key || "__root__"}
+                          type="button"
+                          title={folder.key || "Briefcast"}
+                          className="w-full text-left px-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                          onClick={() => {
+                            onMoveFiles(selectedInFolder, folder.key);
+                            setBulkMoveOpen(false);
+                          }}
+                        >
+                          {folder.label}
+                        </button>
+                      ))
                     )}
                   </div>
                 )}
@@ -395,6 +407,44 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
             >
               Rename
             </button>
+            {/* "Move to ▸" - expands in place into the folder list rather than opening a hover
+                flyout, matching the sidebar's own per-file move menu (Dashboard.tsx): it behaves
+                the same on touch/trackpad as with a mouse, and there's no hover timing to get
+                wrong. Acts on this one tile only, like every other row in this menu - moving a
+                whole selection at once is what the multi-select panel's own "Move to" is for. */}
+            <button
+              type="button"
+              className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+              onClick={() => setCtxMoveOpen((prev) => !prev)}
+            >
+              <span className="flex-1 text-left">Move to</span>
+              <IoChevronForward
+                size={11}
+                className={`shrink-0 text-neutral-400 dark:text-neutral-500 transition-transform ${ctxMoveOpen ? "rotate-90" : ""}`}
+              />
+            </button>
+            {ctxMoveOpen && (
+              <div className="mx-1 my-0.5 max-h-40 overflow-y-auto rounded bg-gray-50 dark:bg-neutral-900/60 py-0.5">
+                {otherFolders.length === 0 ? (
+                  <p className="px-3 py-1.5 text-xs text-neutral-400 dark:text-neutral-500 italic">No other folders</p>
+                ) : (
+                  otherFolders.map((folder) => (
+                    <button
+                      key={folder.key || "__root__"}
+                      type="button"
+                      title={folder.label}
+                      className="w-full text-left px-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
+                      onClick={() => {
+                        onMoveFiles([contextMenu.file], folder.key);
+                        setContextMenu(null);
+                      }}
+                    >
+                      {folder.label}
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
             <button
               type="button"
               className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 text-red-600 dark:text-red-400"

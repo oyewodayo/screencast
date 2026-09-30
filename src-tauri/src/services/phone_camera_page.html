@@ -280,7 +280,9 @@
     // actually looks. WebRTC is built for the open internet, so Chromium starts a single video
     // stream conservatively and ramps cautiously - well under what this link can carry. Everything
     // downstream inherits that ceiling: the desktop records what WebRTC delivered, so a
-    // MediaRecorder set to 8 Mbps cannot put back detail the sender never encoded.
+    // MediaRecorder cannot put back detail the sender never encoded, so this cap is the real
+    // ceiling on how the phone layer looks. 3 Mbps at 720p is generous for a PiP bubble and is
+    // what the desktop can receive and re-encode without stalling its own UI.
     //
     // `maintain-framerate` because this is a camera feed, not a slide: under pressure it should
     // shed sharpness rather than start stuttering, which is the artefact people actually notice.
@@ -293,7 +295,7 @@
         pc.addTransceiver(t, {
           direction: "sendonly",
           streams: [stream],
-          sendEncodings: [{ maxBitrate: 8000000, maxFramerate: 30 }],
+          sendEncodings: [{ maxBitrate: 3000000, maxFramerate: 30 }],
         });
       } catch (e) {
         // Older WebView without sendEncodings support - fall back to addTrack and apply the
@@ -302,7 +304,7 @@
         try {
           var params = sender.getParameters();
           if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-          params.encodings[0].maxBitrate = 8000000;
+          params.encodings[0].maxBitrate = 3000000;
           params.encodings[0].maxFramerate = 30;
           params.degradationPreference = "maintain-framerate";
           sender.setParameters(params).catch(function () {});
@@ -318,7 +320,7 @@
         var p = sender.getParameters();
         p.degradationPreference = "maintain-framerate";
         if (!p.encodings || !p.encodings.length) p.encodings = [{}];
-        if (!p.encodings[0].maxBitrate) p.encodings[0].maxBitrate = 8000000;
+        if (!p.encodings[0].maxBitrate) p.encodings[0].maxBitrate = 3000000;
         sender.setParameters(p).catch(function () {});
       } catch (e) { /* keep the browser's defaults */ }
     });
@@ -350,8 +352,15 @@
     var constraints = {
       video: {
         facingMode: { ideal: facing },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        // 720p, not 1080p. This is a picture-in-picture camera layer composited into a corner of
+        // the recording, not the main picture - 720p is already more detail than the bubble can
+        // show. It also halves what the desktop has to decode, which matters because that decode
+        // happens inside the same WebView that draws the app's UI: measured on a 4K/HD-630
+        // machine, a 1080p stream being received and re-encoded during a screen recording dropped
+        // the app from 61fps to the mid-30s/50s with IPC round trips spiking past 400ms, while
+        // 720p at a matched bitrate stayed at 58fps with a single dropped frame.
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
         frameRate: { ideal: 30 }
       },
       audio: false   // mic stays on the PC's own selected audio device

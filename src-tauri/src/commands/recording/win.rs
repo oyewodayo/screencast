@@ -16,12 +16,10 @@ use windows::Win32::System::Threading::{
 };
 
 use super::{
-    audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext,
+    audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext_hw,
     extract_ffmpeg_error, map_overlay_size, resolve_capture_target, silent_command, AppState,
     CaptureTarget, FormData, AUDIO_ENHANCE_FILTER,
 };
-use crate::services::hw_encoder;
-use crate::services::process_job;
 use crate::services::progress_watch;
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
@@ -38,41 +36,6 @@ fn desktop_scale_args(max_width: i32) -> Vec<String> {
     ]
 }
 
-// Swaps codec_args_for_ext's software video-encode segment (`-c:v libx264 -preset ultrafast
-// [-crf N]`) for a detected hardware encoder's own, when one actually works on this machine (see
-// services/hw_encoder.rs) - CPU usage on a long/high-res recording is the single biggest
-// encoding-side complaint this app's software-only libx264 path has (see
-// RECORDING_UPGRADE_NOTES.md). Only for the h264-targeting containers that path already covers
-// (mp4/mkv/avi/mov); webm's target codec is VP8, which has no equivalent widely-available
-// hardware path, so it's left on software regardless. Finds the software segment by locating
-// "-pix_fmt" (which immediately follows it in every one of those four branches) rather than
-// hardcoding each branch's exact offset, so this stays correct if codec_args_for_ext's own args
-// ever get reordered.
-fn codec_args_for_ext_hw(ext: &str, ffmpeg_path: &std::path::Path) -> Vec<String> {
-    let args = codec_args_for_ext(ext);
-    if !matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "avi" | "mov") {
-        return args;
-    }
-    let Some(encoder) = hw_encoder::detect(ffmpeg_path) else {
-        return args;
-    };
-    let Some(cv_idx) = args.iter().position(|a| a == "-c:v") else {
-        return args;
-    };
-    let Some(pix_fmt_idx) = args.iter().position(|a| a == "-pix_fmt") else {
-        return args;
-    };
-    if pix_fmt_idx <= cv_idx {
-        return args;
-    }
-
-    let mut patched = args[..cv_idx].to_vec();
-    patched.push("-c:v".to_string());
-    patched.push(encoder.name().to_string());
-    patched.extend(encoder.quality_args());
-    patched.extend(args[pix_fmt_idx..].iter().cloned());
-    patched
-}
 
 fn desktop_crop_args(x: i32, y: i32, width: i32, height: i32) -> Vec<String> {
     vec![
@@ -229,10 +192,11 @@ async fn start_recording_process(
         cmd.stdout(Stdio::piped());
     }
 
+    crate::services::orphan_guard::before_spawn(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
-    process_job::assign_to_job(&child);
+    crate::services::orphan_guard::after_spawn(&child);
     let pid = child.id();
 
     if capture_preview {

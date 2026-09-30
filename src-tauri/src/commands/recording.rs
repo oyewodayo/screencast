@@ -813,6 +813,46 @@ pub(crate) fn extract_ffmpeg_error(stderr: &str) -> String {
     lines[lines.len() - tail_len..].join(" | ")
 }
 
+// Shared by every platform backend (win/macos/linux) - the swap is pure argument-vector
+// surgery with nothing OS-specific in it, and hw_encoder handles which encoders are even worth
+// probing per platform.
+//
+// Swaps codec_args_for_ext's software video-encode segment (`-c:v libx264 -preset ultrafast
+// [-crf N]`) for a detected hardware encoder's own, when one actually works on this machine (see
+// services/hw_encoder.rs) - CPU usage on a long/high-res recording is the single biggest
+// encoding-side complaint this app's software-only libx264 path has (see
+// RECORDING_UPGRADE_NOTES.md). Only for the h264-targeting containers that path already covers
+// (mp4/mkv/avi/mov); webm's target codec is VP8, which has no equivalent widely-available
+// hardware path, so it's left on software regardless. Finds the software segment by locating
+// "-pix_fmt" (which immediately follows it in every one of those four branches) rather than
+// hardcoding each branch's exact offset, so this stays correct if codec_args_for_ext's own args
+// ever get reordered.
+pub(crate) fn codec_args_for_ext_hw(ext: &str, ffmpeg_path: &std::path::Path) -> Vec<String> {
+    let args = codec_args_for_ext(ext);
+    if !matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "avi" | "mov") {
+        return args;
+    }
+    let Some(encoder) = crate::services::hw_encoder::detect(ffmpeg_path) else {
+        return args;
+    };
+    let Some(cv_idx) = args.iter().position(|a| a == "-c:v") else {
+        return args;
+    };
+    let Some(pix_fmt_idx) = args.iter().position(|a| a == "-pix_fmt") else {
+        return args;
+    };
+    if pix_fmt_idx <= cv_idx {
+        return args;
+    }
+
+    let mut patched = args[..cv_idx].to_vec();
+    patched.push("-c:v".to_string());
+    patched.push(encoder.name().to_string());
+    patched.extend(encoder.quality_args());
+    patched.extend(args[pix_fmt_idx..].iter().cloned());
+    patched
+}
+
 // Caps the encoded/composited frame width for every desktop-capture recording mode - screen
 // capture otherwise grabs at the monitor's exact native pixel resolution (see win.rs's
 // desktop_crop_args) with no downscale at all, so a 4K/5K display produces files whose frames a
@@ -1271,10 +1311,13 @@ pub(crate) async fn spawn_recording(
 
     log::debug!("FFmpeg args: {:?}", args);
 
-    let child = silent_command(ffmpeg_path)
-        .args(&args)
+    let mut cmd = silent_command(ffmpeg_path);
+    cmd.args(&args);
+    crate::services::orphan_guard::before_spawn(&mut cmd);
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    crate::services::orphan_guard::after_spawn(&child);
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;

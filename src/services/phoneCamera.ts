@@ -313,12 +313,18 @@ export const startPhoneCapture = (
     const mimeType = pickMimeType();
     let recorder: MediaRecorder;
     try {
-        // 8 Mbps. This was cut to 2.5 when every chunk had to cross Tauri's IPC as base64 inside a
-        // JSON document, which made bitrate a throughput problem rather than a quality decision.
-        // Chunks are raw bytes now (see phone_camera_capture_chunk), so the constraint is gone and
-        // this can be set for how the footage should actually look - 8 Mbps is comfortable for
-        // 1080p30 and leaves headroom for the re-encode that follows.
-        recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 8_000_000 } : undefined);
+        // 3 Mbps, matched to the 720p the phone is asked to send.
+        //
+        // This was briefly 8 Mbps, chosen once raw-binary IPC removed the throughput constraint
+        // that had previously forced it down - but that reasoning only accounted for moving the
+        // bytes, not for producing them. MediaRecorder encodes inside the same WebView that draws
+        // the app, so its cost lands directly on the UI thread's budget, and it lands there while
+        // ffmpeg is already capturing the screen. Measured during a real screen recording: with no
+        // encoder the page held 61fps and zero stalls; adding a 1080p encode took it to the
+        // mid-30s with dozens of >100ms stalls and IPC round trips past 400ms; 720p at 3 Mbps came
+        // back to 58fps and a single stall. That is the difference between the app feeling
+        // responsive while recording and feeling stuck.
+        recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 3_000_000 } : undefined);
     } catch (e) {
         onError?.(`Could not record the phone camera: ${e}`);
         return null;

@@ -22,36 +22,97 @@ pub fn get_platform() -> &'static str {
     std::env::consts::OS
 }
 
-// Centralized FFmpeg path resolution with cross-platform support
-pub fn get_ffmpeg_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+// Finds `name` on the PATH, the way a shell would.
+//
+// Deliberately hand-rolled rather than pulling in a `which` crate for one short function: the
+// rule is simple and the dependency wouldn't be.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    // Windows needs the extension appended; Unix uses the bare name.
     #[cfg(windows)]
-    let binary_name = "ffmpeg.exe";
-
+    let candidates = [format!("{name}.exe"), name.to_string()];
     #[cfg(not(windows))]
-    let binary_name = "ffmpeg";
+    let candidates = [name.to_string()];
+
+    env::split_paths(&path_var).find_map(|dir| {
+        candidates.iter().find_map(|candidate| {
+            let full = dir.join(candidate);
+            full.is_file().then_some(full)
+        })
+    })
+}
+
+// Resolves one of the ffmpeg-suite tools, preferring the copy bundled with the app and falling
+// back to a system install on the PATH.
+//
+// The fallback is what makes this work off Windows at all. `binaries/ffmpeg/` only ever contained
+// Windows executables (`ffmpeg.exe`/`ffprobe.exe`), so on macOS and Linux the bundled path
+// resolved to a file that simply isn't there - and because `resolve()` only builds a path and
+// never checks for existence, that surfaced as an opaque spawn failure at the first recording,
+// conversion or thumbnail rather than as anything diagnosable.
+//
+// Falling back to the PATH is also the normal arrangement on those platforms, where ffmpeg is
+// expected to come from the package manager (`brew install ffmpeg`, `apt install ffmpeg`) rather
+// than be vendored per-application. Windows behaviour is unchanged: the bundled copy exists, so
+// it is found first and the PATH is never consulted.
+fn resolve_ffmpeg_tool(app_handle: &AppHandle, tool: &str) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let binary_name = format!("{tool}.exe");
+    #[cfg(not(windows))]
+    let binary_name = tool.to_string();
 
     let resource_path = format!("binaries/ffmpeg/{}", binary_name);
 
-    app_handle
-        .path()
-        .resolve(&resource_path, BaseDirectory::Resource)
-        .map_err(|e| format!("Failed to resolve ffmpeg at {}: {}", resource_path, e))
+    if let Ok(bundled) = app_handle.path().resolve(&resource_path, BaseDirectory::Resource) {
+        if bundled.is_file() {
+            return Ok(bundled);
+        }
+    }
+
+    if let Some(found) = find_on_path(tool) {
+        log::debug!("Using system {} at {:?}", tool, found);
+        return Ok(found);
+    }
+
+    Err(format!(
+        "{tool} was not found. Briefcast ships it on Windows; on {} install it with {} and make \
+         sure it is on your PATH.",
+        std::env::consts::OS,
+        if cfg!(target_os = "macos") {
+            "`brew install ffmpeg`"
+        } else {
+            "your package manager (e.g. `sudo apt install ffmpeg`)"
+        }
+    ))
+}
+
+#[cfg(test)]
+mod tool_path_tests {
+    use super::*;
+
+    #[test]
+    fn finds_a_binary_that_is_on_the_path() {
+        // Something guaranteed present on every platform's default PATH.
+        let name = if cfg!(windows) { "cmd" } else { "sh" };
+        let found = find_on_path(name);
+        assert!(found.is_some(), "{name} should be discoverable on PATH");
+        assert!(found.unwrap().is_file());
+    }
+
+    #[test]
+    fn returns_none_for_something_that_is_not_there() {
+        assert!(find_on_path("briefcast_definitely_not_a_real_binary_xyz").is_none());
+    }
+}
+
+// Centralized FFmpeg path resolution with cross-platform support
+pub fn get_ffmpeg_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    resolve_ffmpeg_tool(app_handle, "ffmpeg")
 }
 
 // Centralized ffprobe path resolution, mirroring get_ffmpeg_path
 pub fn get_ffprobe_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    let binary_name = "ffprobe.exe";
-
-    #[cfg(not(windows))]
-    let binary_name = "ffprobe";
-
-    let resource_path = format!("binaries/ffmpeg/{}", binary_name);
-
-    app_handle
-        .path()
-        .resolve(&resource_path, BaseDirectory::Resource)
-        .map_err(|e| format!("Failed to resolve ffprobe at {}: {}", resource_path, e))
+    resolve_ffmpeg_tool(app_handle, "ffprobe")
 }
 
 // Bundled libheif CLI decoder (binaries/heif/) - the fallback HEIC/HEIF decode path used when

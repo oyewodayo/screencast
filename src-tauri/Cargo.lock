@@ -13,6 +13,7 @@ dependencies = [
  "futures-util",
  "hound",
  "image",
+ "libc",
  "local-ip-address",
  "log",
  "notify-debouncer-mini",
