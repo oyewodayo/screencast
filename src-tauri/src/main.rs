@@ -10,6 +10,7 @@ use tauri::Manager;
 
 mod commands {
     pub mod annotation;
+    pub mod audio_tracks;
     pub mod conversion;
     pub mod native_playback;
     pub mod recording;
@@ -23,6 +24,17 @@ mod services {
     pub mod file_watcher;
     pub mod image_annotations;
     pub mod pdf_annotations;
+    // Serves a phone's browser as a camera source over the LAN - see the module's own doc
+    // comment for why a webcam driver (DroidCam/Iriun/Camo) is otherwise the only way to get a
+    // phone into a DirectShow device list, and why this needs to be an HTTPS server to avoid one.
+    pub mod phone_camera;
+    // Carries the live recording preview from ffmpeg's stdout to the UI without touching the
+    // disk - see the module's own doc comment for the file-based approach this replaced and why.
+    pub mod preview_stream;
+    // Makes a recording's ffmpeg child die with the app instead of outliving it, holding the
+    // camera open and competing for the machine - Job Object on Windows, PR_SET_PDEATHSIG on
+    // Linux. See the module's own comment for the macOS gap.
+    pub mod orphan_guard;
     pub mod trash;
     pub mod utility;
     pub mod video_edits;
@@ -50,11 +62,12 @@ mod services {
     // live signal at all). Windows-only for now, same reasoning as process_job above.
     #[cfg(target_os = "windows")]
     pub mod progress_watch;
-    // Detects a real, working hardware H.264 encoder (NVENC/QSV/AMF) via a trial encode, so
-    // recordings can offload from the CPU instead of always using software libx264 - see the
-    // module's own doc comment for why "does ffmpeg list this encoder" alone isn't good enough.
-    // Windows-only for now, same reasoning as progress_watch above.
-    #[cfg(target_os = "windows")]
+    // Detects a real, working hardware H.264 encoder via a trial encode, so recordings can
+    // offload from the CPU instead of always using software libx264 - see the module's own doc
+    // comment for why "does ffmpeg list this encoder" alone isn't good enough. Cross-platform:
+    // NVENC/QSV/AMF on Windows, VideoToolbox on macOS, NVENC on Linux. The detection mechanism is
+    // a real subprocess encode with the exact intended flags, which is platform-agnostic by
+    // construction - nothing here needed to be Windows-specific.
     pub mod hw_encoder;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
@@ -254,6 +267,7 @@ fn main() {
         .manage(commands::conversion::ConversionState::default())
         .manage(commands::native_playback::NativePlaybackState::default())
         .manage(services::file_watcher::FileWatcherState::default())
+        .manage(services::phone_camera::PhoneCameraState::default())
         .setup(|app| {
             // Start watching the Briefcast folder for external changes right away, so the sidebar
             // stays live without needing a restart or a manual refresh click - see
@@ -280,6 +294,13 @@ fn main() {
             commands::recording::load_view_switch_sidecar,
             commands::recording::record_view_switch,
             commands::recording::get_webcam_sidecar_path,
+            commands::recording::phone_camera_capture_chunk,
+            commands::recording::get_recording_preview_frame,
+            commands::recording::save_phone_camera_capture,
+            services::phone_camera::start_phone_camera_server,
+            services::phone_camera::stop_phone_camera_server,
+            services::phone_camera::phone_camera_status,
+            services::phone_camera::phone_camera_send_signal,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,
@@ -310,6 +331,12 @@ fn main() {
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
             commands::conversion::extract_clip_audio,
+            commands::audio_tracks::probe_audio_streams,
+            commands::audio_tracks::get_separation_engine,
+            commands::audio_tracks::separate_voice_music,
+            commands::audio_tracks::download_separation_engine,
+            commands::audio_tracks::cancel_separation_engine_download,
+            commands::audio_tracks::cancel_voice_music_separation,
             commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,

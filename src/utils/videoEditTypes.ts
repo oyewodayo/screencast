@@ -285,6 +285,9 @@ export interface AudioOverlay {
   fadeInSec?: number; // undefined/0 means no fade
   fadeOutSec?: number;
   muted?: boolean;
+  // Short name shown on the timeline chip - set by "Detach audio" ("Voice", "Music", "Track 2 ·
+  // eng"); user-added music has none and shows its file name in the tooltip only.
+  label?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -411,7 +414,8 @@ export interface VideoEditCommand {
     | "edit-pip"
     | "delete-pip"
     | "view-switch-cut"
-    | "edit-track-audio";
+    | "edit-track-audio"
+    | "detach-audio";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {

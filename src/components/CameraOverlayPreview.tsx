@@ -1,11 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { IoVideocamOffOutline } from "react-icons/io5";
+import { PHONE_CAMERA_DEVICE, subscribePhoneCamera } from "../services/phoneCamera";
 
 interface CameraOverlayPreviewProps {
     videoDevices: string[];
     overlayShape: string;
     overlayPosition: string;
     overlaySize: string;
+    // "overlay" (default) previews the camera as the bubble it will be composited into a screen
+    // recording as - the shape/position/size maths below only mean anything in that arrangement.
+    // "full" previews the camera as the whole picture, which is what the camera-only record types
+    // ("v", "va") actually produce: there's no screen underneath and no bubble to place.
+    variant?: "overlay" | "full";
 }
 
 // Mirrors map_overlay_size in src-tauri/src/commands/recording.rs - the actual capture
@@ -76,10 +82,18 @@ const shapeStyle = (shape: string): React.CSSProperties => {
 // percentages instead of ffmpeg expressions. There's no live preview anywhere else in this app
 // (the real composite only exists baked into the finished ffmpeg output), so this is the first
 // place a user sees their camera arrangement before committing to a recording.
-const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, overlaySize }: CameraOverlayPreviewProps) => {
+const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, overlaySize, variant = "overlay" }: CameraOverlayPreviewProps) => {
     const [streams, setStreams] = useState<Record<string, MediaStream>>({});
     const [errors, setErrors] = useState<Record<string, string>>({});
     const streamsRef = useRef<Record<string, MediaStream>>({});
+
+    // The phone's stream is owned by the phoneCamera service, not acquired here: it arrives over
+    // WebRTC rather than from getUserMedia, and the same MediaStream is shared with the pairing
+    // panel and the recorder. Tracked separately from streamsRef for that reason - the cleanup
+    // paths below stop everything they hold, which must never happen to a stream this component
+    // doesn't own.
+    const [phoneStream, setPhoneStream] = useState<MediaStream | null>(null);
+    useEffect(() => subscribePhoneCamera((st) => setPhoneStream(st.stream)), []);
 
     useEffect(() => {
         streamsRef.current = streams;
@@ -92,8 +106,20 @@ const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, ove
         // and Chromium's own MediaDeviceInfo.label are usually identical on Windows since both
         // read the same OS-level friendly name, but fall back to a case-insensitive/substring
         // match in case of minor formatting differences between the two enumerations.
+        //
+        // Entries with a blank label or deviceId are filtered out FIRST, and that is load-bearing,
+        // not defensive tidying. Until the page has been granted camera permission, enumerate-
+        // Devices() still lists every videoinput but blanks both fields - and the substring
+        // fallback below reads `label.includes(d.label)`, which against an empty d.label is
+        // `"Integrated Webcam".includes("")`, i.e. true for every device. That made this function
+        // return a placeholder whose deviceId was "", which resolveDeviceId then treated as a
+        // successful match and returned early from - skipping the very permission prompt that
+        // would have populated the labels. The result was a camera that could never preview on a
+        // fresh permission state, reported only as the generic "Preview unavailable".
         const findVideoInput = (devices: MediaDeviceInfo[], label: string) => {
-            const videoInputs = devices.filter((d) => d.kind === "videoinput");
+            const videoInputs = devices.filter(
+                (d) => d.kind === "videoinput" && d.deviceId !== "" && d.label !== ""
+            );
             return (
                 videoInputs.find((d) => d.label === label) ??
                 videoInputs.find((d) => d.label.toLowerCase() === label.toLowerCase()) ??
@@ -106,8 +132,9 @@ const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, ove
             let match = findVideoInput(devices, label);
             if (match) return match.deviceId;
 
-            // Device labels are blank until the page has been granted camera permission at
-            // least once - unlock them with a throwaway request, then look again.
+            // No usable match yet - which, thanks to the filter above, now genuinely means
+            // "labels are still hidden behind the permission prompt" rather than "matched a
+            // blank placeholder". A throwaway request unlocks them; then look again.
             const unlock = await navigator.mediaDevices.getUserMedia({ video: true });
             unlock.getTracks().forEach((t) => t.stop());
             devices = await navigator.mediaDevices.enumerateDevices();
@@ -143,6 +170,9 @@ const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, ove
 
             // Acquire streams for newly selected cameras.
             for (const label of videoDevices) {
+                // Not a real capture device - resolveDeviceId could never match it, and its
+                // stream is supplied by the phoneCamera service instead.
+                if (label === PHONE_CAMERA_DEVICE) continue;
                 if (streamsRef.current[label]) continue;
                 try {
                     const deviceId = await resolveDeviceId(label);
@@ -190,6 +220,70 @@ const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, ove
     const widthPct = (camW / REFERENCE_WIDTH) * 100;
     const heightPct = (camH / REFERENCE_HEIGHT) * 100;
 
+    // Shared by both variants so a camera that can't open reads the same either way.
+    const renderPlaceholder = (label: string, isPhone: boolean) => (
+        <div
+            className="w-full h-full flex flex-col items-center justify-center gap-1 bg-neutral-700/80 text-white/80 text-center p-1"
+            title={errors[label]}
+        >
+            <IoVideocamOffOutline className="text-base opacity-80" />
+            <span className="text-[9px] leading-tight">
+                {isPhone
+                    ? "Phone not connected"
+                    : !errors[label]
+                    ? "Loading…"
+                    : errors[label] === "Camera permission was denied"
+                    ? "Permission needed"
+                    : errors[label] === "Camera is in use by another app"
+                    ? "In use elsewhere"
+                    : errors[label] === "Camera not found by the browser"
+                    ? "Not found"
+                    : "Preview unavailable"}
+            </span>
+        </div>
+    );
+
+    if (variant === "full") {
+        return (
+            <div>
+                <label className="block text-sm font-medium mb-2">Preview</label>
+                <div className="relative w-full aspect-video rounded-lg overflow-hidden bg-black border border-gray-200 dark:border-neutral-700">
+                    {videoDevices.length === 0 ? (
+                        <div className="absolute inset-0 flex items-center justify-center text-neutral-400 text-xs">
+                            No camera selected
+                        </div>
+                    ) : (
+                        // Several cameras share the frame evenly - the camera-only modes record
+                        // whichever is first, but showing them all makes it obvious which is which.
+                        <div className="absolute inset-0 flex">
+                            {videoDevices.map((label) => {
+                                const isPhone = label === PHONE_CAMERA_DEVICE;
+                                const stream = isPhone ? phoneStream : streams[label];
+                                return (
+                                    <div key={label} className="relative flex-1 min-w-0 border-r border-black last:border-r-0">
+                                        {stream ? (
+                                            <video
+                                                autoPlay
+                                                muted
+                                                playsInline
+                                                className="w-full h-full object-contain"
+                                                ref={(el) => {
+                                                    if (el && el.srcObject !== stream) el.srcObject = stream;
+                                                }}
+                                            />
+                                        ) : (
+                                            renderPlaceholder(label, isPhone)
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    }
+
     return (
         <div>
             <label className="block text-sm font-medium mb-2">Preview</label>
@@ -202,7 +296,8 @@ const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, ove
                     const { xBase, yBase } = resolveAnchor(overlayPosition);
                     const leftPct = (overlayXOffset(xBase, index, videoDevices.length, camW) / REFERENCE_WIDTH) * 100;
                     const vertPct = (MARGIN_Y / REFERENCE_HEIGHT) * 100;
-                    const stream = streams[label];
+                    const isPhone = label === PHONE_CAMERA_DEVICE;
+                    const stream = isPhone ? phoneStream : streams[label];
 
                     return (
                         <div
@@ -238,10 +333,16 @@ const CameraOverlayPreview = ({ videoDevices, overlayShape, overlayPosition, ove
                                 >
                                     <IoVideocamOffOutline className="text-base opacity-80" />
                                     <span className="text-[9px] leading-tight">
-                                        {!errors[label]
+                                        {isPhone
+                                            ? "Phone not connected"
+                                            : !errors[label]
                                             ? "Loading…"
                                             : errors[label] === "Camera permission was denied"
                                             ? "Permission needed"
+                                            : errors[label] === "Camera is in use by another app"
+                                            ? "In use elsewhere"
+                                            : errors[label] === "Camera not found by the browser"
+                                            ? "Not found"
                                             : "Preview unavailable"}
                                     </span>
                                 </div>

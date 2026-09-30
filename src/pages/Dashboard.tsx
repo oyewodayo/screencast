@@ -34,6 +34,18 @@ import VideoEditorHome from "../components/video/VideoEditorHome";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
+import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
+import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
+
+// Record types that capture cameras and no screen (win.rs recording_with_output_va/_v). Mirrors
+// CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
+const CAMERA_ONLY_RECORD_TYPES = ["va", "v"];
+import {
+  PHONE_CAMERA_DEVICE,
+  startPhoneCapture,
+  subscribePhoneCamera,
+  type PhoneCaptureHandle,
+} from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
 import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
@@ -46,6 +58,17 @@ import {
   repathFile,
   forgetFile,
 } from "../utils/homeScreenFiles";
+import {
+  getResumeTime,
+  recordPlaybackPosition,
+  clearPlaybackPosition,
+  flushPlaybackPositions,
+  getLastOpenedFile,
+  recordLastOpenedFile,
+  forgetLastOpenedFile,
+  repathPlaybackState,
+  forgetPlaybackState,
+} from "../utils/playbackResume";
 import {
   IoVideocam,
   IoMusicalNotes,
@@ -250,6 +273,20 @@ const Dashboard = () => {
      const [overlayShape, setOverlayShape] = useState("rounded"); // ADD THIS
   const [overlayPosition, setOverlayPosition] = useState("bottom_right"); // ADD THIS
   const [overlaySize, setOverlaySize] = useState("small"); // ADD THIS
+  // Phone-as-camera (see src/services/phoneCamera.ts). Only the connected flag lives in React
+  // state here - the stream itself is held by the service singleton, because the pairing modal,
+  // the overlay preview and the recorder below all need the same one.
+  const [showPhoneCamera, setShowPhoneCamera] = useState(false);
+  const [isPhoneCameraConnected, setIsPhoneCameraConnected] = useState(false);
+  // The in-flight phone recording, if any. A ref rather than state: handleStopRecording has to
+  // read it synchronously, and nothing renders from it.
+  const phoneCaptureRef = useRef<PhoneCaptureHandle | null>(null);
+
+  useEffect(
+    () => subscribePhoneCamera((s) => setIsPhoneCameraConnected(s.status === "live")),
+    []
+  );
+
   // WASAPI loopback ("what you hear") capture, Windows-only - see start_recording's handling of
   // FormData.include_system_audio and services/loopback_audio.rs for why this exists (dshow alone
   // can't capture system audio on a machine with no Stereo Mix-equivalent device). Only
@@ -512,6 +549,11 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     // left the player pointed at some *other* file's asset URL - opening a genuinely different
     // file here always starts fresh, so the "what's actually loaded" tracker needs to reset too.
     previewSourcePathRef.current = selectedFile?.sourcePath ?? null;
+    // Closing/replacing the open file is exactly the moment where the position updates still
+    // sitting in playbackResume's write-behind buffer matter most (leaving for Docs/home unmounts
+    // the player, so no further ticks are coming), so force them out instead of waiting for the
+    // timer. Runs on unmount too, via the cleanup.
+    return flushPlaybackPositions;
   }, [selectedFile?.path]);
 
   // Asset URLs for files referenced by a timeline clip other than the one currently open -
@@ -652,10 +694,9 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // hiding a window the user just turned drawing back on for.
   const annotationHideTimeoutRef = useRef<number | null>(null);
 
-  // Last known playback position per audio file (keyed by sourcePath), so switching away and
-  // back — including by accident via prev/next — resumes instead of restarting at 0. A ref, not
-  // state: it's written on every timeupdate tick and shouldn't trigger re-renders.
-  const audioPositionsRef = useRef<Record<string, number>>({});
+  // Playback positions used to live here as an audio-only ref; they're now in
+  // utils/playbackResume.ts, which covers video too and survives an app restart. See
+  // handleMediaTimeUpdate below for the write side and the `initialTime` prop for the read side.
   // Sourcepaths visited while shuffle is on, so "previous" can undo a shuffled "next" instead of
   // computing a sequential-order previous that wouldn't match what was actually just played.
   const shuffleHistoryRef = useRef<string[]>([]);
@@ -766,6 +807,36 @@ useEffect(() => {
       if (unlistenFn) {
         unlistenFn();
       }
+    };
+  }, []);
+
+  // The "Play" button in the same recording-completed popup. That window has no player of its
+  // own, so it hands the path over here and closes itself - the same arrangement
+  // 'open-conversion-dialog' above uses.
+  //
+  // setFocus matters: this window is behind the popup, so without it the file would load out of
+  // sight and clicking Play would look like it did nothing.
+  useEffect(() => {
+    const setupListener = async () => {
+      return await listen<string>('open-recording-playback', async (event) => {
+        const path = event.payload;
+        const name = path.split(/[\\/]/).pop() || path;
+        try {
+          await getCurrentWebviewWindow().setFocus();
+        } catch {
+          /* focus is a nicety - never let it stop the file from loading */
+        }
+        await loadFileForPlayback(path, name);
+      });
+    };
+
+    let unlistenFn: (() => void) | undefined;
+    setupListener().then((fn) => {
+      unlistenFn = fn;
+    });
+
+    return () => {
+      if (unlistenFn) unlistenFn();
     };
   }, []);
 
@@ -914,8 +985,26 @@ const setScreen = () => {
 
         await playAudioNotification();
 
+        // Timestamped before start_recording so the offset handed to the backend covers the
+        // whole gap - spawning ffmpeg plus its own half-second early-exit check - rather than
+        // only the part after it returns. save_phone_camera_capture pads the camera file by this
+        // much so both files share a t=0.
+        const recordingLaunchedAt = Date.now();
         const response = await invoke<string>("start_recording", { formData });
         const startTime = Date.now();
+
+        // The phone records in this WebView, not in ffmpeg: its frames arrive over WebRTC and
+        // never reach the backend as a capture device (start_recording strips the sentinel out of
+        // video_devices for exactly that reason). The result lands as the same `<stem>_webcam.mp4`
+        // sidecar a real separately-captured webcam produces, so the editor needs no new path.
+        if (formData.video_devices?.includes(PHONE_CAMERA_DEVICE)) {
+          phoneCaptureRef.current = startPhoneCapture(recordingLaunchedAt, (msg) => setError(msg));
+          if (!phoneCaptureRef.current) {
+            setError(
+              "The screen recording started, but the phone camera wasn't connected so it isn't being recorded."
+            );
+          }
+        }
         setIsRecording(true);
         setRecordingStartTime(startTime);
         setIsPaused(false);
@@ -948,7 +1037,11 @@ const setScreen = () => {
         // Send recording state to overlay - both windows derive elapsed time from this
         // same start timestamp so their displayed timers can't drift apart. Sent even while
         // hidden so the overlay is already in sync the moment the user reveals it.
-        // canSwitchView: only "sva" with separate_webcam_capture actually produces the second
+        // canSwitchView: the toggle needs a second (camera) file to cut to. Two things produce
+        // one: separate_webcam_capture, and the phone camera - which always records to that same
+        // `<stem>_webcam.mp4` sidecar (save_phone_camera_capture, recording.rs) even though
+        // start_recording deliberately clears separate_webcam_capture for it, since the phone
+        // owns that slot. So the phone gets live view-switching on exactly the same terms.
         // (camera) file the live Screen/Camera toggle needs something to switch to - see
         // RECORDING_UPGRADE_NOTES.md's view-switching feature design.
         overlayWindow.emit('recording-state-update', {
@@ -958,7 +1051,10 @@ const setScreen = () => {
           isPaused: false,
           pauseStartedAt: null,
           pausedAccumulatedMs: 0,
-          canSwitchView: formData.record_type === 'sva' && Boolean(formData.separate_webcam_capture),
+          canSwitchView:
+            formData.record_type === 'sva' &&
+            (Boolean(formData.separate_webcam_capture) ||
+              Boolean(formData.video_devices?.includes(PHONE_CAMERA_DEVICE))),
         });
 
         if (!(await isRegistered(OVERLAY_TOGGLE_SHORTCUT))) {
@@ -976,6 +1072,19 @@ const setScreen = () => {
   
   let handleStopRecording = async () => {
     setError("");
+
+    // Flushed and written BEFORE stop_recording, so the finished camera file is already on disk
+    // next to the screen recording by the time the completion UI points the user at it.
+    if (phoneCaptureRef.current) {
+      const capture = phoneCaptureRef.current;
+      phoneCaptureRef.current = null;
+      try {
+        await capture.stop();
+      } catch (e) {
+        console.error("Error saving phone camera recording:", e);
+      }
+    }
+
     try {
       const response = await invoke<string>("stop_recording");
       const audio = new Audio("/sounds/option-3.mp3");
@@ -1035,7 +1144,8 @@ const setScreen = () => {
         isPaused: true,
         pauseStartedAt: now,
         pausedAccumulatedMs,
-        canSwitchView: recordType === 'sva' && separateWebcamCapture,
+        canSwitchView:
+          recordType === 'sva' && (separateWebcamCapture || videoDevices.includes(PHONE_CAMERA_DEVICE)),
       });
     } catch (error) {
       console.error("Error pausing recording:", error);
@@ -1063,7 +1173,8 @@ const setScreen = () => {
         isPaused: false,
         pauseStartedAt: null,
         pausedAccumulatedMs: newAccumulatedMs,
-        canSwitchView: recordType === 'sva' && separateWebcamCapture,
+        canSwitchView:
+          recordType === 'sva' && (separateWebcamCapture || videoDevices.includes(PHONE_CAMERA_DEVICE)),
       });
     } catch (error) {
       console.error("Error resuming recording:", error);
@@ -1199,6 +1310,7 @@ const setScreen = () => {
 			const { pinned, recent } = forgetFile(file.path);
 			setPinnedPaths(pinned);
 			setRecentPaths(recent);
+			forgetPlaybackState(file.path);
 			await handleDirectoryFiles();
 			setMessage(`Moved to trash: ${formatFileName(file.name)}`);
 		} catch (error) {
@@ -1601,6 +1713,11 @@ const setScreen = () => {
 		// leaves it, since the tool has nothing to do with what's now on screen.
 		setVideoEditorScreen((prev) => (prev && getFileCategory(fileName) === "video" ? { mode: "editing" } : null));
 		setRecentPaths(recordFileOpened(filePath));
+		// Remembered per category so clicking the sidebar's Video/Audio/Image/Pdf/Documents tab can
+		// bring this file back later (see restoreLastOpenedForCategory below), rather than leaving
+		// whatever unrelated file happens to be on screen when the tab changes.
+		const openedCategory = getFileCategory(fileName);
+		if (openedCategory) recordLastOpenedFile(openedCategory, { path: filePath, name: fileName });
 
 		console.log('File selected for playback:', fileName);
 	} catch (error) {
@@ -1678,6 +1795,37 @@ const setScreen = () => {
 			.flat()
 			.filter((file) => getFileCategory(file.name) === category);
 
+	// Switching to a sidebar category tab reopens whatever was last open under it, so the tabs
+	// behave like the per-type workspaces they look like rather than only re-filtering the file
+	// list while some unrelated file stays on screen. Paired with the resume positions above, that
+	// means clicking Video mid-way through a podcast and clicking back to Audio lands exactly where
+	// each was left.
+	//
+	// Deliberately conservative about *not* acting:
+	//   - nothing remembered for the category, or the file list hasn't loaded yet: leave the main
+	//     pane exactly as it is, rather than blanking out whatever the user is looking at.
+	//   - the remembered file is gone from disk (deleted/moved outside the app): drop the entry so
+	//     the tab stops trying, and leave the pane alone this time.
+	//   - it's already what's open: don't reload it, which would restart playback from the resume
+	//     point and throw away the live player's position.
+	const restoreLastOpenedForCategory = async (category: FileCategory) => {
+		const last = getLastOpenedFile(category);
+		if (!last) return;
+
+		const categoryFiles = getFlatFilesForCategory(category);
+		// An empty list here means "not loaded yet" as often as it means "none left", and forgetting
+		// the entry on the former would quietly lose it, so only treat a *populated* list that's
+		// missing the file as proof it's gone.
+		if (categoryFiles.length === 0) return;
+		if (!categoryFiles.some((file) => file.path === last.path)) {
+			forgetLastOpenedFile(category);
+			return;
+		}
+
+		if (selectedFileRef.current?.sourcePath === last.path) return;
+		await loadFileForPlayback(last.path, last.name);
+	};
+
 	// Cycles to the previous/next image relative to whatever's currently selected, wrapping
 	// around at either end (matches how most image viewers handle prev/next at the boundaries).
 	//
@@ -1701,15 +1849,19 @@ const setScreen = () => {
 		loadFileForPlayback(next.path, next.name);
 	};
 
-	// Persists the currently-playing audio file's position on every tick, keyed by its
-	// filesystem path — read back in the `initialTime` passed to VideoPlayer below so navigating
-	// away and back (including by an accidental prev/next tap) resumes instead of restarting.
-	// Stable identity (empty deps) so VideoPlayer's own timeupdate listener doesn't get torn
-	// down and re-attached on every unrelated Dashboard re-render.
-	const handleAudioTimeUpdate = useCallback((time: number) => {
+	// Persists the currently-playing file's position on every tick, keyed by its filesystem path —
+	// read back in the `initialTime` passed to VideoPlayer below so navigating away and back
+	// (leaving for Docs/Board/home, switching sidebar tabs, or an accidental prev/next tap)
+	// resumes instead of restarting. Applies to video and audio alike; the persistence itself,
+	// including the throttling that keeps ~4 ticks/sec off localStorage, lives in
+	// utils/playbackResume.ts. Stable identity (empty deps) so VideoPlayer's own timeupdate
+	// listener doesn't get torn down and re-attached on every unrelated Dashboard re-render.
+	const handleMediaTimeUpdate = useCallback((time: number) => {
 		const current = selectedFileRef.current;
-		if (current && getFileCategory(current.name) === "audio") {
-			audioPositionsRef.current[current.sourcePath] = time;
+		if (!current) return;
+		const category = getFileCategory(current.name);
+		if (category === "video" || category === "audio") {
+			recordPlaybackPosition(current.sourcePath, time);
 		}
 	}, []);
 
@@ -1811,6 +1963,11 @@ const setScreen = () => {
 	// handlers above bails immediately if the file that just ended isn't its category, so exactly
 	// one of them actually does anything on any given call.
 	const handleMediaEnded = useCallback(() => {
+		// A file watched to the end has no position worth resuming - without this it would reopen a
+		// second before the end and immediately end again. Done before the auto-advance handlers
+		// below, which may change what selectedFileRef points at.
+		const finished = selectedFileRef.current;
+		if (finished) clearPlaybackPosition(finished.sourcePath);
 		handleAudioEnded();
 		handleVideoEnded();
 	}, [handleAudioEnded, handleVideoEnded]);
@@ -2090,6 +2247,7 @@ const setScreen = () => {
 					const { pinned, recent } = repathFile(toMove[i].path, result.value);
 					setPinnedPaths(pinned);
 					setRecentPaths(recent);
+					repathPlaybackState(toMove[i].path, result.value);
 				}
 			});
 
@@ -2155,6 +2313,7 @@ const setScreen = () => {
 					const { pinned, recent } = forgetFile(fileList[i].path);
 					setPinnedPaths(pinned);
 					setRecentPaths(recent);
+					forgetPlaybackState(fileList[i].path);
 				}
 			});
 			await handleDirectoryFiles();
@@ -2328,6 +2487,7 @@ const setScreen = () => {
 			const { pinned, recent } = repathFile(file.path, newPath);
 			setPinnedPaths(pinned);
 			setRecentPaths(recent);
+			repathPlaybackState(file.path, newPath);
 			try {
 				await invoke("relink_doc_path", { oldPath: file.path, newPath });
 				await refreshDocsIndex();
@@ -2423,6 +2583,7 @@ const setScreen = () => {
                         setActiveFileCategory(category);
                         setSelectedFilePaths(new Set());
                         setSelectedFolder(null);
+                        void restoreLastOpenedForCategory(category);
                       }}
                       className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
                         activeFileCategory === category
@@ -3393,10 +3554,10 @@ const setScreen = () => {
                 filePath={selectedFile.sourcePath}
                 title={selectedFile.name}
                 autoPlay={true}
-                initialTime={isAudioSelected ? audioPositionsRef.current[selectedFile.sourcePath] : undefined}
+                initialTime={getResumeTime(selectedFile.sourcePath)}
                 loop={isAudioSelected && audioRepeatMode === "one"}
                 onTimeUpdate={(time) => {
-                  handleAudioTimeUpdate(time);
+                  handleMediaTimeUpdate(time);
                   setPlayerCurrentTime(time);
                 }}
                 onPlayStateChange={setPlayerIsPlaying}
@@ -3615,6 +3776,12 @@ const setScreen = () => {
                 </div>
               )}
 
+              {/* A camera-only recording captures no screen, so this otherwise-idle home area is
+                  the natural place to show what the cameras are actually sending - see
+                  LiveCameraRecordingView for why it's polled frames rather than a MediaStream. */}
+              {isRecording && CAMERA_ONLY_RECORD_TYPES.includes(recordType) ? (
+                <LiveCameraRecordingView videoDevices={videoDevices} isPaused={isPaused} />
+              ) : (
               <div className="relative flex flex-col items-center gap-3 text-center">
                 <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
                   <IoVideocam size={28} />
@@ -3633,6 +3800,7 @@ const setScreen = () => {
                   Open a file
                 </button>
               </div>
+              )}
 
               {libraryPreviewFiles.length > 0 && (
                 <div className="relative w-full max-w-md">
@@ -3741,6 +3909,8 @@ const setScreen = () => {
         recordingStartTime={recordingStartTime}
         handleStartRecording={handleStartRecording}
         handleStopRecording={handleStopRecording}
+        onOpenPhoneCamera={() => setShowPhoneCamera(true)}
+        isPhoneCameraConnected={isPhoneCameraConnected}
         isPaused={isPaused}
         pauseStartedAt={pauseStartedAt}
         pausedAccumulatedMs={pausedAccumulatedMs}
@@ -3779,6 +3949,18 @@ const setScreen = () => {
       )}
 
       {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} onStorageChanged={handleStorageChanged} />}
+      {showPhoneCamera && (
+        <PhoneCameraModal
+          onClose={() => setShowPhoneCamera(false)}
+          onConnected={() => {
+            // Arm the phone the moment it's actually usable, so pairing and selecting it aren't
+            // two separate chores.
+            setVideoDevices((prev) =>
+              prev.includes(PHONE_CAMERA_DEVICE) ? prev : [...prev, PHONE_CAMERA_DEVICE]
+            );
+          }}
+        />
+      )}
 
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
         {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}

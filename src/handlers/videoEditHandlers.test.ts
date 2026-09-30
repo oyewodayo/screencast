@@ -5,6 +5,7 @@
 // unchanged; if one of these breaks, the app's actual editing behavior changed, not just plumbing.
 import { describe, expect, it } from "vitest";
 import {
+  packAudioRows,
   applyAutoZoomAtClicks,
   buildViewSwitchOverlays,
   bringOverlayToFront,
@@ -487,5 +488,29 @@ describe("duplicateTimedOverlay", () => {
     const copy = duplicateTimedOverlay(original, 10); // timeline only 10s long
     expect(copy.endTime - copy.startTime).toBeLessThanOrEqual(10);
     expect(copy.endTime).toBeLessThanOrEqual(10);
+  });
+});
+
+describe("packAudioRows", () => {
+  const audio = (id: string, startTime: number, endTime: number): AudioOverlay => ({
+    id, src: `${id}.wav`, startTime, endTime, trimStart: 0, sourceDuration: endTime - startTime, volume: 1, createdAt: 0, updatedAt: 0,
+  });
+
+  it("stacks a detached voice/music pair into two rows", () => {
+    const { rowOf, rowCount } = packAudioRows([audio("voice", 0, 99), audio("music", 0, 99)]);
+    expect(rowCount).toBe(2);
+    expect(new Set([rowOf.get("voice"), rowOf.get("music")])).toEqual(new Set([0, 1]));
+  });
+
+  it("reuses a row once the earlier overlay has ended", () => {
+    const { rowOf, rowCount } = packAudioRows([audio("a", 0, 5), audio("b", 5, 10), audio("c", 2, 8)]);
+    expect(rowCount).toBe(2);
+    expect(rowOf.get("a")).toBe(0);
+    expect(rowOf.get("c")).toBe(1);
+    expect(rowOf.get("b")).toBe(0);
+  });
+
+  it("returns zero rows for no overlays", () => {
+    expect(packAudioRows([]).rowCount).toBe(0);
   });
 });

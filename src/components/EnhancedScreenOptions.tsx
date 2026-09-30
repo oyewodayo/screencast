@@ -1,4 +1,4 @@
-import { IoClose, IoDesktop, IoScanOutline, IoApps, IoReload } from "react-icons/io5";
+import { IoClose, IoDesktop, IoScanOutline, IoApps, IoReload, IoChevronDown, IoCheckmark } from "react-icons/io5";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import { FiMonitor } from "react-icons/fi";
@@ -32,8 +32,24 @@ interface ScreenOptionsProps {
     // clicking a window thumbnail below needs to) would still see the *previous* selection.
     onStartRecording: (target?: SelectionTarget) => void;
     setOpen: React.Dispatch<React.SetStateAction<boolean>>;
+    // Lets the header's "Change" control switch what's being recorded without closing the modal -
+    // previously the only way to go from e.g. "Screen + Video + Audio" to "Video + Audio" was to
+    // back out to the recording bar's own dropdown and start the selection flow again.
+    onRecordTypeChange: (recordType: string) => void;
     error?: string;
 }
+
+// What the header's "Change" picker offers, in the order it shows them. Deliberately not derived
+// from RECORD_TYPE_LABELS' key order: that map also carries "c" (Screenshot), which is a separate
+// flow rather than a recording mode - see the picker's own comment in the header below.
+const RECORD_TYPE_OPTIONS = ['sva', 'sa', 'va', 's', 'v', 'a'];
+
+// Record types that capture a camera and no screen at all (win.rs's recording_with_output_va/_v).
+// For these the screen target is never read, so offering Full Screen/Monitor/Window would be
+// asking for a setting that gets thrown away.
+const CAMERA_ONLY_TYPES = ['va', 'v'];
+// Captures neither a screen nor a camera, so this modal has nothing to configure.
+const AUDIO_ONLY_TYPES = ['a'];
 
 type SelectionMode = 'main' | 'monitors' | 'windows';
 
@@ -62,9 +78,14 @@ const EnhancedScreenOptions = ({
     onStartRecording,
     setOpen,
     setSelectedScreen,
+    onRecordTypeChange,
     error
 }: ScreenOptionsProps) => {
     const [mode, setMode] = useState<SelectionMode>('main');
+    // Whether the header's recording-type picker is open.
+    const [typePickerOpen, setTypePickerOpen] = useState(false);
+    const isCameraOnly = CAMERA_ONLY_TYPES.includes(recordType);
+    const isAudioOnly = AUDIO_ONLY_TYPES.includes(recordType);
     const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
     const [windows, setWindows] = useState<WindowInfo[]>([]);
     const [selectedMonitor, setSelectedMonitor] = useState<string>('');
@@ -465,6 +486,52 @@ const EnhancedScreenOptions = ({
                         <span className="text-xs font-medium px-2 py-1 rounded-full bg-green-100 dark:bg-green-500/20 text-green-700 dark:text-green-300">
                             {RECORD_TYPE_LABELS[recordType] ?? recordType}
                         </span>
+                        {/* Screenshot ("c") is a separate flow the caller switches into on its own
+                            (see handleScreenshotClick, BottomDocker.tsx) and restores on close -
+                            offering a type change in the middle of it would fight that. */}
+                        {recordType !== "c" && (
+                            <div className="relative">
+                                <button
+                                    type="button"
+                                    onClick={() => setTypePickerOpen((o) => !o)}
+                                    className="flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full border border-neutral-300 dark:border-neutral-600 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                                    title="Change what gets recorded"
+                                >
+                                    Change
+                                    <IoChevronDown className={`transition-transform ${typePickerOpen ? "rotate-180" : ""}`} />
+                                </button>
+
+                                {typePickerOpen && (
+                                    <>
+                                        {/* Click-away closer, behind the menu but above the rest
+                                            of the modal. */}
+                                        <div className="fixed inset-0 z-10" onClick={() => setTypePickerOpen(false)} />
+                                        <div className="absolute left-0 top-full mt-1.5 z-20 w-56 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 shadow-lg py-1">
+                                            {RECORD_TYPE_OPTIONS.map((value) => (
+                                                <button
+                                                    key={value}
+                                                    type="button"
+                                                    onClick={() => {
+                                                        setTypePickerOpen(false);
+                                                        if (value !== recordType) onRecordTypeChange(value);
+                                                    }}
+                                                    className={`w-full flex items-center gap-2 text-left text-sm px-3 py-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
+                                                        value === recordType
+                                                            ? "text-neutral-900 dark:text-neutral-100 font-medium"
+                                                            : "text-neutral-600 dark:text-neutral-300"
+                                                    }`}
+                                                >
+                                                    <IoCheckmark
+                                                        className={value === recordType ? "opacity-100" : "opacity-0"}
+                                                    />
+                                                    {RECORD_TYPE_LABELS[value] ?? value}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        )}
                     </div>
                     <button onClick={closeModal} className="p-1 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded">
                         <IoClose className="text-2xl" />
@@ -473,9 +540,35 @@ const EnhancedScreenOptions = ({
 
                 {/* Content */}
                 <div className="flex-1 overflow-y-auto">
-                    {mode === 'main' && renderMainOptions()}
-                    {mode === 'monitors' && renderMonitors()}
-                    {mode === 'windows' && renderWindows()}
+                    {mode === 'main' && !isCameraOnly && !isAudioOnly && renderMainOptions()}
+                    {mode === 'monitors' && !isCameraOnly && !isAudioOnly && renderMonitors()}
+                    {mode === 'windows' && !isCameraOnly && !isAudioOnly && renderWindows()}
+                    {/* Camera-only recording: the camera IS the picture, so it gets a full-frame
+                        preview instead of the overlay-bubble settings below (which describe a
+                        composite onto a screen capture that these modes never make). */}
+                    {isCameraOnly && (
+                        <div className="p-6 space-y-3">
+                            <CameraOverlayPreview
+                                videoDevices={videoDevices}
+                                overlayShape={overlayShape}
+                                overlayPosition={overlayPosition}
+                                overlaySize={overlaySize}
+                                variant="full"
+                            />
+                            <p className="text-sm text-gray-500 dark:text-neutral-400">
+                                {videoDevices.length === 0
+                                    ? "Pick a camera in the recording bar's Video device(s) list to record."
+                                    : "Recording the camera only - no screen is captured, so there's nothing to select here."}
+                            </p>
+                        </div>
+                    )}
+                    {isAudioOnly && (
+                        <div className="p-6">
+                            <p className="text-sm text-gray-500 dark:text-neutral-400">
+                                Recording audio only - no screen or camera is captured. Press Start Recording when ready.
+                            </p>
+                        </div>
+                    )}
                     {/* A camera overlay bubble only exists for the two record types that
                         actually composite a camera onto a screen capture (see win.rs's
                         recording_with_output_sva/_sv) - showing these settings for "sa"/"s"/
