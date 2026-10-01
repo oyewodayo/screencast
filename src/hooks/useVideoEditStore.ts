@@ -18,6 +18,7 @@ import {
   duplicateOverlay,
   duplicateTimedOverlay,
   insertClip as insertClipHandler,
+  isDetachedAudioOverlay,
   makeAudioOverlay,
   makeBlurOverlay,
   makeImageOverlay,
@@ -30,6 +31,8 @@ import {
   resizeClipEdge as resizeClipEdgeHandler,
   resizeOverlayTime,
   resizePipOverlayTime,
+  splitPipOverlayAt,
+  deletePipOverlayAndCloseGap,
   sendOverlayToBack,
   splitClipAt,
   toKeepSegments,
@@ -95,7 +98,7 @@ type ImageOverlayContentPatch = Partial<
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
-type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "volume" | "muted">>;
+type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted">>;
 type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction">>;
 
 export interface UseVideoEditStoreResult {
@@ -168,7 +171,8 @@ export interface UseVideoEditStoreResult {
   duplicateAudioOverlay: (id: string) => string;
   // "Unlink" the primary video's own sound: adds one audio overlay per already-extracted clip
   // audio file AND mutes the video track, as a single undo step - so the result can be trimmed,
-  // lowered, muted or deleted per piece without touching the picture.
+  // lowered, muted or deleted per piece without touching the picture. Replaces any overlays a
+  // previous detach created (isDetachedAudioOverlay) instead of stacking a second copy.
   detachVideoAudio: (tracks: { src: string; sourceDuration: number; startTime: number; endTime: number; label?: string }[]) => void;
   // Picture-in-picture video layers (e.g. a separately-recorded webcam - see FormData.
   // separate_webcam_capture, recording.rs) - same "real source file, trims into it" shape as audio
@@ -179,7 +183,12 @@ export interface UseVideoEditStoreResult {
   updatePipOverlayContent: (id: string, patch: PipOverlayContentPatch) => void;
   resizePipOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
   movePipOverlayTime: (id: string, newStartTime: number) => void;
+  // Removes the piece AND closes the gap it leaves in its own split chain - see
+  // deletePipOverlayAndCloseGap (videoEditHandlers.ts).
   deletePipOverlay: (id: string) => void;
+  // Cuts one PiP at an output-timeline time; returns the new second piece's id ("" if the cut was
+  // refused - too close to either edge).
+  splitPipOverlay: (id: string, outputTime: number) => string;
   duplicatePipOverlay: (id: string) => string;
   // The primary video's OWN audio level - see VideoEditState.videoAudioMuted's own doc comment for
   // why this is distinct from any AudioOverlay's own volume/muted. Read by VideoPlayer.tsx (stacked
@@ -838,8 +847,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (tracks: { src: string; sourceDuration: number; startTime: number; endTime: number; label?: string }[]) => {
       const current = stateRef.current;
       if (!current || tracks.length === 0) return;
-      let audioOverlays = current.audioOverlays;
-      for (const t of tracks) audioOverlays = addOverlay(audioOverlays, makeAudioOverlay(t.src, t.sourceDuration, t.startTime, t.endTime, t.label));
+      // Replace, don't stack: a previous detach's overlays would otherwise keep playing underneath
+      // the new ones. User-added music (not from a detach) is left alone.
+      let audioOverlays = current.audioOverlays.filter((o) => !isDetachedAudioOverlay(o));
+      for (const t of tracks) audioOverlays = addOverlay(audioOverlays, { ...makeAudioOverlay(t.src, t.sourceDuration, t.startTime, t.endTime, t.label), detached: true });
       pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays, videoAudioMuted: true }), "detach-audio");
     },
     [pushCommand]
@@ -945,8 +956,21 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string) => {
       const current = stateRef.current;
       if (!current) return;
-      const pipOverlays = deleteOverlay(current.pipOverlays, id);
+      const pipOverlays = deletePipOverlayAndCloseGap(current.pipOverlays, id);
       pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "delete-pip");
+    },
+    [pushCommand]
+  );
+
+  const splitPipOverlay = useCallback(
+    (id: string, outputTime: number): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const pipOverlays = splitPipOverlayAt(current.pipOverlays, id, outputTime);
+      if (pipOverlays === current.pipOverlays) return "";
+      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "edit-pip");
+      const index = pipOverlays.findIndex((o) => o.id === id);
+      return pipOverlays[index + 1]?.id ?? "";
     },
     [pushCommand]
   );
@@ -1128,6 +1152,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
               height: Math.round(o.height * videoPixelSize.height),
               shape: o.shape,
               cornerRadius: o.cornerRadius,
+              crop: o.crop,
               trimStart: o.trimStart,
               startTime: o.startTime,
               endTime: o.endTime,
@@ -1222,6 +1247,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     resizePipOverlayTime: resizePipOverlayTimeCb,
     movePipOverlayTime,
     deletePipOverlay,
+    splitPipOverlay,
     duplicatePipOverlay,
     applyViewSwitchOverlays,
     videoAudioMuted: state?.videoAudioMuted ?? false,

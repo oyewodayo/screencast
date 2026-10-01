@@ -1,20 +1,17 @@
 // components/video/PipOverlayPopover.tsx
 //
-// Position/size/shape controls for a selected PipOverlay - same portal + useClampedPopoverPosition
-// + outside-click-close shape as ClipEffectsPopover/AudioOverlayPopover. Position can also be
-// dragged directly on the video itself (PipOverlayLayer.tsx) - the X/Y sliders here are a precise/
-// keyboard-friendly alternative, not the only way to move it. Size/shape have no on-canvas
-// equivalent yet (no resize handle), so these sliders are still the only way to change those - a
-// smaller, simpler control surface than ImageOverlay/BlurOverlay get, in exchange for not
-// duplicating VideoOverlayLayer.tsx's much larger resize/rotate machinery for a first version of
-// this feature.
+// Position/size/shape/crop controls for a selected PipOverlay - same portal + useClampedPopoverPosition
+// + outside-click-close shape as ClipEffectsPopover/AudioOverlayPopover. Position and size can also
+// be edited directly on the video itself (PipOverlayLayer.tsx's drag + resize handles) - the sliders
+// here are a precise/keyboard-friendly alternative, not the only way. Crop has no slider form: the
+// Crop button hands off to PipOverlayLayer's own on-canvas crop editor (onStartCrop).
 import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
-import { IoClose, IoTrashOutline } from "react-icons/io5";
+import { IoClose, IoCropOutline, IoTrashOutline } from "react-icons/io5";
 import { PipOverlay, PipShape } from "../../utils/videoEditTypes";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 
-export type PipOverlayPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "volume" | "muted">>;
+export type PipOverlayPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted">>;
 
 const SHAPE_OPTIONS: { value: PipShape; label: string }[] = [
   { value: "circle", label: "Circle" },
@@ -28,6 +25,7 @@ interface PipOverlayPopoverProps {
   onUpdate: (patch: PipOverlayPatch) => void;
   onDelete: () => void;
   onClose: () => void;
+  onStartCrop: () => void;
 }
 
 const Slider: React.FC<{ label: string; value: number; onChange: (v: number) => void; max?: number }> = ({ label, value, onChange, max = 1 }) => (
@@ -38,12 +36,15 @@ const Slider: React.FC<{ label: string; value: number; onChange: (v: number) => 
   </label>
 );
 
-const PipOverlayPopover: React.FC<PipOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDelete, onClose }) => {
+const PipOverlayPopover: React.FC<PipOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDelete, onClose, onStartCrop }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
 
   useEffect(() => {
     const close = (e: PointerEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-pip-popover]")) return;
+      // [data-pip-interactive] is the pip box itself plus its resize handles (PipOverlayLayer.tsx) -
+      // grabbing one of those to drag/resize must not close the popover and deselect the pip (which
+      // would also unmount the very handle being dragged).
+      if (e.target instanceof Element && e.target.closest("[data-pip-popover], [data-pip-interactive]")) return;
       onClose();
     };
     document.addEventListener("pointerdown", close);
@@ -75,6 +76,22 @@ const PipOverlayPopover: React.FC<PipOverlayPopoverProps> = ({ overlay, anchor, 
         <Slider label="Y" value={overlay.y} onChange={(y) => onUpdate({ y: Math.max(0, Math.min(1 - overlay.height, y)) })} />
         <Slider label="Width" value={overlay.width} onChange={(width) => onUpdate({ width: Math.max(0.05, Math.min(1 - overlay.x, width)) })} />
         <Slider label="Height" value={overlay.height} onChange={(height) => onUpdate({ height: Math.max(0.05, Math.min(1 - overlay.y, height)) })} />
+      </div>
+
+      <div className="flex items-center gap-1.5 pt-1 border-t border-white/10">
+        <button
+          type="button"
+          onClick={onStartCrop}
+          className="flex items-center gap-1 px-2 py-1 rounded text-[11px] text-white/80 hover:text-white bg-white/5 hover:bg-white/10"
+        >
+          <IoCropOutline size={13} />
+          Crop video…
+        </button>
+        {overlay.crop && (
+          <button type="button" onClick={() => onUpdate({ crop: undefined })} className="px-2 py-1 rounded text-[11px] text-white/60 hover:text-white hover:bg-white/10">
+            Reset crop
+          </button>
+        )}
       </div>
 
       <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">

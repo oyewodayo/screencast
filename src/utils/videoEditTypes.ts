@@ -288,6 +288,10 @@ export interface AudioOverlay {
   // Short name shown on the timeline chip - set by "Detach audio" ("Voice", "Music", "Track 2 ·
   // eng"); user-added music has none and shows its file name in the tooltip only.
   label?: string;
+  // True for overlays produced by "Detach audio" (the video's own sound, split out). A later detach
+  // replaces all of these rather than stacking a second copy on top - which would otherwise keep
+  // playing the old Music/Voice underneath the new ones, hidden in lower lane rows.
+  detached?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -311,7 +315,11 @@ export interface PipOverlay {
   width: number;
   height: number;
   shape: PipShape;
-  cornerRadius?: number; // fraction of frame height, "rounded" only - undefined means a modest default
+  cornerRadius?: number; // fraction of this PiP box's own height, "rounded" only - undefined means a modest default
+  // Region of the pip SOURCE frame actually shown (fractions of the source's own width/height, same
+  // basis as Clip.crop) - applied before the box's own cover-fit, in both the preview
+  // (PipOverlayLayer.tsx) and export (pip_overlay_chain, conversion.rs). Undefined means the whole frame.
+  crop?: ClipCrop;
   trimStart: number;
   sourceDuration: number;
   startTime: number;

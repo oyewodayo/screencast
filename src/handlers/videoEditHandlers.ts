@@ -412,6 +412,13 @@ export function makeAudioOverlay(src: string, sourceDuration: number, startTime:
   return { id: crypto.randomUUID(), src, sourceDuration, startTime, endTime, trimStart: 0, volume: 1, ...(label ? { label } : {}), createdAt: now, updatedAt: now };
 }
 
+// Whether an audio overlay came from "Detach audio" rather than being music the user added.
+// Overlays detached before the `detached` flag existed are recognized by where detach writes its
+// files (the app cache's detached-audio folder), so re-detaching also cleans those up.
+export function isDetachedAudioOverlay(o: AudioOverlay): boolean {
+  return o.detached === true || /[\\/]detached-audio[\\/]/.test(o.src);
+}
+
 // Stacks audio overlays into rows so overlapping ones (e.g. a detached voice and music pair, or
 // several detached streams) get their own row instead of drawing on top of each other. Greedy
 // by start time: each overlay takes the first row whose last overlay has already ended.
@@ -603,6 +610,65 @@ export function resizePipOverlayTime(overlays: PipOverlay[], id: string, edge: "
     const clampedEnd = Math.min(maxEnd, Math.max(time, o.startTime + MIN_OVERLAY_DURATION));
     return { ...o, endTime: clampedEnd, updatedAt: Date.now() };
   });
+}
+
+// Cuts one PiP overlay in two at `outputTime` - the PiP-lane counterpart to splitClipAt. The
+// second piece picks up exactly where the first leaves off in the pip's own source (trimStart
+// advanced by the first piece's length), so playing both back to back is visually identical to
+// the unsplit original. Everything else (geometry, shape, crop, audio) carries over to both pieces.
+// Returns the input unchanged when the cut would leave either piece shorter than
+// MIN_OVERLAY_DURATION (same "too close to an edge" rule splitClipAt applies to clips).
+export function splitPipOverlayAt(overlays: PipOverlay[], id: string, outputTime: number): PipOverlay[] {
+  const index = overlays.findIndex((o) => o.id === id);
+  if (index === -1) return overlays;
+  const o = overlays[index];
+  if (outputTime - o.startTime < MIN_OVERLAY_DURATION || o.endTime - outputTime < MIN_OVERLAY_DURATION) return overlays;
+  const now = Date.now();
+  const first: PipOverlay = { ...o, endTime: outputTime, updatedAt: now };
+  const second: PipOverlay = {
+    ...o,
+    id: crypto.randomUUID(),
+    startTime: outputTime,
+    trimStart: o.trimStart + (outputTime - o.startTime),
+    createdAt: now,
+    updatedAt: now,
+  };
+  return [...overlays.slice(0, index), first, second, ...overlays.slice(index + 1)];
+}
+
+// Tolerance for "this piece starts exactly where that one ends" - pieces produced by
+// splitPipOverlayAt share the exact same boundary value, but a boundary that has since been moved
+// through the store's own float math can drift by a hair.
+const PIP_CHAIN_EPSILON_SEC = 0.001;
+
+// Deletes one PiP piece and closes the gap it leaves - the PiP-lane counterpart to deleting a clip
+// (which the concat-based clip track does implicitly). Only the pieces CHAINED directly after the
+// deleted one move back: each successive piece of the same source that starts exactly where the
+// previous one ends, i.e. what splitting one PiP produces. Cut the unwanted middle out of a split
+// PiP and the pieces either side of it join up and play back to back. Anything not touching the
+// chain - a separately-placed PiP, or the gapped per-interval pieces a view-switch recording
+// produces (buildViewSwitchOverlays), which must stay in sync with the screen track - is left
+// exactly where it is.
+export function deletePipOverlayAndCloseGap(overlays: PipOverlay[], id: string): PipOverlay[] {
+  const deleted = overlays.find((o) => o.id === id);
+  if (!deleted) return overlays;
+  const remaining = overlays.filter((o) => o.id !== id);
+  const gap = deleted.endTime - deleted.startTime;
+
+  const chainIds = new Set<string>();
+  let chainEnd = deleted.endTime;
+  for (;;) {
+    const next = remaining.find(
+      (o) => !chainIds.has(o.id) && o.sourcePath === deleted.sourcePath && Math.abs(o.startTime - chainEnd) <= PIP_CHAIN_EPSILON_SEC
+    );
+    if (!next) break;
+    chainIds.add(next.id);
+    chainEnd = next.endTime;
+  }
+  if (chainIds.size === 0) return remaining;
+
+  const now = Date.now();
+  return remaining.map((o) => (chainIds.has(o.id) ? { ...o, startTime: o.startTime - gap, endTime: o.endTime - gap, updatedAt: now } : o));
 }
 
 // A time-offset sibling to duplicateOverlay above (which requires x/y - meaningless for an audio

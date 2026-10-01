@@ -2166,6 +2166,11 @@ pub struct PipOverlay {
     pub height: i64,
     pub shape: String, // "circle" | "rounded" | "rectangle" - sanitized via sanitize_pip_shape
     pub corner_radius: Option<f64>, // fraction of `height`, "rounded" only
+    // Source-frame region to keep (fractions of the pip source's own width/height, same basis as
+    // PipOverlay.crop, videoEditTypes.ts) - applied before the cover-fit scale below. `default` so
+    // an older frontend that never sends it still deserializes.
+    #[serde(default)]
+    pub crop: Option<PipCrop>,
     pub trim_start: f64,
     pub start_time: f64,
     pub end_time: f64,
@@ -2174,6 +2179,36 @@ pub struct PipOverlay {
     // effective_video_volume already folds audio_muted into the primary track's own volume,
     // rather than carrying a separate bool here too.
     pub volume: f64,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct PipCrop {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+// `crop=` fragment (with trailing comma) for a pip's source-frame crop, or "" when there's nothing
+// to crop - an unset, non-finite, or effectively full-frame crop is skipped entirely rather than
+// emitted as a no-op filter. Clamped the same way ClipCropOverlay clamps it on the frontend
+// (MIN_FRACTION 0.05), so a hand-edited sidecar can't ask ffmpeg for a zero-area crop.
+fn pip_crop_fragment(crop: Option<PipCrop>) -> String {
+    let Some(c) = crop else { return String::new() };
+    if ![c.x, c.y, c.width, c.height].iter().all(|v| v.is_finite()) {
+        return String::new();
+    }
+    let w = c.width.clamp(0.05, 1.0);
+    let h = c.height.clamp(0.05, 1.0);
+    let x = c.x.clamp(0.0, 1.0 - w);
+    let y = c.y.clamp(0.0, 1.0 - h);
+    if w > 0.999 && h > 0.999 {
+        return String::new();
+    }
+    format!(
+        "crop=w=iw*{w:.6}:h=ih*{h:.6}:x=iw*{x:.6}:y=ih*{y:.6},",
+        w = w, h = h, x = x, y = y
+    )
 }
 
 const ALLOWED_PIP_SHAPES: &[&str] = &["circle", "rounded", "rectangle"];
@@ -2206,8 +2241,8 @@ fn pip_overlay_chain(
     let duration = (pip.end_time - pip.start_time).max(0.01);
     let trim_end = pip.trim_start + duration;
     let cover = format!(
-        "trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}",
-        ts = pip.trim_start, te = trim_end, w = pip.width, h = pip.height
+        "trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS,{src_crop}scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}",
+        ts = pip.trim_start, te = trim_end, src_crop = pip_crop_fragment(pip.crop), w = pip.width, h = pip.height
     );
     let shape = sanitize_pip_shape(&pip.shape);
     let video_label = format!("pip{}v", stage_index);
@@ -2222,12 +2257,18 @@ fn pip_overlay_chain(
             let mask_expr = if shape == "rounded" {
                 let r = ((pip.corner_radius.unwrap_or(0.08).max(0.0).min(0.5)) * pip.height as f64)
                     .round() as i64;
+                // Distance past the nearest corner circle's centre on each axis (0 anywhere along
+                // the straight edges/interior) - opaque iff that point lies within radius r, i.e.
+                // real quarter-circle corners matching the preview's CSS border-radius.
                 format!(
-                    "if(gte(X,{r})*gte(Y,{r})*gte(W-{r}-X,0)*gte(H-{r}-Y,0),255,0)",
-                    r = r
+                    "if(lte(pow(max(max({r}-X,X-(W-1-{r})),0),2)+pow(max(max({r}-Y,Y-(H-1-{r})),0),2),{r}*{r}),255,0)",
+                    r = r.max(1)
                 )
             } else {
-                "if(gt((X-W/2)^2+(Y-H/2)^2,(W/2)^2),0,255)".to_string()
+                // Ellipse inscribed in the box (a true circle when the box is square) - matches the
+                // preview's `ellipse(50% 50%)` clip-path, so a non-square box never gets cut into
+                // the circle-wider-than-its-box shape a plain W/2 radius produced.
+                "if(gt((X-W/2)^2/((W/2)^2)+(Y-H/2)^2/((H/2)^2),1),0,255)".to_string()
             };
             let alpha_label = format!("pip{}a", stage_index);
             let masked_label = format!("pip{}m", stage_index);
@@ -3139,11 +3180,16 @@ pub async fn export_trimmed_video(
             // effectively always one consistent rate throughout a session either way).
             let target_fps = probe_frame_rate(&ffprobe_path, &segments[0].source_path);
 
+            // `settb=AVTB` too: xfade also demands both inputs share one timebase, but a plain
+            // 2-way `concat` fold step (a boundary with no transition) outputs AVTB (1/1000000)
+            // while an untouched segment is still at 1/fps - so an xfade following any concat
+            // failed with "First input link main timebase ... do not match" (reproduced against
+            // the bundled ffmpeg). Pinning every segment to AVTB makes all fold steps agree.
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height);
                 let speed = segment_speed(seg);
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{5:.4}{3},fps={4:.3}[v{2}];",
+                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{5:.4}{3},fps={4:.3},settb=AVTB[v{2}];",
                     seg.start, seg.end, i, extra, target_fps, speed
                 ));
                 filter.push_str(&audio_trim_chain(
@@ -4118,6 +4164,25 @@ mod tests {
         assert_eq!(sanitize_overlay_animation("slide-left"), "slide-left");
         assert_eq!(sanitize_overlay_animation("pop"), "none"); // "pop" is preview-only, never sent
         assert_eq!(sanitize_overlay_animation("anything-else"), "none");
+    }
+
+    #[test]
+    fn pip_crop_fragment_skips_full_frame_and_clamps() {
+        assert_eq!(pip_crop_fragment(None), "");
+        assert_eq!(
+            pip_crop_fragment(Some(PipCrop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 })),
+            ""
+        );
+        assert_eq!(
+            pip_crop_fragment(Some(PipCrop { x: 0.25, y: 0.1, width: 0.5, height: 0.8 })),
+            "crop=w=iw*0.500000:h=ih*0.800000:x=iw*0.250000:y=ih*0.100000,"
+        );
+        // Zero-area and overflowing crops are clamped rather than handed to ffmpeg as-is.
+        assert_eq!(
+            pip_crop_fragment(Some(PipCrop { x: 0.99, y: 0.0, width: 0.0, height: 1.0 })),
+            "crop=w=iw*0.050000:h=ih*1.000000:x=iw*0.950000:y=ih*0.000000,"
+        );
+        assert_eq!(pip_crop_fragment(Some(PipCrop { x: f64::NAN, y: 0.0, width: 0.5, height: 0.5 })), "");
     }
 
     #[test]
