@@ -214,6 +214,38 @@ interface FileMap {
 // second carries no payload of its own.
 type VideoEditorScreen = { mode: "home" } | { mode: "editing" };
 
+// True while the cursor has moved (or a key/click/wheel happened) within the last `idleMs`, the
+// same "controls fade out while you're just watching" behaviour as the player's own control bar.
+// Only flips state on an actual active<->idle transition, so mousemove doesn't re-render per event.
+function useCursorActive(enabled: boolean, idleMs = 2500): boolean {
+  const [active, setActive] = useState(true);
+  const activeRef = useRef(true);
+  useEffect(() => {
+    if (!enabled) {
+      activeRef.current = true;
+      setActive(true);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout>;
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { activeRef.current = false; setActive(false); }, idleMs);
+    };
+    const wake = () => {
+      if (!activeRef.current) { activeRef.current = true; setActive(true); }
+      arm();
+    };
+    const events = ["mousemove", "mousedown", "keydown", "wheel", "touchstart"] as const;
+    events.forEach((e) => window.addEventListener(e, wake, { passive: true }));
+    arm();
+    return () => {
+      clearTimeout(timer);
+      events.forEach((e) => window.removeEventListener(e, wake));
+    };
+  }, [enabled, idleMs]);
+  return active;
+}
+
 const Dashboard = () => {
   const [message, setMessage] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
@@ -485,6 +517,12 @@ const Dashboard = () => {
   // PNG for them by the time this reads it (see resolveImageDisplayUrl/loadFileForPlayback), so
   // there's nothing left to fail decoding.
   const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
+  // While a video/audio file is playing, the floating "Back to …" button fades out once the cursor
+  // goes idle (like the player's own controls) so it isn't sitting on top of the picture.
+  const selectedCategory = selectedFile ? getFileCategory(selectedFile.name) : null;
+  const isMediaFileSelected = selectedCategory === "video" || selectedCategory === "audio";
+  const cursorActive = useCursorActive(isMediaFileSelected);
+  const backButtonFade = `transition-opacity duration-300 ${cursorActive ? "opacity-100" : "opacity-0 [&>button]:pointer-events-none"}`;
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
@@ -3449,7 +3487,7 @@ const setScreen = () => {
               is full-width, so only the button itself takes pointer events back; the rest of the
               strip stays click-through to the player underneath. */}
           {videoEditorScreen?.mode === "editing" && selectedFile ? (
-            <div className="shrink-0 px-3 pt-3 relative z-20 pointer-events-none">
+            <div className={`shrink-0 px-3 pt-3 relative z-20 pointer-events-none ${backButtonFade}`}>
               <button
                 type="button"
                 onClick={() => { setSelectedFile(null); setVideoEditorScreen({ mode: "home" }); }}
@@ -3460,7 +3498,7 @@ const setScreen = () => {
               </button>
             </div>
           ) : selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
-            <div className="shrink-0 px-3 pt-3 relative z-20 pointer-events-none">
+            <div className={`shrink-0 px-3 pt-3 relative z-20 pointer-events-none ${backButtonFade}`}>
               <button
                 type="button"
                 onClick={() => setSelectedFile(null)}
@@ -3877,6 +3915,7 @@ const setScreen = () => {
         onActiveClipChange={setActiveClipEffects}
         noiseReductionStatus={noiseReductionStatus}
         onRecalibrateNoise={() => videoPlayerRef.current?.recalibrateNoiseReduction()}
+        onPreviewNoiseOriginal={(bypass) => videoPlayerRef.current?.setNoisePreviewBypass(bypass)}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={setSelectedOverlayId}
         isPlacingText={isPlacingText}

@@ -59,6 +59,8 @@ interface Props {
   // Video-only: forwards NoiseReductionPopover's "Recalibrate from current playback" click through
   // to VideoPlayer, same threading direction as onActiveClipChange above.
   onRecalibrateNoise?: () => void;
+  // Video-only: NoiseReductionPopover's "Hold to compare", forwarded to VideoTimelineDocker.
+  onPreviewNoiseOriginal?: (bypass: boolean) => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // FileToolsDocker/VideoTimelineDocker.
   selectedOverlayId?: string | null;
@@ -197,6 +199,7 @@ const BottomDocker = ({
   onActiveClipChange,
   noiseReductionStatus,
   onRecalibrateNoise,
+  onPreviewNoiseOriginal,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -621,6 +624,7 @@ const BottomDocker = ({
             onActiveClipChange={onActiveClipChange}
             noiseReductionStatus={noiseReductionStatus}
             onRecalibrateNoise={onRecalibrateNoise}
+            onPreviewNoiseOriginal={onPreviewNoiseOriginal}
             selectedOverlayId={selectedOverlayId}
             onSelectOverlay={onSelectOverlay}
             isPlacingText={isPlacingText}

@@ -340,6 +340,12 @@ real tradeoff, and only the multilingual one supports the language picker in the
 [the ggml-org/whisper.cpp model repo on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp)
 into the same folder (~141MB).
 
+The audio cleanup tool's "Remove noise" mode exports through ffmpeg's `arnndn` filter, which
+needs an RNNoise model file: download
+[`bd.rnnn`](https://raw.githubusercontent.com/GregorR/rnnoise-models/master/beguiling-drafter-2018-08-30/bd.rnnn)
+(~300KB, from GregorR/rnnoise-models - trained on voice over recording noise) into
+`src-tauri/binaries/rnnoise/`. Without it, export falls back to the spectral `afftdn` filter.
+
 ```bash
 npm run tauri dev
 ```
@@ -428,6 +434,7 @@ screencast/
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
 │   ├── binaries/heif/               # Bundled libheif (heif-dec.exe + DLLs) - HEIC/HEIF fallback decode
 │   ├── binaries/whisper/            # Bundled whisper.cpp CLI + DLLs + ggml-base.bin (multilingual) model - auto-generated captions
+│   ├── binaries/rnnoise/            # bd.rnnn RNNoise model - arnndn for the audio cleanup tool's "Remove noise" export
 │   └── tauri.conf.json              # Tauri app/window/permissions configuration
 └── public/                          # Static assets (icons, notification sounds)
 ```

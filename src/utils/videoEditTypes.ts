@@ -123,7 +123,29 @@ export interface Clip {
   // afftdn but not bit-identical) so NoiseReductionPopover's strength slider is audible while
   // editing, not just after export.
   noiseReduction?: number;
+  // How noiseReduction is applied plus the extra cleanup stages around it - see AudioCleanup.
+  // Undefined keeps the original behaviour (spectral "reduce" mode, no extra stages).
+  audioCleanup?: AudioCleanup;
 }
+
+// Optional audio-cleanup stages for one clip, applied in this order in both the live preview
+// (VideoPlayer.tsx's Web Audio graph) and the export (conversion.rs's audio_cleanup_filters):
+// low-cut -> hum notches -> denoise (Clip.noiseReduction, in `mode`) -> gate.
+export interface AudioCleanup {
+  // "reduce": spectral noise reduction (afftdn on export) - keeps some room tone, safest on
+  // music/ambience. "remove": RNNoise voice isolation (arnndn on export) - strips everything that
+  // isn't voice, for speech-only footage. Undefined means "reduce".
+  mode?: "reduce" | "remove";
+  // 80Hz high-pass - rumble, handling noise, wind, AC/traffic low end.
+  lowCut?: boolean;
+  // Mains hum (and its first harmonics) at 50Hz (Europe/Africa/Asia) or 60Hz (Americas).
+  hum?: 50 | 60;
+  // Downward expander that silences what's left between phrases.
+  gate?: boolean;
+}
+
+export const hasAudioCleanup = (clip: { noiseReduction?: number; audioCleanup?: AudioCleanup }): boolean =>
+  (clip.noiseReduction ?? 0) > 0 || !!clip.audioCleanup?.lowCut || !!clip.audioCleanup?.hum || !!clip.audioCleanup?.gate;
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
 // when a backgroundColor is set (an invisible box has no edges to round). Video-only: TextObject
@@ -352,6 +374,7 @@ export interface KeepSegment {
   flipHorizontal?: boolean;
   speed?: number;
   noiseReduction?: number;
+  audioCleanup?: AudioCleanup;
 }
 
 export interface VideoEditState {

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { MdClosedCaption, MdOutlineOpacity, MdSpeed } from 'react-icons/md';
-import { IoPlayCircleOutline, IoChevronForward, IoCheckmark, IoImageOutline } from 'react-icons/io5';
+import { IoPlayCircleOutline, IoChevronForward, IoCheckmark, IoImageOutline, IoEyeOutline, IoScanOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
 import { CAPTIONS_LANGUAGE_OPTIONS } from '../../utils/videoUtils';
 
 // Define the props interface
@@ -17,6 +17,11 @@ interface PlaytimeSettingsProps {
   autoDetectCaptions: boolean;
   onAutoDetectCaptionsChange: () => void;
   hasCaptions: boolean;
+  captionsVisible: boolean;
+  onCaptionsVisibleChange: () => void;
+  // Language the on-screen captions were generated in (null = loaded from a file / none) - so the
+  // generate row can say "Regenerate" and the language row can flag a pending mismatch.
+  generatedCaptionsLanguage: string | null;
   onLoadCaptionsFile: () => void;
   onGenerateCaptions: () => void;
   isGeneratingCaptions: boolean;
@@ -32,6 +37,9 @@ interface PlaytimeSettingsProps {
   thumbnailStatus: 'idle' | 'saving' | 'saved' | 'error';
 }
 
+const languageName = (code: string): string =>
+  CAPTIONS_LANGUAGE_OPTIONS.find(([c]) => c === code)?.[1] ?? code;
+
 const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   onAutoplayChange,
   isAutoplay,
@@ -42,6 +50,9 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   autoDetectCaptions,
   onAutoDetectCaptionsChange,
   hasCaptions,
+  captionsVisible,
+  onCaptionsVisibleChange,
+  generatedCaptionsLanguage,
   onLoadCaptionsFile,
   onGenerateCaptions,
   isGeneratingCaptions,
@@ -168,27 +179,59 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
           Captions
         </span>
         <span className="settings-row-value">
-          {isGeneratingCaptions ? `${Math.round(captionsGenerationProgress ?? 0)}%` : hasCaptions ? 'On' : 'Off'}
+          {isGeneratingCaptions
+            ? `${Math.round(captionsGenerationProgress ?? 0)}%`
+            : !hasCaptions
+            ? 'None'
+            : captionsVisible
+            ? generatedCaptionsLanguage
+              ? languageName(generatedCaptionsLanguage)
+              : 'On'
+            : 'Off'}
           <IoChevronForward className={`settings-chevron ${showCaptionsOptions ? 'settings-chevron-open' : ''}`} />
         </span>
       </button>
 
       {showCaptionsOptions && (
         <div className="settings-submenu">
+          {hasCaptions && (
+            <button className="settings-row settings-submenu-item" onClick={onCaptionsVisibleChange}>
+              <span className="settings-row-label">
+                <IoEyeOutline />
+                Show captions
+              </span>
+              <label className="switch" onClick={(e) => e.stopPropagation()}>
+                <input type="checkbox" checked={captionsVisible} onChange={onCaptionsVisibleChange} name="captions-visible" />
+                <span className="slider round"></span>
+              </label>
+            </button>
+          )}
           <button className="settings-row settings-submenu-item" onClick={onAutoDetectCaptionsChange}>
-            <span>Auto-detect from file</span>
+            <span className="settings-row-label">
+              <IoScanOutline />
+              Auto-load matching file
+            </span>
             <label className="switch" onClick={(e) => e.stopPropagation()}>
               <input type="checkbox" checked={autoDetectCaptions} onChange={onAutoDetectCaptionsChange} name="captions-autodetect" />
               <span className="slider round"></span>
             </label>
           </button>
           <button className="settings-row settings-submenu-item" onClick={onLoadCaptionsFile} disabled={isGeneratingCaptions}>
-            <span>Load caption file…</span>
+            <span className="settings-row-label">
+              <IoDocumentTextOutline />
+              Load caption file…
+            </span>
+            <span className="settings-row-value">.vtt / .srt</span>
           </button>
+
+          <div className="settings-subheader">Generate from audio · offline</div>
           <div className="settings-row settings-submenu-item">
-            <span>Generate language</span>
+            <span className="settings-row-label">
+              <IoLanguageOutline />
+              Language
+            </span>
             <select
-              className="text-xs rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 px-1.5 py-1 focus:outline-none"
+              className="settings-select"
               value={captionsLanguage}
               onChange={(e) => onCaptionsLanguageChange(e.target.value)}
               onClick={(e) => e.stopPropagation()}
@@ -199,9 +242,24 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
               ))}
             </select>
           </div>
-          <button className="settings-row settings-submenu-item" onClick={onGenerateCaptions} disabled={isGeneratingCaptions}>
-            <span>{isGeneratingCaptions ? `Generating… ${Math.round(captionsGenerationProgress ?? 0)}%` : 'Generate from audio (offline)'}</span>
-          </button>
+          {isGeneratingCaptions ? (
+            <div className="settings-row settings-submenu-item settings-progress-row">
+              <span className="settings-row-label">
+                <IoMicOutline />
+                Transcribing… {Math.round(captionsGenerationProgress ?? 0)}%
+              </span>
+              <div className="settings-progress">
+                <div className="settings-progress-fill" style={{ width: `${captionsGenerationProgress ?? 0}%` }} />
+              </div>
+            </div>
+          ) : (
+            <button className="settings-row settings-submenu-item" onClick={onGenerateCaptions}>
+              <span className="settings-row-label">
+                <IoMicOutline />
+                {generatedCaptionsLanguage ? 'Regenerate captions' : 'Generate captions'}
+              </span>
+            </button>
+          )}
         </div>
       )}
     </div>

@@ -187,6 +187,17 @@ pub fn get_whisper_model_path(app_handle: &AppHandle) -> Result<PathBuf, String>
         .map_err(|e| format!("Failed to resolve whisper model at {}: {}", resource_path, e))
 }
 
+// RNNoise model for arnndn ("remove noise" mode) - GregorR/rnnoise-models' beguiling-drafter,
+// trained on voice over recording-type noise.
+pub fn get_rnnoise_model_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let resource_path = "binaries/rnnoise/bd.rnnn";
+
+    app_handle
+        .path()
+        .resolve(resource_path, BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve RNNoise model at {}: {}", resource_path, e))
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct FileEntry {
     name: String,

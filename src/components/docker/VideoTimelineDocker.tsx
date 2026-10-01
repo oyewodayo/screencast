@@ -42,7 +42,7 @@ import {
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, PipOverlay, TextOverlay } from "../../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
 import { buildViewSwitchOverlays, overlaysActiveAt, packAudioRows, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
@@ -378,6 +378,9 @@ interface VideoTimelineDockerProps {
   // component has no ref to VideoPlayer itself) - same "Dashboard is the only place that can
   // reach across siblings" shape onLivePreview/onTogglePlayActiveFile already use.
   onRecalibrateNoise?: () => void;
+  // NoiseReductionPopover's "Hold to compare" - forwarded to VideoPlayer's setNoisePreviewBypass
+  // the same way onRecalibrateNoise is.
+  onPreviewNoiseOriginal?: (bypass: boolean) => void;
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
   // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
@@ -445,6 +448,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onActiveClipChange,
   noiseReductionStatus = "idle",
   onRecalibrateNoise,
+  onPreviewNoiseOriginal,
   selectedOverlayId = null,
   onSelectOverlay,
   isPlacingText = false,
@@ -1691,6 +1695,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         end: selectedClip.end,
         speed: selectedClip.speed ?? 1,
         noiseReduction: selectedClip.noiseReduction ?? null,
+        audioCleanup: selectedClip.audioCleanup ?? null,
         volume: editStore.videoAudioMuted ? 0 : editStore.videoAudioVolume,
         outputFormat: format,
         outputPath: chosen,
@@ -1790,6 +1795,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             end: clip.end,
             speed: clip.speed ?? 1,
             noiseReduction: clip.noiseReduction ?? null,
+            audioCleanup: clip.audioCleanup ?? null,
             volume: editStore.videoAudioVolume,
             outputFormat: "wav",
             outputPath,
@@ -2105,11 +2111,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             flipHorizontal: activeClip.flipHorizontal,
             speed: activeClip.speed,
             noiseReduction: activeClip.noiseReduction,
+            audioCleanup: activeClip.audioCleanup,
           }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.noiseReduction]);
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.noiseReduction, activeClip?.audioCleanup]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -2263,7 +2270,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={noiseReductionButtonRef}
             type="button"
-            title={selectedClipId ? "Reduce background noise" : "Select a clip to reduce its noise"}
+            title={selectedClipId ? "Clean up audio (reduce or remove noise, hum, rumble)" : "Select a clip to clean up its audio"}
             disabled={!selectedClipId}
             onClick={() => {
               if (noiseReductionPopoverAnchor) {
@@ -2280,7 +2287,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             {selectedClipId === activeClip?.id && noiseReductionStatus === "calibrating" ? (
               <IoSyncOutline size={15} className="text-blue-400 animate-spin" />
             ) : (
-              <MdOutlineNoiseControlOff size={15} className={selectedClip?.noiseReduction ? "text-blue-400" : undefined} />
+              <MdOutlineNoiseControlOff size={15} className={selectedClip && hasAudioCleanup(selectedClip) ? "text-blue-400" : undefined} />
             )}
           </button>
           <button
@@ -3188,11 +3195,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           return (
             <NoiseReductionPopover
               strength={clip.noiseReduction ?? 0}
+              cleanup={clip.audioCleanup}
               status={noiseReductionStatus}
               anchor={noiseReductionPopoverAnchor}
-              onUpdate={(noiseReduction) => editStore.updateClipEffects(clip.id, { noiseReduction })}
+              clipCount={editStore.clips.length}
+              onUpdate={(patch) => editStore.updateClipEffects(clip.id, patch)}
+              onApplyToAll={(patch) => editStore.updateAllClipEffects(patch)}
               onClose={() => setNoiseReductionPopoverAnchor(null)}
               onRecalibrate={onRecalibrateNoise}
+              onPreviewOriginal={onPreviewNoiseOriginal}
+              isPlaying={isPlaying}
+              onTogglePlay={handleTransportPlayClick}
             />
           );
         })()}

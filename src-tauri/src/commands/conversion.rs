@@ -2079,6 +2079,21 @@ pub struct KeepSegment {
     // segment_noise_reduction_params() below is what actually clamps/maps this value onto afftdn's
     // own `nr`/`nf` parameter pair for the real export-time filter.
     pub noise_reduction: Option<f64>,
+    // How noise_reduction is applied plus the extra cleanup stages around it - see AudioCleanup.
+    pub audio_cleanup: Option<AudioCleanup>,
+}
+
+// Mirrors AudioCleanup (videoEditTypes.ts). None/default fields keep the original behaviour:
+// spectral afftdn denoise only, no extra stages.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioCleanup {
+    // "reduce" (afftdn) or "remove" (arnndn voice isolation). Anything else means "reduce".
+    pub mode: Option<String>,
+    pub low_cut: Option<bool>,
+    // Mains frequency to notch out, 50 or 60 (anything else is ignored).
+    pub hum: Option<u32>,
+    pub gate: Option<bool>,
 }
 
 // One text or image overlay, already fully rendered client-side to a transparent PNG matching
@@ -2463,6 +2478,60 @@ fn noise_reduction_afftdn_params(strength: Option<f64>) -> Option<(f64, f64)> {
 // testable without spawning ffmpeg - see this file's own test module. noise_reduction belongs here
 // exactly like speed/crop/etc: omitting it once meant a single-segment timeline with ONLY noise
 // reduction turned on silently took the effect-free fast path and never got afftdn applied at all.
+// The full audio-cleanup chain for one clip, in the same order the live preview's Web Audio graph
+// runs it (VideoPlayer.tsx): low-cut -> hum notches -> denoise -> gate. Empty when nothing is on,
+// so an untouched clip's filter graph stays byte-for-byte what it was before this existed.
+// `rnnoise_model` is the already filtergraph-escaped path of the bundled arnndn model (see
+// escape_filter_path); "remove" mode falls back to afftdn if it's missing rather than failing the
+// whole export.
+fn audio_cleanup_filters(strength: Option<f64>, cleanup: Option<&AudioCleanup>, rnnoise_model: Option<&str>) -> Vec<String> {
+    let mut filters = Vec::new();
+    let cleanup = cleanup.cloned().unwrap_or_default();
+    if cleanup.low_cut.unwrap_or(false) {
+        filters.push("highpass=f=80".to_string());
+    }
+    if let Some(hz) = cleanup.hum.filter(|hz| *hz == 50 || *hz == 60) {
+        // Fundamental plus the next two harmonics - mains hum is rarely a pure sine. Narrow (Q=8)
+        // so voice energy right next to each notch survives.
+        for harmonic in 1..=3 {
+            filters.push(format!("bandreject=f={}:t=q:w=8", hz * harmonic));
+        }
+    }
+    let wants_remove = cleanup.mode.as_deref() == Some("remove");
+    match (wants_remove, rnnoise_model) {
+        (true, Some(model)) => {
+            let strength = strength.unwrap_or(0.0).max(0.0).min(1.0);
+            if strength > 0.0 {
+                // mix: 1 = fully denoised, lower blends the original back in (sample-aligned).
+                filters.push(format!("arnndn=m='{}':mix={:.2}", model, strength));
+            }
+        }
+        _ => {
+            if let Some((nr, nf)) = noise_reduction_afftdn_params(strength) {
+                filters.push(format!("afftdn=nr={:.2}:nf={:.1}", nr, nf));
+            }
+        }
+    }
+    if cleanup.gate.unwrap_or(false) {
+        // Gentle downward expander rather than a hard gate: ~-24dB of reduction (range) below the
+        // threshold, slow release so word tails aren't chopped.
+        filters.push("agate=threshold=0.015:ratio=3:attack=5:release=250:range=0.06".to_string());
+    }
+    filters
+}
+
+fn segment_audio_cleanup_filters(seg: &KeepSegment, rnnoise_model: Option<&str>) -> Vec<String> {
+    audio_cleanup_filters(seg.noise_reduction, seg.audio_cleanup.as_ref(), rnnoise_model)
+}
+
+// A path as a filter option value inside single quotes: forward slashes, and the drive colon
+// escaped for the option parser (the quotes protect it at the filtergraph level) - checked against
+// the bundled ffmpeg with `arnndn=m='C\:/.../bd.rnnn'`. Quotes are dropped since they can't be
+// escaped inside a quoted value.
+fn escape_filter_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/").replace(':', "\\:").replace('\'', "")
+}
+
 fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
     seg.color_filter
         .as_ref()
@@ -2473,6 +2542,7 @@ fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
         || seg.flip_horizontal.unwrap_or(false)
         || (segment_speed(seg) - 1.0).abs() > 0.001
         || segment_noise_reduction_db(seg).is_some()
+        || !segment_audio_cleanup_filters(seg, None).is_empty()
 }
 
 // Decomposes an arbitrary speed factor into a chain of ffmpeg `atempo` filters, each within the
@@ -2781,7 +2851,7 @@ fn audio_trim_chain(
     start: f64,
     end: f64,
     speed: f64,
-    noise_reduction: Option<(f64, f64)>,
+    cleanup_filters: &[String],
     out_label: &str,
 ) -> String {
     if has_audio {
@@ -2790,10 +2860,7 @@ fn audio_trim_chain(
         // "atempo=1.0000", functionally a no-op, so this needs no separate branch for that case.
         // afftdn runs AFTER atempo - it's a per-frame spectral filter, order relative to tempo
         // doesn't change its own output, so there's no reason to special-case which comes first.
-        let denoise = match noise_reduction {
-            Some((nr, nf)) => format!(",afftdn=nr={:.2}:nf={:.1}", nr, nf),
-            None => String::new(),
-        };
+        let denoise: String = cleanup_filters.iter().map(|f| format!(",{}", f)).collect();
         format!(
             "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo}{denoise}[{out}];",
             idx = input_index, tempo = atempo_chain(speed), out = out_label
@@ -3059,6 +3126,11 @@ pub async fn export_trimmed_video(
         // Probed once up front (not per-branch) since all three shapes below - single segment,
         // plain concat, transition fold - need it: see audio_trim_chain's own doc comment for why.
         let ffprobe_path = get_ffprobe_path(&app_handle)?;
+        // Only needed for "remove" mode clips; missing just falls back to afftdn per clip.
+        let rnnoise_model = crate::services::utility::get_rnnoise_model_path(&app_handle)
+            .ok()
+            .filter(|p| p.exists())
+            .map(|p| escape_filter_path(&p));
 
         // One audio probe per UNIQUE source file, not one per segment - a timeline built by
         // splitting a single recording into several clips would otherwise spawn a redundant
@@ -3138,7 +3210,7 @@ pub async fn export_trimmed_video(
                 seg.start,
                 seg.end,
                 speed,
-                segment_noise_reduction_params(seg),
+                &segment_audio_cleanup_filters(seg, rnnoise_model.as_deref()),
                 "outa",
             ));
         } else if !has_transitions {
@@ -3161,7 +3233,7 @@ pub async fn export_trimmed_video(
                     seg.start,
                     seg.end,
                     speed,
-                    segment_noise_reduction_params(seg),
+                    &segment_audio_cleanup_filters(seg, rnnoise_model.as_deref()),
                     &format!("a{}", i),
                 ));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
@@ -3207,7 +3279,7 @@ pub async fn export_trimmed_video(
                     seg.start,
                     seg.end,
                     speed,
-                    segment_noise_reduction_params(seg),
+                    &segment_audio_cleanup_filters(seg, rnnoise_model.as_deref()),
                     &format!("a{}", i),
                 ));
             }
@@ -3580,6 +3652,7 @@ pub async fn extract_clip_audio(
     // below rather than routed through that helper.
     speed: f64,
     noise_reduction: Option<f64>,
+    audio_cleanup: Option<AudioCleanup>,
     // Already folds mute into 0.0 on the frontend (Clip.ts's own effective-volume convention,
     // matching pipOverlays/effective_video_volume elsewhere in this file) - no separate `muted`
     // bool here.
@@ -3609,9 +3682,11 @@ pub async fn extract_clip_audio(
     if (speed - 1.0).abs() > 0.001 {
         af_parts.push(atempo_chain(speed));
     }
-    if let Some((nr, nf)) = noise_reduction_afftdn_params(noise_reduction) {
-        af_parts.push(format!("afftdn=nr={:.2}:nf={:.1}", nr, nf));
-    }
+    let rnnoise_model = crate::services::utility::get_rnnoise_model_path(&app_handle)
+        .ok()
+        .filter(|p| p.exists())
+        .map(|p| escape_filter_path(&p));
+    af_parts.extend(audio_cleanup_filters(noise_reduction, audio_cleanup.as_ref(), rnnoise_model.as_deref()));
     if (volume - 1.0).abs() > 0.001 {
         af_parts.push(format!("volume={:.3}", volume.max(0.0)));
     }
@@ -4065,6 +4140,7 @@ mod tests {
             flip_horizontal: None,
             speed: None,
             noise_reduction: None,
+            audio_cleanup: None,
         }
     }
 
@@ -4376,7 +4452,7 @@ mod tests {
     #[test]
     fn audio_trim_chain_no_audio_synthesizes_silence_of_the_right_output_duration() {
         // 10 source seconds at 2x speed -> 5 output seconds.
-        let chain = audio_trim_chain(false, 0, 0.0, 10.0, 2.0, None, "outa");
+        let chain = audio_trim_chain(false, 0, 0.0, 10.0, 2.0, &[], "outa");
         assert_eq!(
             chain,
             "anullsrc=channel_layout=stereo:sample_rate=44100:duration=5.000[outa];"
@@ -4385,7 +4461,7 @@ mod tests {
 
     #[test]
     fn audio_trim_chain_with_audio_includes_tempo_but_no_denoise_when_off() {
-        let chain = audio_trim_chain(true, 0, 1.0, 5.0, 1.0, None, "outa");
+        let chain = audio_trim_chain(true, 0, 1.0, 5.0, 1.0, &[], "outa");
         assert_eq!(
             chain,
             "[0:a]atrim=start=1.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000[outa];"
@@ -4394,11 +4470,47 @@ mod tests {
 
     #[test]
     fn audio_trim_chain_appends_afftdn_after_atempo_when_noise_reduction_is_set() {
-        let chain = audio_trim_chain(true, 2, 0.0, 5.0, 1.0, Some((22.0, -35.0)), "a2");
+        let chain = audio_trim_chain(true, 2, 0.0, 5.0, 1.0, &["afftdn=nr=22.00:nf=-35.0".to_string()], "a2");
         assert_eq!(
             chain,
             "[2:a]atrim=start=0.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000,afftdn=nr=22.00:nf=-35.0[a2];"
         );
+    }
+
+    // ---- audio_cleanup_filters --------------------------------------------------------------------
+
+    #[test]
+    fn audio_cleanup_filters_is_empty_when_nothing_is_on() {
+        assert!(audio_cleanup_filters(None, None, None).is_empty());
+        assert!(audio_cleanup_filters(Some(0.0), Some(&AudioCleanup::default()), Some("m")).is_empty());
+    }
+
+    #[test]
+    fn audio_cleanup_filters_orders_lowcut_hum_denoise_gate() {
+        let cleanup = AudioCleanup { mode: None, low_cut: Some(true), hum: Some(50), gate: Some(true) };
+        let f = audio_cleanup_filters(Some(0.5), Some(&cleanup), None);
+        assert_eq!(f[0], "highpass=f=80");
+        assert_eq!(&f[1..4], ["bandreject=f=50:t=q:w=8", "bandreject=f=100:t=q:w=8", "bandreject=f=150:t=q:w=8"]);
+        assert_eq!(f[4], "afftdn=nr=22.00:nf=-35.0");
+        assert!(f[5].starts_with("agate="));
+    }
+
+    #[test]
+    fn audio_cleanup_filters_remove_mode_uses_arnndn_and_falls_back_without_a_model() {
+        let cleanup = AudioCleanup { mode: Some("remove".into()), ..Default::default() };
+        assert_eq!(audio_cleanup_filters(Some(1.0), Some(&cleanup), Some("C\\:/m.rnnn")), ["arnndn=m='C\\:/m.rnnn':mix=1.00"]);
+        assert_eq!(audio_cleanup_filters(Some(1.0), Some(&cleanup), None), ["afftdn=nr=40.00:nf=-20.0"]);
+    }
+
+    #[test]
+    fn audio_cleanup_filters_ignores_unknown_hum_frequencies() {
+        let cleanup = AudioCleanup { hum: Some(55), ..Default::default() };
+        assert!(audio_cleanup_filters(None, Some(&cleanup), None).is_empty());
+    }
+
+    #[test]
+    fn escape_filter_path_escapes_drive_colon_and_backslashes() {
+        assert_eq!(escape_filter_path(std::path::Path::new(r"C:\a\b.rnnn")), r"C\:/a/b.rnnn");
     }
 
     // ---- overlay animation expressions ------------------------------------------------------------

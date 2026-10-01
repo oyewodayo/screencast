@@ -99,7 +99,7 @@ type ImageOverlayContentPatch = Partial<
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
 type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -213,6 +213,8 @@ export interface UseVideoEditStoreResult {
   // generic patch fn" shape as updateTextOverlayContent, just for a clip's own non-geometric
   // fields (see updateClip, videoEditHandlers.ts).
   updateClipEffects: (id: string, patch: ClipEffectsPatch) => void;
+  // Same patch applied to every clip as ONE undo step (NoiseReductionPopover's "Apply to all clips").
+  updateAllClipEffects: (patch: ClipEffectsPatch) => void;
   // Applies the result of a detect_silence scan (conversion.rs) to one clip, splitting out and
   // dropping every detected dead-air range in a single undo step - see removeSilentRanges,
   // videoEditHandlers.ts, for the actual splice logic.
@@ -570,6 +572,17 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const current = stateRef.current;
       if (!current) return;
       const clips = updateClipHandler(current.clips, id, patch);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "edit-clip-effects");
+    },
+    [pushCommand]
+  );
+
+  const updateAllClipEffects = useCallback(
+    (patch: ClipEffectsPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = current.clips.reduce((acc, clip) => updateClipHandler(acc, clip.id, patch), current.clips);
       if (clips === current.clips) return;
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "edit-clip-effects");
     },
@@ -1261,6 +1274,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     reorderClip,
     resizeClipEdge,
     updateClipEffects,
+    updateAllClipEffects,
     trimSilenceForClip,
     applyAutoZoomAtClicks,
     insertClipAt,
