@@ -8,7 +8,8 @@ import { listen } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
-import { formatFileName, truncateFileName } from "../utils/Formater";
+import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
+import { useMediaDurations } from "../hooks/useMediaDurations";
 import SidebarFileIcon from "../components/SidebarFileIcon";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import useVideoEditStore from "../hooks/useVideoEditStore";
@@ -1786,6 +1787,14 @@ const setScreen = () => {
 		(file) => !pinnedPaths.includes(file.path)
 	);
 	const libraryPreviewFiles = [...pinnedLibraryFiles, ...fillerFiles].slice(0, MAX_HOME_SCREEN_FILES);
+	// Length shown next to each audio/video row's size - probed only for those (at most
+	// MAX_HOME_SCREEN_FILES) rows, never the whole library.
+	const libraryPreviewDurations = useMediaDurations(
+		libraryPreviewFiles.filter((file) => {
+			const category = getFileCategory(file.name);
+			return category === "video" || category === "audio";
+		})
+	);
 
 	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
 	// the currently selected file happens to live in, so prev/next still works when a category
@@ -3741,7 +3750,7 @@ const setScreen = () => {
               onBulkDelete={handleBulkDeleteFiles}
             />
           ) : (
-            <div className="relative flex flex-col items-center justify-center h-full w-full gap-6 px-8 overflow-hidden">
+            <div className="relative flex flex-col items-center justify-[safe_center] h-full w-full gap-6 px-8 pt-8 pb-24 overflow-y-auto overflow-x-hidden">
               {/* Purely decorative - a soft color glow plus a faint graph-paper line grid, sat
                   behind everything else in this empty state via z-index/pointer-events:none. Only
                   rendered on this "nothing open yet" screen, not the shared bg-neutral-950
@@ -3821,9 +3830,16 @@ const setScreen = () => {
                         <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
                           {truncateFileName(file.name)}
                         </span>
-                        {pinnedPaths.includes(file.path) && (
-                          <IoPin size={13} className="ml-auto text-gray-400 dark:text-neutral-500 shrink-0" />
-                        )}
+                        <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
+                          {libraryPreviewDurations.has(file.path) && (
+                            <>
+                              <span>{formatMediaDuration(libraryPreviewDurations.get(file.path)!)}</span>
+                              <span aria-hidden>·</span>
+                            </>
+                          )}
+                          <span>{formatFileSize(file.size)}</span>
+                          {pinnedPaths.includes(file.path) && <IoPin size={13} />}
+                        </span>
                       </button>
                     ))}
                   </div>

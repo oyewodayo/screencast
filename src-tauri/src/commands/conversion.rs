@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter, State, Window};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
+use crate::services::responsiveness::blocking;
 use crate::services::utility::{get_ffmpeg_path, get_ffprobe_path, path_to_str};
 
 #[cfg(windows)]
@@ -1292,7 +1293,11 @@ pub async fn get_video_scrub_sprite(
     }
 
     let ffprobe_path = get_ffprobe_path(&app_handle)?;
-    let duration = probe_duration_secs(&ffprobe_path, &input)?;
+    let duration = {
+        let ffprobe_path = ffprobe_path.clone();
+        let input = input.clone();
+        blocking(move || probe_duration_secs(&ffprobe_path, &input)).await??
+    };
     if duration <= 0.0 {
         return Err("Video has no measurable duration".to_string());
     }
@@ -3178,7 +3183,11 @@ pub async fn export_trimmed_video(
             // so every segment gets an explicit `fps=` up front, using the first segment's own
             // source file's frame rate as the shared target (screen recordings from this app are
             // effectively always one consistent rate throughout a session either way).
-            let target_fps = probe_frame_rate(&ffprobe_path, &segments[0].source_path);
+            let target_fps = {
+                let ffprobe_path = ffprobe_path.clone();
+                let source_path = segments[0].source_path.clone();
+                blocking(move || probe_frame_rate(&ffprobe_path, &source_path)).await?
+            };
 
             // `settb=AVTB` too: xfade also demands both inputs share one timebase, but a plain
             // 2-way `concat` fold step (a boundary with no transition) outputs AVTB (1/1000000)
@@ -3416,17 +3425,29 @@ pub async fn export_trimmed_video(
         // win.rs) - without this, a stray `[idx:a]` on a video-only input would reject the whole
         // filtergraph with "Stream specifier ':a' ... matches no streams", the same failure mode
         // probe_has_audio already exists to prevent for segments.
-        let pip_audio_input_index: Vec<Option<usize>> = pip_overlays
+        let pip_audio_probes: Vec<_> = pip_overlays
             .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if p.volume > 0.001 && probe_has_audio(&ffprobe_path, &p.source_path) {
-                    Some(pip_input_base + i)
-                } else {
-                    None
-                }
+            .map(|p| {
+                let audible = p.volume > 0.001;
+                let ffprobe_path = ffprobe_path.clone();
+                let source_path = p.source_path.clone();
+                // Spawned (not just created) here, so every probe runs concurrently.
+                tauri::async_runtime::spawn_blocking(move || {
+                    audible && probe_has_audio(&ffprobe_path, &source_path)
+                })
             })
             .collect();
+        let mut pip_audio_input_index: Vec<Option<usize>> = Vec::with_capacity(pip_overlays.len());
+        for (i, probe) in pip_audio_probes.into_iter().enumerate() {
+            let has_audio = probe
+                .await
+                .map_err(|e| format!("Background task failed: {}", e))?;
+            pip_audio_input_index.push(if has_audio {
+                Some(pip_input_base + i)
+            } else {
+                None
+            });
+        }
         let has_pip_audio = pip_audio_input_index.iter().any(|idx| idx.is_some());
 
         // Mixes each audio overlay (and any audible pip layer) into base_audio_label - amix's
@@ -3633,15 +3654,17 @@ pub async fn cancel_conversion(state: State<'_, ConversionState>) -> Result<(), 
             let mut cmd = Command::new("taskkill");
             cmd.args(["/F", "/PID", &pid.to_string()]);
             hide_console_window(&mut cmd);
-            cmd.output()
+            blocking(move || cmd.output())
+                .await?
                 .map_err(|e| format!("Failed to cancel conversion: {}", e))?;
         }
 
         #[cfg(not(windows))]
         {
-            Command::new("kill")
-                .args(&["-9", &pid.to_string()])
-                .output()
+            let mut cmd = Command::new("kill");
+            cmd.args(["-9", &pid.to_string()]);
+            blocking(move || cmd.output())
+                .await?
                 .map_err(|e| format!("Failed to cancel conversion: {}", e))?;
         }
 
@@ -3733,8 +3756,10 @@ pub async fn batch_convert_to_mp4(
 #[tauri::command]
 pub async fn read_image_data_url(path: String) -> Result<String, String> {
     let file_path = PathBuf::from(&path);
-    let bytes =
-        std::fs::read(&file_path).map_err(|e| format!("Failed to read image file: {}", e))?;
+    let read_path = file_path.clone();
+    let bytes = blocking(move || std::fs::read(&read_path))
+        .await?
+        .map_err(|e| format!("Failed to read image file: {}", e))?;
     let mime = match file_path
         .extension()
         .and_then(|e| e.to_str())
@@ -3754,10 +3779,15 @@ pub async fn read_image_data_url(path: String) -> Result<String, String> {
 // read_image_data_url just above (sidesteps the frontend fs allowlist scope, unrestricted Rust-
 // side fs access), but returning raw bytes rather than a base64 data URL since the caller (docx
 // import, see src/utils/docxImport.ts) needs an ArrayBuffer to hand to a JS parsing library, not
-// something to drop into an <img src>.
+// something to drop into an <img src>. Answered as raw bytes (tauri::ipc::Response, an
+// ArrayBuffer on the JS side) rather than Vec<u8>, which serde would turn into a JSON array of
+// numbers several times the file's size.
 #[tauri::command]
-pub fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
-    std::fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))
+pub async fn read_file_bytes(path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = blocking(move || std::fs::read(&path))
+        .await?
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 // Get file information before conversion
@@ -3785,8 +3815,8 @@ pub async fn get_conversion_info(
     ]);
     #[cfg(windows)]
     hide_console_window(&mut cmd);
-    let output = cmd
-        .output()
+    let output = blocking(move || cmd.output())
+        .await?
         .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
 
     let mut info = HashMap::new();
@@ -3829,7 +3859,7 @@ pub async fn get_conversion_info(
 }
 
 // Get available conversion formats
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_supported_conversion_formats() -> Vec<HashMap<&'static str, &'static str>> {
     vec![
         HashMap::from([("value", "mp4"), ("label", "MP4 (Recommended)")]),
@@ -3841,7 +3871,7 @@ pub fn get_supported_conversion_formats() -> Vec<HashMap<&'static str, &'static 
 }
 
 // Check if file needs conversion
-#[tauri::command]
+#[tauri::command(async)]
 pub fn should_convert_file(file_path: String) -> bool {
     let path = PathBuf::from(file_path);
     if let Some(ext) = path.extension() {

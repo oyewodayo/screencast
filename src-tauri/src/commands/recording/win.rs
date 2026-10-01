@@ -96,7 +96,12 @@ pub fn get_connected_devices(app_handle: &AppHandle) -> (Vec<String>, Vec<String
     let mut cmd = Command::new(&ffmpeg_path);
     cmd.args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
     super::hide_console_window(&mut cmd);
-    let output = match cmd.output() {
+    // Bounded: a dshow probe can hang on a camera driver that's busy or wedged, and nothing that
+    // waits on this list should be able to hang with it.
+    let output = match crate::services::responsiveness::output_with_timeout(
+        cmd,
+        std::time::Duration::from_secs(10),
+    ) {
         Ok(output) => output,
         Err(e) => {
             return (

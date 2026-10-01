@@ -302,8 +302,9 @@ fn click_sidecar_path(video_path: &Path) -> PathBuf {
 // Reads back whatever click_sidecar_path holds for `video_path`, if anything - None (not an
 // error) when the video was never recorded with track_clicks on, same "no sidecar yet is normal,
 // not a failure" convention load_video_edit_state (video_edits.rs) already uses.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sidecar = click_sidecar_path(&PathBuf::from(&video_path));
     if !sidecar.exists() {
         return Ok(None);
@@ -326,8 +327,9 @@ fn view_switch_sidecar_path(video_path: &Path) -> PathBuf {
 // Reads back whatever view_switch_sidecar_path holds for `video_path`, if anything - None (not an
 // error) when the video was never recorded with any view switches, same convention
 // load_click_sidecar above uses.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn load_view_switch_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sidecar = view_switch_sidecar_path(&PathBuf::from(&video_path));
     if !sidecar.exists() {
         return Ok(None);
@@ -343,8 +345,9 @@ pub fn load_view_switch_sidecar(video_path: String) -> Result<Option<String>, St
 // error) if no such file exists - the normal case for any recording that didn't have
 // FormData.separate_webcam_capture on, same "missing is fine" convention load_click_sidecar and
 // load_view_switch_sidecar both use.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_webcam_sidecar_path(video_path: String) -> Option<String> {
+    let _serial = crate::services::responsiveness::serial();
     let path = PathBuf::from(&video_path);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
     let webcam_path = path.with_file_name(format!("{}_webcam.mp4", stem));
@@ -1330,19 +1333,79 @@ pub(crate) async fn spawn_recording(
     ))
 }
 
-#[tauri::command]
-pub fn get_connected_devices(app_handle: AppHandle) -> (Vec<String>, Vec<String>) {
-    platform::get_connected_devices(&app_handle)
+// Device enumeration shells out to ffmpeg (`-list_devices` on Windows), which takes a second or
+// more and can take far longer while a recording already holds the camera/mic. It used to run on
+// the UI thread on every call - twice in a row from the device pickers - which was one of the
+// main "Not responding" triggers. Now: probed on a blocking thread, cached briefly, with
+// concurrent callers sharing one probe (the cache lock is held across it), and never re-probed
+// while a recording is running if there's any answer to give already.
+type DeviceLists = (Vec<String>, Vec<String>);
+
+struct CachedDevices {
+    probed_at: Instant,
+    devices: DeviceLists,
+}
+
+static DEVICE_CACHE: std::sync::Mutex<Option<CachedDevices>> = std::sync::Mutex::new(None);
+const DEVICE_CACHE_TTL: Duration = Duration::from_secs(15);
+
+fn connected_devices_cached(app_handle: &AppHandle, recording: bool) -> DeviceLists {
+    let mut cache = DEVICE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.as_ref() {
+        if recording || cached.probed_at.elapsed() < DEVICE_CACHE_TTL {
+            return cached.devices.clone();
+        }
+    }
+    let devices = platform::get_connected_devices(app_handle);
+    *cache = Some(CachedDevices {
+        probed_at: Instant::now(),
+        devices: devices.clone(),
+    });
+    devices
+}
+
+fn recording_in_progress(app_handle: &AppHandle) -> bool {
+    app_handle
+        .try_state::<AppState>()
+        .map(|state| {
+            state
+                .ffmpeg_process
+                .try_lock()
+                // Locked means a start/stop is mid-flight - treat as recording.
+                .map(|process| process.is_some())
+                .unwrap_or(true)
+        })
+        .unwrap_or(false)
+}
+
+/// Fills the device cache in the background at startup so the first picker opens instantly.
+pub fn warm_device_cache(app_handle: &AppHandle) {
+    let app_handle = app_handle.clone();
+    std::thread::spawn(move || {
+        connected_devices_cached(&app_handle, false);
+    });
 }
 
 #[tauri::command]
-pub fn get_connected_audios(app_handle: AppHandle) -> Vec<String> {
-    get_connected_devices(app_handle).1
+pub async fn get_connected_devices(app_handle: AppHandle) -> DeviceLists {
+    let recording = recording_in_progress(&app_handle);
+    crate::services::responsiveness::blocking(move || {
+        connected_devices_cached(&app_handle, recording)
+    })
+    .await
+    .unwrap_or_else(|e| (vec![e.clone()], vec![e]))
 }
 
 #[tauri::command]
-pub fn get_connected_cameras(app_handle: AppHandle) -> Vec<String> {
-    get_connected_devices(app_handle).0
+pub async fn get_connected_audios(app_handle: AppHandle) -> Vec<String> {
+    get_connected_devices(app_handle).await.1
+}
+
+#[tauri::command]
+pub async fn get_connected_cameras(app_handle: AppHandle) -> Vec<String> {
+    get_connected_devices(app_handle).await.0
 }
 
 // Shared by resolve_output_path and resolve_recording_output_path below - both need "figure out
@@ -1957,68 +2020,101 @@ async fn mux_system_audio(
     Ok(())
 }
 
+const REC_COMPLETED_LABEL: &str = "completed_recording";
+
+// Building a WebView2 window always runs on the UI thread and takes one to two seconds - long
+// enough that stopping a recording visibly froze the app while this popup was created (caught by
+// services::responsiveness's watchdog). So the popup's window is built once, hidden, shortly
+// after startup (prewarm_rec_completed_modal), and every stop just points it at the new file and
+// shows it. Closing it hides it instead of destroying it, so it's ready for the next recording.
+fn build_rec_completed_window(
+    app_handle: &tauri::AppHandle,
+    url: String,
+    visible: bool,
+) -> tauri::Result<tauri::WebviewWindow> {
+    let window = tauri::WebviewWindowBuilder::new(
+        app_handle,
+        REC_COMPLETED_LABEL,
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title("Recording completed")
+    .center()
+    .resizable(false)
+    .inner_size(420.0, 480.0)
+    .always_on_top(true)
+    .minimizable(false)
+    .visible(visible)
+    .build()?;
+
+    let handle = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            // Only kept alive while the app itself is - once the main window is gone, a hidden
+            // popup must not be what keeps the process running.
+            if handle.app_handle().get_webview_window("main").is_some() {
+                api.prevent_close();
+                let _ = handle.hide();
+            }
+        }
+    });
+    Ok(window)
+}
+
+/// Builds the recording-completed popup hidden, in the background, once the app has settled.
+pub fn prewarm_rec_completed_modal(app_handle: &tauri::AppHandle) {
+    let app_handle = app_handle.clone();
+    std::thread::spawn(move || {
+        // Let the main window finish its own startup work first.
+        std::thread::sleep(Duration::from_secs(4));
+        if app_handle.get_webview_window(REC_COMPLETED_LABEL).is_none() {
+            if let Err(e) =
+                build_rec_completed_window(&app_handle, "completed_recording.html".into(), false)
+            {
+                warn!("Could not pre-create the recording-completed window: {}", e);
+            }
+        }
+    });
+}
+
 async fn create_or_replace_rec_completed_modal(
     app_handle: tauri::AppHandle,
     file_path: &str,
 ) -> Result<String, String> {
-    // The file path is baked into the window's own URL (rather than sent via a
-    // 'display-file-modal' event emitted from here) because emit only reaches windows that
-    // already exist at the moment it's called - this window doesn't exist yet until `build()`
-    // below returns, and even then its webview/JS hasn't loaded far enough to have registered
-    // a listener. An event fired here would always be missed. A URL query param has no such
-    // race: the page reads it on its very first render.
+    // The file path is baked into the window's own URL (rather than sent via an event) because
+    // the page reads it synchronously on its first render - an event emitted before its listener
+    // registers would be missed. Re-navigating the pre-built window reloads that page with the
+    // new path, so the same mechanism works for both the reused and the freshly built window.
     // Root-relative: the entry HTML sits beside index.html (see vite.config.ts's rollup input for
     // why it can't live under src-tauri/), which is where both the dev server and the bundled
     // frontend serve it from.
-    let url = format!(
-        "completed_recording.html?path={}",
-        urlencoding::encode(file_path)
-    );
+    let encoded_path = urlencoding::encode(file_path).into_owned();
+    let url = format!("completed_recording.html?path={}", encoded_path);
 
-    // spawn_blocking, not done inline: under Tauri v2's IPC bridge, an async command's own
-    // execution was observed running ON the main/UI thread itself (see ensure_annotation_overlay's
-    // own doc comment for the full live-reproduced hang this caused). Both `.close()` and
-    // `WebviewWindowBuilder::build()` need to marshal onto the main thread and wait for it -
-    // calling either from a command already on the main thread self-deadlocks. Running both on a
-    // real background thread guarantees neither is ever called from the main thread either way.
+    // spawn_blocking, not done inline: show()/navigate()/build() all marshal onto the main thread
+    // and wait for it, so they must never be called from it - running them on a real background
+    // thread guarantees that.
     tauri::async_runtime::spawn_blocking(move || {
-        // Closing is a request, not a completed act: it marshals onto the main thread and the
-        // label stays registered until the window is really gone. Building immediately after
-        // therefore raced it and failed with "a webview with label `completed_recording` already
-        // exists" - which, before the caller stopped treating that as fatal, reported a perfectly
-        // good recording as a failed stop. Reproduced by stopping a second recording while the
-        // first recording's popup was still open.
-        if let Some(modal_window) = app_handle.get_webview_window("completed_recording") {
-            if let Err(e) = modal_window.close() {
-                return Err(format!("Failed to close existing modal window: {}", e));
-            }
-            // Poll rather than sleep a fixed amount: usually gone within a tick, and the cap is
-            // only there so a window that refuses to close can't wedge this thread.
-            for _ in 0..50 {
-                if app_handle.get_webview_window("completed_recording").is_none() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+        if let Some(window) = app_handle.get_webview_window(REC_COMPLETED_LABEL) {
+            let mut target = window
+                .url()
+                .map_err(|e| format!("Failed to read popup URL: {}", e))?;
+            target.set_path("/completed_recording.html");
+            target.set_query(Some(&format!("path={}", encoded_path)));
+            window
+                .navigate(target)
+                .map_err(|e| format!("Failed to load recording into popup: {}", e))?;
+            let _ = window.center();
+            window
+                .show()
+                .map_err(|e| format!("Failed to show popup: {}", e))?;
+            let _ = window.set_focus();
+            return Ok("Recording completed".to_string());
         }
 
-        let result = tauri::WebviewWindowBuilder::new(
-            &app_handle,
-            "completed_recording",
-            tauri::WebviewUrl::App(url.into()),
-        )
-        .title("Recording completed")
-        .center()
-        .resizable(false)
-        .inner_size(420.0, 480.0)
-        .always_on_top(true)
-        .minimizable(false)
-        .build();
-
-        match result {
-            Ok(_) => Ok("Recording completed".to_string()),
-            Err(e) => Err(format!("Failed to create modal window: {}", e)),
-        }
+        // Not pre-built yet (a recording stopped within seconds of launch) - build it now.
+        build_rec_completed_window(&app_handle, url, true)
+            .map(|_| "Recording completed".to_string())
+            .map_err(|e| format!("Failed to create modal window: {}", e))
     })
     .await
     .map_err(|e| format!("Modal window creation task panicked: {}", e))?

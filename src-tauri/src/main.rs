@@ -35,6 +35,9 @@ mod services {
     // camera open and competing for the machine - Job Object on Windows, PR_SET_PDEATHSIG on
     // Linux. See the module's own comment for the macOS gap.
     pub mod orphan_guard;
+    // Keeps the window from ever going "Not responding" - see the module's own comment for the
+    // threading rules every command follows and the test that enforces them.
+    pub mod responsiveness;
     pub mod trash;
     pub mod utility;
     pub mod video_edits;
@@ -103,7 +106,7 @@ use log::{error, LevelFilter};
 use std::fs::OpenOptions;
 use std::panic;
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_os_info() -> String {
     OS.to_string().to_uppercase()
 }
@@ -259,6 +262,8 @@ fn main() {
 
     std::env::set_var("RUST_BACKTRACE", "1");
 
+    services::responsiveness::install_async_runtime();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -280,11 +285,24 @@ fn main() {
                 }
                 Err(e) => log::warn!("Could not resolve Briefcast dir for file watcher: {}", e),
             }
+
+            services::responsiveness::start_ui_watchdog(app.handle());
+            // Both are slow first-time probes (ffmpeg -list_devices, a trial hardware encode);
+            // doing them now in the background means the device pickers and the first recording
+            // never wait on them.
+            commands::recording::warm_device_cache(app.handle());
+            commands::recording::prewarm_rec_completed_modal(app.handle());
+            if let Ok(ffmpeg_path) = services::utility::get_ffmpeg_path(app.handle()) {
+                std::thread::spawn(move || {
+                    services::hw_encoder::detect(&ffmpeg_path);
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::system_info::get_ram_info,
             get_os_info,
+            services::responsiveness::report_frontend_stall,
             commands::recording::get_connected_audios,
             commands::recording::get_connected_cameras,
             commands::recording::get_connected_devices,

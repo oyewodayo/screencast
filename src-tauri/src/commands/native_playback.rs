@@ -10,6 +10,18 @@
 // therefore ffmpeg itself, via normal OS pipe blocking) so a slow renderer can't make ffmpeg
 // pile up unbounded frames in memory.
 //
+// Threading rules this module must keep (breaking any of them is what used to freeze the whole
+// window as "Not responding" during editing):
+// - Every command is `async` and every wait (ffprobe, spawning/killing ffmpeg, the bounded
+//   recv_timeout on a pull) runs inside spawn_blocking. A non-async Tauri v2 command runs on the
+//   UI thread, and a pull that waits there for up to 300ms, called back-to-back by two loops,
+//   starves the Win32 message loop.
+// - The sessions-map lock is only ever held long enough to clone an Arc out of it, and a
+//   session's pipes lock only long enough to clone a receiver handle or swap pipes - never across
+//   a wait, a spawn or a kill. A seek therefore never queues behind an in-flight pull.
+// - Frames/chunks travel as raw bytes (tauri::ipc::Response), not base64 inside JSON, so neither
+//   side spends CPU re-encoding every frame. See encode_video_packet/encode_audio_packet.
+//
 // Deliberately all plain functions (spawn_video_pipe/spawn_audio_pipe/read_video_frames/
 // read_audio_chunks/probe_media) rather than logic embedded directly in #[tauri::command]
 // bodies, so this can be exercised by an isolated test/scratch binary against the real bundled
@@ -21,10 +33,11 @@ use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
+use tauri::ipc::Response;
 use tauri::{AppHandle, State};
 
 use crate::services::utility::{get_ffmpeg_path, get_ffprobe_path};
@@ -52,15 +65,28 @@ const PULL_TIMEOUT_MS: u64 = 300;
 
 #[derive(Default)]
 pub struct NativePlaybackState {
-    sessions: Mutex<HashMap<u64, NativeSession>>,
+    sessions: Mutex<HashMap<u64, Arc<NativeSession>>>,
     next_id: AtomicU64,
 }
 
-struct NativeSession {
+// One encoded frame/chunk, already in its wire layout. The receiver sits behind its own
+// Arc<Mutex> so a pull can clone the handle out and wait on it without holding the session's
+// pipes lock.
+type Packet = Vec<u8>;
+type PacketRx = Arc<Mutex<Receiver<Packet>>>;
+
+struct SessionPipes {
+    // Which seek produced these pipes - lets a slower, older seek that finishes spawning after a
+    // newer one notice it lost the race and discard its own pipes instead of clobbering the newer
+    // ones (rapid timeline scrubbing fires many overlapping seeks).
+    generation: u64,
     video_child: Child,
     audio_child: Option<Child>,
-    video_rx: Receiver<VideoFrame>,
-    audio_rx: Option<Receiver<AudioChunk>>,
+    video_rx: PacketRx,
+    audio_rx: Option<PacketRx>,
+}
+
+struct NativeSession {
     input_path: String,
     // width/fps/channels are re-used to respawn matching pipes on seek; height and the audio
     // sample rate aren't needed again after being reported once in PlaybackSessionInfo (height
@@ -68,20 +94,37 @@ struct NativeSession {
     // not stored here.
     width: u32,
     fps: f64,
+    has_audio: bool,
     channels: u16,
+    seek_generation: AtomicU64,
+    // None once the session has been stopped, so a seek that was already in flight discards its
+    // freshly spawned pipes instead of resurrecting a dead session.
+    pipes: Mutex<Option<SessionPipes>>,
 }
 
-#[derive(Serialize, Clone)]
-pub struct VideoFrame {
-    data_base64: String,
-    pts: f64,
+// A panic anywhere while one of these locks is held would otherwise poison it and turn every
+// later playback call into a panic too - recovering the guard keeps playback usable.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[derive(Serialize, Clone)]
-pub struct AudioChunk {
-    data_base64: String,
-    pts: f64,
-    sample_count: u32,
+// Wire layout, little-endian, parsed by useNativePlaybackEngine.ts:
+//   video: [pts f64][jpeg bytes...]
+//   audio: [pts f64][sample_count u32][s16le pcm bytes...]
+// An empty body means "nothing yet / stream ended".
+fn encode_video_packet(pts: f64, jpeg: &[u8]) -> Packet {
+    let mut packet = Vec::with_capacity(8 + jpeg.len());
+    packet.extend_from_slice(&pts.to_le_bytes());
+    packet.extend_from_slice(jpeg);
+    packet
+}
+
+fn encode_audio_packet(pts: f64, sample_count: u32, pcm: &[u8]) -> Packet {
+    let mut packet = Vec::with_capacity(12 + pcm.len());
+    packet.extend_from_slice(&pts.to_le_bytes());
+    packet.extend_from_slice(&sample_count.to_le_bytes());
+    packet.extend_from_slice(pcm);
+    packet
 }
 
 #[derive(Serialize)]
@@ -214,8 +257,7 @@ fn spawn_video_pipe(
         .stderr(Stdio::piped());
     #[cfg(windows)]
     hide_console_window(&mut cmd);
-    cmd.spawn()
-        .map_err(|e| format!("Failed to start video decode: {}", e))
+    spawn_guarded(cmd, "video")
 }
 
 // Raw PCM on stdout - directly usable by the Web Audio API without needing a container, and
@@ -247,8 +289,19 @@ fn spawn_audio_pipe(
         .stderr(Stdio::piped());
     #[cfg(windows)]
     hide_console_window(&mut cmd);
-    cmd.spawn()
-        .map_err(|e| format!("Failed to start audio decode: {}", e))
+    spawn_guarded(cmd, "audio")
+}
+
+// Bracketed by orphan_guard like the recording pipeline's own spawns, so a force-closed app
+// (exactly what a user reaches for when it hangs) can't leave decode ffmpegs behind burning CPU
+// and making the next session slower still.
+fn spawn_guarded(mut cmd: Command, kind: &str) -> Result<Child, String> {
+    crate::services::orphan_guard::before_spawn(&mut cmd);
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start {} decode: {}", kind, e))?;
+    crate::services::orphan_guard::after_spawn(&child);
+    Ok(child)
 }
 
 // Drains a child's stderr on its own thread so ffmpeg never blocks on a full stderr pipe (it
@@ -260,7 +313,7 @@ fn drain_stderr(stderr: Option<std::process::ChildStderr>) {
     if let Some(stderr) = stderr {
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().flatten() {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 log::debug!("[native_playback ffmpeg] {}", line);
             }
         });
@@ -283,7 +336,7 @@ fn read_video_frames(
     mut stdout: ChildStdout,
     fps: f64,
     seek_offset: f64,
-    tx: SyncSender<VideoFrame>,
+    tx: SyncSender<Packet>,
 ) {
     let mut buffer: Vec<u8> = Vec::new();
     let mut read_buf = [0u8; 65536];
@@ -308,9 +361,9 @@ fn read_video_frames(
             let frame_end = eoi + 2;
 
             let pts = seek_offset + (frame_index as f64) / fps;
-            let data_base64 = BASE64.encode(&buffer[soi..frame_end]);
+            let packet = encode_video_packet(pts, &buffer[soi..frame_end]);
 
-            if tx.send(VideoFrame { data_base64, pts }).is_err() {
+            if tx.send(packet).is_err() {
                 return; // receiver gone (session stopped/seeked) - stop decoding, let the process exit
             }
             frame_index += 1;
@@ -326,7 +379,7 @@ fn read_audio_chunks(
     sample_rate: u32,
     channels: u16,
     seek_offset: f64,
-    tx: SyncSender<AudioChunk>,
+    tx: SyncSender<Packet>,
 ) {
     let bytes_per_frame = (channels as usize).max(1) * 2; // s16le = 2 bytes/sample
     let chunk_bytes = AUDIO_CHUNK_FRAMES * bytes_per_frame;
@@ -352,14 +405,8 @@ fn read_audio_chunks(
         let sample_count = (filled / bytes_per_frame) as u32;
         let pts =
             seek_offset + (chunk_index as f64) * (AUDIO_CHUNK_FRAMES as f64) / (sample_rate as f64);
-        let data_base64 = BASE64.encode(&buf);
-
         if tx
-            .send(AudioChunk {
-                data_base64,
-                pts,
-                sample_count,
-            })
+            .send(encode_audio_packet(pts, sample_count, &buf))
             .is_err()
         {
             return;
@@ -368,6 +415,7 @@ fn read_audio_chunks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_session_pipes(
     ffmpeg_path: &Path,
     input_path: &str,
@@ -376,50 +424,87 @@ fn spawn_session_pipes(
     fps: f64,
     has_audio: bool,
     channels: u16,
-) -> Result<
-    (
-        Child,
-        Receiver<VideoFrame>,
-        Option<Child>,
-        Option<Receiver<AudioChunk>>,
-    ),
-    String,
-> {
+    generation: u64,
+) -> Result<SessionPipes, String> {
     let mut video_child = spawn_video_pipe(ffmpeg_path, input_path, seek_secs, width, fps)?;
-    let video_stdout = video_child
-        .stdout
-        .take()
-        .ok_or("Failed to capture video stdout")?;
+    let Some(video_stdout) = video_child.stdout.take() else {
+        kill_child(&mut video_child);
+        return Err("Failed to capture video stdout".to_string());
+    };
     drain_stderr(video_child.stderr.take());
-    let (video_tx, video_rx) = mpsc::sync_channel::<VideoFrame>(VIDEO_CHANNEL_CAP);
+    let (video_tx, video_rx) = mpsc::sync_channel::<Packet>(VIDEO_CHANNEL_CAP);
     std::thread::spawn(move || read_video_frames(video_stdout, fps, seek_secs, video_tx));
 
     let (audio_child, audio_rx) = if has_audio {
-        let mut child = spawn_audio_pipe(ffmpeg_path, input_path, seek_secs, channels)?;
-        let audio_stdout = child
-            .stdout
-            .take()
-            .ok_or("Failed to capture audio stdout")?;
+        // If the audio half fails, the already-running video ffmpeg must not be leaked.
+        let mut child = match spawn_audio_pipe(ffmpeg_path, input_path, seek_secs, channels) {
+            Ok(child) => child,
+            Err(e) => {
+                kill_child(&mut video_child);
+                return Err(e);
+            }
+        };
+        let Some(audio_stdout) = child.stdout.take() else {
+            kill_child(&mut child);
+            kill_child(&mut video_child);
+            return Err("Failed to capture audio stdout".to_string());
+        };
         drain_stderr(child.stderr.take());
-        let (tx, rx) = mpsc::sync_channel::<AudioChunk>(AUDIO_CHANNEL_CAP);
+        let (tx, rx) = mpsc::sync_channel::<Packet>(AUDIO_CHANNEL_CAP);
         std::thread::spawn(move || {
             read_audio_chunks(audio_stdout, AUDIO_SAMPLE_RATE, channels, seek_secs, tx)
         });
-        (Some(child), Some(rx))
+        (Some(child), Some(Arc::new(Mutex::new(rx))))
     } else {
         (None, None)
     };
 
-    Ok((video_child, video_rx, audio_child, audio_rx))
+    Ok(SessionPipes {
+        generation,
+        video_child,
+        audio_child,
+        video_rx: Arc::new(Mutex::new(video_rx)),
+        audio_rx,
+    })
 }
 
-fn kill_session_children(session: &mut NativeSession) {
-    let _ = session.video_child.kill();
-    let _ = session.video_child.wait();
-    if let Some(audio_child) = session.audio_child.as_mut() {
-        let _ = audio_child.kill();
-        let _ = audio_child.wait();
+fn kill_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// Killing closes each pipe's stdout, so its reader thread hits EOF and drops its sender, and any
+// pull still waiting on the old receiver returns "nothing" immediately instead of hanging.
+fn kill_pipes(mut pipes: SessionPipes) {
+    kill_child(&mut pipes.video_child);
+    if let Some(audio_child) = pipes.audio_child.as_mut() {
+        kill_child(audio_child);
     }
+}
+
+fn find_session(state: &NativePlaybackState, session_id: u64) -> Result<Arc<NativeSession>, String> {
+    lock(&state.sessions)
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "Unknown playback session".to_string())
+}
+
+// Waits (bounded) for the next packet on a blocking-pool thread - never the UI thread, and never
+// one of the shared async workers every other command needs.
+async fn pull_packet(rx: Option<PacketRx>) -> Result<Response, String> {
+    let Some(rx) = rx else {
+        return Ok(Response::new(Vec::new()));
+    };
+    let packet = tauri::async_runtime::spawn_blocking(move || {
+        lock(&rx)
+            .recv_timeout(Duration::from_millis(PULL_TIMEOUT_MS))
+            .ok()
+    })
+    .await
+    .map_err(|e| format!("Playback worker failed: {}", e))?;
+    // Timed out (nothing new yet) or disconnected (EOF) - same "try again or stop" signal to the
+    // caller: an empty body.
+    Ok(Response::new(packet.unwrap_or_default()))
 }
 
 #[tauri::command]
@@ -433,86 +518,80 @@ pub async fn start_native_playback(
     let ffprobe_path = get_ffprobe_path(&app_handle)?;
     let seek = start_time.unwrap_or(0.0);
 
-    let probe = probe_media(&ffprobe_path, &input_path)?;
+    let (session, duration, out_height) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+            let probe = probe_media(&ffprobe_path, &input_path)?;
 
-    let out_width = probe.width.min(MAX_WIDTH);
-    let out_height = if probe.width > 0 {
-        (((probe.height as f64) * (out_width as f64) / (probe.width as f64)).round() as u32) & !1
-    } else {
-        probe.height
-    };
-    let out_fps = probe.fps.min(MAX_FPS);
+            let out_width = probe.width.min(MAX_WIDTH);
+            let out_height = if probe.width > 0 {
+                (((probe.height as f64) * (out_width as f64) / (probe.width as f64)).round()
+                    as u32)
+                    & !1
+            } else {
+                probe.height
+            };
+            let out_fps = probe.fps.min(MAX_FPS);
 
-    let (video_child, video_rx, audio_child, audio_rx) = spawn_session_pipes(
-        &ffmpeg_path,
-        &input_path,
-        seek,
-        out_width,
-        out_fps,
-        probe.has_audio,
-        probe.channels,
-    )?;
+            let pipes = spawn_session_pipes(
+                &ffmpeg_path,
+                &input_path,
+                seek,
+                out_width,
+                out_fps,
+                probe.has_audio,
+                probe.channels,
+                0,
+            )?;
 
-    let session_id = state.next_id.fetch_add(1, Ordering::SeqCst);
-    let session = NativeSession {
-        video_child,
-        audio_child,
-        video_rx,
-        audio_rx,
-        input_path: input_path.clone(),
-        width: out_width,
-        fps: out_fps,
-        channels: probe.channels,
-    };
+            let session = NativeSession {
+                input_path,
+                width: out_width,
+                fps: out_fps,
+                has_audio: probe.has_audio,
+                channels: probe.channels,
+                seek_generation: AtomicU64::new(0),
+                pipes: Mutex::new(Some(pipes)),
+            };
+            Ok((session, probe.duration, out_height))
+        })
+        .await
+        .map_err(|e| format!("Playback worker failed: {}", e))??;
 
-    state.sessions.lock().unwrap().insert(session_id, session);
-
-    Ok(PlaybackSessionInfo {
-        session_id,
-        duration: probe.duration,
-        width: out_width,
+    let info = PlaybackSessionInfo {
+        session_id: state.next_id.fetch_add(1, Ordering::SeqCst),
+        duration,
+        width: session.width,
         height: out_height,
-        fps: out_fps,
-        has_audio: probe.has_audio,
+        fps: session.fps,
+        has_audio: session.has_audio,
         sample_rate: AUDIO_SAMPLE_RATE,
-        channels: probe.channels,
-    })
-}
-
-#[tauri::command]
-pub fn get_next_video_frame(
-    state: State<'_, NativePlaybackState>,
-    session_id: u64,
-) -> Result<Option<VideoFrame>, String> {
-    let sessions = state.sessions.lock().unwrap();
-    let session = sessions
-        .get(&session_id)
-        .ok_or("Unknown playback session")?;
-    match session
-        .video_rx
-        .recv_timeout(std::time::Duration::from_millis(PULL_TIMEOUT_MS))
-    {
-        Ok(frame) => Ok(Some(frame)),
-        Err(_) => Ok(None), // timed out (nothing new yet) or disconnected (EOF) - same "try again or stop" signal to the caller
-    }
-}
-
-#[tauri::command]
-pub fn get_next_audio_chunk(
-    state: State<'_, NativePlaybackState>,
-    session_id: u64,
-) -> Result<Option<AudioChunk>, String> {
-    let sessions = state.sessions.lock().unwrap();
-    let session = sessions
-        .get(&session_id)
-        .ok_or("Unknown playback session")?;
-    let Some(audio_rx) = session.audio_rx.as_ref() else {
-        return Ok(None); // source has no audio stream at all
+        channels: session.channels,
     };
-    match audio_rx.recv_timeout(std::time::Duration::from_millis(PULL_TIMEOUT_MS)) {
-        Ok(chunk) => Ok(Some(chunk)),
-        Err(_) => Ok(None),
-    }
+    lock(&state.sessions).insert(info.session_id, Arc::new(session));
+    Ok(info)
+}
+
+#[tauri::command]
+pub async fn get_next_video_frame(
+    state: State<'_, NativePlaybackState>,
+    session_id: u64,
+) -> Result<Response, String> {
+    let session = find_session(&state, session_id)?;
+    let rx = lock(&session.pipes).as_ref().map(|p| p.video_rx.clone());
+    pull_packet(rx).await
+}
+
+#[tauri::command]
+pub async fn get_next_audio_chunk(
+    state: State<'_, NativePlaybackState>,
+    session_id: u64,
+) -> Result<Response, String> {
+    let session = find_session(&state, session_id)?;
+    // None for a source with no audio stream at all - answered with an empty body too.
+    let rx = lock(&session.pipes)
+        .as_ref()
+        .and_then(|p| p.audio_rx.clone());
+    pull_packet(rx).await
 }
 
 #[tauri::command]
@@ -523,50 +602,81 @@ pub async fn seek_native_playback(
     time_secs: f64,
 ) -> Result<(), String> {
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let session = find_session(&state, session_id)?;
+    let generation = session.seek_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions
-        .get_mut(&session_id)
-        .ok_or("Unknown playback session")?;
-
-    kill_session_children(session);
-
-    let has_audio = session.audio_rx.is_some();
-    let (video_child, video_rx, audio_child, audio_rx) = spawn_session_pipes(
-        &ffmpeg_path,
-        &session.input_path,
-        time_secs,
-        session.width,
-        session.fps,
-        has_audio,
-        session.channels,
-    )?;
-
-    session.video_child = video_child;
-    session.video_rx = video_rx;
-    session.audio_child = audio_child;
-    session.audio_rx = audio_rx;
-
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // Spawned with no lock held - pulls on the current pipes carry on meanwhile.
+        let fresh = spawn_session_pipes(
+            &ffmpeg_path,
+            &session.input_path,
+            time_secs,
+            session.width,
+            session.fps,
+            session.has_audio,
+            session.channels,
+            generation,
+        )?;
+        let to_kill = {
+            let mut slot = lock(&session.pipes);
+            match slot.as_ref() {
+                // Stopped while spawning, or a newer seek already installed its own pipes.
+                None => Some(fresh),
+                Some(current) if current.generation > generation => Some(fresh),
+                Some(_) => slot.replace(fresh),
+            }
+        };
+        if let Some(stale) = to_kill {
+            kill_pipes(stale);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Playback worker failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn stop_native_playback(
+pub async fn stop_native_playback(
     state: State<'_, NativePlaybackState>,
     session_id: u64,
 ) -> Result<(), String> {
-    if let Some(mut session) = state.sessions.lock().unwrap().remove(&session_id) {
-        kill_session_children(&mut session);
+    let Some(session) = lock(&state.sessions).remove(&session_id) else {
+        return Ok(());
+    };
+    let pipes = lock(&session.pipes).take();
+    if let Some(pipes) = pipes {
+        tauri::async_runtime::spawn_blocking(move || kill_pipes(pipes))
+            .await
+            .map_err(|e| format!("Playback worker failed: {}", e))?;
     }
     Ok(())
 }
 
 // Called from main.rs's RunEvent::Exit handler - without this, quitting the app mid-playback
-// would orphan the session's ffmpeg.exe processes (same residual risk already accepted for the
-// main recording pipeline's AppState, not a new gap introduced here).
+// would leave the session's ffmpeg.exe processes running until orphan_guard's job object reaps
+// them; killing them here keeps a normal quit tidy on every platform.
 pub fn cleanup_all_sessions(state: &NativePlaybackState) {
-    let mut sessions = state.sessions.lock().unwrap();
-    for (_, mut session) in sessions.drain() {
-        kill_session_children(&mut session);
+    let sessions: Vec<_> = lock(&state.sessions).drain().map(|(_, s)| s).collect();
+    for session in sessions {
+        if let Some(pipes) = lock(&session.pipes).take() {
+            kill_pipes(pipes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packets_use_the_layout_the_frontend_parses() {
+        let video = encode_video_packet(1.5, &[0xFF, 0xD8, 0xFF, 0xD9]);
+        assert_eq!(f64::from_le_bytes(video[..8].try_into().unwrap()), 1.5);
+        assert_eq!(&video[8..], &[0xFF, 0xD8, 0xFF, 0xD9]);
+
+        let audio = encode_audio_packet(2.25, 3, &[1, 2, 3, 4]);
+        assert_eq!(f64::from_le_bytes(audio[..8].try_into().unwrap()), 2.25);
+        assert_eq!(u32::from_le_bytes(audio[8..12].try_into().unwrap()), 3);
+        assert_eq!(&audio[12..], &[1, 2, 3, 4]);
     }
 }

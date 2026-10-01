@@ -155,19 +155,21 @@ fn is_ancestor_or_self(folders: &[DocFolder], candidate: &str, ancestor_of: &str
     false
 }
 
-#[command]
+#[command(async)]
 pub fn list_doc_folders() -> Result<Vec<DocFolder>, String> {
+    let _serial = crate::services::responsiveness::serial();
     read_folders()
 }
 
 // id is frontend-generated (crypto.randomUUID()), same convention as create_doc's own id param -
 // there's no existing UUID-generation dependency on the Rust side to reuse for one call site.
-#[command]
+#[command(async)]
 pub fn create_doc_folder(
     id: String,
     name: String,
     parent_id: Option<String>,
 ) -> Result<DocFolder, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut folders = read_folders()?;
     if folders.iter().any(|f| f.id == id) {
         return Err("A folder with that id already exists".to_string());
@@ -188,8 +190,9 @@ pub fn create_doc_folder(
     Ok(folder)
 }
 
-#[command]
+#[command(async)]
 pub fn rename_doc_folder(id: String, name: String) -> Result<DocFolder, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut folders = read_folders()?;
     let folder = folders
         .iter_mut()
@@ -201,8 +204,9 @@ pub fn rename_doc_folder(id: String, name: String) -> Result<DocFolder, String> 
     Ok(result)
 }
 
-#[command]
+#[command(async)]
 pub fn move_doc_folder(id: String, new_parent_id: Option<String>) -> Result<DocFolder, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut folders = read_folders()?;
     if let Some(ref pid) = new_parent_id {
         if !folders.iter().any(|f| &f.id == pid) {
@@ -228,8 +232,9 @@ pub fn move_doc_folder(id: String, new_parent_id: Option<String>) -> Result<DocF
 // filed under one of them - folders are organizational metadata, not containers, same reasoning
 // relink_doc_path uses to repair a stale reference rather than cascading a delete onto the doc
 // that holds it.
-#[command]
+#[command(async)]
 pub fn delete_doc_folder(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut folders = read_folders()?;
 
     let mut doomed: Vec<String> = vec![id];
@@ -279,8 +284,9 @@ pub fn delete_doc_folder(id: String) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn set_doc_folder(id: String, folder_id: Option<String>) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     if let Some(ref fid) = folder_id {
         let folders = read_folders()?;
         if !folders.iter().any(|f| &f.id == fid) {
@@ -354,8 +360,9 @@ fn read_summary(dir: &PathBuf, id: &str) -> Option<DocSummary> {
     })
 }
 
-#[command]
+#[command(async)]
 pub fn list_docs() -> Result<Vec<DocSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = docs_root()?;
     let mut summaries: Vec<DocSummary> = Vec::new();
 
@@ -384,13 +391,14 @@ pub fn list_docs() -> Result<Vec<DocSummary>, String> {
     Ok(summaries)
 }
 
-#[command]
+#[command(async)]
 pub fn create_doc(
     id: String,
     title: String,
     bytes: Vec<u8>,
     folder_id: Option<String>,
 ) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     if dir.exists() {
         return Err("A document with that id already exists".to_string());
@@ -433,8 +441,9 @@ pub fn create_doc(
     })
 }
 
-#[command]
+#[command(async)]
 pub fn save_doc(id: String, bytes: Vec<u8>, title: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create document folder: {}", e))?;
 
@@ -473,8 +482,9 @@ pub fn save_doc(id: String, bytes: Vec<u8>, title: String) -> Result<(), String>
     )
 }
 
-#[command]
+#[command(async)]
 pub fn load_doc(id: String) -> Result<LoadedDoc, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let bytes =
         fs::read(dir.join("doc.bin")).map_err(|e| format!("Failed to load document: {}", e))?;
@@ -502,13 +512,14 @@ pub struct DocPageSetup {
     footer_text: Option<String>,
 }
 
-#[command]
+#[command(async)]
 pub fn set_doc_page_setup(
     id: String,
     page_size: Option<String>,
     header_text: Option<String>,
     footer_text: Option<String>,
 ) -> Result<DocPageSetup, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.page_size = page_size;
@@ -526,8 +537,9 @@ pub fn set_doc_page_setup(
 // "an accidental click shouldn't be unrecoverable" reasoning as services/trash.rs's file-level
 // move_to_trash. list_docs already skips DOCS_TRASH_DIR_NAME, so a trashed doc immediately stops
 // appearing in the normal list without a real delete.
-#[command]
+#[command(async)]
 pub fn delete_doc(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.deleted_at = Some(chrono::Local::now().to_rfc3339());
@@ -537,8 +549,9 @@ pub fn delete_doc(id: String) -> Result<(), String> {
     fs::rename(&dir, &trash_dest).map_err(|e| format!("Failed to move document to trash: {}", e))
 }
 
-#[command]
+#[command(async)]
 pub fn list_trashed_docs() -> Result<Vec<DocSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = docs_trash_root()?;
     let mut summaries: Vec<DocSummary> = Vec::new();
 
@@ -569,8 +582,9 @@ pub fn list_trashed_docs() -> Result<Vec<DocSummary>, String> {
     Ok(summaries)
 }
 
-#[command]
+#[command(async)]
 pub fn restore_doc(id: String) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let trash_dir = docs_trash_root()?.join(&id);
     if !trash_dir.exists() {
         return Err("Document is not in the trash".to_string());
@@ -598,8 +612,9 @@ pub fn restore_doc(id: String) -> Result<DocSummary, String> {
 }
 
 // The real, unrecoverable delete - only ever called on a doc already sitting in the trash.
-#[command]
+#[command(async)]
 pub fn delete_doc_permanently(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let trash_dir = docs_trash_root()?.join(&id);
     fs::remove_dir_all(&trash_dir)
         .map_err(|e| format!("Failed to permanently delete document: {}", e))
@@ -608,8 +623,9 @@ pub fn delete_doc_permanently(id: String) -> Result<(), String> {
 // Points this doc at a recording/file elsewhere in the library ("notes for this screencast"). One
 // doc links to at most one file; a file can have several docs pointing at it (see
 // find_docs_linked_to) - a recording might accumulate more than one separate note over time.
-#[command]
+#[command(async)]
 pub fn link_doc_to_file(id: String, file_path: String) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.linked_to = Some(file_path);
@@ -625,8 +641,9 @@ pub fn link_doc_to_file(id: String, file_path: String) -> Result<DocSummary, Str
     })
 }
 
-#[command]
+#[command(async)]
 pub fn unlink_doc(id: String) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.linked_to = None;
@@ -645,8 +662,9 @@ pub fn unlink_doc(id: String) -> Result<DocSummary, String> {
 // Reverse lookup for a given file path - which doc(s) are "notes for" it. A full scan over every
 // doc's meta.json rather than a second sidecar-per-recording index: trivially cheap at
 // desktop/local doc-count scale, and avoids a second data structure that could drift out of sync.
-#[command]
+#[command(async)]
 pub fn find_docs_linked_to(file_path: String) -> Result<Vec<DocSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = docs_root()?;
     let mut summaries: Vec<DocSummary> = Vec::new();
 
@@ -676,8 +694,9 @@ pub fn find_docs_linked_to(file_path: String) -> Result<Vec<DocSummary>, String>
 // Called when a linked recording is renamed/moved, alongside the frontend's existing
 // repathFile()-style pin/recent repair, so a doc's link doesn't silently go stale. Returns how
 // many docs were updated (0 is a valid, expected result for a file nothing links to).
-#[command]
+#[command(async)]
 pub fn relink_doc_path(old_path: String, new_path: String) -> Result<u32, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = docs_root()?;
     let mut updated = 0u32;
 
@@ -727,8 +746,9 @@ fn build_export_path(doc_title: &str, extension: &str) -> Result<PathBuf, String
     Ok(root.join(format!("{} {}.{}", safe_name, stamp, extension)))
 }
 
-#[command]
+#[command(async)]
 pub fn export_doc(doc_title: String, extension: String, content: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     if extension != "md" && extension != "txt" {
         return Err(format!("Unsupported export extension: {}", extension));
     }
@@ -741,12 +761,13 @@ pub fn export_doc(doc_title: String, extension: String, content: String) -> Resu
     Ok(output.to_string_lossy().to_string())
 }
 
-#[command]
+#[command(async)]
 pub fn export_doc_binary(
     doc_title: String,
     extension: String,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     if extension != "docx" {
         return Err(format!("Unsupported export extension: {}", extension));
     }
@@ -763,13 +784,14 @@ pub fn export_doc_binary(
 // boards.rs's import_board_image - except this takes bytes directly (clipboard data starts as an
 // in-memory File/Blob, not a path on disk) and returns the full absolute path rather than just a
 // filename, so the frontend doesn't need to duplicate docs_root()-equivalent path-joining in JS.
-#[command]
+#[command(async)]
 pub fn save_doc_image(
     id: String,
     asset_id: String,
     extension: String,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     // extension comes from a clipboard MIME type, not a real file extension - whitelist rather
     // than trust it verbatim.
     const ALLOWED: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
@@ -881,13 +903,15 @@ fn write_version(dir: &PathBuf, bytes: &[u8]) -> Result<Option<DocVersionSummary
     Ok(Some(version_summary_from_millis(millis)))
 }
 
-#[command]
+#[command(async)]
 pub fn create_doc_version(id: String, bytes: Vec<u8>) -> Result<Option<DocVersionSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     write_version(&versions_dir(&id)?, &bytes)
 }
 
-#[command]
+#[command(async)]
 pub fn list_doc_versions(id: String) -> Result<Vec<DocVersionSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let versions = list_version_files(&versions_dir(&id)?)?;
     Ok(versions
         .into_iter()
@@ -905,8 +929,9 @@ fn version_file_path(dir: &PathBuf, version_id: &str) -> Result<PathBuf, String>
     Ok(dir.join(format!("{}.bin", version_id)))
 }
 
-#[command]
+#[command(async)]
 pub fn load_doc_version(id: String, version_id: String) -> Result<Vec<u8>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let path = version_file_path(&versions_dir(&id)?, &version_id)?;
     fs::read(&path).map_err(|e| format!("Failed to load version: {}", e))
 }
@@ -915,8 +940,9 @@ pub fn load_doc_version(id: String, version_id: String) -> Result<Vec<u8>, Strin
 // then overwrites doc.bin with the target version's bytes and bumps meta.json's updated_at - same
 // write-then-rename convention as save_doc. Returns the restored bytes so the frontend can apply
 // them to a fresh Y.Doc without a second round trip.
-#[command]
+#[command(async)]
 pub fn restore_doc_version(id: String, version_id: String) -> Result<Vec<u8>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let versions = versions_dir(&id)?;
     let target_path = version_file_path(&versions, &version_id)?;
@@ -984,21 +1010,23 @@ fn write_comments(id: &str, comments: &[DocComment]) -> Result<(), String> {
     fs::rename(&tmp, &path).map_err(|e| format!("Failed to save comments: {}", e))
 }
 
-#[command]
+#[command(async)]
 pub fn list_doc_comments(id: String) -> Result<Vec<DocComment>, String> {
+    let _serial = crate::services::responsiveness::serial();
     read_comments(&id)
 }
 
 // id/mark_id are both frontend-generated (crypto.randomUUID()) - mark_id doubles as the comment
 // mark's own attribute value applied to the selection at the same moment this is called, so the
 // two ids start out equal, though only mark_id is ever looked up against the live document again.
-#[command]
+#[command(async)]
 pub fn add_doc_comment(
     id: String,
     comment_id: String,
     mark_id: String,
     text: String,
 ) -> Result<DocComment, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut comments = read_comments(&id)?;
     let comment = DocComment {
         id: comment_id,
@@ -1012,8 +1040,9 @@ pub fn add_doc_comment(
     Ok(comment)
 }
 
-#[command]
+#[command(async)]
 pub fn resolve_doc_comment(id: String, comment_id: String) -> Result<DocComment, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut comments = read_comments(&id)?;
     let comment = comments
         .iter_mut()
@@ -1025,8 +1054,9 @@ pub fn resolve_doc_comment(id: String, comment_id: String) -> Result<DocComment,
     Ok(result)
 }
 
-#[command]
+#[command(async)]
 pub fn reopen_doc_comment(id: String, comment_id: String) -> Result<DocComment, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut comments = read_comments(&id)?;
     let comment = comments
         .iter_mut()
@@ -1038,8 +1068,9 @@ pub fn reopen_doc_comment(id: String, comment_id: String) -> Result<DocComment, 
     Ok(result)
 }
 
-#[command]
+#[command(async)]
 pub fn delete_doc_comment(id: String, comment_id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut comments = read_comments(&id)?;
     comments.retain(|c| c.id != comment_id);
     write_comments(&id, &comments)

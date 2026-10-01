@@ -60,7 +60,7 @@ pub struct MonitorInfo {
 // direct syscall needing no app resources. Threaded through uniformly anyway so this command's
 // signature doesn't need its own per-platform #[cfg], matching get_connected_devices elsewhere
 // in this codebase (also uniformly takes an AppHandle even where most platforms ignore it).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_monitors(app_handle: tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
     #[cfg(target_os = "macos")]
     {
@@ -111,7 +111,7 @@ pub async fn capture_window_screenshots_by_title_command(
     platform::capture_window_screenshots_by_title(app_handle).await
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_windows_titles() -> Vec<String> {
     platform::get_windows_titles()
 }

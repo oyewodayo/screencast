@@ -90,8 +90,9 @@ fn read_summary(dir: &PathBuf, id: &str) -> Option<MindmapSummary> {
     })
 }
 
-#[command]
+#[command(async)]
 pub fn list_mindmaps() -> Result<Vec<MindmapSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = mindmaps_root()?;
     let mut summaries: Vec<MindmapSummary> = Vec::new();
     let entries = match fs::read_dir(&root) {
@@ -113,8 +114,9 @@ pub fn list_mindmaps() -> Result<Vec<MindmapSummary>, String> {
     Ok(summaries)
 }
 
-#[command]
+#[command(async)]
 pub fn create_mindmap(id: String, name: String, json: String) -> Result<MindmapSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = mindmap_dir(&id)?;
     if dir.exists() {
         return Err("A mindmap with that id already exists".to_string());
@@ -152,8 +154,9 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 // Copies an existing mindmap's whole project folder into a new id - deliberately does NOT touch
 // mindmap.json's own id/name/timestamps, same "frontend owns the document shape" division of labor
 // duplicate_whiteboard uses: the frontend loads and re-saves right after this to patch those in.
-#[command]
+#[command(async)]
 pub fn duplicate_mindmap(source_id: String, new_id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let source_dir = mindmap_dir(&source_id)?;
     if !source_dir.is_dir() {
         return Err("Source mindmap does not exist".to_string());
@@ -165,8 +168,9 @@ pub fn duplicate_mindmap(source_id: String, new_id: String) -> Result<(), String
     copy_dir_recursive(&source_dir, &dest_dir)
 }
 
-#[command]
+#[command(async)]
 pub fn save_mindmap(id: String, json: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = mindmap_dir(&id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create mindmap folder: {}", e))?;
     let target = dir.join("mindmap.json");
@@ -176,14 +180,16 @@ pub fn save_mindmap(id: String, json: String) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn load_mindmap(id: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let target = mindmap_dir(&id)?.join("mindmap.json");
     fs::read_to_string(&target).map_err(|e| format!("Failed to load mindmap: {}", e))
 }
 
-#[command]
+#[command(async)]
 pub fn delete_mindmap(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = mindmap_dir(&id)?;
     fs::remove_dir_all(&dir).map_err(|e| format!("Failed to delete mindmap: {}", e))
 }
@@ -196,12 +202,13 @@ const ALLOWED_IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp"
 // name, which is what the node persists. Always copies, never moves - the source lives outside this
 // project folder and must be left untouched. Same convention as whiteboards.rs's
 // import_whiteboard_image.
-#[command]
+#[command(async)]
 pub fn import_mindmap_image(
     mindmap_id: String,
     source_path: String,
     asset_id: String,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let source = PathBuf::from(&source_path);
     if !source.is_file() {
         return Err(format!("Image does not exist: {}", source_path));
@@ -223,8 +230,9 @@ pub fn import_mindmap_image(
     Ok(asset_file_name)
 }
 
-#[command]
+#[command(async)]
 pub fn save_mindmap_thumbnail(mindmap_id: String, bytes: Vec<u8>) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = mindmap_dir(&mindmap_id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create mindmap folder: {}", e))?;
     let target = dir.join("thumbnail.png");
@@ -239,12 +247,13 @@ pub fn save_mindmap_thumbnail(mindmap_id: String, bytes: Vec<u8>) -> Result<(), 
 // export_whiteboard_png follows. `extension` is what makes this serve both the PNG and PDF exports
 // from one implementation; it is whitelisted rather than trusted, since a command is directly
 // reachable and this decides a filename on disk.
-#[command]
+#[command(async)]
 pub fn export_mindmap_file(
     mindmap_name: String,
     extension: String,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     const ALLOWED: [&str; 2] = ["png", "pdf"];
     let ext = extension.to_ascii_lowercase();
     if !ALLOWED.contains(&ext.as_str()) {
@@ -273,7 +282,8 @@ pub fn export_mindmap_file(
 // Save-As counterpart: the destination comes from the frontend's own native save dialog, which is
 // what constrains where this can write, so no extension whitelist applies here - the user picked
 // the path and the format along with it.
-#[command]
+#[command(async)]
 pub fn export_mindmap_to_path(dest_path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     fs::write(&dest_path, &bytes).map_err(|e| format!("Failed to write file: {}", e))
 }

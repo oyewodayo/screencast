@@ -17,7 +17,7 @@ pub fn path_to_str(path: &Path) -> Result<&str, String> {
 // window_capture::macos's module comment), rather than offering it and erroring when clicked.
 // std::env::consts::OS is a compile-time constant ("windows" | "macos" | "linux"), so this is
 // exactly as reliable as the #[cfg(target_os = ...)] switches the rest of the backend uses.
-#[command]
+#[command(async)]
 pub fn get_platform() -> &'static str {
     std::env::consts::OS
 }
@@ -424,8 +424,9 @@ fn repair_sidecars_in_tree(
     }
 }
 
-#[command]
+#[command(async)]
 pub fn repair_stale_file_references() -> Result<u32, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = briefcast_dir()?;
     if !root.is_dir() {
         return Ok(0);
@@ -450,13 +451,15 @@ fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
-#[command]
+#[command(async)]
 pub fn get_briefcast_dir() -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     briefcast_dir().and_then(|p| path_to_str(&p).map(|s| s.to_string()))
 }
 
-#[command]
+#[command(async)]
 pub fn get_default_briefcast_dir() -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     default_briefcast_dir().and_then(|p| path_to_str(&p).map(|s| s.to_string()))
 }
 
@@ -469,8 +472,9 @@ pub fn get_default_briefcast_dir() -> Result<String, String> {
 // library move from freezing the UI without this needing to manually manage a runtime/thread pool
 // of its own (that would require adding tokio as a direct dependency here just to reach a
 // scheduler tauri already owns and uses internally for exactly this).
-#[command]
+#[command(async)]
 pub fn set_briefcast_dir(new_parent_dir: String, app_handle: AppHandle) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let new_parent = PathBuf::from(&new_parent_dir);
     if !new_parent.is_dir() {
         return Err("Selected location does not exist".to_string());
@@ -516,8 +520,9 @@ pub fn set_briefcast_dir(new_parent_dir: String, app_handle: AppHandle) -> Resul
     path_to_str(&new_root).map(|s| s.to_string())
 }
 
-#[command]
+#[command(async)]
 pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let old_root = briefcast_dir()?;
     let new_root = default_briefcast_dir()?;
 
@@ -550,8 +555,9 @@ pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
     path_to_str(&new_root).map(|s| s.to_string())
 }
 
-#[command]
+#[command(async)]
 pub fn list_briefcast_files() -> HashMap<String, Vec<FileEntry>> {
+    let _serial = crate::services::responsiveness::serial();
     let mut result = HashMap::new();
 
     if let Ok(folder_path) = briefcast_dir() {
@@ -671,8 +677,9 @@ fn validate_folder_name(name: &str) -> Result<&str, String> {
 // `parent_path` is "" for the Briefcast root or a relative_key-shaped path (e.g. "Workshops") for
 // a subfolder — same convention list_briefcast_files' map is keyed by. Returns the new folder's
 // own relative_key, ready to hand straight back for a subsequent create_folder/move_file call.
-#[command]
+#[command(async)]
 pub fn create_folder(parent_path: String, name: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let name = validate_folder_name(&name)?;
     let root = briefcast_dir()?;
     let parent = resolve_relative(&root, &parent_path)?;
@@ -698,8 +705,9 @@ pub fn create_folder(parent_path: String, name: String) -> Result<String, String
 // real fs::read_dir, not just "no media files of some category", so a folder holding an
 // unsupported file type or a nested empty subfolder still refuses to delete rather than
 // silently discarding something). The Briefcast root itself can never be deleted this way.
-#[command]
+#[command(async)]
 pub fn delete_folder(folder_path: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     if folder_path.is_empty() {
         return Err("Cannot delete the Briefcast root folder".to_string());
     }
@@ -721,8 +729,9 @@ pub fn delete_folder(folder_path: String) -> Result<(), String> {
 // identified by relative_key-shaped path ("" = Briefcast root). Same-folder moves are a no-op
 // success rather than an error, so the frontend doesn't need to special-case "dropped it back
 // where it came from".
-#[command]
+#[command(async)]
 pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = briefcast_dir()?;
     let dest_dir = resolve_relative(&root, &dest_folder_path)?;
     if !dest_dir.is_dir() {
@@ -753,8 +762,9 @@ pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String
 // rather than renames since the source lives outside briefcast_dir() and must be left in place.
 // Rejects extensions list_briefcast_files wouldn't display anyway (is_media_file), so a dropped
 // file never silently vanishes from the sidebar after a successful copy.
-#[command]
+#[command(async)]
 pub fn import_file(source_path: String, dest_folder_path: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = briefcast_dir()?;
     let dest_dir = resolve_relative(&root, &dest_folder_path)?;
     if !dest_dir.is_dir() {
@@ -872,8 +882,9 @@ pub async fn open_file_with_default_app(filepath: String) -> Result<(), String> 
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn rename_file(old_path: String, new_name: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     if new_name.trim().is_empty()
         || new_name.contains('/')
         || new_name.contains('\\')
@@ -913,7 +924,7 @@ pub fn rename_file(old_path: String, new_name: String) -> Result<String, String>
     path_to_str(&new_path).map(|s| s.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
     use std::fs;
     use std::path::PathBuf;
@@ -971,7 +982,7 @@ pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
 // trusting a second source to agree, sidesteps having to figure out exactly which of the two
 // disagreed.
 #[cfg(target_os = "windows")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_cursor_position_in_window(window: tauri::Window) -> Result<(f64, f64), String> {
     use windows::Win32::Foundation::{HWND, POINT};
     use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -1006,7 +1017,7 @@ pub fn get_cursor_position_in_window(window: tauri::Window) -> Result<(f64, f64)
 }
 
 #[cfg(not(target_os = "windows"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_cursor_position_in_window(_window: tauri::Window) -> Result<(f64, f64), String> {
     Err("Cursor position lookup is only implemented on Windows".to_string())
 }
@@ -1048,8 +1059,9 @@ fn dir_stats(dir: &Path) -> (u64, u64) {
 // empty list rather than one row per known namespace with zeros. The frontend's Settings > Cache
 // section maps each namespace to a human-readable label itself, keeping this side agnostic of
 // what the namespaces actually mean.
-#[command]
+#[command(async)]
 pub fn get_cache_info() -> Result<Vec<CacheCategoryInfo>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = preview_cache_root();
     if !root.exists() {
         return Ok(Vec::new());
@@ -1078,8 +1090,9 @@ pub fn get_cache_info() -> Result<Vec<CacheCategoryInfo>, String> {
 // regenerates its own entry transparently the next time it's needed - nothing here is ever
 // anything but a derived, disposable copy of a real file elsewhere, so the only cost of clearing
 // is a one-time regeneration, never lost data.
-#[command]
+#[command(async)]
 pub fn clear_preview_cache(namespace: Option<String>) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = preview_cache_root();
     let target = match namespace {
         Some(ns) => root.join(ns),

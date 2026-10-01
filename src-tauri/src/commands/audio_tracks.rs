@@ -335,7 +335,7 @@ pub async fn download_separation_engine(app_handle: AppHandle, window: Window) -
     .map_err(|e| format!("Download task failed: {}", e))?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cancel_separation_engine_download() {
     DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst);
 }
@@ -445,7 +445,7 @@ fn run_with_progress(mut cmd: Command, what: &str, window: &Window, workers: u32
     Err(format!("{} failed: {}", what, tail.into_iter().rev().collect::<Vec<_>>().join("\n")))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cancel_voice_music_separation() {
     SEPARATION_CANCELLED.store(true, Ordering::SeqCst);
 }

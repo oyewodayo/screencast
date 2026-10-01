@@ -16,8 +16,9 @@ fn sidecar_path_for(video_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-#[command]
+#[command(async)]
 pub fn save_video_edit_state(video_path: String, json: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let video = PathBuf::from(&video_path);
     if !video.exists() {
         return Err(format!("Video does not exist: {}", video_path));
@@ -34,8 +35,9 @@ pub fn save_video_edit_state(video_path: String, json: String) -> Result<(), Str
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn load_video_edit_state(video_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sidecar = sidecar_path_for(&PathBuf::from(&video_path));
     if !sidecar.exists() {
         return Ok(None);
@@ -55,8 +57,9 @@ fn chapters_sidecar_path_for(video_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-#[command]
+#[command(async)]
 pub fn save_video_chapters(video_path: String, json: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let video = PathBuf::from(&video_path);
     if !video.exists() {
         return Err(format!("Video does not exist: {}", video_path));
@@ -72,8 +75,9 @@ pub fn save_video_chapters(video_path: String, json: String) -> Result<(), Strin
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn load_video_chapters(video_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sidecar = chapters_sidecar_path_for(&PathBuf::from(&video_path));
     if !sidecar.exists() {
         return Ok(None);

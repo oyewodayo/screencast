@@ -95,7 +95,7 @@ async function buildImageRun(src: string, width?: number | null, height?: number
     return null;
   }
   try {
-    const bytes = await invoke<number[]>("read_file_bytes", { path });
+    const bytes = await invoke<ArrayBuffer>("read_file_bytes", { path });
     return new ImageRun({
       type,
       data: new Uint8Array(bytes),

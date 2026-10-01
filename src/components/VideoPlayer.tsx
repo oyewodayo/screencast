@@ -100,7 +100,7 @@ const srtToVtt = (srtText: string): string => {
 // the exact MIME type itself instead of depending on that guess. media-src in tauri.conf.json's
 // CSP was widened to include blob: specifically to allow this.
 const loadCaptionsSrc = async (path: string): Promise<string> => {
-  const bytes = await invoke<number[]>('read_file_bytes', { path });
+  const bytes = await invoke<ArrayBuffer>('read_file_bytes', { path });
   const text = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
   const vttText = path.toLowerCase().endsWith('.srt') ? srtToVtt(text) : text;
   return URL.createObjectURL(new Blob([vttText], { type: 'text/vtt' }));
