@@ -1,4 +1,4 @@
-import { IoClose, IoScanOutline, IoApps, IoReload, IoArrowBack, IoVideocam, IoMic, IoDesktopOutline, IoSwapHorizontal, IoPencil, IoPhonePortraitOutline, IoVolumeHigh, IoHandLeftOutline } from "react-icons/io5";
+import { IoClose, IoScanOutline, IoApps, IoReload, IoArrowBack, IoVideocam, IoMic, IoDesktopOutline, IoSwapHorizontal, IoPencil, IoPhonePortraitOutline, IoVolumeHigh, IoHandLeftOutline, IoTvOutline } from "react-icons/io5";
 import { PHONE_CAMERA_DEVICE, PHONE_CAMERA_LABEL } from "../services/phoneCamera";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
@@ -7,6 +7,8 @@ import { WindowInfo, MonitorInfo } from "../Types";
 import CameraOverlayPreview from "./CameraOverlayPreview";
 import { RECORD_TYPE_LABELS } from "./ActiveRecordingState";
 import { loadSettings, saveSettings } from "../utils/appSettings";
+import { PresentationPanel, startOrStopPresentation, usePresentation } from "./PresentationControls";
+import { getPresentationState } from "../services/presentation";
 
 interface ScreenOptionsProps {
     recordType: string;
@@ -217,6 +219,19 @@ const EnhancedScreenOptions = ({
     error,
 }: ScreenOptionsProps) => {
     const [mode, setMode] = useState<SelectionMode>("main");
+    // "Present": the live camera display (PresentationControls.tsx) instead of a recording setup.
+    // Opens straight into it while the display is live, so reopening the modal finds the controls.
+    const [presentMode, setPresentMode] = useState(() => getPresentationState().active);
+    const presentation = usePresentation();
+    const [presentError, setPresentError] = useState<string | null>(null);
+    const togglePresentation = async () => {
+        setPresentError(null);
+        try {
+            await startOrStopPresentation(presentation.active);
+        } catch (err) {
+            setPresentError(String(err));
+        }
+    };
     // The header title doubles as the recording's file name - click it to rename.
     const [editingName, setEditingName] = useState(false);
     const isCameraOnly = CAMERA_ONLY_TYPES.includes(recordType);
@@ -350,7 +365,11 @@ const EnhancedScreenOptions = ({
         if (!isOpenScreen) return;
         const onKey = (e: KeyboardEvent) => {
             if (e.key === "Escape") closeModal();
-            if (e.key === "Enter" && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLButtonElement)) confirmAndStart(resolveCurrentTarget());
+            if (e.key === "Enter" && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLButtonElement)) {
+                if (presentMode) {
+                    if (!presentation.active) void togglePresentation();
+                } else confirmAndStart(resolveCurrentTarget());
+            }
         };
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
@@ -892,11 +911,11 @@ const EnhancedScreenOptions = ({
                             </button>
                         )}
                         <p className="text-xs text-neutral-500 dark:text-neutral-400">
-                            {RECORD_TYPE_LABELS[recordType] ?? recordType}
+                            {presentMode ? "Live camera display" : RECORD_TYPE_LABELS[recordType] ?? recordType}
                         </p>
                     </div>
                     {/* Screenshot is a separate flow the caller manages - switching type mid-way would fight it. */}
-                    {recordType !== "c" && (
+                    {recordType !== "c" && !presentMode && (
                         <div className="hidden md:flex mx-auto p-1 gap-1 rounded-2xl bg-neutral-100 dark:bg-neutral-800/80">
                             {RECORD_TYPE_OPTIONS.map((opt) => (
                                 <button
@@ -926,6 +945,11 @@ const EnhancedScreenOptions = ({
                 </div>
 
                 {/* Body */}
+                {presentMode ? (
+                    <div className="flex-1 min-h-0 overflow-y-auto p-6">
+                        <PresentationPanel connectedCameraDevices={connectedCameraDevices} />
+                    </div>
+                ) : (
                 <div className={`flex-1 min-h-0 grid ${hasCameraBubble ? "lg:grid-cols-[minmax(0,1fr)_400px]" : "grid-cols-1"}`}>
                     <div className="min-h-0 overflow-y-auto p-6 space-y-6">
                         {!isCameraOnly && !isAudioOnly && (
@@ -1016,10 +1040,46 @@ const EnhancedScreenOptions = ({
                         </aside>
                     )}
                 </div>
+                )}
 
                 {/* Footer */}
                 <div className="flex items-center gap-4 px-6 py-4 border-t border-neutral-200/80 dark:border-neutral-800 bg-white/80 dark:bg-neutral-900/80">
-                    <div className="min-w-0 flex items-center gap-2 text-sm">
+                    <div className="min-w-0 flex items-center gap-3 text-sm">
+                        {recordType !== "c" && (
+                            <div className="flex p-1 gap-1 rounded-xl bg-neutral-100 dark:bg-neutral-800" role="tablist" aria-label="Mode">
+                                {([
+                                    ["record", "Record", <IoVideocam key="r" />],
+                                    ["present", "Present", <IoTvOutline key="p" />],
+                                ] as const).map(([value, label, icon]) => {
+                                    const active = (value === "present") === presentMode;
+                                    return (
+                                        <button
+                                            key={value}
+                                            type="button"
+                                            role="tab"
+                                            aria-selected={active}
+                                            onClick={() => setPresentMode(value === "present")}
+                                            title={value === "present" ? "Show cameras live, full screen on a TV or projector" : "Set up a recording"}
+                                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                                                active
+                                                    ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm"
+                                                    : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200"
+                                            }`}
+                                        >
+                                            {icon}
+                                            {label}
+                                            {value === "present" && presentation.active && (
+                                                <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                                            )}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
+                        {presentMode ? (
+                            presentError && <span className="text-xs text-red-500 truncate">{presentError}</span>
+                        ) : (
+                        <>
                         {!isCameraOnly && !isAudioOnly && (
                             <span className="truncate px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs font-medium">
                                 {summary}
@@ -1031,7 +1091,24 @@ const EnhancedScreenOptions = ({
                             <Kbd>R</Kbd>
                             <span className="ml-1">starts and stops a recording anytime</span>
                         </span>
+                        </>
+                        )}
                     </div>
+                    {presentMode ? (
+                    <button
+                        type="button"
+                        onClick={() => void togglePresentation()}
+                        disabled={!presentation.active && presentation.cameras.length === 0}
+                        className={`ml-auto flex items-center gap-2 px-6 py-2.5 rounded-xl text-white text-sm font-semibold shadow-sm active:scale-[0.98] transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                            presentation.active
+                                ? "bg-neutral-900 hover:bg-neutral-800 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-100"
+                                : "bg-red-600 hover:bg-red-500 shadow-red-600/30"
+                        }`}
+                    >
+                        <IoTvOutline className="text-base" />
+                        {presentation.active ? "Stop display" : "Go live"}
+                    </button>
+                    ) : (
                     <button
                         type="button"
                         onClick={() => confirmAndStart(resolveCurrentTarget())}
@@ -1040,6 +1117,7 @@ const EnhancedScreenOptions = ({
                         <span className="w-2.5 h-2.5 rounded-full bg-white/90" />
                         {recordType === "c" ? "Take Screenshot" : "Start Recording"}
                     </button>
+                    )}
                 </div>
             </div>
         </div>

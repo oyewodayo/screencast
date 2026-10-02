@@ -31,11 +31,13 @@ import { formatFileSize, truncateFileName } from "../utils/Formater";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
 import { ensureWorkerConfigured } from "../hooks/usePdfDocument";
 import { getCachedPdfThumbnail, setCachedPdfThumbnail } from "../utils/pdfThumbnailCache";
+import { useGallerySort } from "./GallerySort";
 
 interface GalleryFile {
   name: string;
   path: string;
   size: number;
+  modified?: number;
 }
 
 interface PdfFolderGalleryProps {
@@ -105,7 +107,7 @@ async function renderPdfFirstPageThumbnail(assetUrl: string): Promise<string> {
 }
 
 const PdfFolderGallery: React.FC<PdfFolderGalleryProps> = ({
-  files,
+  files: unsortedFiles,
   folderLabel,
   resolveAssetUrl,
   onOpenPdf,
@@ -126,6 +128,7 @@ const PdfFolderGallery: React.FC<PdfFolderGalleryProps> = ({
   onMoveFiles,
   onBulkDelete,
 }) => {
+  const { sorted: files, control: sortControl } = useGallerySort(unsortedFiles, "pdf");
   const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
   const [contextMenu, setContextMenu] = useState<{ file: GalleryFile; x: number; y: number } | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
@@ -236,9 +239,12 @@ const PdfFolderGallery: React.FC<PdfFolderGalleryProps> = ({
           {actionStatus}
         </div>
       )}
-      <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-3">
-        {folderLabel} — {files.length} PDF{files.length === 1 ? "" : "s"}
-      </p>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500">
+          {folderLabel} — {files.length} PDF{files.length === 1 ? "" : "s"}
+        </p>
+        {sortControl}
+      </div>
       <div
         className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-7 gap-3"
         onClick={(e) => {

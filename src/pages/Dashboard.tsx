@@ -37,6 +37,8 @@ import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
+import { PresentationLiveBar } from "../components/PresentationControls";
+import { getPresentationState, visibleCameras } from "../services/presentation";
 
 // Record types that capture cameras and no screen (win.rs recording_with_output_va/_v). Mirrors
 // CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
@@ -213,6 +215,7 @@ interface FileEntry {
     name: string;
     path: string;
     size: number;
+    modified?: number;
 }
 
 interface FileMap {
@@ -1038,6 +1041,20 @@ const setScreen = () => {
     if (formData.record_type === "c") {
       await handleTakeScreenshot(formData);
       return;
+    }
+    // The live display holds its cameras open, and a Windows camera serves one app at a time -
+    // ffmpeg couldn't open one that's on the display. Say so now rather than fail mid-start.
+    const presentation = getPresentationState();
+    if (presentation.active && ['sva', 'va', 'v'].includes(formData.record_type)) {
+      const onDisplay = visibleCameras(presentation);
+      // The phone is shared, not opened - recording it while it's on the display is fine.
+      const clash = (formData.video_devices ?? []).filter((d: string) => d !== PHONE_CAMERA_DEVICE && onDisplay.includes(d));
+      if (clash.length > 0) {
+        setError(
+          `${clash.join(', ')} ${clash.length === 1 ? 'is' : 'are'} on the live display. Take ${clash.length === 1 ? 'it' : 'them'} off the display (or stop it) to record ${clash.length === 1 ? 'that camera' : 'those cameras'}.`
+        );
+        return;
+      }
     }
     try {
         await activateTargetWindowIfNeeded();
@@ -4047,6 +4064,9 @@ const setScreen = () => {
         </div>
         </div>
       </div>
+
+      {/* Cut cameras on the live display without reopening the modal - only while it's live. */}
+      <PresentationLiveBar />
 
       {!isPdfFullscreen && (
       <BottomDocker

@@ -13,6 +13,7 @@ mod commands {
     pub mod audio_tracks;
     pub mod conversion;
     pub mod native_playback;
+    pub mod presentation;
     pub mod recording;
     pub mod system_info;
     pub mod window_capture;
@@ -416,6 +417,8 @@ fn main() {
             commands::native_playback::seek_native_playback,
             commands::native_playback::stop_native_playback,
             commands::annotation::ensure_annotation_overlay,
+            commands::presentation::open_presentation_window,
+            commands::presentation::close_presentation_window,
             services::utility::open_file_from_directory,
             services::utility::open_file_with_default_app,
             services::utility::list_briefcast_files,

@@ -187,6 +187,9 @@ pub struct FileEntry {
     name: String,
     path: String,
     size: u64,
+    // Last modified, in milliseconds since the Unix epoch (0 when the OS won't say) - what the
+    // galleries' "Date" sort orders by.
+    modified: u64,
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -600,11 +603,18 @@ fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<File
 
                 if is_media_file(&ext) {
                     if let Some(file_name) = entry_path.file_name() {
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let meta = entry.metadata().ok();
+                        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                        let modified = meta
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
                         files.push(FileEntry {
                             name: file_name.to_string_lossy().to_string(),
                             path: entry_path.display().to_string(),
                             size,
+                            modified,
                         });
                     }
                 }

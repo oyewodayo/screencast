@@ -2,7 +2,6 @@ import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "re
 import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
-import { message } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import ActiveRecordingState, { RecordSource, SOURCE_FLAGS } from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
@@ -12,6 +11,11 @@ import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import { loadSettings } from "../utils/appSettings";
+
+// First entry of each is the fallback when Settings' default format is of another kind.
+const VIDEO_EXTS = ["mp4", "mkv", "mov", "webm", "avi"];
+const AUDIO_EXTS = ["mp3", "wav", "aac", "wma"];
+const IMAGE_EXTS = ["png", "jpeg", "webp"];
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -396,29 +400,20 @@ const BottomDocker = ({
     loadDevices();
   }, []);
 
+  // Keeps the format valid for the record type: switching between video types keeps the user's
+  // choice; moving to a different kind (video/audio/screenshot) takes the Settings default when
+  // it's of that kind, otherwise MP4 / MP3 / PNG.
   useEffect(() => {
-    // Set default file extension based on recordType
-    switch (recordType) {
-      case "c":
-        setFileExt("png");
-        break;
-      case "a":
-        setFileExt("mp3");
-        break;
-      default:
-        setFileExt("Avi");
-        break;
-    }
+    const allowed = recordType === "c" ? IMAGE_EXTS : recordType === "a" ? AUDIO_EXTS : VIDEO_EXTS;
+    const preferred = loadSettings().defaultFileExt.toLowerCase();
+    setFileExt((prev) => {
+      const current = prev.toLowerCase();
+      if (allowed.includes(current)) return current;
+      return allowed.includes(preferred) ? preferred : allowed[0];
+    });
   }, [recordType]);
 
-  const handleRecordTypeChange = (
-    event: React.ChangeEvent<HTMLSelectElement>
-  ) => {
-    setRecordType(event.target.value);
-  };
-
-  // Same thing, for callers that already have the value rather than a <select> event - currently
-  // the screen-selection modal's own "Change" control. Clearing previousRecordType matters:
+  // For the screen-selection modal's own "Change" control. Clearing previousRecordType matters:
   // closeModalScreen restores it on close, so without this, deliberately switching type inside
   // the modal during a screenshot flow would be silently undone the moment it closed.
   const handleRecordTypeSelected = (value: string) => {
@@ -426,20 +421,8 @@ const BottomDocker = ({
     setRecordType(value);
   };
 
-  const handleFileExtChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
-    console.log(event.target.value);
-
-    setFileExt(event.target.value);
-  };
-
   const handleFileNameChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     setFileName(event.target.value);
-  };
-
-  const handleAudioDeviceChange = (
-    event: React.ChangeEvent<HTMLSelectElement>
-  ) => {
-    setAudioDevice(event.target.value);
   };
 
   const toggleVideoDevice = (device: string) => {
@@ -539,10 +522,6 @@ const BottomDocker = ({
     setPreviousRecordType(recordType);
     setRecordType("c");
     openModalScreen();
-  }
-
-  const videoFormatInfo = async() =>{
-    return await message("Avi or Mkv format is highly rocommended to record video. However, you can remuxe or convert to other format when you are done recording.", { title: 'Video format', kind: 'info' });
   }
 
   return (
@@ -677,12 +656,11 @@ const BottomDocker = ({
             fileName={fileName}
             onFileNameChange={handleFileNameChange}
             fileExt={fileExt}
-            onFileExtChange={handleFileExtChange}
-            onShowVideoFormatInfo={videoFormatInfo}
+            onFileExtChange={setFileExt}
             recordType={recordType}
-            onRecordTypeChange={handleRecordTypeChange}
+            onRecordTypeChange={setRecordType}
             audioDevice={audioDevice}
-            onAudioDeviceChange={handleAudioDeviceChange}
+            onAudioDeviceChange={setAudioDevice}
             connectedAudioDevices={connectedAudioDevices}
             connectedCameraDevices={connectedCameraDevices}
             videoDevices={videoDevices}

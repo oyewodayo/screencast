@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { IoVideocamOffOutline } from "react-icons/io5";
 import { PHONE_CAMERA_DEVICE, subscribePhoneCamera } from "../services/phoneCamera";
+import { cameraStatusText, useCameraStreams } from "../hooks/useCameraStreams";
 
 interface CameraOverlayPreviewProps {
     videoDevices: string[];
@@ -105,138 +106,13 @@ const CameraOverlayPreview = ({
     showLabel = true,
     variant = "overlay",
 }: CameraOverlayPreviewProps) => {
-    const [streams, setStreams] = useState<Record<string, MediaStream>>({});
-    const [errors, setErrors] = useState<Record<string, string>>({});
-    const streamsRef = useRef<Record<string, MediaStream>>({});
+    const { streams, errors } = useCameraStreams(videoDevices);
 
     // The phone's stream is owned by the phoneCamera service, not acquired here: it arrives over
     // WebRTC rather than from getUserMedia, and the same MediaStream is shared with the pairing
-    // panel and the recorder. Tracked separately from streamsRef for that reason - the cleanup
-    // paths below stop everything they hold, which must never happen to a stream this component
-    // doesn't own.
+    // panel and the recorder - so useCameraStreams skips it and it's read from the service.
     const [phoneStream, setPhoneStream] = useState<MediaStream | null>(null);
     useEffect(() => subscribePhoneCamera((st) => setPhoneStream(st.stream)), []);
-
-    useEffect(() => {
-        streamsRef.current = streams;
-    }, [streams]);
-
-    useEffect(() => {
-        let cancelled = false;
-
-        // ffmpeg's dshow device name (what the "Video device(s)" checklist and FormData use)
-        // and Chromium's own MediaDeviceInfo.label are usually identical on Windows since both
-        // read the same OS-level friendly name, but fall back to a case-insensitive/substring
-        // match in case of minor formatting differences between the two enumerations.
-        //
-        // Entries with a blank label or deviceId are filtered out FIRST, and that is load-bearing,
-        // not defensive tidying. Until the page has been granted camera permission, enumerate-
-        // Devices() still lists every videoinput but blanks both fields - and the substring
-        // fallback below reads `label.includes(d.label)`, which against an empty d.label is
-        // `"Integrated Webcam".includes("")`, i.e. true for every device. That made this function
-        // return a placeholder whose deviceId was "", which resolveDeviceId then treated as a
-        // successful match and returned early from - skipping the very permission prompt that
-        // would have populated the labels. The result was a camera that could never preview on a
-        // fresh permission state, reported only as the generic "Preview unavailable".
-        const findVideoInput = (devices: MediaDeviceInfo[], label: string) => {
-            const videoInputs = devices.filter(
-                (d) => d.kind === "videoinput" && d.deviceId !== "" && d.label !== ""
-            );
-            return (
-                videoInputs.find((d) => d.label === label) ??
-                videoInputs.find((d) => d.label.toLowerCase() === label.toLowerCase()) ??
-                videoInputs.find((d) => d.label.includes(label) || label.includes(d.label))
-            );
-        };
-
-        const resolveDeviceId = async (label: string): Promise<string | null> => {
-            let devices = await navigator.mediaDevices.enumerateDevices();
-            let match = findVideoInput(devices, label);
-            if (match) return match.deviceId;
-
-            // No usable match yet - which, thanks to the filter above, now genuinely means
-            // "labels are still hidden behind the permission prompt" rather than "matched a
-            // blank placeholder". A throwaway request unlocks them; then look again.
-            const unlock = await navigator.mediaDevices.getUserMedia({ video: true });
-            unlock.getTracks().forEach((t) => t.stop());
-            devices = await navigator.mediaDevices.enumerateDevices();
-            match = findVideoInput(devices, label);
-            return match?.deviceId ?? null;
-        };
-
-        const describeError = (err: unknown): string => {
-            if (err instanceof DOMException) {
-                switch (err.name) {
-                    case "NotAllowedError":
-                        return "Camera permission was denied";
-                    case "NotFoundError":
-                    case "OverconstrainedError":
-                        return "Camera not found by the browser";
-                    case "NotReadableError":
-                        return "Camera is in use by another app";
-                    default:
-                        return `${err.name}: ${err.message}`;
-                }
-            }
-            return err instanceof Error ? err.message : String(err);
-        };
-
-        const sync = async () => {
-            // Drop streams for cameras that are no longer selected.
-            for (const label of Object.keys(streamsRef.current)) {
-                if (!videoDevices.includes(label)) {
-                    streamsRef.current[label].getTracks().forEach((t) => t.stop());
-                    delete streamsRef.current[label];
-                }
-            }
-
-            // Acquire streams for newly selected cameras.
-            for (const label of videoDevices) {
-                // Not a real capture device - resolveDeviceId could never match it, and its
-                // stream is supplied by the phoneCamera service instead.
-                if (label === PHONE_CAMERA_DEVICE) continue;
-                if (streamsRef.current[label]) continue;
-                try {
-                    const deviceId = await resolveDeviceId(label);
-                    if (!deviceId) throw new Error("Camera not found by the browser");
-                    const stream = await navigator.mediaDevices.getUserMedia({
-                        video: { deviceId: { exact: deviceId } },
-                    });
-                    if (cancelled) {
-                        stream.getTracks().forEach((t) => t.stop());
-                        return;
-                    }
-                    streamsRef.current[label] = stream;
-                    setErrors((prev) => {
-                        const next = { ...prev };
-                        delete next[label];
-                        return next;
-                    });
-                } catch (err) {
-                    console.error(`Camera preview failed for "${label}":`, err);
-                    if (!cancelled) {
-                        setErrors((prev) => ({ ...prev, [label]: describeError(err) }));
-                    }
-                }
-            }
-
-            if (!cancelled) setStreams({ ...streamsRef.current });
-        };
-
-        sync();
-
-        return () => {
-            cancelled = true;
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [videoDevices.join("|")]);
-
-    // Stop every open camera when the preview itself unmounts (modal closed).
-    useEffect(() => {
-        return () => {
-            Object.values(streamsRef.current).forEach((stream) => stream.getTracks().forEach((t) => t.stop()));
-        };
-    }, []);
 
     const [picW, picH] = bubblePicture(overlayShape, overlaySize);
     const border = BORDER_FRACTION[overlayBorder] ?? 0;
@@ -252,17 +128,7 @@ const CameraOverlayPreview = ({
         >
             <IoVideocamOffOutline className="text-base opacity-80" />
             <span className="text-[9px] leading-tight">
-                {isPhone
-                    ? "Phone not connected"
-                    : !errors[label]
-                    ? "Loading…"
-                    : errors[label] === "Camera permission was denied"
-                    ? "Permission needed"
-                    : errors[label] === "Camera is in use by another app"
-                    ? "In use elsewhere"
-                    : errors[label] === "Camera not found by the browser"
-                    ? "Not found"
-                    : "Preview unavailable"}
+                {isPhone ? "Phone not connected" : cameraStatusText(errors[label])}
             </span>
         </div>
     );
@@ -372,17 +238,7 @@ const CameraOverlayPreview = ({
                                 >
                                     <IoVideocamOffOutline className="text-base opacity-80" />
                                     <span className="text-[9px] leading-tight">
-                                        {isPhone
-                                            ? "Phone not connected"
-                                            : !errors[label]
-                                            ? "Loading…"
-                                            : errors[label] === "Camera permission was denied"
-                                            ? "Permission needed"
-                                            : errors[label] === "Camera is in use by another app"
-                                            ? "In use elsewhere"
-                                            : errors[label] === "Camera not found by the browser"
-                                            ? "Not found"
-                                            : "Preview unavailable"}
+                                        {isPhone ? "Phone not connected" : cameraStatusText(errors[label])}
                                     </span>
                                 </div>
                             )}

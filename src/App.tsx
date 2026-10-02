@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import RecordingOverlayWindow from "./components/RecordingOverlayWindow";
 import ScreenshotOverlayWindow from "./components/ScreenshotOverlayWindow";
 import AnnotationOverlayWindow from "./components/AnnotationOverlayWindow";
+import PresentationWindow from "./components/PresentationWindow";
 import Dashboard from "./pages/Dashboard";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
@@ -48,6 +49,7 @@ function App() {
           <Route path="/recording-overlay" element={<RecordingOverlayWindow />} />
           <Route path="/screenshot-overlay" element={<ScreenshotOverlayWindow />} />
           <Route path="/annotation-overlay" element={<AnnotationOverlayWindow />} />
+          <Route path="/presentation" element={<PresentationWindow />} />
           {/* <Route path="/file-modal" element={<FileModal />} /> */}
           {/* <Route path="/settings" element={} /> */}
         </Routes>
