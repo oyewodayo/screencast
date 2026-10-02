@@ -373,13 +373,8 @@ interface VideoTimelineDockerProps {
   // is what needs to show that as a spinner - Dashboard just relays the value it already round-
   // trips through activeClipEffects's own reverse-direction sibling, onActiveClipChange, above.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
-  // Forwards NoiseReductionPopover's "Recalibrate from current playback" click to VideoPlayer's
-  // own imperative recalibrateNoiseReduction() (via videoPlayerRef, held by Dashboard - this
-  // component has no ref to VideoPlayer itself) - same "Dashboard is the only place that can
-  // reach across siblings" shape onLivePreview/onTogglePlayActiveFile already use.
-  onRecalibrateNoise?: () => void;
   // NoiseReductionPopover's "Hold to compare" - forwarded to VideoPlayer's setNoisePreviewBypass
-  // the same way onRecalibrateNoise is.
+  // (via videoPlayerRef, held by Dashboard - this component has no ref to VideoPlayer itself).
   onPreviewNoiseOriginal?: (bypass: boolean) => void;
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
@@ -447,7 +442,6 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onOutputTimeChange,
   onActiveClipChange,
   noiseReductionStatus = "idle",
-  onRecalibrateNoise,
   onPreviewNoiseOriginal,
   selectedOverlayId = null,
   onSelectOverlay,
@@ -2112,11 +2106,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             speed: activeClip.speed,
             noiseReduction: activeClip.noiseReduction,
             audioCleanup: activeClip.audioCleanup,
+            sourcePath: activeClip.sourcePath,
           }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.noiseReduction, activeClip?.audioCleanup]);
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.noiseReduction, activeClip?.audioCleanup, activeClip?.sourcePath]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -3202,7 +3197,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               onUpdate={(patch) => editStore.updateClipEffects(clip.id, patch)}
               onApplyToAll={(patch) => editStore.updateAllClipEffects(patch)}
               onClose={() => setNoiseReductionPopoverAnchor(null)}
-              onRecalibrate={onRecalibrateNoise}
+              sourcePath={clip.sourcePath}
+              clipStart={clip.start}
+              clipEnd={clip.end}
+              playhead={activeClip?.id === clip.id ? currentTime : undefined}
+              onSeek={(t) => onSeek(clip.sourcePath, t)}
               onPreviewOriginal={onPreviewNoiseOriginal}
               isPlaying={isPlaying}
               onTogglePlay={handleTransportPlayClick}

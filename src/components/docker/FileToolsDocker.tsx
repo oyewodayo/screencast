@@ -75,9 +75,6 @@ interface FileToolsDockerProps {
   // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
   // through to VideoTimelineDocker - see its own prop doc comment.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
-  // Video-only: forwards NoiseReductionPopover's "Recalibrate from current playback" click through
-  // to VideoTimelineDocker - see its own prop doc comment.
-  onRecalibrateNoise?: () => void;
   // Video-only: NoiseReductionPopover's "Hold to compare", forwarded to VideoTimelineDocker.
   onPreviewNoiseOriginal?: (bypass: boolean) => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
@@ -132,7 +129,6 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onOutputTimeChange,
   onActiveClipChange,
   noiseReductionStatus,
-  onRecalibrateNoise,
   onPreviewNoiseOriginal,
   selectedOverlayId,
   onSelectOverlay,
@@ -177,7 +173,6 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onOutputTimeChange={onOutputTimeChange}
         onActiveClipChange={onActiveClipChange}
         noiseReductionStatus={noiseReductionStatus}
-        onRecalibrateNoise={onRecalibrateNoise}
         onPreviewNoiseOriginal={onPreviewNoiseOriginal}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={onSelectOverlay}

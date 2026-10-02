@@ -218,14 +218,25 @@ export interface VideoPlayerHandle {
   // whole tree every few milliseconds, so this writes video.style.transform directly instead, the
   // same "bypass React for a hot path" idiom the Ken Burns rAF loop below already uses.
   previewCropLive: (crop: ClipCrop | null) => void;
-  // Captures a fixed noise profile from the next ~0.5s of playback, replacing the continuously
-  // tracked estimate for this clip ("Reduce" mode only) - NoiseReductionPopover's "Learn noise from
-  // here" button, for a user who scrubs to a noise-only stretch of steady noise. A no-op when
-  // there's no live graph yet.
-  recalibrateNoiseReduction: () => void;
   // A/B compare: true routes the untouched original audio to the speakers instead of the cleaned
   // signal (NoiseReductionPopover's "Hold to hear original"), false switches back.
   setNoisePreviewBypass: (bypass: boolean) => void;
+}
+
+// Decoded noise samples (mono 48kHz PCM from decode_audio_range), keyed by file+range. A handful
+// of entries at most - each is <= 10s (~1.9MB) - so the oldest is evicted past NOISE_PCM_CACHE_MAX.
+const NOISE_PCM_CACHE_MAX = 6;
+const noisePcmCache = new Map<string, Promise<Float32Array>>();
+function loadNoiseSamplePcm(sourcePath: string, start: number, end: number): Promise<Float32Array> {
+  const key = `${sourcePath}|${start.toFixed(3)}|${end.toFixed(3)}`;
+  let cached = noisePcmCache.get(key);
+  if (!cached) {
+    cached = invoke<ArrayBuffer>('decode_audio_range', { sourcePath, start, end }).then((buf) => new Float32Array(buf));
+    cached.catch(() => noisePcmCache.delete(key));
+    noisePcmCache.set(key, cached);
+    if (noisePcmCache.size > NOISE_PCM_CACHE_MAX) noisePcmCache.delete(noisePcmCache.keys().next().value!);
+  }
+  return cached;
 }
 
 const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange }, ref) => {
@@ -272,7 +283,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // down mid-session, since createMediaElementSource can only ever be called once per element.
   //
   // source -> lowCut -> hum[0..2] -> reduce (spectral worklet)      -> reduceGain -+
-  //                                -> rnnoise (added lazily)        -> wetGain    -+-> gate -> processedGain -> out
+  //                                -> rnnoise (added lazily)        -> wetGain    -+-> gate -> leveler -> processedGain -> out
   //                                -> dryDelay                      -> dryGain    -+
   // source ----------------------------------------------------------------------------------> originalGain -> out
   //
@@ -290,6 +301,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     wetGain: GainNode;
     dryGain: GainNode;
     gate: AudioWorkletNode;
+    leveler: AudioWorkletNode;
     processedGain: GainNode;
     originalGain: GainNode;
   } | null>(null);
@@ -309,9 +321,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Which clip id the spectral worklet's noise estimate belongs to, so the effect below only sends
   // {type:'reset'} when the ACTIVE CLIP actually changes, not on every strength tweak.
   const lastCalibratedClipIdRef = useRef<string | null>(null);
-  // True while a "Learn noise from here" capture is running (the worklet posts 'calibrated' when
-  // it's done) - keeps the status reported as "calibrating" across effect re-runs meanwhile.
+  // True while a picked noise sample is being decoded and handed to the spectral worklet (it posts
+  // 'calibrated' once the profile is in) - keeps the status reported as "calibrating" meanwhile.
   const noiseLearningRef = useRef(false);
+  // Which noise sample (sourcePath|start|end) the worklet currently holds a profile for, or null
+  // for "adaptive tracking" - so a profile is only re-decoded/re-sent when the pick changes.
+  const noiseProfileKeyRef = useRef<string | null>(null);
   const onNoiseReductionStatusChangeRef = useRef(onNoiseReductionStatusChange);
   onNoiseReductionStatusChangeRef.current = onNoiseReductionStatusChange;
 
@@ -394,15 +409,6 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     previewCropLive: (crop: ClipCrop | null) => {
       liveCropOverrideRef.current = crop;
       applyCropAndKenBurns();
-    },
-    recalibrateNoiseReduction: () => {
-      const graph = noiseGraphRef.current;
-      if (!graph) return;
-      noiseLearningRef.current = true;
-      graph.reduce.port.postMessage({ type: "learn" });
-      onNoiseReductionStatusChangeRef.current?.("calibrating");
-      // So the id-change-driven effect below doesn't reset this deliberate capture right away.
-      lastCalibratedClipIdRef.current = activeClipEffectsRef.current?.id ?? null;
     },
     setNoisePreviewBypass: (bypass: boolean) => {
       const graph = noiseGraphRef.current;
@@ -1404,13 +1410,40 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       ramp(graph.wetGain.gain, useRemove ? strength : 0);
       ramp(graph.dryGain.gain, useRemove ? 1 - strength : 0);
       ramp(graph.gate.parameters.get('enabled'), cleanup?.gate ? 1 : 0);
+      ramp(graph.leveler.parameters.get('enabled'), cleanup?.level ? 1 : 0);
 
       // Reset the spectral tracker when the active clip changes - one clip's room tone says
       // nothing about another's.
       if (clipId !== lastCalibratedClipIdRef.current) {
         lastCalibratedClipIdRef.current = clipId;
         noiseLearningRef.current = false;
+        noiseProfileKeyRef.current = null;
         graph.reduce.port.postMessage({ type: 'reset' });
+      }
+
+      // Picked noise sample -> fixed profile in the spectral worklet (the live twin of the export's
+      // afftdn sample_noise). "Remove" mode doesn't use it.
+      const sample = cleanup?.mode !== 'remove' ? cleanup?.noiseSample : undefined;
+      const sampleKey = sample && fx?.sourcePath ? `${fx.sourcePath}|${sample.start.toFixed(3)}|${sample.end.toFixed(3)}` : null;
+      if (sampleKey !== noiseProfileKeyRef.current) {
+        noiseProfileKeyRef.current = sampleKey;
+        if (!sampleKey || !sample || !fx?.sourcePath) {
+          noiseLearningRef.current = false;
+          graph.reduce.port.postMessage({ type: 'profile', pcm: null });
+        } else {
+          noiseLearningRef.current = true;
+          loadNoiseSamplePcm(fx.sourcePath, sample.start, sample.end)
+            .then((pcm) => {
+              if (noiseProfileKeyRef.current !== sampleKey) return; // superseded by a newer pick
+              graph.reduce.port.postMessage({ type: 'profile', pcm });
+            })
+            .catch((err) => {
+              console.error('Failed to decode noise sample:', err);
+              if (noiseProfileKeyRef.current !== sampleKey) return;
+              noiseLearningRef.current = false;
+              applySettings();
+            });
+        }
       }
 
       const waitingForRnnoise = cleanup?.mode === 'remove' && strength > 0 && !graph.rnnoise;
@@ -1477,6 +1510,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         const hum = [1, 2, 3].map((h) => new BiquadFilterNode(ctx, { type: 'allpass', frequency: 50 * h, Q: 8 }));
         const reduce = new AudioWorkletNode(ctx, 'noise-reduction-processor', { outputChannelCount: [2] });
         const gate = new AudioWorkletNode(ctx, 'noise-gate-processor', { outputChannelCount: [2] });
+        const leveler = new AudioWorkletNode(ctx, 'leveler-processor', { outputChannelCount: [2] });
         const reduceGain = new GainNode(ctx, { gain: 1 });
         const wetGain = new GainNode(ctx, { gain: 0 });
         const dryGain = new GainNode(ctx, { gain: 0 });
@@ -1498,10 +1532,10 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         tail.connect(reduce).connect(reduceGain).connect(gate);
         tail.connect(dryDelay).connect(dryGain).connect(gate);
         wetGain.connect(gate);
-        gate.connect(processedGain).connect(ctx.destination);
+        gate.connect(leveler).connect(processedGain).connect(ctx.destination);
         source.connect(originalGain).connect(ctx.destination);
 
-        noiseGraphRef.current = { ctx, source, lowCut, hum, reduce, reduceGain, rnnoise: null, wetGain, dryGain, gate, processedGain, originalGain };
+        noiseGraphRef.current = { ctx, source, lowCut, hum, reduce, reduceGain, rnnoise: null, wetGain, dryGain, gate, leveler, processedGain, originalGain };
         applySettings();
         if (activeClipEffectsRef.current?.audioCleanup?.mode === 'remove') ensureRnnoise();
         if (ctx.state === 'suspended') ctx.resume().catch(() => {});
@@ -1516,7 +1550,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         noiseGraphSetupInProgressRef.current = false;
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.id, activeClipEffects?.noiseReduction, audioCleanupKey]);
+  }, [activeClipEffects?.id, activeClipEffects?.noiseReduction, activeClipEffects?.sourcePath, audioCleanupKey]);
 
   // Live-preview crop + Ken Burns, combined into the one thing that's ever allowed to write
   // video.style.transform (two separate effects each writing it independently would race and

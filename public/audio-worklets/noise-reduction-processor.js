@@ -8,6 +8,8 @@
 //     family as the export's `afftdn` filter (conversion.rs) so preview and export sound like the
 //     same idea, without being bit-identical.
 //   noise-gate-processor      - the optional gate stage, mirroring the export's `agate`.
+//   leveler-processor         - loudness levelling, standing in for the export's
+//     `speechnorm` + `loudnorm` (a slow speech-gated AGC plus a peak limiter).
 //
 // "Remove" mode (voice isolation) is not here - VideoPlayer.tsx runs RNNoise for that via
 // @sapphi-red/web-noise-suppressor, matching the export's `arnndn`.
@@ -25,9 +27,11 @@
 // (minimum statistics, simplified to Doblinger-style continuous tracking - follows the floor down
 // instantly, creeps back up slowly so speech never gets mistaken for noise), times a bias factor
 // since a minimum underestimates the mean noise level. That adapts on its own to fans/AC/traffic
-// that change over the clip. `{type:'learn'}` additionally captures a fixed profile from the next
-// ~0.5s (for steady noise, pointed at a noise-only moment) which then takes over from the tracker;
-// `{type:'reset'}` drops both (sent when the active clip changes).
+// that change over the clip. `{type:'profile', pcm}` replaces the tracker with a fixed profile
+// averaged over a noise-only stretch the user picked on the waveform (mono Float32Array at the
+// context rate, decoded by the backend) - same FFT/window/hop as the processing itself, so the
+// profile is in exactly the units processHop compares against. `{type:'reset'}` drops both (sent
+// when the active clip changes).
 //
 // ---- Suppression rule -----------------------------------------------------------------------
 // Wiener gain with the decision-directed a-priori SNR estimate (Ephraim & Malah) instead of plain
@@ -39,7 +43,6 @@
 const FFT_SIZE = 1024;
 const HOP_SIZE = FFT_SIZE / 2;
 const BINS = FFT_SIZE / 2 + 1;
-const LEARN_HOPS = 40; // ~0.45s at 44.1/48kHz
 const POWER_SMOOTHING = 0.8; // per-hop smoothing of each bin's power before minimum tracking
 const NOISE_RISE_PER_HOP = 1.004; // ~1.5dB/s upward creep of the tracked floor
 const MIN_STATS_BIAS = 1.8; // minimum-of-smoothed-power -> mean noise power
@@ -120,9 +123,7 @@ function makeChannelState() {
     outAccum: new Float32Array(FFT_SIZE), // OLA accumulator
     smoothedPower: null, // Float32Array(BINS), lazily seeded from the first frame
     trackedNoise: null, // Float32Array(BINS)
-    learnedNoise: null, // Float32Array(BINS) once a {type:'learn'} capture completes
-    learnSum: null,
-    learnHops: 0,
+    learnedNoise: null, // Float32Array(BINS) once a {type:'profile'} arrives
     prevCleanPower: new Float32Array(BINS), // |G·X|² of the previous hop, for the DD estimate
     re: new Float32Array(FFT_SIZE),
     im: new Float32Array(FFT_SIZE),
@@ -141,29 +142,57 @@ class NoiseReductionProcessor extends AudioWorkletProcessor {
     super();
     this.hann = makeHann(FFT_SIZE);
     this.channels = null; // sized to the actual input channel count on the first process()
+    // A profile can arrive before the first process() call sizes this.channels - kept here and
+    // applied to every channel as soon as they exist.
+    this.pendingProfile = null;
     this.port.onmessage = (e) => {
       const type = e.data?.type;
-      if (!this.channels) return;
-      if (type === "reset" || type === "recalibrate") {
-        for (const ch of this.channels) {
+      if (type === "reset") {
+        this.pendingProfile = null;
+        for (const ch of this.channels ?? []) {
           ch.trackedNoise = null;
           ch.smoothedPower = null;
           ch.learnedNoise = null;
-          ch.learnSum = null;
           ch.prevCleanPower.fill(0);
         }
-      }
-      if (type === "learn" || type === "recalibrate") {
-        for (const ch of this.channels) {
-          ch.learnSum = new Float64Array(BINS);
-          ch.learnHops = 0;
-        }
-        this.port.postMessage({ type: "calibrating" });
+      } else if (type === "profile") {
+        this.pendingProfile = e.data.pcm ? this.profileFromPcm(e.data.pcm) : null;
+        this.applyPendingProfile();
+        this.port.postMessage({ type: "calibrated" });
       }
     };
   }
 
-  processHop(state, strength, isReportingChannel) {
+  // Average power spectrum of `pcm` with the same Hann/FFT_SIZE/HOP_SIZE framing processHop uses.
+  // Runs once per pick on the audio thread - a 10s sample is ~940 FFTs, a few milliseconds.
+  profileFromPcm(pcm) {
+    const re = new Float32Array(FFT_SIZE), im = new Float32Array(FFT_SIZE);
+    const sum = new Float64Array(BINS);
+    let frames = 0;
+    for (let off = 0; off + FFT_SIZE <= pcm.length; off += HOP_SIZE) {
+      for (let i = 0; i < FFT_SIZE; i++) {
+        re[i] = pcm[off + i] * this.hann[i];
+        im[i] = 0;
+      }
+      fft(re, im, -1);
+      for (let k = 0; k < BINS; k++) sum[k] += re[k] * re[k] + im[k] * im[k];
+      frames++;
+    }
+    if (frames === 0) return null;
+    const profile = new Float32Array(BINS);
+    for (let k = 0; k < BINS; k++) profile[k] = sum[k] / frames;
+    return profile;
+  }
+
+  applyPendingProfile() {
+    if (!this.channels) return;
+    for (const ch of this.channels) {
+      ch.learnedNoise = this.pendingProfile ? Float32Array.from(this.pendingProfile) : null;
+      ch.prevCleanPower.fill(0);
+    }
+  }
+
+  processHop(state, strength) {
     const N = FFT_SIZE;
     const { re, im, power, gain, smoothGain } = state;
     for (let i = 0; i < N; i++) {
@@ -184,16 +213,6 @@ class NoiseReductionProcessor extends AudioWorkletProcessor {
       for (let k = 0; k < BINS; k++) {
         sp[k] = POWER_SMOOTHING * sp[k] + (1 - POWER_SMOOTHING) * power[k];
         tn[k] = sp[k] < tn[k] ? sp[k] : tn[k] * NOISE_RISE_PER_HOP;
-      }
-    }
-
-    if (state.learnSum) {
-      for (let k = 0; k < BINS; k++) state.learnSum[k] += power[k];
-      if (++state.learnHops >= LEARN_HOPS) {
-        state.learnedNoise = new Float32Array(BINS);
-        for (let k = 0; k < BINS; k++) state.learnedNoise[k] = state.learnSum[k] / state.learnHops;
-        state.learnSum = null;
-        if (isReportingChannel) this.port.postMessage({ type: "calibrated" });
       }
     }
 
@@ -245,6 +264,7 @@ class NoiseReductionProcessor extends AudioWorkletProcessor {
 
     if (!this.channels || this.channels.length !== input.length) {
       this.channels = input.map(() => makeChannelState());
+      if (this.pendingProfile) this.applyPendingProfile();
     }
 
     for (let c = 0; c < input.length; c++) {
@@ -254,7 +274,7 @@ class NoiseReductionProcessor extends AudioWorkletProcessor {
         state.inBuf[FFT_SIZE - HOP_SIZE + state.pending] = inCh[i];
         if (++state.pending === HOP_SIZE) {
           state.pending = 0;
-          this.processHop(state, strength, c === 0);
+          this.processHop(state, strength);
           // Slide the window by one hop, ready for the next HOP_SIZE samples.
           state.inBuf.copyWithin(0, HOP_SIZE);
         }
@@ -322,5 +342,78 @@ class NoiseGateProcessor extends AudioWorkletProcessor {
   }
 }
 
+// Loudness levelling for the live preview. The export uses speechnorm + loudnorm (-16 LUFS); this
+// approximates the same result in real time without loudnorm's 3s look-ahead:
+//   1. 300ms RMS level detector, gated - frames quieter than -50dBFS don't move the gain, so
+//      pauses and leftover noise are never pumped up.
+//   2. Gain chases TARGET_DB in the dB domain, clamped to [MIN_GAIN_DB, MAX_GAIN_DB]; it comes
+//      down faster (0.4s) than it goes up (1.5s) so a loud speaker is tamed promptly but a quiet
+//      one is lifted without breathing.
+//   3. Peak limiter at -1.5dBFS (instant attack, 80ms release) plus a soft clip as a final net,
+//      matching loudnorm's TP=-1.5.
+// One shared envelope/gain across channels so the stereo image doesn't wander.
+class LevelerProcessor extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [{ name: "enabled", defaultValue: 0, minValue: 0, maxValue: 1, automationRate: "k-rate" }];
+  }
+
+  constructor() {
+    super();
+    const sr = sampleRate;
+    this.meanSquare = 0;
+    this.gainDb = 0;
+    this.limitGain = 1;
+    this.rmsCoef = Math.exp(-1 / (0.3 * sr));
+    this.downCoef = Math.exp(-1 / (0.4 * sr));
+    this.upCoef = Math.exp(-1 / (1.5 * sr));
+    this.limitRelease = Math.exp(-1 / (0.08 * sr));
+  }
+
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    const output = outputs[0];
+    if (!input || input.length === 0) return true;
+    const enabled = parameters.enabled[0] > 0.5;
+    const frames = input[0].length;
+    const TARGET_DB = -20, GATE_DB = -50, MIN_GAIN_DB = -12, MAX_GAIN_DB = 15, CEILING = 0.84; // -1.5dBFS
+
+    for (let i = 0; i < frames; i++) {
+      let sq = 0, peakIn = 0;
+      for (let c = 0; c < input.length; c++) {
+        const v = input[c][i];
+        sq += v * v;
+        const a = v < 0 ? -v : v;
+        if (a > peakIn) peakIn = a;
+      }
+      this.meanSquare = this.rmsCoef * this.meanSquare + (1 - this.rmsCoef) * (sq / input.length);
+
+      // The level is always tracked (so switching on mid-play starts from a warm estimate), but
+      // the gain only follows it while enabled; when off it glides back to unity, never jumps.
+      let targetGainDb = 0;
+      if (enabled) {
+        const levelDb = 10 * Math.log10(this.meanSquare + 1e-12);
+        targetGainDb = levelDb < GATE_DB ? this.gainDb : Math.max(MIN_GAIN_DB, Math.min(MAX_GAIN_DB, TARGET_DB - levelDb));
+      }
+      const coef = targetGainDb < this.gainDb ? this.downCoef : this.upCoef;
+      this.gainDb = coef * this.gainDb + (1 - coef) * targetGainDb;
+      const gain = Math.pow(10, this.gainDb / 20);
+
+      const peakOut = peakIn * gain * this.limitGain;
+      if (enabled && peakOut > CEILING) this.limitGain = CEILING / (peakIn * gain);
+      else this.limitGain = this.limitRelease * this.limitGain + (1 - this.limitRelease);
+
+      const g = gain * this.limitGain;
+      for (let c = 0; c < output.length; c++) {
+        const src = input[c] ?? input[0];
+        let y = src[i] * g;
+        if (enabled && (y > CEILING || y < -CEILING)) y = Math.tanh(y / CEILING) * CEILING;
+        output[c][i] = y;
+      }
+    }
+    return true;
+  }
+}
+
 registerProcessor("noise-reduction-processor", NoiseReductionProcessor);
+registerProcessor("leveler-processor", LevelerProcessor);
 registerProcessor("noise-gate-processor", NoiseGateProcessor);

@@ -2094,7 +2094,22 @@ pub struct AudioCleanup {
     // Mains frequency to notch out, 50 or 60 (anything else is ignored).
     pub hum: Option<u32>,
     pub gate: Option<bool>,
+    // Loudness levelling (speechnorm + loudnorm) - evens out quiet and loud speakers.
+    pub level: Option<bool>,
+    // A noise-only stretch of the clip's own source file (source seconds) for "reduce" mode to
+    // learn its profile from, instead of afftdn's built-in estimate - see audio_branch.
+    pub noise_sample: Option<NoiseSample>,
 }
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct NoiseSample {
+    pub start: f64,
+    pub end: f64,
+}
+
+// Longest noise sample afftdn is asked to learn from - a profile settles within a second or two,
+// so anything longer is wasted decode time.
+const MAX_NOISE_SAMPLE_SECS: f64 = 10.0;
 
 // One text or image overlay, already fully rendered client-side to a transparent PNG matching
 // what the live preview shows (font/stroke/background/corner-radius for text; rotation/corner-
@@ -2484,7 +2499,20 @@ fn noise_reduction_afftdn_params(strength: Option<f64>) -> Option<(f64, f64)> {
 // `rnnoise_model` is the already filtergraph-escaped path of the bundled arnndn model (see
 // escape_filter_path); "remove" mode falls back to afftdn if it's missing rather than failing the
 // whole export.
+//
+// `sample_secs` is set when the caller has prepended a noise sample of that length to the stream
+// (see audio_branch / cleanup_noise_sample): afftdn learns its profile from exactly that prefix via
+// asendcmd, and the prefix is trimmed off again right after the denoiser.
 fn audio_cleanup_filters(strength: Option<f64>, cleanup: Option<&AudioCleanup>, rnnoise_model: Option<&str>) -> Vec<String> {
+    audio_cleanup_filters_with_sample(strength, cleanup, rnnoise_model, None)
+}
+
+fn audio_cleanup_filters_with_sample(
+    strength: Option<f64>,
+    cleanup: Option<&AudioCleanup>,
+    rnnoise_model: Option<&str>,
+    sample_secs: Option<f64>,
+) -> Vec<String> {
     let mut filters = Vec::new();
     let cleanup = cleanup.cloned().unwrap_or_default();
     if cleanup.low_cut.unwrap_or(false) {
@@ -2508,7 +2536,23 @@ fn audio_cleanup_filters(strength: Option<f64>, cleanup: Option<&AudioCleanup>, 
         }
         _ => {
             if let Some((nr, nf)) = noise_reduction_afftdn_params(strength) {
-                filters.push(format!("afftdn=nr={:.2}:nf={:.1}", nr, nf));
+                match sample_secs {
+                    Some(secs) => {
+                        // With a real noise profile the floor needn't be pushed as far: measured
+                        // on a noisy field recording, nf=-20 cost ~6dB of speech while -28 cost
+                        // ~2.5dB for nearly the same noise removal.
+                        let s = strength.unwrap_or(0.0).max(0.0).min(1.0);
+                        let nf = -44.0 + 16.0 * s;
+                        filters.push(format!(
+                            "asendcmd=c='0.000 afftdn sample_noise start;{:.3} afftdn sample_noise stop'",
+                            (secs - 0.001).max(0.0)
+                        ));
+                        filters.push(format!("afftdn=nr={:.2}:nf={:.1}", nr, nf));
+                        filters.push(format!("atrim=start={:.6}", secs));
+                        filters.push("asetpts=PTS-STARTPTS".to_string());
+                    }
+                    None => filters.push(format!("afftdn=nr={:.2}:nf={:.1}", nr, nf)),
+                }
             }
         }
     }
@@ -2517,7 +2561,80 @@ fn audio_cleanup_filters(strength: Option<f64>, cleanup: Option<&AudioCleanup>, 
         // threshold, slow release so word tails aren't chopped.
         filters.push("agate=threshold=0.015:ratio=3:attack=5:release=250:range=0.06".to_string());
     }
+    if cleanup.level.unwrap_or(false) {
+        // speechnorm evens out speaker-to-speaker level (bounded expansion so pauses aren't pumped
+        // up into noise), then loudnorm lands the result on -16 LUFS with -1.5dBTP headroom. loudnorm
+        // runs internally at 192kHz, hence the resample back.
+        filters.push("speechnorm=e=4:r=0.0001:l=1".to_string());
+        filters.push("loudnorm=I=-16:TP=-1.5:LRA=11".to_string());
+        filters.push("aresample=48000".to_string());
+    }
     filters
+}
+
+// The noise sample range to prepend, when one applies: only for the afftdn path ("reduce" mode,
+// or "remove" falling back without a model), only with the denoiser actually on, and clamped to
+// a sane length. None means "no prefix" - callers then use the plain single-branch graph.
+fn cleanup_noise_sample(strength: Option<f64>, cleanup: Option<&AudioCleanup>, rnnoise_model: Option<&str>) -> Option<(f64, f64)> {
+    let cleanup = cleanup?;
+    if strength.unwrap_or(0.0) <= 0.0 {
+        return None;
+    }
+    if cleanup.mode.as_deref() == Some("remove") && rnnoise_model.is_some() {
+        return None;
+    }
+    let sample = cleanup.noise_sample?;
+    let start = sample.start.max(0.0);
+    let end = sample.end.min(start + MAX_NOISE_SAMPLE_SECS);
+    if !(start.is_finite() && end.is_finite()) || end - start < 0.1 {
+        return None;
+    }
+    // Rounded to the same 3 decimals atrim gets, so the trim-off after afftdn removes exactly the
+    // prefix that was prepended.
+    let r = |x: f64| (x * 1000.0).round() / 1000.0;
+    Some((r(start), r(end)))
+}
+
+// One clip's audio branch from `input_label` (e.g. "[2:a]") to `[out_label]`: trim to
+// [start,end), speed, then the cleanup chain. With a noise sample, the input is split, the sample
+// range is cut out and concatenated IN FRONT of the clip so afftdn can learn from it, and the
+// cleanup chain's own atrim (audio_cleanup_filters_with_sample) drops it again - the profile then
+// applies to the whole clip from its first sample, unlike learning mid-stream.
+fn audio_branch(
+    input_label: &str,
+    start: f64,
+    end: f64,
+    speed: f64,
+    filters: &[String],
+    noise_sample: Option<(f64, f64)>,
+    out_label: &str,
+) -> String {
+    let chain: String = filters.iter().map(|f| format!(",{}", f)).collect();
+    match noise_sample {
+        None => format!(
+            "{input}atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo}{chain}[{out}];",
+            input = input_label, tempo = atempo_chain(speed), out = out_label
+        ),
+        Some((ss, se)) => format!(
+            "{input}asplit=2[{out}_m][{out}_s];\
+             [{out}_s]atrim=start={ss:.3}:end={se:.3},asetpts=PTS-STARTPTS[{out}_n];\
+             [{out}_m]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo}[{out}_t];\
+             [{out}_n][{out}_t]concat=n=2:v=0:a=1{chain}[{out}];",
+            input = input_label, tempo = atempo_chain(speed), out = out_label
+        ),
+    }
+}
+
+// (filters, noise sample) for one segment - the pair audio_trim_chain needs.
+fn segment_cleanup(seg: &KeepSegment, rnnoise_model: Option<&str>) -> (Vec<String>, Option<(f64, f64)>) {
+    let sample = cleanup_noise_sample(seg.noise_reduction, seg.audio_cleanup.as_ref(), rnnoise_model);
+    let filters = audio_cleanup_filters_with_sample(
+        seg.noise_reduction,
+        seg.audio_cleanup.as_ref(),
+        rnnoise_model,
+        sample.map(|(s, e)| e - s),
+    );
+    (filters, sample)
 }
 
 fn segment_audio_cleanup_filters(seg: &KeepSegment, rnnoise_model: Option<&str>) -> Vec<String> {
@@ -2851,7 +2968,7 @@ fn audio_trim_chain(
     start: f64,
     end: f64,
     speed: f64,
-    cleanup_filters: &[String],
+    cleanup: &(Vec<String>, Option<(f64, f64)>),
     out_label: &str,
 ) -> String {
     if has_audio {
@@ -2860,11 +2977,7 @@ fn audio_trim_chain(
         // "atempo=1.0000", functionally a no-op, so this needs no separate branch for that case.
         // afftdn runs AFTER atempo - it's a per-frame spectral filter, order relative to tempo
         // doesn't change its own output, so there's no reason to special-case which comes first.
-        let denoise: String = cleanup_filters.iter().map(|f| format!(",{}", f)).collect();
-        format!(
-            "[{idx}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo}{denoise}[{out}];",
-            idx = input_index, tempo = atempo_chain(speed), out = out_label
-        )
+        audio_branch(&format!("[{}:a]", input_index), start, end, speed, &cleanup.0, cleanup.1, out_label)
     } else {
         // Divided by speed to match the video stream's own now-speed-adjusted duration (see the
         // trim/setpts call sites above) - concat/xfade both require the audio and video branches of
@@ -3210,7 +3323,7 @@ pub async fn export_trimmed_video(
                 seg.start,
                 seg.end,
                 speed,
-                &segment_audio_cleanup_filters(seg, rnnoise_model.as_deref()),
+                &segment_cleanup(seg, rnnoise_model.as_deref()),
                 "outa",
             ));
         } else if !has_transitions {
@@ -3233,7 +3346,7 @@ pub async fn export_trimmed_video(
                     seg.start,
                     seg.end,
                     speed,
-                    &segment_audio_cleanup_filters(seg, rnnoise_model.as_deref()),
+                    &segment_cleanup(seg, rnnoise_model.as_deref()),
                     &format!("a{}", i),
                 ));
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
@@ -3279,7 +3392,7 @@ pub async fn export_trimmed_video(
                     seg.start,
                     seg.end,
                     speed,
-                    &segment_audio_cleanup_filters(seg, rnnoise_model.as_deref()),
+                    &segment_cleanup(seg, rnnoise_model.as_deref()),
                     &format!("a{}", i),
                 ));
             }
@@ -3673,23 +3786,27 @@ pub async fn extract_clip_audio(
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create output folder: {}", e))?;
     }
 
-    let mut af_parts = vec![format!(
-        "atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS",
-        start, end
-    )];
-    // afftdn AFTER atempo - see audio_trim_chain's own comment; order doesn't change either
-    // filter's own output, so there's no reason to special-case it here differently.
-    if (speed - 1.0).abs() > 0.001 {
-        af_parts.push(atempo_chain(speed));
-    }
     let rnnoise_model = crate::services::utility::get_rnnoise_model_path(&app_handle)
         .ok()
         .filter(|p| p.exists())
         .map(|p| escape_filter_path(&p));
-    af_parts.extend(audio_cleanup_filters(noise_reduction, audio_cleanup.as_ref(), rnnoise_model.as_deref()));
+    let sample = cleanup_noise_sample(noise_reduction, audio_cleanup.as_ref(), rnnoise_model.as_deref());
+    let mut filters = audio_cleanup_filters_with_sample(
+        noise_reduction,
+        audio_cleanup.as_ref(),
+        rnnoise_model.as_deref(),
+        sample.map(|(s, e)| e - s),
+    );
     if (volume - 1.0).abs() > 0.001 {
-        af_parts.push(format!("volume={:.3}", volume.max(0.0)));
+        filters.push(format!("volume={:.3}", volume.max(0.0)));
     }
+    // Same branch builder as the export (audio_branch) - a filter graph rather than a plain -af so
+    // a noise sample can be split off the same input and prepended.
+    let input_label = match stream_index {
+        Some(n) => format!("[0:a:{}]", n),
+        None => "[0:a]".to_string(),
+    };
+    let graph = audio_branch(&input_label, start, end, speed, &filters, sample, "xa");
 
     let codec_args: Vec<&str> = match output_format.to_lowercase().as_str() {
         "mp3" => vec!["-c:a", "libmp3lame", "-b:a", "192k"],
@@ -3698,11 +3815,13 @@ pub async fn extract_clip_audio(
         _ => return Err(format!("Unsupported audio format: {}", output_format)),
     };
 
-    let mut owned_args: Vec<String> = Vec::new();
-    if let Some(n) = stream_index {
-        owned_args.extend(["-map".to_string(), format!("0:a:{}", n)]);
-    }
-    owned_args.extend(["-vn".to_string(), "-af".to_string(), af_parts.join(",")]);
+    let mut owned_args: Vec<String> = vec![
+        "-filter_complex".to_string(),
+        graph.trim_end_matches(';').to_string(),
+        "-map".to_string(),
+        "[xa]".to_string(),
+        "-vn".to_string(),
+    ];
     owned_args.extend(codec_args.iter().map(|s| s.to_string()));
     let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
 
@@ -4121,6 +4240,153 @@ fn parse_silence_ranges(stderr: &str) -> Vec<SilentRange> {
 // ffmpeg/ffprobe process spawned, no Tauri AppHandle/Window needed. These are the functions a
 // future Tauri version bump (or any other refactor) should be able to leave completely unchanged;
 // if one of these tests breaks, the export's actual OUTPUT changed, not just its plumbing.
+// Runs ffmpeg to completion and returns its raw stdout - for the small f32le PCM/envelope streams
+// the audio-cleanup UI reads back (never for anything video-sized).
+async fn run_ffmpeg_capture(ffmpeg_path: PathBuf, args: Vec<String>) -> Result<Vec<u8>, String> {
+    blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.args(&args);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let out = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("unknown error").to_string();
+            return Err(format!("ffmpeg failed: {}", reason));
+        }
+        Ok(out.stdout)
+    })
+    .await?
+}
+
+fn f32le_to_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+// Peak of each channel per bucket, for interleaved stereo frames. Kept pure for testing.
+fn bucket_peaks(frames: &[f32], buckets: usize) -> Vec<f32> {
+    let n = frames.len() / 2;
+    let mut out = vec![0f32; buckets * 2];
+    if n == 0 || buckets == 0 {
+        return out;
+    }
+    for b in 0..buckets {
+        let from = b * n / buckets;
+        let to = ((b + 1) * n / buckets).max(from + 1).min(n);
+        let (mut l, mut r) = (0f32, 0f32);
+        for i in from..to {
+            l = l.max(frames[i * 2].abs());
+            r = r.max(frames[i * 2 + 1].abs());
+        }
+        out[b * 2] = l;
+        out[b * 2 + 1] = r;
+    }
+    out
+}
+
+// Before/after envelope for the audio-cleanup popover's waveform: the clip's original audio and
+// the same audio through the EXACT export chain (audio_branch + audio_cleanup_filters), so what the
+// view shows as removed is what export removes. Returns raw little-endian f32 pairs
+// [original, cleaned] per bucket - each the peak of a rectified, low-passed envelope (|x| averaged
+// down by aresample), which reads like a loudness contour rather than spiky sample peaks.
+// Seeks the input to whichever comes first, the clip or its noise sample, so a clip deep into a
+// long recording doesn't decode everything before it.
+#[tauri::command]
+pub async fn audio_cleanup_waveform(
+    app_handle: AppHandle,
+    source_path: String,
+    start: f64,
+    end: f64,
+    noise_reduction: Option<f64>,
+    audio_cleanup: Option<AudioCleanup>,
+    buckets: u32,
+) -> Result<tauri::ipc::Response, String> {
+    if !(end > start) {
+        return Err("End must be after start".to_string());
+    }
+    let buckets = buckets.clamp(16, 4000) as usize;
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let rnnoise_model = crate::services::utility::get_rnnoise_model_path(&app_handle)
+        .ok()
+        .filter(|p| p.exists())
+        .map(|p| escape_filter_path(&p));
+    let sample = cleanup_noise_sample(noise_reduction, audio_cleanup.as_ref(), rnnoise_model.as_deref());
+    let filters = audio_cleanup_filters_with_sample(
+        noise_reduction,
+        audio_cleanup.as_ref(),
+        rnnoise_model.as_deref(),
+        sample.map(|(s, e)| e - s),
+    );
+
+    let offset = sample.map_or(start, |(s, _)| s.min(start)).max(0.0);
+    let span_end = sample.map_or(end, |(_, e)| e.max(end));
+    let shifted_sample = sample.map(|(s, e)| (s - offset, e - offset));
+    let (s, e) = (start - offset, end - offset);
+    let duration = end - start;
+    // ~16 envelope samples per bucket is plenty; bounded so a long clip stays a small transfer.
+    let rate = ((buckets as f64 * 16.0 / duration).ceil() as u32).clamp(100, 4000);
+
+    let clean = audio_branch("[wp]", s, e, 1.0, &filters, shifted_sample, "wc");
+    // amerge cannot negotiate on its own once one side went through loudnorm/arnndn - pin both.
+    let fmt = "aformat=sample_fmts=flt:sample_rates=48000:channel_layouts=mono";
+    let graph = format!(
+        "[0:a]aresample=48000,aformat=channel_layouts=mono,asplit=2[wo][wp];\
+         [wo]atrim=start={s:.3}:end={e:.3},asetpts=PTS-STARTPTS,{fmt}[wo2];\
+         {clean}\
+         [wc]aresample=48000,{fmt}[wc2];\
+         [wo2][wc2]amerge=inputs=2,aresample=16000,aeval='abs(val(0))|abs(val(1))':c=same,aresample={rate}[wout]"
+    );
+
+    let args: Vec<String> = vec![
+        "-v".into(), "error".into(),
+        "-ss".into(), format!("{:.3}", offset),
+        "-t".into(), format!("{:.3}", span_end - offset + 0.05),
+        "-i".into(), source_path,
+        "-filter_complex".into(), graph,
+        "-map".into(), "[wout]".into(),
+        "-f".into(), "f32le".into(),
+        "-ac".into(), "2".into(),
+        "pipe:1".into(),
+    ];
+    let bytes = run_ffmpeg_capture(ffmpeg_path, args).await?;
+    let peaks = bucket_peaks(&f32le_to_vec(&bytes), buckets);
+    let mut out = Vec::with_capacity(peaks.len() * 4);
+    for v in peaks {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(tauri::ipc::Response::new(out))
+}
+
+// Mono 48kHz f32le PCM of [start,end) of a file's audio - the live preview's noise-reduction
+// worklet learns its profile from this when a clip has a noise sample (VideoPlayer.tsx), the
+// browser-side twin of the export's afftdn sample_noise. Capped at MAX_NOISE_SAMPLE_SECS.
+#[tauri::command]
+pub async fn decode_audio_range(
+    app_handle: AppHandle,
+    source_path: String,
+    start: f64,
+    end: f64,
+) -> Result<tauri::ipc::Response, String> {
+    let start = start.max(0.0);
+    let duration = (end - start).min(MAX_NOISE_SAMPLE_SECS);
+    if !(duration > 0.0) {
+        return Err("End must be after start".to_string());
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let args: Vec<String> = vec![
+        "-v".into(), "error".into(),
+        "-ss".into(), format!("{:.3}", start),
+        "-t".into(), format!("{:.3}", duration),
+        "-i".into(), source_path,
+        "-vn".into(), "-ac".into(), "1".into(), "-ar".into(), "48000".into(),
+        "-f".into(), "f32le".into(), "pipe:1".into(),
+    ];
+    Ok(tauri::ipc::Response::new(run_ffmpeg_capture(ffmpeg_path, args).await?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4452,7 +4718,7 @@ mod tests {
     #[test]
     fn audio_trim_chain_no_audio_synthesizes_silence_of_the_right_output_duration() {
         // 10 source seconds at 2x speed -> 5 output seconds.
-        let chain = audio_trim_chain(false, 0, 0.0, 10.0, 2.0, &[], "outa");
+        let chain = audio_trim_chain(false, 0, 0.0, 10.0, 2.0, &(vec![], None), "outa");
         assert_eq!(
             chain,
             "anullsrc=channel_layout=stereo:sample_rate=44100:duration=5.000[outa];"
@@ -4461,7 +4727,7 @@ mod tests {
 
     #[test]
     fn audio_trim_chain_with_audio_includes_tempo_but_no_denoise_when_off() {
-        let chain = audio_trim_chain(true, 0, 1.0, 5.0, 1.0, &[], "outa");
+        let chain = audio_trim_chain(true, 0, 1.0, 5.0, 1.0, &(vec![], None), "outa");
         assert_eq!(
             chain,
             "[0:a]atrim=start=1.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000[outa];"
@@ -4470,7 +4736,7 @@ mod tests {
 
     #[test]
     fn audio_trim_chain_appends_afftdn_after_atempo_when_noise_reduction_is_set() {
-        let chain = audio_trim_chain(true, 2, 0.0, 5.0, 1.0, &["afftdn=nr=22.00:nf=-35.0".to_string()], "a2");
+        let chain = audio_trim_chain(true, 2, 0.0, 5.0, 1.0, &(vec!["afftdn=nr=22.00:nf=-35.0".to_string()], None), "a2");
         assert_eq!(
             chain,
             "[2:a]atrim=start=0.000:end=5.000,asetpts=PTS-STARTPTS,atempo=1.0000,afftdn=nr=22.00:nf=-35.0[a2];"
@@ -4487,7 +4753,7 @@ mod tests {
 
     #[test]
     fn audio_cleanup_filters_orders_lowcut_hum_denoise_gate() {
-        let cleanup = AudioCleanup { mode: None, low_cut: Some(true), hum: Some(50), gate: Some(true) };
+        let cleanup = AudioCleanup { low_cut: Some(true), hum: Some(50), gate: Some(true), ..Default::default() };
         let f = audio_cleanup_filters(Some(0.5), Some(&cleanup), None);
         assert_eq!(f[0], "highpass=f=80");
         assert_eq!(&f[1..4], ["bandreject=f=50:t=q:w=8", "bandreject=f=100:t=q:w=8", "bandreject=f=150:t=q:w=8"]);
@@ -4500,6 +4766,47 @@ mod tests {
         let cleanup = AudioCleanup { mode: Some("remove".into()), ..Default::default() };
         assert_eq!(audio_cleanup_filters(Some(1.0), Some(&cleanup), Some("C\\:/m.rnnn")), ["arnndn=m='C\\:/m.rnnn':mix=1.00"]);
         assert_eq!(audio_cleanup_filters(Some(1.0), Some(&cleanup), None), ["afftdn=nr=40.00:nf=-20.0"]);
+    }
+
+    #[test]
+    fn audio_cleanup_filters_appends_levelling_last() {
+        let cleanup = AudioCleanup { gate: Some(true), level: Some(true), ..Default::default() };
+        let f = audio_cleanup_filters(None, Some(&cleanup), None);
+        assert!(f[0].starts_with("agate="));
+        assert_eq!(&f[1..], ["speechnorm=e=4:r=0.0001:l=1", "loudnorm=I=-16:TP=-1.5:LRA=11", "aresample=48000"]);
+    }
+
+    #[test]
+    fn noise_sample_learns_from_the_prefix_then_trims_it_off() {
+        let cleanup = AudioCleanup { noise_sample: Some(NoiseSample { start: 5.3, end: 6.3 }), ..Default::default() };
+        let sample = cleanup_noise_sample(Some(1.0), Some(&cleanup), None);
+        assert_eq!(sample, Some((5.3, 6.3)));
+        let f = audio_cleanup_filters_with_sample(Some(1.0), Some(&cleanup), None, sample.map(|(s, e)| e - s));
+        assert_eq!(f[0], "asendcmd=c='0.000 afftdn sample_noise start;0.999 afftdn sample_noise stop'");
+        assert_eq!(f[1], "afftdn=nr=40.00:nf=-28.0");
+        assert_eq!(f[2], "atrim=start=1.000000");
+        assert_eq!(f[3], "asetpts=PTS-STARTPTS");
+        let branch = audio_branch("[0:a]", 0.0, 40.0, 1.0, &f, sample, "a0");
+        assert!(branch.starts_with("[0:a]asplit=2[a0_m][a0_s];[a0_s]atrim=start=5.300:end=6.300"));
+        assert!(branch.contains("[a0_n][a0_t]concat=n=2:v=0:a=1,asendcmd="));
+        assert!(branch.ends_with("[a0];"));
+    }
+
+    #[test]
+    fn noise_sample_is_ignored_when_off_too_short_or_in_remove_mode() {
+        let mut cleanup = AudioCleanup { noise_sample: Some(NoiseSample { start: 1.0, end: 1.05 }), ..Default::default() };
+        assert_eq!(cleanup_noise_sample(Some(1.0), Some(&cleanup), None), None);
+        cleanup.noise_sample = Some(NoiseSample { start: 1.0, end: 30.0 });
+        assert_eq!(cleanup_noise_sample(Some(1.0), Some(&cleanup), None), Some((1.0, 11.0)));
+        assert_eq!(cleanup_noise_sample(Some(0.0), Some(&cleanup), None), None);
+        cleanup.mode = Some("remove".into());
+        assert_eq!(cleanup_noise_sample(Some(1.0), Some(&cleanup), Some("m")), None);
+    }
+
+    #[test]
+    fn bucket_peaks_takes_per_channel_maxima() {
+        let frames = [0.1, -0.5, -0.3, 0.2, 0.05, 0.0, 0.0, 0.9];
+        assert_eq!(bucket_peaks(&frames, 2), vec![0.3, 0.5, 0.05, 0.9]);
     }
 
     #[test]

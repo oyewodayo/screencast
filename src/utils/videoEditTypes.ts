@@ -142,10 +142,17 @@ export interface AudioCleanup {
   hum?: 50 | 60;
   // Downward expander that silences what's left between phrases.
   gate?: boolean;
+  // Loudness levelling - evens out quiet and loud speakers (speechnorm + loudnorm on export, a
+  // slow AGC + limiter worklet in the live preview). Runs last.
+  level?: boolean;
+  // A noise-only stretch of this clip's own source file, in source seconds, that "reduce" mode
+  // learns its noise profile from (afftdn sample_noise on export, the spectral worklet's learned
+  // profile live). Picked on the popover's waveform; ignored by "remove" mode.
+  noiseSample?: { start: number; end: number };
 }
 
 export const hasAudioCleanup = (clip: { noiseReduction?: number; audioCleanup?: AudioCleanup }): boolean =>
-  (clip.noiseReduction ?? 0) > 0 || !!clip.audioCleanup?.lowCut || !!clip.audioCleanup?.hum || !!clip.audioCleanup?.gate;
+  (clip.noiseReduction ?? 0) > 0 || !!clip.audioCleanup?.lowCut || !!clip.audioCleanup?.hum || !!clip.audioCleanup?.gate || !!clip.audioCleanup?.level;
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
 // when a backgroundColor is set (an invisible box has no edges to round). Video-only: TextObject

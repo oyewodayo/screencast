@@ -8,19 +8,23 @@
 //   Mode      "Reduce" - spectral suppression (afftdn), keeps a natural bit of room tone.
 //             "Remove" - RNNoise voice isolation (arnndn), strips everything that isn't voice.
 //   Strength  Clip.noiseReduction, 0..1 - the denoiser's depth (Reduce) or wet/dry mix (Remove).
-//   Extras    low-cut (rumble/wind), mains hum notches (50/60Hz), gate (silence between phrases).
+//   Extras    low-cut (rumble/wind), mains hum notches (50/60Hz), gate (silence between phrases),
+//             loudness levelling (speechnorm + loudnorm).
+//   Waveform  before/after envelope from the real export chain (CleanupWaveform), where a noise
+//             sample for "Reduce" mode is picked by dragging - no need to catch it during playback.
 //
 // `status` (threaded down from VideoPlayer via Dashboard/VideoTimelineDocker) reflects the live
-// graph honestly: "calibrating" while it's loading, RNNoise is downloading its model, or a "Learn
-// noise from here" capture is running.
+// graph honestly: "calibrating" while it's loading, RNNoise is loading, or a picked noise sample is
+// being decoded into a profile.
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoClose, IoSyncOutline, IoEarOutline, IoLocateOutline, IoCopyOutline, IoSparkles, IoPlay, IoPause } from "react-icons/io5";
+import { IoClose, IoSyncOutline, IoEarOutline, IoCopyOutline, IoSparkles, IoPlay, IoPause } from "react-icons/io5";
 import { MdOutlineNoiseControlOff } from "react-icons/md";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { AudioCleanup } from "../../utils/videoEditTypes";
 import Slider from "./Slider";
 import NumberStepper from "./NumberStepper";
+import CleanupWaveform from "./CleanupWaveform";
 
 const STRENGTH_STEP = 0.01;
 // "Off" clears the field entirely (undefined, not 0) so a clip that's never touched this feature
@@ -48,9 +52,13 @@ interface NoiseReductionPopoverProps {
   onUpdate: (patch: AudioCleanupPatch) => void;
   onApplyToAll: (patch: AudioCleanupPatch) => void;
   onClose: () => void;
-  // Captures a fixed noise profile from what's playing right now ("Reduce" mode) - see
-  // VideoPlayerHandle.recalibrateNoiseReduction.
-  onRecalibrate?: () => void;
+  // The clip itself, for the waveform: which file, which source range, where the playhead is
+  // (source seconds, only when this clip is the one playing) and how to seek within it.
+  sourcePath: string;
+  clipStart: number;
+  clipEnd: number;
+  playhead?: number;
+  onSeek: (sourceTime: number) => void;
   // A/B compare - true while "Hold to hear original" is held down.
   onPreviewOriginal?: (bypass: boolean) => void;
   // Timeline transport, so the clip can be auditioned without leaving the popover.
@@ -65,6 +73,8 @@ const normalizeCleanup = (c: AudioCleanup): AudioCleanup | undefined => {
   if (c.lowCut) out.lowCut = true;
   if (c.hum) out.hum = c.hum;
   if (c.gate) out.gate = true;
+  if (c.level) out.level = true;
+  if (c.noiseSample) out.noiseSample = c.noiseSample;
   return Object.keys(out).length > 0 ? out : undefined;
 };
 
@@ -95,7 +105,11 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
   onUpdate,
   onApplyToAll,
   onClose,
-  onRecalibrate,
+  sourcePath,
+  clipStart,
+  clipEnd,
+  playhead,
+  onSeek,
   onPreviewOriginal,
   isPlaying,
   onTogglePlay,
@@ -104,7 +118,8 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
   const [comparing, setComparing] = useState(false);
   const [appliedToAll, setAppliedToAll] = useState(false);
   const mode = cleanup?.mode ?? "reduce";
-  const anythingOn = strength > 0 || !!cleanup?.lowCut || !!cleanup?.hum || !!cleanup?.gate;
+  const anythingOn = strength > 0 || !!cleanup?.lowCut || !!cleanup?.hum || !!cleanup?.gate || !!cleanup?.level;
+  const samplingEnabled = mode === "reduce" && strength > 0;
 
   useEffect(() => {
     const close = (e: PointerEvent) => {
@@ -147,14 +162,14 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
   };
 
   const statusLabel =
-    !anythingOn ? null : status === "calibrating" ? (mode === "remove" ? "Loading AI…" : "Learning…") : status === "active" ? "Live" : null;
+    !anythingOn ? null : status === "calibrating" ? (mode === "remove" ? "Loading AI…" : "Learning noise…") : status === "active" ? "Live" : null;
 
   return createPortal(
     <div
       ref={popoverRef}
       data-noise-reduction-popover
       style={{ position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
-      className="w-72 rounded-xl bg-neutral-900/95 backdrop-blur-md shadow-2xl ring-1 ring-white/10 text-white/90 flex flex-col"
+      className="w-80 max-h-[calc(100vh-16px)] overflow-y-auto overscroll-contain rounded-xl bg-neutral-900/95 backdrop-blur-md shadow-2xl ring-1 ring-white/10 text-white/90 flex flex-col"
     >
       {/* Header */}
       <div className="flex items-center justify-between gap-2 px-3 pt-3 pb-2">
@@ -263,7 +278,30 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
             label="Silence gaps"
             hint="Mutes leftover noise between phrases"
           />
+          <Toggle
+            checked={!!cleanup?.level}
+            onChange={(level) => setCleanup({ level })}
+            label="Even out loudness"
+            hint="Levels quiet and loud speakers to -16 LUFS"
+          />
         </div>
+
+        {/* Before / after */}
+        {anythingOn && (
+          <div className="pt-2 border-t border-white/10">
+            <CleanupWaveform
+              sourcePath={sourcePath}
+              clipStart={clipStart}
+              clipEnd={clipEnd}
+              strength={strength}
+              cleanup={cleanup}
+              samplingEnabled={samplingEnabled}
+              onSampleChange={(noiseSample) => setCleanup({ noiseSample })}
+              playhead={playhead}
+              onSeek={onSeek}
+            />
+          </div>
+        )}
 
         {/* Actions */}
         <div className="flex gap-1.5">
@@ -295,17 +333,6 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
               {comparing ? "Original" : "Hold to compare"}
             </button>
           )}
-          {anythingOn && mode === "reduce" && strength > 0 && (
-            <button
-              type="button"
-              onClick={onRecalibrate}
-              title="Play a moment with only background noise (no speech), then click to learn exactly that noise"
-              className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md text-[11px] bg-white/5 text-white/70 hover:bg-white/10 hover:text-white transition-colors"
-            >
-              <IoLocateOutline size={13} />
-              Learn noise here
-            </button>
-          )}
           {!anythingOn && <span className="flex-1 flex items-center text-[10px] text-white/40">Play the clip to hear changes live</span>}
         </div>
 
@@ -313,7 +340,8 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
           <button
             type="button"
             onClick={() => {
-              onApplyToAll({ noiseReduction: strength > 0 ? strength : undefined, audioCleanup: cleanup });
+              // The noise sample is a range of THIS clip's source - meaningless for other clips.
+              onApplyToAll({ noiseReduction: strength > 0 ? strength : undefined, audioCleanup: cleanup && normalizeCleanup({ ...cleanup, noiseSample: undefined }) });
               setAppliedToAll(true);
             }}
             className="flex items-center justify-center gap-1.5 py-1.5 rounded-md text-[11px] text-blue-300 hover:text-blue-200 hover:bg-blue-500/10 transition-colors"
@@ -328,10 +356,10 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
             ? "Pick a mode to start - you hear changes live while the clip plays."
             : mode === "remove" && strength > 0
             ? "Keeps only voices. Great for talks and interviews; turn it down or use Reduce if music or ambience matters."
-            : status === "calibrating"
-            ? "Learning this clip's noise from what's playing - keep it playing for a moment."
+            : strength > 0 && cleanup?.noiseSample
+            ? "Using the picked noise sample as the noise profile - preview and export both learn from exactly that range."
             : strength > 0
-            ? "Adapts to the noise automatically. For steady noise, play a noise-only moment and hit “Learn noise here”."
+            ? "Adapts to the noise automatically. For steady noise, drag over a noise-only part of the waveform."
             : "Extra cleanup works on its own, or together with a denoise mode above."}
         </p>
       </div>

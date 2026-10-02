@@ -149,4 +149,6 @@ export interface ActiveClipEffects {
   speed?: number;
   noiseReduction?: number;
   audioCleanup?: AudioCleanup;
+  // Which file this clip plays from - VideoPlayer decodes its noise sample from here.
+  sourcePath?: string;
 }
