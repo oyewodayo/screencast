@@ -51,6 +51,10 @@ export interface AppSettings {
   // system audio under the voice, loudness to -16 LUFS (see src-tauri/src/services/
   // audio_enhance.rs). On by default; off keeps the audio exactly as captured (still in sync).
   autoEnhanceAudio: boolean;
+  // Webcam bubble border ("none" | "thin" | "medium" | "thick") and its "#rrggbb" colour, chosen
+  // in the Screen Options modal and remembered between recordings.
+  cameraBorder: string;
+  cameraBorderColor: string;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -87,6 +91,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultResolutionWidth: null,
   defaultFramerate: null,
   autoEnhanceAudio: true,
+  cameraBorder: "none",
+  cameraBorderColor: "#ffffff",
 };
 
 // One-time correction for installs whose settings were saved back when "avi" was still the coded

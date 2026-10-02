@@ -434,16 +434,17 @@ pub(crate) fn assemble_args(parts: &Parts, output: &Path) -> Result<Vec<String>,
     if mixed.is_some() {
         args.extend(["-map".to_string(), "[aout]".to_string()]);
     }
-    args.extend([
-        "-c:v".to_string(),
-        "copy".to_string(),
-        "-bsf:v".to_string(),
-        format!(
-            "setts=pts='{}':dts='{}'",
-            parts.segments.setts_expr("PTS"),
-            parts.segments.setts_expr("DTS")
-        ),
-    ]);
+    let mut bsf = format!(
+        "setts=pts='{}':dts='{}'",
+        parts.segments.setts_expr("PTS"),
+        parts.segments.setts_expr("DTS")
+    );
+    // Matroska carries H.264 length-prefixed; AVI only takes it with start codes, and refuses the
+    // stream copy without this conversion ("h264 bitstream malformed, no startcode found").
+    if ext == "avi" {
+        bsf.push_str(",h264_mp4toannexb");
+    }
+    args.extend(["-c:v".to_string(), "copy".to_string(), "-bsf:v".to_string(), bsf]);
     if mixed.is_some() {
         // No -t: it's measured before setts moves the timestamps, so after a pause it cut the end
         // of the picture off. The audio needs no limit - its segments are trimmed to length.
@@ -615,6 +616,14 @@ mod tests {
         let off = assemble_args(&parts(false), Path::new("out.mp4")).unwrap().join(" ");
         assert!(!off.contains("sidechaincompress") && !off.contains("alimiter"), "{}", off);
         assert!(off.contains("amix=inputs=2"), "{}", off);
+    }
+
+    #[test]
+    fn avi_gets_annex_b_h264() {
+        let avi = assemble_args(&parts(true), Path::new("out.avi")).unwrap().join(" ");
+        assert!(avi.contains("h264_mp4toannexb"), "{}", avi);
+        let mp4 = assemble_args(&parts(true), Path::new("out.mp4")).unwrap().join(" ");
+        assert!(!mp4.contains("h264_mp4toannexb"), "{}", mp4);
     }
 
     #[test]

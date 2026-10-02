@@ -129,6 +129,12 @@ pub struct FormData {
     overlay_shape: String,
     overlay_position: String,
     overlay_size: String,
+    // Camera bubble border: "none" | "thin" | "medium" | "thick", and its "#rrggbb" colour - see
+    // OverlayStyle. Defaults keep an older caller's recording exactly as before (no border).
+    #[serde(default = "default_border")]
+    overlay_border: String,
+    #[serde(default = "default_border_color")]
+    overlay_border_color: String,
     // The title of the window screen_size names (as "window:<hwnd>") — the hwnd alone isn't
     // enough to actually *capture* that window on Windows (gdigrab targets windows by title, not
     // handle), so the frontend sends this alongside it. #[serde(default)] so a caller that
@@ -177,6 +183,14 @@ pub struct FormData {
     // Set by start_recording: the app is capturing the mic itself, so ffmpeg mustn't.
     #[serde(skip)]
     mic_external: bool,
+}
+
+fn default_border() -> String {
+    "none".to_string()
+}
+
+fn default_border_color() -> String {
+    "#ffffff".to_string()
 }
 
 fn enhance_by_default() -> bool {
@@ -939,164 +953,227 @@ pub(crate) fn resolved_max_width(form_data: &FormData) -> i32 {
 // 60 keeps that to at most 2s (30fps) or 1s (60fps) without meaningfully hurting compression.
 const KEYFRAME_INTERVAL: &str = "60";
 
+// The resolution a camera is captured at (dshow/avfoundation/v4l2 `-video_size`). Every named
+// bubble size captures at 640x480 - a mode practically every webcam supports - and the bubble is
+// scaled from that: the old "small" captured at 320x240, which looked soft even small, and asking
+// a camera for a size it doesn't offer fails the whole recording. A literal "WxH" passes through.
 pub fn map_overlay_size(size: &str) -> String {
     match size {
-        "small" => "320x240".to_string(),
-        "medium" => "640x480".to_string(),
+        "xs" | "small" | "medium" | "large" | "xl" => "640x480".to_string(),
         _ => size.to_string(),
     }
 }
 
-// The real on-screen footprint of one camera bubble, needed to space multiple bubbles apart
-// without overlapping. circle/rounded collapse to a square the way get_overlay_shape's own
-// scale=w='min(iw,ih)':h='min(iw,ih)' already does per-camera - this just mirrors that math so
-// the position math agrees with what the filter graph actually produces.
-fn overlay_pixel_dimensions(shape: &str, size: &str) -> (i32, i32) {
-    let mapped = map_overlay_size(size);
-    let (w, h) = mapped
-        .split_once('x')
-        .and_then(|(w, h)| Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?)))
-        .unwrap_or((320, 240));
+// How a camera bubble looks, as chosen in the Screen Options modal. Sizes, margins and border
+// thickness are all fractions of the recorded frame's width, so a bubble looks the same at 1080p
+// and at 4K - and so the modal's preview (CameraOverlayPreview.tsx, which mirrors every number
+// here) can draw it exactly.
+pub(crate) struct OverlayStyle<'a> {
+    pub shape: &'a str,
+    pub position: &'a str,
+    pub size: &'a str,
+    // "none" | "thin" | "medium" | "thick".
+    pub border: &'a str,
+    // "#rrggbb".
+    pub border_color: &'a str,
+}
 
-    match shape {
-        "circle" | "rounded" => {
-            let s = w.min(h);
-            (s, s)
-        }
-        _ => (w, h),
+fn even(v: f64) -> i32 {
+    ((v.round() as i32) / 2 * 2).max(2)
+}
+
+// Bubble width as a share of the frame's.
+fn bubble_fraction(size: &str) -> f64 {
+    match size {
+        "xs" => 0.10,
+        "medium" => 0.18,
+        "large" => 0.24,
+        "xl" => 0.30,
+        _ => 0.14, // "small" and anything unrecognised
     }
 }
 
-// Shared by every platform's overlay compositing (a webcam bubble drawn over the screen
-// capture) — only the *inputs* feeding this filter graph differ per OS (dshow/avfoundation/v4l2
-// device syntax), the graph itself is plain ffmpeg filter syntax and has no OS dependency.
-//
-// With N cameras selected, each one is stacked outward from the chosen anchor corner (gap of
-// 20px, same margin the single-camera positions already used) rather than all landing on top of
-// each other at the same x/y. Covers all 6 positions the Camera Position buttons in
-// EnhancedScreenOptions.tsx can send - top_left/top_center/top_right previously fell through to
-// the bottom_right default below (silently, since nothing ever rendered a preview to notice),
-// same bug class as the "bottom_center" vs "bottom_middle" mismatch fixed above.
-fn overlay_position_expr(
-    anchor: &str,
-    index: usize,
-    count: usize,
-    cam_w: i32,
-    cam_h: i32,
-) -> String {
-    let _ = cam_h; // width alone (via cam_w) is enough since margins are fixed constants.
-    let gap = 20;
-    let step = index as i32 * (cam_w + gap);
+// The camera picture inside one bubble (border excluded): square for circle/rounded, 4:3 for the
+// plain rectangle.
+fn overlay_pixel_dimensions(shape: &str, size: &str, frame_width: i32) -> (i32, i32) {
+    let side = even(frame_width as f64 * bubble_fraction(size));
+    match shape {
+        "circle" | "rounded" => (side, side),
+        _ => (side, even(side as f64 * 3.0 / 4.0)),
+    }
+}
 
-    let (x_base, y_top) = match anchor {
-        "top_left" => ("left", true),
-        "top_center" => ("center", true),
-        "top_right" => ("right", true),
-        "bottom_left" => ("left", false),
-        "bottom_center" => ("center", false),
-        // "bottom_right" and any unrecognized anchor fall back to this, matching the old
-        // single-camera default.
-        _ => ("right", false),
+fn border_px(border: &str, frame_width: i32) -> i32 {
+    let w = frame_width as f64;
+    match border {
+        "thin" => even((w * 0.003).max(2.0)),
+        "medium" => even((w * 0.006).max(4.0)),
+        "thick" => even((w * 0.011).max(6.0)),
+        _ => 0,
+    }
+}
+
+// "#rrggbb" for ffmpeg's color source; anything malformed falls back to white.
+fn ffmpeg_color(hex: &str) -> String {
+    let h = hex.trim().trim_start_matches('#');
+    if h.len() == 6 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("0x{}", h)
+    } else {
+        "white".to_string()
+    }
+}
+
+// geq: 255 inside a rounded rectangle inset `o` px into the frame with corner radius `r`, else 0.
+fn rounded_mask(o: i32, r: i32) -> String {
+    format!(
+        "if(lte(pow(max(max({o}+{r}-X,X-(W-1-{o}-{r})),0),2)+pow(max(max({o}+{r}-Y,Y-(H-1-{o}-{r})),0),2),{r}*{r}),255,0)",
+        o = o,
+        r = r
+    )
+}
+
+// geq: 255 inside a centred circle inset `o` px into the frame, else 0.
+fn circle_mask(o: i32) -> String {
+    format!("if(lte((X-W/2+0.5)^2+(Y-H/2+0.5)^2,(W/2-{o})^2),255,0)", o = o)
+}
+
+// Where bubble `index` of `count` goes, for bubbles `bubble_w` wide (border included). Bubbles
+// stack outward from the anchor corner; margin and gap scale with the frame like everything else.
+fn overlay_position_expr(anchor: &str, index: usize, count: usize, bubble_w: i32, frame_width: i32) -> String {
+    let margin = even(frame_width as f64 * 0.025);
+    let gap = even(frame_width as f64 * 0.012);
+    let step = index as i32 * (bubble_w + gap);
+
+    // (horizontal, vertical) - the 3x3 grid the modal offers.
+    let (x_base, y_base) = match anchor {
+        "top_left" => ("left", "top"),
+        "top_center" => ("center", "top"),
+        "top_right" => ("right", "top"),
+        "center_left" => ("left", "middle"),
+        "center" => ("center", "middle"),
+        "center_right" => ("right", "middle"),
+        "bottom_left" => ("left", "bottom"),
+        "bottom_center" => ("center", "bottom"),
+        // "bottom_right" and any unrecognized anchor.
+        _ => ("right", "bottom"),
     };
-
     let x_expr = match x_base {
-        "left" => format!("{}+{}", 100, step),
+        "left" => format!("{}+{}", margin, step),
         "center" => {
-            let total = count as i32 * cam_w + (count.saturating_sub(1)) as i32 * gap;
+            let total = count as i32 * bubble_w + (count.saturating_sub(1)) as i32 * gap;
             format!("(W-{})/2+{}", total, step)
         }
-        _ => format!("W-w-{}-{}", 100, step),
+        _ => format!("W-w-{}-{}", margin, step),
     };
-
-    let y_expr = if y_top {
-        "50".to_string()
-    } else {
-        "H-h-50".to_string()
+    let y_expr = match y_base {
+        "top" => format!("{}", margin),
+        "middle" => "(H-h)/2".to_string(),
+        _ => format!("H-h-{}", margin),
     };
-
     format!("overlay=x={}:y={}", x_expr, y_expr)
 }
 
-// One stage of the overlay chain: reads `prev_label` (the running composite so far, "[0:v]" for
-// the first camera or "[tmpN]" for subsequent ones) and `input_label` (this camera's raw input,
-// "[1:v]", "[2:v]", ...), and writes either an intermediate "[tmpN]" label (out_label = Some) for
-// the next stage to read, or nothing (out_label = None) on the final stage so ffmpeg auto-selects
-// it as the sole unlabeled filter output, same as the old single-camera graph did.
+// One camera's bubble, composited onto `prev_label` into `out_label`.
 //
-// Shaped bubbles (circle/rounded) center-crop the camera to a square of `side` px and merge it with
-// an alpha mask drawn ONCE and looped. The mask used to be a geq over every camera frame, which
-// measured ~1.8 CPU cores on its own (geq evaluates its expression per pixel per frame) - against
-// ~0.3 for the whole composite with the looped mask. Cropping rather than squeezing also stops a
-// 4:3 camera from coming out horizontally squashed.
+// Everything that defines the bubble's shape and border is drawn ONCE and looped: masks and the
+// border ring are static images, merged with each camera frame. Computing them per frame (geq)
+// measured ~1.8 CPU cores on its own; looped, the whole composite costs ~0.3. The camera is
+// center-cropped to the bubble's aspect rather than squeezed into it.
+#[allow(clippy::too_many_arguments)]
 fn overlay_stage_filter(
-    shape: &str,
-    stage_index: usize,
+    style: &OverlayStyle,
+    n: usize,
     input_label: &str,
     prev_label: &str,
-    out_label: Option<&str>,
+    out_label: &str,
     position_expr: &str,
-    side: i32,
+    pic: (i32, i32),
+    border: i32,
 ) -> String {
-    // Just the trailing "[label]" to append when this stage feeds another one, or nothing when
-    // it's the final stage (left for ffmpeg to auto-select, as today's single-camera graph did).
-    let out_suffix = match out_label {
-        Some(label) => format!("[{}]", label),
-        None => String::new(),
+    let (w, h) = pic;
+    let (bw, bh) = (w + 2 * border, h + 2 * border);
+    let color = ffmpeg_color(style.border_color);
+    let radius = (w / 8).max(4);
+    let shaped = style.shape == "circle" || style.shape == "rounded";
+    // The camera, cropped to the bubble's aspect and scaled into it.
+    let crop = if shaped {
+        "crop='min(iw,ih)':'min(iw,ih)'"
+    } else {
+        "crop='min(iw,ih*4/3)':'min(ih,iw*3/4)'"
     };
+    let mut picture = format!(
+        "{input}{crop},scale={w}:{h},setsar=1,format=yuva420p",
+        input = input_label,
+        crop = crop,
+        w = w,
+        h = h
+    );
+    let mut stages = Vec::new();
+    let mut cam = format!("cam{}", n);
 
-    // 255 inside the shape, 0 outside; X/Y/W/H are geq's pixel position and frame size.
-    let mask_expr = match shape {
-        "circle" => Some("if(lte((X-W/2+0.5)^2+(Y-H/2+0.5)^2,(W/2)^2),255,0)".to_string()),
-        "rounded" => {
-            let r = (side / 8).max(4);
-            Some(format!(
-                "if(lte(pow(max(max({r}-X,X-(W-1-{r})),0),2)+pow(max(max({r}-Y,Y-(H-1-{r})),0),2),{r}*{r}),255,0)",
-                r = r
-            ))
+    if border > 0 {
+        // The picture sits inside a border-coloured frame. For shaped bubbles a looped ring
+        // (border colour between the outer and inner shape) covers the frame's square corners
+        // inside the outer shape, so the border follows the curve.
+        picture.push_str(&format!(",pad={bw}:{bh}:{b}:{b}:color={c}", bw = bw, bh = bh, b = border, c = color));
+        stages.push(format!("{}[{}]", picture, cam));
+        let ring = match style.shape {
+            "circle" => Some((circle_mask(0), circle_mask(border))),
+            "rounded" => Some((rounded_mask(0, radius + border), rounded_mask(border, radius))),
+            _ => None,
+        };
+        if let Some((outer, inner)) = ring {
+            stages.push(format!(
+                "color=c={c}:s={bw}x{bh}:r=1:d=1,format=yuva420p[ringc{n}]; \
+                 color=black:s={bw}x{bh}:r=1:d=1,format=gray,geq=lum='if(gt({outer},0)*eq({inner},0),255,0)'[ringm{n}]; \
+                 [ringc{n}][ringm{n}]alphamerge,loop=-1:1:0[ring{n}]; \
+                 [{cam}][ring{n}]overlay=0:0:eof_action=repeat[camr{n}]",
+                c = color,
+                bw = bw,
+                bh = bh,
+                outer = outer,
+                inner = inner,
+                n = n,
+                cam = cam
+            ));
+            cam = format!("camr{}", n);
         }
+    } else {
+        stages.push(format!("{}[{}]", picture, cam));
+    }
+
+    // The outer shape, cut out of the (bordered) picture.
+    let outer = match style.shape {
+        "circle" => Some(circle_mask(0)),
+        "rounded" => Some(rounded_mask(0, radius + border)),
         _ => None,
     };
-
-    match mask_expr {
-        Some(expr) => format!(
-            "{input}crop='min(iw,ih)':'min(iw,ih)',scale={s}:{s},format=yuva420p[cam{n}]; \
-            color=black:s={s}x{s}:r=1:d=1,format=gray,geq=lum='{expr}',loop=-1:1:0[mask{n}]; \
-            [cam{n}][mask{n}]alphamerge[overlay{n}]; \
-            {prev}[overlay{n}]{position_expr}{out_suffix}",
-            input = input_label,
-            n = stage_index,
-            s = side,
-            expr = expr,
-            prev = prev_label,
-            position_expr = position_expr,
-            out_suffix = out_suffix,
-        ),
-        None => format!(
-            "{}{}{}{}",
-            prev_label, input_label, position_expr, out_suffix
-        ),
-    }
+    let bubble = match outer {
+        Some(mask) => {
+            stages.push(format!(
+                "color=black:s={bw}x{bh}:r=1:d=1,format=gray,geq=lum='{mask}',loop=-1:1:0[mask{n}]; \
+                 [{cam}][mask{n}]alphamerge[bubble{n}]",
+                bw = bw,
+                bh = bh,
+                mask = mask,
+                n = n,
+                cam = cam
+            ));
+            format!("[bubble{}]", n)
+        }
+        None => format!("[{}]", cam),
+    };
+    stages.push(format!("{}{}{}[{}]", prev_label, bubble, position_expr, out_label));
+    stages.join("; ")
 }
 
-// Builds the full filter_complex chaining one overlay stage per camera - two or more cameras
-// each get masked/shaped independently and composited onto the running result in sequence
-// ([0:v] + cam0 -> tmp1, tmp1 + cam1 -> tmp2, ...), then a final downscale stage capping the
-// composited output at `max_width` (left unlabeled so ffmpeg picks it automatically as this
-// output's video stream, same as the old last overlay stage did before this one existed). Every
-// overlay stage is labeled now (including what used to be the final, unlabeled one) since the
-// downscale stage needs a named input to read the finished composite from. `max_width` is caller-
-// resolved (see resolved_max_width) rather than always MAX_RECORDING_WIDTH so Windows callers can
-// honor FormData.resolution_width - macOS/Linux callers still just pass MAX_RECORDING_WIDTH,
-// unchanged from before this parameter existed.
+// Builds the full filter_complex chaining one overlay stage per camera onto the screen ([0:v],
+// or `screen` - see build_camera_overlay_filter_complex_from), then a final downscale stage
+// capping the composite at `max_width`, left unlabeled so ffmpeg maps it automatically.
 //
 // `crop` (w, h, x, y) is Some only for macOS's own window-capture path: avfoundation has no
-// per-window capture mode at all (only whole displays or camera devices - unlike gdigrab, which
-// at least offers one even though win.rs deliberately doesn't use it either), so a specific
-// window has to be cropped out of a full-display capture instead - see
-// window_capture::macos::get_window_rect_by_title's own doc comment for how that rect is
-// obtained and its known multi-monitor caveat. Windows/Linux callers always pass None - their own
-// window-region cropping happens at the input-arg level (offset_x/video_size, x11grab's own
-// video_size+i), before any camera overlay is ever composited on top, so they never needed this.
+// per-window capture mode at all, so a specific window has to be cropped out of a full-display
+// capture instead - see window_capture::macos::get_window_rect_by_title.
 #[cfg_attr(target_os = "windows", allow(dead_code))] // Windows uses the _from form below
 pub fn build_camera_overlay_filter_complex(
     shape: &str,
@@ -1106,31 +1183,31 @@ pub fn build_camera_overlay_filter_complex(
     max_width: i32,
     crop: Option<(i32, i32, i32, i32)>,
 ) -> String {
+    let style = OverlayStyle { shape, position, size, border: "none", border_color: "#ffffff" };
     build_camera_overlay_filter_complex_from(
-        shape,
-        position,
-        size,
+        &style,
         camera_count,
         max_width,
+        max_width.min(MAX_RECORDING_WIDTH),
         crop.map(|(w, h, x, y)| format!("[0:v]crop={}:{}:{}:{}", w, h, x, y)).as_deref(),
         1,
     )
 }
 
 // Same graph, with `screen` - a filter chain producing the screen picture - in place of the raw
-// [0:v] input, and the cameras starting at input `first_camera`. The chain can read an input
-// ("[0:v]crop=...") or be a source filter itself: the GPU capture path runs ddagrab inside the
-// graph (see win.rs's recording_with_output_sva for why), so the cameras are inputs 0..N there.
+// [0:v] input, and the cameras starting at input `first_camera`. `frame_width` is the width of
+// the picture the bubbles are composited onto, which every bubble dimension scales with.
 pub(crate) fn build_camera_overlay_filter_complex_from(
-    shape: &str,
-    position: &str,
-    size: &str,
+    style: &OverlayStyle,
     camera_count: usize,
     max_width: i32,
+    frame_width: i32,
     screen: Option<&str>,
     first_camera: usize,
 ) -> String {
-    let (cam_w, cam_h) = overlay_pixel_dimensions(shape, size);
+    let pic = overlay_pixel_dimensions(style.shape, style.size, frame_width);
+    let border = border_px(style.border, frame_width);
+    let bubble_w = pic.0 + 2 * border;
     let mut stages: Vec<String> = Vec::with_capacity(camera_count + 2);
     let mut prev_label = "[0:v]".to_string();
 
@@ -1141,27 +1218,13 @@ pub(crate) fn build_camera_overlay_filter_complex_from(
 
     for index in 0..camera_count {
         let input_label = format!("[{}:v]", index + first_camera);
-        let position_expr = overlay_position_expr(position, index, camera_count, cam_w, cam_h);
+        let position_expr = overlay_position_expr(style.position, index, camera_count, bubble_w, frame_width);
         let out_label = format!("comp{}", index + 1);
-
-        stages.push(overlay_stage_filter(
-            shape,
-            index,
-            &input_label,
-            &prev_label,
-            Some(&out_label),
-            &position_expr,
-            cam_w,
-        ));
-
+        stages.push(overlay_stage_filter(style, index, &input_label, &prev_label, &out_label, &position_expr, pic, border));
         prev_label = format!("[{}]", out_label);
     }
 
-    stages.push(format!(
-        "{}scale='min({},iw)':-2",
-        prev_label, max_width
-    ));
-
+    stages.push(format!("{}scale='min({},iw)':-2", prev_label, max_width));
     stages.join("; ")
 }
 
@@ -2480,4 +2543,31 @@ async fn create_or_replace_rec_completed_modal(
     })
     .await
     .map_err(|e| format!("Modal window creation task panicked: {}", e))?
+}
+
+#[cfg(test)]
+mod overlay_style_tests {
+    use super::*;
+
+    #[test]
+    #[ignore] // prints graphs for a manual ffmpeg render check
+    fn print_overlay_graphs() {
+        for shape in ["circle", "rounded", "square"] {
+            let style = OverlayStyle { shape, position: "bottom_right", size: "large", border: "thick", border_color: "#ff3355" };
+            println!("GRAPH {} {}", shape, build_camera_overlay_filter_complex_from(&style, 1, 1920, 1920, None, 1));
+        }
+    }
+
+    #[test]
+    fn bubbles_scale_with_the_frame() {
+        assert_eq!(overlay_pixel_dimensions("circle", "medium", 1920), (346, 346));
+        assert_eq!(overlay_pixel_dimensions("circle", "medium", 3840), (690, 690));
+        assert_eq!(overlay_pixel_dimensions("square", "small", 1920), (268, 200));
+        assert_eq!(border_px("none", 1920), 0);
+        assert!(border_px("thick", 1920) > border_px("thin", 1920));
+        assert_eq!(ffmpeg_color("#FF3355"), "0xFF3355");
+        assert_eq!(ffmpeg_color("red; drop"), "white");
+        assert!(overlay_position_expr("center", 0, 1, 300, 1920).ends_with("y=(H-h)/2"));
+        assert!(overlay_position_expr("center_left", 0, 1, 300, 1920).starts_with("overlay=x=48+0"));
+    }
 }

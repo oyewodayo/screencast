@@ -4,7 +4,7 @@ import * as Y from "yjs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import BottomDocker from "../components/BottomDocker";
-import { listen } from '@tauri-apps/api/event';
+import { listen, emit } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
@@ -156,6 +156,12 @@ const OPEN_FILE_DIALOG_FILTERS = [
 // see every keystroke system-wide.
 const OVERLAY_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+H';
 
+// Cuts the recording's main view between the screen and a full-frame camera, while recording -
+// only registered when the recording has a separate camera file to cut to (see canSwitchView).
+// Alt+Shift rather than Ctrl+Shift: Ctrl+Shift+V is "paste as plain text" in browsers, Slack and
+// Docs - exactly the apps people demo - and a global shortcut would swallow it.
+const VIEW_SWITCH_SHORTCUT = 'Alt+Shift+V';
+
 const toggleOverlayVisibility = async () => {
   const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
   if (!overlayWindow) return;
@@ -260,6 +266,12 @@ const Dashboard = () => {
   // is cheap to keep as ordinary state - ActiveRecordingState/RecordingOverlayWindow both need it
   // as a prop/event field to compute their own ticking display, since each runs its own timer.
   const [isPaused, setIsPaused] = useState<boolean>(false);
+  // Live Screen <-> Camera cutting for the recording in progress. canSwitchView: the recording has
+  // a second (camera) file to cut to - a separately recorded webcam or the phone camera. The
+  // current view is owned here, so the hotkey, the recording bar's buttons and the overlay
+  // window's buttons all act on one state (see switchView).
+  const [canSwitchView, setCanSwitchView] = useState<boolean>(false);
+  const [viewMode, setViewMode] = useState<'screen' | 'camera'>('screen');
   const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
   const [pausedAccumulatedMs, setPausedAccumulatedMs] = useState<number>(0);
   const [error, setError] = useState<string>("");
@@ -790,6 +802,10 @@ useEffect(() => {
       if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
         await unregister(OVERLAY_TOGGLE_SHORTCUT);
       }
+      if (await isRegistered(VIEW_SWITCH_SHORTCUT)) {
+        await unregister(VIEW_SWITCH_SHORTCUT);
+      }
+      setCanSwitchView(false);
     });
     
     return unlisten;
@@ -1012,7 +1028,13 @@ const setScreen = () => {
   const handleStartRecording = async (formData: any) => {
     // Read at the moment of recording rather than threaded through every caller - the panel and
     // the record hotkey both land here.
-    formData = { ...formData, enhance_audio: loadSettings().autoEnhanceAudio };
+    const recordingPrefs = loadSettings();
+    formData = {
+      ...formData,
+      enhance_audio: recordingPrefs.autoEnhanceAudio,
+      overlay_border: recordingPrefs.cameraBorder,
+      overlay_border_color: recordingPrefs.cameraBorderColor,
+    };
     if (formData.record_type === "c") {
       await handleTakeScreenshot(formData);
       return;
@@ -1115,7 +1137,24 @@ const setScreen = () => {
           await register(OVERLAY_TOGGLE_SHORTCUT, toggleOverlayVisibility);
         }
 
-        setMessage(`${response} (Ctrl+Shift+H to show/hide the recording overlay)`);
+        const switchable =
+          formData.record_type === 'sva' &&
+          (Boolean(formData.separate_webcam_capture) || Boolean(formData.video_devices?.includes(PHONE_CAMERA_DEVICE)));
+        setCanSwitchView(switchable);
+        setViewMode('screen');
+        viewSwitchRef.current.canSwitchView = switchable;
+        viewSwitchRef.current.viewMode = 'screen';
+        if (switchable && !(await isRegistered(VIEW_SWITCH_SHORTCUT))) {
+          await register(VIEW_SWITCH_SHORTCUT, (event) => {
+            if (event.state === 'Pressed') void switchViewRef.current('toggle');
+          });
+        }
+
+        setMessage(
+          switchable
+            ? `${response} (Alt+Shift+V switches between screen and camera, Ctrl+Shift+H shows the recording overlay)`
+            : `${response} (Ctrl+Shift+H to show/hide the recording overlay)`
+        );
 
     } catch (error) {
         console.error("Error starting recording:", error);
@@ -1124,6 +1163,60 @@ const setScreen = () => {
   };
 
   
+  // The latest recording timing and view state, for switchView - which the global hotkey calls
+  // through switchViewRef, registered once per recording, so it must never read a stale render.
+  const viewSwitchRef = useRef({
+    startTime: null as number | null,
+    isPaused: false,
+    pauseStartedAt: null as number | null,
+    pausedAccumulatedMs: 0,
+    viewMode: 'screen' as 'screen' | 'camera',
+    canSwitchView: false,
+  });
+  useEffect(() => {
+    viewSwitchRef.current = {
+      startTime: recordingStartTime,
+      isPaused,
+      pauseStartedAt,
+      pausedAccumulatedMs,
+      viewMode,
+      canSwitchView,
+    };
+  });
+
+  // Cuts the main view between screen and camera: logs the cut at the recording's elapsed time
+  // (same pause-aware formula as every timer) - assembly re-bases these onto the final file, and
+  // the editor/export cut to match - then tells every window, so the overlay's and the recording
+  // bar's buttons all show the live view.
+  const switchView = async (requested: 'screen' | 'camera' | 'toggle') => {
+    const st = viewSwitchRef.current;
+    if (!st.canSwitchView || !st.startTime) return;
+    const mode = requested === 'toggle' ? (st.viewMode === 'screen' ? 'camera' : 'screen') : requested;
+    if (mode === st.viewMode) return;
+    st.viewMode = mode;
+    setViewMode(mode);
+    const now = st.isPaused && st.pauseStartedAt ? st.pauseStartedAt : Date.now();
+    const elapsedSecs = Math.max(0, (now - st.startTime - st.pausedAccumulatedMs) / 1000);
+    try {
+      await invoke('record_view_switch', { elapsedSecs, mode });
+    } catch (error) {
+      console.error('Error recording view switch:', error);
+    }
+    void emit('view-mode-changed', { mode });
+  };
+  const switchViewRef = useRef(switchView);
+  switchViewRef.current = switchView;
+
+  // The overlay window asks rather than acting itself, so there's one place a cut is logged.
+  useEffect(() => {
+    const unlisten = listen<{ mode: 'screen' | 'camera' }>('view-switch-requested', (event) => {
+      void switchViewRef.current(event.payload.mode);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   let handleStopRecording = async () => {
     if (isStoppingRef.current) return;
     isStoppingRef.current = true;
@@ -1183,6 +1276,10 @@ const setScreen = () => {
     if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
       await unregister(OVERLAY_TOGGLE_SHORTCUT);
     }
+    if (await isRegistered(VIEW_SWITCH_SHORTCUT)) {
+      await unregister(VIEW_SWITCH_SHORTCUT);
+    }
+    setCanSwitchView(false);
 
     if (isMonitoring) {
       try {
@@ -4027,6 +4124,9 @@ const setScreen = () => {
         onOpenPhoneCamera={() => setShowPhoneCamera(true)}
         isPhoneCameraConnected={isPhoneCameraConnected}
         isPaused={isPaused}
+        canSwitchView={canSwitchView}
+        viewMode={viewMode}
+        onSwitchView={(mode: 'screen' | 'camera') => void switchView(mode)}
         pauseStartedAt={pauseStartedAt}
         pausedAccumulatedMs={pausedAccumulatedMs}
         handlePauseRecording={handlePauseRecording}

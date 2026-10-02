@@ -185,6 +185,16 @@ impl ScreenSource {
         Ok(args)
     }
 
+    // Width of the picture the screen stage produces - what camera bubbles are sized against.
+    fn output_width(&self) -> i32 {
+        match &self.gpu {
+            Some(g) => g.scaled_size(self.max_width).0,
+            None => capture_region_bounds(&self.target)
+                .map(|(_, _, w, _)| w.min(self.max_width))
+                .unwrap_or(self.max_width.min(MAX_RECORDING_WIDTH)),
+        }
+    }
+
     // For the log and the "Recording started" message, e.g. "3840x2160 at 60 fps, Intel Quick Sync".
     fn summary(&self) -> String {
         match &self.gpu {
@@ -308,6 +318,7 @@ fn add_overlay_args(
     screen: &str,
     first_camera: usize,
     max_width: i32,
+    frame_width: i32,
 ) {
     let overlay_size = map_overlay_size(&form_data.overlay_size);
 
@@ -322,12 +333,18 @@ fn add_overlay_args(
         ]);
     }
 
+    let style = super::OverlayStyle {
+        shape: &form_data.overlay_shape,
+        position: &form_data.overlay_position,
+        size: &form_data.overlay_size,
+        border: &form_data.overlay_border,
+        border_color: &form_data.overlay_border_color,
+    };
     let filter_complex = build_camera_overlay_filter_complex_from(
-        &form_data.overlay_shape,
-        &form_data.overlay_position,
-        &form_data.overlay_size,
+        &style,
         form_data.video_devices.len(),
         max_width,
+        frame_width,
         Some(screen),
         first_camera,
     );
@@ -524,7 +541,7 @@ pub async fn recording_with_output_sva(
     let mic_input;
     if baked_camera {
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
-        add_overlay_args(&mut args, form_data, &stage, first_camera, screen.max_width);
+        add_overlay_args(&mut args, form_data, &stage, first_camera, screen.max_width, screen.output_width());
         mic_input = first_camera + form_data.video_devices.len();
     } else if separate_webcam_capture && form_data.capture_path.is_some() {
         // The camera gets its own ffmpeg (start_camera_sidecar, below) - see CameraSidecar for why.

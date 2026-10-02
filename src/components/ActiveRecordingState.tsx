@@ -77,10 +77,14 @@ interface Props {
     // before presenting/recording a screen that includes this window, so they don't end up baked
     // into the video.
     showRecordingPanelButtons: boolean;
+    // Live Screen <-> Camera cutting while recording (Alt+Shift+V) - see Dashboard's switchView.
+    canSwitchView?: boolean;
+    viewMode?: 'screen' | 'camera';
+    onSwitchView?: (mode: 'screen' | 'camera') => void;
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenMindmap,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenMindmap,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -282,6 +286,30 @@ const ActiveRecordingState = (
                                 </>
                             );
                         })()}
+                        {isRecording && canSwitchView && (
+                            // Which view is live as the main picture right now - a cut is logged
+                            // at this moment and applied by the editor and export.
+                            <div
+                                className="ml-2 flex p-0.5 gap-0.5 rounded-lg bg-neutral-200/70 dark:bg-white/10"
+                                title="Switch the main view (Alt+Shift+V)"
+                            >
+                                {(['screen', 'camera'] as const).map((m) => (
+                                    <button
+                                        key={m}
+                                        type="button"
+                                        onClick={() => onSwitchView?.(m)}
+                                        className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                                            viewMode === m
+                                                ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm"
+                                                : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-white"
+                                        }`}
+                                    >
+                                        {m === 'screen' ? <IoScanSharp /> : <IoVideocam />}
+                                        {m === 'screen' ? 'Screen' : 'Camera'}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
                         {isRecording && (
                             <div className={`ml-1 text-xs font-mono ${isPaused ? "text-amber-500" : "text-neutral-700 dark:text-white"}`}>
                                 {formatTime(elapsedTime)}{isPaused ? " (paused)" : ""}

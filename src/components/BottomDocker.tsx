@@ -117,6 +117,10 @@ interface Props {
   setIncludeSystemAudio: React.Dispatch<React.SetStateAction<boolean>>;
   separateWebcamCapture: boolean;
   setSeparateWebcamCapture: React.Dispatch<React.SetStateAction<boolean>>;
+  // Live Screen <-> Camera cutting while recording - see Dashboard's switchView.
+  canSwitchView: boolean;
+  viewMode: 'screen' | 'camera';
+  onSwitchView: (mode: 'screen' | 'camera') => void;
   trackClicks: boolean;
   setTrackClicks: React.Dispatch<React.SetStateAction<boolean>>;
   resolutionWidth: number | null;
@@ -247,6 +251,9 @@ const BottomDocker = ({
   setIncludeSystemAudio,
   separateWebcamCapture,
   setSeparateWebcamCapture,
+  canSwitchView,
+  viewMode,
+  onSwitchView,
   trackClicks,
   setTrackClicks,
   resolutionWidth,
@@ -557,6 +564,29 @@ const BottomDocker = ({
       setOverlayShape={setOverlayShape}
       setOverlayPosition={setOverlayPosition}
       setOverlaySize={setOverlaySize}
+      separateWebcamCapture={separateWebcamCapture}
+      setSeparateWebcamCapture={setSeparateWebcamCapture}
+      fileName={fileName}
+      onFileNameChange={setFileName}
+      fileExt={fileExt}
+      onFileExtChange={setFileExt}
+      audioDevice={audioDevice}
+      onAudioDeviceChange={setAudioDevice}
+      connectedAudioDevices={connectedAudioDevices}
+      connectedCameraDevices={connectedCameraDevices}
+      onToggleVideoDevice={toggleVideoDevice}
+      onRefreshDevices={loadDevices}
+      onOpenPhoneCamera={onOpenPhoneCamera}
+      isPhoneCameraConnected={isPhoneCameraConnected}
+      includeSystemAudio={includeSystemAudio}
+      onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
+      trackClicks={trackClicks}
+      onToggleTrackClicks={() => setTrackClicks((prev) => !prev)}
+      isClickTrackingSupported={isClickTrackingSupported}
+      resolutionWidth={resolutionWidth}
+      onResolutionWidthChange={setResolutionWidth}
+      framerate={framerate}
+      onFramerateChange={setFramerate}
       isOpenScreen={modalOpenScreen} 
       onCloseScreen={closeModalScreen} 
       onStartRecording={onStartRecording} 
@@ -566,6 +596,9 @@ const BottomDocker = ({
     <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
      
         <ActiveRecordingState
+            canSwitchView={canSwitchView}
+            viewMode={viewMode}
+            onSwitchView={onSwitchView}
             isRecording={isRecording}
             recordingStartTime={recordingStartTime}
             recordType={recordType}

@@ -171,16 +171,24 @@ const RecordingOverlayWindow = () => {
     // logged mid-pause still lines up with what the displayed timer read at that moment.
     const handleSwitchView = async (mode: 'screen' | 'camera') => {
         if (mode === viewMode) return;
+        // The main window owns the view (it also takes the Alt+Shift+V hotkey) and logs the cut;
+        // this window just asks, and follows 'view-mode-changed' like every other control.
         setViewMode(mode);
-        if (!startTime) return;
-        const effectiveNow = isPaused && pauseStartedAt ? pauseStartedAt : Date.now();
-        const elapsedSecs = Math.max(0, (effectiveNow - startTime - pausedAccumulatedMs) / 1000);
         try {
-            await invoke('record_view_switch', { elapsedSecs, mode });
+            await emit('view-switch-requested', { mode });
         } catch (error) {
-            console.error('Error recording view switch:', error);
+            console.error('Error requesting view switch:', error);
         }
     };
+
+    useEffect(() => {
+        const unlisten = listen<{ mode: 'screen' | 'camera' }>('view-mode-changed', (event) => {
+            setViewMode(event.payload.mode);
+        });
+        return () => {
+            unlisten.then((fn) => fn());
+        };
+    }, []);
 
     // Derive elapsed time from the shared start timestamp (see Dashboard.tsx /
     // ActiveRecordingState.tsx) so this window's timer can't drift apart from the main window's -
