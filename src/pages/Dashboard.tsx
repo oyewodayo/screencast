@@ -39,6 +39,7 @@ import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
 import { PresentationLiveBar } from "../components/PresentationControls";
 import { getPresentationState, visibleCameras } from "../services/presentation";
+import { SNIP_SHORTCUT, SnipResult, startSnip } from "../services/snip";
 
 // Record types that capture cameras and no screen (win.rs recording_with_output_va/_v). Mirrors
 // CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
@@ -1889,6 +1890,35 @@ const setScreen = () => {
 			});
 		};
 	}, [handleRecordingToggleHotkey]);
+
+	// Screenshots: Alt+Shift+S from any app opens the screen picker, and the picker reports back
+	// here when it's done (commands/snip.rs emits snip-done; null means cancelled).
+	useEffect(() => {
+		(async () => {
+			try {
+				if (!(await isRegistered(SNIP_SHORTCUT))) {
+					await register(SNIP_SHORTCUT, (event) => {
+						if (event.state !== 'Pressed') return;
+						startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+					});
+				}
+			} catch (err) {
+				console.warn(`Couldn't register ${SNIP_SHORTCUT}:`, err);
+			}
+		})();
+		const unlisten = listen<SnipResult | null>('snip-done', (event) => {
+			if (!event.payload) return;
+			const name = event.payload.path.split(/[\\/]/).pop() ?? event.payload.path;
+			setError('');
+			setMessage(event.payload.copied ? `Screenshot saved and copied to the clipboard: ${name}` : `Screenshot saved: ${name}`);
+		});
+		return () => {
+			unlisten.then((fn) => fn());
+			isRegistered(SNIP_SHORTCUT).then((registered) => {
+				if (registered) void unregister(SNIP_SHORTCUT);
+			});
+		};
+	}, []);
 
 	const handleTogglePdfFullscreen = async () => {
 		const next = !isPdfFullscreen;

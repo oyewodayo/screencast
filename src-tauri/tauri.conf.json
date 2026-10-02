@@ -86,6 +86,30 @@
         "transparent": true,
         "visible": false,
         "focus": false
+      },
+      {
+        "label": "snip-overlay",
+        "title": "Screenshot",
+        "url": "/snip",
+        "width": 800,
+        "height": 600,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "decorations": false,
+        "shadow": false,
+        "visible": false,
+        "focus": false
+      },
+      {
+        "label": "presentation",
+        "title": "Briefcast Live Display",
+        "url": "/presentation",
+        "width": 1280,
+        "height": 720,
+        "decorations": false,
+        "visible": false,
+        "focus": false
       }
     ]
   }

@@ -1,7 +1,7 @@
 // PresentationWindow.tsx
 //
 // The live display itself: a borderless full-screen window (opened on the chosen monitor by
-// open_presentation_window, presentation.rs) showing the cameras the operator put on it. It holds
+// services/presentation.ts; declared in tauri.conf.json) showing the cameras the operator put on it. It holds
 // no state of its own - it renders the last "presentation-state" the main window sent, and opens
 // the shown cameras at up to 1080p directly (no re-encoding on the way to the TV).
 //
@@ -11,6 +11,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { IoClose } from "react-icons/io5";
 import PresentationStage from "./PresentationStage";
 import { useCameraStreams } from "../hooks/useCameraStreams";
@@ -70,6 +71,18 @@ const PresentationWindow = () => {
         };
     }, []);
 
+    // Alt+F4 would destroy this pre-declared window for the rest of the session - stop the
+    // display instead, which hides it.
+    useEffect(() => {
+        const unlisten = getCurrentWindow().onCloseRequested((e) => {
+            e.preventDefault();
+            request({ type: "close" });
+        });
+        return () => {
+            unlisten.then((fn) => fn());
+        };
+    }, []);
+
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
             if (e.key === "Escape") {
@@ -96,7 +109,8 @@ const PresentationWindow = () => {
     // Every shown camera stays open, including the ones off air in "single": opening a camera
     // takes the better part of a second, and a cut has to be instant. A camera taken off the
     // display is released.
-    const shown = state ? visibleCameras(state) : [];
+    // Nothing is opened while the display is stopped (the window stays loaded, hidden).
+    const shown = state?.active ? visibleCameras(state) : [];
     const live = state ? liveCamera(state) : null;
     const { streams, errors } = useCameraStreams(shown, "hd");
 

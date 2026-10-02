@@ -18,6 +18,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { PhysicalPosition } from "@tauri-apps/api/window";
 import { isRegistered, register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { PHONE_CAMERA_DEVICE, PHONE_CAMERA_LABEL, getPhoneCameraState, subscribePhoneCamera } from "./phoneCamera";
 
@@ -319,35 +320,64 @@ const ensureRequestListener = async () => {
     subscribePhoneCamera(() => void syncPhoneRelay());
 };
 
+// The display window is pre-declared in tauri.conf.json (created hidden at startup, like the
+// app's other overlays) and only ever shown, moved and hidden from here - building windows from a
+// command has hung this app before (see ANNOTATION_FEATURE_DISABLED in Dashboard.tsx).
+const displayWindow = async () => {
+    const w = await WebviewWindow.getByLabel(PRESENTATION_WINDOW_LABEL);
+    if (!w) throw new Error("The live display window is missing - restart Briefcast");
+    return w;
+};
+
+interface MonitorGeometry {
+    id: string;
+    x: number;
+    y: number;
+}
+
+// Full screen on `monitorId`, or the last monitor (the TV, on a laptop with one attached) when
+// it's unset or no longer connected.
+const placeOnMonitor = async (w: WebviewWindow, monitorId: string | null) => {
+    const monitors = await invoke<MonitorGeometry[]>("get_monitors");
+    const m = monitors.find((mon) => mon.id === monitorId) ?? monitors[monitors.length - 1];
+    if (!m) throw new Error("No display found");
+    // Full screen pins a window to its current monitor, so leave it before moving.
+    await w.setFullscreen(false);
+    await w.setPosition(new PhysicalPosition(m.x + 50, m.y + 50));
+    await w.setFullscreen(true);
+};
+
 export const startPresentation = async (monitorId?: string | null) => {
     await ensureRequestListener();
     const target = monitorId === undefined ? state.monitorId : monitorId;
     state = { ...state, active: true, monitorId: target };
     publish();
     try {
-        await invoke("open_presentation_window", { monitorId: target });
+        const w = await displayWindow();
+        await placeOnMonitor(w, target);
+        await w.show();
     } catch (err) {
         state = { ...state, active: false };
         publish();
         throw err;
     }
+    // The page has been loaded and listening since startup.
+    displayReady = true;
+    void emit(PRESENTATION_STATE_EVENT, state);
+    void syncPhoneRelay();
     void registerGlobalShortcuts();
-    // Closed some other way (Alt+F4, the display disconnecting) - reflect it here.
-    const window = await WebviewWindow.getByLabel(PRESENTATION_WINDOW_LABEL);
-    void window?.once("tauri://destroyed", () => {
-        displayReady = false;
-        if (state.active) {
-            state = { ...state, active: false };
-            publish();
-            void unregisterGlobalShortcuts();
-        }
-    });
 };
 
 export const stopPresentation = async () => {
     displayReady = false;
     state = { ...state, active: false };
     publish();
+    // Tells the display to let go of its cameras.
+    void emit(PRESENTATION_STATE_EVENT, state);
     await unregisterGlobalShortcuts();
-    await invoke("close_presentation_window");
+    const w = await WebviewWindow.getByLabel(PRESENTATION_WINDOW_LABEL);
+    if (w) {
+        await w.setFullscreen(false);
+        await w.hide();
+    }
 };

@@ -165,7 +165,7 @@ const TogglePill: React.FC<{
     aria-checked={checked}
     disabled={disabled}
     onClick={onToggle}
-    title={title}
+    data-tip={title}
     className={`docker-chip flex items-center gap-2.5 h-10 px-3 rounded-xl border text-[13px] font-medium transition-colors ${
       disabled
         ? "border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 cursor-not-allowed"
@@ -250,7 +250,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
               onChange={onFileNameChange}
               disabled={isRecording}
               placeholder="Recording name"
-              title="File name"
+              data-tip="File name"
               className="docker-name-input w-44 bg-transparent px-2 text-[13px] font-medium text-neutral-800 dark:text-neutral-100 placeholder:text-neutral-400 outline-none disabled:opacity-60"
             />
             <div className="h-full border-l border-neutral-200 dark:border-neutral-700/80">
@@ -287,7 +287,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
                   role="radio"
                   aria-checked={active}
                   onClick={() => onRecordTypeChange(t.value)}
-                  title={t.label}
+                  data-tip={t.label}
                   className={`docker-type flex items-center gap-1.5 h-8 px-2.5 rounded-lg text-[12px] font-medium whitespace-nowrap transition-all ${
                     active
                       ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm"
@@ -307,7 +307,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             type="button"
             onClick={onScreenshotClick}
             disabled={isRecording}
-            title="Take a screenshot"
+            data-tip="Take a screenshot"
             className="docker-chip flex items-center gap-2 h-10 px-3.5 rounded-xl border border-neutral-200 dark:border-neutral-700/80 bg-white dark:bg-neutral-800/80 text-[13px] font-medium text-neutral-700 dark:text-neutral-200 hover:border-neutral-300 dark:hover:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <IoCameraOutline size={16} />
@@ -318,6 +318,8 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             <button
               type="button"
               onClick={onStartRecordingClick}
+              data-tip="Choose what to record, then start"
+              data-tip-kbd="Ctrl+Shift+R"
               className="docker-chip group flex items-center gap-2 h-10 pl-3 pr-4 rounded-xl bg-red-600 hover:bg-red-500 active:bg-red-700 text-white text-[13px] font-semibold shadow-sm shadow-red-600/30 transition-colors"
             >
               <span className="flex items-center justify-center w-4 h-4 rounded-full border-2 border-white/90">
@@ -386,7 +388,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
                     type="button"
                     aria-pressed={selected}
                     onClick={() => (isPhone && !isPhoneCameraConnected ? onOpenPhoneCamera() : onToggleVideoDevice(device))}
-                    title={isPhone && !isPhoneCameraConnected ? "Pair your phone to use it as a camera" : device}
+                    data-tip={isPhone && !isPhoneCameraConnected ? "Pair your phone to use it as a camera" : device}
                     className={`flex items-center gap-1.5 h-7 px-2.5 rounded-lg text-[12px] font-medium max-w-[180px] transition-colors ${
                       selected
                         ? "bg-blue-500 text-white"
@@ -398,7 +400,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
                     {isPhone && (
                       <span
                         className={`shrink-0 w-1.5 h-1.5 rounded-full ${isPhoneCameraConnected ? "bg-green-400" : "bg-neutral-400"}`}
-                        title={isPhoneCameraConnected ? "Connected" : "Not paired"}
+                        data-tip={isPhoneCameraConnected ? "Connected" : "Not paired"}
                       />
                     )}
                     {isPhone && !isPhoneCameraConnected && (
@@ -415,7 +417,7 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             <button
               type="button"
               onClick={onRefreshDevices}
-              title="Refresh devices"
+              data-tip="Refresh devices"
               className="flex items-center justify-center w-7 h-7 ml-0.5 rounded-lg text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700"
             >
               <IoRefresh size={14} />
@@ -466,7 +468,11 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
             label="System audio"
             checked={includeSystemAudio}
             onToggle={onToggleIncludeSystemAudio}
-            title="Captures whatever's playing through your speakers (e.g. a video open in another app) alongside the screen capture. On macOS this needs a virtual-audio-loopback device (e.g. BlackHole) already installed."
+            title={
+              navigator.userAgent.includes("Mac")
+                ? "Also records what's playing through your speakers. Needs a loopback device such as BlackHole on macOS."
+                : "Also records what's playing through your speakers - a video, a call, music."
+            }
           />
         )}
 

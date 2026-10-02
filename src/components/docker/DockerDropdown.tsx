@@ -145,7 +145,7 @@ const DockerDropdown: React.FC<DockerDropdownProps> = ({
             <button
                 type="button"
                 disabled={disabled}
-                title={triggerTitle}
+                data-tip={triggerTitle}
                 aria-haspopup="listbox"
                 aria-expanded={open}
                 onClick={() => (open ? setOpen(false) : openMenu())}

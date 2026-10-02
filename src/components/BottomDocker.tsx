@@ -11,6 +11,7 @@ import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import { loadSettings } from "../utils/appSettings";
+import { startSnip } from "../services/snip";
 
 // First entry of each is the fallback when Settings' default format is of another kind.
 const VIDEO_EXTS = ["mp4", "mkv", "mov", "webm", "avi"];
@@ -518,7 +519,13 @@ const BottomDocker = ({
   // screen-selection modal and the backend both key off recordType === "c" to behave as a
   // screenshot flow. Switch to it just for this flow and restore the dropdown's value
   // (in closeModalScreen) once the modal closes.
-  const handleScreenshotClick = () => {
+  // The screen picker (services/snip.ts) where it's available; elsewhere, the screenshot modal.
+  const handleScreenshotClick = async () => {
+    try {
+      if (await startSnip()) return;
+    } catch (err) {
+      console.error("Screenshot picker failed:", err);
+    }
     setPreviousRecordType(recordType);
     setRecordType("c");
     openModalScreen();
