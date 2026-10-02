@@ -59,17 +59,22 @@ pub fn watch(
 ) {
     tauri::async_runtime::spawn(async move {
         let mut last_len: u64 = 0;
+        // Whether another ffmpeg has taken over by the time this one is gone - a start retried
+        // through a different capture path reuses the same progress file, which then isn't ours
+        // to delete.
+        let replaced;
         loop {
             let _ = tauri::async_runtime::spawn_blocking(|| {
                 std::thread::sleep(Duration::from_millis(750));
             })
             .await;
 
-            let still_this_recording = {
+            let current = {
                 let guard = ffmpeg_process.lock().await;
-                guard.as_ref().map(|c| c.id()) == Some(expected_pid)
+                guard.as_ref().map(|c| c.id())
             };
-            if !still_this_recording {
+            if current != Some(expected_pid) {
+                replaced = current.is_some();
                 break;
             }
 
@@ -86,7 +91,9 @@ pub fn watch(
                 let _ = app_handle.emit("recording-progress", progress);
             }
         }
-        let _ = std::fs::remove_file(&progress_path);
+        if !replaced {
+            let _ = std::fs::remove_file(&progress_path);
+        }
     });
 }
 

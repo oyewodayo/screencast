@@ -330,14 +330,15 @@ fn main() {
 
             services::telemetry::init(app.handle());
             services::responsiveness::start_ui_watchdog(app.handle());
-            // Both are slow first-time probes (ffmpeg -list_devices, a trial hardware encode);
-            // doing them now in the background means the device pickers and the first recording
-            // never wait on them.
+            // All slow first-time probes (ffmpeg -list_devices, a trial hardware encode, a trial
+            // GPU screen capture); doing them now in the background means the device pickers and
+            // the first recording never wait on them.
             commands::recording::warm_device_cache(app.handle());
             commands::recording::prewarm_rec_completed_modal(app.handle());
             if let Ok(ffmpeg_path) = services::utility::get_ffmpeg_path(app.handle()) {
                 std::thread::spawn(move || {
                     services::hw_encoder::detect(&ffmpeg_path);
+                    commands::recording::warm_screen_capture(&ffmpeg_path);
                 });
             }
             Ok(())

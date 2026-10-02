@@ -137,7 +137,7 @@ pub struct TelemetrySettings {
     pub available: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_telemetry_settings() -> TelemetrySettings {
     TelemetrySettings {
         enabled: ENABLED.load(Ordering::SeqCst),
@@ -145,8 +145,10 @@ pub fn get_telemetry_settings() -> TelemetrySettings {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_telemetry_enabled(app_handle: AppHandle, enabled: bool) -> Result<(), String> {
+    // Writes the consent file - serialized like every other sync (async) command, see responsiveness.rs.
+    let _serial = crate::services::responsiveness::serial();
     if !enabled {
         track("telemetry_disabled", None); // the last event this install sends
     }
@@ -160,13 +162,13 @@ pub fn set_telemetry_enabled(app_handle: AppHandle, enabled: bool) -> Result<(),
 }
 
 // For the frontend's own events (src/utils/telemetry.ts).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn track_event(name: String, props: Option<Map<String, Value>>) {
     track(&name, props);
 }
 
 // Uncaught frontend errors (ErrorBoundary, window.onerror) - same scrubbing and gating as panics.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn report_frontend_error(message: String, stack: Option<String>) {
     if SENTRY_GUARD.get().is_none() || !ENABLED.load(Ordering::SeqCst) {
         return;

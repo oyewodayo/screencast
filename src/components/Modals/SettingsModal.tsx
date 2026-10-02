@@ -518,7 +518,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                         value={settings.defaultResolutionWidth ?? ""}
                         onChange={(e) => update("defaultResolutionWidth", e.target.value ? Number(e.target.value) : null)}
                       >
-                        <option value="">1080p (default)</option>
+                        <option value="">Auto - full display resolution on supported GPUs (default)</option>
                         <option value="1280">720p</option>
                         <option value="1920">1080p</option>
                         <option value="2560">1440p</option>
@@ -534,15 +534,17 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                         value={settings.defaultFramerate ?? ""}
                         onChange={(e) => update("defaultFramerate", e.target.value ? Number(e.target.value) : null)}
                       >
-                        <option value="">Default (60fps for Screen+Video+Audio, 30fps otherwise)</option>
+                        <option value="">Auto - 60fps on supported GPUs (default)</option>
                         <option value="24">24 fps</option>
                         <option value="30">30 fps</option>
                         <option value="60">60 fps</option>
                       </select>
                     </Field>
                     <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
-                      Recordings automatically use hardware-accelerated encoding (NVENC/Quick Sync/AMF) when your
-                      GPU and driver support it, falling back to software encoding otherwise - nothing to configure.
+                      Screen recordings are captured and encoded on your GPU (Quick Sync/NVENC/AMF) when it supports
+                      it - up to 4K at 60fps with almost no CPU, so the app stays smooth while you record. Auto
+                      records at your display's own resolution then; on other machines it records 1080p, and with a
+                      webcam baked into the video it records 1080p at 30fps. Nothing to configure.
                     </p>
                   </>
                 )}

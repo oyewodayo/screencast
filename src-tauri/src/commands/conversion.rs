@@ -1014,6 +1014,12 @@ pub async fn get_video_thumbnail(
     if cache_path.exists() {
         return path_to_str(&cache_path).map(|s| s.to_string());
     }
+    // A file that already failed both extractions isn't retried until it changes (the cache path
+    // is keyed by mtime, so a changed file gets a fresh key) - a broken file in a gallery used to
+    // cost two ffmpeg runs every time the grid re-rendered, about once a second, indefinitely.
+    if failed_video_thumbnails().contains(&cache_path) {
+        return Err("Thumbnail extraction already failed for this version of the file".to_string());
+    }
 
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1030,11 +1036,21 @@ pub async fn get_video_thumbnail(
         {
             let combined = format!("{err}; retry at frame 0 also failed: {err2}");
             log::error!("Video thumbnail failed for {}: {combined}", input.display());
+            failed_video_thumbnails().insert(cache_path);
             return Err(combined);
         }
     }
 
     path_to_str(&cache_path).map(|s| s.to_string())
+}
+
+fn failed_video_thumbnails() -> std::sync::MutexGuard<'static, std::collections::HashSet<PathBuf>> {
+    static FAILED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    FAILED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 // Lets a user pick which frame becomes a video's thumbnail - both inside Briefcast (gallery/
@@ -1378,6 +1394,13 @@ async fn generate_scrub_sprite(
         #[cfg(windows)]
         hide_console_window(&mut cmd);
         cmd.arg("-y");
+        // Decode keyframes only once tiles are far enough apart for keyframe spacing not to show
+        // (recordings carry one every 1-2s). Otherwise every frame of the file is decoded on the
+        // CPU just to keep a few dozen - measured 18s of CPU against 0.6s for a 15s 4K60
+        // recording, and it scales with length, right when the user opens a fresh recording.
+        if interval >= 2.0 {
+            cmd.args(["-skip_frame", "nokey"]);
+        }
         cmd.arg("-i").arg(path_to_str(&input)?);
         cmd.args([
             "-frames:v",

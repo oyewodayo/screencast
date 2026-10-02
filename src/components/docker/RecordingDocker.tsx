@@ -252,9 +252,9 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
                 className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
                 value={resolutionWidth ?? ""}
                 onChange={(e) => onResolutionWidthChange(e.target.value ? Number(e.target.value) : null)}
-                title="Downscales the recording to this max width - lower is smaller and easier to edit/share; Native keeps the display's own resolution"
+                title="Auto records at your display's full resolution (up to 4K) when your GPU can capture it, 1080p otherwise. Lower is smaller and easier to edit/share."
               >
-                <option value="">1080p (default)</option>
+                <option value="">Auto (default)</option>
                 <option value="1280">720p</option>
                 <option value="1920">1080p</option>
                 <option value="2560">1440p</option>
@@ -267,9 +267,9 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
                 className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
                 value={framerate ?? ""}
                 onChange={(e) => onFramerateChange(e.target.value ? Number(e.target.value) : null)}
-                title="Capture framerate - default is 60fps for Screen+Video+Audio, 30fps for other screen modes"
+                title="Auto is 60fps when your GPU can capture the screen, 30fps otherwise (and 30fps with a webcam baked into the video)"
               >
-                <option value="">Default</option>
+                <option value="">Auto</option>
                 <option value="24">24 fps</option>
                 <option value="30">30 fps</option>
                 <option value="60">60 fps</option>
