@@ -5,6 +5,8 @@
 // small, non-sensitive UI preference data with no need for filesystem placement or the
 // asset-scope concerns that apply to actual recording/annotation files.
 
+import type { AnnotationFade, AnnotationStyle } from "./annotationStyles";
+
 export interface AppSettings {
   defaultRecordType: string;
   defaultFileExt: string;
@@ -26,6 +28,17 @@ export interface AppSettings {
   // AnnotationOverlayWindow.tsx) — when false, Dashboard never creates the overlay window or
   // registers its hotkey at all.
   enableAnnotationTool: boolean;
+  // The overlay's ink (see utils/annotationStyles.ts) - re-read by the overlay every time draw mode
+  // turns on, so a change here applies from the next Ctrl+Shift+D without a restart. Colour and
+  // style can also be switched from the overlay's own toolbar mid-presentation; that's temporary.
+  annotationColor: string;
+  annotationWidth: number;
+  annotationStyle: AnnotationStyle;
+  annotationFade: AnnotationFade;
+  annotationShadow: boolean;
+  // Off hides the overlay's floating toolbar so drawing looks like it comes from nowhere while
+  // presenting - its keyboard shortcuts (Esc, Backspace, 1-8, P/M/N/L) still work.
+  annotationShowToolbar: boolean;
   // Whether the full recording setup panel (file name/type/recording options/audio+video
   // device pickers/Screenshot/Start Recording) still appears in the bottom docker. Its fields
   // now live here in Settings as defaults regardless of this - turning it off just also stops
@@ -77,10 +90,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
   homeBackgroundStyle: "graph",
   trashRetentionDays: 30,
   // The overlay this drives now stays hidden except for the brief, user-initiated span while
-  // draw mode is actually on (see ensure_annotation_overlay/toggleAnnotationDrawMode) - a hidden
+  // draw mode is actually on (see Dashboard.tsx's toggleAnnotationDrawMode) - a hidden
   // window can't block input no matter what, which is what makes it safe to default to on rather
   // than requiring an opt-in visit to Settings.
   enableAnnotationTool: true,
+  annotationColor: "#ef4444",
+  annotationWidth: 6,
+  annotationStyle: "pen",
+  annotationFade: "normal",
+  annotationShadow: false,
+  annotationShowToolbar: true,
   // Off by default - the bottom-right shortcut icons (see ActiveRecordingState.tsx) are the
   // primary way to start a recording now; the full panel is an opt-in for anyone who wants it.
   showRecordingDocker: false,

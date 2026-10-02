@@ -102,6 +102,22 @@
         "focus": false
       },
       {
+        "label": "annotation-overlay",
+        "title": "Annotation",
+        "url": "/annotation-overlay",
+        "width": 800,
+        "height": 600,
+        "resizable": false,
+        "minimizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "visible": false,
+        "focus": false
+      },
+      {
         "label": "presentation",
         "title": "Briefcast Live Display",
         "url": "/presentation",

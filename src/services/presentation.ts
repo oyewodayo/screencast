@@ -279,7 +279,9 @@ const GLOBAL_SHORTCUTS: [string, PresentationAction][] = [
 const registerGlobalShortcuts = async () => {
     for (const [shortcut, action] of GLOBAL_SHORTCUTS) {
         try {
-            if (await isRegistered(shortcut)) continue;
+            // Re-registered rather than skipped: after a page reload the plugin still holds the
+            // shortcut, bound to the dead page's callback (see bindShortcut in Dashboard.tsx).
+            if (await isRegistered(shortcut)) await unregister(shortcut);
             await register(shortcut, (event) => {
                 if (event.state === "Pressed") applyPresentationAction(action);
             });

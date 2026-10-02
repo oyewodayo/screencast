@@ -9,7 +9,6 @@ use std::env::consts::OS;
 use tauri::Manager;
 
 mod commands {
-    pub mod annotation;
     pub mod audio_tracks;
     pub mod conversion;
     pub mod native_playback;
@@ -416,7 +415,6 @@ fn main() {
             commands::native_playback::get_next_audio_chunk,
             commands::native_playback::seek_native_playback,
             commands::native_playback::stop_native_playback,
-            commands::annotation::ensure_annotation_overlay,
             commands::snip::snip_begin,
             commands::snip::snip_info,
             commands::snip::snip_frame,

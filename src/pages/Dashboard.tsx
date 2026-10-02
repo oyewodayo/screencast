@@ -7,6 +7,8 @@ import BottomDocker from "../components/BottomDocker";
 import { listen, emit } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { PhysicalPosition, PhysicalSize, availableMonitors } from '@tauri-apps/api/window';
+import { fadeTotalMs } from '../utils/annotationStyles';
 import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
 import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
@@ -175,6 +177,34 @@ const toggleOverlayVisibility = async () => {
   }
 };
 
+// Global shortcuts go through these two instead of register/unregister directly:
+//
+//  - bindShortcut always re-registers. The plugin keeps a shortcut registered on the Rust side
+//    across a page reload, still pointing at the dead page's callback - the old "register only if
+//    !isRegistered" check then skipped registering for the new page, so the shortcut silently did
+//    nothing after any reload (a Vite full reload in dev, Settings' "Reload app").
+//  - Every bind/unbind for one shortcut runs strictly in call order. Effect cleanups used to
+//    unregister asynchronously, so under StrictMode's mount -> unmount -> mount (and on effect
+//    re-runs) a late unregister could land after the new register and remove it.
+//  - The handler fires on key-down only; the plugin reports release too.
+const shortcutQueues = new Map<string, Promise<void>>();
+const queueShortcutOp = (accelerator: string, op: () => Promise<void>): Promise<void> => {
+  const next = (shortcutQueues.get(accelerator) ?? Promise.resolve()).catch(() => {}).then(op);
+  shortcutQueues.set(accelerator, next);
+  return next;
+};
+const bindShortcut = (accelerator: string, onPress: () => void): Promise<void> =>
+  queueShortcutOp(accelerator, async () => {
+    if (await isRegistered(accelerator)) await unregister(accelerator);
+    await register(accelerator, (event) => {
+      if (event.state === 'Pressed') onPress();
+    });
+  });
+const unbindShortcut = (accelerator: string): Promise<void> =>
+  queueShortcutOp(accelerator, async () => {
+    if (await isRegistered(accelerator)) await unregister(accelerator);
+  });
+
 // Toggles the system-wide stylus annotation overlay's "draw mode" - unlike the recording overlay
 // above, this one is available any time (not gated on an active recording), so its hotkey is
 // registered/unregistered purely based on the enableAnnotationTool setting (see the effect that
@@ -194,23 +224,15 @@ const PANEL_BUTTONS_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+B';
 // EnhancedScreenOptions' target picker (screen_size is hardcoded to "fullscreen") since the whole
 // point of a global hotkey is starting a recording without switching to this window first.
 const RECORDING_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+R';
-// Hard kill switch, independent of the Settings checkbox/localStorage. Confirmed on 2026-07-21:
-// flipping this to false reliably hangs the whole app (Briefcast.exe stops responding, verified via
-// Get-Process -> Responding: False) on first launch, right as ensure_annotation_overlay
-// (annotation.rs) creates the overlay window - it appears in the window list but the app never
-// gets past window.set_position()/set_size() afterward. This is a real deadlock, not just the
-// click-through issue the surrounding comments describe, and reproduced twice in a row on a 4K/2.5x
-// scaled display. Root cause not yet found - likely something in tauri::WindowBuilder::build() or
-// the physical set_position/set_size calls blocking the main event loop thread from an async
-// command context. Do not flip this without first fixing that deadlock and confirming
-// ensure_annotation_overlay can return successfully (add temporary eprintln checkpoints around the
-// build()/set_position()/set_size() calls in annotation.rs and watch `npm run tauri dev`'s output -
-// the run stops dead between the bounds log line and a final success log line).
-const ANNOTATION_FEATURE_DISABLED = true;
 // How long to keep the overlay window shown (but click-through) after draw mode turns off, so a
-// stroke that's still fading gets to finish instead of vanishing instantly. Covers
-// AnnotationOverlayWindow.tsx's FADE_HOLD_MS (1200) + FADE_OUT_MS (1400) with margin.
-const ANNOTATION_FADE_GRACE_MS = 3000;
+// stroke that's still fading gets to finish instead of vanishing instantly - the longest fade the
+// current Settings > Annotation fade can produce (the overlay's toolbar can switch style, never
+// fade), plus margin. "Until I exit" strokes are dropped by the overlay itself on exit; laser trails
+// still fade, which is what the laser term covers there.
+const annotationFadeGraceMs = (): number => {
+	const { annotationFade } = loadSettings();
+	return Math.max(fadeTotalMs('pen', annotationFade), fadeTotalMs('laser', annotationFade)) + 400;
+};
 
 interface FileEntry {
     name: string;
@@ -812,12 +834,8 @@ useEffect(() => {
       if (overlayWindow) {
         await overlayWindow.hide();
       }
-      if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
-        await unregister(OVERLAY_TOGGLE_SHORTCUT);
-      }
-      if (await isRegistered(VIEW_SWITCH_SHORTCUT)) {
-        await unregister(VIEW_SWITCH_SHORTCUT);
-      }
+      await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
+      await unbindShortcut(VIEW_SWITCH_SHORTCUT);
       setCanSwitchView(false);
     });
     
@@ -1160,9 +1178,7 @@ const setScreen = () => {
               Boolean(formData.video_devices?.includes(PHONE_CAMERA_DEVICE))),
         });
 
-        if (!(await isRegistered(OVERLAY_TOGGLE_SHORTCUT))) {
-          await register(OVERLAY_TOGGLE_SHORTCUT, toggleOverlayVisibility);
-        }
+        await bindShortcut(OVERLAY_TOGGLE_SHORTCUT, () => void toggleOverlayVisibility());
 
         const switchable =
           formData.record_type === 'sva' &&
@@ -1171,10 +1187,8 @@ const setScreen = () => {
         setViewMode('screen');
         viewSwitchRef.current.canSwitchView = switchable;
         viewSwitchRef.current.viewMode = 'screen';
-        if (switchable && !(await isRegistered(VIEW_SWITCH_SHORTCUT))) {
-          await register(VIEW_SWITCH_SHORTCUT, (event) => {
-            if (event.state === 'Pressed') void switchViewRef.current('toggle');
-          });
+        if (switchable) {
+          await bindShortcut(VIEW_SWITCH_SHORTCUT, () => void switchViewRef.current('toggle'));
         }
 
         setMessage(
@@ -1300,12 +1314,8 @@ const setScreen = () => {
     if (overlayWindow) {
       await overlayWindow.hide();
     }
-    if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
-      await unregister(OVERLAY_TOGGLE_SHORTCUT);
-    }
-    if (await isRegistered(VIEW_SWITCH_SHORTCUT)) {
-      await unregister(VIEW_SWITCH_SHORTCUT);
-    }
+    await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
+    await unbindShortcut(VIEW_SWITCH_SHORTCUT);
     setCanSwitchView(false);
 
     if (isMonitoring) {
@@ -1677,12 +1687,18 @@ const setScreen = () => {
 	// to show/hide the floating toolbar. Called both by the global hotkey (toggles) and by the
 	// turn-off-request listener below (forces off, e.g. from the overlay's Esc/close button).
 	//
-	// The overlay stays hidden except for this deliberately brief, user-initiated window - see the
-	// long comment in ensure_annotation_overlay (annotation.rs) for why: a click-through style that
-	// silently fails to apply is nearly harmless on a window that's about to be hidden anyway, but
-	// catastrophic on one left permanently visible in the background. show()/setIgnoreCursorEvents
-	// are also always sequenced show-before-ignore when turning draw mode on, since setting that
-	// style before a window has ever been shown is what didn't reliably stick on Windows.
+	// The overlay stays hidden except for this deliberately brief, user-initiated window: a
+	// click-through style that silently fails to apply is nearly harmless on a window that's about
+	// to be hidden anyway, but catastrophic on one left permanently visible in the background (an
+	// invisible, always-on-top, all-monitors window eating every click on the desktop).
+	// show()/setIgnoreCursorEvents are also always sequenced show-before-ignore when turning draw
+	// mode on, since setting that style before a window has ever been shown is what didn't reliably
+	// stick on Windows.
+	//
+	// The window itself is pre-declared in tauri.conf.json (like the snip overlay) and placed from
+	// here, over the union of every monitor, each time it's shown - so a monitor plugged in or
+	// rearranged since last time is covered too. Building and placing it from a Rust command instead
+	// deadlocked the whole app on a 4K/250% display (what kept this feature switched off).
 	const toggleAnnotationDrawMode = useCallback(async (forceOff = false) => {
 		const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 		if (!overlay) return;
@@ -1696,33 +1712,43 @@ const setScreen = () => {
 
 		try {
 			if (next) {
+				const monitors = await availableMonitors();
+				if (monitors.length > 0) {
+					const left = Math.min(...monitors.map((m) => m.position.x));
+					const top = Math.min(...monitors.map((m) => m.position.y));
+					const right = Math.max(...monitors.map((m) => m.position.x + m.size.width));
+					const bottom = Math.max(...monitors.map((m) => m.position.y + m.size.height));
+					await overlay.setPosition(new PhysicalPosition(left, top));
+					await overlay.setSize(new PhysicalSize(right - left, bottom - top));
+				}
 				await overlay.show();
 				await overlay.setIgnoreCursorEvents(false);
+				// Focused so Esc reaches the overlay's own keydown listener; hiding it hands focus
+				// back to whatever was underneath (the slides, the browser...).
+				await overlay.setFocus();
 				await overlay.emit('annotation-mode-changed', { active: true });
 			} else {
 				await overlay.emit('annotation-mode-changed', { active: false });
 				await overlay.setIgnoreCursorEvents(true);
 				// Not hidden immediately - a still-fading stroke should keep fading, not vanish the
-				// instant draw mode turns off. ANNOTATION_FADE_GRACE_MS covers the overlay's own
-				// FADE_HOLD_MS + FADE_OUT_MS (AnnotationOverlayWindow.tsx) with margin. Click-through
+				// instant draw mode turns off. annotationFadeGraceMs covers the overlay's own fade
+				// (utils/annotationStyles.ts) with margin. Click-through
 				// is already applied above, so even if this timer never fires (e.g. the app closes
 				// first), the overlay can't block input in the meantime.
 				annotationHideTimeoutRef.current = window.setTimeout(() => {
 					annotationHideTimeoutRef.current = null;
 					if (!annotationDrawModeRef.current) void overlay.hide();
-				}, ANNOTATION_FADE_GRACE_MS);
+				}, annotationFadeGraceMs());
 			}
 		} catch (err) {
 			console.error('Failed to toggle annotation draw mode:', err);
 		}
 	}, []);
 
-	// Creates (idempotent) and shows the annotation overlay + registers its hotkey whenever the
-	// feature is enabled; tears both down whenever it's disabled. Independent of recording state —
-	// this feature is meant to be available any time, not just mid-recording (unlike
-	// OVERLAY_TOGGLE_SHORTCUT above).
+	// Registers the annotation hotkey whenever the feature is enabled; unregisters it (and hides the
+	// overlay) whenever it's disabled. Independent of recording state — this feature is meant to be
+	// available any time, not just mid-recording (unlike OVERLAY_TOGGLE_SHORTCUT above).
 	useEffect(() => {
-		if (ANNOTATION_FEATURE_DISABLED) return;
 		let cancelled = false;
 
 		(async () => {
@@ -1730,27 +1756,15 @@ const setScreen = () => {
 				if (annotationDrawModeRef.current) {
 					await toggleAnnotationDrawMode(true);
 				}
-				if (await isRegistered(ANNOTATION_TOGGLE_SHORTCUT)) {
-					await unregister(ANNOTATION_TOGGLE_SHORTCUT);
-				}
+				await unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
 				const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 				if (overlay) await overlay.hide();
 				return;
 			}
 
-			try {
-				await invoke('ensure_annotation_overlay');
-			} catch (err) {
-				console.error('Failed to create annotation overlay:', err);
-				return;
-			}
 			if (cancelled) return;
 			try {
-				if (!(await isRegistered(ANNOTATION_TOGGLE_SHORTCUT))) {
-					await register(ANNOTATION_TOGGLE_SHORTCUT, () => {
-						void toggleAnnotationDrawMode();
-					});
-				}
+				await bindShortcut(ANNOTATION_TOGGLE_SHORTCUT, () => void toggleAnnotationDrawMode());
 			} catch (err) {
 				// Most likely cause: another already-running app has this exact combo registered
 				// as its own OS-level global hotkey, so ours is rejected - surfaced here (rather
@@ -1783,9 +1797,7 @@ const setScreen = () => {
 	// Unregister on unmount so the hotkey doesn't linger after Dashboard itself goes away.
 	useEffect(() => {
 		return () => {
-			isRegistered(ANNOTATION_TOGGLE_SHORTCUT).then((registered) => {
-				if (registered) void unregister(ANNOTATION_TOGGLE_SHORTCUT);
-			});
+			void unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
 		};
 	}, []);
 
@@ -1808,11 +1820,7 @@ const setScreen = () => {
 
 		(async () => {
 			try {
-				if (!(await isRegistered(PANEL_BUTTONS_TOGGLE_SHORTCUT)) && !cancelled) {
-					await register(PANEL_BUTTONS_TOGGLE_SHORTCUT, () => {
-						void toggleRecordingPanelButtons();
-					});
-				}
+				if (!cancelled) await bindShortcut(PANEL_BUTTONS_TOGGLE_SHORTCUT, toggleRecordingPanelButtons);
 			} catch (err) {
 				console.error('Failed to register panel-buttons hotkey:', err);
 				setError(`Couldn't register the panel-buttons shortcut (${PANEL_BUTTONS_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
@@ -1821,9 +1829,7 @@ const setScreen = () => {
 
 		return () => {
 			cancelled = true;
-			isRegistered(PANEL_BUTTONS_TOGGLE_SHORTCUT).then((registered) => {
-				if (registered) void unregister(PANEL_BUTTONS_TOGGLE_SHORTCUT);
-			});
+			void unbindShortcut(PANEL_BUTTONS_TOGGLE_SHORTCUT);
 		};
 	}, [toggleRecordingPanelButtons]);
 
@@ -1881,11 +1887,7 @@ const setScreen = () => {
 
 		(async () => {
 			try {
-				if (!(await isRegistered(RECORDING_TOGGLE_SHORTCUT)) && !cancelled) {
-					await register(RECORDING_TOGGLE_SHORTCUT, () => {
-						handleRecordingToggleHotkey();
-					});
-				}
+				if (!cancelled) await bindShortcut(RECORDING_TOGGLE_SHORTCUT, handleRecordingToggleHotkey);
 			} catch (err) {
 				console.error('Failed to register recording-toggle hotkey:', err);
 				setError(`Couldn't register the start/stop recording shortcut (${RECORDING_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
@@ -1894,9 +1896,7 @@ const setScreen = () => {
 
 		return () => {
 			cancelled = true;
-			isRegistered(RECORDING_TOGGLE_SHORTCUT).then((registered) => {
-				if (registered) void unregister(RECORDING_TOGGLE_SHORTCUT);
-			});
+			void unbindShortcut(RECORDING_TOGGLE_SHORTCUT);
 		};
 	}, [handleRecordingToggleHotkey]);
 
@@ -1905,12 +1905,9 @@ const setScreen = () => {
 	useEffect(() => {
 		(async () => {
 			try {
-				if (!(await isRegistered(SNIP_SHORTCUT))) {
-					await register(SNIP_SHORTCUT, (event) => {
-						if (event.state !== 'Pressed') return;
-						startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
-					});
-				}
+				await bindShortcut(SNIP_SHORTCUT, () => {
+					startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+				});
 			} catch (err) {
 				console.warn(`Couldn't register ${SNIP_SHORTCUT}:`, err);
 			}
@@ -1923,9 +1920,7 @@ const setScreen = () => {
 		});
 		return () => {
 			unlisten.then((fn) => fn());
-			isRegistered(SNIP_SHORTCUT).then((registered) => {
-				if (registered) void unregister(SNIP_SHORTCUT);
-			});
+			void unbindShortcut(SNIP_SHORTCUT);
 		};
 	}, []);
 

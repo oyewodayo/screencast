@@ -6,6 +6,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { AppSettings, DEFAULT_SETTINGS, loadSettings, saveSettings } from "../../utils/appSettings";
 import { ThemePreference, useTheme } from "../../contexts/ThemeContext";
 import { formatFileSize } from "../../utils/Formater";
+import { ANNOTATION_COLORS, ANNOTATION_FADES, ANNOTATION_STYLES } from "../../utils/annotationStyles";
+import AnnotationPreview from "./AnnotationPreview";
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -51,6 +53,32 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
     <span className="text-sm text-neutral-700 dark:text-neutral-300">{label}</span>
     {children}
   </label>
+);
+
+// Pill-style single choice (annotation style/fade) - same look as a segmented control.
+const Segmented = <T extends string>({ value, options, onChange, disabled }: {
+  value: T;
+  options: { id: T; label: string }[];
+  onChange: (value: T) => void;
+  disabled?: boolean;
+}) => (
+  <div className="flex p-0.5 rounded-lg bg-neutral-100 dark:bg-neutral-800">
+    {options.map((o) => (
+      <button
+        key={o.id}
+        type="button"
+        disabled={disabled}
+        onClick={() => onChange(o.id)}
+        className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+          value === o.id
+            ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
+            : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-100"
+        }`}
+      >
+        {o.label}
+      </button>
+    ))}
+  </div>
 );
 
 // Mirrors services/telemetry.rs's TelemetrySettings. `available` is false in builds compiled
@@ -749,6 +777,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
             )}
 
             {activeSection === "annotation" && (
+              <>
               <Section title="Presentation annotation">
                 <Field label="Enable annotation tool">
                   <input
@@ -760,9 +789,144 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                 </Field>
                 <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
                   While enabled, press Ctrl+Shift+D (Cmd+Shift+D on Mac) anywhere to draw on screen — circle or underline
-                  anything to emphasize it. Strokes fade out on their own after a few seconds.
+                  anything to emphasize it. Press Esc or the shortcut again to stop.
                 </p>
+                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
+                  <Field label="Show toolbar while drawing">
+                    <input
+                      type="checkbox"
+                      checked={settings.annotationShowToolbar}
+                      onChange={(e) => update("annotationShowToolbar", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer"
+                    />
+                  </Field>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                    {settings.annotationShowToolbar
+                      ? "Turn off to draw with nothing else on screen, so it looks like magic."
+                      : "Hidden - drive it from the keyboard instead:"}
+                  </p>
+                  {/* Shown either way - they work with the toolbar too. */}
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs text-neutral-500 dark:text-neutral-400">
+                    {[
+                      ["Esc", "Stop drawing"],
+                      ["Backspace", "Clear the screen"],
+                      ["1 – 8", "Pick a colour"],
+                      ["P  M  N  L", "Pen, Marker, Neon, Laser"],
+                    ].map(([keys, what]) => (
+                      <div key={keys} className="flex items-center justify-between gap-2">
+                        <span>{what}</span>
+                        <kbd className="px-1.5 py-0.5 rounded-md font-mono text-[10px] bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700">
+                          {keys}
+                        </kbd>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </Section>
+
+              <Section title="Ink">
+                {/* Everything below applies from the next time draw mode opens - no restart. */}
+                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
+                  <AnnotationPreview
+                    color={settings.annotationColor}
+                    width={settings.annotationWidth}
+                    style={settings.annotationStyle}
+                    shadow={settings.annotationShadow}
+                  />
+
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Color</span>
+                    <div className="flex items-center gap-1.5">
+                      {ANNOTATION_COLORS.map((c) => (
+                        <button
+                          key={c}
+                          type="button"
+                          onClick={() => update("annotationColor", c)}
+                          aria-label={`Color ${c}`}
+                          aria-pressed={settings.annotationColor.toLowerCase() === c}
+                          className={`w-6 h-6 rounded-full ring-1 ring-black/15 dark:ring-white/25 transition-transform hover:scale-110 ${
+                            settings.annotationColor.toLowerCase() === c ? "outline outline-2 outline-offset-2 outline-blue-500" : ""
+                          }`}
+                          style={{ backgroundColor: c }}
+                        />
+                      ))}
+                      <label
+                        className={`relative w-6 h-6 rounded-full cursor-pointer ring-1 ring-black/15 dark:ring-white/25 bg-[conic-gradient(#ef4444,#facc15,#22c55e,#3b82f6,#a855f7,#ef4444)] ${
+                          ANNOTATION_COLORS.includes(settings.annotationColor.toLowerCase()) ? "" : "outline outline-2 outline-offset-2 outline-blue-500"
+                        }`}
+                        data-tip="Custom color"
+                      >
+                        <input
+                          type="color"
+                          value={settings.annotationColor}
+                          onChange={(e) => update("annotationColor", e.target.value)}
+                          className="absolute inset-0 opacity-0 cursor-pointer"
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between gap-4">
+                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Style</span>
+                      <Segmented value={settings.annotationStyle} options={ANNOTATION_STYLES} onChange={(v) => update("annotationStyle", v)} />
+                    </div>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                      {ANNOTATION_STYLES.find((st) => st.id === settings.annotationStyle)?.hint}
+                    </p>
+                  </div>
+
+                  <Field label="Size">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min={2}
+                        max={24}
+                        step={1}
+                        value={settings.annotationWidth}
+                        onChange={(e) => update("annotationWidth", Number(e.target.value))}
+                        className="w-32 accent-blue-500"
+                      />
+                      <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-6 text-right">{settings.annotationWidth}</span>
+                    </div>
+                  </Field>
+
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between gap-4">
+                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Fade out</span>
+                      <Segmented
+                        value={settings.annotationFade}
+                        options={ANNOTATION_FADES}
+                        onChange={(v) => update("annotationFade", v)}
+                        disabled={settings.annotationStyle === "laser"}
+                      />
+                    </div>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                      {settings.annotationStyle === "laser"
+                        ? "Laser trails always vanish in under a second."
+                        : settings.annotationFade === "never"
+                        ? "Strokes stay until you press Clear or leave draw mode."
+                        : "How long each stroke stays before fading away."}
+                    </p>
+                  </div>
+
+                  <Field label="Drop shadow">
+                    <input
+                      type="checkbox"
+                      checked={settings.annotationShadow}
+                      disabled={settings.annotationStyle === "neon" || settings.annotationStyle === "laser"}
+                      onChange={(e) => update("annotationShadow", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer disabled:opacity-40 disabled:cursor-default"
+                    />
+                  </Field>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">
+                    {settings.annotationStyle === "neon" || settings.annotationStyle === "laser"
+                      ? "Neon and Laser already glow, so they don't use a shadow."
+                      : "Keeps ink readable on busy or same-coloured backgrounds."}
+                  </p>
+                </div>
+              </Section>
+              </>
             )}
 
             {activeSection === "files" && (
