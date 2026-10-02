@@ -769,6 +769,15 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     selectedFileRef.current = selectedFile;
   }, [selectedFile]);
 
+  // Native window title shows what's open - "lecture.mp4 - Briefcast", the usual Windows order -
+  // and goes back to plain "Briefcast" when nothing is.
+  useEffect(() => {
+    const title = selectedFile ? `${selectedFile.name} - Briefcast` : "Briefcast";
+    getCurrentWebviewWindow()
+      .setTitle(title)
+      .catch((err) => console.error("Failed to set window title:", err));
+  }, [selectedFile?.name]);
+
 
 useEffect(() => {
   const setupListener = async () => {
@@ -2800,6 +2809,12 @@ const setScreen = () => {
 			? "Search results:"
 			: filteredEntries.length === 1 ? `${folderDisplayName(filteredEntries[0][0])}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
 	const isAudioSelected = selectedFile !== null && getFileCategory(selectedFile.name) === "audio";
+	// Whether the player's own prev/next buttons have anywhere to go - same list navigateAudio/
+	// navigateVideo walk.
+	const selectedMediaCategory = selectedFile ? getFileCategory(selectedFile.name) : null;
+	const hasSiblingMedia =
+		(selectedMediaCategory === "audio" || selectedMediaCategory === "video") &&
+		getFlatFilesForCategory(selectedMediaCategory).length > 1;
 
   return (
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
@@ -3764,7 +3779,6 @@ const setScreen = () => {
                 key={selectedFile.path}
                 src={selectedFile.path}
                 sourcePath={selectedFile.sourcePath}
-                title={selectedFile.name}
                 isFullscreen={isPdfFullscreen}
                 onToggleFullscreen={handleTogglePdfFullscreen}
               />
@@ -3814,6 +3828,8 @@ const setScreen = () => {
                 }}
                 onPlayStateChange={setPlayerIsPlaying}
                 onEnded={handleMediaEnded}
+                onPrevious={hasSiblingMedia ? () => (isAudioSelected ? navigateAudio(-1) : navigateVideo(-1)) : undefined}
+                onNext={hasSiblingMedia ? () => (isAudioSelected ? navigateAudio(1) : navigateVideo(1)) : undefined}
                 autoplayNext={isAudioSelected ? audioAutoplayNext : videoAutoplayNext}
                 onAutoplayNextChange={() =>
                   isAudioSelected ? setAudioAutoplayNext((prev) => !prev) : setVideoAutoplayNext((prev) => !prev)

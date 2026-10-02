@@ -775,6 +775,56 @@ input:focus-visible {
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 
+/* Skip-amount picker (custom/Dropdown.tsx) - a compact sibling of .settings-menu. Selectors are
+   class + button type for the same reason as .settings-menu button.settings-row: to beat the
+   generic .controls button rule. */
+.skip-menu {
+    min-width: 150px;
+    padding: 0.3rem 0;
+    font-size: 0.8125rem;
+}
+
+.skip-menu-header {
+    padding: 0.4rem 0.9rem 0.3rem;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    opacity: 0.5;
+}
+
+.video-controls-container .controls .skip-menu button.skip-menu-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    width: 100%;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.8125rem;
+    text-align: left;
+    opacity: 1;
+}
+
+.video-controls-container .controls .skip-menu button.skip-menu-item:hover {
+    background-color: rgba(120, 120, 120, 0.12);
+    transform: none;
+}
+
+/* Percentage readout next to a submenu slider (Noise > Strength) - fixed width so the slider
+   doesn't shift as the number changes. */
+.settings-slider-value {
+    min-width: 2.4rem;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The "AI" marker on Noise > Remove noise - matches NoiseReductionPopover's own. */
+.settings-row-label svg.settings-sparkle {
+    font-size: 0.7rem;
+    color: #fcd34d;
+    opacity: 1;
+}
+
 .settings-slider::-moz-range-thumb {
     width: 12px;
     height: 12px;

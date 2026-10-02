@@ -4,7 +4,7 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { trackEvent } from '../utils/telemetry';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { IoPause, IoPlay, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
+import { IoPause, IoPlay, IoPlaySkipBack, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -131,6 +131,8 @@ interface KeyboardHandlerActions {
   stepFrameBackward: () => void;
   stepFrameForward: () => void;
   toggleShortcutsOverlay: () => void;
+  playPrevious?: () => void;
+  playNext?: () => void;
 }
 
 // Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
@@ -192,6 +194,11 @@ interface VideoPlayerProps {
   // sibling, VideoTimelineDocker) surfaces this as its spinner - same "report state upward for a
   // sibling to consume" shape as onActiveClipChange itself.
   onNoiseReductionStatusChange?: (status: "idle" | "calibrating" | "active") => void;
+  // Previous/next file in the same category (Dashboard's navigateAudio/navigateVideo) - shown as
+  // skip buttons either side of play/pause so switching files doesn't need the sidebar. Omitted
+  // (no buttons) when there's nothing else to switch to.
+  onPrevious?: () => void;
+  onNext?: () => void;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -240,15 +247,55 @@ function loadNoiseSamplePcm(sourcePath: string, start: number, end: number): Pro
   return cached;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange }, ref) => {
+// Settings > Noise - the player's own "just make this sound better while I watch" choice, separate
+// from any clip edit: never saved into the file or its edit sidecar, only remembered as a viewing
+// preference (localStorage, same as the captions prefs) so it carries over to the next file.
+export type PlayerNoise = { mode: 'reduce' | 'remove'; strength: number } | null;
+const PLAYER_NOISE_KEY = 'briefcast:playerNoise';
+const readPlayerNoise = (): PlayerNoise => {
+  try {
+    const v = JSON.parse(localStorage.getItem(PLAYER_NOISE_KEY) ?? 'null');
+    if ((v?.mode === 'reduce' || v?.mode === 'remove') && typeof v.strength === 'number') {
+      return { mode: v.mode, strength: Math.max(0.05, Math.min(1, v.strength)) };
+    }
+  } catch {
+    // Missing/corrupt/locked-down storage - start with it off.
+  }
+  return null;
+};
+// Layers the player's noise choice over the active clip's own effects (or stands alone when no
+// timeline clip is tracked), so the one cleanup graph below serves both. While it's on it decides
+// the denoise mode/strength; the clip's own extras (low-cut, hum, gate, levelling) still apply.
+const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): ActiveClipEffects | null => {
+  if (!noise) return fx;
+  const base: ActiveClipEffects = fx ?? { id: 'player', sourceStart: 0, sourceEnd: 0 };
+  return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
+};
+
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange, onPrevious, onNext }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
   // (called both from the effect below AND imperatively from previewCropLive, whose own closure is
   // frozen at mount - see the comment on the useImperativeHandle factory) always reads the current
   // value instead of whatever activeClipEffects happened to be at mount time.
-  const activeClipEffectsRef = useRef(activeClipEffects);
-  activeClipEffectsRef.current = activeClipEffects;
+  //
+  // Holds audioEffects (the clip's effects with Settings > Noise layered on top) - identical to the
+  // prop for every visual field, which withPlayerNoise never touches.
+  const [playerNoise, setPlayerNoiseState] = useState<PlayerNoise>(readPlayerNoise);
+  const setPlayerNoise = (next: PlayerNoise): void => {
+    setPlayerNoiseState(next);
+    try {
+      localStorage.setItem(PLAYER_NOISE_KEY, JSON.stringify(next));
+    } catch {
+      // Private/locked-down storage - still works for this session.
+    }
+  };
+  const audioEffects = useMemo(() => withPlayerNoise(activeClipEffects, playerNoise), [activeClipEffects, playerNoise]);
+  const activeClipEffectsRef = useRef(audioEffects);
+  activeClipEffectsRef.current = audioEffects;
+  // Mirrors the cleanup graph's status for the Settings > Noise row.
+  const [noiseStatus, setNoiseStatus] = useState<'idle' | 'calibrating' | 'active'>('idle');
   // Non-null exactly while ClipCropOverlay has an in-progress drag - see previewCropLive below and
   // VideoPlayerHandle's own doc comment on it.
   const liveCropOverrideRef = useRef<ClipCrop | null>(null);
@@ -266,15 +313,24 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // clock could stall on, which read as "clicking the clip stopped playback".
   const noiseCtxRef = useRef<AudioContext | null>(null);
   const noiseWorkletReadyRef = useRef<Promise<void> | null>(null);
-  // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only) - a
-  // completely separate AudioContext/graph from the noise-reduction one above, not a shared one:
-  // noiseCtxRef's own createMediaElementSource call only ever fires when activeClipEffects has a
-  // noiseReduction value, which only the timeline editor (video-only) ever sets, so the two never
-  // actually compete for this element's one-time-only createMediaElementSource call in practice,
-  // and keeping them separate avoids retrofitting that already-working code to share a source.
-  const audioVisualizerCtxRef = useRef<AudioContext | null>(null);
+  // This element's one MediaElementAudioSourceNode (createMediaElementSource can only ever be called
+  // once per element) and the bus everything audible flows through to the speakers, both on
+  // noiseCtxRef. Shared by the audio-file visualizer (which taps `bus`) and the cleanup graph
+  // (which takes over from the direct source -> bus passthrough) - Settings > Noise means cleanup
+  // can now run on audio files too, so the two can no longer live in separate contexts.
+  const mediaSourceRef = useRef<{ source: MediaElementAudioSourceNode; bus: GainNode } | null>(null);
+  const attachMediaSource = (ctx: AudioContext, video: HTMLVideoElement) => {
+    if (!mediaSourceRef.current) {
+      const source = ctx.createMediaElementSource(video);
+      const bus = new GainNode(ctx, { gain: 1 });
+      bus.connect(ctx.destination);
+      source.connect(bus);
+      mediaSourceRef.current = { source, bus };
+    }
+    return mediaSourceRef.current;
+  };
+  // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only).
   const audioAnalyserRef = useRef<AnalyserNode | null>(null);
-  const audioVisualizerSetupRef = useRef(false);
   const visualizerCanvasRef = useRef<HTMLCanvasElement>(null);
   // The cleanup graph, built once addModule has resolved AND a clip has actually asked for any
   // audio cleanup - null until then, so a session that never touches the feature never pays for a
@@ -328,8 +384,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Which noise sample (sourcePath|start|end) the worklet currently holds a profile for, or null
   // for "adaptive tracking" - so a profile is only re-decoded/re-sent when the pick changes.
   const noiseProfileKeyRef = useRef<string | null>(null);
-  const onNoiseReductionStatusChangeRef = useRef(onNoiseReductionStatusChange);
-  onNoiseReductionStatusChangeRef.current = onNoiseReductionStatusChange;
+  // Fresh every render so the keyboard handler (bound once per mediaType) never calls a stale one.
+  const onPreviousRef = useRef(onPrevious);
+  onPreviousRef.current = onPrevious;
+  const onNextRef = useRef(onNext);
+  onNextRef.current = onNext;
+  const onNoiseReductionStatusChangeRef = useRef<VideoPlayerProps['onNoiseReductionStatusChange']>(undefined);
+  onNoiseReductionStatusChangeRef.current = (status) => {
+    setNoiseStatus(status);
+    onNoiseReductionStatusChange?.(status);
+  };
 
   // Pre-warm: kicks off the AudioContext + worklet module load immediately on mount, well before
   // any clip has actually asked for noise reduction - see noiseCtxRef's own doc comment for why.
@@ -348,7 +412,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       });
     return () => {
       noiseGraphUnmountedRef.current = true;
-      noiseGraphRef.current?.source.disconnect();
+      mediaSourceRef.current?.source.disconnect();
       ctx.close().catch(() => {});
     };
   }, []);
@@ -479,6 +543,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [hoveredChapter, setHoveredChapter] = useState<Chapter | null>(null);
   const chaptersBtnRef = useRef<HTMLButtonElement>(null);
   const chaptersMenuRef = useRef<HTMLDivElement>(null);
+  // Wraps both skip buttons and their skip-amount picker - clicks inside it don't count as
+  // "outside" (the buttons' own double-click is what toggles the picker).
+  const skipControlsRef = useRef<HTMLDivElement>(null);
   // "?" toggles this - see keyboardHandlers.ts's own comment on why a keyboard-only affordance
   // (no toolbar button) matches the convention this mirrors.
   const [showShortcutsOverlay, setShowShortcutsOverlay] = useState<boolean>(false);
@@ -711,41 +778,42 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     };
   }, [mediaType, filePath]);
 
-  // Sets up the real-time audio-reactive visualizer graph once, the first time this element is
-  // actually playing audio (mediaType 'audio') - a completely separate AudioContext/graph from the
-  // noise-reduction one above (see audioVisualizerCtxRef's own doc comment for why that's fine).
-  // createMediaElementSource detaches the element's native audio output the instant it's called,
-  // so this resumes the (possibly suspended, per browser autoplay policy) context and reconnects
-  // through the analyser in the same synchronous block - otherwise there'd be an audible gap where
-  // the file kept "playing" but produced no sound at all until some later resume.
+  // Sets up the real-time audio-reactive visualizer the first time this element is actually playing
+  // audio (mediaType 'audio') - an analyser tapping the shared output bus (see mediaSourceRef), so
+  // it draws what's actually heard, cleaned or not. createMediaElementSource detaches the element's
+  // native audio output the instant it's called, so attachMediaSource reconnects it to the speakers
+  // in the same synchronous block, and the (possibly suspended, per browser autoplay policy) context
+  // is resumed right after - otherwise there'd be an audible gap where the file kept "playing" but
+  // produced no sound at all until some later resume.
   useEffect(() => {
-    if (mediaType !== 'audio' || audioVisualizerSetupRef.current) return;
+    if (mediaType !== 'audio') return;
     const video = videoRef.current;
-    if (!video) return;
-    audioVisualizerSetupRef.current = true;
+    const ctx = noiseCtxRef.current;
+    if (!video || !ctx) return;
 
-    const ctx = new AudioContext();
+    let bus: GainNode;
     try {
-      const source = ctx.createMediaElementSource(video);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.8;
-      source.connect(analyser);
-      analyser.connect(ctx.destination);
-      if (ctx.state === "suspended") ctx.resume().catch(() => {});
-      audioVisualizerCtxRef.current = ctx;
-      audioAnalyserRef.current = analyser;
+      bus = attachMediaSource(ctx, video).bus;
     } catch (err) {
       console.error("Failed to set up audio visualizer:", err);
-      ctx.close().catch(() => {});
+      return;
     }
+    // Left unconnected downstream - an analyser is pulled on its own, and the bus already feeds
+    // the speakers.
+    const analyser = new AnalyserNode(ctx, { fftSize: 1024, smoothingTimeConstant: 0.8 });
+    bus.connect(analyser);
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    audioAnalyserRef.current = analyser;
 
     return () => {
       audioAnalyserRef.current = null;
-      audioVisualizerCtxRef.current = null;
-      audioVisualizerSetupRef.current = false;
-      ctx.close().catch(() => {});
+      try {
+        bus.disconnect(analyser);
+      } catch {
+        // Context already closed on unmount.
+      }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mediaType]);
 
   // Draws the live waveform while playing; shows a flat idle line otherwise. Measures the canvas
@@ -1394,7 +1462,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // clip is active. Export counterpart is audio_cleanup_filters (conversion.rs): highpass ->
   // bandreject x3 -> afftdn|arnndn -> agate, the same order and roughly the same settings, so the
   // preview and export sound alike without being bit-identical.
-  const audioCleanupKey = JSON.stringify(activeClipEffects?.audioCleanup ?? null);
+  const audioCleanupKey = JSON.stringify(audioEffects?.audioCleanup ?? null);
   useEffect(() => {
     const effects = activeClipEffectsRef.current;
     const enabled = !!effects && hasAudioCleanup(effects);
@@ -1518,7 +1586,10 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         // the gap an earlier version of this had (async module-load happening AFTER the detach),
         // which could stall the element's own AV-sync clock and read as "clicking the clip stopped
         // playback".
-        const source = ctx.createMediaElementSource(video);
+        // Reuses the visualizer's source if it already exists, taking over from its direct
+        // source -> bus passthrough.
+        const { source, bus } = attachMediaSource(ctx, video);
+        source.disconnect(bus);
         const lowCut = new BiquadFilterNode(ctx, { type: 'allpass', frequency: 80, Q: 0.707 });
         const hum = [1, 2, 3].map((h) => new BiquadFilterNode(ctx, { type: 'allpass', frequency: 50 * h, Q: 8 }));
         const reduce = new AudioWorkletNode(ctx, 'noise-reduction-processor', { outputChannelCount: [2] });
@@ -1545,8 +1616,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         tail.connect(reduce).connect(reduceGain).connect(gate);
         tail.connect(dryDelay).connect(dryGain).connect(gate);
         wetGain.connect(gate);
-        gate.connect(leveler).connect(processedGain).connect(ctx.destination);
-        source.connect(originalGain).connect(ctx.destination);
+        gate.connect(leveler).connect(processedGain).connect(bus);
+        source.connect(originalGain).connect(bus);
 
         noiseGraphRef.current = { ctx, source, lowCut, hum, reduce, reduceGain, rnnoise: null, wetGain, dryGain, gate, leveler, processedGain, originalGain };
         applySettings();
@@ -1563,7 +1634,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         noiseGraphSetupInProgressRef.current = false;
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.id, activeClipEffects?.noiseReduction, activeClipEffects?.sourcePath, audioCleanupKey]);
+  }, [audioEffects?.id, audioEffects?.noiseReduction, audioEffects?.sourcePath, audioCleanupKey]);
 
   // Live-preview crop + Ken Burns, combined into the one thing that's ever allowed to write
   // video.style.transform (two separate effects each writing it independently would race and
@@ -1798,6 +1869,28 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showChaptersMenu]);
 
+  // Same click-outside pattern again, for the skip-amount picker - plus Escape, since it has no
+  // close button of its own.
+  useEffect(() => {
+    if (!showSkipTime) return;
+
+    const handleClickOutside = (event: globalThis.MouseEvent): void => {
+      if (skipControlsRef.current?.contains(event.target as Node)) return;
+      setShowSkipTime(false);
+      suppressNextVideoClickRef.current = true;
+    };
+    const handleEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setShowSkipTime(false);
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [showSkipTime]);
+
   const handleAutoplay = (): void => {
     if (onAutoplayNextChange) {
       onAutoplayNextChange();
@@ -1881,7 +1974,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       seekForward,
       stepFrameBackward: () => stepFrame(-1),
       stepFrameForward: () => stepFrame(1),
-      toggleShortcutsOverlay: () => setShowShortcutsOverlay((prev) => !prev)
+      toggleShortcutsOverlay: () => setShowShortcutsOverlay((prev) => !prev),
+      playPrevious: () => onPreviousRef.current?.(),
+      playNext: () => onNextRef.current?.()
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -2032,7 +2127,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					</div>
 					<div className="flex flex-col gap-3 text-sm">
 						{[
-							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame']] },
+							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame'], ['Shift+P / Shift+N', 'Previous / next file']] },
 							{ title: 'Volume', rows: [['M', 'Mute / unmute']] },
 							{ title: 'Display', rows: [['F', 'Fullscreen'], ['T', 'Theater mode'], ['I', 'Picture in picture']] },
 							{ title: 'Captions', rows: [['C', 'Toggle captions']] },
@@ -2104,9 +2199,19 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					
 					<div className="controls flex flex-row justify-between mt-2">
 						<div className='flex gap-5'>
+						{onPrevious && (
+							<button className="w-7" onClick={onPrevious} data-tip={`Previous ${mediaType === 'audio' ? 'track' : 'video'}`} data-tip-kbd="Shift+P" aria-label="Previous">
+								<IoPlaySkipBack className='text-2xl' />
+							</button>
+						)}
 						<button className="play-pause-btn" onClick={togglePauseAndPlay} title={isPlaying ? 'Pause (k)' : 'Play (k)'}>
 							{isPlaying ? <IoPause className='text-3xl' /> : <IoPlay className='text-3xl' />}
 						</button>
+						{onNext && (
+							<button className="w-7" onClick={onNext} data-tip={`Next ${mediaType === 'audio' ? 'track' : 'video'}`} data-tip-kbd="Shift+N" aria-label="Next">
+								<IoPlaySkipForward className='text-2xl' />
+							</button>
+						)}
 
 						<div className="volume-container">
 							<button className="mute-btn z-20 w-7" onClick={toggleMute} title="Mute (m)">
@@ -2136,7 +2241,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 						
 						<div className="flex flex-col place-items-center items-center">
-						<div className='flex gap-4'>
+						<div ref={skipControlsRef} className='relative flex gap-4'>
 							<button
 							className='flex justify-center place-items-center'
 							onClick={handleBackwardSkipTime}
@@ -2158,7 +2263,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							</button>
 
 							{showSkipTime && (
-							<Dropdown onCallback={selectSkipTiming} />
+							<Dropdown value={currentSkipTime} onCallback={selectSkipTiming} />
 							)}
 						</div>
 						</div>
@@ -2392,6 +2497,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							onCaptionsLanguageChange={handleCaptionsLanguageChange}
 							onSetThumbnail={() => { setShowSettings(false); openThumbnailPicker(); }}
 							thumbnailStatus={thumbnailStatus}
+							noise={playerNoise}
+							noiseStatus={noiseStatus}
+							onNoiseChange={setPlayerNoise}
 							/>
 							</div>
 						)}
