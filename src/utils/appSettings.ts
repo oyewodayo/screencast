@@ -47,6 +47,10 @@ export interface AppSettings {
   // Same "untouched setting changes nothing" reasoning as every other default here.
   defaultResolutionWidth: number | null;
   defaultFramerate: number | null;
+  // Studio cleanup of every recording's audio once it stops - noise removal, levelling, ducking
+  // system audio under the voice, loudness to -16 LUFS (see src-tauri/src/services/
+  // audio_enhance.rs). On by default; off keeps the audio exactly as captured (still in sync).
+  autoEnhanceAudio: boolean;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -82,6 +86,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultIncludeSystemAudio: false,
   defaultResolutionWidth: null,
   defaultFramerate: null,
+  autoEnhanceAudio: true,
 };
 
 // One-time correction for installs whose settings were saved back when "avi" was still the coded

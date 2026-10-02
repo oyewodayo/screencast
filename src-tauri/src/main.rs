@@ -51,8 +51,10 @@ mod services {
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
     #[cfg(target_os = "windows")]
-    pub mod loopback_audio;
-    // A Win32 low-level mouse hook, Windows-only for the same reason loopback_audio above is
+    pub mod audio_capture;
+    // Default cleanup of every recording's audio - see the module's own doc comment.
+    pub mod audio_enhance;
+    // A Win32 low-level mouse hook, Windows-only for the same reason audio_capture above is
     // (SetWindowsHookExW/WH_MOUSE_LL has no cross-platform equivalent this app's existing `windows`
     // crate dependency could reuse) - see the module's own doc comment for why this needed no new
     // Cargo dependency at all.
@@ -168,7 +170,7 @@ fn resolve_log_dir() -> std::path::PathBuf {
 
 // Shows a native "already running" notice before the duplicate process exits - Windows only for
 // now (matches this codebase's existing "Windows is the verified platform" posture elsewhere,
-// e.g. loopback_audio.rs/heic_windows.rs), since MessageBoxW needs no Tauri app context to call,
+// e.g. audio_capture.rs/heic_windows.rs), since MessageBoxW needs no Tauri app context to call,
 // unlike tauri::api::dialog which assumes a running app. A silent exit is an acceptable fallback
 // on macOS/Linux - a launcher/dock effectively already fills this role there by focusing the
 // existing window instead of spawning a second process in the first place.

@@ -551,8 +551,12 @@ pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
 }
 
 #[command(async)]
+// Read-only, so deliberately not behind responsiveness::serial(): it walks the whole library, and
+// holding the app-wide write lock for that meant every whiteboard, mindmap, doc and board command
+// queued behind each rescan - and a recording triggers rescans continuously. It used to also print
+// the entire listing to stdout on every call, which under `tauri dev` could block inside that lock
+// whenever the terminal fell behind, hanging all of those features for as long as it lasted.
 pub fn list_briefcast_files() -> HashMap<String, Vec<FileEntry>> {
-    let _serial = crate::services::responsiveness::serial();
     let mut result = HashMap::new();
 
     if let Ok(folder_path) = briefcast_dir() {
@@ -560,7 +564,6 @@ pub fn list_briefcast_files() -> HashMap<String, Vec<FileEntry>> {
             scan_directory(&folder_path, &folder_path, &mut result);
         }
     }
-    println!("Folder: {:?}", &result);
     result
 }
 
@@ -944,9 +947,7 @@ pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
         path_str
     };
 
-    println!("Original path: {}", filepath);
-    println!("Canonicalized: {}", absolute_path.display());
-    println!("Clean path: {}", clean_path);
+    log::debug!("Resolved path {} -> {}", filepath, clean_path);
 
     // Return the clean absolute path - we'll convert it on the frontend
     Ok(clean_path)

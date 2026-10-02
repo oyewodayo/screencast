@@ -38,12 +38,17 @@ pub struct RecordingProgress {
 // Sidecar convention mirrors click_sidecar_path/system_audio's own "<stem>.<suffix>" naming in
 // recording.rs - deleted once the watcher stops, so it never lingers as a stray file next to a
 // finished recording.
+//
+// Kept in the temp capture folder, not beside the recording: ffmpeg rewrites it twice a second, and
+// inside the library each rewrite set off the file watcher and a full library rescan.
 pub fn progress_sidecar_path(output_path: &Path) -> PathBuf {
     let stem = output_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("recording");
-    output_path.with_file_name(format!("{}.progress.log", stem))
+    let dir = std::env::temp_dir().join("briefcast-capture");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{}.progress.log", stem))
 }
 
 // Spawns a background task that tails `progress_path` and emits a `recording-progress` event

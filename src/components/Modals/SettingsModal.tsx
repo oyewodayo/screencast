@@ -494,6 +494,19 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     ))}
                   </select>
                 </Field>
+                <Field label="Enhance audio automatically">
+                  <input
+                    type="checkbox"
+                    checked={settings.autoEnhanceAudio}
+                    onChange={(e) => update("autoEnhanceAudio", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  After each recording: removes background noise, evens out your voice, lowers system
+                  audio while you talk, and sets a consistent loudness. Turn off to keep the audio
+                  exactly as recorded.
+                </p>
                 {/* System audio ("what you hear") is now attempted on every platform - WASAPI
                     loopback on Windows, an auto-selected PulseAudio monitor source on Linux, and
                     (best-effort - only if the user already has a known virtual-audio-loopback

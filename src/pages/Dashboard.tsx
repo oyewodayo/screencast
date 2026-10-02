@@ -1010,6 +1010,9 @@ const setScreen = () => {
   };
 
   const handleStartRecording = async (formData: any) => {
+    // Read at the moment of recording rather than threaded through every caller - the panel and
+    // the record hotkey both land here.
+    formData = { ...formData, enhance_audio: loadSettings().autoEnhanceAudio };
     if (formData.record_type === "c") {
       await handleTakeScreenshot(formData);
       return;
@@ -1249,10 +1252,28 @@ const setScreen = () => {
     }
   };
 
+  // One library scan at a time: a burst of refresh events (a batch copy, a recording finishing)
+  // runs at most one more scan after the current one, instead of stacking them up.
+  const fileScanRef = useRef<{ running: boolean; again: boolean }>({ running: false, again: false });
   const handleDirectoryFiles = async () => {
+    if (fileScanRef.current.running) {
+      fileScanRef.current.again = true;
+      return;
+    }
+    fileScanRef.current.running = true;
+    try {
+      do {
+        fileScanRef.current.again = false;
+        await scanDirectoryFiles();
+      } while (fileScanRef.current.again);
+    } finally {
+      fileScanRef.current.running = false;
+    }
+  };
+
+  const scanDirectoryFiles = async () => {
     try {
       const data = await invoke<FileMap>("list_briefcast_files");
-      console.log("Files found:", data);
       setFiles(data); 
     } catch (error) {
       console.error("Error getting files:", error);

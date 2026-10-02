@@ -158,7 +158,7 @@ pub fn cleanup_stale_window_screenshots() {
 pub async fn cleanup_screenshot_files(file_paths: Vec<String>) -> Result<(), String> {
     for path in file_paths {
         if let Err(e) = std::fs::remove_file(&path) {
-            eprintln!("Failed to delete {}: {}", path, e);
+            log::warn!("Failed to delete {}: {}", path, e);
         }
     }
     Ok(())

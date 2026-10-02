@@ -15,12 +15,13 @@ use windows::Win32::System::Threading::{
     OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME,
 };
 
+use super::assembly::{CAMERA_LATENCY_HNS, FRAME_LOG_FILTER, SCREEN_LATENCY_HNS};
 use super::gpu_capture::{self, GpuCapture};
 use super::{
     audio_codec_args_for_ext, build_camera_overlay_filter_complex_from, capture_region_bounds,
     codec_args_for_ext_hw, codec_args_with_video_encoder, extract_ffmpeg_error, map_overlay_size,
     resolve_capture_target, silent_command, AppState, CaptureTarget, FormData,
-    AUDIO_ENHANCE_FILTER, MAX_RECORDING_WIDTH,
+    MAX_RECORDING_WIDTH,
 };
 use crate::services::progress_watch;
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
@@ -130,18 +131,58 @@ impl ScreenSource {
         match &self.gpu {
             Some(g) => {
                 let (chain, cpu) = g.chain(g.scaled_size(self.max_width), to_cpu);
-                (format!("{},{}", g.source_filter(self.framerate), chain), cpu)
+                (format!("{},{},{}", g.source_filter(self.framerate), FRAME_LOG_FILTER, chain), cpu)
             }
-            None => (format!("[0:v]scale='min({},iw)':-2", self.max_width), true),
+            None => (format!("[0:v]{},scale='min({},iw)':-2", FRAME_LOG_FILTER, self.max_width), true),
         }
     }
 
     fn codec_args(&self, ext: &str, ffmpeg_path: &std::path::Path, cpu_frames: bool) -> Vec<String> {
-        match &self.gpu {
+        let mut args = match &self.gpu {
             Some(g) => codec_args_with_video_encoder(ext, &g.encoder_args(ffmpeg_path, cpu_frames), false)
                 .unwrap_or_else(|| codec_args_for_ext_hw(ext, ffmpeg_path)),
             None => codec_args_for_ext_hw(ext, ffmpeg_path),
+        };
+        // No B-frames: decode order then equals display order, which lets assembly close pause
+        // gaps by shifting timestamps on a stream copy (see recording/assembly.rs) - and a live
+        // capture gains nothing from the extra encoder latency anyway.
+        args.extend(["-bf".to_string(), "0".to_string()]);
+        args
+    }
+
+    // Everything after the inputs and filter graph: the mic map (when ffmpeg captures the mic -
+    // `mic_input`), video codec, and the output. A recording being assembled at stop
+    // (form_data.capture_path) is written to its intermediate - Matroska regardless of the final
+    // container, since it must survive a crash and carry pause gaps as gaps - with every frame's
+    // timestamp logged for the assembly's sync (see ScreenSource::stage).
+    fn output_args(
+        &self,
+        form_data: &FormData,
+        ffmpeg_path: &std::path::Path,
+        cpu_frames: bool,
+        mic_input: Option<usize>,
+        output_path: &std::path::Path,
+    ) -> Result<Vec<String>, String> {
+        let mut args = Vec::new();
+        if let Some(i) = mic_input {
+            args.extend(["-map".to_string(), format!("{}:a", i)]);
         }
+        let mut codec = self.codec_args(&form_data.file_ext, ffmpeg_path, cpu_frames);
+        let target = match &form_data.capture_path {
+            Some(path) => {
+                if let Some(i) = codec.iter().position(|a| a == "-movflags") {
+                    codec.drain(i..(i + 2).min(codec.len()));
+                }
+                codec.extend(["-fps_mode:v".into(), "vfr".into(), "-f".into(), "matroska".into()]);
+                path.as_path()
+            }
+            None => {
+                output_path
+            }
+        };
+        args.extend(codec);
+        args.extend(["-y".to_string(), path_to_str(target)?.to_string()]);
+        Ok(args)
     }
 
     // For the log and the "Recording started" message, e.g. "3840x2160 at 60 fps, Intel Quick Sync".
@@ -314,6 +355,9 @@ async fn start_recording_process(
     args: &[String],
     progress_sidecar: std::path::PathBuf,
     capture_preview: bool,
+    // Recordings assembled at stop: the capture framerate and capture latency, and ffmpeg's stderr
+    // is read for frame timing (see recording/assembly.rs) instead of discarded.
+    frame_timing: Option<(i32, i64)>,
 ) -> Result<(), String> {
     log::debug!("FFmpeg args: {:?}", args);
 
@@ -324,6 +368,11 @@ async fn start_recording_process(
     if capture_preview {
         cmd.stdout(Stdio::piped());
     }
+    let mut assembly = state.assembly.lock().await;
+    let frame_timing = frame_timing.filter(|_| assembly.is_some());
+    if frame_timing.is_some() {
+        cmd.stderr(Stdio::piped());
+    }
 
     crate::services::orphan_guard::before_spawn(&mut cmd);
     let mut child = cmd
@@ -331,6 +380,11 @@ async fn start_recording_process(
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     crate::services::orphan_guard::after_spawn(&child);
     let pid = child.id();
+
+    if let (Some((fps, latency)), Some(stderr), Some(parts)) = (frame_timing, child.stderr.take(), assembly.as_mut()) {
+        parts.timing = Some(super::assembly::spawn_frame_timing(stderr, fps, latency));
+    }
+    drop(assembly);
 
     if capture_preview {
         if let Some(stdout) = child.stdout.take() {
@@ -355,6 +409,69 @@ async fn start_recording_process(
         pid,
     );
 
+    Ok(())
+}
+
+// Starts the separately recorded webcam's own ffmpeg (see assembly::CameraSidecar), into the temp
+// capture folder beside the screen's intermediate. Every frame is timed like the screen's, so
+// assembly can re-time it onto the final recording.
+async fn start_camera_sidecar(
+    state: &State<'_, AppState>,
+    ffmpeg_path: &std::path::Path,
+    form_data: &FormData,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
+    let mut assembly = state.assembly.lock().await;
+    let Some(parts) = assembly.as_mut() else {
+        return Ok(());
+    };
+    // A start retried through another capture path would otherwise leave the first camera running.
+    if let Some(mut old) = parts.camera.take().and_then(|c| c.process) {
+        let _ = old.kill();
+    }
+    let stem = output_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
+    let video_path = parts.video_path.with_file_name(format!("{}.camera.mkv", stem));
+    let final_path = output_path.with_file_name(format!("{}_webcam.mp4", stem));
+
+    let mut cmd = silent_command(ffmpeg_path);
+    cmd.args([
+        "-f",
+        "dshow",
+        "-video_size",
+        &map_overlay_size(&form_data.overlay_size),
+        "-i",
+        &format!("video={}", form_data.video_devices[0]),
+        "-vf",
+        FRAME_LOG_FILTER,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-bf",
+        "0",
+        "-fps_mode:v",
+        "vfr",
+        "-f",
+        "matroska",
+        "-y",
+    ])
+    .arg(&video_path)
+    .stderr(Stdio::piped());
+    crate::services::orphan_guard::before_spawn(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start the webcam recording: {}", e))?;
+    crate::services::orphan_guard::after_spawn(&child);
+    let stderr = child.stderr.take().ok_or("The webcam recording has no output to time")?;
+    let timing = super::assembly::spawn_frame_timing(stderr, 30, CAMERA_LATENCY_HNS);
+    parts.camera = Some(super::assembly::CameraSidecar {
+        process: Some(child),
+        timing,
+        video_path,
+        final_path,
+    });
     Ok(())
 }
 
@@ -409,6 +526,11 @@ pub async fn recording_with_output_sva(
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
         add_overlay_args(&mut args, form_data, &stage, first_camera, screen.max_width);
         mic_input = first_camera + form_data.video_devices.len();
+    } else if separate_webcam_capture && form_data.capture_path.is_some() {
+        // The camera gets its own ffmpeg (start_camera_sidecar, below) - see CameraSidecar for why.
+        log::debug!("Recording webcam separately for PiP editing, in its own process");
+        args.extend(vec!["-filter_complex".to_string(), format!("{}[scr]", stage)]);
+        mic_input = first_camera;
     } else if separate_webcam_capture {
         log::debug!("Recording webcam separately for PiP editing");
         let overlay_size = map_overlay_size(&form_data.overlay_size);
@@ -427,26 +549,20 @@ pub async fn recording_with_output_sva(
         mic_input = first_camera;
     }
 
-    // Audio is now always its own standalone input - previously it was bundled into the single
-    // camera's dshow input line (video=X:audio=Y), which only worked for exactly one camera.
-    args.extend(screen_mic_input_args(&form_data.audio_device));
+    // Audio is its own standalone input - previously it was bundled into the single camera's dshow
+    // input line (video=X:audio=Y), which only worked for exactly one camera. Not added at all when
+    // the app captures the mic itself for assembly (form_data.mic_external).
+    let mic_input = (!form_data.mic_external).then_some(mic_input);
+    if mic_input.is_some() {
+        args.extend(screen_mic_input_args(&form_data.audio_device));
+    }
 
     // Explicit maps: with a -filter_complex in play ffmpeg's default stream selection can't be
     // relied on. The baked-in overlay graph ends in an unlabeled output, which ffmpeg maps itself.
     if !baked_camera {
         args.extend(vec!["-map".to_string(), "[scr]".to_string()]);
     }
-    args.extend(vec!["-map".to_string(), format!("{}:a", mic_input)]);
-    args.extend(screen.codec_args(&form_data.file_ext, &ffmpeg_path, cpu_frames));
-    // Evens out quiet/inconsistent mic levels - see AUDIO_ENHANCE_FILTER's doc comment.
-    args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
-
-    let output_file = path_to_str(output_path)?.to_string();
-
-    log::debug!("Output file: {}", output_file);
-
-    // Add output file
-    args.push(output_file.clone());
+    args.extend(screen.output_args(form_data, &ffmpeg_path, cpu_frames, mic_input, output_path)?);
 
     // Second output, same ffmpeg process: the raw camera stream (input first_camera), video-only (no
     // audio - the mic already went to the primary output above, and doubling it here would just
@@ -454,7 +570,7 @@ pub async fn recording_with_output_sva(
     // the user's chosen file_ext for the main recording - this is an internal editor artifact, not
     // the deliverable, so it doesn't need to match. A simple, fast preset is enough: this is a
     // small-resolution (overlay_size) source, not the full desktop capture.
-    if separate_webcam_capture {
+    if separate_webcam_capture && form_data.capture_path.is_none() {
         let webcam_output = output_path.with_file_name(format!(
             "{}_webcam.mp4",
             output_path
@@ -486,7 +602,10 @@ pub async fn recording_with_output_sva(
     // and the process gets force-killed - which for a container format that needs a proper
     // finalize on exit (WebM/Matroska in particular) produces exactly the kind of corrupt,
     // unparseable file ("EBML header parsing failed") this was silently causing.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS))).await?;
+    if separate_webcam_capture && form_data.capture_path.is_some() {
+        start_camera_sidecar(&state, &ffmpeg_path, form_data, output_path).await?;
+    }
 
     Ok(format!(
         "Recording started ({}). File will be saved as:\n{}",
@@ -517,32 +636,24 @@ pub async fn recording_with_output_sa(
         path_to_str(&progress_sidecar)?.to_string(),
     ];
     args.extend(screen.inputs()?);
-    let mic_input = screen.next_input();
-    args.extend(screen_mic_input_args(&form_data.audio_device));
+    let mic_input = (!form_data.mic_external).then_some(screen.next_input());
+    if mic_input.is_some() {
+        args.extend(screen_mic_input_args(&form_data.audio_device));
+    }
     let (stage, cpu_frames) = screen.stage(false);
     args.extend(vec![
         "-filter_complex".to_string(),
         format!("{}[scr]", stage),
         "-map".to_string(),
         "[scr]".to_string(),
-        "-map".to_string(),
-        format!("{}:a", mic_input),
     ]);
-    // Previously had no codec flags at all here, leaving both streams to ffmpeg's per-container
-    // defaults - which measured out to a 200kbps video bitrate for a 4K capture (badly
-    // blocky) and default-quality MP3 audio, inconsistent with every other recording mode.
-    args.extend(screen.codec_args(&form_data.file_ext, &ffmpeg_path, cpu_frames));
-    args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
-    args.extend(vec![
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
-    ]);
+    args.extend(screen.output_args(form_data, &ffmpeg_path, cpu_frames, mic_input, output_path)?);
 
     log::debug!("Path {:?}", output_path);
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS))).await?;
 
     Ok(format!(
         "Recording started ({}). File will be saved to {}",
@@ -587,15 +698,13 @@ pub async fn recording_with_output_v(
         camera_only_filter_complex(cameras.len()),
     ]);
     args.extend(vec!["-map".to_string(), "[vout]".to_string()]);
-    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
-    args.push("-y".to_string());
-    args.push(path_to_str(output_path)?.to_string());
+    args.extend(camera_output_args(form_data, &ffmpeg_path, output_path)?);
     args.extend(preview_output_args());
 
     // stdout carries the live preview stream for this mode (see preview_output_args), so it is
     // captured and drained rather than inherited - left inherited it would write raw JPEG bytes
     // to whatever console the app was launched from.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true, Some((30, CAMERA_LATENCY_HNS))).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {:?}",
@@ -626,7 +735,6 @@ pub async fn recording_with_output_a(
     // Previously had no codec flags at all - left to ffmpeg's per-container default, which for
     // .mp3 measured out to 128k, same gap as every other mode fixed above.
     args.extend(audio_codec_args_for_ext(&form_data.file_ext));
-    args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
     args.extend(vec![
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
@@ -635,7 +743,7 @@ pub async fn recording_with_output_a(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, None).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -706,6 +814,25 @@ const PREVIEW_FPS: i32 = 12;
 //
 // The split is deliberately after the stack, so the preview shows exactly the composite being
 // recorded rather than just the first camera.
+// Video codec and output for a camera-only recording's main output - its intermediate when it's
+// assembled at stop (form_data.capture_path, see ScreenSource::output_args for the same treatment).
+fn camera_output_args(form_data: &FormData, ffmpeg_path: &std::path::Path, output_path: &std::path::Path) -> Result<Vec<String>, String> {
+    let mut args = codec_args_for_ext_hw(&form_data.file_ext, ffmpeg_path);
+    args.extend(["-bf".to_string(), "0".to_string()]);
+    let target = match &form_data.capture_path {
+        Some(path) => {
+            if let Some(i) = args.iter().position(|a| a == "-movflags") {
+                args.drain(i..(i + 2).min(args.len()));
+            }
+            args.extend(["-fps_mode:v".into(), "vfr".into(), "-f".into(), "matroska".into()]);
+            path.as_path()
+        }
+        None => output_path,
+    };
+    args.extend(["-y".to_string(), path_to_str(target)?.to_string()]);
+    Ok(args)
+}
+
 fn camera_only_filter_complex(camera_count: usize) -> String {
     let mut fc = String::new();
 
@@ -721,12 +848,12 @@ fn camera_only_filter_complex(camera_count: usize) -> String {
             fc.push_str(&format!("[c{}]", i));
         }
         fc.push_str(&format!("hstack=inputs={}[stacked];", camera_count));
-        fc.push_str("[stacked]split=2[vout][vp];");
+        fc.push_str(&format!("[stacked]{},split=2[vout][vp];", FRAME_LOG_FILTER));
     } else {
         // Single camera: no scaling at all, so the recording keeps the camera's native
         // resolution exactly as it did before multi-camera support existed. split is a
         // passthrough, so this costs the output nothing.
-        fc.push_str("[0:v]split=2[vout][vp];");
+        fc.push_str(&format!("[0:v]{},split=2[vout][vp];", FRAME_LOG_FILTER));
     }
 
     fc.push_str(&format!(
@@ -806,29 +933,28 @@ pub async fn recording_with_output_va(
     // The microphone is its own input rather than being bundled onto a camera's input line
     // (`video=X:audio=Y`), which only ever worked when there was exactly one camera to bundle it
     // onto - the same reasoning recording_with_output_sva already applies for its own mic.
-    args.extend(mic_input_args(&form_data.audio_device));
+    // Left out when the app captures the mic itself, to be lined up with the picture exactly when
+    // the recording is assembled (form_data.mic_external).
+    if !form_data.mic_external {
+        args.extend(mic_input_args(&form_data.audio_device));
+    }
     let audio_input_index = cameras.len();
 
     args.extend(vec![
         "-filter_complex".to_string(),
         camera_only_filter_complex(cameras.len()),
     ]);
-    args.extend(vec![
-        "-map".to_string(),
-        "[vout]".to_string(),
-        "-map".to_string(),
-        format!("{}:a", audio_input_index),
-    ]);
-    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
-    args.extend(vec!["-af".to_string(), AUDIO_ENHANCE_FILTER.to_string()]);
-    args.push("-y".to_string());
-    args.push(path_to_str(output_path)?.to_string());
+    args.extend(vec!["-map".to_string(), "[vout]".to_string()]);
+    if !form_data.mic_external {
+        args.extend(vec!["-map".to_string(), format!("{}:a", audio_input_index)]);
+    }
+    args.extend(camera_output_args(form_data, &ffmpeg_path, output_path)?);
     args.extend(preview_output_args());
 
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true, Some((30, CAMERA_LATENCY_HNS))).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -864,20 +990,13 @@ pub async fn recording_with_output_s(
         "-map".to_string(),
         "[scr]".to_string(),
     ]);
-    // This used to have no codec flags at all, leaving the video stream to ffmpeg's implicit
-    // per-container default encoder (e.g. plain mpeg4 for .mp4) instead of libx264 - a real,
-    // separate cause of poor quality/efficiency for screen-only recordings specifically.
-    args.extend(screen.codec_args(&form_data.file_ext, &ffmpeg_path, cpu_frames));
-    args.extend(vec![
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
-    ]);
+    args.extend(screen.output_args(form_data, &ffmpeg_path, cpu_frames, None, output_path)?);
 
     log::debug!("Path {:?}", output_path);
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS))).await?;
 
     Ok(format!(
         "Recording started ({}). File will be saved to {}",
