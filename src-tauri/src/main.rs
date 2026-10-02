@@ -18,6 +18,7 @@ mod commands {
     pub mod window_capture;
 }
 mod services {
+    pub mod asset_download;
     pub mod boards;
     pub mod docs;
     pub mod docs_search;
@@ -38,8 +39,11 @@ mod services {
     // Keeps the window from ever going "Not responding" - see the module's own comment for the
     // threading rules every command follows and the test that enforces them.
     pub mod responsiveness;
+    // Opt-out analytics + crash reports, compiled in only for release builds with keys.
+    pub mod telemetry;
     pub mod trash;
     pub mod utility;
+    pub mod whisper_model;
     pub mod video_edits;
     pub mod mindmaps;
     pub mod whiteboards;
@@ -98,13 +102,47 @@ mod services {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub mod heic_unix;
 }
-use simplelog::{
-    ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
-};
+use simplelog::{CombinedLogger, ConfigBuilder, WriteLogger};
 
 use log::{error, LevelFilter};
 use std::fs::OpenOptions;
 use std::panic;
+
+// Terminal half of the logger. Lines are handed to a background thread rather than written to
+// stdout inline: in a dev build stdout is a pipe to the `tauri dev` terminal, and whenever that
+// pipe stopped being drained, every log call in the process blocked on it - the UI thread, the
+// watchdog, and stop_recording/pause_recording mid-command alike - which froze the Stop and Pause
+// buttons for minutes at a time. If the queue is full the line is dropped from the terminal only;
+// app.log still gets every line.
+struct NonBlockingStdout(std::sync::mpsc::SyncSender<Vec<u8>>);
+
+impl NonBlockingStdout {
+    fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4096);
+        // If the thread can't start, rx is dropped and every try_send below just fails quietly.
+        let _ = std::thread::Builder::new()
+            .name("log-stdout".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                for chunk in rx {
+                    let _ = out.write_all(&chunk);
+                }
+            });
+        Self(tx)
+    }
+}
+
+impl std::io::Write for NonBlockingStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.try_send(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 #[tauri::command(async)]
 fn get_os_info() -> String {
@@ -206,15 +244,11 @@ fn main() {
         .unwrap_or_else(|builder| builder)
         .build();
 
-    // Initialize combined logger (writes to both terminal and file)
+    // Initialize combined logger (writes to both file and terminal). The file comes first and the
+    // terminal never blocks - see NonBlockingStdout for why.
     CombinedLogger::init(vec![
-        TermLogger::new(
-            LevelFilter::Debug,
-            config.clone(),
-            TerminalMode::Mixed,
-            ColorChoice::Auto,
-        ),
-        WriteLogger::new(LevelFilter::Trace, config, log_file), // TRACE captures everything
+        WriteLogger::new(LevelFilter::Trace, config.clone(), log_file), // TRACE captures everything
+        WriteLogger::new(LevelFilter::Debug, config, NonBlockingStdout::spawn()),
     ])
     .expect("Failed to initialize logger");
 
@@ -262,12 +296,20 @@ fn main() {
 
     std::env::set_var("RUST_BACKTRACE", "1");
 
+    // Must run before any TLS use (phone camera server, updater, telemetry) - see Cargo.toml's
+    // rustls entry for why rustls can't pick a provider on its own in this build.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     services::responsiveness::install_async_runtime();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        // Checks this repo's latest GitHub Release for a newer signed build - see
+        // src/utils/updater.ts for when the check runs and what the user sees.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
         .manage(commands::conversion::ConversionState::default())
         .manage(commands::native_playback::NativePlaybackState::default())
@@ -286,6 +328,7 @@ fn main() {
                 Err(e) => log::warn!("Could not resolve Briefcast dir for file watcher: {}", e),
             }
 
+            services::telemetry::init(app.handle());
             services::responsiveness::start_ui_watchdog(app.handle());
             // Both are slow first-time probes (ffmpeg -list_devices, a trial hardware encode);
             // doing them now in the background means the device pickers and the first recording
@@ -303,6 +346,10 @@ fn main() {
             commands::system_info::get_ram_info,
             get_os_info,
             services::responsiveness::report_frontend_stall,
+            services::telemetry::get_telemetry_settings,
+            services::telemetry::set_telemetry_enabled,
+            services::telemetry::track_event,
+            services::telemetry::report_frontend_error,
             commands::recording::get_connected_audios,
             commands::recording::get_connected_cameras,
             commands::recording::get_connected_devices,

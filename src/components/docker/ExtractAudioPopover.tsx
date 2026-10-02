@@ -119,7 +119,7 @@ const ExtractAudioPopover: React.FC<ExtractAudioPopoverProps> = ({ anchor, isExt
                   ? `Splits mixed sound into Voice + Music rows using ${separationEngine.installed}. Takes several times the video length on a typical laptop.`
                   : separationAvailable
                     ? `Splits mixed sound into Voice + Music rows. First use downloads the AI audio engine (~${downloadMb} MB, one time); separating takes several times the video length on a typical laptop.`
-                    : String.raw`Needs Demucs: run "pip install demucs", or put demucs.cpp and its htdemucs-4s model in %LOCALAPPDATA%\com.briefscan.app\demucs, then reopen this.`}
+                    : String.raw`Needs Demucs: run "pip install demucs", or put demucs.cpp and its htdemucs-4s model in %LOCALAPPDATA%\com.withbriefs.briefcast\demucs, then reopen this.`}
             </span>
           </span>
         </label>

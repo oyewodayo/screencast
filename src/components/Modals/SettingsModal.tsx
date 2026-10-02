@@ -53,6 +53,48 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
   </label>
 );
 
+// Mirrors services/telemetry.rs's TelemetrySettings. `available` is false in builds compiled
+// without analytics/crash-report keys (dev and source builds), which send nothing regardless.
+interface TelemetrySettings {
+  enabled: boolean;
+  available: boolean;
+}
+
+const PrivacySection: React.FC = () => {
+  const [telemetry, setTelemetry] = useState<TelemetrySettings | null>(null);
+
+  useEffect(() => {
+    invoke<TelemetrySettings>("get_telemetry_settings").then(setTelemetry).catch(console.error);
+  }, []);
+
+  const toggle = (enabled: boolean) => {
+    setTelemetry((prev) => (prev ? { ...prev, enabled } : prev));
+    invoke("set_telemetry_enabled", { enabled }).catch(console.error);
+  };
+
+  return (
+    <Section title="Privacy">
+      <Field label="Send anonymous usage statistics and crash reports">
+        <input
+          type="checkbox"
+          checked={telemetry?.enabled ?? false}
+          disabled={!telemetry}
+          onChange={(e) => toggle(e.target.checked)}
+          className="w-4 h-4 accent-blue-500 cursor-pointer"
+        />
+      </Field>
+      <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+        Helps decide what to fix and build next. Sent: which features are used (e.g. "recording finished", with its length
+        and type), crash details with your user folder removed from file paths, app version and OS. Never sent: file names,
+        file contents, recordings, documents, or anything you type. Turning this off takes effect immediately.
+      </p>
+      {telemetry && !telemetry.available && (
+        <p className="text-xs text-neutral-400 dark:text-neutral-500">This build has no analytics configured, so nothing is sent either way.</p>
+      )}
+    </Section>
+  );
+};
+
 const fieldInputClass =
   "text-sm rounded-lg border border-neutral-200 dark:border-neutral-700 px-2.5 py-1.5 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent";
 
@@ -67,7 +109,7 @@ const HOME_BACKGROUND_OPTIONS: { value: AppSettings["homeBackgroundStyle"]; labe
   { value: "plain", label: "Plain" },
 ];
 
-type SectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "help";
+type SectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "privacy" | "help";
 const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "appearance", label: "Appearance" },
   { key: "recording", label: "Recording" },
@@ -76,6 +118,7 @@ const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "annotation", label: "Annotation" },
   { key: "files", label: "Files" },
   { key: "pdf", label: "PDF Annotator" },
+  { key: "privacy", label: "Privacy" },
   { key: "help", label: "Help & Shortcuts" },
 ];
 
@@ -724,6 +767,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                 </Field>
               </Section>
             )}
+
+            {activeSection === "privacy" && <PrivacySection />}
 
             {activeSection === "pdf" && (
               <Section title="PDF annotator defaults">

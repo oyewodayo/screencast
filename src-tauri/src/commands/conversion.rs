@@ -1470,19 +1470,16 @@ pub async fn generate_captions(
 
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
     let whisper_path = crate::services::utility::get_whisper_cli_path(&app_handle)?;
-    let model_path = crate::services::utility::get_whisper_model_path(&app_handle)?;
     if !whisper_path.exists() {
         return Err(format!(
             "whisper-cli not found at {} - see README's Getting Started for how to obtain it",
             whisper_path.display()
         ));
     }
-    if !model_path.exists() {
-        return Err(format!(
-            "Speech-to-text model not found at {} - see README's Getting Started for how to obtain it",
-            model_path.display()
-        ));
-    }
+    let model_handle = app_handle.clone();
+    let model_path = tauri::async_runtime::spawn_blocking(move || crate::services::whisper_model::ensure_model(&model_handle))
+        .await
+        .map_err(|e| format!("Speech model lookup failed: {}", e))??;
 
     // whisper.cpp needs a plain mono 16kHz WAV, not whatever the source video's own audio track
     // happens to be encoded as - extracted into the same cache directory as a scratch file,
@@ -1516,19 +1513,16 @@ pub async fn transcribe_doc_audio(
     }
 
     let whisper_path = crate::services::utility::get_whisper_cli_path(&app_handle)?;
-    let model_path = crate::services::utility::get_whisper_model_path(&app_handle)?;
     if !whisper_path.exists() {
         return Err(format!(
             "whisper-cli not found at {} - see README's Getting Started for how to obtain it",
             whisper_path.display()
         ));
     }
-    if !model_path.exists() {
-        return Err(format!(
-            "Speech-to-text model not found at {} - see README's Getting Started for how to obtain it",
-            model_path.display()
-        ));
-    }
+    let model_handle = app_handle.clone();
+    let model_path = tauri::async_runtime::spawn_blocking(move || crate::services::whisper_model::ensure_model(&model_handle))
+        .await
+        .map_err(|e| format!("Speech model lookup failed: {}", e))??;
 
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
     let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());

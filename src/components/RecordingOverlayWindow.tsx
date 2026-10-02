@@ -6,6 +6,7 @@ import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { listen, emit } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { message } from '@tauri-apps/plugin-dialog';
+import { trackEvent } from "../utils/telemetry";
 const appWindow = getCurrentWebviewWindow()
 
 const RecordingOverlayWindow = () => {
@@ -55,6 +56,7 @@ const RecordingOverlayWindow = () => {
         // happened" step differs between the two branches below.
         try {
             await invoke("stop_recording");
+            trackEvent("recording_finished", { durationSeconds: elapsedTime, stoppedFrom: "overlay" });
         } catch (error) {
             console.error("Error stopping recording:", error);
             await message(String(error), { title: 'Recording failed', kind: 'error' });

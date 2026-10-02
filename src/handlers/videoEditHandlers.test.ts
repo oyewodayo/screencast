@@ -602,7 +602,7 @@ describe("isDetachedAudioOverlay", () => {
   });
 
   it("recognizes legacy detach overlays by their cache folder", () => {
-    expect(isDetachedAudioOverlay({ ...base, src: String.raw`C:\Users\x\AppData\Local\com.briefscan.app\detached-audio\abc-music.wav` })).toBe(true);
+    expect(isDetachedAudioOverlay({ ...base, src: String.raw`C:\Users\x\AppData\Local\com.withbriefs.briefcast\detached-audio\abc-music.wav` })).toBe(true);
   });
 
   it("leaves user-added music alone", () => {

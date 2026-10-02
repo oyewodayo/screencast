@@ -2,6 +2,7 @@ import './player.css';
 import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { trackEvent } from '../utils/telemetry';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { IoPause, IoPlay, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
@@ -563,6 +564,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // transcription progress, not a guess, so the button can show something more honest than an
   // indefinite spinner for what can be a multi-minute wait on a long recording.
   const [captionsGenerationProgress, setCaptionsGenerationProgress] = useState<number | null>(null);
+  // True while the first-ever run is still fetching the speech model (whisper_model.rs) - the
+  // progress above then tracks that download instead of transcription.
+  const [isDownloadingSpeechModel, setIsDownloadingSpeechModel] = useState<boolean>(false);
   const [captionsGenerationError, setCaptionsGenerationError] = useState<string | null>(null);
   const [thumbnailStatus, setThumbnailStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   // A visible snapshot of the exact frame about to become the thumbnail, plus the timestamp it was
@@ -1259,7 +1263,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     setCaptionsGenerationProgress(0);
     setCaptionsGenerationError(null);
     const unlisten = await listen<number>('captions-progress', (event) => {
+      setIsDownloadingSpeechModel(false);
       setCaptionsGenerationProgress(event.payload);
+    });
+    const unlistenModel = await listen<{ downloaded: number; total: number }>('whisper-model-download', (event) => {
+      const { downloaded, total } = event.payload;
+      setIsDownloadingSpeechModel(downloaded < total);
+      setCaptionsGenerationProgress(downloaded < total ? (downloaded / total) * 100 : 0);
     });
     try {
       const vttText = await invoke<string>('generate_captions', { inputPath: filePath, language });
@@ -1268,12 +1278,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       setCaptionsUrl(url);
       setCaptionsVisible(true);
       setGeneratedCaptionsLanguage(language);
+      trackEvent('captions_generated', { language });
     } catch (err) {
       console.error('Caption generation failed:', err);
       setCaptionsGenerationError(String(err));
     } finally {
       unlisten();
+      unlistenModel();
       setIsGeneratingCaptions(false);
+      setIsDownloadingSpeechModel(false);
       setCaptionsGenerationProgress(null);
     }
   };
@@ -2280,7 +2293,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								disabled={isGeneratingCaptions}
 								title={
 									isGeneratingCaptions
-										? `Generating captions from audio… ${Math.round(captionsGenerationProgress ?? 0)}% (can take a while on a long recording)`
+										? isDownloadingSpeechModel
+											? `Downloading the speech-to-text model (one time only)… ${Math.round(captionsGenerationProgress ?? 0)}%`
+											: `Generating captions from audio… ${Math.round(captionsGenerationProgress ?? 0)}% (can take a while on a long recording)`
 										: !captionsUrl
 										? 'Add captions (load a file, or generate from audio)'
 										: captionsVisible
@@ -2372,6 +2387,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							onGenerateCaptions={() => { setShowSettings(false); void generateCaptionsFromAudio(); }}
 							isGeneratingCaptions={isGeneratingCaptions}
 							captionsGenerationProgress={captionsGenerationProgress}
+							isDownloadingSpeechModel={isDownloadingSpeechModel}
 							captionsLanguage={captionsLanguage}
 							onCaptionsLanguageChange={handleCaptionsLanguageChange}
 							onSetThumbnail={() => { setShowSettings(false); openThumbnailPicker(); }}

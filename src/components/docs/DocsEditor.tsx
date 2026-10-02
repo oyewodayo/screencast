@@ -517,6 +517,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       setIsTranscribingDictation(true);
       setDictationProgress(0);
       setDictationStatus("Transcribing...");
+      // First run only: the speech model downloads before transcription can start (whisper_model.rs).
+      const unlistenModel = await listen<{ downloaded: number; total: number }>("whisper-model-download", (event) => {
+        const { downloaded, total } = event.payload;
+        setDictationStatus(downloaded < total ? "Downloading speech model (one time)..." : "Transcribing...");
+        setDictationProgress(downloaded < total ? (downloaded / total) * 100 : 0);
+      });
       try {
         const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
         const transcript = await invoke<string>("transcribe_doc_audio", {
@@ -529,6 +535,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         console.error("Failed to transcribe dictation:", err);
         setDictationStatus(err instanceof Error ? err.message : String(err));
       } finally {
+        unlistenModel();
         setIsTranscribingDictation(false);
         setDictationProgress(null);
       }

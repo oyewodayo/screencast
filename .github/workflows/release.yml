@@ -1,0 +1,112 @@
+name: Release
+
+# Builds the Windows installers and publishes them to a DRAFT GitHub Release.
+#
+#   1. Bump "version" in src-tauri/tauri.conf.json (+ Cargo.toml / package.json to match).
+#   2. git tag v<that version> && git push origin v<that version>
+#   3. Review the draft on GitHub, then click Publish. Only a published (non-draft, non-prerelease)
+#      release becomes /releases/latest, which is what the in-app updater and the website's
+#      download link both point at - so nothing reaches users until you publish.
+#
+# Secrets (Settings -> Secrets and variables -> Actions):
+#   TAURI_SIGNING_PRIVATE_KEY           required - contents of the updater private key file
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  required - its password
+#   BRIEFCAST_APTABASE_KEY              optional - usage analytics (src-tauri/src/services/telemetry.rs)
+#   BRIEFCAST_SENTRY_DSN                optional - crash reports (same file)
+#   AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID
+#                                       optional - Windows code signing via Azure Trusted Signing
+# Variables (same page, Variables tab), only for code signing:
+#   AZURE_SIGNING_ENDPOINT              e.g. https://eus.codesigning.azure.net
+#   AZURE_SIGNING_ACCOUNT               the Trusted Signing account name
+#   AZURE_SIGNING_PROFILE               the certificate profile name
+# Without the AZURE_* values the installers are built unsigned (SmartScreen will warn on install).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches app version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match tauri.conf.json version ${version}"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+
+      # binaries/ is gitignored (hundreds of MB of ffmpeg/libheif/whisper builds), so the exact
+      # files tauri.conf.json bundles are published once as a release asset and pinned here by
+      # SHA-256. To change any of them: rebuild the zip with scripts/package-build-binaries.ps1,
+      # upload it under a new tag, and update both values below together.
+      - name: Fetch bundled binaries
+        shell: bash
+        env:
+          BINARIES_URL: https://github.com/oyewodayo/screencast/releases/download/build-binaries-v1/build-binaries-win-x64.zip
+          BINARIES_SHA256: 0b8a3b9a90ca5640a8b96a64990d14840ee70fbaa89ecb0f0a7dbdcdaa5f7f61
+        run: |
+          curl --location --fail --silent --show-error --retry 3 --output binaries.zip "$BINARIES_URL"
+          echo "${BINARIES_SHA256}  binaries.zip" | sha256sum --check
+          unzip -q binaries.zip -d src-tauri
+          rm binaries.zip
+
+      # Writes a config overlay that adds a signCommand only when signing is configured, so the
+      # same workflow produces unsigned test builds until the Azure account exists.
+      - name: Configure Windows code signing
+        id: signing
+        if: vars.AZURE_SIGNING_ACCOUNT != ''
+        shell: bash
+        run: |
+          cargo install trusted-signing-cli --locked
+          cat > src-tauri/tauri.signing.conf.json <<EOF
+          {
+            "bundle": {
+              "windows": {
+                "signCommand": "trusted-signing-cli -e ${{ vars.AZURE_SIGNING_ENDPOINT }} -a ${{ vars.AZURE_SIGNING_ACCOUNT }} -c ${{ vars.AZURE_SIGNING_PROFILE }} -d Briefcast %1"
+              }
+            }
+          }
+          EOF
+          echo "args=--config src-tauri/tauri.signing.conf.json" >> "$GITHUB_OUTPUT"
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Read at compile time (option_env!) - unset means telemetry is compiled out entirely.
+          BRIEFCAST_APTABASE_KEY: ${{ secrets.BRIEFCAST_APTABASE_KEY }}
+          BRIEFCAST_SENTRY_DSN: ${{ secrets.BRIEFCAST_SENTRY_DSN }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Briefcast v__VERSION__
+          releaseBody: |
+            To install, download the file ending in **x64-setup.exe** below.
+            Already installed? Briefcast will offer this update on its next launch.
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: ${{ steps.signing.outputs.args }}

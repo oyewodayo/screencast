@@ -26,6 +26,8 @@ interface PlaytimeSettingsProps {
   onGenerateCaptions: () => void;
   isGeneratingCaptions: boolean;
   captionsGenerationProgress: number | null;
+  // First run only: the progress is the speech model's one-time download, not transcription.
+  isDownloadingSpeechModel: boolean;
   captionsLanguage: string;
   onCaptionsLanguageChange: (lang: string) => void;
   // Overwrites this video's gallery/sidebar poster with whatever frame is on screen right now
@@ -57,6 +59,7 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   onGenerateCaptions,
   isGeneratingCaptions,
   captionsGenerationProgress,
+  isDownloadingSpeechModel,
   captionsLanguage,
   onCaptionsLanguageChange,
   onSetThumbnail,
@@ -246,7 +249,7 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
             <div className="settings-row settings-submenu-item settings-progress-row">
               <span className="settings-row-label">
                 <IoMicOutline />
-                Transcribing… {Math.round(captionsGenerationProgress ?? 0)}%
+                {isDownloadingSpeechModel ? 'Downloading speech model…' : 'Transcribing…'} {Math.round(captionsGenerationProgress ?? 0)}%
               </span>
               <div className="settings-progress">
                 <div className="settings-progress-fill" style={{ width: `${captionsGenerationProgress ?? 0}%` }} />

@@ -1,6 +1,6 @@
 [package]
 name = "Briefcast"
-version = "0.0.0"
+version = "0.1.0"
 description = "A screen recording and streaming application for easy use."
 authors = ["Temidayo Oyewo"]
 license = "MIT"
@@ -61,6 +61,18 @@ tauri-plugin-shell = "2"
 # SHA-256 check on the on-demand voice/music engine download (commands/audio_tracks.rs) - already
 # in the tree transitively, named directly here.
 sha2 = "0.10"
+# In-app updates from this repo's GitHub Releases - see src/utils/updater.ts.
+tauri-plugin-updater = "2"
+# relaunch() after an update installs.
+tauri-plugin-process = "2"
+# Named directly only to pick rustls' process-wide crypto provider at startup (main.rs): the
+# updater enables rustls' "ring" backend while axum-server (phone_camera.rs) enables "aws-lc-rs",
+# and with both compiled in rustls refuses to guess - the phone camera's TLS server would panic.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+# Crash reports and anonymous usage events - services/telemetry.rs. Both ride the same reqwest
+# 0.13 + rustls stack the updater already brings in, so no second HTTP/TLS implementation.
+sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 
 # Win32 bindings — only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the

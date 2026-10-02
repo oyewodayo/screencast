@@ -171,22 +171,6 @@ pub fn get_whisper_cli_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("Failed to resolve whisper-cli at {}: {}", resource_path, e))
 }
 
-// The one model this app ships (see README's "Getting started" for why base specifically - a
-// reasonable size/accuracy balance for narrated screen recordings) - co-located with
-// whisper-cli.exe in the same bundled folder. Deliberately the multilingual build (no ".en"
-// suffix), not the English-only one this used to ship: the two are near-identical in size (the
-// English-only variant isn't meaningfully smaller), so there was no real tradeoff in switching -
-// language selection (generate_captions' own `language` param, conversion.rs) only works at all
-// because this model understands more than English.
-pub fn get_whisper_model_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
-    let resource_path = "binaries/whisper/ggml-base.bin";
-
-    app_handle
-        .path()
-        .resolve(resource_path, BaseDirectory::Resource)
-        .map_err(|e| format!("Failed to resolve whisper model at {}: {}", resource_path, e))
-}
-
 // RNNoise model for arnndn ("remove noise" mode) - GregorR/rnnoise-models' beguiling-drafter,
 // trained on voice over recording-type noise.
 pub fn get_rnnoise_model_path(app_handle: &AppHandle) -> Result<PathBuf, String> {

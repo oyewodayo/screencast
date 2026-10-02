@@ -48,6 +48,10 @@ import {
   type PhoneCaptureHandle,
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
+import UpdateBanner from "../components/custom/UpdateBanner";
+import { checkForUpdate } from "../utils/updater";
+import { trackEvent } from "../utils/telemetry";
+import type { Update } from "@tauri-apps/plugin-updater";
 import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
 import {
@@ -314,6 +318,9 @@ const Dashboard = () => {
   // The in-flight phone recording, if any. A ref rather than state: handleStopRecording has to
   // read it synchronously, and nothing renders from it.
   const phoneCaptureRef = useRef<PhoneCaptureHandle | null>(null);
+  // True while a stop is in flight, so repeated clicks on Stop (or the hotkey) while the backend is
+  // still finalizing don't each run stop_recording and open their own completion popup.
+  const isStoppingRef = useRef(false);
 
   useEffect(
     () => subscribePhoneCamera((s) => setIsPhoneCameraConnected(s.status === "live")),
@@ -1031,6 +1038,11 @@ const setScreen = () => {
         const recordingLaunchedAt = Date.now();
         const response = await invoke<string>("start_recording", { formData });
         const startTime = Date.now();
+        trackEvent("recording_started", {
+          recordType: String(formData.record_type),
+          format: String(formData.file_ext ?? ""),
+          phoneCamera: !!formData.video_devices?.includes(PHONE_CAMERA_DEVICE),
+        });
 
         // The phone records in this WebView, not in ffmpeg: its frames arrive over WebRTC and
         // never reach the backend as a capture device (start_recording strips the sentinel out of
@@ -1110,6 +1122,16 @@ const setScreen = () => {
 
   
   let handleStopRecording = async () => {
+    if (isStoppingRef.current) return;
+    isStoppingRef.current = true;
+    try {
+      await stopRecordingOnce();
+    } finally {
+      isStoppingRef.current = false;
+    }
+  };
+
+  const stopRecordingOnce = async () => {
     setError("");
 
     // Flushed and written BEFORE stop_recording, so the finished camera file is already on disk
@@ -1126,6 +1148,12 @@ const setScreen = () => {
 
     try {
       const response = await invoke<string>("stop_recording");
+      // Wall-clock span (includes any paused time) - the overlay's own stop path reports the exact
+      // pause-aware duration instead.
+      trackEvent("recording_finished", {
+        durationSeconds: recordingStartTime ? Math.round((Date.now() - recordingStartTime) / 1000) : 0,
+        stoppedFrom: "main",
+      });
       const audio = new Audio("/sounds/option-3.mp3");
       audio.play().catch(err => console.error("Error playing audio:", err));
       setMessage(response);
@@ -1259,6 +1287,18 @@ const setScreen = () => {
 				if (purgedCount > 0) console.log(`Purged ${purgedCount} expired trash item(s)`);
 			})
 			.catch((error) => console.error("Error purging expired trash:", error));
+	}, []);
+
+	// One update check per launch, delayed so it never competes with startup work (device probes,
+	// file list, thumbnails). Shown as a dismissible card - see UpdateBanner.
+	const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+	useEffect(() => {
+		const timer = setTimeout(() => {
+			void checkForUpdate().then((update) => {
+				if (update) setPendingUpdate(update);
+			});
+		}, 15_000);
+		return () => clearTimeout(timer);
 	}, []);
 
 	const loadTrash = async () => {
@@ -4019,6 +4059,9 @@ const setScreen = () => {
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
         {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}
         {error && <Toast key={`err-${error}`} message={error} variant="error" onDismiss={() => setError("")} />}
+        {pendingUpdate && (
+          <UpdateBanner update={pendingUpdate} isRecording={isRecording} onDismiss={() => setPendingUpdate(null)} />
+        )}
       </div>
     </div>
   );
