@@ -23,11 +23,13 @@ import { listen } from "@tauri-apps/api/event";
 import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoPlay, IoTrashOutline, IoVideocam } from "react-icons/io5";
 import { formatFileSize, truncateFileName } from "../utils/Formater";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
+import { useGallerySort } from "./GallerySort";
 
 interface GalleryFile {
   name: string;
   path: string;
   size: number;
+  modified?: number;
 }
 
 interface VideoFolderGalleryProps {
@@ -69,7 +71,7 @@ interface VideoFolderGalleryProps {
 const STATUS_RESET_MS = 1500;
 
 const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
-  files,
+  files: unsortedFiles,
   folderLabel,
   resolveThumbnailUrl,
   onOpenVideo,
@@ -91,6 +93,7 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
   onMoveFiles,
   onBulkDelete,
 }) => {
+  const { sorted: files, control: sortControl } = useGallerySort(unsortedFiles, "video");
   const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
   const [contextMenu, setContextMenu] = useState<{ file: GalleryFile; x: number; y: number } | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
@@ -213,9 +216,12 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
           {actionStatus}
         </div>
       )}
-      <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-3">
-        {folderLabel} — {files.length} video{files.length === 1 ? "" : "s"}
-      </p>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500">
+          {folderLabel} — {files.length} video{files.length === 1 ? "" : "s"}
+        </p>
+        {sortControl}
+      </div>
       <div
         className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3"
         onClick={(e) => {

@@ -20,11 +20,13 @@ import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoImage
 import { formatFileSize, truncateFileName } from "../utils/Formater";
 import { preloadImage } from "../utils/imageObjectCache";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
+import { useGallerySort } from "./GallerySort";
 
 interface GalleryFile {
   name: string;
   path: string;
   size: number;
+  modified?: number;
 }
 
 interface ImageFolderGalleryProps {
@@ -70,7 +72,7 @@ interface ImageFolderGalleryProps {
 const STATUS_RESET_MS = 1500;
 
 const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
-  files,
+  files: unsortedFiles,
   folderLabel,
   resolveThumbnailUrl,
   resolveFullUrl,
@@ -93,6 +95,7 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
   onMoveFiles,
   onBulkDelete,
 }) => {
+  const { sorted: files, control: sortControl } = useGallerySort(unsortedFiles, "image");
   const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
   const [contextMenu, setContextMenu] = useState<{ file: GalleryFile; x: number; y: number } | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
@@ -251,9 +254,12 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
           {actionStatus}
         </div>
       )}
-      <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-3">
-        {folderLabel} — {files.length} image{files.length === 1 ? "" : "s"}
-      </p>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500">
+          {folderLabel} — {files.length} image{files.length === 1 ? "" : "s"}
+        </p>
+        {sortControl}
+      </div>
       <div
         className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-3"
         onClick={(e) => {

@@ -43,6 +43,7 @@ import { TbPointer } from "react-icons/tb";
 import useWhiteboardStore from "../../hooks/useWhiteboardStore";
 import {
   ArrowheadType,
+  createDefaultWhiteboardNode,
   createImageWhiteboardNode,
   hasImageCrop,
   LINE_ONLY_SHAPES,
@@ -55,10 +56,17 @@ import {
 import { canvasToPdfBytes, canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import { computeContentBounds, renderWhiteboardToCanvas, shapeOutlineFor, CYLINDER_CAP_RATIO, SERIES_FILL_OPACITY } from "../../handlers/whiteboardHandlers";
 import { importImageFromBlob, importImageFromPath, measureImage, whiteboardAssetUrl } from "../../utils/whiteboardImageCache";
+import { isTypingInField, measureTextBlock, readPastePayload, writeInternalMarker } from "../../utils/canvasClipboard";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
 import WhiteboardStylePanel from "./WhiteboardStylePanel";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
+
+// Private OS-clipboard type written on Ctrl+C of shapes - see canvasClipboard.ts.
+const WHITEBOARD_CLIPBOARD_MARKER = "application/x-briefcast-whiteboard";
+// A pasted paragraph wraps at this width instead of producing one enormously wide text node.
+const TEXT_PASTE_MAX_WIDTH = 480;
+const TEXT_PASTE_PAD = 8;
 
 // PNG for dropping into a slide or a chat; PDF for something printed or shared as a document.
 type WhiteboardExportFormat = "png" | "pdf";
@@ -934,29 +942,59 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     [briefcastDir, whiteboardId, store]
   );
 
-  // A real bitmap on the system clipboard (a screenshot, an image copied out of a browser) - handled
-  // as a native paste event rather than inside the Ctrl+V keyboard shortcut below, because only the
-  // event carries clipboardData. Falls through to the shape clipboard when the paste has no image,
-  // so copying shapes and copying a picture both keep working through the same keystroke.
-  useEffect(() => {
-    const onPaste = (e: ClipboardEvent) => {
-      const active = document.activeElement;
-      if (active instanceof HTMLElement && (active.isContentEditable || active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
-      const items = e.clipboardData?.items;
-      if (!items) return;
-      const files = Array.from(items)
-        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-        .map((item) => item.getAsFile())
-        .filter((f): f is File => f !== null);
-      if (files.length === 0) return;
-      e.preventDefault();
-      void addImagesFromBlobs(files, viewportCenterDocPoint());
-    };
-    window.addEventListener("paste", onPaste);
-    return () => window.removeEventListener("paste", onPaste);
-  }, [addImagesFromBlobs, viewportCenterDocPoint]);
+  // Plain text from the system clipboard lands as a text node at the middle of the view, its box
+  // sized to the text (wrapping past TEXT_PASTE_MAX_WIDTH) rather than the 160x40 default.
+  const addTextNode = useCallback(
+    (text: string, at: { x: number; y: number }) => {
+      const base = createDefaultWhiteboardNode(crypto.randomUUID(), "text", at.x, at.y);
+      const lineHeight = base.fontSize * 1.3;
+      const lineWidths = text.split("\n").map((line) => measureTextBlock(line, base.fontSize).width);
+      const width = Math.min(TEXT_PASTE_MAX_WIDTH, Math.max(...lineWidths)) + TEXT_PASTE_PAD * 2;
+      const wrappedLines = lineWidths.reduce((sum, w) => sum + Math.max(1, Math.ceil(w / TEXT_PASTE_MAX_WIDTH)), 0);
+      const height = wrappedLines * lineHeight + TEXT_PASTE_PAD * 2;
+      const node: WhiteboardNode = {
+        ...base,
+        text,
+        x: at.x - width / 2,
+        y: at.y - height / 2,
+        width,
+        height,
+        textAlign: lineWidths.length > 1 ? "left" : "center",
+      };
+      store.addNode(node);
+      setSelectedNodeIds(new Set([node.id]));
+      setSelectedEdgeIds(new Set());
+    },
+    [store]
+  );
 
-  // ---- Keyboard shortcuts: undo/redo/copy/paste (Delete/Escape live inside WhiteboardCanvas,
+  // Ctrl+C / Ctrl+V go through the native copy/paste events (see canvasClipboard.ts for why), so a
+  // screenshot, copied text, and copied shapes all paste through the same keystroke - whichever was
+  // copied LAST wins. An empty clipboard (or a webview that dropped the marker type) still falls back
+  // to the in-memory shape clipboard.
+  useEffect(() => {
+    const onCopy = (e: ClipboardEvent) => {
+      if (isTypingInField() || selectedNodeIds.size === 0) return;
+      handleCopy();
+      writeInternalMarker(e, WHITEBOARD_CLIPBOARD_MARKER);
+    };
+    const onPaste = (e: ClipboardEvent) => {
+      if (isTypingInField()) return;
+      const payload = readPastePayload(e, WHITEBOARD_CLIPBOARD_MARKER);
+      e.preventDefault();
+      if (payload.kind === "images") void addImagesFromBlobs(payload.files, viewportCenterDocPoint());
+      else if (payload.kind === "text") addTextNode(payload.text, viewportCenterDocPoint());
+      else handlePaste();
+    };
+    window.addEventListener("copy", onCopy);
+    window.addEventListener("paste", onPaste);
+    return () => {
+      window.removeEventListener("copy", onCopy);
+      window.removeEventListener("paste", onPaste);
+    };
+  }, [selectedNodeIds, handleCopy, handlePaste, addImagesFromBlobs, addTextNode, viewportCenterDocPoint]);
+
+  // ---- Keyboard shortcuts: undo/redo (copy/paste are the native events above; Delete/Escape live inside WhiteboardCanvas,
   // which owns selection-adjacent state that undo/redo doesn't need) -------------------------------
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -970,20 +1008,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       } else if (mod && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
         e.preventDefault();
         store.redo();
-      } else if (mod && e.key.toLowerCase() === "c") {
-        if (selectedNodeIds.size === 0) return;
-        e.preventDefault();
-        handleCopy();
-      } else if (mod && e.key.toLowerCase() === "v") {
-        e.preventDefault();
-        handlePaste();
       } else if (e.key === "Escape" && (armedShapeType || connectorArmed || laserArmed)) {
         deselectTools();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools, selectedNodeIds, handleCopy, handlePaste]);
+  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools]);
 
   // PNG and PDF share the one renderer - the PDF is that same canvas wrapped in a single page (see
   // canvasToPdfBytes), so the two formats can't drift into showing different diagrams.

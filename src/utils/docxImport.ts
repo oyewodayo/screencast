@@ -101,8 +101,8 @@ export async function importDocxFile(path: string, fileName: string): Promise<Im
   await invoke("create_doc", { id, title, bytes: Array.from(Y.encodeStateAsUpdate(new Y.Doc())) });
 
   try {
-    const fileBytes = await invoke<number[]>("read_file_bytes", { path });
-    const arrayBuffer = new Uint8Array(fileBytes).buffer;
+    // read_file_bytes answers with raw bytes (an ArrayBuffer), not a JSON number array.
+    const arrayBuffer = await invoke<ArrayBuffer>("read_file_bytes", { path });
 
     const result = await mammoth.convertToHtml(
       { arrayBuffer },
@@ -118,7 +118,7 @@ export async function importDocxFile(path: string, fileName: string): Promise<Im
 
     // Recovers color/font/size mammoth's own HTML conversion can't (see docxStyleResolver.ts) by
     // reading the .docx's raw OOXML directly, then overlaying it onto mammoth's structural output.
-    const paragraphStyles = await resolveDocxParagraphStyles(new Uint8Array(fileBytes));
+    const paragraphStyles = await resolveDocxParagraphStyles(new Uint8Array(arrayBuffer));
     const node = applyParagraphStyles(parsedNode, schema.marks.textStyle, paragraphStyles);
 
     // "default" matches @tiptap/extension-collaboration's own default field name (DocsEditor.tsx

@@ -5,6 +5,7 @@
 // unchanged; if one of these breaks, the app's actual editing behavior changed, not just plumbing.
 import { describe, expect, it } from "vitest";
 import {
+  isDetachedAudioOverlay,
   packAudioRows,
   applyAutoZoomAtClicks,
   buildViewSwitchOverlays,
@@ -12,6 +13,7 @@ import {
   clipIndexAt,
   deleteClipAt,
   deleteOverlay,
+  deletePipOverlayAndCloseGap,
   duplicateOverlay,
   duplicateTimedOverlay,
   insertClip,
@@ -24,11 +26,12 @@ import {
   resizeOverlayTime,
   sendOverlayToBack,
   splitClipAt,
+  splitPipOverlayAt,
   toKeepSegments,
   updateClip,
   updateOverlay,
 } from "./videoEditHandlers";
-import { AudioOverlay, Clip, TextOverlay } from "../utils/videoEditTypes";
+import { AudioOverlay, Clip, PipOverlay, TextOverlay } from "../utils/videoEditTypes";
 
 function makeClip(overrides: Partial<Clip> = {}): Clip {
   return { id: "clip-1", sourcePath: "video.mp4", start: 0, end: 10, ...overrides };
@@ -512,5 +515,97 @@ describe("packAudioRows", () => {
 
   it("returns zero rows for no overlays", () => {
     expect(packAudioRows([]).rowCount).toBe(0);
+  });
+});
+
+function makePip(overrides: Partial<PipOverlay> = {}): PipOverlay {
+  return {
+    id: "pip",
+    sourcePath: "cam.mp4",
+    x: 0.6,
+    y: 0.6,
+    width: 0.3,
+    height: 0.3,
+    shape: "rounded",
+    trimStart: 2,
+    sourceDuration: 60,
+    startTime: 10,
+    endTime: 30,
+    volume: 1,
+    muted: true,
+    createdAt: 0,
+    updatedAt: 0,
+    ...overrides,
+  };
+}
+
+describe("splitPipOverlayAt", () => {
+  it("cuts one pip into two contiguous pieces that continue through the source", () => {
+    const [first, second] = splitPipOverlayAt([makePip({ crop: { x: 0.1, y: 0, width: 0.5, height: 1 } })], "pip", 15);
+    expect(first).toMatchObject({ id: "pip", startTime: 10, endTime: 15, trimStart: 2 });
+    expect(second).toMatchObject({ startTime: 15, endTime: 30, trimStart: 7, x: 0.6, shape: "rounded", crop: { x: 0.1, y: 0, width: 0.5, height: 1 } });
+    expect(second.id).not.toBe("pip");
+  });
+
+  it("refuses a cut too close to either edge, or for an unknown id", () => {
+    const overlays = [makePip()];
+    expect(splitPipOverlayAt(overlays, "pip", 10.05)).toBe(overlays);
+    expect(splitPipOverlayAt(overlays, "pip", 29.95)).toBe(overlays);
+    expect(splitPipOverlayAt(overlays, "missing", 15)).toBe(overlays);
+  });
+});
+
+describe("deletePipOverlayAndCloseGap", () => {
+  it("removes a cut-out middle piece and joins the rest of the chain back up", () => {
+    const [a, rest] = splitPipOverlayAt([makePip()], "pip", 15);
+    const [b, c] = splitPipOverlayAt([rest], rest.id, 20);
+    const result = deletePipOverlayAndCloseGap([a, b, c], b.id);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({ id: a.id, startTime: 10, endTime: 15, trimStart: 2 });
+    // Moved back by the deleted piece's 5s, but still plays the same source range as before.
+    expect(result[1]).toMatchObject({ id: c.id, startTime: 15, endTime: 25, trimStart: 12 });
+  });
+
+  it("moves the whole chain after the deleted piece, not just its immediate neighbour", () => {
+    const pieces = [
+      makePip({ id: "a", startTime: 0, endTime: 5 }),
+      makePip({ id: "b", startTime: 5, endTime: 8 }),
+      makePip({ id: "c", startTime: 8, endTime: 12 }),
+    ];
+    const result = deletePipOverlayAndCloseGap(pieces, "a");
+    expect(result.map((o) => [o.id, o.startTime, o.endTime])).toEqual([
+      ["b", 0, 3],
+      ["c", 3, 7],
+    ]);
+  });
+
+  it("leaves gapped pieces, other sources and a lone pip where they are", () => {
+    const pieces = [
+      makePip({ id: "a", startTime: 0, endTime: 5 }),
+      makePip({ id: "gapped", startTime: 6, endTime: 9 }),
+      makePip({ id: "other", sourcePath: "screen2.mp4", startTime: 5, endTime: 7 }),
+    ];
+    const result = deletePipOverlayAndCloseGap(pieces, "a");
+    expect(result.map((o) => [o.id, o.startTime])).toEqual([
+      ["gapped", 6],
+      ["other", 5],
+    ]);
+    expect(deletePipOverlayAndCloseGap([makePip()], "pip")).toEqual([]);
+  });
+});
+
+describe("isDetachedAudioOverlay", () => {
+  const base: AudioOverlay = { id: "a", src: "C:/music/song.mp3", startTime: 0, endTime: 5, trimStart: 0, sourceDuration: 5, volume: 1, createdAt: 0, updatedAt: 0 };
+
+  it("recognizes flagged detach overlays", () => {
+    expect(isDetachedAudioOverlay({ ...base, detached: true })).toBe(true);
+  });
+
+  it("recognizes legacy detach overlays by their cache folder", () => {
+    expect(isDetachedAudioOverlay({ ...base, src: String.raw`C:\Users\x\AppData\Local\com.withbriefs.briefcast\detached-audio\abc-music.wav` })).toBe(true);
+  });
+
+  it("leaves user-added music alone", () => {
+    expect(isDetachedAudioOverlay(base)).toBe(false);
   });
 });

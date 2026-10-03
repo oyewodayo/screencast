@@ -42,7 +42,7 @@ import {
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, PipOverlay, TextOverlay } from "../../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
 import { buildViewSwitchOverlays, overlaysActiveAt, packAudioRows, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
@@ -373,11 +373,9 @@ interface VideoTimelineDockerProps {
   // is what needs to show that as a spinner - Dashboard just relays the value it already round-
   // trips through activeClipEffects's own reverse-direction sibling, onActiveClipChange, above.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
-  // Forwards NoiseReductionPopover's "Recalibrate from current playback" click to VideoPlayer's
-  // own imperative recalibrateNoiseReduction() (via videoPlayerRef, held by Dashboard - this
-  // component has no ref to VideoPlayer itself) - same "Dashboard is the only place that can
-  // reach across siblings" shape onLivePreview/onTogglePlayActiveFile already use.
-  onRecalibrateNoise?: () => void;
+  // NoiseReductionPopover's "Hold to compare" - forwarded to VideoPlayer's setNoisePreviewBypass
+  // (via videoPlayerRef, held by Dashboard - this component has no ref to VideoPlayer itself).
+  onPreviewNoiseOriginal?: (bypass: boolean) => void;
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
   // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
@@ -444,7 +442,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onOutputTimeChange,
   onActiveClipChange,
   noiseReductionStatus = "idle",
-  onRecalibrateNoise,
+  onPreviewNoiseOriginal,
   selectedOverlayId = null,
   onSelectOverlay,
   isPlacingText = false,
@@ -471,6 +469,26 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // usage is a one-shot UI sound effect, not a seekable/synced source).
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const trackAreaRef = useRef<HTMLDivElement>(null);
+  const trackContentRef = useRef<HTMLDivElement>(null);
+  // Whether lanes are sitting below the timeline's capped height right now. The themed scrollbar
+  // is subtle enough that rows down there (e.g. a second Voice/Music pair) went unnoticed while
+  // still playing, so a visible "more below" hint is shown whenever this is true.
+  const [lanesHiddenBelow, setLanesHiddenBelow] = useState(false);
+  useEffect(() => {
+    const area = trackAreaRef.current;
+    const content = trackContentRef.current;
+    if (!area || !content) return;
+    const update = () => setLanesHiddenBelow(area.scrollHeight - area.scrollTop - area.clientHeight > 4);
+    update();
+    area.addEventListener("scroll", update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(area);
+    observer.observe(content);
+    return () => {
+      area.removeEventListener("scroll", update);
+      observer.disconnect();
+    };
+  }, []);
 
   const [duration, setDuration] = useState<number>(0);
   // Native pixel size of the primary file, read off the same hidden capture <video> already used
@@ -1116,6 +1134,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
   const beginPipOverlayDrag = (overlay: PipOverlay) => (e: React.PointerEvent) => {
     e.stopPropagation();
+    if (toolMode === "razor") {
+      // Razor mode cuts the PiP right where the click landed, same as it does for clip blocks.
+      editStore.splitPipOverlay(overlay.id, outputTimeFromClientX(e.clientX));
+      onSelectPipOverlay?.(overlay.id);
+      setSelectedClipId(null);
+      return;
+    }
     e.currentTarget.setPointerCapture(e.pointerId);
     setPipOverlayDrag({
       id: overlay.id,
@@ -1143,6 +1168,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       editStore.movePipOverlayTime(id, liveStartTime);
     }
     onSelectPipOverlay?.(id);
+    setSelectedClipId(null);
     // Same reasoning as endBlurOverlayDrag's own comment: bring the playhead into the overlay's
     // own range on select, so choosing (or just placing) one from the timeline immediately shows
     // its actual video bubble in the preview instead of leaving it invisible off-screen in time -
@@ -1479,6 +1505,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       editStore.reorderClip(index, overIndex);
     } else {
       setSelectedClipId(clip.id);
+      // One selection at a time across the clip and PiP lanes, so Split/Delete (which prefer a
+      // selected PiP) can never act on a PiP the user has since clicked away from.
+      onSelectPipOverlay?.(null);
       // Selecting a clip only jumps the playhead to its start while playback is paused - same
       // reasoning as endPipOverlayDrag's own comment just below: yanking the playhead back to a
       // clip's start on a plain click mid-playback reads as "clicking the timeline restarts the
@@ -1495,11 +1524,31 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // never on a bare time value searched across all clips - once clips can come from different
   // files, a raw source time alone is ambiguous (two clips from different files can easily share
   // overlapping ranges), so the caller has to say which clip it means.
+  //
+  // Exception: a selected PiP chip takes over both - Split cuts that PiP at the playhead (if the
+  // playhead is inside it) and Delete removes that PiP piece, closing the gap it leaves in its own
+  // split chain (deletePipOverlayAndCloseGap). Splitting/deleting the main clip underneath a PiP
+  // the user had explicitly selected was exactly the wrong-target surprise this avoids.
+  const selectedPip = selectedPipOverlayId ? editStore.pipOverlays.find((o) => o.id === selectedPipOverlayId) : undefined;
   const handleSplit = () => {
+    if (selectedPip) {
+      // Split at currentOutputTime - the PiP lane's own coordinate space - not currentTime, which
+      // is the active clip's SOURCE time. Deliberately never falls through to splitting the clip:
+      // with a PiP selected, a playhead outside it just means there's nothing of it to cut there.
+      if (currentOutputTime > selectedPip.startTime && currentOutputTime < selectedPip.endTime) {
+        editStore.splitPipOverlay(selectedPip.id, currentOutputTime);
+      }
+      return;
+    }
     const idx = activeClipIndexRef.current;
     if (idx >= 0 && idx < baseClips.length) editStore.splitAt(idx, currentTime);
   };
   const handleDeleteSegment = () => {
+    if (selectedPip) {
+      editStore.deletePipOverlay(selectedPip.id);
+      onSelectPipOverlay?.(null);
+      return;
+    }
     const selectedIndex = selectedClipId ? baseClips.findIndex((c) => c.id === selectedClipId) : -1;
     const index = selectedIndex !== -1 ? selectedIndex : activeClipIndexRef.current;
     if (index < 0 || index >= baseClips.length) return;
@@ -1578,7 +1627,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         editStore.deleteAudioOverlay(selectedAudioOverlayId);
         setSelectedAudioOverlayId(null);
         setAudioPopoverAnchor(null);
-      } else if (selectedClipId) {
+      } else if (selectedPipOverlayId || selectedClipId) {
         e.preventDefault();
         handleDeleteSegment();
       }
@@ -1586,7 +1635,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAudioOverlayId, selectedClipId, editStore]);
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAudioOverlayId, selectedPipOverlayId, selectedClipId, editStore]);
 
   // Pressing Play after the sequence has already played through to the end needs to restart from
   // clip 0 - native <video> never auto-rewinds on .play() once it's reached "ended", it just sits
@@ -1640,6 +1689,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         end: selectedClip.end,
         speed: selectedClip.speed ?? 1,
         noiseReduction: selectedClip.noiseReduction ?? null,
+        audioCleanup: selectedClip.audioCleanup ?? null,
         volume: editStore.videoAudioMuted ? 0 : editStore.videoAudioVolume,
         outputFormat: format,
         outputPath: chosen,
@@ -1739,6 +1789,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             end: clip.end,
             speed: clip.speed ?? 1,
             noiseReduction: clip.noiseReduction ?? null,
+            audioCleanup: clip.audioCleanup ?? null,
             volume: editStore.videoAudioVolume,
             outputFormat: "wav",
             outputPath,
@@ -2054,11 +2105,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             flipHorizontal: activeClip.flipHorizontal,
             speed: activeClip.speed,
             noiseReduction: activeClip.noiseReduction,
+            audioCleanup: activeClip.audioCleanup,
+            sourcePath: activeClip.sourcePath,
           }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.noiseReduction]);
+  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.noiseReduction, activeClip?.audioCleanup, activeClip?.sourcePath]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -2168,13 +2221,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoArrowRedo size={15} />
           </ActionButton>
           <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
-          <ActionButton title="Split at playhead" onClick={handleSplit} disabled={duration <= 0}>
+          <ActionButton
+            title={selectedPip ? "Split selected PiP at playhead" : "Split at playhead"}
+            onClick={handleSplit}
+            disabled={selectedPip ? !(currentOutputTime > selectedPip.startTime && currentOutputTime < selectedPip.endTime) : duration <= 0}
+          >
             <IoCutOutline size={15} />
           </ActionButton>
           <ActionButton
-            title={selectedClipId ? "Delete selected clip" : "Delete clip at playhead"}
+            title={selectedPip ? "Delete selected PiP piece" : selectedClipId ? "Delete selected clip" : "Delete clip at playhead"}
             onClick={handleDeleteSegment}
-            disabled={editStore.clips.length <= 1}
+            disabled={!selectedPip && editStore.clips.length <= 1}
           >
             <IoTrashOutline size={15} />
           </ActionButton>
@@ -2208,7 +2265,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={noiseReductionButtonRef}
             type="button"
-            title={selectedClipId ? "Reduce background noise" : "Select a clip to reduce its noise"}
+            title={selectedClipId ? "Clean up audio (reduce or remove noise, hum, rumble)" : "Select a clip to clean up its audio"}
             disabled={!selectedClipId}
             onClick={() => {
               if (noiseReductionPopoverAnchor) {
@@ -2225,7 +2282,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             {selectedClipId === activeClip?.id && noiseReductionStatus === "calibrating" ? (
               <IoSyncOutline size={15} className="text-blue-400 animate-spin" />
             ) : (
-              <MdOutlineNoiseControlOff size={15} className={selectedClip?.noiseReduction ? "text-blue-400" : undefined} />
+              <MdOutlineNoiseControlOff size={15} className={selectedClip && hasAudioCleanup(selectedClip) ? "text-blue-400" : undefined} />
             )}
           </button>
           <button
@@ -2442,7 +2499,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       )}
 
       {/* Timeline */}
-      <div className="w-full flex border border-neutral-800 rounded-md overflow-hidden bg-neutral-950 text-neutral-200">
+      <div className="relative w-full flex border border-neutral-800 rounded-md overflow-hidden bg-neutral-950 text-neutral-200">
         {/* Track control rail */}
         <div className="w-14 shrink-0 flex flex-col items-center gap-1.5 py-2 bg-neutral-900 border-r border-neutral-800">
           <button
@@ -2585,7 +2642,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             above), and past ~4 lanes the stack scrolls vertically here instead of growing the
             panel up over the video preview. The ruler stays pinned while scrolling. */}
         <div ref={trackAreaRef} className="flex-1 max-h-[236px] overflow-x-auto overflow-y-auto relative select-none">
-          <div style={{ width: totalWidth }} className="relative">
+          <div ref={trackContentRef} style={{ width: totalWidth }} className="relative">
             {/* Ruler - represents the *assembled* (playback-order) timeline, not raw source time */}
             <div
               className="sticky top-0 z-30 bg-neutral-950 h-6 border-b border-neutral-800 cursor-pointer"
@@ -2928,8 +2985,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     onPointerMove={handlePipOverlayDragMove}
                     onPointerUp={endPipOverlayDrag}
                     onPointerCancel={endPipOverlayDrag}
-                    title="Picture-in-picture - click to jump the playhead here"
-                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center justify-between gap-1 px-2 text-[11px] text-white cursor-grab active:cursor-grabbing ${
+                    title={toolMode === "razor" ? "Picture-in-picture - click to split it here" : "Picture-in-picture - click to select (then Split/Delete act on it), drag to move"}
+                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center justify-between gap-1 px-2 text-[11px] text-white ${
+                      toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"
+                    } ${
                       isSelected ? "border-dashed border-white" : "border-fuchsia-400"
                     }`}
                     style={{ left, width }}
@@ -3053,6 +3112,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             </div>
           </div>
         </div>
+
+        {lanesHiddenBelow && (
+          <button
+            type="button"
+            title="Some tracks are below - scroll to see them"
+            onClick={() => trackAreaRef.current?.scrollBy({ top: 96, behavior: "smooth" })}
+            className="absolute bottom-1.5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] text-white bg-neutral-700/90 hover:bg-neutral-600 shadow ring-1 ring-white/10"
+          >
+            More tracks below ↓
+          </button>
+        )}
       </div>
 
       {exportOptionsAnchor && (
@@ -3120,11 +3190,21 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           return (
             <NoiseReductionPopover
               strength={clip.noiseReduction ?? 0}
+              cleanup={clip.audioCleanup}
               status={noiseReductionStatus}
               anchor={noiseReductionPopoverAnchor}
-              onUpdate={(noiseReduction) => editStore.updateClipEffects(clip.id, { noiseReduction })}
+              clipCount={editStore.clips.length}
+              onUpdate={(patch) => editStore.updateClipEffects(clip.id, patch)}
+              onApplyToAll={(patch) => editStore.updateAllClipEffects(patch)}
               onClose={() => setNoiseReductionPopoverAnchor(null)}
-              onRecalibrate={onRecalibrateNoise}
+              sourcePath={clip.sourcePath}
+              clipStart={clip.start}
+              clipEnd={clip.end}
+              playhead={activeClip?.id === clip.id ? currentTime : undefined}
+              onSeek={(t) => onSeek(clip.sourcePath, t)}
+              onPreviewOriginal={onPreviewNoiseOriginal}
+              isPlaying={isPlaying}
+              onTogglePlay={handleTransportPlayClick}
             />
           );
         })()}

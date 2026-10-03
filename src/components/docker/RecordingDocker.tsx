@@ -1,7 +1,22 @@
 // components/docker/RecordingDocker.tsx
 import React from "react";
-import { IoInformationCircle, IoRefresh, IoPhonePortraitOutline } from "react-icons/io5";
+import {
+  IoCameraOutline,
+  IoChevronDown,
+  IoDesktopOutline,
+  IoMic,
+  IoMicOutline,
+  IoPause,
+  IoPencil,
+  IoPhonePortraitOutline,
+  IoPlay,
+  IoRefresh,
+  IoSquare,
+  IoVideocam,
+  IoVideocamOutline,
+} from "react-icons/io5";
 import { PHONE_CAMERA_DEVICE, PHONE_CAMERA_LABEL } from "../../services/phoneCamera";
+import DockerDropdown, { DropdownOption } from "./DockerDropdown";
 
 // Represents "Native" (no downscale) as a plain width rather than a separate value/flag - see
 // FormData.resolution_width's own doc comment (recording.rs) for why the backend already expects
@@ -13,12 +28,11 @@ interface RecordingDockerProps {
   fileName: string;
   onFileNameChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
   fileExt: string;
-  onFileExtChange: (event: React.ChangeEvent<HTMLSelectElement>) => void;
-  onShowVideoFormatInfo: () => void;
+  onFileExtChange: (ext: string) => void;
   recordType: string;
-  onRecordTypeChange: (event: React.ChangeEvent<HTMLSelectElement>) => void;
+  onRecordTypeChange: (recordType: string) => void;
   audioDevice: string;
-  onAudioDeviceChange: (event: React.ChangeEvent<HTMLSelectElement>) => void;
+  onAudioDeviceChange: (device: string) => void;
   connectedAudioDevices: string[] | null;
   connectedCameraDevices: string[] | null;
   videoDevices: string[];
@@ -65,6 +79,116 @@ interface RecordingDockerProps {
   onResumeRecordingClick: () => void;
 }
 
+// The record types, in the same order and with the same icon language as the Screen Options
+// modal's header (EnhancedScreenOptions.tsx), so the two read as one control.
+const RECORD_TYPES: { value: string; label: string; icons: React.ReactNode[] }[] = [
+  { value: "sva", label: "Screen + Camera", icons: [<IoDesktopOutline key="s" />, <IoVideocam key="v" />, <IoMic key="a" />] },
+  { value: "sa", label: "Screen + Mic", icons: [<IoDesktopOutline key="s" />, <IoMic key="a" />] },
+  { value: "s", label: "Screen only", icons: [<IoDesktopOutline key="s" />] },
+  { value: "va", label: "Camera + Mic", icons: [<IoVideocam key="v" />, <IoMic key="a" />] },
+  { value: "v", label: "Camera only", icons: [<IoVideocam key="v" />] },
+  { value: "a", label: "Audio only", icons: [<IoMic key="a" />] },
+];
+
+const FORMATS: Record<"image" | "audio" | "video", { value: string; label: string }[]> = {
+  image: [
+    { value: "png", label: "PNG" },
+    { value: "jpeg", label: "JPEG" },
+    { value: "webp", label: "WebP" },
+  ],
+  audio: [
+    { value: "mp3", label: "MP3" },
+    { value: "wav", label: "WAV" },
+    { value: "aac", label: "AAC" },
+    { value: "wma", label: "WMA" },
+  ],
+  video: [
+    { value: "mp4", label: "MP4" },
+    { value: "mkv", label: "MKV" },
+    { value: "mov", label: "MOV" },
+    { value: "webm", label: "WebM" },
+    { value: "avi", label: "AVI" },
+  ],
+};
+
+const SCREEN_TYPES = ["sva", "sa", "s"];
+const MIC_TYPES = ["sva", "sa", "va", "a"];
+const CAMERA_TYPES = ["sva", "va", "v"];
+
+// A chip that opens a DockerDropdown: caption icon, small caption, current value, chevron.
+const ChipSelect: React.FC<{
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  options: DropdownOption[];
+  onChange: (value: string) => void;
+  title?: string;
+  className?: string;
+  emptyLabel?: string;
+}> = ({ icon, label, value, options, onChange, title, className = "", emptyLabel }) => {
+  const current = options.find((o) => o.value === value);
+  return (
+    <DockerDropdown
+      value={value}
+      options={options}
+      onChange={onChange}
+      title={label}
+      triggerTitle={title}
+      emptyLabel={emptyLabel}
+      triggerClassName={`docker-chip flex items-center gap-2.5 h-10 pl-3 pr-2.5 rounded-xl border border-neutral-200 dark:border-neutral-700/80 bg-white dark:bg-neutral-800/80 hover:border-neutral-300 dark:hover:border-neutral-600 text-left transition-colors ${className}`}
+    >
+      <span className="text-neutral-400 dark:text-neutral-500 shrink-0">{icon}</span>
+      <span className="flex flex-col min-w-0 leading-tight">
+        <span className="docker-chip-caption text-[10px] font-medium uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
+          {label}
+        </span>
+        <span className="text-[13px] font-medium text-neutral-800 dark:text-neutral-100 truncate">
+          {current?.label ?? emptyLabel ?? value}
+        </span>
+      </span>
+      <IoChevronDown className="shrink-0 ml-1 text-neutral-400" size={14} />
+    </DockerDropdown>
+  );
+};
+
+// An on/off pill with a sliding switch - reads as a setting at a glance, unlike a bare checkbox.
+const TogglePill: React.FC<{
+  label: string;
+  checked: boolean;
+  onToggle: () => void;
+  disabled?: boolean;
+  title?: string;
+}> = ({ label, checked, onToggle, disabled, title }) => (
+  <button
+    type="button"
+    role="switch"
+    aria-checked={checked}
+    disabled={disabled}
+    onClick={onToggle}
+    data-tip={title}
+    className={`docker-chip flex items-center gap-2.5 h-10 px-3 rounded-xl border text-[13px] font-medium transition-colors ${
+      disabled
+        ? "border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 cursor-not-allowed"
+        : checked
+        ? "border-blue-500/40 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300"
+        : "border-neutral-200 dark:border-neutral-700/80 bg-white dark:bg-neutral-800/80 text-neutral-700 dark:text-neutral-200 hover:border-neutral-300 dark:hover:border-neutral-600"
+    }`}
+  >
+    <span
+      className={`relative inline-flex w-7 h-4 shrink-0 rounded-full transition-colors ${
+        checked && !disabled ? "bg-blue-500" : "bg-neutral-300 dark:bg-neutral-600"
+      }`}
+    >
+      <span
+        className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white shadow transition-transform ${
+          checked && !disabled ? "translate-x-3" : ""
+        }`}
+      />
+    </span>
+    <span className="whitespace-nowrap">{label}</span>
+  </button>
+);
+
 // The default docker content: screen/video/audio recording setup. This is exactly what used to
 // be BottomDocker's inline `scopedDocker()` closure, pulled out into its own component so
 // BottomDocker can act as a plain switcher between this and FileToolsDocker (see dockerMode in
@@ -74,7 +198,6 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   onFileNameChange,
   fileExt,
   onFileExtChange,
-  onShowVideoFormatInfo,
   recordType,
   onRecordTypeChange,
   audioDevice,
@@ -105,301 +228,286 @@ const RecordingDocker: React.FC<RecordingDockerProps> = ({
   onPauseRecordingClick,
   onResumeRecordingClick,
 }) => {
+  const formats = recordType === "c" ? FORMATS.image : recordType === "a" ? FORMATS.audio : FORMATS.video;
+  const hasScreen = SCREEN_TYPES.includes(recordType);
+  const hasMic = MIC_TYPES.includes(recordType);
+  const hasCamera = CAMERA_TYPES.includes(recordType);
+
   return (
-    <div className="docker-panel w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
-      <div className="docker-fields-row flex flex-wrap items-end gap-3">
-        <div>
-          <div className="docker-field-label p-1 text-sm">Save file as</div>
-          <input
-            type="text"
-            className="file_name p-2.5 rounded-l text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-            name="file_name"
-            id="file_name"
-            value={fileName}
-            onChange={onFileNameChange}
-            placeholder={"Recording-" + Date()}
-          />
-        </div>
-
-        <div>
-          <div className="docker-field-label p-1 text-sm flex items-center justify-between">
-            Type{" "}
-            <button type="button">
-              <IoInformationCircle onClick={onShowVideoFormatInfo} />
-            </button>
+    <div className="docker-panel docker-recording w-full flex flex-col gap-3 overflow-auto rounded-2xl border border-neutral-200/80 dark:border-neutral-800 bg-neutral-50/80 dark:bg-neutral-900/60 p-3">
+      {/* Top row: what's recorded and what it's called, then the primary actions. */}
+      <div className="docker-top-row flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-3 min-w-0">
+          {/* The file name, edited in place - with its format as a suffix, the way the file will
+              actually be named on disk. */}
+          <div className="docker-chip flex items-center h-10 rounded-xl border border-neutral-200 dark:border-neutral-700/80 bg-white dark:bg-neutral-800/80 focus-within:ring-2 focus-within:ring-blue-500/30 focus-within:border-blue-500/50 transition-shadow">
+            <IoPencil className="ml-3 text-neutral-400 shrink-0" size={13} />
+            <input
+              type="text"
+              name="file_name"
+              id="file_name"
+              value={fileName}
+              onChange={onFileNameChange}
+              disabled={isRecording}
+              placeholder="Recording name"
+              data-tip="File name"
+              className="docker-name-input w-44 bg-transparent px-2 text-[13px] font-medium text-neutral-800 dark:text-neutral-100 placeholder:text-neutral-400 outline-none disabled:opacity-60"
+            />
+            <div className="h-full border-l border-neutral-200 dark:border-neutral-700/80">
+              <DockerDropdown
+                value={fileExt}
+                options={formats.map((f) => ({ value: f.value, label: `.${f.label.toLowerCase()}`, hint: f.label }))}
+                onChange={onFileExtChange}
+                disabled={isRecording}
+                title="File format"
+                triggerTitle="File format"
+                triggerClassName="flex items-center gap-1 h-[38px] pl-3 pr-3 rounded-r-xl text-[12px] font-semibold text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-white disabled:cursor-not-allowed"
+              >
+                .{fileExt.toLowerCase()}
+                <IoChevronDown className="text-neutral-400" size={12} />
+              </DockerDropdown>
+            </div>
           </div>
-          <select
-            name="file_ext"
-            id="file_ext"
-            className="p-2.5 rounded-r text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-            value={fileExt}
-            onChange={onFileExtChange}
+
+          {/* Record type as segmented pills rather than a long dropdown - every mode is visible
+              and one click away. */}
+          <div
+            role="radiogroup"
+            aria-label="Recording type"
+            className={`docker-types flex flex-wrap items-center gap-0.5 p-1 rounded-xl bg-neutral-200/60 dark:bg-neutral-800 ${
+              isRecording ? "opacity-60 pointer-events-none" : ""
+            }`}
           >
-            {recordType === "c" ? (
-              <>
-                <option value="png">Png</option>
-                <option value="jpeg">Jpeg</option>
-                <option value="webp">webp</option>
-              </>
-            ) : recordType === "a" ? (
-              <>
-                <option value="mp3">Mp3</option>
-                <option value="wav">Wav</option>
-                <option value="aac">AAC</option>
-                <option value="wma">WMA</option>
-              </>
-            ) : (
-              <>
-                <option value="avi">Avi</option>
-                <option value="mkv">Mkv</option>
-                <option value="webm">webm</option>
-                <option value="mov">Mov</option>
-                <option value="mp4">Mp4</option>
-              </>
-            )}
-          </select>
+            {RECORD_TYPES.map((t) => {
+              const active = t.value === recordType;
+              return (
+                <button
+                  key={t.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  onClick={() => onRecordTypeChange(t.value)}
+                  data-tip={t.label}
+                  className={`docker-type flex items-center gap-1.5 h-8 px-2.5 rounded-lg text-[12px] font-medium whitespace-nowrap transition-all ${
+                    active
+                      ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm"
+                      : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-100"
+                  }`}
+                >
+                  <span className={`flex items-center gap-0.5 ${active ? "text-blue-500" : ""}`}>{t.icons}</span>
+                  <span className="docker-type-label">{t.label}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
 
-        <div>
-          <div className="docker-field-label p-1 text-sm">Recording options</div>
-          <select
-            name="record_type"
-            id="record_type"
-            className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-            value={recordType}
-            onChange={onRecordTypeChange}
+        <div className="docker-actions-row flex items-center gap-2 ml-auto">
+          <button
+            type="button"
+            onClick={onScreenshotClick}
+            disabled={isRecording}
+            data-tip="Take a screenshot"
+            className="docker-chip flex items-center gap-2 h-10 px-3.5 rounded-xl border border-neutral-200 dark:border-neutral-700/80 bg-white dark:bg-neutral-800/80 text-[13px] font-medium text-neutral-700 dark:text-neutral-200 hover:border-neutral-300 dark:hover:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <option value="sva">Screen record(Screen + Video + Audio)</option>
-            <option value="sa">Screen record(Screen + Audio)</option>
-            <option value="va">Screen record(Video and Audio)</option>
-            <option value="s">Screen record(Screen only)</option>
-            <option value="v">Video</option>
-            <option value="a">Audio</option>
-          </select>
-        </div>
+            <IoCameraOutline size={16} />
+            <span className="docker-action-label">Screenshot</span>
+          </button>
 
-        <div>
-          <div className="docker-field-label p-1 text-sm">Audio device</div>
-          <select
-            name="audioDevice"
-            id="audioDevice"
-            className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
+          {!isRecording ? (
+            <button
+              type="button"
+              onClick={onStartRecordingClick}
+              data-tip="Choose what to record, then start"
+              data-tip-kbd="Ctrl+Shift+R"
+              className="docker-chip group flex items-center gap-2 h-10 pl-3 pr-4 rounded-xl bg-red-600 hover:bg-red-500 active:bg-red-700 text-white text-[13px] font-semibold shadow-sm shadow-red-600/30 transition-colors"
+            >
+              <span className="flex items-center justify-center w-4 h-4 rounded-full border-2 border-white/90">
+                <span className="w-1.5 h-1.5 rounded-full bg-white" />
+              </span>
+              Start recording
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={isPaused ? onResumeRecordingClick : onPauseRecordingClick}
+                className="docker-chip flex items-center gap-2 h-10 px-3.5 rounded-xl border border-neutral-200 dark:border-neutral-700/80 bg-white dark:bg-neutral-800/80 text-[13px] font-medium text-neutral-800 dark:text-neutral-100 hover:border-neutral-300 dark:hover:border-neutral-600"
+              >
+                {isPaused ? <IoPlay size={14} /> : <IoPause size={14} />}
+                {isPaused ? "Resume" : "Pause"}
+              </button>
+              <button
+                type="button"
+                onClick={onStopRecordingClick}
+                className="docker-chip flex items-center gap-2 h-10 pl-3 pr-4 rounded-xl bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 text-[13px] font-semibold hover:bg-neutral-800 dark:hover:bg-neutral-100"
+              >
+                <span className="relative flex w-2 h-2">
+                  {!isPaused && <span className="absolute inline-flex w-full h-full rounded-full bg-red-500 opacity-75 animate-ping" />}
+                  <span className="relative inline-flex w-2 h-2 rounded-full bg-red-500" />
+                </span>
+                <IoSquare size={10} />
+                Stop
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Bottom row: devices, then capture options. Locked while recording - changes wouldn't
+          reach a capture that's already running. */}
+      <div
+        className={`docker-fields-row flex flex-wrap items-center gap-2 ${isRecording ? "opacity-60 pointer-events-none" : ""}`}
+        aria-disabled={isRecording}
+      >
+        {hasMic && (
+          <ChipSelect
+            icon={<IoMicOutline size={16} />}
+            label="Microphone"
             value={audioDevice}
             onChange={onAudioDeviceChange}
-          >
-            {connectedAudioDevices ? (
-              connectedAudioDevices.map((device, index) => (
-                <option key={index} value={device}>
-                  {device}
-                </option>
-              ))
+            className="max-w-[280px]"
+            options={(connectedAudioDevices ?? []).map((device) => ({ value: device, label: device }))}
+            emptyLabel="No microphone detected"
+          />
+        )}
+
+        {hasCamera && (
+          <div className="docker-chip flex items-center gap-1 h-10 pl-3 pr-1 rounded-xl border border-neutral-200 dark:border-neutral-700/80 bg-white dark:bg-neutral-800/80">
+            <IoVideocamOutline className="text-neutral-400 dark:text-neutral-500 shrink-0 mr-1" size={16} />
+            {connectedCameraDevices && connectedCameraDevices.length > 0 ? (
+              connectedCameraDevices.map((device) => {
+                // The phone entry is always present but only usable once paired, so it carries
+                // its own label and status, and opens the pairing panel instead of silently doing
+                // nothing when it isn't paired yet.
+                const isPhone = device === PHONE_CAMERA_DEVICE;
+                const selected = videoDevices.includes(device);
+                return (
+                  <button
+                    key={device}
+                    type="button"
+                    aria-pressed={selected}
+                    onClick={() => (isPhone && !isPhoneCameraConnected ? onOpenPhoneCamera() : onToggleVideoDevice(device))}
+                    data-tip={isPhone && !isPhoneCameraConnected ? "Pair your phone to use it as a camera" : device}
+                    className={`flex items-center gap-1.5 h-7 px-2.5 rounded-lg text-[12px] font-medium max-w-[180px] transition-colors ${
+                      selected
+                        ? "bg-blue-500 text-white"
+                        : "text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+                    }`}
+                  >
+                    {isPhone && <IoPhonePortraitOutline className="shrink-0" size={12} />}
+                    <span className="truncate">{isPhone ? PHONE_CAMERA_LABEL : device}</span>
+                    {isPhone && (
+                      <span
+                        className={`shrink-0 w-1.5 h-1.5 rounded-full ${isPhoneCameraConnected ? "bg-green-400" : "bg-neutral-400"}`}
+                        data-tip={isPhoneCameraConnected ? "Connected" : "Not paired"}
+                      />
+                    )}
+                    {isPhone && !isPhoneCameraConnected && (
+                      <span className="shrink-0 text-[10px] px-1.5 py-px rounded-full bg-neutral-100 dark:bg-neutral-700 text-neutral-500 dark:text-neutral-400">
+                        Set up
+                      </span>
+                    )}
+                  </button>
+                );
+              })
             ) : (
-              <option value="">No audio device detected</option>
+              <span className="px-1 text-[12px] text-neutral-500">No cameras detected</span>
             )}
-          </select>
-        </div>
-
-        {/* Only meaningful for the screen-capture record types - "va"/"v"/"a" don't grab the
-            screen at all, so there's no "what's playing while I record" scenario for them. */}
-        {(recordType === "sva" || recordType === "sa" || recordType === "s") && (
-          <div>
-            <div className="docker-field-label p-1 text-sm">&nbsp;</div>
-            <label
-              title="Captures whatever's playing through your speakers (e.g. a video open in another app) alongside the screen capture. On macOS this needs a virtual-audio-loopback device (e.g. BlackHole) already installed."
-              className="docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
+            <button
+              type="button"
+              onClick={onRefreshDevices}
+              data-tip="Refresh devices"
+              className="flex items-center justify-center w-7 h-7 ml-0.5 rounded-lg text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700"
             >
-              <input
-                type="checkbox"
-                checked={includeSystemAudio}
-                onChange={onToggleIncludeSystemAudio}
-              />
-              System audio
-            </label>
+              <IoRefresh size={14} />
+            </button>
           </div>
         )}
 
-        {/* Same screen-capturing record types click_tracker.rs's own gate uses (start_recording,
-            recording.rs) - "va"/"v"/"a" never touch the screen at all, so there's nothing to click
-            "on" in a meaningful sense for them. */}
-        {(recordType === "sva" || recordType === "sa" || recordType === "s") && (
-          <div>
-            <div className="docker-field-label p-1 text-sm">&nbsp;</div>
-            <label
-              title={
-                isClickTrackingSupported
-                  ? "Records where and when you click during the recording, so the editor can suggest zooming in on each one afterward."
-                  : "Click tracking is Windows-only for now - not available on this platform."
-              }
-              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
-                isClickTrackingSupported
-                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
-                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
-              }`}
-            >
-              <input type="checkbox" checked={trackClicks && isClickTrackingSupported} disabled={!isClickTrackingSupported} onChange={onToggleTrackClicks} />
-              Track clicks (auto-zoom)
-            </label>
-          </div>
-        )}
-
-        {/* Same screen-capturing record types as System audio/Track clicks above - resolution and
-            framerate only mean anything when the screen is actually part of the capture. */}
-        {(recordType === "sva" || recordType === "sa" || recordType === "s") && (
+        {hasScreen && (
           <>
-            <div>
-              <div className="docker-field-label p-1 text-sm">Resolution</div>
-              <select
-                className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-                value={resolutionWidth ?? ""}
-                onChange={(e) => onResolutionWidthChange(e.target.value ? Number(e.target.value) : null)}
-                title="Downscales the recording to this max width - lower is smaller and easier to edit/share; Native keeps the display's own resolution"
-              >
-                <option value="">1080p (default)</option>
-                <option value="1280">720p</option>
-                <option value="1920">1080p</option>
-                <option value="2560">1440p</option>
-                <option value={NATIVE_RESOLUTION_WIDTH}>Native</option>
-              </select>
-            </div>
-            <div>
-              <div className="docker-field-label p-1 text-sm">Frame rate</div>
-              <select
-                className="p-2.5 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
-                value={framerate ?? ""}
-                onChange={(e) => onFramerateChange(e.target.value ? Number(e.target.value) : null)}
-                title="Capture framerate - default is 60fps for Screen+Video+Audio, 30fps for other screen modes"
-              >
-                <option value="">Default</option>
-                <option value="24">24 fps</option>
-                <option value="30">30 fps</option>
-                <option value="60">60 fps</option>
-              </select>
-            </div>
+            <ChipSelect
+              icon={<IoDesktopOutline size={15} />}
+              label="Resolution"
+              value={resolutionWidth == null ? "" : String(resolutionWidth)}
+              onChange={(v) => onResolutionWidthChange(v ? Number(v) : null)}
+              title="Auto records at your display's full resolution (up to 4K) when your GPU can capture it, 1080p otherwise. Lower is smaller and easier to edit/share."
+              options={[
+                { value: "", label: "Auto", hint: "up to 4K" },
+                { value: "1280", label: "720p", hint: "HD" },
+                { value: "1920", label: "1080p", hint: "Full HD" },
+                { value: "2560", label: "1440p", hint: "QHD" },
+                { value: String(NATIVE_RESOLUTION_WIDTH), label: "Native", hint: "display's own" },
+              ]}
+            />
+            <ChipSelect
+              icon={<span className="text-[10px] font-bold">FPS</span>}
+              label="Frame rate"
+              value={framerate == null ? "" : String(framerate)}
+              onChange={(v) => onFramerateChange(v ? Number(v) : null)}
+              title="Auto is 60fps when your GPU can capture the screen, 30fps otherwise (and 30fps with a webcam baked into the video)"
+              options={[
+                { value: "", label: "Auto", hint: "60 or 30" },
+                { value: "24", label: "24 fps", hint: "film" },
+                { value: "30", label: "30 fps" },
+                { value: "60", label: "60 fps", hint: "smoothest" },
+              ]}
+            />
           </>
         )}
 
-        <div className="flex items-end gap-1">
-          <div>
-            <div className="docker-field-label p-1 text-sm">Video device(s)</div>
-            <div className="docker-video-devices p-2 rounded-md text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 max-h-28 overflow-y-auto min-w-[180px]">
-              {connectedCameraDevices && connectedCameraDevices.length > 0 ? (
-                connectedCameraDevices.map((device, index) => {
-                  // The phone entry is always present but only usable once paired, so it carries
-                  // its own label, status and a way into the pairing panel rather than pretending
-                  // to be just another detected device.
-                  const isPhone = device === PHONE_CAMERA_DEVICE;
-                  return (
-                    <label key={index} className="flex items-center gap-2 py-0.5 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={videoDevices.includes(device)}
-                        onChange={() => {
-                          // Ticking an unpaired phone can't arm anything, so send the user where
-                          // they can actually pair it instead of silently doing nothing.
-                          if (isPhone && !isPhoneCameraConnected) {
-                            onOpenPhoneCamera();
-                            return;
-                          }
-                          onToggleVideoDevice(device);
-                        }}
-                      />
-                      {isPhone ? (
-                        <span className="flex items-center gap-1.5 min-w-0">
-                          <IoPhonePortraitOutline className="shrink-0 text-neutral-500" size={13} />
-                          <span className="truncate">{PHONE_CAMERA_LABEL}</span>
-                          <span
-                            className={`shrink-0 text-[10px] px-1.5 py-px rounded-full ${
-                              isPhoneCameraConnected
-                                ? "bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-400"
-                                : "bg-neutral-100 text-neutral-500 dark:bg-neutral-700 dark:text-neutral-400"
-                            }`}
-                          >
-                            {isPhoneCameraConnected ? "Connected" : "Set up"}
-                          </span>
-                        </span>
-                      ) : (
-                        <span className="truncate">{device}</span>
-                      )}
-                    </label>
-                  );
-                })
-              ) : (
-                <span className="text-neutral-500">No video cameras detected</span>
-              )}
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onRefreshDevices}
-            title="Refresh device list"
-            className="p-2.5 rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700"
-          >
-            <IoRefresh />
-          </button>
-        </div>
+        {(hasScreen || (recordType === "sva" && videoDevices.length >= 1)) && (
+          <span className="docker-divider hidden sm:block w-px h-6 mx-1 bg-neutral-200 dark:bg-neutral-700" />
+        )}
+
+        {/* Only meaningful for the screen-capture record types - "va"/"v"/"a" don't grab the
+            screen at all, so there's no "what's playing while I record" scenario for them. */}
+        {hasScreen && (
+          <TogglePill
+            label="System audio"
+            checked={includeSystemAudio}
+            onToggle={onToggleIncludeSystemAudio}
+            title={
+              navigator.userAgent.includes("Mac")
+                ? "Also records what's playing through your speakers. Needs a loopback device such as BlackHole on macOS."
+                : "Also records what's playing through your speakers - a video, a call, music."
+            }
+          />
+        )}
+
+        {/* Same screen-capturing record types click_tracker.rs's own gate uses (start_recording,
+            recording.rs). */}
+        {hasScreen && (
+          <TogglePill
+            label="Track clicks"
+            checked={trackClicks && isClickTrackingSupported}
+            onToggle={onToggleTrackClicks}
+            disabled={!isClickTrackingSupported}
+            title={
+              isClickTrackingSupported
+                ? "Records where and when you click, so the editor can suggest zooming in on each one afterward."
+                : "Click tracking is Windows-only for now - not available on this platform."
+            }
+          />
+        )}
 
         {/* Only meaningful for "sva" with exactly one camera - see recording_with_output_sva's own
             doc comment (win.rs) for why more than one camera isn't supported here. */}
         {recordType === "sva" && videoDevices.length >= 1 && (
-          <div>
-            <div className="docker-field-label p-1 text-sm">&nbsp;</div>
-            <label
-              title={
-                videoDevices.includes(PHONE_CAMERA_DEVICE)
-                  ? "The phone camera is always recorded as its own separate file, so this setting doesn't apply while it's selected."
-                  : videoDevices.length === 1
-                  ? "Records the webcam as its own separate file instead of baking it into the screen recording, so you can reposition/resize/reshape it later in the editor's picture-in-picture layer."
-                  : "Only supported with exactly one camera selected."
-              }
-              className={`docker-checkbox-field flex items-center gap-2 h-[42px] px-2.5 rounded-md text-sm border ${
-                videoDevices.length === 1
-                  ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border-neutral-200 dark:border-neutral-700 cursor-pointer"
-                  : "bg-neutral-50 dark:bg-neutral-900 text-neutral-400 dark:text-neutral-600 border-neutral-200 dark:border-neutral-800 cursor-not-allowed"
-              }`}
-            >
-              <input
-                type="checkbox"
-                checked={separateWebcamCapture && videoDevices.length === 1}
-                disabled={videoDevices.length !== 1}
-                onChange={onToggleSeparateWebcamCapture}
-              />
-              Record webcam separately (PiP editing)
-            </label>
-          </div>
-        )}
-      </div>
-
-      <div className="docker-actions-row flex items-end gap-2">
-        <button
-          onClick={onScreenshotClick}
-          disabled={isRecording}
-          className="p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          Screenshot
-        </button>
-
-        {!isRecording ? (
-          <button
-            onClick={onStartRecordingClick}
-            className="p-2.5 rounded-md text-sm bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white"
-          >
-            Start Recording
-          </button>
-        ) : (
-          <>
-            <button
-              onClick={isPaused ? onResumeRecordingClick : onPauseRecordingClick}
-              className="p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
-            >
-              {isPaused ? "Resume" : "Pause"}
-            </button>
-            <button
-              onClick={onStopRecordingClick}
-              className="p-2.5 rounded-md text-sm bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white"
-            >
-              Stop Recording
-            </button>
-          </>
+          <TogglePill
+            label="Separate webcam file"
+            checked={separateWebcamCapture && videoDevices.length === 1}
+            onToggle={onToggleSeparateWebcamCapture}
+            disabled={videoDevices.length !== 1}
+            title={
+              videoDevices.includes(PHONE_CAMERA_DEVICE)
+                ? "The phone camera is always recorded as its own separate file, so this setting doesn't apply while it's selected."
+                : videoDevices.length === 1
+                ? "Records the webcam as its own file instead of baking it into the screen recording, so you can reposition/resize/reshape it later in the editor's picture-in-picture layer - and switch between screen and camera while recording (Alt+Shift+V)."
+                : "Only supported with exactly one camera selected."
+            }
+          />
         )}
       </div>
     </div>

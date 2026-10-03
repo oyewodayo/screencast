@@ -2,7 +2,6 @@ import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "re
 import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
-import { message } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import ActiveRecordingState, { RecordSource, SOURCE_FLAGS } from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
@@ -12,6 +11,12 @@ import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import { loadSettings } from "../utils/appSettings";
+import { startSnip } from "../services/snip";
+
+// First entry of each is the fallback when Settings' default format is of another kind.
+const VIDEO_EXTS = ["mp4", "mkv", "mov", "webm", "avi"];
+const AUDIO_EXTS = ["mp3", "wav", "aac", "wma"];
+const IMAGE_EXTS = ["png", "jpeg", "webp"];
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -56,9 +61,8 @@ interface Props {
   // through to FileToolsDocker/VideoTimelineDocker - same shape as onActiveClipChange above, just
   // travelling player-to-timeline-docker instead of the other way.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
-  // Video-only: forwards NoiseReductionPopover's "Recalibrate from current playback" click through
-  // to VideoPlayer, same threading direction as onActiveClipChange above.
-  onRecalibrateNoise?: () => void;
+  // Video-only: NoiseReductionPopover's "Hold to compare", forwarded to VideoTimelineDocker.
+  onPreviewNoiseOriginal?: (bypass: boolean) => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // FileToolsDocker/VideoTimelineDocker.
   selectedOverlayId?: string | null;
@@ -118,6 +122,10 @@ interface Props {
   setIncludeSystemAudio: React.Dispatch<React.SetStateAction<boolean>>;
   separateWebcamCapture: boolean;
   setSeparateWebcamCapture: React.Dispatch<React.SetStateAction<boolean>>;
+  // Live Screen <-> Camera cutting while recording - see Dashboard's switchView.
+  canSwitchView: boolean;
+  viewMode: 'screen' | 'camera';
+  onSwitchView: (mode: 'screen' | 'camera') => void;
   trackClicks: boolean;
   setTrackClicks: React.Dispatch<React.SetStateAction<boolean>>;
   resolutionWidth: number | null;
@@ -196,7 +204,7 @@ const BottomDocker = ({
   onOutputTimeChange,
   onActiveClipChange,
   noiseReductionStatus,
-  onRecalibrateNoise,
+  onPreviewNoiseOriginal,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -248,6 +256,9 @@ const BottomDocker = ({
   setIncludeSystemAudio,
   separateWebcamCapture,
   setSeparateWebcamCapture,
+  canSwitchView,
+  viewMode,
+  onSwitchView,
   trackClicks,
   setTrackClicks,
   resolutionWidth,
@@ -390,29 +401,20 @@ const BottomDocker = ({
     loadDevices();
   }, []);
 
+  // Keeps the format valid for the record type: switching between video types keeps the user's
+  // choice; moving to a different kind (video/audio/screenshot) takes the Settings default when
+  // it's of that kind, otherwise MP4 / MP3 / PNG.
   useEffect(() => {
-    // Set default file extension based on recordType
-    switch (recordType) {
-      case "c":
-        setFileExt("png");
-        break;
-      case "a":
-        setFileExt("mp3");
-        break;
-      default:
-        setFileExt("Avi");
-        break;
-    }
+    const allowed = recordType === "c" ? IMAGE_EXTS : recordType === "a" ? AUDIO_EXTS : VIDEO_EXTS;
+    const preferred = loadSettings().defaultFileExt.toLowerCase();
+    setFileExt((prev) => {
+      const current = prev.toLowerCase();
+      if (allowed.includes(current)) return current;
+      return allowed.includes(preferred) ? preferred : allowed[0];
+    });
   }, [recordType]);
 
-  const handleRecordTypeChange = (
-    event: React.ChangeEvent<HTMLSelectElement>
-  ) => {
-    setRecordType(event.target.value);
-  };
-
-  // Same thing, for callers that already have the value rather than a <select> event - currently
-  // the screen-selection modal's own "Change" control. Clearing previousRecordType matters:
+  // For the screen-selection modal's own "Change" control. Clearing previousRecordType matters:
   // closeModalScreen restores it on close, so without this, deliberately switching type inside
   // the modal during a screenshot flow would be silently undone the moment it closed.
   const handleRecordTypeSelected = (value: string) => {
@@ -420,20 +422,8 @@ const BottomDocker = ({
     setRecordType(value);
   };
 
-  const handleFileExtChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
-    console.log(event.target.value);
-
-    setFileExt(event.target.value);
-  };
-
   const handleFileNameChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     setFileName(event.target.value);
-  };
-
-  const handleAudioDeviceChange = (
-    event: React.ChangeEvent<HTMLSelectElement>
-  ) => {
-    setAudioDevice(event.target.value);
   };
 
   const toggleVideoDevice = (device: string) => {
@@ -529,14 +519,16 @@ const BottomDocker = ({
   // screen-selection modal and the backend both key off recordType === "c" to behave as a
   // screenshot flow. Switch to it just for this flow and restore the dropdown's value
   // (in closeModalScreen) once the modal closes.
-  const handleScreenshotClick = () => {
+  // The screen picker (services/snip.ts) where it's available; elsewhere, the screenshot modal.
+  const handleScreenshotClick = async () => {
+    try {
+      if (await startSnip()) return;
+    } catch (err) {
+      console.error("Screenshot picker failed:", err);
+    }
     setPreviousRecordType(recordType);
     setRecordType("c");
     openModalScreen();
-  }
-
-  const videoFormatInfo = async() =>{
-    return await message("Avi or Mkv format is highly rocommended to record video. However, you can remuxe or convert to other format when you are done recording.", { title: 'Video format', kind: 'info' });
   }
 
   return (
@@ -558,6 +550,29 @@ const BottomDocker = ({
       setOverlayShape={setOverlayShape}
       setOverlayPosition={setOverlayPosition}
       setOverlaySize={setOverlaySize}
+      separateWebcamCapture={separateWebcamCapture}
+      setSeparateWebcamCapture={setSeparateWebcamCapture}
+      fileName={fileName}
+      onFileNameChange={setFileName}
+      fileExt={fileExt}
+      onFileExtChange={setFileExt}
+      audioDevice={audioDevice}
+      onAudioDeviceChange={setAudioDevice}
+      connectedAudioDevices={connectedAudioDevices}
+      connectedCameraDevices={connectedCameraDevices}
+      onToggleVideoDevice={toggleVideoDevice}
+      onRefreshDevices={loadDevices}
+      onOpenPhoneCamera={onOpenPhoneCamera}
+      isPhoneCameraConnected={isPhoneCameraConnected}
+      includeSystemAudio={includeSystemAudio}
+      onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
+      trackClicks={trackClicks}
+      onToggleTrackClicks={() => setTrackClicks((prev) => !prev)}
+      isClickTrackingSupported={isClickTrackingSupported}
+      resolutionWidth={resolutionWidth}
+      onResolutionWidthChange={setResolutionWidth}
+      framerate={framerate}
+      onFramerateChange={setFramerate}
       isOpenScreen={modalOpenScreen} 
       onCloseScreen={closeModalScreen} 
       onStartRecording={onStartRecording} 
@@ -567,6 +582,9 @@ const BottomDocker = ({
     <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
      
         <ActiveRecordingState
+            canSwitchView={canSwitchView}
+            viewMode={viewMode}
+            onSwitchView={onSwitchView}
             isRecording={isRecording}
             recordingStartTime={recordingStartTime}
             recordType={recordType}
@@ -620,7 +638,7 @@ const BottomDocker = ({
             onOutputTimeChange={onOutputTimeChange}
             onActiveClipChange={onActiveClipChange}
             noiseReductionStatus={noiseReductionStatus}
-            onRecalibrateNoise={onRecalibrateNoise}
+            onPreviewNoiseOriginal={onPreviewNoiseOriginal}
             selectedOverlayId={selectedOverlayId}
             onSelectOverlay={onSelectOverlay}
             isPlacingText={isPlacingText}
@@ -645,12 +663,11 @@ const BottomDocker = ({
             fileName={fileName}
             onFileNameChange={handleFileNameChange}
             fileExt={fileExt}
-            onFileExtChange={handleFileExtChange}
-            onShowVideoFormatInfo={videoFormatInfo}
+            onFileExtChange={setFileExt}
             recordType={recordType}
-            onRecordTypeChange={handleRecordTypeChange}
+            onRecordTypeChange={setRecordType}
             audioDevice={audioDevice}
-            onAudioDeviceChange={handleAudioDeviceChange}
+            onAudioDeviceChange={setAudioDevice}
             connectedAudioDevices={connectedAudioDevices}
             connectedCameraDevices={connectedCameraDevices}
             videoDevices={videoDevices}

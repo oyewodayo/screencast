@@ -4,11 +4,14 @@ import * as Y from "yjs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import BottomDocker from "../components/BottomDocker";
-import { listen } from '@tauri-apps/api/event';
+import { listen, emit } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { PhysicalPosition, PhysicalSize, availableMonitors } from '@tauri-apps/api/window';
+import { fadeTotalMs } from '../utils/annotationStyles';
 import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
-import { formatFileName, truncateFileName } from "../utils/Formater";
+import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
+import { useMediaDurations } from "../hooks/useMediaDurations";
 import SidebarFileIcon from "../components/SidebarFileIcon";
 import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
 import useVideoEditStore from "../hooks/useVideoEditStore";
@@ -36,6 +39,9 @@ import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
+import { PresentationLiveBar } from "../components/PresentationControls";
+import { getPresentationState, visibleCameras } from "../services/presentation";
+import { SNIP_SHORTCUT, SnipResult, startSnip } from "../services/snip";
 
 // Record types that capture cameras and no screen (win.rs recording_with_output_va/_v). Mirrors
 // CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
@@ -47,6 +53,10 @@ import {
   type PhoneCaptureHandle,
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
+import UpdateBanner from "../components/custom/UpdateBanner";
+import { checkForUpdate } from "../utils/updater";
+import { trackEvent } from "../utils/telemetry";
+import type { Update } from "@tauri-apps/plugin-updater";
 import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
 import {
@@ -151,6 +161,12 @@ const OPEN_FILE_DIALOG_FILTERS = [
 // see every keystroke system-wide.
 const OVERLAY_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+H';
 
+// Cuts the recording's main view between the screen and a full-frame camera, while recording -
+// only registered when the recording has a separate camera file to cut to (see canSwitchView).
+// Alt+Shift rather than Ctrl+Shift: Ctrl+Shift+V is "paste as plain text" in browsers, Slack and
+// Docs - exactly the apps people demo - and a global shortcut would swallow it.
+const VIEW_SWITCH_SHORTCUT = 'Alt+Shift+V';
+
 const toggleOverlayVisibility = async () => {
   const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
   if (!overlayWindow) return;
@@ -160,6 +176,34 @@ const toggleOverlayVisibility = async () => {
     await overlayWindow.show();
   }
 };
+
+// Global shortcuts go through these two instead of register/unregister directly:
+//
+//  - bindShortcut always re-registers. The plugin keeps a shortcut registered on the Rust side
+//    across a page reload, still pointing at the dead page's callback - the old "register only if
+//    !isRegistered" check then skipped registering for the new page, so the shortcut silently did
+//    nothing after any reload (a Vite full reload in dev, Settings' "Reload app").
+//  - Every bind/unbind for one shortcut runs strictly in call order. Effect cleanups used to
+//    unregister asynchronously, so under StrictMode's mount -> unmount -> mount (and on effect
+//    re-runs) a late unregister could land after the new register and remove it.
+//  - The handler fires on key-down only; the plugin reports release too.
+const shortcutQueues = new Map<string, Promise<void>>();
+const queueShortcutOp = (accelerator: string, op: () => Promise<void>): Promise<void> => {
+  const next = (shortcutQueues.get(accelerator) ?? Promise.resolve()).catch(() => {}).then(op);
+  shortcutQueues.set(accelerator, next);
+  return next;
+};
+const bindShortcut = (accelerator: string, onPress: () => void): Promise<void> =>
+  queueShortcutOp(accelerator, async () => {
+    if (await isRegistered(accelerator)) await unregister(accelerator);
+    await register(accelerator, (event) => {
+      if (event.state === 'Pressed') onPress();
+    });
+  });
+const unbindShortcut = (accelerator: string): Promise<void> =>
+  queueShortcutOp(accelerator, async () => {
+    if (await isRegistered(accelerator)) await unregister(accelerator);
+  });
 
 // Toggles the system-wide stylus annotation overlay's "draw mode" - unlike the recording overlay
 // above, this one is available any time (not gated on an active recording), so its hotkey is
@@ -180,28 +224,21 @@ const PANEL_BUTTONS_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+B';
 // EnhancedScreenOptions' target picker (screen_size is hardcoded to "fullscreen") since the whole
 // point of a global hotkey is starting a recording without switching to this window first.
 const RECORDING_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+R';
-// Hard kill switch, independent of the Settings checkbox/localStorage. Confirmed on 2026-07-21:
-// flipping this to false reliably hangs the whole app (Briefcast.exe stops responding, verified via
-// Get-Process -> Responding: False) on first launch, right as ensure_annotation_overlay
-// (annotation.rs) creates the overlay window - it appears in the window list but the app never
-// gets past window.set_position()/set_size() afterward. This is a real deadlock, not just the
-// click-through issue the surrounding comments describe, and reproduced twice in a row on a 4K/2.5x
-// scaled display. Root cause not yet found - likely something in tauri::WindowBuilder::build() or
-// the physical set_position/set_size calls blocking the main event loop thread from an async
-// command context. Do not flip this without first fixing that deadlock and confirming
-// ensure_annotation_overlay can return successfully (add temporary eprintln checkpoints around the
-// build()/set_position()/set_size() calls in annotation.rs and watch `npm run tauri dev`'s output -
-// the run stops dead between the bounds log line and a final success log line).
-const ANNOTATION_FEATURE_DISABLED = true;
 // How long to keep the overlay window shown (but click-through) after draw mode turns off, so a
-// stroke that's still fading gets to finish instead of vanishing instantly. Covers
-// AnnotationOverlayWindow.tsx's FADE_HOLD_MS (1200) + FADE_OUT_MS (1400) with margin.
-const ANNOTATION_FADE_GRACE_MS = 3000;
+// stroke that's still fading gets to finish instead of vanishing instantly - the longest fade the
+// current Settings > Annotation fade can produce (the overlay's toolbar can switch style, never
+// fade), plus margin. "Until I exit" strokes are dropped by the overlay itself on exit; laser trails
+// still fade, which is what the laser term covers there.
+const annotationFadeGraceMs = (): number => {
+	const { annotationFade } = loadSettings();
+	return Math.max(fadeTotalMs('pen', annotationFade), fadeTotalMs('laser', annotationFade)) + 400;
+};
 
 interface FileEntry {
     name: string;
     path: string;
     size: number;
+    modified?: number;
 }
 
 interface FileMap {
@@ -213,6 +250,38 @@ interface FileMap {
 // second carries no payload of its own.
 type VideoEditorScreen = { mode: "home" } | { mode: "editing" };
 
+// True while the cursor has moved (or a key/click/wheel happened) within the last `idleMs`, the
+// same "controls fade out while you're just watching" behaviour as the player's own control bar.
+// Only flips state on an actual active<->idle transition, so mousemove doesn't re-render per event.
+function useCursorActive(enabled: boolean, idleMs = 2500): boolean {
+  const [active, setActive] = useState(true);
+  const activeRef = useRef(true);
+  useEffect(() => {
+    if (!enabled) {
+      activeRef.current = true;
+      setActive(true);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout>;
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { activeRef.current = false; setActive(false); }, idleMs);
+    };
+    const wake = () => {
+      if (!activeRef.current) { activeRef.current = true; setActive(true); }
+      arm();
+    };
+    const events = ["mousemove", "mousedown", "keydown", "wheel", "touchstart"] as const;
+    events.forEach((e) => window.addEventListener(e, wake, { passive: true }));
+    arm();
+    return () => {
+      clearTimeout(timer);
+      events.forEach((e) => window.removeEventListener(e, wake));
+    };
+  }, [enabled, idleMs]);
+  return active;
+}
+
 const Dashboard = () => {
   const [message, setMessage] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
@@ -223,6 +292,12 @@ const Dashboard = () => {
   // is cheap to keep as ordinary state - ActiveRecordingState/RecordingOverlayWindow both need it
   // as a prop/event field to compute their own ticking display, since each runs its own timer.
   const [isPaused, setIsPaused] = useState<boolean>(false);
+  // Live Screen <-> Camera cutting for the recording in progress. canSwitchView: the recording has
+  // a second (camera) file to cut to - a separately recorded webcam or the phone camera. The
+  // current view is owned here, so the hotkey, the recording bar's buttons and the overlay
+  // window's buttons all act on one state (see switchView).
+  const [canSwitchView, setCanSwitchView] = useState<boolean>(false);
+  const [viewMode, setViewMode] = useState<'screen' | 'camera'>('screen');
   const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
   const [pausedAccumulatedMs, setPausedAccumulatedMs] = useState<number>(0);
   const [error, setError] = useState<string>("");
@@ -281,6 +356,9 @@ const Dashboard = () => {
   // The in-flight phone recording, if any. A ref rather than state: handleStopRecording has to
   // read it synchronously, and nothing renders from it.
   const phoneCaptureRef = useRef<PhoneCaptureHandle | null>(null);
+  // True while a stop is in flight, so repeated clicks on Stop (or the hotkey) while the backend is
+  // still finalizing don't each run stop_recording and open their own completion popup.
+  const isStoppingRef = useRef(false);
 
   useEffect(
     () => subscribePhoneCamera((s) => setIsPhoneCameraConnected(s.status === "live")),
@@ -484,6 +562,12 @@ const Dashboard = () => {
   // PNG for them by the time this reads it (see resolveImageDisplayUrl/loadFileForPlayback), so
   // there's nothing left to fail decoding.
   const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
+  // While a video/audio file is playing, the floating "Back to …" button fades out once the cursor
+  // goes idle (like the player's own controls) so it isn't sitting on top of the picture.
+  const selectedCategory = selectedFile ? getFileCategory(selectedFile.name) : null;
+  const isMediaFileSelected = selectedCategory === "video" || selectedCategory === "audio";
+  const cursorActive = useCursorActive(isMediaFileSelected);
+  const backButtonFade = `transition-opacity duration-300 ${cursorActive ? "opacity-100" : "opacity-0 [&>button]:pointer-events-none"}`;
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
@@ -707,6 +791,15 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     selectedFileRef.current = selectedFile;
   }, [selectedFile]);
 
+  // Native window title shows what's open - "lecture.mp4 - Briefcast", the usual Windows order -
+  // and goes back to plain "Briefcast" when nothing is.
+  useEffect(() => {
+    const title = selectedFile ? `${selectedFile.name} - Briefcast` : "Briefcast";
+    getCurrentWebviewWindow()
+      .setTitle(title)
+      .catch((err) => console.error("Failed to set window title:", err));
+  }, [selectedFile?.name]);
+
 
 useEffect(() => {
   const setupListener = async () => {
@@ -741,9 +834,9 @@ useEffect(() => {
       if (overlayWindow) {
         await overlayWindow.hide();
       }
-      if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
-        await unregister(OVERLAY_TOGGLE_SHORTCUT);
-      }
+      await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
+      await unbindShortcut(VIEW_SWITCH_SHORTCUT);
+      setCanSwitchView(false);
     });
     
     return unlisten;
@@ -964,9 +1057,32 @@ const setScreen = () => {
   };
 
   const handleStartRecording = async (formData: any) => {
+    // Read at the moment of recording rather than threaded through every caller - the panel and
+    // the record hotkey both land here.
+    const recordingPrefs = loadSettings();
+    formData = {
+      ...formData,
+      enhance_audio: recordingPrefs.autoEnhanceAudio,
+      overlay_border: recordingPrefs.cameraBorder,
+      overlay_border_color: recordingPrefs.cameraBorderColor,
+    };
     if (formData.record_type === "c") {
       await handleTakeScreenshot(formData);
       return;
+    }
+    // The live display holds its cameras open, and a Windows camera serves one app at a time -
+    // ffmpeg couldn't open one that's on the display. Say so now rather than fail mid-start.
+    const presentation = getPresentationState();
+    if (presentation.active && ['sva', 'va', 'v'].includes(formData.record_type)) {
+      const onDisplay = visibleCameras(presentation);
+      // The phone is shared, not opened - recording it while it's on the display is fine.
+      const clash = (formData.video_devices ?? []).filter((d: string) => d !== PHONE_CAMERA_DEVICE && onDisplay.includes(d));
+      if (clash.length > 0) {
+        setError(
+          `${clash.join(', ')} ${clash.length === 1 ? 'is' : 'are'} on the live display. Take ${clash.length === 1 ? 'it' : 'them'} off the display (or stop it) to record ${clash.length === 1 ? 'that camera' : 'those cameras'}.`
+        );
+        return;
+      }
     }
     try {
         await activateTargetWindowIfNeeded();
@@ -992,6 +1108,11 @@ const setScreen = () => {
         const recordingLaunchedAt = Date.now();
         const response = await invoke<string>("start_recording", { formData });
         const startTime = Date.now();
+        trackEvent("recording_started", {
+          recordType: String(formData.record_type),
+          format: String(formData.file_ext ?? ""),
+          phoneCamera: !!formData.video_devices?.includes(PHONE_CAMERA_DEVICE),
+        });
 
         // The phone records in this WebView, not in ffmpeg: its frames arrive over WebRTC and
         // never reach the backend as a capture device (start_recording strips the sentinel out of
@@ -1057,11 +1178,24 @@ const setScreen = () => {
               Boolean(formData.video_devices?.includes(PHONE_CAMERA_DEVICE))),
         });
 
-        if (!(await isRegistered(OVERLAY_TOGGLE_SHORTCUT))) {
-          await register(OVERLAY_TOGGLE_SHORTCUT, toggleOverlayVisibility);
+        await bindShortcut(OVERLAY_TOGGLE_SHORTCUT, () => void toggleOverlayVisibility());
+
+        const switchable =
+          formData.record_type === 'sva' &&
+          (Boolean(formData.separate_webcam_capture) || Boolean(formData.video_devices?.includes(PHONE_CAMERA_DEVICE)));
+        setCanSwitchView(switchable);
+        setViewMode('screen');
+        viewSwitchRef.current.canSwitchView = switchable;
+        viewSwitchRef.current.viewMode = 'screen';
+        if (switchable) {
+          await bindShortcut(VIEW_SWITCH_SHORTCUT, () => void switchViewRef.current('toggle'));
         }
 
-        setMessage(`${response} (Ctrl+Shift+H to show/hide the recording overlay)`);
+        setMessage(
+          switchable
+            ? `${response} (Alt+Shift+V switches between screen and camera, Ctrl+Shift+H shows the recording overlay)`
+            : `${response} (Ctrl+Shift+H to show/hide the recording overlay)`
+        );
 
     } catch (error) {
         console.error("Error starting recording:", error);
@@ -1070,7 +1204,71 @@ const setScreen = () => {
   };
 
   
+  // The latest recording timing and view state, for switchView - which the global hotkey calls
+  // through switchViewRef, registered once per recording, so it must never read a stale render.
+  const viewSwitchRef = useRef({
+    startTime: null as number | null,
+    isPaused: false,
+    pauseStartedAt: null as number | null,
+    pausedAccumulatedMs: 0,
+    viewMode: 'screen' as 'screen' | 'camera',
+    canSwitchView: false,
+  });
+  useEffect(() => {
+    viewSwitchRef.current = {
+      startTime: recordingStartTime,
+      isPaused,
+      pauseStartedAt,
+      pausedAccumulatedMs,
+      viewMode,
+      canSwitchView,
+    };
+  });
+
+  // Cuts the main view between screen and camera: logs the cut at the recording's elapsed time
+  // (same pause-aware formula as every timer) - assembly re-bases these onto the final file, and
+  // the editor/export cut to match - then tells every window, so the overlay's and the recording
+  // bar's buttons all show the live view.
+  const switchView = async (requested: 'screen' | 'camera' | 'toggle') => {
+    const st = viewSwitchRef.current;
+    if (!st.canSwitchView || !st.startTime) return;
+    const mode = requested === 'toggle' ? (st.viewMode === 'screen' ? 'camera' : 'screen') : requested;
+    if (mode === st.viewMode) return;
+    st.viewMode = mode;
+    setViewMode(mode);
+    const now = st.isPaused && st.pauseStartedAt ? st.pauseStartedAt : Date.now();
+    const elapsedSecs = Math.max(0, (now - st.startTime - st.pausedAccumulatedMs) / 1000);
+    try {
+      await invoke('record_view_switch', { elapsedSecs, mode });
+    } catch (error) {
+      console.error('Error recording view switch:', error);
+    }
+    void emit('view-mode-changed', { mode });
+  };
+  const switchViewRef = useRef(switchView);
+  switchViewRef.current = switchView;
+
+  // The overlay window asks rather than acting itself, so there's one place a cut is logged.
+  useEffect(() => {
+    const unlisten = listen<{ mode: 'screen' | 'camera' }>('view-switch-requested', (event) => {
+      void switchViewRef.current(event.payload.mode);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   let handleStopRecording = async () => {
+    if (isStoppingRef.current) return;
+    isStoppingRef.current = true;
+    try {
+      await stopRecordingOnce();
+    } finally {
+      isStoppingRef.current = false;
+    }
+  };
+
+  const stopRecordingOnce = async () => {
     setError("");
 
     // Flushed and written BEFORE stop_recording, so the finished camera file is already on disk
@@ -1087,6 +1285,12 @@ const setScreen = () => {
 
     try {
       const response = await invoke<string>("stop_recording");
+      // Wall-clock span (includes any paused time) - the overlay's own stop path reports the exact
+      // pause-aware duration instead.
+      trackEvent("recording_finished", {
+        durationSeconds: recordingStartTime ? Math.round((Date.now() - recordingStartTime) / 1000) : 0,
+        stoppedFrom: "main",
+      });
       const audio = new Audio("/sounds/option-3.mp3");
       audio.play().catch(err => console.error("Error playing audio:", err));
       setMessage(response);
@@ -1110,9 +1314,9 @@ const setScreen = () => {
     if (overlayWindow) {
       await overlayWindow.hide();
     }
-    if (await isRegistered(OVERLAY_TOGGLE_SHORTCUT)) {
-      await unregister(OVERLAY_TOGGLE_SHORTCUT);
-    }
+    await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
+    await unbindShortcut(VIEW_SWITCH_SHORTCUT);
+    setCanSwitchView(false);
 
     if (isMonitoring) {
       try {
@@ -1182,10 +1386,28 @@ const setScreen = () => {
     }
   };
 
+  // One library scan at a time: a burst of refresh events (a batch copy, a recording finishing)
+  // runs at most one more scan after the current one, instead of stacking them up.
+  const fileScanRef = useRef<{ running: boolean; again: boolean }>({ running: false, again: false });
   const handleDirectoryFiles = async () => {
+    if (fileScanRef.current.running) {
+      fileScanRef.current.again = true;
+      return;
+    }
+    fileScanRef.current.running = true;
+    try {
+      do {
+        fileScanRef.current.again = false;
+        await scanDirectoryFiles();
+      } while (fileScanRef.current.again);
+    } finally {
+      fileScanRef.current.running = false;
+    }
+  };
+
+  const scanDirectoryFiles = async () => {
     try {
       const data = await invoke<FileMap>("list_briefcast_files");
-      console.log("Files found:", data);
       setFiles(data); 
     } catch (error) {
       console.error("Error getting files:", error);
@@ -1220,6 +1442,18 @@ const setScreen = () => {
 				if (purgedCount > 0) console.log(`Purged ${purgedCount} expired trash item(s)`);
 			})
 			.catch((error) => console.error("Error purging expired trash:", error));
+	}, []);
+
+	// One update check per launch, delayed so it never competes with startup work (device probes,
+	// file list, thumbnails). Shown as a dismissible card - see UpdateBanner.
+	const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+	useEffect(() => {
+		const timer = setTimeout(() => {
+			void checkForUpdate().then((update) => {
+				if (update) setPendingUpdate(update);
+			});
+		}, 15_000);
+		return () => clearTimeout(timer);
 	}, []);
 
 	const loadTrash = async () => {
@@ -1453,12 +1687,18 @@ const setScreen = () => {
 	// to show/hide the floating toolbar. Called both by the global hotkey (toggles) and by the
 	// turn-off-request listener below (forces off, e.g. from the overlay's Esc/close button).
 	//
-	// The overlay stays hidden except for this deliberately brief, user-initiated window - see the
-	// long comment in ensure_annotation_overlay (annotation.rs) for why: a click-through style that
-	// silently fails to apply is nearly harmless on a window that's about to be hidden anyway, but
-	// catastrophic on one left permanently visible in the background. show()/setIgnoreCursorEvents
-	// are also always sequenced show-before-ignore when turning draw mode on, since setting that
-	// style before a window has ever been shown is what didn't reliably stick on Windows.
+	// The overlay stays hidden except for this deliberately brief, user-initiated window: a
+	// click-through style that silently fails to apply is nearly harmless on a window that's about
+	// to be hidden anyway, but catastrophic on one left permanently visible in the background (an
+	// invisible, always-on-top, all-monitors window eating every click on the desktop).
+	// show()/setIgnoreCursorEvents are also always sequenced show-before-ignore when turning draw
+	// mode on, since setting that style before a window has ever been shown is what didn't reliably
+	// stick on Windows.
+	//
+	// The window itself is pre-declared in tauri.conf.json (like the snip overlay) and placed from
+	// here, over the union of every monitor, each time it's shown - so a monitor plugged in or
+	// rearranged since last time is covered too. Building and placing it from a Rust command instead
+	// deadlocked the whole app on a 4K/250% display (what kept this feature switched off).
 	const toggleAnnotationDrawMode = useCallback(async (forceOff = false) => {
 		const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 		if (!overlay) return;
@@ -1472,33 +1712,43 @@ const setScreen = () => {
 
 		try {
 			if (next) {
+				const monitors = await availableMonitors();
+				if (monitors.length > 0) {
+					const left = Math.min(...monitors.map((m) => m.position.x));
+					const top = Math.min(...monitors.map((m) => m.position.y));
+					const right = Math.max(...monitors.map((m) => m.position.x + m.size.width));
+					const bottom = Math.max(...monitors.map((m) => m.position.y + m.size.height));
+					await overlay.setPosition(new PhysicalPosition(left, top));
+					await overlay.setSize(new PhysicalSize(right - left, bottom - top));
+				}
 				await overlay.show();
 				await overlay.setIgnoreCursorEvents(false);
+				// Focused so Esc reaches the overlay's own keydown listener; hiding it hands focus
+				// back to whatever was underneath (the slides, the browser...).
+				await overlay.setFocus();
 				await overlay.emit('annotation-mode-changed', { active: true });
 			} else {
 				await overlay.emit('annotation-mode-changed', { active: false });
 				await overlay.setIgnoreCursorEvents(true);
 				// Not hidden immediately - a still-fading stroke should keep fading, not vanish the
-				// instant draw mode turns off. ANNOTATION_FADE_GRACE_MS covers the overlay's own
-				// FADE_HOLD_MS + FADE_OUT_MS (AnnotationOverlayWindow.tsx) with margin. Click-through
+				// instant draw mode turns off. annotationFadeGraceMs covers the overlay's own fade
+				// (utils/annotationStyles.ts) with margin. Click-through
 				// is already applied above, so even if this timer never fires (e.g. the app closes
 				// first), the overlay can't block input in the meantime.
 				annotationHideTimeoutRef.current = window.setTimeout(() => {
 					annotationHideTimeoutRef.current = null;
 					if (!annotationDrawModeRef.current) void overlay.hide();
-				}, ANNOTATION_FADE_GRACE_MS);
+				}, annotationFadeGraceMs());
 			}
 		} catch (err) {
 			console.error('Failed to toggle annotation draw mode:', err);
 		}
 	}, []);
 
-	// Creates (idempotent) and shows the annotation overlay + registers its hotkey whenever the
-	// feature is enabled; tears both down whenever it's disabled. Independent of recording state —
-	// this feature is meant to be available any time, not just mid-recording (unlike
-	// OVERLAY_TOGGLE_SHORTCUT above).
+	// Registers the annotation hotkey whenever the feature is enabled; unregisters it (and hides the
+	// overlay) whenever it's disabled. Independent of recording state — this feature is meant to be
+	// available any time, not just mid-recording (unlike OVERLAY_TOGGLE_SHORTCUT above).
 	useEffect(() => {
-		if (ANNOTATION_FEATURE_DISABLED) return;
 		let cancelled = false;
 
 		(async () => {
@@ -1506,27 +1756,15 @@ const setScreen = () => {
 				if (annotationDrawModeRef.current) {
 					await toggleAnnotationDrawMode(true);
 				}
-				if (await isRegistered(ANNOTATION_TOGGLE_SHORTCUT)) {
-					await unregister(ANNOTATION_TOGGLE_SHORTCUT);
-				}
+				await unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
 				const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 				if (overlay) await overlay.hide();
 				return;
 			}
 
-			try {
-				await invoke('ensure_annotation_overlay');
-			} catch (err) {
-				console.error('Failed to create annotation overlay:', err);
-				return;
-			}
 			if (cancelled) return;
 			try {
-				if (!(await isRegistered(ANNOTATION_TOGGLE_SHORTCUT))) {
-					await register(ANNOTATION_TOGGLE_SHORTCUT, () => {
-						void toggleAnnotationDrawMode();
-					});
-				}
+				await bindShortcut(ANNOTATION_TOGGLE_SHORTCUT, () => void toggleAnnotationDrawMode());
 			} catch (err) {
 				// Most likely cause: another already-running app has this exact combo registered
 				// as its own OS-level global hotkey, so ours is rejected - surfaced here (rather
@@ -1559,9 +1797,7 @@ const setScreen = () => {
 	// Unregister on unmount so the hotkey doesn't linger after Dashboard itself goes away.
 	useEffect(() => {
 		return () => {
-			isRegistered(ANNOTATION_TOGGLE_SHORTCUT).then((registered) => {
-				if (registered) void unregister(ANNOTATION_TOGGLE_SHORTCUT);
-			});
+			void unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
 		};
 	}, []);
 
@@ -1584,11 +1820,7 @@ const setScreen = () => {
 
 		(async () => {
 			try {
-				if (!(await isRegistered(PANEL_BUTTONS_TOGGLE_SHORTCUT)) && !cancelled) {
-					await register(PANEL_BUTTONS_TOGGLE_SHORTCUT, () => {
-						void toggleRecordingPanelButtons();
-					});
-				}
+				if (!cancelled) await bindShortcut(PANEL_BUTTONS_TOGGLE_SHORTCUT, toggleRecordingPanelButtons);
 			} catch (err) {
 				console.error('Failed to register panel-buttons hotkey:', err);
 				setError(`Couldn't register the panel-buttons shortcut (${PANEL_BUTTONS_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
@@ -1597,9 +1829,7 @@ const setScreen = () => {
 
 		return () => {
 			cancelled = true;
-			isRegistered(PANEL_BUTTONS_TOGGLE_SHORTCUT).then((registered) => {
-				if (registered) void unregister(PANEL_BUTTONS_TOGGLE_SHORTCUT);
-			});
+			void unbindShortcut(PANEL_BUTTONS_TOGGLE_SHORTCUT);
 		};
 	}, [toggleRecordingPanelButtons]);
 
@@ -1657,11 +1887,7 @@ const setScreen = () => {
 
 		(async () => {
 			try {
-				if (!(await isRegistered(RECORDING_TOGGLE_SHORTCUT)) && !cancelled) {
-					await register(RECORDING_TOGGLE_SHORTCUT, () => {
-						handleRecordingToggleHotkey();
-					});
-				}
+				if (!cancelled) await bindShortcut(RECORDING_TOGGLE_SHORTCUT, handleRecordingToggleHotkey);
 			} catch (err) {
 				console.error('Failed to register recording-toggle hotkey:', err);
 				setError(`Couldn't register the start/stop recording shortcut (${RECORDING_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
@@ -1670,11 +1896,33 @@ const setScreen = () => {
 
 		return () => {
 			cancelled = true;
-			isRegistered(RECORDING_TOGGLE_SHORTCUT).then((registered) => {
-				if (registered) void unregister(RECORDING_TOGGLE_SHORTCUT);
-			});
+			void unbindShortcut(RECORDING_TOGGLE_SHORTCUT);
 		};
 	}, [handleRecordingToggleHotkey]);
+
+	// Screenshots: Alt+Shift+S from any app opens the screen picker, and the picker reports back
+	// here when it's done (commands/snip.rs emits snip-done; null means cancelled).
+	useEffect(() => {
+		(async () => {
+			try {
+				await bindShortcut(SNIP_SHORTCUT, () => {
+					startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+				});
+			} catch (err) {
+				console.warn(`Couldn't register ${SNIP_SHORTCUT}:`, err);
+			}
+		})();
+		const unlisten = listen<SnipResult | null>('snip-done', (event) => {
+			if (!event.payload) return;
+			const name = event.payload.path.split(/[\\/]/).pop() ?? event.payload.path;
+			setError('');
+			setMessage(event.payload.copied ? `Screenshot saved and copied to the clipboard: ${name}` : `Screenshot saved: ${name}`);
+		});
+		return () => {
+			unlisten.then((fn) => fn());
+			void unbindShortcut(SNIP_SHORTCUT);
+		};
+	}, []);
 
 	const handleTogglePdfFullscreen = async () => {
 		const next = !isPdfFullscreen;
@@ -1786,6 +2034,14 @@ const setScreen = () => {
 		(file) => !pinnedPaths.includes(file.path)
 	);
 	const libraryPreviewFiles = [...pinnedLibraryFiles, ...fillerFiles].slice(0, MAX_HOME_SCREEN_FILES);
+	// Length shown next to each audio/video row's size - probed only for those (at most
+	// MAX_HOME_SCREEN_FILES) rows, never the whole library.
+	const libraryPreviewDurations = useMediaDurations(
+		libraryPreviewFiles.filter((file) => {
+			const category = getFileCategory(file.name);
+			return category === "video" || category === "audio";
+		})
+	);
 
 	// Flattened, sidebar-order file list for a category — spans all folders, not just the one
 	// the currently selected file happens to live in, so prev/next still works when a category
@@ -2548,6 +2804,12 @@ const setScreen = () => {
 			? "Search results:"
 			: filteredEntries.length === 1 ? `${folderDisplayName(filteredEntries[0][0])}:` : filteredEntries.length > 1 ? "Files:" : "Briefcast:";
 	const isAudioSelected = selectedFile !== null && getFileCategory(selectedFile.name) === "audio";
+	// Whether the player's own prev/next buttons have anywhere to go - same list navigateAudio/
+	// navigateVideo walk.
+	const selectedMediaCategory = selectedFile ? getFileCategory(selectedFile.name) : null;
+	const hasSiblingMedia =
+		(selectedMediaCategory === "audio" || selectedMediaCategory === "video") &&
+		getFlatFilesForCategory(selectedMediaCategory).length > 1;
 
   return (
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
@@ -3440,7 +3702,7 @@ const setScreen = () => {
               is full-width, so only the button itself takes pointer events back; the rest of the
               strip stays click-through to the player underneath. */}
           {videoEditorScreen?.mode === "editing" && selectedFile ? (
-            <div className="shrink-0 px-3 pt-3 relative z-20 pointer-events-none">
+            <div className={`shrink-0 px-3 pt-3 relative z-20 pointer-events-none ${backButtonFade}`}>
               <button
                 type="button"
                 onClick={() => { setSelectedFile(null); setVideoEditorScreen({ mode: "home" }); }}
@@ -3451,7 +3713,7 @@ const setScreen = () => {
               </button>
             </div>
           ) : selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
-            <div className="shrink-0 px-3 pt-3 relative z-20 pointer-events-none">
+            <div className={`shrink-0 px-3 pt-3 relative z-20 pointer-events-none ${backButtonFade}`}>
               <button
                 type="button"
                 onClick={() => setSelectedFile(null)}
@@ -3512,7 +3774,6 @@ const setScreen = () => {
                 key={selectedFile.path}
                 src={selectedFile.path}
                 sourcePath={selectedFile.sourcePath}
-                title={selectedFile.name}
                 isFullscreen={isPdfFullscreen}
                 onToggleFullscreen={handleTogglePdfFullscreen}
               />
@@ -3562,6 +3823,8 @@ const setScreen = () => {
                 }}
                 onPlayStateChange={setPlayerIsPlaying}
                 onEnded={handleMediaEnded}
+                onPrevious={hasSiblingMedia ? () => (isAudioSelected ? navigateAudio(-1) : navigateVideo(-1)) : undefined}
+                onNext={hasSiblingMedia ? () => (isAudioSelected ? navigateAudio(1) : navigateVideo(1)) : undefined}
                 autoplayNext={isAudioSelected ? audioAutoplayNext : videoAutoplayNext}
                 onAutoplayNextChange={() =>
                   isAudioSelected ? setAudioAutoplayNext((prev) => !prev) : setVideoAutoplayNext((prev) => !prev)
@@ -3741,7 +4004,7 @@ const setScreen = () => {
               onBulkDelete={handleBulkDeleteFiles}
             />
           ) : (
-            <div className="relative flex flex-col items-center justify-center h-full w-full gap-6 px-8 overflow-hidden">
+            <div className="relative flex flex-col items-center justify-[safe_center] h-full w-full gap-6 px-8 pt-8 pb-24 overflow-y-auto overflow-x-hidden">
               {/* Purely decorative - a soft color glow plus a faint graph-paper line grid, sat
                   behind everything else in this empty state via z-index/pointer-events:none. Only
                   rendered on this "nothing open yet" screen, not the shared bg-neutral-950
@@ -3821,9 +4084,16 @@ const setScreen = () => {
                         <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
                           {truncateFileName(file.name)}
                         </span>
-                        {pinnedPaths.includes(file.path) && (
-                          <IoPin size={13} className="ml-auto text-gray-400 dark:text-neutral-500 shrink-0" />
-                        )}
+                        <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
+                          {libraryPreviewDurations.has(file.path) && (
+                            <>
+                              <span>{formatMediaDuration(libraryPreviewDurations.get(file.path)!)}</span>
+                              <span aria-hidden>·</span>
+                            </>
+                          )}
+                          <span>{formatFileSize(file.size)}</span>
+                          {pinnedPaths.includes(file.path) && <IoPin size={13} />}
+                        </span>
                       </button>
                     ))}
                   </div>
@@ -3835,6 +4105,9 @@ const setScreen = () => {
         </div>
         </div>
       </div>
+
+      {/* Cut cameras on the live display without reopening the modal - only while it's live. */}
+      <PresentationLiveBar />
 
       {!isPdfFullscreen && (
       <BottomDocker
@@ -3860,7 +4133,7 @@ const setScreen = () => {
         onOutputTimeChange={setCurrentOutputTime}
         onActiveClipChange={setActiveClipEffects}
         noiseReductionStatus={noiseReductionStatus}
-        onRecalibrateNoise={() => videoPlayerRef.current?.recalibrateNoiseReduction()}
+        onPreviewNoiseOriginal={(bypass) => videoPlayerRef.current?.setNoisePreviewBypass(bypass)}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={setSelectedOverlayId}
         isPlacingText={isPlacingText}
@@ -3912,6 +4185,9 @@ const setScreen = () => {
         onOpenPhoneCamera={() => setShowPhoneCamera(true)}
         isPhoneCameraConnected={isPhoneCameraConnected}
         isPaused={isPaused}
+        canSwitchView={canSwitchView}
+        viewMode={viewMode}
+        onSwitchView={(mode: 'screen' | 'camera') => void switchView(mode)}
         pauseStartedAt={pauseStartedAt}
         pausedAccumulatedMs={pausedAccumulatedMs}
         handlePauseRecording={handlePauseRecording}
@@ -3965,6 +4241,9 @@ const setScreen = () => {
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
         {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}
         {error && <Toast key={`err-${error}`} message={error} variant="error" onDismiss={() => setError("")} />}
+        {pendingUpdate && (
+          <UpdateBanner update={pendingUpdate} isRecording={isRecording} onDismiss={() => setPendingUpdate(null)} />
+        )}
       </div>
     </div>
   );

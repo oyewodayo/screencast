@@ -17,7 +17,7 @@ pub fn path_to_str(path: &Path) -> Result<&str, String> {
 // window_capture::macos's module comment), rather than offering it and erroring when clicked.
 // std::env::consts::OS is a compile-time constant ("windows" | "macos" | "linux"), so this is
 // exactly as reliable as the #[cfg(target_os = ...)] switches the rest of the backend uses.
-#[command]
+#[command(async)]
 pub fn get_platform() -> &'static str {
     std::env::consts::OS
 }
@@ -171,20 +171,15 @@ pub fn get_whisper_cli_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("Failed to resolve whisper-cli at {}: {}", resource_path, e))
 }
 
-// The one model this app ships (see README's "Getting started" for why base specifically - a
-// reasonable size/accuracy balance for narrated screen recordings) - co-located with
-// whisper-cli.exe in the same bundled folder. Deliberately the multilingual build (no ".en"
-// suffix), not the English-only one this used to ship: the two are near-identical in size (the
-// English-only variant isn't meaningfully smaller), so there was no real tradeoff in switching -
-// language selection (generate_captions' own `language` param, conversion.rs) only works at all
-// because this model understands more than English.
-pub fn get_whisper_model_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
-    let resource_path = "binaries/whisper/ggml-base.bin";
+// RNNoise model for arnndn ("remove noise" mode) - GregorR/rnnoise-models' beguiling-drafter,
+// trained on voice over recording-type noise.
+pub fn get_rnnoise_model_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let resource_path = "binaries/rnnoise/bd.rnnn";
 
     app_handle
         .path()
         .resolve(resource_path, BaseDirectory::Resource)
-        .map_err(|e| format!("Failed to resolve whisper model at {}: {}", resource_path, e))
+        .map_err(|e| format!("Failed to resolve RNNoise model at {}: {}", resource_path, e))
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -192,6 +187,9 @@ pub struct FileEntry {
     name: String,
     path: String,
     size: u64,
+    // Last modified, in milliseconds since the Unix epoch (0 when the OS won't say) - what the
+    // galleries' "Date" sort orders by.
+    modified: u64,
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -424,8 +422,9 @@ fn repair_sidecars_in_tree(
     }
 }
 
-#[command]
+#[command(async)]
 pub fn repair_stale_file_references() -> Result<u32, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = briefcast_dir()?;
     if !root.is_dir() {
         return Ok(0);
@@ -450,13 +449,15 @@ fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
-#[command]
+#[command(async)]
 pub fn get_briefcast_dir() -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     briefcast_dir().and_then(|p| path_to_str(&p).map(|s| s.to_string()))
 }
 
-#[command]
+#[command(async)]
 pub fn get_default_briefcast_dir() -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     default_briefcast_dir().and_then(|p| path_to_str(&p).map(|s| s.to_string()))
 }
 
@@ -469,8 +470,9 @@ pub fn get_default_briefcast_dir() -> Result<String, String> {
 // library move from freezing the UI without this needing to manually manage a runtime/thread pool
 // of its own (that would require adding tokio as a direct dependency here just to reach a
 // scheduler tauri already owns and uses internally for exactly this).
-#[command]
+#[command(async)]
 pub fn set_briefcast_dir(new_parent_dir: String, app_handle: AppHandle) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let new_parent = PathBuf::from(&new_parent_dir);
     if !new_parent.is_dir() {
         return Err("Selected location does not exist".to_string());
@@ -516,8 +518,9 @@ pub fn set_briefcast_dir(new_parent_dir: String, app_handle: AppHandle) -> Resul
     path_to_str(&new_root).map(|s| s.to_string())
 }
 
-#[command]
+#[command(async)]
 pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let old_root = briefcast_dir()?;
     let new_root = default_briefcast_dir()?;
 
@@ -550,7 +553,12 @@ pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
     path_to_str(&new_root).map(|s| s.to_string())
 }
 
-#[command]
+#[command(async)]
+// Read-only, so deliberately not behind responsiveness::serial(): it walks the whole library, and
+// holding the app-wide write lock for that meant every whiteboard, mindmap, doc and board command
+// queued behind each rescan - and a recording triggers rescans continuously. It used to also print
+// the entire listing to stdout on every call, which under `tauri dev` could block inside that lock
+// whenever the terminal fell behind, hanging all of those features for as long as it lasted.
 pub fn list_briefcast_files() -> HashMap<String, Vec<FileEntry>> {
     let mut result = HashMap::new();
 
@@ -559,7 +567,6 @@ pub fn list_briefcast_files() -> HashMap<String, Vec<FileEntry>> {
             scan_directory(&folder_path, &folder_path, &mut result);
         }
     }
-    println!("Folder: {:?}", &result);
     result
 }
 
@@ -596,11 +603,18 @@ fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<File
 
                 if is_media_file(&ext) {
                     if let Some(file_name) = entry_path.file_name() {
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let meta = entry.metadata().ok();
+                        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                        let modified = meta
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
                         files.push(FileEntry {
                             name: file_name.to_string_lossy().to_string(),
                             path: entry_path.display().to_string(),
                             size,
+                            modified,
                         });
                     }
                 }
@@ -671,8 +685,9 @@ fn validate_folder_name(name: &str) -> Result<&str, String> {
 // `parent_path` is "" for the Briefcast root or a relative_key-shaped path (e.g. "Workshops") for
 // a subfolder — same convention list_briefcast_files' map is keyed by. Returns the new folder's
 // own relative_key, ready to hand straight back for a subsequent create_folder/move_file call.
-#[command]
+#[command(async)]
 pub fn create_folder(parent_path: String, name: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let name = validate_folder_name(&name)?;
     let root = briefcast_dir()?;
     let parent = resolve_relative(&root, &parent_path)?;
@@ -698,8 +713,9 @@ pub fn create_folder(parent_path: String, name: String) -> Result<String, String
 // real fs::read_dir, not just "no media files of some category", so a folder holding an
 // unsupported file type or a nested empty subfolder still refuses to delete rather than
 // silently discarding something). The Briefcast root itself can never be deleted this way.
-#[command]
+#[command(async)]
 pub fn delete_folder(folder_path: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     if folder_path.is_empty() {
         return Err("Cannot delete the Briefcast root folder".to_string());
     }
@@ -721,8 +737,9 @@ pub fn delete_folder(folder_path: String) -> Result<(), String> {
 // identified by relative_key-shaped path ("" = Briefcast root). Same-folder moves are a no-op
 // success rather than an error, so the frontend doesn't need to special-case "dropped it back
 // where it came from".
-#[command]
+#[command(async)]
 pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = briefcast_dir()?;
     let dest_dir = resolve_relative(&root, &dest_folder_path)?;
     if !dest_dir.is_dir() {
@@ -753,8 +770,9 @@ pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String
 // rather than renames since the source lives outside briefcast_dir() and must be left in place.
 // Rejects extensions list_briefcast_files wouldn't display anyway (is_media_file), so a dropped
 // file never silently vanishes from the sidebar after a successful copy.
-#[command]
+#[command(async)]
 pub fn import_file(source_path: String, dest_folder_path: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = briefcast_dir()?;
     let dest_dir = resolve_relative(&root, &dest_folder_path)?;
     if !dest_dir.is_dir() {
@@ -872,8 +890,9 @@ pub async fn open_file_with_default_app(filepath: String) -> Result<(), String> 
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn rename_file(old_path: String, new_name: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     if new_name.trim().is_empty()
         || new_name.contains('/')
         || new_name.contains('\\')
@@ -913,7 +932,7 @@ pub fn rename_file(old_path: String, new_name: String) -> Result<String, String>
     path_to_str(&new_path).map(|s| s.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
     use std::fs;
     use std::path::PathBuf;
@@ -938,9 +957,7 @@ pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
         path_str
     };
 
-    println!("Original path: {}", filepath);
-    println!("Canonicalized: {}", absolute_path.display());
-    println!("Clean path: {}", clean_path);
+    log::debug!("Resolved path {} -> {}", filepath, clean_path);
 
     // Return the clean absolute path - we'll convert it on the frontend
     Ok(clean_path)
@@ -971,7 +988,7 @@ pub fn convert_file_path_to_url(filepath: String) -> Result<String, String> {
 // trusting a second source to agree, sidesteps having to figure out exactly which of the two
 // disagreed.
 #[cfg(target_os = "windows")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_cursor_position_in_window(window: tauri::Window) -> Result<(f64, f64), String> {
     use windows::Win32::Foundation::{HWND, POINT};
     use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -1006,7 +1023,7 @@ pub fn get_cursor_position_in_window(window: tauri::Window) -> Result<(f64, f64)
 }
 
 #[cfg(not(target_os = "windows"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_cursor_position_in_window(_window: tauri::Window) -> Result<(f64, f64), String> {
     Err("Cursor position lookup is only implemented on Windows".to_string())
 }
@@ -1048,8 +1065,9 @@ fn dir_stats(dir: &Path) -> (u64, u64) {
 // empty list rather than one row per known namespace with zeros. The frontend's Settings > Cache
 // section maps each namespace to a human-readable label itself, keeping this side agnostic of
 // what the namespaces actually mean.
-#[command]
+#[command(async)]
 pub fn get_cache_info() -> Result<Vec<CacheCategoryInfo>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = preview_cache_root();
     if !root.exists() {
         return Ok(Vec::new());
@@ -1078,8 +1096,9 @@ pub fn get_cache_info() -> Result<Vec<CacheCategoryInfo>, String> {
 // regenerates its own entry transparently the next time it's needed - nothing here is ever
 // anything but a derived, disposable copy of a real file elsewhere, so the only cost of clearing
 // is a one-time regeneration, never lost data.
-#[command]
+#[command(async)]
 pub fn clear_preview_cache(namespace: Option<String>) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = preview_cache_root();
     let target = match namespace {
         Some(ns) => root.join(ns),

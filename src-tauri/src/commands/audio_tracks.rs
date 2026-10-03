@@ -9,7 +9,6 @@
 //   Demucs engine is installed (see resolve_engine) - the same "external CLI, not a Rust binding"
 //   tradeoff already made for whisper-cli.
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,6 +18,7 @@ use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, Window};
 
 #[cfg(windows)]
 use crate::commands::recording::hide_console_window;
+use crate::services::asset_download::{download_asset, is_valid_install, DownloadAsset};
 use crate::services::utility::{find_on_path, get_ffmpeg_path, get_ffprobe_path, path_to_str};
 
 #[derive(Debug, Serialize)]
@@ -149,22 +149,11 @@ const NOT_INSTALLED: &str = "SEPARATION_ENGINE_MISSING";
 //
 // The engine isn't bundled (it would add ~100 MB to every install for a feature most people never
 // use). Instead the first "Voice and music" detach offers to download it into
-// <app local data>/demucs, where resolve_engine already looks. Every file is pinned by size and
-// SHA-256, so a truncated download or a swapped file on the host is rejected, never executed.
-//
-// Downloads go through the system curl (built into Windows 10 1803+, macOS and Linux) rather than
-// an HTTP crate: the reqwest already in the dependency tree is built without TLS, and turning TLS
-// on drags in a native crypto build - a lot of weight for one download button.
-
-struct EngineAsset {
-    file_name: &'static str,
-    url: &'static str,
-    sha256: &'static str,
-    size: u64,
-}
+// <app local data>/demucs, where resolve_engine already looks - pinned and verified by
+// services/asset_download.rs.
 
 // Converted htdemucs 4-stem weights from demucs.cpp's author (Hugging Face "Retrobear/demucs.cpp").
-const MODEL_ASSET: EngineAsset = EngineAsset {
+const MODEL_ASSET: DownloadAsset = DownloadAsset {
     file_name: DEMUCS_CPP_MODEL,
     url: "https://huggingface.co/datasets/Retrobear/demucs.cpp/resolve/main/ggml-model-htdemucs-4s-f16.bin",
     sha256: "72b17c42d308982ddb5069bc3bf48b81a5aac4cb6516e4366c0fa7cef6df0064",
@@ -178,14 +167,14 @@ const MODEL_ASSET: EngineAsset = EngineAsset {
 // install under the same name, so resolve_engine finds either. Rebuilding changes the hashes:
 // upload under a new tag and update both URLs + hashes together.
 #[cfg(all(windows, target_arch = "x86_64"))]
-const EXE_V3_ASSET: EngineAsset = EngineAsset {
+const EXE_V3_ASSET: DownloadAsset = DownloadAsset {
     file_name: "demucs_mt.cpp.main.exe",
     url: "https://github.com/oyewodayo/screencast/releases/download/demucs-engine-v1/demucs_mt-win-x64-v3.exe",
     sha256: "92a69333cdc20debb029c82db6658cc52d010c50cbba069f7f2b32f6f223e2bf",
     size: 34_481_678,
 };
 #[cfg(all(windows, target_arch = "x86_64"))]
-const EXE_V2_ASSET: EngineAsset = EngineAsset {
+const EXE_V2_ASSET: DownloadAsset = DownloadAsset {
     file_name: "demucs_mt.cpp.main.exe",
     url: "https://github.com/oyewodayo/screencast/releases/download/demucs-engine-v1/demucs_mt-win-x64-v2.exe",
     sha256: "4819eee498065ae1729fc16665afeae2f5a012d734b87d288f4c93fa7a3202c0",
@@ -194,7 +183,7 @@ const EXE_V2_ASSET: EngineAsset = EngineAsset {
 
 // The engine exe + model to fetch for this machine; None = no prebuilt engine for this platform
 // (the Python fallback still works there).
-fn downloadable_assets() -> Option<[&'static EngineAsset; 2]> {
+fn downloadable_assets() -> Option<[&'static DownloadAsset; 2]> {
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
         let v3 = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
@@ -243,70 +232,6 @@ struct EngineDownloadProgress {
     total: u64,
 }
 
-fn sha256_of(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = file.read(&mut buf).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect())
-}
-
-fn is_valid_install(path: &Path, asset: &EngineAsset) -> bool {
-    std::fs::metadata(path).map(|m| m.len() == asset.size).unwrap_or(false) && sha256_of(path).map(|h| h == asset.sha256).unwrap_or(false)
-}
-
-// Fetches one asset to `<dest>.part` via curl, reporting bytes on disk as progress (curl's own
-// progress meter isn't machine-readable), then verifies it and renames it into place.
-fn download_asset(window: &Window, asset: &EngineAsset, dest: &Path, already: u64, total: u64) -> Result<(), String> {
-    let part = dest.with_extension("part");
-    let _ = std::fs::remove_file(&part);
-    let curl = find_on_path("curl").ok_or("curl was not found on this system, so the engine can't be downloaded")?;
-    let mut child = new_command(curl)
-        .args(["--location", "--fail", "--silent", "--show-error", "--retry", "3", "--output"])
-        .arg(&part)
-        .arg(asset.url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start download: {}", e))?;
-
-    let status = loop {
-        if DOWNLOAD_CANCELLED.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(&part);
-            return Err(DOWNLOAD_CANCELLED_ERR.to_string());
-        }
-        let on_disk = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0).min(asset.size);
-        let _ = window.emit("separation-engine-download", EngineDownloadProgress { downloaded: already + on_disk, total });
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(250)),
-            Err(e) => return Err(format!("Download failed: {}", e)),
-        }
-    };
-    if !status.success() {
-        let mut err = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut err);
-        }
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("Download of {} failed: {}", asset.file_name, err.trim()));
-    }
-    if !is_valid_install(&part, asset) {
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("Downloaded {} failed its integrity check - please try again", asset.file_name));
-    }
-    let _ = std::fs::remove_file(dest);
-    std::fs::rename(&part, dest).map_err(|e| format!("Failed to install {}: {}", asset.file_name, e))
-}
-
 // Downloads (or repairs) the separation engine into <app local data>/demucs. Files already present
 // and intact are skipped, so an interrupted download picks up at the next file. Emits
 // "separation-engine-download" {downloaded, total} while running.
@@ -322,7 +247,10 @@ pub async fn download_separation_engine(app_handle: AppHandle, window: Window) -
         for asset in assets {
             let dest = dir.join(asset.file_name);
             if !is_valid_install(&dest, asset) {
-                download_asset(&window, asset, &dest, done, total)?;
+                let progress = |on_disk: u64| {
+                    let _ = window.emit("separation-engine-download", EngineDownloadProgress { downloaded: done + on_disk, total });
+                };
+                download_asset(asset, &dest, &DOWNLOAD_CANCELLED, DOWNLOAD_CANCELLED_ERR, &progress)?;
             }
             done += asset.size;
             let _ = window.emit("separation-engine-download", EngineDownloadProgress { downloaded: done, total });
@@ -335,7 +263,7 @@ pub async fn download_separation_engine(app_handle: AppHandle, window: Window) -
     .map_err(|e| format!("Download task failed: {}", e))?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cancel_separation_engine_download() {
     DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst);
 }
@@ -445,7 +373,7 @@ fn run_with_progress(mut cmd: Command, what: &str, window: &Window, workers: u32
     Err(format!("{} failed: {}", what, tail.into_iter().rev().collect::<Vec<_>>().join("\n")))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cancel_voice_music_separation() {
     SEPARATION_CANCELLED.store(true, Ordering::SeqCst);
 }

@@ -1,52 +1,121 @@
 /* components/docs/docPageLayout.css
  *
- * The live auto-pagination gap (docAutoPaginate.ts) - styled to look like the current page card
- * genuinely ending and a new one beginning (a flat closing/opening edge + a small shadow on each,
- * gray canvas showing through the gap), not just a blank spacer inside one continuous white card.
- * Edges are straight, not rounded - a real page's edge is a flat cut, not a rounded corner (only
- * the document's own outer top/bottom keep the rounded-card treatment, from the page container
- * itself, untouched by this file). Height is set per-instance via inline style (it depends on how
- * much space was actually left on that page - a runtime measurement, not something CSS can
- * express), everything else is static.
- *
- * The -96px horizontal margins pull the gap out to the page card's full width, undoing its own
- * padding - safe to hardcode rather than read from docPageGeometry.ts's marginPx(), since
- * PAGE_MARGIN_IN is a fixed 1in constant there, not something that varies per page size.
+ * The live auto-pagination gap (docAutoPaginate.ts), drawn the way a page break looks on paper /
+ * in Google Docs: the end of one sheet (its unused space + bottom margin), a strip of canvas, then
+ * the next sheet's top margin. The gap is a widget *inside* the one page card; docAutoPaginate.ts
+ * sets inline negative margins so it reaches past the card's padding (the page margins) and 4px
+ * beyond, painting over the card's own ring and shadow there - otherwise the side edges run
+ * straight through the canvas strip and it reads as a band inside one long page. The white parts
+ * are inset 3px with a 1px side border, landing exactly where the card's ring is drawn.
  */
 
 .doc-page-gap {
   position: relative;
-  margin-left: -96px;
-  margin-right: -96px;
-  background: #e5e5e5;
+  background: var(--doc-canvas, #f9fbfd);
 }
 
-.doc-page-gap::before,
-.doc-page-gap::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 20px;
+/* Gap and tail are children of .ProseMirror, so the editor's 1rem between-blocks rule
+   (docSchemaExtensions.ts) would add space above them; the gap's -1rem bottom margin also cancels
+   that same rule on the block right after it, so the next page's text starts exactly at its top
+   margin. */
+.ProseMirror > .doc-page-gap {
+  margin-top: 0 !important;
+  margin-bottom: -1rem !important;
+}
+.ProseMirror > .doc-page-tail {
+  margin-top: 0 !important;
+}
+
+.doc-page-gap-end,
+.doc-page-gap-start {
+  position: relative;
+  margin: 0 3px;
   background: #ffffff;
+  border-left: 1px solid #e5e5e5;
+  border-right: 1px solid #e5e5e5;
 }
 
-.doc-page-gap::before {
-  top: 0;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+.doc-page-gap-end {
+  border-bottom: 1px solid #e5e5e5;
+  box-shadow: 0 1px 3px rgba(60, 64, 67, 0.15);
+  z-index: 1;
 }
 
-.doc-page-gap::after {
-  bottom: 0;
-  box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.06);
+.doc-page-gap-start {
+  border-top: 1px solid #e5e5e5;
 }
 
-.dark .doc-page-gap {
-  background: #0a0a0a;
-}
-
-.dark .doc-page-gap::before,
-.dark .doc-page-gap::after {
+.dark .doc-page-gap-end,
+.dark .doc-page-gap-start {
   background: #171717;
+  border-color: #262626;
   box-shadow: none;
+}
+
+/* Print frame (DocsEditor.tsx): on screen the table is just transparent blocks; in print its
+   thead/tfoot spacer rows repeat on every page, giving each page its 1in top/bottom margin while
+   @page itself has margin 0 - and a zero page margin is what leaves Chromium no room to stamp its
+   own date/title/URL header and footer. */
+.doc-print-frame,
+.doc-print-frame > tbody,
+.doc-print-frame > tbody > tr,
+.doc-print-frame > tbody > tr > td {
+  display: block;
+}
+.doc-print-frame > thead,
+.doc-print-frame > tfoot {
+  display: none;
+}
+
+@media print {
+  /* Every ancestor of the document, up to <html>: plain full-height blocks. The app shell around
+     the Docs view is a one-screen-tall flex box that *centres* its child, so in print a document
+     taller than the screen was centred over the page edge - the top of the doc (title, first
+     paragraphs) landed above page 1 and was cut off. */
+  *:has(.doc-print-frame) {
+    display: block !important;
+    position: static !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    transform: none !important;
+  }
+  /* ...and everything beside that chain (sidebars, panels - laid out next to the doc by flex on
+     screen, so with the chain flattened to blocks they'd stack above it as blank pages). The
+     repeating header/footer text opts back in with .doc-print-keep. */
+  *:has(.doc-print-frame) > *:not(:has(.doc-print-frame)):not(.doc-print-frame):not(.doc-print-keep) {
+    display: none !important;
+  }
+  /* WebView2's PrintToPdf paints the focused editor's caret and selection into the PDF. */
+  .doc-print-frame .ProseMirror {
+    caret-color: transparent !important;
+  }
+  .doc-print-frame ::selection {
+    background: transparent;
+  }
+  .doc-print-frame {
+    display: table;
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .doc-print-frame > thead {
+    display: table-header-group;
+  }
+  .doc-print-frame > tfoot {
+    display: table-footer-group;
+  }
+  .doc-print-frame > tbody {
+    display: table-row-group;
+  }
+  .doc-print-frame > tbody > tr {
+    display: table-row;
+  }
+  .doc-print-frame > tbody > tr > td {
+    display: table-cell;
+    padding: 0;
+  }
+  .doc-print-spacer {
+    height: 1in;
+  }
 }
