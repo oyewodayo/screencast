@@ -230,6 +230,33 @@ pub fn import_mindmap_image(
     Ok(asset_file_name)
 }
 
+// In-memory counterpart to import_mindmap_image - for a clipboard paste (a screenshot, an image
+// copied out of a browser), where the bytes exist only in the webview and there is no source path
+// to copy from. Same shape as whiteboards.rs's save_whiteboard_image.
+#[command(async)]
+pub fn save_mindmap_image(
+    mindmap_id: String,
+    asset_id: String,
+    extension: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
+    let ext = extension.to_ascii_lowercase();
+    if !ALLOWED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!("Unsupported image extension: {}", ext));
+    }
+    let assets_dir = mindmap_dir(&mindmap_id)?.join("assets");
+    fs::create_dir_all(&assets_dir)
+        .map_err(|e| format!("Failed to create assets folder: {}", e))?;
+    let asset_file_name = format!("{}.{}", asset_id, ext);
+    // Write-then-rename so a reader can never observe a half-written asset under its final name.
+    let target = assets_dir.join(&asset_file_name);
+    let tmp = assets_dir.join(format!("{}.tmp", asset_file_name));
+    fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write image: {}", e))?;
+    fs::rename(&tmp, &target).map_err(|e| format!("Failed to save image: {}", e))?;
+    Ok(asset_file_name)
+}
+
 #[command(async)]
 pub fn save_mindmap_thumbnail(mindmap_id: String, bytes: Vec<u8>) -> Result<(), String> {
     let _serial = crate::services::responsiveness::serial();
