@@ -67,8 +67,9 @@ fn read_summary(dir: &PathBuf, id: &str) -> Option<BoardSummary> {
     })
 }
 
-#[command]
+#[command(async)]
 pub fn list_boards() -> Result<Vec<BoardSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = boards_root()?;
     let mut summaries: Vec<BoardSummary> = Vec::new();
 
@@ -93,8 +94,9 @@ pub fn list_boards() -> Result<Vec<BoardSummary>, String> {
     Ok(summaries)
 }
 
-#[command]
+#[command(async)]
 pub fn create_board(id: String, name: String, json: String) -> Result<BoardSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = board_dir(&id)?;
     if dir.exists() {
         return Err("A board with that id already exists".to_string());
@@ -137,8 +139,9 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 // right after this to patch those fields in with its own JS Date().toISOString() convention,
 // rather than this file learning to parse and rewrite JSON it doesn't otherwise need to understand.
 // `new_id` is frontend-generated (crypto.randomUUID()), same convention create_board's `id` uses.
-#[command]
+#[command(async)]
 pub fn duplicate_board(source_id: String, new_id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let source_dir = board_dir(&source_id)?;
     if !source_dir.is_dir() {
         return Err("Source board does not exist".to_string());
@@ -150,8 +153,9 @@ pub fn duplicate_board(source_id: String, new_id: String) -> Result<(), String> 
     copy_dir_recursive(&source_dir, &dest_dir)
 }
 
-#[command]
+#[command(async)]
 pub fn save_board(id: String, json: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = board_dir(&id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create board folder: {}", e))?;
 
@@ -162,14 +166,16 @@ pub fn save_board(id: String, json: String) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn load_board(id: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let target = board_dir(&id)?.join("board.json");
     fs::read_to_string(&target).map_err(|e| format!("Failed to load board: {}", e))
 }
 
-#[command]
+#[command(async)]
 pub fn delete_board(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = board_dir(&id)?;
     fs::remove_dir_all(&dir).map_err(|e| format!("Failed to delete board: {}", e))
 }
@@ -180,12 +186,13 @@ pub fn delete_board(id: String) -> Result<(), String> {
 // this board's folder and must be left untouched. asset_id comes from the frontend's own
 // crypto.randomUUID() (it already needs one for the new BoardImage) rather than generating one
 // here, which would need a new uuid crate dependency for no real benefit.
-#[command]
+#[command(async)]
 pub fn import_board_image(
     board_id: String,
     source_path: String,
     asset_id: String,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = board_dir(&board_id)?;
     let assets_dir = dir.join("assets");
     fs::create_dir_all(&assets_dir)
@@ -202,8 +209,9 @@ pub fn import_board_image(
     Ok(asset_file_name)
 }
 
-#[command]
+#[command(async)]
 pub fn save_board_thumbnail(board_id: String, bytes: Vec<u8>) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = board_dir(&board_id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create board folder: {}", e))?;
 
@@ -221,8 +229,9 @@ pub fn save_board_thumbnail(board_id: String, bytes: Vec<u8>) -> Result<(), Stri
 // module's own internal project storage, excluded from the sidebar entirely (see its own doc
 // comment); this is a normal, browsable library folder, just like any the user creates themselves.
 // Timestamp-suffixed so repeat exports of the same board never collide.
-#[command]
+#[command(async)]
 pub fn export_board_png(board_name: String, bytes: Vec<u8>) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = briefcast_dir()?.join("Board");
     fs::create_dir_all(&root).map_err(|e| format!("Failed to create Board folder: {}", e))?;
 
@@ -257,8 +266,9 @@ pub fn export_board_png(board_name: String, bytes: Vec<u8>) -> Result<String, St
 // at all: the whole point of Save As is picking a location outside (or inside, if the user chooses)
 // the library, so nothing here should assume one. Same write-then-rename crash-safety convention as
 // every other save in this file.
-#[command]
+#[command(async)]
 pub fn export_board_png_to_path(dest_path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dest = PathBuf::from(&dest_path);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)

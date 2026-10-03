@@ -6,7 +6,7 @@
 // byte-identical output (a CSS `filter` and an ffmpeg pixel filter are never going to match
 // exactly). If one side's formula is retuned, retune the other so preview and export don't
 // silently drift apart - see the cross-reference comment on color_filter_chain itself.
-import { ClipColorFilter, ClipCrop, ClipKenBurns, ColorFilterPreset, KenBurnsPreset, TransitionType } from "./videoEditTypes";
+import { AudioCleanup, ClipColorFilter, ClipCrop, ClipKenBurns, ColorFilterPreset, KenBurnsPreset, TransitionType } from "./videoEditTypes";
 
 export const COLOR_FILTER_PRESETS: { value: ColorFilterPreset; label: string }[] = [
   { value: "none", label: "None" },
@@ -148,4 +148,7 @@ export interface ActiveClipEffects {
   flipHorizontal?: boolean;
   speed?: number;
   noiseReduction?: number;
+  audioCleanup?: AudioCleanup;
+  // Which file this clip plays from - VideoPlayer decodes its noise sample from here.
+  sourcePath?: string;
 }

@@ -9,22 +9,41 @@ use std::env::consts::OS;
 use tauri::Manager;
 
 mod commands {
-    pub mod annotation;
+    pub mod audio_tracks;
     pub mod conversion;
     pub mod native_playback;
+    pub mod snip;
     pub mod recording;
     pub mod system_info;
     pub mod window_capture;
 }
 mod services {
+    pub mod asset_download;
     pub mod boards;
     pub mod docs;
     pub mod docs_search;
     pub mod file_watcher;
     pub mod image_annotations;
     pub mod pdf_annotations;
+    // Serves a phone's browser as a camera source over the LAN - see the module's own doc
+    // comment for why a webcam driver (DroidCam/Iriun/Camo) is otherwise the only way to get a
+    // phone into a DirectShow device list, and why this needs to be an HTTPS server to avoid one.
+    pub mod phone_camera;
+    // Carries the live recording preview from ffmpeg's stdout to the UI without touching the
+    // disk - see the module's own doc comment for the file-based approach this replaced and why.
+    pub mod preview_stream;
+    // Makes a recording's ffmpeg child die with the app instead of outliving it, holding the
+    // camera open and competing for the machine - Job Object on Windows, PR_SET_PDEATHSIG on
+    // Linux. See the module's own comment for the macOS gap.
+    pub mod orphan_guard;
+    // Keeps the window from ever going "Not responding" - see the module's own comment for the
+    // threading rules every command follows and the test that enforces them.
+    pub mod responsiveness;
+    // Opt-out analytics + crash reports, compiled in only for release builds with keys.
+    pub mod telemetry;
     pub mod trash;
     pub mod utility;
+    pub mod whisper_model;
     pub mod video_edits;
     pub mod mindmaps;
     pub mod whiteboards;
@@ -32,8 +51,10 @@ mod services {
     // Mix-equivalent dshow device on some machines means ffmpeg alone can never capture system/
     // "what you hear" audio; WASAPI loopback is the universal, driver-independent alternative).
     #[cfg(target_os = "windows")]
-    pub mod loopback_audio;
-    // A Win32 low-level mouse hook, Windows-only for the same reason loopback_audio above is
+    pub mod audio_capture;
+    // Default cleanup of every recording's audio - see the module's own doc comment.
+    pub mod audio_enhance;
+    // A Win32 low-level mouse hook, Windows-only for the same reason audio_capture above is
     // (SetWindowsHookExW/WH_MOUSE_LL has no cross-platform equivalent this app's existing `windows`
     // crate dependency could reuse) - see the module's own doc comment for why this needed no new
     // Cargo dependency at all.
@@ -50,11 +71,12 @@ mod services {
     // live signal at all). Windows-only for now, same reasoning as process_job above.
     #[cfg(target_os = "windows")]
     pub mod progress_watch;
-    // Detects a real, working hardware H.264 encoder (NVENC/QSV/AMF) via a trial encode, so
-    // recordings can offload from the CPU instead of always using software libx264 - see the
-    // module's own doc comment for why "does ffmpeg list this encoder" alone isn't good enough.
-    // Windows-only for now, same reasoning as progress_watch above.
-    #[cfg(target_os = "windows")]
+    // Detects a real, working hardware H.264 encoder via a trial encode, so recordings can
+    // offload from the CPU instead of always using software libx264 - see the module's own doc
+    // comment for why "does ffmpeg list this encoder" alone isn't good enough. Cross-platform:
+    // NVENC/QSV/AMF on Windows, VideoToolbox on macOS, NVENC on Linux. The detection mechanism is
+    // a real subprocess encode with the exact intended flags, which is platform-agnostic by
+    // construction - nothing here needed to be Windows-specific.
     pub mod hw_encoder;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
@@ -82,15 +104,49 @@ mod services {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub mod heic_unix;
 }
-use simplelog::{
-    ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
-};
+use simplelog::{CombinedLogger, ConfigBuilder, WriteLogger};
 
 use log::{error, LevelFilter};
 use std::fs::OpenOptions;
 use std::panic;
 
-#[tauri::command]
+// Terminal half of the logger. Lines are handed to a background thread rather than written to
+// stdout inline: in a dev build stdout is a pipe to the `tauri dev` terminal, and whenever that
+// pipe stopped being drained, every log call in the process blocked on it - the UI thread, the
+// watchdog, and stop_recording/pause_recording mid-command alike - which froze the Stop and Pause
+// buttons for minutes at a time. If the queue is full the line is dropped from the terminal only;
+// app.log still gets every line.
+struct NonBlockingStdout(std::sync::mpsc::SyncSender<Vec<u8>>);
+
+impl NonBlockingStdout {
+    fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4096);
+        // If the thread can't start, rx is dropped and every try_send below just fails quietly.
+        let _ = std::thread::Builder::new()
+            .name("log-stdout".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                for chunk in rx {
+                    let _ = out.write_all(&chunk);
+                }
+            });
+        Self(tx)
+    }
+}
+
+impl std::io::Write for NonBlockingStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.try_send(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tauri::command(async)]
 fn get_os_info() -> String {
     OS.to_string().to_uppercase()
 }
@@ -114,7 +170,7 @@ fn resolve_log_dir() -> std::path::PathBuf {
 
 // Shows a native "already running" notice before the duplicate process exits - Windows only for
 // now (matches this codebase's existing "Windows is the verified platform" posture elsewhere,
-// e.g. loopback_audio.rs/heic_windows.rs), since MessageBoxW needs no Tauri app context to call,
+// e.g. audio_capture.rs/heic_windows.rs), since MessageBoxW needs no Tauri app context to call,
 // unlike tauri::api::dialog which assumes a running app. A silent exit is an acceptable fallback
 // on macOS/Linux - a launcher/dock effectively already fills this role there by focusing the
 // existing window instead of spawning a second process in the first place.
@@ -190,15 +246,11 @@ fn main() {
         .unwrap_or_else(|builder| builder)
         .build();
 
-    // Initialize combined logger (writes to both terminal and file)
+    // Initialize combined logger (writes to both file and terminal). The file comes first and the
+    // terminal never blocks - see NonBlockingStdout for why.
     CombinedLogger::init(vec![
-        TermLogger::new(
-            LevelFilter::Debug,
-            config.clone(),
-            TerminalMode::Mixed,
-            ColorChoice::Auto,
-        ),
-        WriteLogger::new(LevelFilter::Trace, config, log_file), // TRACE captures everything
+        WriteLogger::new(LevelFilter::Trace, config.clone(), log_file), // TRACE captures everything
+        WriteLogger::new(LevelFilter::Debug, config, NonBlockingStdout::spawn()),
     ])
     .expect("Failed to initialize logger");
 
@@ -246,14 +298,25 @@ fn main() {
 
     std::env::set_var("RUST_BACKTRACE", "1");
 
+    // Must run before any TLS use (phone camera server, updater, telemetry) - see Cargo.toml's
+    // rustls entry for why rustls can't pick a provider on its own in this build.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    services::responsiveness::install_async_runtime();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        // Checks this repo's latest GitHub Release for a newer signed build - see
+        // src/utils/updater.ts for when the check runs and what the user sees.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
         .manage(commands::conversion::ConversionState::default())
         .manage(commands::native_playback::NativePlaybackState::default())
         .manage(services::file_watcher::FileWatcherState::default())
+        .manage(services::phone_camera::PhoneCameraState::default())
         .setup(|app| {
             // Start watching the Briefcast folder for external changes right away, so the sidebar
             // stays live without needing a restart or a manual refresh click - see
@@ -266,11 +329,30 @@ fn main() {
                 }
                 Err(e) => log::warn!("Could not resolve Briefcast dir for file watcher: {}", e),
             }
+
+            services::telemetry::init(app.handle());
+            services::responsiveness::start_ui_watchdog(app.handle());
+            // All slow first-time probes (ffmpeg -list_devices, a trial hardware encode, a trial
+            // GPU screen capture); doing them now in the background means the device pickers and
+            // the first recording never wait on them.
+            commands::recording::warm_device_cache(app.handle());
+            commands::recording::prewarm_rec_completed_modal(app.handle());
+            if let Ok(ffmpeg_path) = services::utility::get_ffmpeg_path(app.handle()) {
+                std::thread::spawn(move || {
+                    services::hw_encoder::detect(&ffmpeg_path);
+                    commands::recording::warm_screen_capture(&ffmpeg_path);
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::system_info::get_ram_info,
             get_os_info,
+            services::responsiveness::report_frontend_stall,
+            services::telemetry::get_telemetry_settings,
+            services::telemetry::set_telemetry_enabled,
+            services::telemetry::track_event,
+            services::telemetry::report_frontend_error,
             commands::recording::get_connected_audios,
             commands::recording::get_connected_cameras,
             commands::recording::get_connected_devices,
@@ -280,6 +362,13 @@ fn main() {
             commands::recording::load_view_switch_sidecar,
             commands::recording::record_view_switch,
             commands::recording::get_webcam_sidecar_path,
+            commands::recording::phone_camera_capture_chunk,
+            commands::recording::get_recording_preview_frame,
+            commands::recording::save_phone_camera_capture,
+            services::phone_camera::start_phone_camera_server,
+            services::phone_camera::stop_phone_camera_server,
+            services::phone_camera::phone_camera_status,
+            services::phone_camera::phone_camera_send_signal,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,
@@ -306,10 +395,18 @@ fn main() {
             commands::conversion::set_video_thumbnail,
             commands::conversion::get_video_scrub_sprite,
             commands::conversion::generate_captions,
+            commands::conversion::audio_cleanup_waveform,
+            commands::conversion::decode_audio_range,
             commands::conversion::transcribe_doc_audio,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
             commands::conversion::extract_clip_audio,
+            commands::audio_tracks::probe_audio_streams,
+            commands::audio_tracks::get_separation_engine,
+            commands::audio_tracks::separate_voice_music,
+            commands::audio_tracks::download_separation_engine,
+            commands::audio_tracks::cancel_separation_engine_download,
+            commands::audio_tracks::cancel_voice_music_separation,
             commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,
@@ -318,7 +415,11 @@ fn main() {
             commands::native_playback::get_next_audio_chunk,
             commands::native_playback::seek_native_playback,
             commands::native_playback::stop_native_playback,
-            commands::annotation::ensure_annotation_overlay,
+            commands::snip::snip_begin,
+            commands::snip::snip_info,
+            commands::snip::snip_frame,
+            commands::snip::snip_finish,
+            commands::snip::snip_cancel,
             services::utility::open_file_from_directory,
             services::utility::open_file_with_default_app,
             services::utility::list_briefcast_files,
@@ -360,6 +461,7 @@ fn main() {
             services::mindmaps::load_mindmap,
             services::mindmaps::delete_mindmap,
             services::mindmaps::import_mindmap_image,
+            services::mindmaps::save_mindmap_image,
             services::mindmaps::save_mindmap_thumbnail,
             services::mindmaps::export_mindmap_file,
             services::mindmaps::export_mindmap_to_path,
@@ -385,6 +487,7 @@ fn main() {
             services::docs::relink_doc_path,
             services::docs::export_doc,
             services::docs::export_doc_binary,
+            services::docs::export_doc_pdf,
             services::docs::save_doc_image,
             services::docs::list_trashed_docs,
             services::docs::restore_doc,

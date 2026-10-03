@@ -7,7 +7,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
-import { IoAdd, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoPin, IoSearch, IoTrashOutline } from "react-icons/io5";
+import { IoAdd, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoOpenOutline, IoPin, IoSearch, IoTrashOutline } from "react-icons/io5";
 import { MdFileUpload } from "react-icons/md";
 import * as Y from "yjs";
 import { DOC_DRAG_MIME, DocFolder, DocSummary, flattenFolderTree } from "../../utils/docTypes";
@@ -367,7 +367,10 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
       <div className="absolute top-1.5 right-1.5 z-10">
         <button
           type="button"
-          title="Document options"
+          data-tip="Document options"
+          aria-label="Document options"
+          aria-haspopup="menu"
+          aria-expanded={openMenuId === doc.id}
           onClick={(e) => {
             e.stopPropagation();
             setConfirmDeleteId(null);
@@ -395,10 +398,22 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
             <button
               type="button"
               onClick={() => {
+                setOpenMenuId(null);
+                onOpenDoc(doc.id);
+              }}
+              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm font-medium text-gray-800 dark:text-neutral-100 hover:bg-gray-50 dark:hover:bg-neutral-700 rounded-t-md"
+            >
+              <IoOpenOutline size={14} />
+              Open
+            </button>
+            <div className="h-px bg-gray-100 dark:bg-neutral-700" />
+            <button
+              type="button"
+              onClick={() => {
                 setPinnedIds(toggleDocPin(doc.id));
                 setOpenMenuId(null);
               }}
-              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-50 dark:hover:bg-neutral-700 rounded-t-md"
+              className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-50 dark:hover:bg-neutral-700"
             >
               <IoPin size={14} />
               {pinnedIds.includes(doc.id) ? "Unpin document" : "Pin document"}
@@ -458,7 +473,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
       </div>
 
       {pinnedIds.includes(doc.id) && (
-        <div className="absolute top-1.5 left-1.5 z-10 p-1 rounded-md bg-black/40 text-white" title="Pinned">
+        <div className="absolute top-1.5 left-1.5 z-10 p-1 rounded-md bg-black/40 text-white" data-tip="Pinned">
           <IoPin size={12} />
         </div>
       )}
@@ -467,7 +482,9 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
         <IoDocumentTextOutline size={22} className="text-gray-300 dark:text-neutral-600" />
       </div>
       <div className="px-2.5 py-2">
-        <p className="text-sm text-gray-700 dark:text-neutral-200 truncate">{doc.title || "Untitled document"}</p>
+        <p className="text-sm text-gray-700 dark:text-neutral-200 truncate" data-tip={doc.title || "Untitled document"}>
+          {doc.title || "Untitled document"}
+        </p>
         <p className="text-xs text-gray-400 dark:text-neutral-500">{formatUpdatedAt(doc.updated_at)}</p>
       </div>
     </div>
@@ -585,7 +602,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
             {searchQuery && (
               <button
                 type="button"
-                title="Clear search"
+                data-tip="Clear search"
                 onClick={() => setSearchQuery("")}
                 className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700"
               >

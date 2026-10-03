@@ -19,7 +19,7 @@ use std::process::Command;
 use tauri::{AppHandle, State};
 
 use super::{
-    build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error,
+    build_camera_overlay_filter_complex, codec_args_for_ext_hw, extract_ffmpeg_error,
     map_overlay_size, spawn_recording, AppState, FormData, MAX_RECORDING_WIDTH,
 };
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
@@ -412,7 +412,7 @@ pub async fn recording_with_output_sva(
         screen_capture_args(screen_index, crop, audio_index, system_audio_index)
     };
 
-    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
@@ -465,16 +465,20 @@ pub async fn recording_with_output_v(
     let camera_index = find_index(&video_devices, &video_device)
         .ok_or_else(|| format!("Camera '{}' not found", video_device))?;
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(),
         "avfoundation".to_string(),
         "-i".to_string(),
         av_input_spec(Some(camera_index), None),
-        "-c:v".to_string(),
-        "mpeg4".to_string(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    // Hardware encoding, and the container's own codec table, rather than the bare `-c:v mpeg4`
+    // this used to hardcode. That old default ignored the file type the user picked entirely and
+    // produced MPEG-4 Part 2 - a pre-H.264 codec with markedly worse quality per byte, and one
+    // most players treat as legacy - while the equivalent Windows path had been using the shared
+    // H.264 table all along. It also meant camera recordings carried no audio codec choice at all.
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }
@@ -518,16 +522,20 @@ pub async fn recording_with_output_va(
         .ok_or_else(|| format!("Camera '{}' not found", video_device))?;
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(),
         "avfoundation".to_string(),
         "-i".to_string(),
         av_input_spec(Some(camera_index), audio_index),
-        "-c:v".to_string(),
-        "mpeg4".to_string(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    // Hardware encoding, and the container's own codec table, rather than the bare `-c:v mpeg4`
+    // this used to hardcode. That old default ignored the file type the user picked entirely and
+    // produced MPEG-4 Part 2 - a pre-H.264 codec with markedly worse quality per byte, and one
+    // most players treat as legacy - while the equivalent Windows path had been using the shared
+    // H.264 table all along. It also meant camera recordings carried no audio codec choice at all.
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }

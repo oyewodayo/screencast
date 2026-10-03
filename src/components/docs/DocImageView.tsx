@@ -268,16 +268,16 @@ const DocImageView: React.FC<NodeViewProps> = ({ node, selected, updateAttribute
               onPointerUp={handleMoveUp}
               onPointerCancel={cancelMove}
               className="cursor-grab active:cursor-grabbing p-0.5 hover:bg-white/10 rounded"
-              title="Drag to move"
+              data-tip="Drag to move"
             >
               <MdDragIndicator size={14} />
             </span>
             {docId && (
-              <button type="button" onClick={() => setShowCrop(true)} className="p-0.5 hover:bg-white/10 rounded" title="Crop">
+              <button type="button" onClick={() => setShowCrop(true)} className="p-0.5 hover:bg-white/10 rounded" data-tip="Crop">
                 <MdCrop size={14} />
               </button>
             )}
-            <button type="button" onClick={() => deleteNode()} className="p-0.5 hover:bg-white/10 rounded" title="Delete">
+            <button type="button" onClick={() => deleteNode()} className="p-0.5 hover:bg-white/10 rounded" data-tip="Delete">
               <MdDelete size={14} />
             </button>
           </div>

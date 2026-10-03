@@ -9,6 +9,7 @@ import {
   IoTimeOutline,
   IoServerOutline,
   IoFolderOpenOutline,
+  IoPlay,
 } from 'react-icons/io5';
 import { open } from '@tauri-apps/plugin-shell';
 const appWindow = getCurrentWebviewWindow()
@@ -73,6 +74,17 @@ const FileModal = ({ filePath }: FileModalProps) => {
     await appWindow.close();
   };
 
+  // Plays the recording in Briefcast itself rather than handing it to whatever the OS has
+  // registered for the extension - the file-path button above already covers "open it elsewhere",
+  // and staying in the app is what makes the editor and its tools reachable from here.
+  //
+  // Same shape as handleConvertFormat: this window can't host the player, so it asks the main
+  // window to load the file and then gets out of the way.
+  const handlePlay = async () => {
+    await emit('open-recording-playback', filePath);
+    await appWindow.close();
+  };
+
   const handleClose = async () => {
     await appWindow.close();
   };
@@ -115,6 +127,13 @@ const FileModal = ({ filePath }: FileModalProps) => {
           onClick={handleClose}
         >
           Close
+        </button>
+        <button
+          className="flex-1 flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-700 dark:text-neutral-200 border-l border-gray-100 dark:border-neutral-800 hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors"
+          onClick={handlePlay}
+        >
+          <IoPlay className="text-base" />
+          Play
         </button>
         <button
           className="flex-1 py-3.5 text-sm font-medium bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white transition-colors"

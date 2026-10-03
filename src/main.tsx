@@ -3,7 +3,12 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import './index.css'
 import { ThemeProvider } from "./contexts/ThemeContext";
+import { startStallMonitor } from "./utils/stallMonitor";
+import { installGlobalErrorReporting } from "./utils/telemetry";
 // import "./App.css";
+
+startStallMonitor();
+installGlobalErrorReporting();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

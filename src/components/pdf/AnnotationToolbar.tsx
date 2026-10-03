@@ -9,7 +9,6 @@ import {
   IoCheckmarkCircle,
   IoCloudUploadOutline,
   IoAlertCircleOutline,
-  IoDocumentTextOutline,
   IoText,
   IoExpand,
   IoGridOutline,
@@ -26,7 +25,6 @@ import { PdfSidebarView } from "./PdfSidebar";
 import ColorSwatchPicker from "./ColorSwatchPicker";
 
 interface AnnotationToolbarProps {
-  title?: string;
   sidebarView: PdfSidebarView | null;
   onSidebarViewChange: (view: PdfSidebarView) => void;
   tool: AnnotationTool | null;
@@ -62,6 +60,8 @@ interface AnnotationToolbarProps {
   onExport: () => void;
 }
 
+// Every tooltip in this toolbar goes through TooltipLayer (data-tip / data-tip-kbd) rather than a
+// native `title`, so shortcuts show as keys instead of being buried in parentheses.
 const TOOL_BUTTONS: { tool: AnnotationTool; label: string; shortcut: string; icon: React.ReactNode }[] = [
   { tool: "pen", label: "Pen", shortcut: "P", icon: <IoPencil size={16} /> },
   { tool: "highlighter", label: "Highlighter", shortcut: "H", icon: <BsHighlighter size={15} /> },
@@ -70,22 +70,31 @@ const TOOL_BUTTONS: { tool: AnnotationTool; label: string; shortcut: string; ico
 ];
 
 // Thin vertical hairline used to separate control groups, mirroring macOS/iPadOS toolbar chrome.
-const Divider: React.FC = () => <div className="w-px h-6 bg-black/[0.06] dark:bg-white/[0.1] shrink-0" />;
+const Divider: React.FC = () => <div className="w-px h-5 mx-0.5 bg-black/[0.08] dark:bg-white/[0.1] shrink-0" />;
+
+// Rounded tray grouping related controls (panels, tools, page nav, zoom).
+const Group: React.FC<{ children: React.ReactNode; className?: string }> = ({ children, className = "" }) => (
+  <div className={`flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045] dark:bg-white/[0.06] shrink-0 ${className}`}>{children}</div>
+);
 
 // Circular, icon-only button — the base unit every control in this toolbar is built from.
 const IconButton: React.FC<{
   title: string;
+  kbd?: string;
   onClick?: () => void;
   disabled?: boolean;
   active?: boolean;
   children: React.ReactNode;
-}> = ({ title, onClick, disabled, active, children }) => (
+}> = ({ title, kbd, onClick, disabled, active, children }) => (
   <button
     type="button"
-    title={title}
+    data-tip={title}
+    data-tip-kbd={kbd}
+    aria-label={title}
+    aria-pressed={active}
     onClick={onClick}
     disabled={disabled}
-    className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors duration-150 ${
+    className={`shrink-0 flex items-center justify-center w-8 h-8 rounded-full transition-[background-color,color,box-shadow,transform] duration-150 active:scale-90 ${
       active
         ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
         : "text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] hover:text-neutral-800 dark:hover:text-neutral-100"
@@ -98,7 +107,7 @@ const IconButton: React.FC<{
 const SaveStatus: React.FC<{ isSaving: boolean; saveError: string | null }> = ({ isSaving, saveError }) => {
   if (saveError) {
     return (
-      <div className="flex items-center gap-1.5 text-red-500 text-xs font-medium" title={saveError}>
+      <div className="flex items-center gap-1.5 text-red-500 text-xs font-medium whitespace-nowrap" data-tip={saveError}>
         <IoAlertCircleOutline size={15} />
         <span className="hidden sm:inline">Save failed</span>
       </div>
@@ -106,14 +115,14 @@ const SaveStatus: React.FC<{ isSaving: boolean; saveError: string | null }> = ({
   }
   if (isSaving) {
     return (
-      <div className="flex items-center gap-1.5 text-neutral-400 dark:text-neutral-500 text-xs font-medium">
+      <div className="flex items-center gap-1.5 text-neutral-400 dark:text-neutral-500 text-xs font-medium whitespace-nowrap">
         <IoCloudUploadOutline size={15} className="animate-pulse" />
         <span className="hidden sm:inline">Saving…</span>
       </div>
     );
   }
   return (
-    <div className="flex items-center gap-1.5 text-emerald-500/80 text-xs font-medium">
+    <div className="flex items-center gap-1.5 text-emerald-500/80 text-xs font-medium whitespace-nowrap" data-tip="Your markup is saved automatically">
       <IoCheckmarkCircle size={15} />
       <span className="hidden sm:inline">Saved</span>
     </div>
@@ -146,7 +155,8 @@ const PageJumpInput: React.FC<{ currentPageIndex: number; numPages: number; onPa
     <input
       type="text"
       inputMode="numeric"
-      title="Jump to page"
+      data-tip="Type a page number to jump to it"
+      aria-label="Page number"
       value={value}
       onChange={(e) => setValue(e.target.value.replace(/[^0-9]/g, ""))}
       onKeyDown={(e) => {
@@ -160,7 +170,8 @@ const PageJumpInput: React.FC<{ currentPageIndex: number; numPages: number; onPa
       }}
       onBlur={commit}
       onFocus={(e) => e.currentTarget.select()}
-      className="w-7 text-center text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
+      style={{ width: `${Math.max(2, String(numPages).length) + 1}ch` }}
+      className="text-center text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
     />
   );
 };
@@ -193,7 +204,9 @@ const ZoomInput: React.FC<{ zoom: number; minZoom: number; maxZoom: number; onZo
     <input
       type="text"
       inputMode="numeric"
-      title={`Zoom level (${Math.round(minZoom * 100)}-${Math.round(maxZoom * 100)}%) — Ctrl+0 to reset to 100%`}
+      data-tip={`Zoom level, ${Math.round(minZoom * 100)}-${Math.round(maxZoom * 100)}%`}
+      data-tip-kbd="Ctrl+0"
+      aria-label="Zoom level"
       value={value}
       onChange={(e) => setValue(e.target.value.replace(/[^0-9]/g, ""))}
       onKeyDown={(e) => {
@@ -207,13 +220,12 @@ const ZoomInput: React.FC<{ zoom: number; minZoom: number; maxZoom: number; onZo
       }}
       onBlur={commit}
       onFocus={(e) => e.currentTarget.select()}
-      className="w-8 text-center text-xs font-medium text-neutral-600 dark:text-neutral-300 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
+      className="w-[4ch] text-center text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
     />
   );
 };
 
 const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
-  title,
   sidebarView,
   onSidebarViewChange,
   tool,
@@ -245,152 +257,149 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   exportProgress,
   onExport,
 }) => {
+  const pageLabel = twoPageMode && currentPageIndex + 1 < numPages ? `–${currentPageIndex + 2}` : "";
+
   return (
     <div className="shrink-0 px-4 pt-3 pb-2">
-      <div className="flex items-center gap-3 mx-auto max-w-fit px-3 py-2 rounded-2xl bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.04] dark:ring-white/[0.08]">
+      {/* One row that scrolls sideways (scrollbar hidden) instead of wrapping when the window is
+          narrow - a wrapped toolbar reshuffles every control's position. */}
+      <div
+        className="flex items-center gap-2 mx-auto max-w-fit overflow-x-auto px-2 py-1.5 rounded-2xl bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.04] dark:ring-white/[0.08]"
+        style={{ scrollbarWidth: "none" }}
+      >
         {/* Sidebar panel toggles: page thumbnails and the PDF's table of contents. Each re-clicks
             itself off (handled by the parent, same toggle pattern as the tool buttons below) so
             there's always an unambiguous way back to "no panel open". */}
-        <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045] dark:bg-white/[0.06]">
+        <Group>
           <IconButton title="Page thumbnails" active={sidebarView === "thumbnails"} onClick={() => onSidebarViewChange("thumbnails")}>
             <IoGridOutline size={15} />
           </IconButton>
           <IconButton title="Table of contents" active={sidebarView === "outline"} onClick={() => onSidebarViewChange("outline")}>
             <IoListOutline size={16} />
           </IconButton>
-        </div>
+        </Group>
 
         <Divider />
-
-        {title && (
-          <>
-            <div className="flex items-center gap-1.5 pl-1 pr-1 text-neutral-600 dark:text-neutral-300 max-w-[160px]" title={title}>
-              <IoDocumentTextOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-              <span className="text-sm font-medium truncate">{title}</span>
-            </div>
-            <Divider />
-          </>
-        )}
 
         {/* Tool segmented control. "Select" is a real, always-present option (not just a side
             effect of re-clicking an active tool) so deselecting has an unmistakable, always-
             highlightable target — clicking an active pen/highlighter/eraser again also toggles
-            it off, but this is the explicit, discoverable way to get back to "nothing selected". */}
-        <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045] dark:bg-white/[0.06]">
-          <IconButton title="Select / no tool (V)" active={tool === null} onClick={onDeselectTool}>
+            it off, but this is the explicit, discoverable way to get back to "nothing selected".
+            Inserting an image is a one-shot action rather than a persistent tool, so it sits
+            just after the tray instead of inside it. */}
+        <Group>
+          <IconButton title="Select" kbd="V" active={tool === null} onClick={onDeselectTool}>
             <BsCursor size={14} />
           </IconButton>
           {TOOL_BUTTONS.map(({ tool: t, label, shortcut, icon }) => (
-            <IconButton key={t} title={`${label} (${shortcut})`} active={tool === t} onClick={() => onToolChange(t)}>
+            <IconButton key={t} title={label} kbd={shortcut} active={tool === t} onClick={() => onToolChange(t)}>
               {icon}
             </IconButton>
           ))}
-        </div>
-
-        {/* Inserting an image isn't a persistent "tool" the way pen/highlighter/text are — it's a
-            one-shot action (pick a file, it appears selected and ready to drag/resize/rotate) —
-            so it lives here as a standalone button rather than in the tool segmented control. */}
+        </Group>
         <IconButton title="Insert image" onClick={onInsertImageClick}>
           <IoImageOutline size={16} />
         </IconButton>
 
-        {tool && tool !== "eraser" && (
-          <>
-            <Divider />
-            <ColorSwatchPicker color={color} onChange={onColorChange} />
-          </>
+        {/* Options for the active tool only - nothing to set with Select. Size is stroke width for
+            pen/highlighter, font size for text notes and radius for the eraser. */}
+        {tool && (
+          <div key={tool} className="flex items-center gap-2.5 pl-1 shrink-0 animate-[tipIn_150ms_ease-out]">
+            {tool !== "eraser" && <ColorSwatchPicker color={color} onChange={onColorChange} />}
+            <input
+              type="range"
+              min={1}
+              max={20}
+              step={1}
+              value={strokeWidth}
+              onChange={(e) => onStrokeWidthChange(Number(e.target.value))}
+              data-tip={tool === "text" ? "Text size" : tool === "eraser" ? "Eraser size" : "Stroke width"}
+              data-tip-kbd="[ / ]"
+              aria-label="Size"
+              className="w-20 accent-blue-500 cursor-pointer"
+            />
+          </div>
         )}
-
-        <div className="flex items-center gap-2 pl-1">
-          <input
-            type="range"
-            min={1}
-            max={20}
-            step={1}
-            value={strokeWidth}
-            onChange={(e) => onStrokeWidthChange(Number(e.target.value))}
-            title="Stroke width ([ / ])"
-            className="w-16 accent-blue-500"
-          />
-        </div>
 
         <Divider />
 
-        <div className="flex items-center gap-0.5">
-          <IconButton title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={onUndo}>
+        <div className="flex items-center gap-0.5 shrink-0">
+          <IconButton title="Undo" kbd="Ctrl+Z" disabled={!canUndo} onClick={onUndo}>
             <IoArrowUndo size={16} />
           </IconButton>
-          <IconButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={onRedo}>
+          <IconButton title="Redo" kbd="Ctrl+Shift+Z" disabled={!canRedo} onClick={onRedo}>
             <IoArrowRedo size={16} />
           </IconButton>
         </div>
 
         <Divider />
 
-        <IconButton title={twoPageMode ? "Single page view (B)" : "Two-page view (B)"} active={twoPageMode} onClick={onToggleTwoPageMode}>
-          <MdAutoStories size={17} />
-        </IconButton>
-
-        <IconButton title="Enter fullscreen / presentation mode (F)" onClick={onToggleFullscreen}>
-          <IoExpand size={16} />
-        </IconButton>
+        <div className="flex items-center gap-0.5 shrink-0">
+          <IconButton title={twoPageMode ? "Single page view" : "Two-page view"} kbd="B" active={twoPageMode} onClick={onToggleTwoPageMode}>
+            <MdAutoStories size={17} />
+          </IconButton>
+          <IconButton title="Fullscreen presentation" kbd="F" onClick={onToggleFullscreen}>
+            <IoExpand size={16} />
+          </IconButton>
+        </div>
 
         <Divider />
 
-        {/* Page navigator pill */}
-        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] dark:bg-white/[0.06] pl-1 pr-2 py-0.5">
-          <IconButton title="Previous page (←)" disabled={currentPageIndex <= 0} onClick={() => onPageChange(currentPageIndex - pageStep)}>
+        {/* Page navigator */}
+        <Group className="pr-1">
+          <IconButton title="Previous page" kbd="←" disabled={currentPageIndex <= 0} onClick={() => onPageChange(currentPageIndex - pageStep)}>
             <IoIosArrowBack size={15} />
           </IconButton>
           {numPages === 0 ? (
-            <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300 w-14 text-center">…</span>
+            <span className="text-xs font-medium text-neutral-400 dark:text-neutral-500 w-14 text-center">…</span>
           ) : (
-            <span className="flex items-center gap-1 text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums">
+            <span className="flex items-center gap-1 px-0.5 text-xs font-medium whitespace-nowrap tabular-nums">
               <PageJumpInput currentPageIndex={currentPageIndex} numPages={numPages} onPageChange={onPageChange} />
               <span className="text-neutral-400 dark:text-neutral-500">
-                {twoPageMode && currentPageIndex + 1 < numPages ? `-${currentPageIndex + 2} ` : " "}
-                / {numPages}
+                {pageLabel} of {numPages}
               </span>
             </span>
           )}
-          <IconButton title="Next page (→)" disabled={currentPageIndex >= numPages - 1} onClick={() => onPageChange(currentPageIndex + pageStep)}>
+          <IconButton title="Next page" kbd="→" disabled={currentPageIndex >= numPages - 1} onClick={() => onPageChange(currentPageIndex + pageStep)}>
             <IoIosArrowForward size={15} />
           </IconButton>
-        </div>
+        </Group>
 
-        {/* Zoom pill */}
-        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] dark:bg-white/[0.06] pl-1 pr-2 py-0.5">
-          <IconButton title="Zoom out (Ctrl+-)" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
+        {/* Zoom */}
+        <Group>
+          <IconButton title="Zoom out" kbd="Ctrl+-" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
             <IoRemove size={16} />
           </IconButton>
-          <span className="flex items-center text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums">
+          <span className="flex items-center text-xs font-medium text-neutral-400 dark:text-neutral-500 whitespace-nowrap tabular-nums">
             <ZoomInput zoom={zoom} minZoom={minZoom} maxZoom={maxZoom} onZoomChange={onZoomChange} />%
           </span>
-          <IconButton title="Zoom in (Ctrl+=)" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
+          <IconButton title="Zoom in" kbd="Ctrl+=" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
             <IoAdd size={16} />
           </IconButton>
-        </div>
+        </Group>
 
         <Divider />
 
         {/* Flattens annotations into a brand-new standalone PDF next to the source file — unlike
             the sidecar JSON SaveStatus reports on, this is what makes markup readable outside
-            this app (a real PDF, not something that needs to be re-composited on load). */}
-        <IconButton
-          title={
-            isExporting
-              ? exportProgress
-                ? `Exporting… page ${exportProgress.completed}/${exportProgress.total}`
-                : "Exporting…"
-              : "Export annotated PDF"
-          }
-          disabled={isExporting}
-          onClick={onExport}
-        >
-          <IoDownloadOutline size={16} className={isExporting ? "animate-pulse" : undefined} />
-        </IconButton>
+            this app (a real PDF, not something that needs to be re-composited on load). Shows its
+            page progress inline while running, rather than only in a tooltip. */}
+        <div className="flex items-center gap-1 shrink-0">
+          <IconButton
+            title={isExporting ? "Exporting…" : "Export as a PDF with your markup"}
+            disabled={isExporting}
+            onClick={onExport}
+          >
+            <IoDownloadOutline size={16} className={isExporting ? "animate-pulse" : undefined} />
+          </IconButton>
+          {isExporting && exportProgress && (
+            <span className="text-xs font-medium text-neutral-500 dark:text-neutral-400 whitespace-nowrap tabular-nums">
+              {exportProgress.completed}/{exportProgress.total}
+            </span>
+          )}
+        </div>
 
-        <div className="pr-1">
+        <div className="pr-1.5 shrink-0">
           <SaveStatus isSaving={isSaving} saveError={saveError} />
         </div>
       </div>

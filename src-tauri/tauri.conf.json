@@ -7,11 +7,15 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "msi"],
+    "createUpdaterArtifacts": true,
     "resources": [
-      "binaries/ffmpeg/*",
+      "binaries/ffmpeg/ffmpeg.exe",
+      "binaries/ffmpeg/ffprobe.exe",
       "binaries/heif/*",
-      "binaries/whisper/*"
+      "binaries/whisper/*.exe",
+      "binaries/whisper/*.dll",
+      "binaries/rnnoise/*"
     ],
     "icon": [
       "icons/32x32.png",
@@ -23,9 +27,19 @@
   },
   "productName": "Briefcast",
   "mainBinaryName": "Briefcast",
-  "version": "0.0.0",
-  "identifier": "com.briefscan.app",
-  "plugins": {},
+  "version": "0.1.0",
+  "identifier": "com.withbriefs.briefcast",
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxMkI1RjFGQ0JDMTgwMEQKUldRTmdNSExIMThySVkvRjlMUkJXKzc4R2hxcmJoME1pT0xMRW15dVVMNC9tby9POEE1N2p5TkEK",
+      "endpoints": [
+        "https://github.com/oyewodayo/screencast/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "app": {
     "security": {
       "assetProtocol": {
@@ -34,7 +48,7 @@
         ],
         "enable": true
       },
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob:; frame-src 'self' asset: http://asset.localhost https://asset.localhost; connect-src ipc: http://ipc.localhost 'self' asset: http://asset.localhost https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob:; frame-src 'self' asset: http://asset.localhost https://asset.localhost; connect-src ipc: http://ipc.localhost 'self' asset: http://asset.localhost https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
     },
     "windows": [
       {
@@ -70,6 +84,46 @@
         "skipTaskbar": true,
         "decorations": false,
         "transparent": true,
+        "visible": false,
+        "focus": false
+      },
+      {
+        "label": "snip-overlay",
+        "title": "Screenshot",
+        "url": "/snip",
+        "width": 800,
+        "height": 600,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "decorations": false,
+        "shadow": false,
+        "visible": false,
+        "focus": false
+      },
+      {
+        "label": "annotation-overlay",
+        "title": "Annotation",
+        "url": "/annotation-overlay",
+        "width": 800,
+        "height": 600,
+        "resizable": false,
+        "minimizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "visible": false,
+        "focus": false
+      },
+      {
+        "label": "presentation",
+        "title": "Briefcast Live Display",
+        "url": "/presentation",
+        "width": 1280,
+        "height": 720,
+        "decorations": false,
         "visible": false,
         "focus": false
       }

@@ -65,7 +65,7 @@ const DocFindReplaceBar: React.FC<DocFindReplaceBarProps> = ({ editor, onClose }
         </span>
         <button
           type="button"
-          title="Previous match"
+          data-tip="Previous match"
           disabled={matchCount === 0}
           onClick={() => editor.commands.findPrevious()}
           className="p-1.5 rounded-md text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-40"
@@ -74,7 +74,7 @@ const DocFindReplaceBar: React.FC<DocFindReplaceBarProps> = ({ editor, onClose }
         </button>
         <button
           type="button"
-          title="Next match"
+          data-tip="Next match"
           disabled={matchCount === 0}
           onClick={() => editor.commands.findNext()}
           className="p-1.5 rounded-md text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 disabled:opacity-40"
@@ -90,7 +90,7 @@ const DocFindReplaceBar: React.FC<DocFindReplaceBarProps> = ({ editor, onClose }
         </button>
         <button
           type="button"
-          title="Close (Esc)"
+          data-tip="Close" data-tip-kbd="Esc"
           onClick={handleClose}
           className="ml-auto p-1.5 rounded-md text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800"
         >

@@ -75,8 +75,9 @@ fn unique_trashed_name(original_name: &str) -> String {
     format!("{}_{}", Utc::now().timestamp_millis(), original_name)
 }
 
-#[command]
+#[command(async)]
 pub fn move_to_trash(path: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let source = PathBuf::from(&path);
     if !source.exists() {
         return Err("File does not exist".to_string());
@@ -117,8 +118,9 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn list_trash() -> Result<Vec<TrashEntry>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut records = read_manifest()?;
     records.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
     Ok(records
@@ -167,8 +169,9 @@ fn free_restore_path(original_path: &Path) -> PathBuf {
     unreachable!()
 }
 
-#[command]
+#[command(async)]
 pub fn restore_from_trash(trashed_name: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut records = read_manifest()?;
     let index = records
         .iter()
@@ -196,8 +199,9 @@ pub fn restore_from_trash(trashed_name: String) -> Result<String, String> {
     path_to_str(&destination).map(|s| s.to_string())
 }
 
-#[command]
+#[command(async)]
 pub fn delete_trash_item(trashed_name: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut records = read_manifest()?;
     let index = records
         .iter()
@@ -214,8 +218,9 @@ pub fn delete_trash_item(trashed_name: String) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn empty_trash() -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let records = read_manifest()?;
     for record in &records {
         let path = trash_dir()?.join(&record.trashed_name);
@@ -229,8 +234,9 @@ pub fn empty_trash() -> Result<(), String> {
 // Deliberately not a background timer: this is a desktop app, "check whenever it's opened" is
 // the same policy every mainstream trash implementation (Gmail, Google Photos, ...) already uses
 // in practice, without needing a persistent scheduler for something this low-stakes.
-#[command]
+#[command(async)]
 pub fn purge_expired_trash(retention_days: i64) -> Result<u32, String> {
+    let _serial = crate::services::responsiveness::serial();
     if retention_days <= 0 {
         return Ok(0); // 0/negative means "never auto-purge"
     }

@@ -37,7 +37,9 @@ pub fn start_watching(app_handle: &AppHandle, dir: &Path) {
     let result = new_debouncer(
         Duration::from_millis(DEBOUNCE_MS),
         move |res: DebounceEventResult| match res {
-            Ok(events) if !events.is_empty() => {
+            // Capture bookkeeping (a stray progress log) changes constantly and never alters what
+            // the sidebar shows - not worth a library rescan.
+            Ok(events) if events.iter().any(|e| !e.path.to_string_lossy().ends_with(".progress.log")) => {
                 if let Err(e) = emit_handle.emit("refresh-file-list", ()) {
                     log::warn!("Failed to emit refresh-file-list from file watcher: {}", e);
                 }
