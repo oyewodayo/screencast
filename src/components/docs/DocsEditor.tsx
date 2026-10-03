@@ -23,6 +23,7 @@ import { createDocImagePasteExtension, uploadImageFromPath } from "../../utils/d
 import { createSlashCommandExtension } from "../../utils/docSlashCommand";
 import DocFindReplace from "../../utils/docFindReplace";
 import DocDictation from "../../utils/docDictationExtension";
+import DocPaint from "../../utils/docPaintExtension";
 import { getDocContentExtensions, docProseClassName } from "../../utils/docSchemaExtensions";
 import DocVersionHistoryPanel from "./DocVersionHistoryPanel";
 import DocFindReplaceBar from "./DocFindReplaceBar";
@@ -38,6 +39,7 @@ import "./docComments.css";
 import "./docPageLayout.css";
 import "./docLinks.css";
 import "./docDictation.css";
+import "./docPaint.css";
 import "../board/boardFonts.css";
 
 interface DocsEditorProps {
@@ -172,6 +174,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         DocFindReplace,
         DocAutoPaginate,
         DocDictation,
+        DocPaint,
         DocShortcuts,
         Placeholder.configure({ placeholder: "Start writing, type “/” for blocks, or press Ctrl+Shift+S to dictate…" }),
       ],

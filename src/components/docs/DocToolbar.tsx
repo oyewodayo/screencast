@@ -57,6 +57,8 @@ import { BiHighlight } from "react-icons/bi";
 import { TbTable, TbTableOptions } from "react-icons/tb";
 import DocColorPicker from "./DocColorPicker";
 import { DICTATION_LANGUAGES, DocDictation } from "../../hooks/useDocDictation";
+import { PaintKind, getPaintState } from "../../utils/docPaintExtension";
+import { markKeyHandled } from "../../utils/keyEvents";
 
 // Classic web-safe fonts (what .docx documents and Word itself most commonly use, for import/export
 // fidelity) plus a handful of modern ones self-hosted via boardFonts.css - renders the same on
@@ -207,7 +209,11 @@ export const Dropdown: React.FC<DropdownProps> = ({
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) onOpenChange(false);
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onOpenChange(false);
+      // Marked as used, so outer Esc handlers (highlighter mode) leave this one be.
+      if (e.key === "Escape") {
+        markKeyHandled(e);
+        onOpenChange(false);
+      }
     };
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("keydown", onKeyDown, true);
@@ -543,6 +549,39 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
   const highlightColor = (editor.getAttributes("highlight").color as string | undefined) ?? null;
   const activeAlign = ALIGNMENTS.find((a) => editor.isActive({ textAlign: a.value })) ?? ALIGNMENTS[0];
   const lineSpacing = (editor.getAttributes("paragraph").lineSpacing ?? editor.getAttributes("heading").lineSpacing ?? null) as number | null;
+  const paint = getPaintState(editor);
+
+  // Text selected -> colour it now. Nothing selected -> arm highlighter mode (docPaintExtension.ts):
+  // every selection made next gets this colour, and it's also stored so typed text takes it.
+  const pickColor = (kind: PaintKind, color: string) => {
+    const chain = editor.chain().focus();
+    const withColor = kind === "color" ? chain.setColor(color) : chain.setHighlight({ color });
+    if (editor.state.selection.empty) withColor.startPaint(kind, color).run();
+    else withColor.run();
+  };
+  const clearColor = (kind: PaintKind) => {
+    const chain = editor.chain().focus();
+    (kind === "color" ? chain.unsetColor() : chain.unsetHighlight()).run();
+    if (paint?.kind === kind) editor.commands.stopPaint();
+    close();
+  };
+  // While a colour's highlighter mode is on, its button turns it off instead of opening the picker.
+  const colorMenu = (kind: PaintKind, id: string) => {
+    const b = bind(id);
+    return {
+      open: b.open,
+      onOpenChange: (next: boolean) => {
+        if (next && paint?.kind === kind) {
+          editor.chain().focus().stopPaint().run();
+          return;
+        }
+        b.onOpenChange(next);
+      },
+    };
+  };
+  const paintTrigger = (kind: PaintKind, open: boolean) =>
+    `${toolClass(open || paint?.kind === kind)} ${paint?.kind === kind ? "ring-2 ring-blue-500/60" : ""}`;
+
   const onLink = editor.isActive("link");
   const inTable = editor.isActive("table");
   const hasSelection = !editor.state.selection.empty;
@@ -646,7 +685,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
   );
 
   return (
-    <div className="@container shrink-0 px-3 pt-1.5 pb-2 print:hidden">
+    <div className="@container relative shrink-0 px-3 pt-1.5 pb-2 print:hidden">
       <div
         role="toolbar"
         aria-label="Formatting"
@@ -753,8 +792,9 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
         </ToolButton>
 
         <Dropdown
-          {...bind("textColor")}
-          label="Text color"
+          {...colorMenu("color", "textColor")}
+          label={paint?.kind === "color" ? "Stop text colour highlighter (Esc)" : "Text color"}
+          triggerClassName={paintTrigger("color", bind("textColor").open)}
           trigger={
             <span className="flex flex-col items-center leading-none">
               <MdFormatColorText size={17} />
@@ -765,19 +805,17 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
         >
           <DocColorPicker
             value={textColor}
-            onChange={(color) => editor.chain().focus().setColor(color).run()}
-            onClear={() => {
-              editor.chain().focus().unsetColor().run();
-              close();
-            }}
+            onChange={(color) => pickColor("color", color)}
+            onClear={() => clearColor("color")}
             onClose={close}
             storageKey="text"
             clearLabel="Reset color"
           />
         </Dropdown>
         <Dropdown
-          {...bind("highlight")}
-          label="Highlight color"
+          {...colorMenu("highlight", "highlight")}
+          label={paint?.kind === "highlight" ? "Stop highlighter (Esc)" : "Highlight color"}
+          triggerClassName={paintTrigger("highlight", bind("highlight").open)}
           trigger={
             <span className="flex flex-col items-center leading-none">
               <BiHighlight size={16} />
@@ -791,11 +829,8 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
         >
           <DocColorPicker
             value={highlightColor}
-            onChange={(color) => editor.chain().focus().setHighlight({ color }).run()}
-            onClear={() => {
-              editor.chain().focus().unsetHighlight().run();
-              close();
-            }}
+            onChange={(color) => pickColor("highlight", color)}
+            onClear={() => clearColor("highlight")}
             onClose={close}
             storageKey="highlight"
             clearLabel="None"
@@ -1040,6 +1075,28 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
 
         <DictationControl dictation={dictation} menu={bind("dictation")} />
       </div>
+      {paint && (
+        <div className="absolute left-1/2 top-full -translate-x-1/2 -mt-1 z-30 flex items-center gap-2 rounded-full bg-neutral-900 pl-3 pr-1.5 py-1 text-xs text-white shadow-lg dark:bg-neutral-100 dark:text-neutral-900">
+          <span
+            className="w-3.5 h-3.5 rounded-full ring-1 ring-white/40 dark:ring-black/20"
+            style={{ backgroundColor: paint.color }}
+            aria-hidden
+          />
+          <span>
+            {paint.kind === "highlight" ? "Highlighter" : "Text colour"} on - select text to apply, again to remove
+          </span>
+          <button
+            type="button"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => editor.chain().focus().stopPaint().run()}
+            className="ml-1 rounded-full px-2 py-0.5 font-medium bg-white/15 hover:bg-white/25 dark:bg-black/10 dark:hover:bg-black/20"
+            data-tip="Stop"
+            data-tip-kbd="Esc"
+          >
+            Done
+          </button>
+        </div>
+      )}
     </div>
   );
 };
