@@ -164,15 +164,18 @@ export const docProseClassName = [
   // ProseMirror-selectednode lands on the NodeView's own wrapper element rather than the raw
   // <img> once a NodeView owns it.
   //
-  // Manual page break (docPageBreakExtension.ts): a dashed rule with a small floating "Page break"
-  // label on screen; on print, the rule/label disappear and `break-after: page` (plus the older
-  // `page-break-after` for broader Chromium-version coverage) takes over, which is what actually
-  // forces a new page in the printed/PDF output.
-  "[&_[data-page-break]]:relative [&_[data-page-break]]:h-0 [&_[data-page-break]]:my-4",
-  "[&_[data-page-break]]:border-t [&_[data-page-break]]:border-dashed [&_[data-page-break]]:border-neutral-300 dark:[&_[data-page-break]]:border-neutral-600",
-  "[&_[data-page-break]::after]:content-['Page_break'] [&_[data-page-break]::after]:absolute [&_[data-page-break]::after]:left-1/2 [&_[data-page-break]::after]:-translate-x-1/2 [&_[data-page-break]::after]:-top-2.5",
-  "[&_[data-page-break]::after]:bg-white dark:[&_[data-page-break]::after]:bg-neutral-900 [&_[data-page-break]::after]:px-2 [&_[data-page-break]::after]:text-[10px] [&_[data-page-break]::after]:uppercase [&_[data-page-break]::after]:tracking-wide [&_[data-page-break]::after]:text-neutral-400",
-  "print:[&_[data-page-break]]:[break-after:page] print:[&_[data-page-break]]:[page-break-after:always] print:[&_[data-page-break]]:border-none print:[&_[data-page-break]::after]:hidden",
+  // Manual page break (docPageBreakExtension.ts): on screen just a small "Page break" tag where the
+  // page ends - in the live editor docAutoPaginate.ts already draws the new page right after it, so
+  // the old full-width dashed rule on top of that gap said the same thing twice. The tag is the
+  // handle for selecting (click it, then Delete) the break and turns blue while selected. On print
+  // the tag disappears and `break-after: page` (plus the older `page-break-after`) forces the new
+  // page in the printed/PDF output.
+  "[&_[data-page-break]]:relative [&_[data-page-break]]:h-6 [&_[data-page-break]]:my-1 [&_[data-page-break]]:flex [&_[data-page-break]]:items-center [&_[data-page-break]]:justify-center",
+  "[&_[data-page-break]::after]:content-['Page_break'] [&_[data-page-break]::after]:px-2 [&_[data-page-break]::after]:py-0.5 [&_[data-page-break]::after]:rounded-full",
+  "[&_[data-page-break]::after]:border [&_[data-page-break]::after]:border-neutral-200 dark:[&_[data-page-break]::after]:border-neutral-700 [&_[data-page-break]::after]:bg-neutral-50 dark:[&_[data-page-break]::after]:bg-neutral-800",
+  "[&_[data-page-break]::after]:text-[10px] [&_[data-page-break]::after]:font-medium [&_[data-page-break]::after]:uppercase [&_[data-page-break]::after]:tracking-wide [&_[data-page-break]::after]:text-neutral-400",
+  "[&_[data-page-break].ProseMirror-selectednode::after]:border-blue-500 [&_[data-page-break].ProseMirror-selectednode::after]:text-blue-600 [&_[data-page-break].ProseMirror-selectednode]:outline-none",
+  "print:[&_[data-page-break]]:[break-after:page] print:[&_[data-page-break]]:[page-break-after:always] print:[&_[data-page-break]]:h-0 print:[&_[data-page-break]]:my-0 print:[&_[data-page-break]::after]:hidden",
   "[&_.tableWrapper]:overflow-x-auto [&_.tableWrapper]:w-full [&_.tableWrapper]:my-4 [&_.tableWrapper]:pb-1",
   "[&_.ProseMirror_table]:table-fixed [&_.ProseMirror_table]:border-collapse [&_.ProseMirror_table]:w-full [&_.ProseMirror_table]:min-w-[28rem]",
   "[&_.ProseMirror_th]:relative [&_.ProseMirror_th]:border [&_.ProseMirror_th]:border-neutral-300 dark:[&_.ProseMirror_th]:border-neutral-700 [&_.ProseMirror_th]:bg-neutral-100 dark:[&_.ProseMirror_th]:bg-neutral-800 [&_.ProseMirror_th]:px-3 [&_.ProseMirror_th]:py-2 [&_.ProseMirror_th]:align-top",

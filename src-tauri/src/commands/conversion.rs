@@ -1524,13 +1524,29 @@ pub async fn generate_captions(
         .map_err(|e| format!("whisper-cli reported success but produced no readable output: {}", e))
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocTranscript {
+    text: String,
+    // whisper's own language code ("en", "de", ...) when it auto-detected one - the frontend locks
+    // later chunks to it, since detection on a two-second utterance is far less reliable than on
+    // the first, usually longer one.
+    language: Option<String>,
+}
+
+// Dictation chunks from useDocDictation.ts: the frontend cuts the mic stream at speech pauses and
+// sends each utterance as a 16kHz mono WAV, so whisper runs on a few seconds of audio at a time and
+// text lands while the user is still talking. `prompt` is the document text before the cursor,
+// passed as whisper's initial prompt - biases spelling of names/jargon already in the doc and keeps
+// punctuation/casing consistent with what's already written.
 #[tauri::command]
 pub async fn transcribe_doc_audio(
     app_handle: AppHandle,
     audio_bytes: Vec<u8>,
     mime_type: Option<String>,
     language: Option<String>,
-) -> Result<String, String> {
+    prompt: Option<String>,
+) -> Result<DocTranscript, String> {
     if audio_bytes.is_empty() {
         return Err("No audio was recorded".to_string());
     }
@@ -1563,15 +1579,38 @@ pub async fn transcribe_doc_audio(
     let output_stem = work_dir.join(format!("dictation-{}-{}", std::process::id(), stamp));
     let output_txt = output_stem.with_extension("txt");
 
+    let ready_wav = is_whisper_ready_wav(&audio_bytes);
     std::fs::write(&input_path, audio_bytes)
         .map_err(|e| format!("Failed to write recorded audio: {}", e))?;
 
+    let prompt = prompt.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
     let result = async {
-        extract_audio_for_whisper(&ffmpeg_path, &input_path, &wav_path).await?;
-        run_whisper_text_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem, &lang).await?;
-        std::fs::read_to_string(&output_txt)
+        // Already in whisper's input format - skip the ffmpeg round trip (a process spawn per chunk).
+        let whisper_input = if ready_wav {
+            &input_path
+        } else {
+            extract_audio_for_whisper(&ffmpeg_path, &input_path, &wav_path).await?;
+            &wav_path
+        };
+        // 16kHz mono s16 = 32000 bytes/s after the 44-byte header.
+        let seconds = std::fs::metadata(whisper_input)
+            .map(|m| m.len().saturating_sub(44) as f64 / 32000.0)
+            .unwrap_or(30.0);
+        let language = run_whisper_text_cli(
+            &app_handle,
+            &whisper_path,
+            &model_path,
+            whisper_input,
+            &output_stem,
+            &lang,
+            prompt.as_deref(),
+            dictation_audio_ctx(seconds),
+        )
+        .await?;
+        let text = std::fs::read_to_string(&output_txt)
             .map(|text| normalize_whisper_text(&text))
-            .map_err(|e| format!("whisper-cli reported success but produced no readable transcript: {}", e))
+            .map_err(|e| format!("whisper-cli reported success but produced no readable transcript: {}", e))?;
+        Ok::<_, String>(DocTranscript { text, language })
     }
     .await;
 
@@ -1579,6 +1618,25 @@ pub async fn transcribe_doc_audio(
     let _ = std::fs::remove_file(&wav_path);
     let _ = std::fs::remove_file(&output_txt);
     result
+}
+
+// whisper's encoder always runs over a full 30s window (1500 frames, 50/s) unless told otherwise,
+// so a three-second dictation phrase paid for 27s of padding. Sizing the window to the clip plus a
+// margin, rounded up to 64 frames, cut a 6s phrase from ~1.6s to ~0.75s on this machine with an
+// identical transcript. Too tight a window truncates the tail, hence the 2.5s margin.
+fn dictation_audio_ctx(seconds: f64) -> u32 {
+    let frames = ((seconds + 2.5) * 50.0).ceil() as u32;
+    (frames.div_ceil(64) * 64).clamp(256, 1500)
+}
+
+// True for a canonical 44-byte-header PCM WAV that's already 16kHz, mono, 16-bit.
+fn is_whisper_ready_wav(bytes: &[u8]) -> bool {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" || &bytes[12..16] != b"fmt " {
+        return false;
+    }
+    let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    u16_at(20) == 1 && u16_at(22) == 1 && u32_at(24) == 16000 && u16_at(34) == 16 && &bytes[36..40] == b"data"
 }
 
 fn audio_extension_for_mime(mime_type: Option<&str>) -> &'static str {
@@ -1866,6 +1924,7 @@ async fn run_whisper_cli(
     .map_err(|e| format!("Transcription task panicked: {e}"))?
 }
 
+// Returns the language code whisper auto-detected, if it detected one (None with an explicit -l).
 async fn run_whisper_text_cli(
     app_handle: &AppHandle,
     whisper_path: &PathBuf,
@@ -1873,13 +1932,16 @@ async fn run_whisper_text_cli(
     wav_path: &PathBuf,
     output_stem: &PathBuf,
     language: &str,
-) -> Result<(), String> {
+    prompt: Option<&str>,
+    audio_ctx: u32,
+) -> Result<Option<String>, String> {
     let app_handle = app_handle.clone();
     let whisper_path = whisper_path.clone();
     let model_path = model_path.clone();
     let wav_path = wav_path.clone();
     let output_stem = output_stem.clone();
     let language = language.to_string();
+    let prompt = prompt.map(str::to_string);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))
         .unwrap_or(4);
@@ -1889,7 +1951,17 @@ async fn run_whisper_text_cli(
         hide_console_window(&mut cmd);
         cmd.arg("-m").arg(path_to_str(&model_path)?);
         cmd.arg("-f").arg(path_to_str(&wav_path)?);
-        cmd.args(["-otxt", "-np", "-pp", "-t", &threads.to_string(), "-l", &language]);
+        // -bs 1 -bo 1: greedy decoding - beam search (the default 5) cost ~250ms more per phrase
+        // with no change in the transcript on short dictation clips. -ac: see
+        // dictation_audio_ctx. No -pp: a phrase finishes in well under a second, so per-percent
+        // progress events were just noise.
+        // -sns: suppress non-speech tokens ("[MUSIC]", "(laughs)") at decode time rather than only
+        // filtering them out afterwards.
+        let audio_ctx = audio_ctx.to_string();
+        cmd.args(["-otxt", "-np", "-sns", "-bs", "1", "-bo", "1", "-ac", &audio_ctx, "-t", &threads.to_string(), "-l", &language]);
+        if let Some(prompt) = &prompt {
+            cmd.arg("--prompt").arg(prompt);
+        }
         cmd.arg("-of").arg(path_to_str(&output_stem)?);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
@@ -1916,7 +1988,7 @@ async fn run_whisper_text_cli(
             let mut full_output = String::new();
             let progress_re = regex::Regex::new(r"progress\s*=\s*(\d+)%").unwrap();
             let language_re = regex::Regex::new(r"(?:auto-)?detected language:\s*([A-Za-z][A-Za-z_-]*)").unwrap();
-            let mut emitted_language = false;
+            let mut detected_language: Option<String> = None;
 
             for line in reader.lines() {
                 let Ok(line) = line else { continue };
@@ -1928,22 +2000,22 @@ async fn run_whisper_text_cli(
                         let _ = app_handle_for_stderr.emit("docs-dictation-progress", pct);
                     }
                 }
-                if !emitted_language {
+                if detected_language.is_none() {
                     if let Some(caps) = language_re.captures(&line.to_ascii_lowercase()) {
                         let label = whisper_language_label(&caps[1]);
                         let _ = app_handle_for_stderr.emit("docs-dictation-language", label);
-                        emitted_language = true;
+                        detected_language = Some(caps[1].to_string());
                     }
                 }
             }
 
-            full_output
+            (full_output, detected_language)
         });
 
         let status = child
             .wait()
             .map_err(|e| format!("Failed to wait for whisper-cli: {}", e))?;
-        let stderr_output = stderr_thread.join().unwrap_or_default();
+        let (stderr_output, detected_language) = stderr_thread.join().unwrap_or_default();
 
         if !status.success() {
             let tail: Vec<&str> = stderr_output
@@ -1960,7 +2032,7 @@ async fn run_whisper_text_cli(
             ));
         }
         let _ = app_handle.emit("docs-dictation-progress", 100.0);
-        Ok(())
+        Ok(detected_language)
     })
     .await
     .map_err(|e| format!("Transcription task panicked: {e}"))?

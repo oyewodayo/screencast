@@ -85,6 +85,11 @@ windows = {version="0.57.0", features = ["Win32_System_SystemInformation", "Win3
 # loopback is the one universal, driver-independent way to grab it on any Windows install.
 wasapi = "0.23"
 hound = "3.5"
+# Docs "Download PDF" (services/docs.rs export_doc_pdf): WebView2's own PrintToPdf, which - unlike
+# window.print() - can turn off Chromium's date/title/URL header and footer and skip the dialog.
+# Pinned to the versions wry already links, so its ICoreWebView2 types are the ones Tauri hands out.
+webview2-com = "0.39.1"
+windows-core = "0.62.2"
 
 # Pure-Rust X11 protocol client (talks directly to the X server over its own socket transport —
 # no libX11/libxcb .so needed at build or run time) — the closest Linux analog to using the

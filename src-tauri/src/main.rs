@@ -486,6 +486,7 @@ fn main() {
             services::docs::relink_doc_path,
             services::docs::export_doc,
             services::docs::export_doc_binary,
+            services::docs::export_doc_pdf,
             services::docs::save_doc_image,
             services::docs::list_trashed_docs,
             services::docs::restore_doc,
