@@ -161,8 +161,12 @@ const AnnotationOverlayWindow = () => {
     if (rafRef.current === null) rafRef.current = requestAnimationFrame(() => renderRef.current());
   }).current;
 
+  // Must also clear rafRef: StrictMode's mount -> unmount -> mount cancels the frame the resize
+  // effect queued, and a stale non-null id left behind made requestRender think a frame was
+  // always pending - so nothing was ever drawn again.
   useEffect(() => () => {
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
   }, []);
 
   // Real stylus pressure (0 for mouse/touch, normalized to 0.5 - perfect-freehand's own
