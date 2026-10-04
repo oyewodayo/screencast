@@ -113,7 +113,8 @@ const PrivacySection: React.FC = () => {
       </Field>
       <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
         Helps decide what to fix and build next. Sent: which features are used (e.g. "recording finished", with its length
-        and type), crash details with your user folder removed from file paths, app version and OS. Never sent: file names,
+        and type), crash details with your user folder removed from file paths, app version, OS, and a random ID for this
+        install that isn't linked to you (deleted when you turn this off). Never sent: file names,
         file contents, recordings, documents, or anything you type. Turning this off takes effect immediately.
       </p>
       {telemetry && !telemetry.available && (
