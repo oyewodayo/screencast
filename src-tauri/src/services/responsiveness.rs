@@ -161,7 +161,17 @@ pub fn start_ui_watchdog(app: &AppHandle) {
         .spawn(move || {
             let mut stall_peak: Option<u64> = None;
             loop {
+                let slept_from = std::time::SystemTime::now();
                 std::thread::sleep(WATCHDOG_INTERVAL);
+                // This thread oversleeping by many seconds means the machine was suspended, not
+                // that the UI froze - the heartbeat is stale only because nothing ran at all.
+                // Skip this round instead of logging the sleep as an hours-long "stall".
+                let suspended = slept_from.elapsed().is_ok_and(|e| e > WATCHDOG_INTERVAL + Duration::from_secs(10));
+                if suspended {
+                    stall_peak = None;
+                    last_beat.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    continue;
+                }
                 let beat = last_beat.clone();
                 let posted = app.run_on_main_thread(move || {
                     beat.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -184,6 +194,13 @@ pub fn start_ui_watchdog(app: &AppHandle) {
     if let Err(e) = spawned {
         log::warn!("Could not start UI watchdog: {}", e);
     }
+}
+
+/// One-line diagnostics from the frontend that belong next to the watchdog's own lines - e.g. the
+/// page's canvases losing their GPU contents (src/utils/stallMonitor.ts's canvas monitor).
+#[tauri::command]
+pub async fn report_frontend_event(message: String) {
+    log::info!("[frontend] {}", message);
 }
 
 /// The webview's own main thread is separate from the native UI thread above - a long JS task

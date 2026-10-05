@@ -67,6 +67,10 @@ mod services {
     // camera/mic open - see the module's own doc comment for the orphan this fixes.
     #[cfg(target_os = "windows")]
     pub mod process_job;
+    // Repaints WebView2 after sleep/resume and after its GPU/page process dies - the blank white
+    // window after reopening a laptop lid. See the module's own doc comment.
+    #[cfg(target_os = "windows")]
+    pub mod webview_recovery;
     // Polls ffmpeg's `-progress` sidecar file while a recording is in flight and forwards it to
     // the frontend as a `recording-progress` event - see the module's own doc comment for why
     // this exists (win.rs deliberately nulls ffmpeg's stdout/stderr, so there was previously no
@@ -334,6 +338,8 @@ fn main() {
 
             services::telemetry::init(app.handle());
             services::responsiveness::start_ui_watchdog(app.handle());
+            #[cfg(target_os = "windows")]
+            services::webview_recovery::install(app.handle());
             // All slow first-time probes (ffmpeg -list_devices, a trial hardware encode, a trial
             // GPU screen capture); doing them now in the background means the device pickers and
             // the first recording never wait on them.
@@ -351,6 +357,7 @@ fn main() {
             commands::system_info::get_ram_info,
             get_os_info,
             services::responsiveness::report_frontend_stall,
+            services::responsiveness::report_frontend_event,
             services::telemetry::get_telemetry_settings,
             services::telemetry::set_telemetry_enabled,
             services::telemetry::track_event,

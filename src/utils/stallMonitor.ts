@@ -46,3 +46,35 @@ export function startStallMonitor(): void {
     // Monitoring is best-effort - never let it break startup.
   }
 }
+
+// Logs when the page's canvases lose their GPU-backed contents (GPU process crash, or the GPU
+// device being reset across sleep/resume) and when the browser hands them back - blank. Pairs
+// with src-tauri/src/services/webview_recovery.rs, which repaints the window itself: this is what
+// tells app.log whether the canvases inside it also need redrawing. Batched, since one GPU reset
+// hits every canvas on the page at once.
+let canvasMonitorStarted = false;
+
+export function startCanvasLossMonitor(): void {
+  if (canvasMonitorStarted) return;
+  canvasMonitorStarted = true;
+
+  const counts = { lost: 0, restored: 0 };
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  const flush = () => {
+    flushTimer = null;
+    const message = `canvas contexts lost: ${counts.lost}, restored: ${counts.restored} (${location.pathname})`;
+    console.warn(`[canvas] ${message}`);
+    invoke('report_frontend_event', { message }).catch(() => {});
+    counts.lost = 0;
+    counts.restored = 0;
+  };
+  const note = (kind: 'lost' | 'restored') => () => {
+    counts[kind] += 1;
+    if (flushTimer === null) flushTimer = setTimeout(flush, 2000);
+  };
+  // Neither event bubbles; capture-phase listeners on the document still see them.
+  document.addEventListener('contextlost', note('lost'), true);
+  document.addEventListener('contextrestored', note('restored'), true);
+  document.addEventListener('webglcontextlost', note('lost'), true);
+  document.addEventListener('webglcontextrestored', note('restored'), true);
+}
