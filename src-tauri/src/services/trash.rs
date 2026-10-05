@@ -35,7 +35,7 @@ pub struct TrashEntry {
     deleted_at: i64,
 }
 
-fn trash_dir() -> Result<PathBuf, String> {
+pub(crate) fn trash_dir() -> Result<PathBuf, String> {
     let dir = briefcast_dir()?.join(".trash");
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("Failed to create trash directory: {}", e))?;

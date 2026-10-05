@@ -41,6 +41,8 @@ interface DocumentFolderGalleryProps {
   folderLabel: string;
   onOpenDocument: (file: GalleryFile) => void;
   onDeleteFile: (file: GalleryFile) => void;
+  // Opens the file Info panel (FileInfoModal, owned by Dashboard.tsx).
+  onShowInfo: (file: GalleryFile) => void;
   // Rename is inline (matches the sidebar's own inline rename), so its state is lifted to
   // Dashboard.tsx - one rename in flight at a time, shared with the sidebar list, rather than a
   // second parallel rename state living only here.
@@ -85,6 +87,7 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
   folderLabel,
   onOpenDocument,
   onDeleteFile,
+  onShowInfo,
   renamingFile,
   renameValue,
   onRenameValueChange,
@@ -451,6 +454,16 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
                 )}
               </div>
             )}
+            <button
+              type="button"
+              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+              onClick={() => {
+                onShowInfo(contextMenu.file);
+                setContextMenu(null);
+              }}
+            >
+              Info
+            </button>
             <button
               type="button"
               className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 text-red-600 dark:text-red-400"

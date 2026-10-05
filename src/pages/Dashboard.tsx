@@ -38,6 +38,7 @@ import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
+import FileInfoModal from "../components/Modals/FileInfoModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
 import { PresentationLiveBar } from "../components/PresentationControls";
 import { getPresentationState, visibleCameras } from "../services/presentation";
@@ -105,6 +106,7 @@ import {
   IoSwapVerticalOutline,
   IoEyeOffOutline,
   IoEyeOutline,
+  IoInformationCircleOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -606,6 +608,10 @@ const Dashboard = () => {
     setIsCroppingClip(false);
   }, [selectedFile?.path]);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
+// File whose "Info" panel (FileInfoModal) is open, from the sidebar file menu.
+const [infoFile, setInfoFile] = useState<{path: string; name: string} | null>(null);
+// Same panel for a Trash row, which is addressed by its trashed name rather than a live path.
+const [infoTrashItem, setInfoTrashItem] = useState<TrashEntry | null>(null);
 const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
@@ -3183,6 +3189,14 @@ const setScreen = () => {
                             <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
                               <button
                                 type="button"
+                                title="Info"
+                                onClick={() => setInfoTrashItem(item)}
+                                className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                              >
+                                <IoInformationCircleOutline size={14} />
+                              </button>
+                              <button
+                                type="button"
                                 title="Restore"
                                 onClick={() => handleRestoreFromTrash(item)}
                                 className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
@@ -3598,6 +3612,18 @@ const setScreen = () => {
                                         </div>
                                       )}
 
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setInfoFile({ path: file.path, name: file.name });
+                                          setOpenMenu(null);
+                                        }}
+                                      >
+                                        <IoInformationCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">Info</span>
+                                      </button>
+
                                       <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
                                       <button
                                           className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
@@ -3624,6 +3650,22 @@ const setScreen = () => {
               </div>
             )}
           </div>
+
+          {infoTrashItem && (
+            <FileInfoModal
+              item={{ kind: "trash", id: infoTrashItem.trashed_name }}
+              fileName={infoTrashItem.name}
+              onClose={() => setInfoTrashItem(null)}
+            />
+          )}
+
+          {infoFile && (
+            <FileInfoModal
+              filePath={infoFile.path}
+              fileName={infoFile.name}
+              onClose={() => setInfoFile(null)}
+            />
+          )}
 
           {/* Conversion Dialog */}
           {conversionFile && (
@@ -3917,6 +3959,7 @@ const setScreen = () => {
               resolveFullUrl={resolveImageDisplayUrl}
               onOpenImage={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
+              onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
               renamingFile={renamingFile}
               renameValue={renameValue}
@@ -3941,6 +3984,7 @@ const setScreen = () => {
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
               onOpenVideo={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
+              onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
               renamingFile={renamingFile}
               renameValue={renameValue}
@@ -3965,6 +4009,7 @@ const setScreen = () => {
               resolveAssetUrl={resolvePreviewAssetUrl}
               onOpenPdf={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
+              onShowInfo={(file) => setInfoFile(file)}
               renamingFile={renamingFile}
               renameValue={renameValue}
               onRenameValueChange={setRenameValue}
@@ -3987,6 +4032,7 @@ const setScreen = () => {
               folderLabel={folderDisplayName(selectedFolder)}
               onOpenDocument={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
+              onShowInfo={(file) => setInfoFile(file)}
               renamingFile={renamingFile}
               renameValue={renameValue}
               onRenameValueChange={setRenameValue}

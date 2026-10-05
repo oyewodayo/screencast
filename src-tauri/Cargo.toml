@@ -73,6 +73,9 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 # 0.13 + rustls stack the updater already brings in, so no second HTTP/TLS implementation.
 sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls-no-provider"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+# Photo EXIF (camera, date taken, GPS location) for the file "Info" panel - commands/file_info.rs.
+# Pure Rust, reads JPEG/TIFF/PNG/WebP/HEIF; ffprobe exposes none of these tags for still images.
+kamadak-exif = "0.6.1"
 
 # Win32 bindings — only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the

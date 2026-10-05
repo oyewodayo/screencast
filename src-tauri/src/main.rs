@@ -11,6 +11,8 @@ use tauri::Manager;
 mod commands {
     pub mod audio_tracks;
     pub mod conversion;
+    pub mod embedded_scan;
+    pub mod file_info;
     pub mod native_playback;
     pub mod snip;
     pub mod recording;
@@ -402,6 +404,8 @@ fn main() {
             commands::conversion::export_trimmed_video,
             commands::conversion::extract_clip_audio,
             commands::audio_tracks::probe_audio_streams,
+            commands::file_info::get_file_info,
+            commands::file_info::get_library_item_info,
             commands::audio_tracks::get_separation_engine,
             commands::audio_tracks::separate_voice_music,
             commands::audio_tracks::download_separation_engine,

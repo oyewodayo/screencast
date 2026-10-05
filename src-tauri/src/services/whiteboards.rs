@@ -38,7 +38,7 @@ fn whiteboards_root() -> Result<PathBuf, String> {
 // but every command below is directly reachable, so this boundary is enforced here regardless of
 // caller - rejects anything that could escape whiteboards_root() via a path separator or a
 // "." / ".." segment.
-fn whiteboard_dir(id: &str) -> Result<PathBuf, String> {
+pub(crate) fn whiteboard_dir(id: &str) -> Result<PathBuf, String> {
     if id.is_empty() || id.contains(['/', '\\']) || id == "." || id == ".." {
         return Err("Invalid whiteboard id".to_string());
     }
