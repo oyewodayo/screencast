@@ -55,6 +55,8 @@ import {
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
 import UpdateBanner from "../components/custom/UpdateBanner";
+import TelemetryNotice from "../components/custom/TelemetryNotice";
+import type { RecordingStatus } from "../utils/recordingStatus";
 import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
 import type { Update } from "@tauri-apps/plugin-updater";
@@ -1448,6 +1450,22 @@ const setScreen = () => {
 				if (purgedCount > 0) console.log(`Purged ${purgedCount} expired trash item(s)`);
 			})
 			.catch((error) => console.error("Error purging expired trash:", error));
+	}, []);
+
+	// A recording can outlive this page: services/webview_recovery.rs reloads it if its renderer
+	// crashes. Picking the running recording back up keeps the Stop button (and timer) working -
+	// otherwise the page would offer Record, which the backend refuses while one is in progress.
+	useEffect(() => {
+		invoke<RecordingStatus>("get_recording_status")
+			.then(({ recording, clock }) => {
+				if (!recording || !clock) return;
+				setIsRecording(true);
+				setRecordingStartTime(clock.startedAt);
+				setIsPaused(clock.pauseStartedAt !== null);
+				setPauseStartedAt(clock.pauseStartedAt);
+				setPausedAccumulatedMs(clock.pausedAccumulatedMs);
+			})
+			.catch((error) => console.error("Error checking for a recording in progress:", error));
 	}, []);
 
 	// One update check per launch, delayed so it never competes with startup work (device probes,
@@ -4290,6 +4308,7 @@ const setScreen = () => {
         {pendingUpdate && (
           <UpdateBanner update={pendingUpdate} isRecording={isRecording} onDismiss={() => setPendingUpdate(null)} />
         )}
+        <TelemetryNotice />
       </div>
     </div>
   );

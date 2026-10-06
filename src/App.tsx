@@ -1,13 +1,19 @@
 
-import { useEffect } from "react";
-import RecordingOverlayWindow from "./components/RecordingOverlayWindow";
-import ScreenshotOverlayWindow from "./components/ScreenshotOverlayWindow";
-import AnnotationOverlayWindow from "./components/AnnotationOverlayWindow";
-import PresentationWindow from "./components/PresentationWindow";
-import SnipOverlay from "./components/SnipOverlay";
+import { lazy, Suspense, useEffect } from "react";
 import TooltipLayer from "./components/TooltipLayer";
-import Dashboard from "./pages/Dashboard";
 import ErrorBoundary from "./components/ErrorBoundary";
+
+// Every window (the main one and each overlay) loads this same page and picks its route, so a
+// route imported eagerly here is code every window downloads, parses and keeps in memory - the
+// recording pill was carrying the docs editor, PDF.js and three.js. Lazy routes give each window
+// only its own code. The overlays are created hidden at startup, so their chunks have long since
+// loaded by the time one is shown.
+const Dashboard = lazy(() => import("./pages/Dashboard"));
+const RecordingOverlayWindow = lazy(() => import("./components/RecordingOverlayWindow"));
+const ScreenshotOverlayWindow = lazy(() => import("./components/ScreenshotOverlayWindow"));
+const AnnotationOverlayWindow = lazy(() => import("./components/AnnotationOverlayWindow"));
+const PresentationWindow = lazy(() => import("./components/PresentationWindow"));
+const SnipOverlay = lazy(() => import("./components/SnipOverlay"));
 import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
 
 // WebView2 (like any Chromium-based browser) reloads the whole page on Ctrl+R/Cmd+R/F5 by
@@ -45,17 +51,19 @@ function App() {
     // which would leave the same crashed subtree to immediately re-render and crash again.
     <ErrorBoundary fallbackTitle="Briefcast ran into a problem" onReset={() => window.location.reload()}>
       <Router>
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
+        <Suspense fallback={null}>
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
 
-          <Route path="/recording-overlay" element={<RecordingOverlayWindow />} />
-          <Route path="/screenshot-overlay" element={<ScreenshotOverlayWindow />} />
-          <Route path="/annotation-overlay" element={<AnnotationOverlayWindow />} />
-          <Route path="/presentation" element={<PresentationWindow />} />
-          <Route path="/snip" element={<SnipOverlay />} />
-          {/* <Route path="/file-modal" element={<FileModal />} /> */}
-          {/* <Route path="/settings" element={} /> */}
-        </Routes>
+            <Route path="/recording-overlay" element={<RecordingOverlayWindow />} />
+            <Route path="/screenshot-overlay" element={<ScreenshotOverlayWindow />} />
+            <Route path="/annotation-overlay" element={<AnnotationOverlayWindow />} />
+            <Route path="/presentation" element={<PresentationWindow />} />
+            <Route path="/snip" element={<SnipOverlay />} />
+            {/* <Route path="/file-modal" element={<FileModal />} /> */}
+            {/* <Route path="/settings" element={} /> */}
+          </Routes>
+        </Suspense>
       </Router>
       <TooltipLayer />
     </ErrorBoundary>

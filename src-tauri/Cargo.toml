@@ -10,7 +10,9 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [ "protocol-asset", "devtools"] }
+# No "devtools" feature: debug builds get the inspector regardless, and in a release build it would
+# let anyone open a console with full access to every command below.
+tauri = { version = "2", features = [ "protocol-asset"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4.38"
@@ -107,6 +109,9 @@ libc = "0.2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"
+# One running copy at a time (main.rs) - a second launch focuses the first instead. Replaces a
+# fixed-localhost-port guard that any unrelated program holding that port could block entirely.
+tauri-plugin-single-instance = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

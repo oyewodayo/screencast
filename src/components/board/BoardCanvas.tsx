@@ -33,6 +33,7 @@ import {
   rotateHandlePoint,
 } from "../../handlers/boardHandlers";
 import { preloadBoardFonts } from "../../utils/boardFonts";
+import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 // All three below are CSS-pixel sizes, not canvas-buffer ones - the buffer stays at
 // doc.canvasWidth/canvasHeight regardless of zoom (see this file's own top comment), so a fixed
@@ -252,9 +253,10 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
     // trigger (see its own doc comment above), draw() never reads it directly.
   }, [doc, displayImages, imageBitmaps, selectedIds, zoom, marqueeRect, snapGuides, fontsReadyTick]);
 
+  const canvasRestoreTick = useCanvasRestoreTick();
   useEffect(() => {
     draw();
-  }, [draw]);
+  }, [draw, canvasRestoreTick]);
 
   // Converts a client-space (clientX/clientY) point into the board's own unpadded document space -
   // the same space item.x/y, hitTestBoardItem, applyMove/Resize/Rotate, and resizeHandlePoints all

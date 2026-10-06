@@ -279,16 +279,22 @@ pub fn briefcast_dir() -> Result<PathBuf, String> {
 // removes the now-empty old_root - used by both set_briefcast_dir and reset_briefcast_dir, the
 // only difference between them being what new_root resolves to. fs::rename is tried first for
 // each entry (an instant metadata-only op, even for a large video file) and only falls back to a
-// recursive copy+delete when rename fails - the normal reason being old_root/new_root sitting on
+// recursive copy when rename fails - the normal reason being old_root/new_root sitting on
 // different volumes/drives, which fs::rename can never succeed across no matter how it's retried.
 // This carries .trash (services/trash.rs) and any per-video .edits.json sidecar along for free,
 // with no special-casing needed - they move as part of whatever folder already contains them.
+//
+// All or nothing: a move to another drive can fail partway (the drive fills up, a file is locked),
+// and continuing from there would leave the library split across two folders with the setting
+// still naming the old one. So nothing is deleted from old_root until every entry is safely in
+// new_root; on a failure the renames are undone and the partial copies removed, leaving old_root
+// exactly as it was.
 fn relocate_briefcast_dir(old_root: &Path, new_root: &Path) -> Result<(), String> {
-    let entries = fs::read_dir(old_root)
-        .map_err(|e| format!("Failed to read {}: {}", old_root.display(), e))?;
-    for entry in entries {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(old_root)
+        .map_err(|e| format!("Failed to read {}: {}", old_root.display(), e))?
+    {
         let entry = entry.map_err(|e| format!("Failed to read {}: {}", old_root.display(), e))?;
-        let src = entry.path();
         let dest = new_root.join(entry.file_name());
         if dest.exists() {
             return Err(format!(
@@ -296,13 +302,42 @@ fn relocate_briefcast_dir(old_root: &Path, new_root: &Path) -> Result<(), String
                 entry.file_name().to_string_lossy()
             ));
         }
+        entries.push((entry.path(), dest));
+    }
+
+    // (src, dest, renamed) - renamed entries are already gone from old_root; copied ones are not.
+    let mut done: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    for (src, dest) in entries {
         if fs::rename(&src, &dest).is_ok() {
+            done.push((src, dest, true));
             continue;
         }
-        copy_then_remove(&src, &dest)?;
+        if let Err(e) = copy_tree(&src, &dest) {
+            let _ = remove_any(&dest);
+            for (src, dest, renamed) in done.into_iter().rev() {
+                if renamed {
+                    let _ = fs::rename(&dest, &src);
+                } else {
+                    let _ = remove_any(&dest);
+                }
+            }
+            return Err(format!("{} - nothing was moved, the library is still where it was", e));
+        }
+        done.push((src, dest, false));
     }
-    fs::remove_dir_all(old_root)
-        .map_err(|e| format!("Failed to remove the old Briefcast folder: {}", e))?;
+
+    // Everything is in new_root now, so failing to tidy up the old copies must not fail the move -
+    // the caller would then keep pointing at old_root, whose files may already be partly gone.
+    for (src, _, renamed) in &done {
+        if !renamed {
+            if let Err(e) = remove_any(src) {
+                log::warn!("Moved {} but couldn't remove the original: {}", src.display(), e);
+            }
+        }
+    }
+    if let Err(e) = fs::remove_dir_all(old_root) {
+        log::warn!("Couldn't remove the old Briefcast folder {}: {}", old_root.display(), e);
+    }
 
     // Every file/folder now genuinely lives under new_root, but nothing above touched the
     // *contents* of any sidecar JSON (video_edits.rs's .edits.json, trash.rs's manifest.json) -
@@ -432,7 +467,7 @@ pub fn repair_stale_file_references() -> Result<u32, String> {
     Ok(repair_stale_file_references_in(&root))
 }
 
-fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), String> {
+fn copy_tree(src: &Path, dest: &Path) -> Result<(), String> {
     if src.is_dir() {
         fs::create_dir_all(dest)
             .map_err(|e| format!("Failed to create \"{}\": {}", dest.display(), e))?;
@@ -440,12 +475,23 @@ fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), String> {
             fs::read_dir(src).map_err(|e| format!("Failed to read {}: {}", src.display(), e))?
         {
             let entry = entry.map_err(|e| format!("Failed to read {}: {}", src.display(), e))?;
-            copy_then_remove(&entry.path(), &dest.join(entry.file_name()))?;
+            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
         }
-        fs::remove_dir(src).map_err(|e| format!("Failed to remove \"{}\": {}", src.display(), e))
+        Ok(())
     } else {
-        fs::copy(src, dest).map_err(|e| format!("Failed to copy \"{}\": {}", src.display(), e))?;
-        fs::remove_file(src).map_err(|e| format!("Failed to remove \"{}\": {}", src.display(), e))
+        fs::copy(src, dest)
+            .map(|_| ())
+            .map_err(|e| format!("Failed to copy \"{}\": {}", src.display(), e))
+    }
+}
+
+fn remove_any(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else if path.exists() {
+        fs::remove_file(path)
+    } else {
+        Ok(())
     }
 }
 
@@ -1108,4 +1154,64 @@ pub fn clear_preview_cache(namespace: Option<String>) -> Result<(), String> {
         fs::remove_dir_all(&target).map_err(|e| format!("Failed to clear cache: {}", e))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod relocate_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("briefcast_relocate_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn moves_the_whole_library_and_removes_the_old_folder() {
+        let base = scratch("ok");
+        let old_root = base.join("old").join("Briefcast");
+        let new_root = base.join("new").join("Briefcast");
+        fs::create_dir_all(old_root.join("recordings")).unwrap();
+        fs::create_dir_all(&new_root).unwrap();
+        fs::write(old_root.join("recordings").join("a.mp4"), b"video").unwrap();
+        fs::write(old_root.join("notes.md"), b"text").unwrap();
+
+        relocate_briefcast_dir(&old_root, &new_root).unwrap();
+
+        assert_eq!(fs::read(new_root.join("recordings").join("a.mp4")).unwrap(), b"video");
+        assert_eq!(fs::read(new_root.join("notes.md")).unwrap(), b"text");
+        assert!(!old_root.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refuses_up_front_when_a_name_is_taken_and_moves_nothing() {
+        let base = scratch("clash");
+        let old_root = base.join("old").join("Briefcast");
+        let new_root = base.join("new").join("Briefcast");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&new_root).unwrap();
+        fs::write(old_root.join("a.mp4"), b"1").unwrap();
+        fs::write(old_root.join("b.mp4"), b"2").unwrap();
+        fs::write(new_root.join("b.mp4"), b"theirs").unwrap();
+
+        assert!(relocate_briefcast_dir(&old_root, &new_root).is_err());
+        assert!(old_root.join("a.mp4").exists(), "nothing may move when the move is refused");
+        assert!(!new_root.join("a.mp4").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_tree_copies_nested_folders_without_touching_the_source() {
+        let base = scratch("copy");
+        fs::create_dir_all(base.join("src").join("inner")).unwrap();
+        fs::write(base.join("src").join("inner").join("f.txt"), b"x").unwrap();
+        copy_tree(&base.join("src"), &base.join("dest")).unwrap();
+        assert!(base.join("dest").join("inner").join("f.txt").exists());
+        assert!(base.join("src").join("inner").join("f.txt").exists());
+        remove_any(&base.join("dest")).unwrap();
+        assert!(!base.join("dest").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
 }

@@ -80,7 +80,13 @@ const AnnotationOverlayWindow = () => {
 
     resize();
     window.addEventListener('resize', resize);
-    return () => window.removeEventListener('resize', resize);
+    // A context restored after a GPU reset comes back blank and without the DPR transform -
+    // resize() puts both back.
+    canvas.addEventListener('contextrestored', resize);
+    return () => {
+      window.removeEventListener('resize', resize);
+      canvas.removeEventListener('contextrestored', resize);
+    };
   }, []);
 
   // Draw-mode on/off comes from the main window (global hotkey) - Dashboard.tsx is the one that

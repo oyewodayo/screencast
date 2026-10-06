@@ -36,6 +36,10 @@ struct ConsentFile {
     enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     install_id: Option<String>,
+    // Whether the first-launch notice (Dashboard's TelemetryNotice) has been dismissed. Files
+    // written before the notice existed lack it, so those users see it once too.
+    #[serde(default)]
+    notice_seen: bool,
 }
 
 // 128 random bits as hex. std's RandomState keys are drawn from the OS random source, which is
@@ -58,12 +62,19 @@ fn consent_path(app_handle: &AppHandle) -> Option<PathBuf> {
     app_handle.path().app_config_dir().ok().map(|d| d.join("telemetry.json"))
 }
 
-// Opt-out: on unless the user has turned it off. A missing file is a fresh install.
+// Opt-out: on unless the user has turned it off. A missing file is a fresh install. A file that
+// exists but can't be read or parsed is treated as off - it may well be someone's opt-out, and
+// silently turning telemetry back on for them would be the one unacceptable way to get this wrong.
 fn read_consent(app_handle: &AppHandle) -> ConsentFile {
-    consent_path(app_handle)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    let fresh = ConsentFile { enabled: true, install_id: None, notice_seen: false };
+    let Some(path) = consent_path(app_handle) else { return fresh };
+    if !path.exists() {
+        return fresh;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
         .and_then(|s| serde_json::from_str::<ConsentFile>(&s).ok())
-        .unwrap_or(ConsentFile { enabled: true, install_id: None })
+        .unwrap_or(ConsentFile { enabled: false, install_id: None, notice_seen: true })
 }
 
 fn write_consent(app_handle: &AppHandle, consent: &ConsentFile) -> Result<(), String> {
@@ -100,18 +111,57 @@ fn home_dir() -> Option<String> {
     std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok().filter(|h| h.len() > 3)
 }
 
-// Replaces the home folder (in both slash styles, and JSON-escaped) with "~" across the whole
-// serialized event - messages, stack frame paths, breadcrumbs - rather than field by field, so a
-// path can't slip through some field this didn't think to check.
-fn scrub_paths(event: sentry::protocol::Event<'static>) -> sentry::protocol::Event<'static> {
-    let Some(home) = home_dir() else { return event };
-    let Ok(mut text) = serde_json::to_string(&event) else { return event };
-    let forward = home.replace('\\', "/");
-    let escaped = home.replace('\\', "\\\\");
-    for needle in [&escaped, &forward, &home] {
-        text = text.replace(needle.as_str(), "~");
+// Any absolute file path, in any of the shapes this app's errors carry them: a drive path in
+// either slash style, a UNC share, a Unix home, a "~"-relative path, and the asset-protocol URL
+// the webview loads local files through (whose path part is URL-encoded, so it needs its own
+// pattern). A path runs until a character no file name can contain - names can hold spaces, so
+// whitespace can't end it, and ": " after a path (the usual "<path>: <os error>") ends it at the
+// colon. Over-redacting a few trailing words is fine; leaking a file name is not.
+fn path_pattern() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(concat!(
+            r#"(?:https?://asset\.localhost|asset://localhost)/[^\s"'<>)]*"#,
+            // \b keeps the drive-letter branch from matching the "p:/" inside "http://".
+            r#"|(?:\b[A-Za-z]:|\\\\[^\\/\s"]+|~|/Users|/home)[\\/][^"\r\n:*?<>|]*"#,
+        ))
+        .expect("path pattern is valid")
+    })
+}
+
+// Stack frame location fields: in a release build these are the build machine's source paths
+// (where the code was compiled), not anything on the user's machine, and they're what makes a
+// crash report readable - so they keep their text, with only the home folder replaced in case a
+// local build is reporting.
+const FRAME_KEYS: [&str; 5] = ["abs_path", "filename", "module", "package", "function"];
+
+fn scrub_value(value: &mut Value, key: Option<&str>, home: Option<&str>) {
+    match value {
+        Value::String(s) => {
+            if key.is_some_and(|k| FRAME_KEYS.contains(&k)) {
+                if let Some(home) = home {
+                    *s = s.replace(home, "~").replace(&home.replace('\\', "/"), "~");
+                }
+            } else if path_pattern().is_match(s) {
+                *s = path_pattern().replace_all(s, "<path>").into_owned();
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| scrub_value(v, None, home)),
+        Value::Object(map) => map.iter_mut().for_each(|(k, v)| scrub_value(v, Some(k), home)),
+        _ => {}
     }
-    serde_json::from_str(&text).unwrap_or(event)
+}
+
+// Removes every file path and the machine's name from an event before it leaves the machine -
+// walking the whole serialized event (message, exception values, extras, breadcrumbs) rather
+// than field by field, so a path can't slip through some field this didn't think to check.
+fn scrub_event(mut event: sentry::protocol::Event<'static>) -> sentry::protocol::Event<'static> {
+    // sentry-contexts fills server_name with the computer's hostname, which is very often the
+    // owner's name ("JANE-SMITH-PC").
+    event.server_name = None;
+    let Ok(mut value) = serde_json::to_value(&event) else { return event };
+    scrub_value(&mut value, None, home_dir().as_deref());
+    serde_json::from_value(value).unwrap_or(event)
 }
 
 // Called once from main.rs's setup.
@@ -131,7 +181,7 @@ pub fn init(app_handle: &AppHandle) {
         options.send_default_pii = false;
         options.before_send = Some(std::sync::Arc::new(|event| {
             if ENABLED.load(Ordering::SeqCst) {
-                Some(scrub_paths(event))
+                Some(scrub_event(event))
             } else {
                 None
             }
@@ -188,14 +238,28 @@ pub struct TelemetrySettings {
     pub enabled: bool,
     // False in builds without any keys (dev, source builds) - Settings says nothing is collected.
     pub available: bool,
+    pub notice_seen: bool,
 }
 
 #[tauri::command(async)]
-pub fn get_telemetry_settings() -> TelemetrySettings {
+pub fn get_telemetry_settings(app_handle: AppHandle) -> TelemetrySettings {
+    let _serial = crate::services::responsiveness::serial();
     TelemetrySettings {
         enabled: ENABLED.load(Ordering::SeqCst),
         available: key_present(POSTHOG_KEY) || key_present(SENTRY_DSN),
+        notice_seen: read_consent(&app_handle).notice_seen,
     }
+}
+
+// The first-launch notice was dismissed (either button) - never show it again.
+#[tauri::command(async)]
+pub fn dismiss_telemetry_notice(app_handle: AppHandle) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
+    let mut consent = read_consent(&app_handle);
+    consent.notice_seen = true;
+    // Mirror the live switch rather than whatever the file held, so this can never flip it.
+    consent.enabled = ENABLED.load(Ordering::SeqCst);
+    write_consent(&app_handle, &consent)
 }
 
 #[tauri::command(async)]
@@ -237,4 +301,48 @@ pub fn report_frontend_error(message: String, stack: Option<String>) {
         },
         || sentry::capture_message(&message, sentry::Level::Error),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scrubbed(text: &str) -> String {
+        let mut value = Value::String(text.to_string());
+        scrub_value(&mut value, Some("message"), None);
+        value.as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn redacts_file_names_not_just_the_home_folder() {
+        assert_eq!(
+            scrubbed(r"Failed to rename C:\Users\Jane\Desktop\Briefcast\My Tax Return.pdf: Access is denied."),
+            "Failed to rename <path>: Access is denied."
+        );
+        assert_eq!(scrubbed("Input file does not exist: D:/Library/Briefcast/clip one.mp4"), "Input file does not exist: <path>");
+        assert_eq!(scrubbed(r"open \\nas\share\secret.docx failed"), "open <path>");
+        assert_eq!(scrubbed("GET http://asset.localhost/C%3A%5CUsers%5CJane%5Cx.png 404"), "GET <path> 404");
+        assert_eq!(scrubbed("no such file /home/jane/notes.md"), "no such file <path>");
+    }
+
+    #[test]
+    fn leaves_text_and_app_urls_alone() {
+        let text = "TypeError: x is undefined at http://tauri.localhost/assets/main-abc.js:12:34";
+        assert_eq!(scrubbed(text), text);
+    }
+
+    #[test]
+    fn keeps_stack_frame_locations_and_drops_the_hostname() {
+        let mut value = json!({
+            "message": r"C:\Users\Jane\secret.txt: denied",
+            "frames": [{ "abs_path": r"D:\a\screencast\src-tauri\src\main.rs", "lineno": 3 }],
+        });
+        scrub_value(&mut value, None, None);
+        assert_eq!(value["message"], "<path>: denied");
+        assert_eq!(value["frames"][0]["abs_path"], r"D:\a\screencast\src-tauri\src\main.rs");
+
+        let mut event = sentry::protocol::Event::default();
+        event.server_name = Some("JANE-SMITH-PC".into());
+        assert!(scrub_event(event).server_name.is_none());
+    }
 }

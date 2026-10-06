@@ -15,7 +15,8 @@
       "binaries/heif/*",
       "binaries/whisper/*.exe",
       "binaries/whisper/*.dll",
-      "binaries/rnnoise/*"
+      "binaries/rnnoise/*",
+      "licenses/*"
     ],
     "icon": [
       "icons/32x32.png",

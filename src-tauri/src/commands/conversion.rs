@@ -273,13 +273,25 @@ async fn run_conversion(
     // can take minutes, and child.wait() blocks synchronously.
     let result = tauri::async_runtime::spawn_blocking(move || child.wait())
         .await
-        .map_err(|e| format!("Conversion task panicked: {}", e))?
-        .map_err(|e| format!("Failed to wait for conversion: {}", e))?;
+        .map_err(|e| format!("Conversion task panicked: {}", e))
+        .and_then(|r| r.map_err(|e| format!("Failed to wait for conversion: {}", e)));
 
     {
         let mut active_process = state.active_process.lock().await;
         *active_process = None;
     }
+
+    // ffmpeg creates the output the moment it starts, so a failed or cancelled (taskkill) run
+    // would otherwise leave an empty or unplayable file in the library, which the sidebar then
+    // lists and the thumbnailer retries on every scan. unique_output_path above guarantees the
+    // file didn't exist before this run, so removing it never touches anything of the user's.
+    let result = match result {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = std::fs::remove_file(&output);
+            return Err(e);
+        }
+    };
 
     if result.success() {
         let _ = window.emit(
@@ -296,6 +308,7 @@ async fn run_conversion(
         Ok(output.to_string_lossy().to_string())
     } else {
         let stderr_output = stderr_thread.join().unwrap_or_default();
+        let _ = std::fs::remove_file(&output);
         let error_msg = format!(
             "Conversion failed: {}",
             crate::commands::recording::extract_ffmpeg_error(&stderr_output)
@@ -1017,8 +1030,17 @@ pub async fn get_video_thumbnail(
     // A file that already failed both extractions isn't retried until it changes (the cache path
     // is keyed by mtime, so a changed file gets a fresh key) - a broken file in a gallery used to
     // cost two ffmpeg runs every time the grid re-rendered, about once a second, indefinitely.
-    if failed_video_thumbnails().contains(&cache_path) {
+    // The marker file carries that across restarts too - otherwise every launch re-ran both
+    // extractions for every broken file in the library (over a thousand logged failures a day).
+    let failed_marker = cache_path.with_extension("failed");
+    if failed_video_thumbnails().contains(&cache_path) || failed_marker.exists() {
         return Err("Thumbnail extraction already failed for this version of the file".to_string());
+    }
+    // An empty file (a recording or export that never got going) can't hold a frame - no need to
+    // spend two ffmpeg runs finding that out.
+    if std::fs::metadata(&input).map(|m| m.len() == 0).unwrap_or(false) {
+        failed_video_thumbnails().insert(cache_path);
+        return Err("The file is empty".to_string());
     }
 
     if let Some(parent) = cache_path.parent() {
@@ -1036,6 +1058,7 @@ pub async fn get_video_thumbnail(
         {
             let combined = format!("{err}; retry at frame 0 also failed: {err2}");
             log::error!("Video thumbnail failed for {}: {combined}", input.display());
+            let _ = std::fs::write(&failed_marker, b"");
             failed_video_thumbnails().insert(cache_path);
             return Err(combined);
         }

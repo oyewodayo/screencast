@@ -101,6 +101,50 @@ pub struct AppState {
     // non-empty) as a sidecar JSON by stop_recording, same convention as click_capture's own
     // sidecar.
     view_switches: Arc<Mutex<Vec<ViewSwitchEvent>>>,
+    // The live timer's inputs for the recording in progress - see get_recording_status.
+    clock: Arc<std::sync::Mutex<Option<RecordingClock>>>,
+}
+
+// Wall-clock milliseconds, the same unit as the frontend's Date.now() its timer is built from.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingClock {
+    pub record_type: String,
+    pub started_at: i64,
+    pub pause_started_at: Option<i64>,
+    pub paused_accumulated_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStatus {
+    pub recording: bool,
+    pub clock: Option<RecordingClock>,
+}
+
+// Lets a page that lost its state - reloaded after its renderer crashed (services/
+// webview_recovery.rs), or opened while a recording runs - take control of the recording in
+// progress again. Without this the page shows "Record", pressing it fails with "already in
+// progress", and nothing on screen can stop the capture.
+#[tauri::command]
+pub async fn get_recording_status(state: State<'_, AppState>) -> Result<RecordingStatus, String> {
+    let recording = state.output_path.lock().await.is_some()
+        && state
+            .ffmpeg_process
+            .lock()
+            .await
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+    let clock = if recording {
+        state.clock.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    } else {
+        None
+    };
+    Ok(RecordingStatus { recording, clock })
 }
 
 // One user-initiated toggle between "Screen" and "Camera" as the primary view during a recording
@@ -1825,6 +1869,13 @@ pub async fn start_recording(
         parts.timer_zero_hns = Some(crate::services::audio_capture::now_hns());
     }
 
+    *state.clock.lock().unwrap_or_else(|p| p.into_inner()) = Some(RecordingClock {
+        record_type: form_data.record_type.clone(),
+        started_at: now_ms(),
+        pause_started_at: None,
+        paused_accumulated_ms: 0,
+    });
+
     Ok(output)
 }
 
@@ -2017,8 +2068,16 @@ fn retime_webcam(ffmpeg_path: &Path, segments: &assembly::Segments, camera: &ass
     hide_console_window(&mut cmd);
     match cmd.output() {
         Ok(out) if out.status.success() => {}
-        Ok(out) => warn!("Couldn't write the webcam layer: {}", extract_ffmpeg_error(&String::from_utf8_lossy(&out.stderr))),
-        Err(e) => warn!("Couldn't write the webcam layer: {}", e),
+        // A half-written sidecar has no moov atom and can't be opened - the editor would show a
+        // broken PiP layer and the thumbnailer would retry it forever. No file is better.
+        Ok(out) => {
+            let _ = fs::remove_file(&camera.final_path);
+            warn!("Couldn't write the webcam layer: {}", extract_ffmpeg_error(&String::from_utf8_lossy(&out.stderr)))
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&camera.final_path);
+            warn!("Couldn't write the webcam layer: {}", e)
+        }
     }
 }
 
@@ -2220,6 +2279,7 @@ pub async fn stop_recording(
         let mut app_state = state.output_path.lock().await;
         *app_state = None;
     }
+    *state.clock.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     info!("Recording stopped");
 
@@ -2416,6 +2476,9 @@ pub async fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
 
 
     *paused = true;
+    if let Some(clock) = state.clock.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        clock.pause_started_at = Some(now_ms());
+    }
     info!("Recording paused");
     Ok(())
 }
@@ -2441,6 +2504,11 @@ pub async fn resume_recording(state: State<'_, AppState>) -> Result<(), String> 
 
 
     *paused = false;
+    if let Some(clock) = state.clock.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        if let Some(since) = clock.pause_started_at.take() {
+            clock.paused_accumulated_ms += now_ms() - since;
+        }
+    }
     info!("Recording resumed");
     Ok(())
 }

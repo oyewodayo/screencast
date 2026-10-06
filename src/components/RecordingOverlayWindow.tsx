@@ -7,6 +7,7 @@ import { listen, emit } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { message } from '@tauri-apps/plugin-dialog';
 import { trackEvent } from "../utils/telemetry";
+import type { RecordingStatus } from "../utils/recordingStatus";
 const appWindow = getCurrentWebviewWindow()
 
 const RecordingOverlayWindow = () => {
@@ -93,6 +94,23 @@ const RecordingOverlayWindow = () => {
             await message(String(error), { title: 'Failed to resume recording', kind: 'error' });
         }
     };
+
+    // This window's page can be reloaded mid-recording (renderer crash recovery, see
+    // services/webview_recovery.rs) - take the timer and controls back from the backend rather
+    // than waiting for a 'recording-state-update' that already came and went.
+    useEffect(() => {
+        invoke<RecordingStatus>("get_recording_status")
+            .then(({ recording, clock }) => {
+                if (!recording || !clock) return;
+                setIsRecording(true);
+                setRecordType(clock.recordType);
+                setStartTime(clock.startedAt);
+                setIsPaused(clock.pauseStartedAt !== null);
+                setPauseStartedAt(clock.pauseStartedAt);
+                setPausedAccumulatedMs(clock.pausedAccumulatedMs);
+            })
+            .catch(() => {});
+    }, []);
 
     // Listen for recording updates from main window
     useEffect(() => {
