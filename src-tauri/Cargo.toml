@@ -1,6 +1,6 @@
 [package]
 name = "Briefcast"
-version = "0.1.0"
+version = "0.1.1"
 description = "A screen recording and streaming application for easy use."
 authors = ["Temidayo Oyewo"]
 license = "MIT"
