@@ -10,6 +10,8 @@
 import type { JSONContent } from "@tiptap/core";
 import {
   AlignmentType,
+  BookmarkEnd,
+  BookmarkStart,
   BorderStyle,
   CommentReference,
   CommentRangeEnd,
@@ -23,6 +25,7 @@ import {
   type ICommentOptions,
   ImageRun,
   ImportedXmlComponent,
+  InternalHyperlink,
   LevelFormat,
   Packer,
   PageBreak,
@@ -31,6 +34,7 @@ import {
   type PositiveUniversalMeasure,
   Table,
   TableCell,
+  TableOfContents,
   TableRow,
   Tab,
   TabStopType,
@@ -42,6 +46,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type { DocComment, DocMargins, DocPageSize } from "./docTypes";
 import { PAGE_DIMENSIONS_IN, resolveMargins } from "./docPageGeometry";
 import { latexToOmml } from "./docMathOmml";
+import { CAPTION_NAMES, type DocStructure } from "./docStructure";
+import { citationSpaceBefore, formatCitation, lastCharOf, styleInfo, type Segment } from "./docCitationStyles";
 
 const ALIGNMENT_BY_TEXT_ALIGN: Record<string, (typeof AlignmentType)[keyof typeof AlignmentType]> = {
   left: AlignmentType.LEFT,
@@ -180,8 +186,40 @@ function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
 // number, not a UUID) - passed in from DocxBuilder rather than looked up globally, since the
 // mapping (and which comments actually got referenced, for the final Comments list) is per-export
 // state, not something this standalone function should own itself.
-async function renderInline(content: JSONContent[] | undefined, commentIdFor: (uuid: string) => number, forceBold = false): Promise<ParagraphChild[]> {
+interface InlineContext {
+  commentIdFor: (uuid: string) => number;
+  structure: DocStructure | null;
+}
+
+// Bookmarks as explicit start/end markers with ids from one per-export counter. The library's own
+// Bookmark class numbers every bookmark 1 when it's built outside a Document's id context, and
+// duplicate ids are invalid OOXML - Word "repairs" such a file on open.
+class BookmarkIds {
+  private next = 1;
+  wrap(name: string, children: ParagraphChild[]): ParagraphChild[] {
+    const id = this.next++;
+    return [new BookmarkStart(name, id) as unknown as ParagraphChild, ...children, new BookmarkEnd(id) as unknown as ParagraphChild];
+  }
+}
+
+// Word bookmark names: start with a letter, letters/digits/underscore, at most 40 characters.
+function bookmarkName(id: string): string {
+  return `ref_${id.replace(/[^A-Za-z0-9]/g, "").slice(0, 32)}`;
+}
+
+// A formatted reference's segments (docCitationStyles.ts) as runs - italic journal, bold volume,
+// clickable DOI.
+function segmentRuns(segments: Segment[]): ParagraphChild[] {
+  return segments.map((seg) =>
+    seg.link
+      ? new ExternalHyperlink({ link: seg.link, children: [new TextRun({ text: seg.text, style: "Hyperlink", italics: seg.italic, bold: seg.bold })] })
+      : new TextRun({ text: seg.text, italics: seg.italic || undefined, bold: seg.bold || undefined })
+  );
+}
+
+async function renderInline(content: JSONContent[] | undefined, ctx: InlineContext, forceBold = false): Promise<ParagraphChild[]> {
   if (!content) return [];
+  const { commentIdFor, structure } = ctx;
   const runs: ParagraphChild[] = [];
   // A comment mark wraps a *range* of text, which can span several runs (e.g. commented text that's
   // also partly bold) - tracked here as "the comment range currently open", closed either when the
@@ -196,7 +234,7 @@ async function renderInline(content: JSONContent[] | undefined, commentIdFor: (u
     runs.push(new CommentReference(numericId));
     activeCommentId = null;
   };
-  for (const node of content) {
+  for (const [index, node] of content.entries()) {
     const commentId = (node.marks?.find((m) => m.type === "comment")?.attrs?.commentId as string | undefined) ?? null;
     if (commentId !== activeCommentId) {
       closeComment();
@@ -224,6 +262,18 @@ async function renderInline(content: JSONContent[] | undefined, commentIdFor: (u
       const src = (node.attrs?.src as string) ?? "";
       const image = await buildImageRun(src, node.attrs?.width, node.attrs?.height);
       if (image) runs.push(image);
+    } else if (node.type === "citation") {
+      const refIds = (node.attrs?.refIds as string[] | undefined) ?? [];
+      const cite = structure ? formatCitation(refIds, node.attrs?.locator as string | null, structure.lookup, structure.context) : null;
+      const space = citationSpaceBefore(lastCharOf(content[index - 1]), !!cite?.superscript);
+      if (space) runs.push(new TextRun({ text: space, ...runOptionsFromMarks(node.marks, forceBold) }));
+      runs.push(new TextRun({ text: cite?.text ?? "[?]", ...runOptionsFromMarks(node.marks, forceBold), superScript: cite?.superscript || undefined }));
+    } else if (node.type === "crossRef") {
+      const targetId = String(node.attrs?.targetId ?? "");
+      const target = structure?.targets.get(targetId);
+      const run = new TextRun({ text: target?.label ?? "??", ...runOptionsFromMarks(node.marks, forceBold) });
+      // A real internal link: Ctrl+click in Word jumps to the figure, table or equation.
+      runs.push(target ? new InternalHyperlink({ anchor: bookmarkName(targetId), children: [run] }) : run);
     } else if (node.type === "mathInline") {
       const latex = (node.attrs?.latex as string) ?? "";
       const omml = latex ? latexToOmml(latex, false) : null;
@@ -272,8 +322,17 @@ class DocxBuilder {
   private comments: DocComment[] = [];
   private commentNumericIds = new Map<string, number>();
   private nextCommentNumericId = 0;
-  // Display equations numbered so far - the same document-order count docMath.css's counter shows.
+  // Display equations numbered so far - the same document-order count docStructure.ts assigns.
   private equationNumber = 0;
+  private captionCounts = { figure: 0, table: 0 };
+  // Every heading gets a hidden _Toc bookmark (in document order) for the table of contents' links.
+  private headingIndex = 0;
+  private structure: DocStructure | null = null;
+  private headingPages: number[] = [];
+  private bookmarks = new BookmarkIds();
+  private get inline(): InlineContext {
+    return { commentIdFor: this.commentIdFor, structure: this.structure };
+  }
   // Width between the margins in twips, set by build() before rendering - where a numbered
   // equation's centre and right tab stops go.
   private textWidthTwips = 0;
@@ -313,7 +372,7 @@ class DocxBuilder {
         if (child.type === "paragraph") {
           out.push(
             new Paragraph({
-              children: await renderInline(child.content, this.commentIdFor),
+              children: await renderInline(child.content, this.inline),
               bullet: { level },
               alignment: alignmentFor(child),
             })
@@ -339,7 +398,7 @@ class DocxBuilder {
         if (child.type === "paragraph") {
           out.push(
             new Paragraph({
-              children: await renderInline(child.content, this.commentIdFor),
+              children: await renderInline(child.content, this.inline),
               numbering: { reference: ref, level },
               alignment: alignmentFor(child),
             })
@@ -411,7 +470,7 @@ class DocxBuilder {
       case "paragraph":
         return [
           new Paragraph({
-            children: await renderInline(node.content, this.commentIdFor, forceBold),
+            children: await renderInline(node.content, this.inline, forceBold),
             alignment: alignmentFor(node),
             indent: indentFor(node, indent),
             border,
@@ -419,9 +478,10 @@ class DocxBuilder {
         ];
       case "heading": {
         const level = (node.attrs?.level as number) ?? 1;
+        const headingRuns = await renderInline(node.content, this.inline, forceBold);
         return [
           new Paragraph({
-            children: await renderInline(node.content, this.commentIdFor, forceBold),
+            children: this.bookmarks.wrap(`_Toc_h${this.headingIndex++}`, headingRuns),
             heading: HEADING_BY_LEVEL[level],
             alignment: alignmentFor(node),
             indent: indentFor(node, indent),
@@ -482,10 +542,68 @@ class DocxBuilder {
               { type: TabStopType.CENTER, position: Math.round(this.textWidthTwips / 2) },
               { type: TabStopType.RIGHT, position: this.textWidthTwips },
             ],
-            children: [new TextRun({ children: [new Tab()] }), math, new TextRun({ children: [new Tab(), `(${number})`] })],
+            children: [
+              new TextRun({ children: [new Tab()] }),
+              math,
+              new TextRun({ children: [new Tab()] }),
+              // Cross-references to the equation link to its number.
+              ...(node.attrs?.id ? this.bookmarks.wrap(bookmarkName(String(node.attrs.id)), [new TextRun(`(${number})`)]) : [new TextRun(`(${number})`)]),
+            ],
             indent,
             border,
           }),
+        ];
+      }
+      // "Figure 2.  Caption text" - the label is bookmarked so cross-references link to it. Figure
+      // captions are centred under the image, table captions left-aligned above the table (and
+      // kept on the table's page).
+      case "caption": {
+        const kind = node.attrs?.kind === "table" ? "table" : "figure";
+        const label = `${CAPTION_NAMES[kind]} ${++this.captionCounts[kind]}.`;
+        const labelRun = new TextRun({ text: label, bold: true });
+        const id = node.attrs?.id as string | null | undefined;
+        return [
+          new Paragraph({
+            children: [...(id ? this.bookmarks.wrap(bookmarkName(id), [labelRun]) : [labelRun]), new TextRun("  "), ...(await renderInline(node.content, this.inline, forceBold))],
+            alignment: alignmentFor(node) ?? (kind === "table" ? AlignmentType.LEFT : AlignmentType.CENTER),
+            keepNext: kind === "table" || undefined,
+            spacing: { before: 60, after: 160 },
+            indent,
+            border,
+          }),
+        ];
+      }
+      // The reference list, formatted exactly as in Docs: a hanging label column for numbered
+      // styles, a 0.5in hanging indent for APA.
+      case "bibliography": {
+        const s = this.structure;
+        if (!s || s.bibliography.length === 0) return [];
+        const numeric = styleInfo(s.style).numeric;
+        const hang = numeric ? 567 : 720;
+        return s.bibliography.map(
+          (ref) =>
+            new Paragraph({
+              children: [...(ref.label ? [new TextRun(ref.label), new TextRun({ children: [new Tab()] })] : []), ...segmentRuns(ref.segments)],
+              indent: { left: hang, hanging: hang },
+              tabStops: numeric ? [{ type: TabStopType.LEFT, position: hang }] : undefined,
+              spacing: { after: 100 },
+            })
+        );
+      }
+      // A real Word table-of-contents field, pre-filled with the entries (and the page numbers Docs
+      // shows) so it reads correctly on open; F9 in Word refreshes it against Word's own layout.
+      case "tableOfContents": {
+        const s = this.structure;
+        const maxLevel = Number(node.attrs?.maxLevel ?? 3);
+        const entries = (s?.headings ?? [])
+          .map((h, i) => ({ h, i }))
+          .filter(({ h }) => h.text && h.level <= maxLevel)
+          .map(({ h, i }) => ({ title: h.text, level: h.level, page: this.headingPages[i], href: `_Toc_h${i}` }));
+        return [
+          new Paragraph({ children: [new TextRun({ text: "Contents", bold: true, size: 28 })], spacing: { after: 160 } }),
+          // beginDirty: false - the cached entries are current, so Word opens without asking to
+          // update fields.
+          new TableOfContents("Contents", { hyperlink: true, headingStyleRange: `1-${maxLevel}`, cachedEntries: entries, beginDirty: false }) as unknown as Paragraph,
         ];
       }
       // docx's own PageBreak is a Run (extends Run - see its own import), the standard idiom for
@@ -493,7 +611,7 @@ class DocxBuilder {
       case "pageBreak":
         return [new Paragraph({ children: [new PageBreak()] })];
       default:
-        return [new Paragraph({ children: await renderInline(node.content, this.commentIdFor, forceBold) })];
+        return [new Paragraph({ children: await renderInline(node.content, this.inline, forceBold) })];
     }
   }
 
@@ -505,6 +623,8 @@ class DocxBuilder {
 
   async build(json: JSONContent, title: string, options: DocxExportOptions = {}): Promise<Uint8Array> {
     this.comments = options.comments ?? [];
+    this.structure = options.structure ?? null;
+    this.headingPages = options.headingPages ?? [];
     // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
     // the doc's own margins, not docx's unrelated defaults.
     const dims = PAGE_DIMENSIONS_IN[options.pageSize ?? "letter"];
@@ -570,6 +690,10 @@ class DocxBuilder {
 
 export interface DocxExportOptions {
   comments?: DocComment[];
+  // Numbers, citations and the reference list (docStructure.ts's computeStructureFromJson).
+  structure?: DocStructure | null;
+  // Page of each heading in document order, as Docs paginates it - the table of contents' numbers.
+  headingPages?: number[];
   pageSize?: DocPageSize | null;
   headerText?: string | null;
   footerText?: string | null;

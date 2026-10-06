@@ -119,3 +119,13 @@
     height: 1in;
   }
 }
+
+/* Print breaks pages exactly where the live preview does: each page-gap widget (hidden in print,
+   but still in the DOM) marks the block that starts the next page. Without this the print engine
+   paginates on its own, line by line, and drifts from the preview - so the table of contents'
+   page numbers (DocTocView.tsx, read from these same gaps) would no longer match the PDF. */
+@media print {
+  .ProseMirror > .doc-page-gap + * {
+    break-before: page;
+  }
+}

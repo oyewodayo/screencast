@@ -124,6 +124,20 @@ interface PaginationResult {
   signature: string;
 }
 
+function keepsWithNext(block: import("@tiptap/pm/model").Node, next: import("@tiptap/pm/model").Node): boolean {
+  if (block.type.name === "heading") return true;
+  if (block.type.name === "caption" && block.attrs.kind === "table") return next.type.name === "table";
+  if (next.type.name === "caption" && next.attrs.kind === "figure") {
+    let hasImage = false;
+    block.descendants((n) => {
+      if (n.type.name === "image") hasImage = true;
+      return !hasImage;
+    });
+    return hasImage;
+  }
+  return false;
+}
+
 // One O(n) pass over top-level blocks, reading each one's already-rendered layout - no block is
 // measured more than once, and no mid-pass re-measurement is needed, since every decoration this
 // produces only adds vertical space *after* the point it's measuring (so earlier measurements in
@@ -152,6 +166,9 @@ function computeDecorations(view: EditorView, pageSize: DocPageSize, margins: Do
   // ruler relies on it.
   let lastBottom = 0;
   let pageStartPending = false;
+  // The block before the current one, for keep-with-next: where it starts, and where the page's
+  // content ended before it.
+  let prev: { node: import("@tiptap/pm/model").Node; offset: number; top: number; bottomBefore: number } | null = null;
 
   state.doc.forEach((node, offset) => {
     // view.nodeDOM (not raw DOM child indexing) - this extension's own previously-inserted gap
@@ -182,6 +199,7 @@ function computeDecorations(view: EditorView, pageSize: DocPageSize, margins: Do
       addGap(offset + node.nodeSize, 1, pageTop + contentHeight - bottom);
       pageTop = bottom;
       pageStartPending = true;
+      prev = null; // nothing keeps with a block across a manual break
       lastBottom = bottom;
       return;
     }
@@ -193,9 +211,18 @@ function computeDecorations(view: EditorView, pageSize: DocPageSize, margins: Do
     // `top > pageTop` guards the degenerate case of a block that's *already* at the top of the
     // current page but still overflows - moving it "to the next page" would just repeat forever.
     if (overflowsPage && !tallerThanWholePage && top > pageTop) {
-      addGap(offset, -1, pageTop + contentHeight - lastBottom);
-      pageTop = top;
+      // Keep-with-next, as in Word and LaTeX: a heading never ends a page alone, a table caption
+      // stays with its table, a figure with the caption under it - the pair moves together,
+      // unless the first of them already starts the page.
+      if (prev && prev.top > pageTop && keepsWithNext(prev.node, node)) {
+        addGap(prev.offset, -1, pageTop + contentHeight - prev.bottomBefore);
+        pageTop = prev.top;
+      } else {
+        addGap(offset, -1, pageTop + contentHeight - lastBottom);
+        pageTop = top;
+      }
     }
+    prev = { node, offset, top, bottomBefore: lastBottom };
     lastBottom = bottom;
   });
 

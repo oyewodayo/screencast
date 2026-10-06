@@ -1,11 +1,6 @@
-/* Equations (docMathExtension.ts / DocMathView.tsx). Display equations marked numbered count down
-   the document as (1), (2), ... via a CSS counter, so inserting or deleting one renumbers the rest
-   with no stored state - docDocx.ts and docMarkdown.ts walk the same order to export matching
-   numbers. */
-.ProseMirror {
-  counter-reset: doc-equation;
-}
-
+/* Equations (docMathExtension.ts / DocMathView.tsx). Display equations marked numbered show
+   (1), (2), ... from docStructure.ts, which numbers them in document order - so inserting or
+   deleting one renumbers the rest, cross-references follow, and the exporters agree. */
 .doc-math-block {
   position: relative;
   margin: 0;
@@ -19,16 +14,13 @@
 .doc-math-block .katex-display {
   margin: 0;
 }
-.doc-math-block[data-numbered="true"] {
-  counter-increment: doc-equation;
-}
-.doc-math-block[data-numbered="true"]::after {
-  content: "(" counter(doc-equation) ")";
+.doc-math-number {
   position: absolute;
   right: 0.25em;
   top: 50%;
   transform: translateY(-50%);
   font-size: 0.95em;
+  font-variant-numeric: tabular-nums;
 }
 
 .doc-math-inline {

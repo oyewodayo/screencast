@@ -6,6 +6,12 @@
 // tree directly is simpler and more predictable than round-tripping through HTML.
 import type { JSONContent } from "@tiptap/core";
 import type { DocComment } from "./docTypes";
+import { CAPTION_NAMES, type DocStructure } from "./docStructure";
+import { citationSpaceBefore, formatCitation, lastCharOf, styleInfo, type Segment } from "./docCitationStyles";
+
+// Numbers, citations and the reference list for the export in progress (set by
+// docJsonToMarkdown, read by the renderers below - they recurse without a shared context arg).
+let structure: DocStructure | null = null;
 
 function applyMarks(text: string, marks: JSONContent["marks"]): string {
   let result = text;
@@ -59,7 +65,7 @@ function renderInline(content: JSONContent[] | undefined, comments: DocComment[]
       activeCommentId = null;
     }
   };
-  for (const node of content) {
+  for (const [index, node] of content.entries()) {
     const commentId = (node.marks?.find((m) => m.type === "comment")?.attrs?.commentId as string | undefined) ?? null;
     if (commentId !== activeCommentId) {
       closeComment();
@@ -74,6 +80,16 @@ function renderInline(content: JSONContent[] | undefined, comments: DocComment[]
     // The `$...$` / `$$...$$` convention Pandoc, Obsidian, GitHub and most KaTeX/MathJax-enabled
     // Markdown renderers read.
     else if (node.type === "mathInline") result += `$${(node.attrs?.latex as string) ?? ""}$`;
+    else if (node.type === "citation") {
+      const cite = structure ? formatCitation((node.attrs?.refIds as string[]) ?? [], node.attrs?.locator as string | null, structure.lookup, structure.context) : null;
+      const text = cite?.text ?? "[?]";
+      result += citationSpaceBefore(lastCharOf(content[index - 1]), !!cite?.superscript);
+      // Markdown has no superscript; inline HTML is what renderers (and Pandoc) accept.
+      result += cite?.superscript ? `<sup>${text}</sup>` : text;
+    } else if (node.type === "crossRef") {
+      const target = structure?.targets.get(String(node.attrs?.targetId ?? ""));
+      result += target ? `[${target.label}](#${target.id})` : "??";
+    }
   }
   closeComment();
   return result;
@@ -124,6 +140,30 @@ function renderBlock(node: JSONContent, comments: DocComment[]): string {
     }
     case "image":
       return imageMarkdown(node);
+    // "**Figure 2.** Caption" - with an HTML anchor so cross-references can link to it.
+    case "caption": {
+      const label = captionLabels.get(node) ?? "";
+      const id = node.attrs?.id ? `<a id="${node.attrs.id as string}"></a>` : "";
+      return `${id}**${label}** ${renderInline(node.content, comments)}`.trim();
+    }
+    case "bibliography": {
+      if (!structure || structure.bibliography.length === 0) return "";
+      const numeric = styleInfo(structure.style).numeric;
+      return structure.bibliography
+        .map((ref, i) => {
+          const body = segmentsMarkdown(ref.segments);
+          // Numbered styles as an ordered list; APA as separate paragraphs (hanging indent has no
+          // Markdown form).
+          return numeric ? `${i + 1}. ${body}` : body;
+        })
+        .join(numeric ? "\n" : "\n\n");
+    }
+    case "tableOfContents": {
+      const maxLevel = Number(node.attrs?.maxLevel ?? 3);
+      const headings = (structure?.headings ?? []).filter((h) => h.text && h.level <= maxLevel);
+      const min = headings.reduce((m, h) => Math.min(m, h.level), 6);
+      return ["**Contents**", "", ...headings.map((h) => `${"  ".repeat(h.level - min)}- [${h.text}](#${slugify(h.text)})`)].join("\n");
+    }
     // 	ag{n} keeps the number the equation has in Docs - KaTeX and MathJax both honour it.
     case "mathBlock": {
       const latex = ((node.attrs?.latex as string) ?? "").trim();
@@ -163,20 +203,48 @@ function renderBlock(node: JSONContent, comments: DocComment[]): string {
 // Display equations' numbers, in document order - assigned up front because renderBlock recurses
 // through lists, quotes and tables without a shared counter.
 let equationNumbers = new WeakMap<JSONContent, number>();
+let captionLabels = new WeakMap<JSONContent, string>();
 
-function numberEquations(node: JSONContent, next: { n: number }): void {
+function numberEquations(node: JSONContent, next: { n: number; figure: number; table: number }): void {
   if (node.type === "mathBlock" && node.attrs?.numbered !== false && ((node.attrs?.latex as string) ?? "").trim()) {
     equationNumbers.set(node, ++next.n);
   }
+  if (node.type === "caption") {
+    const kind = node.attrs?.kind === "table" ? "table" : "figure";
+    captionLabels.set(node, `${CAPTION_NAMES[kind]} ${++next[kind]}.`);
+  }
   for (const child of node.content ?? []) numberEquations(child, next);
+}
+
+// GitHub's heading-anchor rule, which most renderers share.
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^\p{L}\p{N}\s-]/gu, "")
+    .replace(/\s/g, "-");
+}
+
+function segmentsMarkdown(segments: Segment[]): string {
+  return segments
+    .map((seg) => {
+      let t = seg.text;
+      if (seg.bold) t = `**${t}**`;
+      if (seg.italic) t = `*${t}*`;
+      if (seg.link) t = seg.link === seg.text ? `<${seg.link}>` : `[${t}](${seg.link})`;
+      return t;
+    })
+    .join("");
 }
 
 function renderBlocks(nodes: JSONContent[], comments: DocComment[]): string {
   return nodes.map((node) => renderBlock(node, comments)).join("\n\n");
 }
 
-export function docJsonToMarkdown(json: JSONContent, comments: DocComment[] = []): string {
+export function docJsonToMarkdown(json: JSONContent, comments: DocComment[] = [], docStructure: DocStructure | null = null): string {
   equationNumbers = new WeakMap();
-  numberEquations(json, { n: 0 });
+  captionLabels = new WeakMap();
+  structure = docStructure;
+  numberEquations(json, { n: 0, figure: 0, table: 0 });
   return renderBlocks(json.content ?? [], comments);
 }

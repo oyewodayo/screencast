@@ -22,6 +22,7 @@ mod commands {
 mod services {
     pub mod asset_download;
     pub mod boards;
+    pub mod citations;
     pub mod docs;
     pub mod docs_search;
     pub mod file_watcher;
@@ -539,6 +540,7 @@ fn main() {
             services::docs::reopen_doc_comment,
             services::docs::delete_doc_comment,
             services::docs::set_doc_page_setup,
+            services::citations::lookup_doi,
             services::docs_search::index_doc_content,
             services::docs_search::remove_doc_from_index,
             services::docs_search::list_indexed_doc_ids,

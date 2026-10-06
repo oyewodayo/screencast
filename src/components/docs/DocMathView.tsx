@@ -13,6 +13,7 @@ import { NodeSelection } from "@tiptap/pm/state";
 import katex from "katex";
 import "katex/dist/katex.min.css";
 import "./docMath.css";
+import { openLink } from "./DocReferenceText";
 
 // Dispatched on a math node's DOM to open its source editor - how the keyboard (Enter on a
 // selected equation) and docMathExtension.ts's insert commands reach this NodeView's React state.
@@ -41,7 +42,16 @@ export function renderLatex(latex: string, displayMode: boolean): Rendered {
 
 const POPOVER_WIDTH = 420;
 
-const DocMathView: React.FC<NodeViewProps> = ({ node, editor, getPos, selected, updateAttributes, deleteNode }) => {
+// The equation's number, delivered by docStructure.ts as a node decoration.
+function equationNumber(decorations: NodeViewProps["decorations"]): number | null {
+  for (const d of decorations) {
+    const n = (d.spec as { eqNumber?: number | null }).eqNumber;
+    if (typeof n === "number") return n;
+  }
+  return null;
+}
+
+const DocMathView: React.FC<NodeViewProps> = ({ node, editor, getPos, selected, decorations, updateAttributes, deleteNode }) => {
   const isBlock = node.type.name === "mathBlock";
   const latex = (node.attrs.latex as string) ?? "";
   const numbered = isBlock && node.attrs.numbered !== false;
@@ -195,14 +205,9 @@ const DocMathView: React.FC<NodeViewProps> = ({ node, editor, getPos, selected, 
       >
         <div className="flex items-center justify-between mb-1.5">
           <span className="text-xs font-medium text-neutral-500 dark:text-neutral-400">{isBlock ? "Display equation" : "Inline equation"} · LaTeX</span>
-          <a
-            href="https://katex.org/docs/supported.html"
-            target="_blank"
-            rel="noreferrer"
-            className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
-          >
+          <button type="button" onClick={() => openLink("https://katex.org/docs/supported.html")} className="text-xs text-blue-600 dark:text-blue-400 hover:underline">
             Supported commands
-          </a>
+          </button>
         </div>
         <textarea
           ref={textareaRef}
@@ -253,6 +258,7 @@ const DocMathView: React.FC<NodeViewProps> = ({ node, editor, getPos, selected, 
         contentEditable={false}
       >
         {body}
+        {numbered && equationNumber(decorations) !== null && <span className="doc-math-number">({equationNumber(decorations)})</span>}
         {popover}
       </NodeViewWrapper>
     );

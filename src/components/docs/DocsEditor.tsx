@@ -4,7 +4,8 @@
 // useDocsEditStore instance and the Tiptap editor bound to its Y.Doc via @tiptap/extension-
 // collaboration. Layout follows Google Docs: a title row carrying the doc-level actions (find,
 // comments, history, page setup, export), one formatting bar (DocToolbar.tsx), and the page.
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { Extension } from "@tiptap/core";
@@ -14,9 +15,11 @@ import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
 import { IoArrowBack, IoChatbubbleOutline, IoClose, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
 import { MdArrowDropDown, MdDescription, MdFileDownload, MdInsertLink, MdPrint } from "react-icons/md";
+import { TbBooks, TbListTree } from "react-icons/tb";
 import { BsFiletypeDocx, BsFiletypeHtml, BsFiletypeMd, BsFiletypePdf, BsFiletypeTxt } from "react-icons/bs";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
 import useDocDictation from "../../hooks/useDocDictation";
+import useBibliography from "../../hooks/useBibliography";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
 import { buildDocxBytes } from "../../utils/docDocx";
 import { LibraryFileEntry } from "../../utils/docTypes";
@@ -26,7 +29,15 @@ import DocFindReplace from "../../utils/docFindReplace";
 import DocDictation from "../../utils/docDictationExtension";
 import DocPaint from "../../utils/docPaintExtension";
 import { getDocContentExtensions, docProseClassName } from "../../utils/docSchemaExtensions";
+import { CAPTION_NAMES, computeStructureFromJson, createDocStructureExtension, getDocStructure, type DocStructure } from "../../utils/docStructure";
+import { citationSpaceBefore, formatCitation, styleInfo, segmentsToText } from "../../utils/docCitationStyles";
+import { pageAtPos } from "./DocTocView";
+import { CITATION_EDIT_EVENT, CROSSREF_EDIT_EVENT, OPEN_PICKER_EVENT, type InlineEditDetail, type OpenPickerDetail } from "../../utils/docStructureNodes";
 import DocVersionHistoryPanel from "./DocVersionHistoryPanel";
+import DocReferencesSidebar from "./DocReferencesSidebar";
+import DocOutlinePanel from "./DocOutlinePanel";
+import DocCitePicker, { type CitePickerMode } from "./DocCitePicker";
+import DocCrossRefPicker, { type CrossRefPickerMode } from "./DocCrossRefPicker";
 import DocFindReplaceBar from "./DocFindReplaceBar";
 import DocCommentsSidebar from "./DocCommentsSidebar";
 import DocPageSetupPopover from "./DocPageSetupPopover";
@@ -41,6 +52,7 @@ import "./docPageLayout.css";
 import "./docLinks.css";
 import "./docDictation.css";
 import "./docPaint.css";
+import "./docStructure.css";
 import "../board/boardFonts.css";
 
 interface DocsEditorProps {
@@ -93,7 +105,15 @@ function escapeHtml(text: string): string {
 // A self-contained .html: images are inlined as data: URLs (their src is an asset:// URL into the
 // doc's own folder, which means nothing outside this app) and a small stylesheet stands in for the
 // editor's Tailwind prose styles.
-async function buildStandaloneHtml(title: string, bodyHtml: string): Promise<string> {
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^\p{L}\p{N}\s-]/gu, "")
+    .replace(/\s/g, "-");
+}
+
+async function buildStandaloneHtml(title: string, bodyHtml: string, structure: DocStructure | null): Promise<string> {
   const dom = new DOMParser().parseFromString(`<body>${bodyHtml}</body>`, "text/html");
   await Promise.all(
     Array.from(dom.querySelectorAll("img")).map(async (img) => {
@@ -113,6 +133,95 @@ async function buildStandaloneHtml(title: string, bodyHtml: string): Promise<str
       }
     })
   );
+  // Captions get their "Figure 2." label and an anchor; cross-references become links to it;
+  // citations get their formatted text.
+  const captionCounts = { figure: 0, table: 0 };
+  dom.querySelectorAll<HTMLElement>("[data-caption]").forEach((el) => {
+    const kind = el.getAttribute("data-caption") === "table" ? "table" : "figure";
+    const label = dom.createElement("strong");
+    label.textContent = `${CAPTION_NAMES[kind]} ${++captionCounts[kind]}.`;
+    el.prepend(label, "\u00a0 ");
+    const id = el.getAttribute("data-caption-id");
+    if (id) el.id = id;
+  });
+  dom.querySelectorAll<HTMLElement>("[data-math-block][data-id]").forEach((el) => {
+    el.id = el.getAttribute("data-id") ?? "";
+  });
+  dom.querySelectorAll<HTMLElement>("[data-xref]").forEach((el) => {
+    const id = el.getAttribute("data-xref") ?? "";
+    const target = structure?.targets.get(id);
+    if (!target) {
+      el.textContent = "??";
+      return;
+    }
+    const a = dom.createElement("a");
+    a.href = `#${id}`;
+    a.textContent = target.label;
+    el.replaceChildren(a);
+  });
+  dom.querySelectorAll<HTMLElement>("[data-cite]").forEach((el) => {
+    const refIds = (el.getAttribute("data-cite") ?? "").split(",").filter(Boolean);
+    const cite = structure ? formatCitation(refIds, el.getAttribute("data-locator"), structure.lookup, structure.context) : null;
+    el.textContent = "";
+    const previous = el.previousSibling?.textContent ?? "";
+    const space = citationSpaceBefore(el.previousSibling ? previous.slice(-1) || "x" : "", !!cite?.superscript);
+    if (cite?.superscript) el.appendChild(dom.createElement("sup")).textContent = cite.text;
+    else el.textContent = space + (cite?.text ?? "[?]");
+  });
+  // Headings get ids (GitHub's slug rule, made unique) for the table of contents' links.
+  const usedIds = new Set<string>();
+  const headingEls = Array.from(dom.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6"));
+  headingEls.forEach((h) => {
+    const base = slugify(h.textContent ?? "") || "section";
+    let id = base;
+    for (let n = 2; usedIds.has(id); n++) id = `${base}-${n}`;
+    usedIds.add(id);
+    h.id = id;
+  });
+  dom.querySelectorAll<HTMLElement>("[data-toc]").forEach((el) => {
+    const maxLevel = Number(el.getAttribute("data-max-level")) || 3;
+    const entries = headingEls.filter((h) => Number(h.tagName[1]) <= maxLevel && h.textContent?.trim());
+    const min = entries.reduce((m, h) => Math.min(m, Number(h.tagName[1])), 6);
+    const nav = dom.createElement("nav");
+    nav.className = "toc";
+    nav.appendChild(dom.createElement("p")).textContent = "Contents";
+    const list = nav.appendChild(dom.createElement("ol"));
+    for (const h of entries) {
+      const li = list.appendChild(dom.createElement("li"));
+      li.style.paddingLeft = `${(Number(h.tagName[1]) - min) * 1.5}em`;
+      const a = li.appendChild(dom.createElement("a"));
+      a.href = `#${h.id}`;
+      a.textContent = h.textContent ?? "";
+    }
+    el.replaceWith(nav);
+  });
+  dom.querySelectorAll<HTMLElement>("[data-bibliography]").forEach((el) => {
+    const refs = structure?.bibliography ?? [];
+    const list = dom.createElement("ol");
+    list.className = structure && styleInfo(structure.style).numeric ? "references" : "references apa";
+    for (const ref of refs) {
+      const li = list.appendChild(dom.createElement("li"));
+      if (ref.label) li.appendChild(dom.createElement("span")).textContent = ref.label;
+      const body = li.appendChild(dom.createElement("div"));
+      for (const seg of ref.segments) {
+        let node: Node = dom.createTextNode(seg.text);
+        if (seg.bold) node = Object.assign(dom.createElement("b"), { textContent: seg.text });
+        if (seg.italic) {
+          const i = dom.createElement("i");
+          i.appendChild(node);
+          node = i;
+        }
+        if (seg.link) {
+          const a = dom.createElement("a");
+          a.href = seg.link;
+          a.appendChild(node);
+          node = a;
+        }
+        body.appendChild(node);
+      }
+    }
+    el.replaceWith(list);
+  });
   // Equations as native MathML (every current browser renders it, no fonts or stylesheet to
   // bundle); the LaTeX source stays in data-latex. Numbered display equations get their (n).
   let equationNumber = 0;
@@ -138,6 +247,10 @@ async function buildStandaloneHtml(title: string, bodyHtml: string): Promise<str
     "table{border-collapse:collapse;width:100%;margin:1em 0}th,td{border:1px solid #d0d0d0;padding:6px 10px;vertical-align:top;text-align:left}th{background:#f3f3f3}",
     "blockquote{margin:1em 0;padding:.2em 1em;border-left:3px solid #d0d0d0;color:#555}",
     "pre{background:#f6f8fa;padding:12px 14px;border-radius:6px;overflow:auto}code{font-family:Consolas,'Courier New',monospace;font-size:.92em}",
+    "[data-caption]{font-size:.92em;text-align:center;margin:.4em 0 1.2em}[data-caption=table]{text-align:left;margin:1.2em 0 .4em}",
+    ".toc p{font-weight:600;font-size:1.1em;margin-bottom:.4em}.toc ol,.references{list-style:none;padding:0}.toc li{margin:.15em 0}",
+    ".references li{display:grid;grid-template-columns:2.4em 1fr;gap:.35em;margin:.45em 0;font-size:.95em}.references li>span{text-align:right}",
+    ".references.apa li{display:block;padding-left:.5in;text-indent:-.5in}.references a{color:inherit;text-decoration:none}",
     "[data-math-block]{position:relative;text-align:center;margin:1em 0;padding:0 3.5em}[data-math-block] math{display:block}.eq-number{position:absolute;right:0;top:50%;transform:translateY(-50%)}",
     "a{color:#1a56db}[data-page-break]{break-after:page}hr{border:0;border-top:1px solid #d0d0d0;margin:1.5em 0}",
   ].join("");
@@ -145,6 +258,70 @@ async function buildStandaloneHtml(title: string, bodyHtml: string): Promise<str
 }
 
 const RULER_STORAGE_KEY = "briefcast.docs.showRuler";
+const OUTLINE_STORAGE_KEY = "briefcast.docs.showOutline";
+
+function readOutlineVisible(): boolean {
+  try {
+    return localStorage.getItem(OUTLINE_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+// The citation / cross-reference picker floating over the page: opened from the toolbar, the
+// slash menu, or by clicking an existing citation or reference (then in edit mode).
+type FloatingPicker =
+  | { kind: "cite"; mode: CitePickerMode; anchor: DOMRect }
+  | { kind: "xref"; mode: CrossRefPickerMode; anchor: DOMRect };
+
+const FloatingPanel: React.FC<{ anchor: DOMRect; onClose: () => void; children: React.ReactNode }> = ({ anchor, onClose, children }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  // Below the anchor, flipped above it near the bottom of the window; re-placed as the panel grows
+  // (a pasted BibTeX entry, a lookup message) so it never runs off screen.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const place = () => {
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      const left = Math.min(Math.max(8, anchor.left), window.innerWidth - w - 8);
+      const below = anchor.bottom + 6;
+      const preferred = below + h > window.innerHeight - 8 ? anchor.top - h - 6 : below;
+      // Always fully on screen, even when the anchor itself has scrolled out of view.
+      const top = Math.min(Math.max(8, preferred), Math.max(8, window.innerHeight - h - 8));
+      setPos((cur) => (cur && cur.left === left && cur.top === top ? cur : { left, top }));
+    };
+    place();
+    const ro = new ResizeObserver(place);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [anchor]);
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      if (!ref.current?.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+  }, [onClose]);
+  return createPortal(
+    <div
+      ref={ref}
+      style={{ left: pos?.left ?? -9999, top: pos?.top ?? -9999 }}
+      className="fixed z-[60] bg-white dark:bg-neutral-800 rounded-xl border border-neutral-200/70 dark:border-neutral-700 shadow-[0_4px_16px_rgba(60,64,67,0.18),0_1px_3px_rgba(60,64,67,0.25)] print:hidden"
+    >
+      {children}
+    </div>,
+    document.body
+  );
+};
 // Height of the sticky ruler bar: the ruler plus its pt-1.5 / pb-2 padding.
 const RULER_BAR_PX = RULER_SIZE + 6 + 8;
 
@@ -172,6 +349,29 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const [showVersionHistory, setShowVersionHistory] = useState(false);
   const [showFindReplace, setShowFindReplace] = useState(false);
   const [showComments, setShowComments] = useState(false);
+  const [showReferences, setShowReferences] = useState(false);
+  const [showOutline, setShowOutline] = useState(readOutlineVisible);
+  const [picker, setPicker] = useState<FloatingPicker | null>(null);
+  const bib = useBibliography(store.ydoc);
+  const toggleOutline = useCallback(() => {
+    setShowOutline((v) => {
+      try {
+        localStorage.setItem(OUTLINE_STORAGE_KEY, v ? "0" : "1");
+      } catch {
+        // per-viewer convenience only
+      }
+      return !v;
+    });
+  }, []);
+  // Comments and References share the right-hand slot.
+  const toggleComments = useCallback(() => {
+    setShowReferences(false);
+    setShowComments((v) => !v);
+  }, []);
+  const toggleReferences = useCallback(() => {
+    setShowComments(false);
+    setShowReferences((v) => !v);
+  }, []);
 
   const menuProps = (id: "export" | "pageSetup" | "linkFile") => ({
     open: headerMenu === id,
@@ -191,6 +391,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
         createDocImagePasteExtension(docId),
         createSlashCommandExtension(docId),
+        // Numbers figures, tables, equations and citations; formats the reference list.
+        createDocStructureExtension(bib.store),
         DocFindReplace,
         DocAutoPaginate,
         DocDictation,
@@ -228,6 +430,46 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   );
 
   const dictation = useDocDictation(editor && !store.loading ? editor : null, store.title);
+
+  const closePicker = useCallback(() => setPicker(null), []);
+  const openPicker = useCallback((kind: "cite" | "xref", anchor: DOMRect) => {
+    // A toolbar button collapsed into the More menu has no box; anchor at the cursor instead.
+    if (editor && anchor.width === 0 && anchor.height === 0) {
+      const c = editor.view.coordsAtPos(editor.state.selection.from);
+      anchor = new DOMRect(c.left, c.top, 1, c.bottom - c.top);
+    }
+    setPicker(kind === "cite" ? { kind, mode: { kind: "insert" }, anchor } : { kind, mode: { kind: "insert" }, anchor });
+  }, [editor]);
+  // Clicking a citation or cross-reference in the text opens its editor; the slash menu opens the
+  // insert pickers at the cursor. All arrive as DOM events from docStructureNodes.ts.
+  useEffect(() => {
+    if (!editor) return;
+    const dom = editor.view.dom;
+    const onCite = (e: Event) => {
+      const { pos, rect } = (e as CustomEvent<InlineEditDetail>).detail;
+      const node = editor.state.doc.nodeAt(pos);
+      if (node?.type.name !== "citation") return;
+      setPicker({ kind: "cite", mode: { kind: "edit", pos, refIds: [...(node.attrs.refIds as string[])], locator: (node.attrs.locator as string | null) ?? null }, anchor: rect });
+    };
+    const onXref = (e: Event) => {
+      const { pos, rect } = (e as CustomEvent<InlineEditDetail>).detail;
+      const node = editor.state.doc.nodeAt(pos);
+      if (node?.type.name !== "crossRef") return;
+      setPicker({ kind: "xref", mode: { kind: "edit", pos, targetId: (node.attrs.targetId as string | null) ?? null }, anchor: rect });
+    };
+    const onOpen = (e: Event) => {
+      const { kind, rect } = (e as CustomEvent<OpenPickerDetail>).detail;
+      openPicker(kind, rect);
+    };
+    dom.addEventListener(CITATION_EDIT_EVENT, onCite);
+    dom.addEventListener(CROSSREF_EDIT_EVENT, onXref);
+    dom.addEventListener(OPEN_PICKER_EVENT, onOpen);
+    return () => {
+      dom.removeEventListener(CITATION_EDIT_EVENT, onCite);
+      dom.removeEventListener(CROSSREF_EDIT_EVENT, onXref);
+      dom.removeEventListener(OPEN_PICKER_EVENT, onOpen);
+    };
+  }, [editor, openPicker]);
 
   const pageSize = store.pageSize ?? "letter";
   const margins = resolveMargins(store.margins);
@@ -359,7 +601,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         if (kind === "pdf") {
           saved = await invoke<string>("export_doc_pdf", { docTitle: store.title, pageSize: store.pageSize, outputPath });
         } else if (kind === "docx") {
-          const bytes = await buildDocxBytes(editor.getJSON(), store.title, {
+          const json = editor.getJSON();
+          const live = getDocStructure(editor.state);
+          const bytes = await buildDocxBytes(json, store.title, {
+            structure: computeStructureFromJson(json, bib.store),
+            headingPages: (live?.headings ?? []).map((h) => pageAtPos(editor.view, h.pos)),
             comments: store.comments,
             pageSize: store.pageSize,
             headerText: store.headerText,
@@ -368,12 +614,28 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           });
           saved = await invoke<string>("export_doc_binary", { docTitle: store.title, extension: "docx", bytes: Array.from(bytes), outputPath });
         } else {
+          const json = editor.getJSON();
+          const structure = computeStructureFromJson(json, bib.store);
           const content =
             kind === "md"
-              ? docJsonToMarkdown(editor.getJSON(), store.comments)
+              ? docJsonToMarkdown(json, store.comments, structure)
               : kind === "html"
-                ? await buildStandaloneHtml(store.title, editor.getHTML())
-                : editor.getText({ blockSeparator: "\n\n" });
+                ? await buildStandaloneHtml(store.title, editor.getHTML(), structure)
+                : editor.getText({
+                    blockSeparator: "\n\n",
+                    // Generated blocks have no text of their own; write out what they show.
+                    textSerializers: {
+                      caption: ({ node }) => {
+                        const kindName = node.attrs.kind === "table" ? "table" : "figure";
+                        const n = structure.targets.get(String(node.attrs.id ?? ""))?.number;
+                        return `${CAPTION_NAMES[kindName]}${n ? ` ${n}` : ""}. ${node.textContent}`;
+                      },
+                      bibliography: () =>
+                        structure.bibliography.map((ref) => `${ref.label ? `${ref.label} ` : ""}${segmentsToText(ref.segments)}`).join("\n"),
+                      tableOfContents: ({ node }) =>
+                        ["Contents", ...structure.headings.filter((h) => h.text && h.level <= Number(node.attrs.maxLevel ?? 3)).map((h) => `${"  ".repeat(h.level - 1)}${h.text}`)].join("\n"),
+                    },
+                  });
           saved = await invoke<string>("export_doc", { docTitle: store.title, extension: kind, content, outputPath });
         }
         showNotice({ text: `Saved ${saved.split(/[\\/]/).pop()}`, path: saved }, 10000);
@@ -382,7 +644,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         showNotice({ text: err instanceof Error ? err.message : String(err), error: true }, 8000);
       }
     },
-    [editor, store.title, store.comments, store.pageSize, store.headerText, store.footerText, store.margins, showNotice]
+    [editor, store.title, store.comments, store.pageSize, store.headerText, store.footerText, store.margins, showNotice, bib.store]
   );
 
   const handleSaveNow = useCallback(async () => {
@@ -567,6 +829,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           </div>
         </div>
 
+        <button type="button" data-tip={showOutline ? "Hide outline" : "Show outline"} aria-label="Document outline" aria-pressed={showOutline} onClick={toggleOutline} className={headerIconClass(showOutline)}>
+          <TbListTree size={19} strokeWidth={1.75} />
+        </button>
         <button type="button" data-tip="Find and replace" data-tip-kbd="Ctrl+F" aria-label="Find and replace" onClick={() => setShowFindReplace((v) => !v)} className={headerIconClass(showFindReplace)}>
           <IoSearch size={18} />
         </button>
@@ -582,7 +847,15 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         >
           <IoTimeOutline size={20} />
         </button>
-        <button type="button" data-tip="Comments" aria-label="Comments" onClick={() => setShowComments((v) => !v)} className={headerIconClass(showComments)}>
+        <button type="button" data-tip="References" aria-label="References" aria-pressed={showReferences} onClick={toggleReferences} className={headerIconClass(showReferences)}>
+          <TbBooks size={20} strokeWidth={1.75} />
+          {bib.entries.length > 0 && (
+            <span className="absolute top-1 right-0.5 min-w-4 h-4 px-1 rounded-full bg-neutral-600 dark:bg-neutral-500 text-white text-[10px] leading-4 font-semibold text-center tabular-nums">
+              {bib.entries.length}
+            </span>
+          )}
+        </button>
+        <button type="button" data-tip="Comments" aria-label="Comments" onClick={toggleComments} className={headerIconClass(showComments)}>
           <IoChatbubbleOutline size={19} />
           {openComments > 0 && (
             <span className="absolute top-1 right-1 min-w-4 h-4 px-1 rounded-full bg-blue-600 text-white text-[10px] leading-4 font-semibold text-center">
@@ -692,12 +965,14 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           onAddComment={(text) => void submitComment(text)}
           rulerVisible={rulerVisible}
           onToggleRuler={toggleRuler}
+          onOpenPicker={openPicker}
         />
       )}
 
       {editor && showFindReplace && <DocFindReplaceBar editor={editor} onClose={() => setShowFindReplace(false)} />}
 
       <div className="flex-1 min-h-0 flex border-t border-neutral-200 dark:border-neutral-800 print:block print:border-0">
+        {editor && showOutline && !store.loading && <DocOutlinePanel editor={editor} scrollerRef={scrollerRef} onClose={toggleOutline} />}
         {/* print:overflow-visible/h-auto/block - without these, this flex/overflow-auto box (built
             for on-screen scrolling) clips the document to the viewport instead of flowing across
             printed pages. */}
@@ -790,7 +1065,20 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             onClose={() => setShowComments(false)}
           />
         )}
+        {editor && showReferences && bib.store && (
+          <DocReferencesSidebar editor={editor} store={bib.store} entries={bib.entries} style={bib.style} onClose={() => setShowReferences(false)} />
+        )}
       </div>
+
+      {editor && picker && bib.store && (
+        <FloatingPanel key={`${picker.kind}:${picker.anchor.left}:${picker.anchor.top}`} anchor={picker.anchor} onClose={closePicker}>
+          {picker.kind === "cite" ? (
+            <DocCitePicker editor={editor} store={bib.store} entries={bib.entries} mode={picker.mode} onClose={closePicker} />
+          ) : (
+            <DocCrossRefPicker editor={editor} mode={picker.mode} onClose={closePicker} />
+          )}
+        </FloatingPanel>
+      )}
 
       {showVersionHistory && (
         <DocVersionHistoryPanel docId={docId} versions={store.versions} onClose={() => setShowVersionHistory(false)} onRestore={store.restoreVersion} />

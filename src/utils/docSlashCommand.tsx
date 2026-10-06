@@ -22,7 +22,8 @@ import {
   MdShortText,
   MdInsertPageBreak,
 } from "react-icons/md";
-import { TbMath, TbMathFunction, TbTable } from "react-icons/tb";
+import { TbListDetails, TbMath, TbMathFunction, TbQuote, TbTable, TbBooks, TbCornerDownRight, TbPhoto } from "react-icons/tb";
+import { OPEN_PICKER_EVENT, type OpenPickerDetail } from "./docStructureNodes";
 import SlashCommandMenu, { SlashCommandItem } from "../components/docs/SlashCommandMenu";
 import { uploadImageFromPath } from "./docImagePaste";
 
@@ -96,6 +97,48 @@ function buildItems(docId: string): SlashCommandItem[] {
       run: (editor, range) => editor.chain().focus().deleteRange(range).insertMathInline().run(),
     },
     {
+      title: "Citation",
+      keywords: ["cite", "citation", "reference", "doi", "bibtex", "arxiv"],
+      icon: TbQuote,
+      run: (editor, range) => {
+        editor.chain().focus().deleteRange(range).run();
+        openPicker(editor, "cite");
+      },
+    },
+    {
+      title: "Cross-reference",
+      keywords: ["cross", "reference", "xref", "ref", "figure", "table", "equation", "see"],
+      icon: TbCornerDownRight,
+      run: (editor, range) => {
+        editor.chain().focus().deleteRange(range).run();
+        openPicker(editor, "xref");
+      },
+    },
+    {
+      title: "Figure caption",
+      keywords: ["caption", "figure", "fig", "image"],
+      icon: TbPhoto,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertCaption("figure").run(),
+    },
+    {
+      title: "Table caption",
+      keywords: ["caption", "table"],
+      icon: TbTable,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertCaption("table").run(),
+    },
+    {
+      title: "Reference list",
+      keywords: ["bibliography", "references", "reference", "list", "works cited"],
+      icon: TbBooks,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertBibliography().run(),
+    },
+    {
+      title: "Table of contents",
+      keywords: ["toc", "contents", "table of contents", "outline"],
+      icon: TbListDetails,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertTableOfContents().run(),
+    },
+    {
       title: "Divider",
       keywords: ["divider", "hr", "line", "separator"],
       icon: MdHorizontalRule,
@@ -127,6 +170,16 @@ function buildItems(docId: string): SlashCommandItem[] {
       },
     },
   ];
+}
+
+// The citation and cross-reference pickers open anchored at the cursor (DocsEditor.tsx hosts them).
+function openPicker(editor: import("@tiptap/core").Editor, kind: OpenPickerDetail["kind"]): void {
+  editor.commands.scrollIntoView();
+  requestAnimationFrame(() => {
+    const { from } = editor.state.selection;
+    const c = editor.view.coordsAtPos(from);
+    editor.view.dom.dispatchEvent(new CustomEvent<OpenPickerDetail>(OPEN_PICKER_EVENT, { detail: { kind, rect: new DOMRect(c.left, c.top, 1, c.bottom - c.top) } }));
+  });
 }
 
 function filterItems(items: SlashCommandItem[], query: string): SlashCommandItem[] {

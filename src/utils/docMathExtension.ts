@@ -126,7 +126,14 @@ export const MathBlock = Node.create({
     return {
       ...latexAttribute,
       // Display equations are numbered (1), (2), ... down the page by default, the way papers
-      // expect - docMath.css counts them, and the exporters compute the same sequence.
+      // expect - docStructure.ts assigns the numbers, and the exporters compute the same sequence.
+      // Stable identity for cross-references ("Eq. (2)") - assigned the first time something
+      // references the equation (DocCrossRefPicker.tsx), kept unique by docStructure.ts.
+      id: {
+        default: null,
+        parseHTML: (element: HTMLElement) => element.getAttribute("data-id"),
+        renderHTML: (attributes: Record<string, unknown>) => (attributes.id ? { "data-id": attributes.id as string } : {}),
+      },
       numbered: {
         default: true,
         parseHTML: (element: HTMLElement) => element.getAttribute("data-numbered") !== "false",

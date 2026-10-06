@@ -33,6 +33,7 @@ import CommentMark from "./docCommentMark";
 import DocPageBreak from "./docPageBreakExtension";
 import DocLink from "./docLinkExtension";
 import { MathBlock, MathInline } from "./docMathExtension";
+import { Bibliography, Caption, Citation, CrossRef, TableOfContents } from "./docStructureNodes";
 
 // `common` (not `all`) - covers every mainstream language (JS/TS, Python, Rust, Go, JSON, etc.)
 // without bundling lowlight's full ~190-grammar set, which this doc editor has no need for.
@@ -110,7 +111,7 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     TableRow,
     TableHeader,
     TableCell,
-    TextAlign.configure({ types: ["heading", "paragraph", "tableCell", "tableHeader"] }),
+    TextAlign.configure({ types: ["heading", "paragraph", "caption", "tableCell", "tableHeader"] }),
     TextStyle,
     Color,
     FontFamily,
@@ -126,6 +127,14 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     DocPageBreak,
     MathInline,
     MathBlock,
+    // Captions, cross-references, citations, reference list, table of contents - numbered by
+    // docStructure.ts's plugin (added by the editors themselves, since it needs the document's
+    // reference library).
+    Caption,
+    CrossRef,
+    Citation,
+    Bibliography,
+    TableOfContents,
   ];
 }
 

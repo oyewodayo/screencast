@@ -1,0 +1,366 @@
+/* components/docs/docStructure.css
+ *
+ * Captions, cross-references, citations, the reference list and the table of contents
+ * (docStructureNodes.ts). Numbers and labels arrive as attributes from the structure plugin's
+ * decorations; this sheet only typesets them. On screen, references and citations are tinted so
+ * they read as live links; on paper they print in the text colour, as in a journal.
+ */
+
+:root {
+  --doc-ref: #1559c7;
+  --doc-ref-hover-bg: rgba(21, 89, 199, 0.08);
+  --doc-ref-selected-bg: rgba(21, 89, 199, 0.16);
+  --doc-missing: #c5221f;
+  --doc-muted: #5f6368;
+  --doc-rule: #dadce0;
+}
+.dark {
+  --doc-ref: #8ab4f8;
+  --doc-ref-hover-bg: rgba(138, 180, 248, 0.1);
+  --doc-ref-selected-bg: rgba(138, 180, 248, 0.2);
+  --doc-missing: #f28b82;
+  --doc-muted: #9aa0a6;
+  --doc-rule: #3c4043;
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Captions: "Figure 2. Text…" - the label is the plugin's data-caption-label, so it renumbers
+   without touching the caption's own text. */
+.ProseMirror .doc-caption {
+  font-size: 0.9em;
+  line-height: 1.5;
+  text-align: center;
+  color: inherit;
+}
+.ProseMirror .doc-caption[data-caption-label]::before {
+  content: attr(data-caption-label) ".\00a0\00a0";
+  font-weight: 600;
+}
+.ProseMirror .doc-caption.doc-caption-empty::after {
+  content: "Write a caption";
+  color: #9aa0a6;
+  pointer-events: none;
+}
+/* Captions sit close to what they label: under a figure, over a table. */
+.ProseMirror > p:has(img) + .doc-caption,
+.ProseMirror > .doc-caption[data-caption="table"] + .tableWrapper {
+  margin-top: 0.5rem !important;
+}
+.ProseMirror > .doc-caption[data-caption="table"] {
+  text-align: left;
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Cross-references and citations (plain inline NodeViews). */
+.ProseMirror .doc-xref,
+.ProseMirror .doc-cite {
+  color: var(--doc-ref);
+  border-radius: 3px;
+  padding: 0 1px;
+  margin: 0 -1px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 120ms ease;
+}
+.ProseMirror .doc-xref:hover,
+.ProseMirror .doc-cite:hover {
+  background: var(--doc-ref-hover-bg);
+}
+.ProseMirror .doc-label-wrap {
+  white-space: nowrap;
+}
+.ProseMirror .doc-label-wrap.ProseMirror-selectednode {
+  outline: none;
+}
+.ProseMirror .ProseMirror-selectednode > .doc-xref,
+.ProseMirror .ProseMirror-selectednode > .doc-cite {
+  background: var(--doc-ref-selected-bg);
+  outline: none;
+}
+.ProseMirror .doc-cite.doc-cite-sup {
+  font-size: 0.72em;
+  line-height: 0;
+  vertical-align: 0.5em;
+  font-feature-settings: "lnum", "tnum";
+  /* Tight against the word it follows, as typeset superscript references are. */
+  padding: 0 0.5px;
+  margin: 0;
+}
+.ProseMirror .doc-label-missing {
+  color: var(--doc-missing);
+  text-decoration: underline wavy var(--doc-missing);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Generated blocks: reference list and table of contents. */
+.doc-bibliography,
+.doc-toc {
+  position: relative;
+  border-radius: 6px;
+  outline: 1.5px solid transparent;
+  outline-offset: 6px;
+  transition: outline-color 120ms ease;
+}
+.doc-block-selected {
+  outline-color: rgba(26, 115, 232, 0.55);
+}
+
+.doc-generated-empty {
+  padding: 14px 16px;
+  border: 1px dashed var(--doc-rule);
+  border-radius: 8px;
+  color: var(--doc-muted);
+  font-size: 0.88em;
+  line-height: 1.55;
+}
+.doc-generated-empty-title {
+  display: block;
+  font-weight: 600;
+  color: inherit;
+  margin-bottom: 2px;
+}
+
+/* Reference list. Numbered styles hang the label in its own column; APA uses a 0.5in hanging
+   indent, as the manual specifies. */
+.doc-bib-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.92em;
+  line-height: 1.5;
+}
+/* Typography's list-item padding and margins don't belong on these generated lists. */
+.doc-bib-list > li,
+.doc-toc-list > li {
+  margin: 0;
+  padding: 0;
+}
+.doc-bib-item + .doc-bib-item {
+  margin-top: 0.45em;
+}
+.doc-bibliography-numeric .doc-bib-item {
+  display: grid;
+  grid-template-columns: 2.4em 1fr;
+  column-gap: 0.35em;
+}
+.doc-bibliography-numeric .doc-bib-label {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.doc-bibliography-hanging .doc-bib-item {
+  padding-left: 0.5in;
+  text-indent: -0.5in;
+}
+.doc-bib-body {
+  overflow-wrap: anywhere;
+}
+/* .ProseMirror-qualified to win over the editor's general link colour (docLinks.css). */
+.ProseMirror .doc-bib-link,
+.doc-bib-link {
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+.ProseMirror .doc-bib-link:hover,
+.doc-bib-link:hover {
+  color: var(--doc-ref);
+  text-decoration: underline;
+}
+
+/* Table of contents: dot leaders run from the entry to its page number. */
+.doc-toc-title {
+  font-size: 1.15em;
+  font-weight: 600;
+  margin-bottom: 0.6em;
+  letter-spacing: 0.01em;
+}
+.doc-toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.doc-toc-entry[data-depth="0"] {
+  font-weight: 500;
+}
+.doc-toc-entry[data-depth="0"]:not(:first-child) {
+  margin-top: 0.35em;
+}
+.doc-toc-entry[data-depth="1"] {
+  padding-left: 1.5em;
+}
+.doc-toc-entry[data-depth="2"] {
+  padding-left: 3em;
+  font-size: 0.95em;
+}
+.doc-toc-entry[data-depth="3"] {
+  padding-left: 4.5em;
+  font-size: 0.95em;
+}
+.doc-toc-link {
+  display: flex;
+  align-items: baseline;
+  width: 100%;
+  gap: 0.4em;
+  padding: 0.12em 0.25em;
+  margin: 0 -0.25em;
+  border-radius: 4px;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  background: none;
+  cursor: pointer;
+}
+.doc-toc-link:hover {
+  background: var(--doc-ref-hover-bg);
+}
+.doc-toc-link:hover .doc-toc-text {
+  color: var(--doc-ref);
+}
+.doc-toc-text {
+  min-width: 0;
+}
+.doc-toc-leader {
+  flex: 1;
+  min-width: 1.5em;
+  align-self: flex-end;
+  margin-bottom: 0.32em;
+  height: 1px;
+  background-image: radial-gradient(circle, currentColor 0.6px, transparent 0.9px);
+  background-size: 6px 2px;
+  background-repeat: repeat-x;
+  background-position: left center;
+  opacity: 0.45;
+}
+.doc-toc-page {
+  font-variant-numeric: tabular-nums;
+  min-width: 1.4em;
+  text-align: right;
+}
+
+/* The small toolbar a selected table of contents shows above itself. */
+.doc-block-toolbar {
+  position: absolute;
+  top: -42px;
+  left: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 8px;
+  background: #202124;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 400;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+}
+.doc-block-toolbar-label {
+  padding: 0 6px 0 4px;
+  color: #bdc1c6;
+}
+.doc-block-toolbar-chip,
+.doc-block-toolbar-icon {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 5px;
+  color: #e8eaed;
+  display: inline-flex;
+  align-items: center;
+}
+.doc-block-toolbar-chip:hover,
+.doc-block-toolbar-icon:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.doc-block-toolbar-chip.is-active {
+  background: #8ab4f8;
+  color: #202124;
+  font-weight: 600;
+}
+.doc-block-toolbar-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* "Go to" from the outline, the table of contents or a cross-reference flashes its target. */
+@keyframes doc-reveal {
+  0%,
+  35% {
+    background-color: rgba(251, 188, 4, 0.32);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+@keyframes doc-reveal-b {
+  0%,
+  35% {
+    background-color: rgba(251, 188, 4, 0.32);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+.doc-reveal {
+  animation: doc-reveal 1.5s ease-out;
+  border-radius: 4px;
+}
+.doc-reveal-b {
+  animation: doc-reveal-b 1.5s ease-out;
+  border-radius: 4px;
+}
+
+.doc-xref-eq-preview .katex {
+  font-size: 1em;
+}
+
+@keyframes doc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.doc-spinner {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  animation: doc-spin 0.7s linear infinite;
+  display: inline-block;
+}
+
+@media print {
+  .ProseMirror .doc-xref,
+  .ProseMirror .doc-cite,
+  .doc-toc-link:hover .doc-toc-text,
+  .doc-bib-link:hover {
+    color: inherit !important;
+    background: none !important;
+    text-decoration: none !important;
+  }
+  .ProseMirror .doc-label-missing {
+    text-decoration: none;
+  }
+  .ProseMirror .doc-caption.doc-caption-empty::after,
+  .doc-generated-empty,
+  .doc-block-toolbar {
+    display: none !important;
+  }
+  .doc-bibliography,
+  .doc-toc {
+    outline: none !important;
+  }
+  .doc-bib-item,
+  .doc-toc-entry,
+  .doc-caption {
+    break-inside: avoid;
+  }
+  /* Captions stay with what they label. */
+  .ProseMirror > p:has(img):has(+ .doc-caption),
+  .ProseMirror > .doc-caption[data-caption="table"] {
+    break-after: avoid;
+  }
+}

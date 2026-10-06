@@ -12,7 +12,7 @@ import React, { useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { NodeViewWrapper, NodeViewProps } from "@tiptap/react";
 import type { EditorView } from "@tiptap/pm/view";
-import { MdCrop, MdDelete, MdDragIndicator } from "react-icons/md";
+import { MdCrop, MdDelete, MdDragIndicator, MdOutlineSubtitles } from "react-icons/md";
 import DocImageCropModal from "./DocImageCropModal";
 
 const MIN_SIZE = 40;
@@ -57,7 +57,7 @@ interface DropIndicatorRect {
   height: number;
 }
 
-const DocImageView: React.FC<NodeViewProps> = ({ node, selected, updateAttributes, deleteNode, extension, view, getPos }) => {
+const DocImageView: React.FC<NodeViewProps> = ({ node, selected, updateAttributes, deleteNode, extension, view, getPos, editor }) => {
   const docId = (extension.options as { docId: string | null }).docId;
   const imgRef = useRef<HTMLImageElement>(null);
   const [showCrop, setShowCrop] = useState(false);
@@ -277,6 +277,10 @@ const DocImageView: React.FC<NodeViewProps> = ({ node, selected, updateAttribute
                 <MdCrop size={14} />
               </button>
             )}
+            {/* Numbered "Figure N." caption under the image (or the cursor moves into its existing one). */}
+            <button type="button" onClick={() => editor.chain().focus().insertCaption("figure").run()} className="p-0.5 hover:bg-white/10 rounded" data-tip="Caption">
+              <MdOutlineSubtitles size={14} />
+            </button>
             <button type="button" onClick={() => deleteNode()} className="p-0.5 hover:bg-white/10 rounded" data-tip="Delete">
               <MdDelete size={14} />
             </button>

@@ -54,7 +54,7 @@ import {
   MdUndo,
 } from "react-icons/md";
 import { BiHighlight } from "react-icons/bi";
-import { TbMath, TbMathFunction, TbTable, TbTableOptions } from "react-icons/tb";
+import { TbBooks, TbCornerDownRight, TbListDetails, TbMath, TbMathFunction, TbPhoto, TbQuote, TbTable, TbTableOptions } from "react-icons/tb";
 import DocColorPicker from "./DocColorPicker";
 import { DICTATION_LANGUAGES, DocDictation } from "../../hooks/useDocDictation";
 import { PaintKind, getPaintState } from "../../utils/docPaintExtension";
@@ -523,9 +523,11 @@ export interface DocToolbarProps {
   onAddComment: (text: string) => void;
   rulerVisible: boolean;
   onToggleRuler: () => void;
+  // Citation / cross-reference pickers, hosted by DocsEditor and anchored to `anchor`.
+  onOpenPicker: (kind: "cite" | "xref", anchor: DOMRect) => void;
 }
 
-const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, onLinkOpenChange, onInsertImage, onAddComment, rulerVisible, onToggleRuler }) => {
+const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, onLinkOpenChange, onInsertImage, onAddComment, rulerVisible, onToggleRuler, onOpenPicker }) => {
   const { bind, setOpenMenu } = useOpenMenu();
   const close = () => setOpenMenu(null);
   const [linkUrl, setLinkUrl] = useState("");
@@ -683,6 +685,14 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
       {opts.keys && <span className="text-xs text-neutral-400">{opts.keys}</span>}
     </button>
   );
+  // The More menu's picker entries open at the cursor - the menu itself is gone by then.
+  const openPickerAtCursor = (kind: "cite" | "xref") => {
+    editor.commands.scrollIntoView();
+    requestAnimationFrame(() => {
+      const c = editor.view.coordsAtPos(editor.state.selection.from);
+      onOpenPicker(kind, new DOMRect(c.left, c.top, 1, c.bottom - c.top));
+    });
+  };
   // Shared by the bar's equation menu and the More menu's Insert section. Inline equation turns
   // any selected text into the equation's source.
   const equationItems = (
@@ -951,6 +961,26 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
           <Dropdown {...bind("equation")} label="Insert equation" trigger={<TbMathFunction size={19} strokeWidth={1.75} />} panelClassName="w-60 py-1.5">
             {equationItems}
           </Dropdown>
+          <button
+            type="button"
+            {...tipProps("Cite a reference")}
+            aria-label="Cite a reference"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={(e) => onOpenPicker("cite", e.currentTarget.getBoundingClientRect())}
+            className={toolClass(false)}
+          >
+            <TbQuote size={19} strokeWidth={1.75} />
+          </button>
+          <button
+            type="button"
+            {...tipProps("Cross-reference a figure, table or equation")}
+            aria-label="Insert cross-reference"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={(e) => onOpenPicker("xref", e.currentTarget.getBoundingClientRect())}
+            className={toolClass(false)}
+          >
+            <TbCornerDownRight size={19} strokeWidth={1.75} />
+          </button>
         </div>
 
         {inTable && (
@@ -969,6 +999,8 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
                 null,
                 ["Delete row", () => editor.chain().focus().deleteRow().run(), editor.can().deleteRow()],
                 ["Delete column", () => editor.chain().focus().deleteColumn().run(), editor.can().deleteColumn()],
+                null,
+                ["Add caption", () => editor.chain().focus().insertCaption("table").run(), true],
               ] as ([string, () => void, boolean] | null)[]
             ).map((item, i) =>
               item ? (
@@ -1069,6 +1101,14 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
             {menuAction("Image", MdImage, onInsertImage)}
             {menuAction("Table (3 × 3)", TbTable, () => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run())}
             {equationItems}
+            {menuAction("Citation…", TbQuote, () => openPickerAtCursor("cite"))}
+            {menuAction("Cross-reference…", TbCornerDownRight, () => openPickerAtCursor("xref"))}
+          </MenuSection>
+          <MenuSection title="References & structure">
+            {menuAction("Figure caption", TbPhoto, () => editor.chain().focus().insertCaption("figure").run())}
+            {menuAction("Table caption", TbTable, () => editor.chain().focus().insertCaption("table").run())}
+            {menuAction("Reference list", TbBooks, () => editor.chain().focus().insertBibliography().run())}
+            {menuAction("Table of contents", TbListDetails, () => editor.chain().focus().insertTableOfContents().run())}
           </MenuSection>
           <MenuSection title="Align" className="@5xl:hidden">
             {alignItems}
