@@ -84,6 +84,27 @@ pub struct PhoneCameraAddress {
 struct WsQuery {
     #[serde(default)]
     role: String,
+    // The pairing key from the QR code - see pairing_key.
+    #[serde(default)]
+    k: String,
+}
+
+// The server listens on every LAN interface, so without this anyone on the same network (a café's
+// Wi-Fi, say) could open the socket, replace the user's phone, and feed their own video into the
+// recording. A fresh key per server start rides in the pairing URL's fragment (#k=...), which
+// browsers never send in a request, and the phone page hands it back on the socket URL.
+// 64 random bits from the OS source behind RandomState - unguessable over a network.
+fn pairing_key() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(0);
+    format!("{:016x}", h.finish())
+}
+
+// Constant-time, so response timing can't be used to guess the key a character at a time.
+fn key_matches(given: &str, expected: &str) -> bool {
+    given.len() == expected.len()
+        && given.bytes().zip(expected.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
 // Everything the running server owns. Kept behind a Mutex in PhoneCameraState below.
@@ -94,6 +115,7 @@ struct RunningServer {
 
 #[derive(Clone)]
 struct AppCtx {
+    key: Arc<str>,
     app_handle: AppHandle,
     // Sender into whichever phone socket is currently connected. `None` whenever no phone is
     // paired. Only one phone at a time is supported by design - a second connection replaces the
@@ -222,6 +244,10 @@ async fn ws_upgrade(
     Query(q): Query<WsQuery>,
     State(ctx): State<AppCtx>,
 ) -> Response {
+    if !key_matches(&q.k, &ctx.key) {
+        log::warn!("Phone camera: refused a connection without the pairing key");
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(move |socket| handle_phone_socket(socket, ctx, q.role))
 }
 
@@ -307,7 +333,9 @@ pub async fn start_phone_camera_server(
         .await
         .map_err(|e| format!("Failed to configure TLS for the phone camera server: {e}"))?;
 
+    let key = pairing_key();
     let ctx = AppCtx {
+        key: Arc::from(key.as_str()),
         app_handle: app_handle.clone(),
         phone_tx: state.phone_tx.clone(),
     };
@@ -333,12 +361,12 @@ pub async fn start_phone_camera_server(
         }
     });
 
-    let url = format!("https://{ip}:{port}/");
+    let url = format!("https://{ip}:{port}/#k={key}");
     let alternatives = addresses
         .iter()
         .skip(1)
         .map(|alt| {
-            let alt_url = format!("https://{alt}:{port}/");
+            let alt_url = format!("https://{alt}:{port}/#k={key}");
             PhoneCameraAddress {
                 qr_svg: render_qr(&alt_url),
                 url: alt_url,
@@ -408,5 +436,22 @@ pub async fn phone_camera_send_signal(
             .send(payload)
             .map_err(|_| "The phone disconnected before the message could be sent.".to_string()),
         None => Err("No phone is currently connected.".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_keys_are_fresh_and_checked_exactly() {
+        let key = pairing_key();
+        assert_eq!(key.len(), 16);
+        assert_ne!(key, pairing_key());
+        assert!(key_matches(&key, &key));
+        assert!(!key_matches("", &key));
+        assert!(!key_matches(&key[..15], &key));
+        let last = if key.ends_with('0') { '1' } else { '0' };
+        assert!(!key_matches(&format!("{}{}", &key[..15], last), &key));
     }
 }

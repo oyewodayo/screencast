@@ -11,7 +11,8 @@ name: Release
 # Secrets (Settings -> Secrets and variables -> Actions):
 #   TAURI_SIGNING_PRIVATE_KEY           required - contents of the updater private key file
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  required - its password
-#   BRIEFCAST_APTABASE_KEY              optional - usage analytics (src-tauri/src/services/telemetry.rs)
+#   BRIEFCAST_POSTHOG_KEY               optional - usage analytics, PostHog project token (phc_...)
+#                                       (src-tauri/src/services/telemetry.rs)
 #   BRIEFCAST_SENTRY_DSN                optional - crash reports (same file)
 #   AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID
 #                                       optional - Windows code signing via Azure Trusted Signing
@@ -66,8 +67,18 @@ jobs:
         run: |
           curl --location --fail --silent --show-error --retry 3 --output binaries.zip "$BINARIES_URL"
           echo "${BINARIES_SHA256}  binaries.zip" | sha256sum --check
-          unzip -q binaries.zip -d src-tauri
-          rm binaries.zip
+
+      # Not unzip: build-binaries-v1 was made by Windows PowerShell's Compress-Archive, which stores
+      # paths with backslashes - unzip warns about that and exits 1. Expand-Archive reads them as
+      # the folder separators they are. (scripts/package-build-binaries.ps1 now writes standard
+      # forward-slash zips, so later binaries zips extract cleanly either way.)
+      - name: Extract bundled binaries
+        shell: pwsh
+        run: |
+          Expand-Archive -Path binaries.zip -DestinationPath src-tauri -Force
+          Remove-Item binaries.zip
+          if (-not (Test-Path src-tauri/binaries/ffmpeg/ffmpeg.exe)) { throw "binaries.zip did not extract to src-tauri/binaries/" }
+          (Get-ChildItem -Recurse -File src-tauri/binaries).Count
 
       # Writes a config overlay that adds a signCommand only when signing is configured, so the
       # same workflow produces unsigned test builds until the Azure account exists.
@@ -94,7 +105,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Read at compile time (option_env!) - unset means telemetry is compiled out entirely.
-          BRIEFCAST_APTABASE_KEY: ${{ secrets.BRIEFCAST_APTABASE_KEY }}
+          BRIEFCAST_POSTHOG_KEY: ${{ secrets.BRIEFCAST_POSTHOG_KEY }}
+          # Only for an EU PostHog project: set the variable to https://eu.i.posthog.com
+          BRIEFCAST_POSTHOG_HOST: ${{ vars.BRIEFCAST_POSTHOG_HOST }}
           BRIEFCAST_SENTRY_DSN: ${{ secrets.BRIEFCAST_SENTRY_DSN }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}

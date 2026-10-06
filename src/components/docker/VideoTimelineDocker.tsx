@@ -59,6 +59,7 @@ import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
 import ViewSwitchPopover, { ViewSwitchDetectState } from "./ViewSwitchPopover";
 import ToolModePopover, { TimelineToolMode } from "./ToolModePopover";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
+import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 const MIN_PX_PER_SEC = 8;
 const AUDIO_ROW_HEIGHT = 32; // px - one row of the audio lane; overlapping audio stacks into more rows
@@ -172,6 +173,7 @@ const ActionButton: React.FC<{
 const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number }> = ({ overlay, widthPx, heightPx }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [peaks, setPeaks] = useState<number[] | null>(null);
+  const canvasRestoreTick = useCanvasRestoreTick();
 
   useEffect(() => {
     let cancelled = false;
@@ -206,7 +208,8 @@ const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heig
       const barHeight = Math.max(1, amp * heightPx);
       ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
     });
-  }, [peaks, widthPx, heightPx, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration]);
+    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
+  }, [peaks, widthPx, heightPx, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration, canvasRestoreTick]);
 
   return <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" style={{ width: widthPx, height: heightPx }} />;
 };
@@ -227,6 +230,7 @@ const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: n
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [peaks, setPeaks] = useState<number[] | null>(null);
+  const canvasRestoreTick = useCanvasRestoreTick();
 
   useEffect(() => {
     let cancelled = false;
@@ -262,7 +266,8 @@ const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: n
       const barHeight = Math.max(1, amp * heightPx);
       ctx.fillRect(i * barWidth, heightPx - barHeight, Math.max(1, barWidth - 1), barHeight);
     });
-  }, [peaks, widthPx, heightPx, trimStart, trimEnd, sourceDuration]);
+    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
+  }, [peaks, widthPx, heightPx, trimStart, trimEnd, sourceDuration, canvasRestoreTick]);
 
   if (!peaks) return null;
   return (

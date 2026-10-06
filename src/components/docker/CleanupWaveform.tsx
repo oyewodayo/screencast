@@ -17,6 +17,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { IoSyncOutline, IoSearchOutline, IoCloseCircle } from "react-icons/io5";
 import { AudioCleanup } from "../../utils/videoEditTypes";
+import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 const FLOOR_DB = -60; // bottom of the dB display scale
 const FETCH_DEBOUNCE_MS = 400;
@@ -84,6 +85,7 @@ const CleanupWaveform: React.FC<CleanupWaveformProps> = ({
 }) => {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRestoreTick = useCanvasRestoreTick();
   const [width, setWidth] = useState(0);
   const [envelope, setEnvelope] = useState<Float32Array | null>(null);
   const [loading, setLoading] = useState(false);
@@ -176,7 +178,8 @@ const CleanupWaveform: React.FC<CleanupWaveformProps> = ({
     };
     fill(0, "rgba(255,255,255,0.22)");
     fill(1, "rgba(96,165,250,0.9)");
-  }, [envelope, width, dpr]);
+    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
+  }, [envelope, width, dpr, canvasRestoreTick]);
 
   const reduction = useMemo(() => (envelope ? floorDb(envelope, 0) - floorDb(envelope, 1) : null), [envelope]);
 

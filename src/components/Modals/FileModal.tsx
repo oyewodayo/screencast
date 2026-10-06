@@ -10,12 +10,21 @@ import {
   IoServerOutline,
   IoFolderOpenOutline,
   IoPlay,
+  IoAlertCircle,
 } from 'react-icons/io5';
 import { open } from '@tauri-apps/plugin-shell';
 const appWindow = getCurrentWebviewWindow()
 
+// "processing": Stop was pressed and the window is shown straight away, while the backend is still
+// cleaning the audio and assembling the file - which takes a while for a long recording, and with
+// nothing on screen the first Stop looked ignored. The backend reloads this window as "done" (or
+// "failed") when it finishes - see stop_recording's finish_recording_modal.
+export type RecordingModalStatus = "processing" | "done" | "failed";
+
 interface FileModalProps {
   filePath: string;
+  status?: RecordingModalStatus;
+  error?: string;
 }
 
 const formatDuration = (totalSeconds: number): string => {
@@ -38,13 +47,13 @@ const InfoRow = ({ icon, label, value }: { icon: React.ReactNode; label: string;
   </div>
 );
 
-const FileModal = ({ filePath }: FileModalProps) => {
+const FileModal = ({ filePath, status = "done", error }: FileModalProps) => {
   const [duration, setDuration] = useState<string | null>(null);
   const [fileSize, setFileSize] = useState<string | null>(null);
   const [isLoadingInfo, setIsLoadingInfo] = useState(true);
 
   useEffect(() => {
-    if (!filePath) return;
+    if (!filePath || status !== "done") return;
     invoke<Record<string, string>>('get_conversion_info', { inputPath: filePath })
       .then((info) => {
         if (info.duration) {
@@ -55,9 +64,9 @@ const FileModal = ({ filePath }: FileModalProps) => {
       })
       .catch((error) => console.error('Failed to load recording info:', error))
       .finally(() => setIsLoadingInfo(false));
-  }, [filePath]);
+  }, [filePath, status]);
 
-  if (!filePath) return null;
+  if (!filePath && status !== "failed") return null;
 
   const fileName = filePath.split(/[\\/]/).pop() || filePath;
   const dotIndex = fileName.lastIndexOf('.');
@@ -88,6 +97,38 @@ const FileModal = ({ filePath }: FileModalProps) => {
   const handleClose = async () => {
     await appWindow.close();
   };
+
+  if (status !== "done") {
+    const processing = status === "processing";
+    return (
+      <div className="fixed inset-0 flex flex-col bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100" data-tauri-drag-region>
+        <div className="flex-1 flex flex-col items-center justify-center px-8 text-center" data-tauri-drag-region>
+          {processing ? (
+            <div className="w-16 h-16 mb-4 rounded-full border-[3px] border-gray-200 dark:border-neutral-700 border-t-blue-500 animate-spin" />
+          ) : (
+            <div className="w-16 h-16 mb-3 rounded-full bg-red-50 dark:bg-red-500/10 flex items-center justify-center">
+              <IoAlertCircle className="text-red-500 text-4xl" />
+            </div>
+          )}
+          <h1 className="text-base font-semibold mb-1.5">{processing ? "Finishing your recording…" : "Recording couldn't be saved"}</h1>
+          <p className="text-xs leading-relaxed text-gray-500 dark:text-neutral-400 max-w-[300px]">
+            {processing
+              ? "Cleaning up the audio and putting the video together. Long recordings can take a minute or two - you can close this, and the file will appear in your library when it's ready."
+              : error || "Something went wrong while saving the recording."}
+          </p>
+          {fileName && processing && <p className="mt-4 text-[11px] font-mono text-gray-400 dark:text-neutral-500 truncate max-w-full">{fileName}</p>}
+        </div>
+        <div className="flex border-t border-gray-100 dark:border-neutral-800">
+          <button
+            className="flex-1 py-3.5 text-sm font-medium text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors"
+            onClick={handleClose}
+          >
+            {processing ? "Hide" : "Close"}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 flex flex-col bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100" data-tauri-drag-region>

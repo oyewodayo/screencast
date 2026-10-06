@@ -204,9 +204,13 @@
     connectSignalling();
   }
 
+  // The pairing key from the QR code's "#k=..." - in the fragment so it never travels in a request
+  // line, and required by the server, so only a phone that scanned this computer's QR can connect.
+  var pairingKey = (location.hash.match(/[#&]k=([A-Za-z0-9]+)/) || [])[1] || "";
+
   function connectSignalling() {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(proto + "//" + location.host + "/ws?role=phone");
+    ws = new WebSocket(proto + "//" + location.host + "/ws?role=phone&k=" + encodeURIComponent(pairingKey));
 
     ws.onopen = function () {
       clearError();
@@ -427,6 +431,10 @@
     startBtn.disabled = true;
     setStatus("Unsupported", "err");
     showError("This browser won't allow camera access on this page. Make sure the address starts with https:// - browsers block the camera on insecure connections.");
+  } else if (!pairingKey) {
+    startBtn.disabled = true;
+    setStatus("Not paired", "err");
+    showError("Open this page by scanning the QR code in Briefcast (or copy the full address it shows, including the part after #).");
   } else {
     connectSignalling();
   }

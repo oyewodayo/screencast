@@ -11,6 +11,8 @@ use tauri::Manager;
 mod commands {
     pub mod audio_tracks;
     pub mod conversion;
+    pub mod embedded_scan;
+    pub mod file_info;
     pub mod native_playback;
     pub mod snip;
     pub mod recording;
@@ -65,6 +67,10 @@ mod services {
     // camera/mic open - see the module's own doc comment for the orphan this fixes.
     #[cfg(target_os = "windows")]
     pub mod process_job;
+    // Repaints WebView2 after sleep/resume and after its GPU/page process dies - the blank white
+    // window after reopening a laptop lid. See the module's own doc comment.
+    #[cfg(target_os = "windows")]
+    pub mod webview_recovery;
     // Polls ffmpeg's `-progress` sidecar file while a recording is in flight and forwards it to
     // the frontend as a `recording-progress` event - see the module's own doc comment for why
     // this exists (win.rs deliberately nulls ffmpeg's stdout/stderr, so there was previously no
@@ -146,6 +152,56 @@ impl std::io::Write for NonBlockingStdout {
     }
 }
 
+// File half of the logger, capped: once app.log passes MAX_LOG_BYTES it becomes app.log.1
+// (replacing the previous one) and a fresh app.log starts, so the logs never hold more than about
+// twice the cap. Uncapped and at TRACE, a month of normal use reached 126 MB.
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
+struct RotatingLogFile {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    written: u64,
+}
+
+impl RotatingLogFile {
+    fn open(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut log = Self { path, file: Some(file), written };
+        if log.written >= MAX_LOG_BYTES {
+            log.rotate();
+        }
+        Ok(log)
+    }
+
+    fn rotate(&mut self) {
+        // Windows can't rename a file that's still open, so the handle goes first.
+        self.file = None;
+        let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+        self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+        self.written = 0;
+    }
+}
+
+impl std::io::Write for RotatingLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written >= MAX_LOG_BYTES {
+            self.rotate();
+        }
+        self.written += buf.len() as u64;
+        match self.file.as_mut() {
+            Some(file) => file.write(buf),
+            // Reopening failed - drop the line rather than fail the caller; logging must never
+            // take the app down.
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.as_mut().map_or(Ok(()), |f| f.flush())
+    }
+}
+
 #[tauri::command(async)]
 fn get_os_info() -> String {
     OS.to_string().to_uppercase()
@@ -168,55 +224,7 @@ fn resolve_log_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir())
 }
 
-// Shows a native "already running" notice before the duplicate process exits - Windows only for
-// now (matches this codebase's existing "Windows is the verified platform" posture elsewhere,
-// e.g. audio_capture.rs/heic_windows.rs), since MessageBoxW needs no Tauri app context to call,
-// unlike tauri::api::dialog which assumes a running app. A silent exit is an acceptable fallback
-// on macOS/Linux - a launcher/dock effectively already fills this role there by focusing the
-// existing window instead of spawning a second process in the first place.
-#[cfg(target_os = "windows")]
-fn show_already_running_message() {
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
-
-    let title: Vec<u16> = "Briefcast"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let text: Vec<u16> = "Briefcast is already running."
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(text.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
-}
-
 fn main() {
-    // Single-instance guard: binding a fixed localhost port is atomic and self-cleaning (the OS
-    // releases it the moment this process exits, crash or not - no stale-PID-file cleanup needed,
-    // unlike a lock file). A second launch failing this bind means a first instance is already
-    // running and already holds every global shortcut (Ctrl+Shift+R/H/B/D, see Dashboard.tsx) -
-    // letting a second copy proceed anyway is exactly what produced "Couldn't register the
-    // panel-buttons shortcut... it may already be in use by another app": that "another app" was
-    // just an earlier copy of this same app. The listener is kept bound for main()'s entire
-    // lifetime (held in this variable, never touched again) rather than dropped right after the
-    // check, which would let a third launch slip in during the race between checking and the app
-    // actually starting up.
-    let _single_instance_guard = match std::net::TcpListener::bind(("127.0.0.1", 47_813)) {
-        Ok(listener) => listener,
-        Err(_) => {
-            #[cfg(target_os = "windows")]
-            show_already_running_message();
-            std::process::exit(0);
-        }
-    };
-
     let context = tauri::generate_context!();
 
     // Resolve logs to the app's own data directory instead of the process's current working
@@ -233,11 +241,8 @@ fn main() {
     let panic_log_path = log_dir.join("panic.log");
 
     // Initialize logger
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&app_log_path)
-        .expect("Failed to open log file");
+    // An unwritable app-data folder costs the log file, never the app.
+    let log_file = RotatingLogFile::open(app_log_path).ok();
 
     // Configure logging with more verbose settings
     let config = ConfigBuilder::new()
@@ -248,11 +253,18 @@ fn main() {
 
     // Initialize combined logger (writes to both file and terminal). The file comes first and the
     // terminal never blocks - see NonBlockingStdout for why.
-    CombinedLogger::init(vec![
-        WriteLogger::new(LevelFilter::Trace, config.clone(), log_file), // TRACE captures everything
-        WriteLogger::new(LevelFilter::Debug, config, NonBlockingStdout::spawn()),
-    ])
-    .expect("Failed to initialize logger");
+    let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = Vec::new();
+    if let Some(log_file) = log_file {
+        // Everything while developing; INFO and up for users, which still keeps every warning,
+        // error, watchdog stall and recording milestone without per-frame noise.
+        loggers.push(WriteLogger::new(
+            if cfg!(debug_assertions) { LevelFilter::Trace } else { LevelFilter::Info },
+            config.clone(),
+            log_file,
+        ));
+    }
+    loggers.push(WriteLogger::new(LevelFilter::Debug, config, NonBlockingStdout::spawn()));
+    let _ = CombinedLogger::init(loggers);
 
     // Set panic hook to log panics to file
     panic::set_hook(Box::new(move |panic_info| {
@@ -305,6 +317,18 @@ fn main() {
     services::responsiveness::install_async_runtime();
 
     tauri::Builder::default()
+        // First, so a second launch exits before it registers anything: the running copy already
+        // holds every global shortcut (Ctrl+Shift+R/H/B/D, see Dashboard.tsx), and a second one
+        // starting up anyway is what used to produce "Couldn't register the panel-buttons
+        // shortcut... it may already be in use by another app". Instead the running copy's main
+        // window is brought forward - what the user launching it again actually wanted.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
@@ -332,6 +356,8 @@ fn main() {
 
             services::telemetry::init(app.handle());
             services::responsiveness::start_ui_watchdog(app.handle());
+            #[cfg(target_os = "windows")]
+            services::webview_recovery::install(app.handle());
             // All slow first-time probes (ffmpeg -list_devices, a trial hardware encode, a trial
             // GPU screen capture); doing them now in the background means the device pickers and
             // the first recording never wait on them.
@@ -349,8 +375,10 @@ fn main() {
             commands::system_info::get_ram_info,
             get_os_info,
             services::responsiveness::report_frontend_stall,
+            services::responsiveness::report_frontend_event,
             services::telemetry::get_telemetry_settings,
             services::telemetry::set_telemetry_enabled,
+            services::telemetry::dismiss_telemetry_notice,
             services::telemetry::track_event,
             services::telemetry::report_frontend_error,
             commands::recording::get_connected_audios,
@@ -358,6 +386,7 @@ fn main() {
             commands::recording::get_connected_devices,
             commands::recording::start_recording,
             commands::recording::stop_recording,
+            commands::recording::get_recording_status,
             commands::recording::load_click_sidecar,
             commands::recording::load_view_switch_sidecar,
             commands::recording::record_view_switch,
@@ -402,6 +431,8 @@ fn main() {
             commands::conversion::export_trimmed_video,
             commands::conversion::extract_clip_audio,
             commands::audio_tracks::probe_audio_streams,
+            commands::file_info::get_file_info,
+            commands::file_info::get_library_item_info,
             commands::audio_tracks::get_separation_engine,
             commands::audio_tracks::separate_voice_music,
             commands::audio_tracks::download_separation_engine,

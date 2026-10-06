@@ -37,7 +37,7 @@ fn mindmaps_root() -> Result<PathBuf, String> {
 // Ids are frontend-generated UUIDs (crypto.randomUUID()), but every command below is directly
 // reachable, so this boundary is enforced here regardless of caller - rejects anything that could
 // escape mindmaps_root() via a path separator or a "." / ".." segment.
-fn mindmap_dir(id: &str) -> Result<PathBuf, String> {
+pub(crate) fn mindmap_dir(id: &str) -> Result<PathBuf, String> {
     if id.is_empty() || id.contains(['/', '\\']) || id == "." || id == ".." {
         return Err("Invalid mindmap id".to_string());
     }

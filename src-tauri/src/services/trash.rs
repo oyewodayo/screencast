@@ -35,7 +35,7 @@ pub struct TrashEntry {
     deleted_at: i64,
 }
 
-fn trash_dir() -> Result<PathBuf, String> {
+pub(crate) fn trash_dir() -> Result<PathBuf, String> {
     let dir = briefcast_dir()?.join(".trash");
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("Failed to create trash directory: {}", e))?;
@@ -64,7 +64,11 @@ fn write_manifest(records: &[TrashRecord]) -> Result<(), String> {
     let path = manifest_path()?;
     let json = serde_json::to_string_pretty(records)
         .map_err(|e| format!("Failed to serialize trash manifest: {}", e))?;
-    fs::write(&path, json).map_err(|e| format!("Failed to write trash manifest: {}", e))
+    // Written beside and renamed over, like every editor save: a crash mid-write must not leave a
+    // truncated manifest, which would make every trashed file unlistable and unrestorable.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| format!("Failed to write trash manifest: {}", e))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("Failed to save trash manifest: {}", e))
 }
 
 // Guards against two different trashed files colliding on the same on-disk name inside .trash
@@ -90,6 +94,9 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
 
     let trashed_name = unique_trashed_name(&original_name);
     let destination = trash_dir()?.join(&trashed_name);
+    // Read before the move, so an unreadable manifest refuses the delete instead of moving the file
+    // somewhere nothing records.
+    let mut records = read_manifest()?;
 
     fs::rename(&source, &destination).map_err(|e| {
         // Windows ERROR_SHARING_VIOLATION (32) - another process (Word, Excel, a preview pane,
@@ -107,13 +114,17 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
         }
     })?;
 
-    let mut records = read_manifest()?;
     records.push(TrashRecord {
         trashed_name,
         original_path: path,
         deleted_at: Utc::now().timestamp(),
     });
-    write_manifest(&records)?;
+    if let Err(e) = write_manifest(&records) {
+        // Unrecorded, the file would sit in .trash invisible to the Trash view and never restorable
+        // - put it back where it was instead.
+        let _ = fs::rename(&destination, &source);
+        return Err(e);
+    }
 
     Ok(())
 }

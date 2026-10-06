@@ -113,7 +113,8 @@ const PrivacySection: React.FC = () => {
       </Field>
       <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
         Helps decide what to fix and build next. Sent: which features are used (e.g. "recording finished", with its length
-        and type), crash details with your user folder removed from file paths, app version and OS. Never sent: file names,
+        and type), crash details with your user folder removed from file paths, app version, OS, and a random ID for this
+        install that isn't linked to you (deleted when you turn this off). Never sent: file names,
         file contents, recordings, documents, or anything you type. Turning this off takes effect immediately.
       </p>
       {telemetry && !telemetry.available && (
@@ -479,6 +480,45 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   Press Ctrl+Shift+B (Cmd+Shift+B on Mac) any time to hide or show it instantly - handy right
                   before presenting or recording a screen that includes this window, so it doesn't end up in
                   the video.
+                </p>
+
+                <Field label="Notify when a recording starts">
+                  <input
+                    type="checkbox"
+                    checked={settings.notifyOnRecordingStart}
+                    onChange={(e) => update("notifyOnRecordingStart", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Shows where the file will be saved and the recording shortcuts each time you start.
+                </p>
+
+                <Field label="Countdown before recording">
+                  <div className="flex items-center gap-2">
+                    <select
+                      className={`${fieldInputClass} w-20`}
+                      value={settings.recordingCountdownSeconds}
+                      disabled={!settings.recordingCountdownEnabled}
+                      onChange={(e) => update("recordingCountdownSeconds", Number(e.target.value))}
+                    >
+                      {[3, 5, 10].map((s) => (
+                        <option key={s} value={s}>
+                          {s} sec
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="checkbox"
+                      checked={settings.recordingCountdownEnabled}
+                      onChange={(e) => update("recordingCountdownEnabled", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer"
+                    />
+                  </div>
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Counts down in the middle of the screen before capture starts, so you can get ready. Click the
+                  countdown, or press Record again, to cancel.
                 </p>
 
                 <Field label="Recording type">

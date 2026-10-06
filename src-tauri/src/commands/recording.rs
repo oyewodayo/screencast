@@ -101,6 +101,50 @@ pub struct AppState {
     // non-empty) as a sidecar JSON by stop_recording, same convention as click_capture's own
     // sidecar.
     view_switches: Arc<Mutex<Vec<ViewSwitchEvent>>>,
+    // The live timer's inputs for the recording in progress - see get_recording_status.
+    clock: Arc<std::sync::Mutex<Option<RecordingClock>>>,
+}
+
+// Wall-clock milliseconds, the same unit as the frontend's Date.now() its timer is built from.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingClock {
+    pub record_type: String,
+    pub started_at: i64,
+    pub pause_started_at: Option<i64>,
+    pub paused_accumulated_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStatus {
+    pub recording: bool,
+    pub clock: Option<RecordingClock>,
+}
+
+// Lets a page that lost its state - reloaded after its renderer crashed (services/
+// webview_recovery.rs), or opened while a recording runs - take control of the recording in
+// progress again. Without this the page shows "Record", pressing it fails with "already in
+// progress", and nothing on screen can stop the capture.
+#[tauri::command]
+pub async fn get_recording_status(state: State<'_, AppState>) -> Result<RecordingStatus, String> {
+    let recording = state.output_path.lock().await.is_some()
+        && state
+            .ffmpeg_process
+            .lock()
+            .await
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+    let clock = if recording {
+        state.clock.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    } else {
+        None
+    };
+    Ok(RecordingStatus { recording, clock })
 }
 
 // One user-initiated toggle between "Screen" and "Camera" as the primary view during a recording
@@ -1825,6 +1869,13 @@ pub async fn start_recording(
         parts.timer_zero_hns = Some(crate::services::audio_capture::now_hns());
     }
 
+    *state.clock.lock().unwrap_or_else(|p| p.into_inner()) = Some(RecordingClock {
+        record_type: form_data.record_type.clone(),
+        started_at: now_ms(),
+        pause_started_at: None,
+        paused_accumulated_ms: 0,
+    });
+
     Ok(output)
 }
 
@@ -2017,8 +2068,16 @@ fn retime_webcam(ffmpeg_path: &Path, segments: &assembly::Segments, camera: &ass
     hide_console_window(&mut cmd);
     match cmd.output() {
         Ok(out) if out.status.success() => {}
-        Ok(out) => warn!("Couldn't write the webcam layer: {}", extract_ffmpeg_error(&String::from_utf8_lossy(&out.stderr))),
-        Err(e) => warn!("Couldn't write the webcam layer: {}", e),
+        // A half-written sidecar has no moov atom and can't be opened - the editor would show a
+        // broken PiP layer and the thumbnailer would retry it forever. No file is better.
+        Ok(out) => {
+            let _ = fs::remove_file(&camera.final_path);
+            warn!("Couldn't write the webcam layer: {}", extract_ffmpeg_error(&String::from_utf8_lossy(&out.stderr)))
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&camera.final_path);
+            warn!("Couldn't write the webcam layer: {}", e)
+        }
     }
 }
 
@@ -2220,6 +2279,7 @@ pub async fn stop_recording(
         let mut app_state = state.output_path.lock().await;
         *app_state = None;
     }
+    *state.clock.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     info!("Recording stopped");
 
@@ -2230,6 +2290,16 @@ pub async fn stop_recording(
         *guard = None;
     }
 
+    // Capture has ended, but cleaning the audio and assembling the file still lie ahead - minutes,
+    // for a long recording on a busy machine. Showing the completion window now (as "finishing")
+    // rather than at the end is what tells the user their Stop registered; with nothing on screen
+    // for that long it looked ignored and got pressed again. It's reloaded with the outcome below.
+    let modal_path = path_to_str(&output_path)?.to_string();
+    if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, "processing", None).await {
+        warn!("Couldn't show the recording-finishing window: {}", e);
+    }
+
+    let finished: Result<String, String> = async {
     // Assemble a screen recording's final file from its parts (see recording/assembly.rs). Must
     // happen after ffmpeg has exited above - the video is stream-copied from its finished file.
     #[cfg(target_os = "windows")]
@@ -2353,20 +2423,28 @@ pub async fn stop_recording(
         }
     }
 
-    let output_str = path_to_str(&output_path)?;
+    let output_str = path_to_str(&output_path)?.to_string();
 
     if let Err(e) = app_handle.emit("refresh-file-list", ()) {
         warn!("Failed to emit refresh-file-list: {}", e);
     }
 
+    Ok(output_str)
+    }
+    .await;
+
     // A cosmetic popup must not turn a successful recording into a failed stop. The file is
     // already written and verified by this point; reporting "Failed to stop recording" because a
     // window wouldn't open tells the user their recording is lost when it is sitting on disk.
-    if let Err(e) = create_or_replace_rec_completed_modal(app_handle, output_str).await {
-        warn!("Recording saved, but the completion popup could not be shown: {}", e);
+    let (status, error) = match &finished {
+        Ok(_) => ("done", None),
+        Err(e) => ("failed", Some(e.as_str())),
+    };
+    if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, status, error).await {
+        warn!("Recording finished, but the completion popup could not be updated: {}", e);
     }
 
-    Ok(output_str.to_string())
+    finished
 }
 
 // Pauses the in-progress recording: suspends every thread of the ffmpeg process (see each
@@ -2416,6 +2494,9 @@ pub async fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
 
 
     *paused = true;
+    if let Some(clock) = state.clock.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        clock.pause_started_at = Some(now_ms());
+    }
     info!("Recording paused");
     Ok(())
 }
@@ -2441,6 +2522,11 @@ pub async fn resume_recording(state: State<'_, AppState>) -> Result<(), String> 
 
 
     *paused = false;
+    if let Some(clock) = state.clock.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        if let Some(since) = clock.pause_started_at.take() {
+            clock.paused_accumulated_ms += now_ms() - since;
+        }
+    }
     info!("Recording resumed");
     Ok(())
 }
@@ -2501,9 +2587,13 @@ pub fn prewarm_rec_completed_modal(app_handle: &tauri::AppHandle) {
     });
 }
 
+// `status` is "processing" (shown the moment Stop is pressed, while the file is still being finished),
+// "done" or "failed" (with `error`) - see FileModal.tsx's RecordingModalStatus.
 async fn create_or_replace_rec_completed_modal(
     app_handle: tauri::AppHandle,
     file_path: &str,
+    status: &str,
+    error: Option<&str>,
 ) -> Result<String, String> {
     // The file path is baked into the window's own URL (rather than sent via an event) because
     // the page reads it synchronously on its first render - an event emitted before its listener
@@ -2512,8 +2602,11 @@ async fn create_or_replace_rec_completed_modal(
     // Root-relative: the entry HTML sits beside index.html (see vite.config.ts's rollup input for
     // why it can't live under src-tauri/), which is where both the dev server and the bundled
     // frontend serve it from.
-    let encoded_path = urlencoding::encode(file_path).into_owned();
-    let url = format!("completed_recording.html?path={}", encoded_path);
+    let mut query = format!("path={}&status={}", urlencoding::encode(file_path), urlencoding::encode(status));
+    if let Some(error) = error {
+        query.push_str(&format!("&error={}", urlencoding::encode(error)));
+    }
+    let url = format!("completed_recording.html?{}", query);
 
     // spawn_blocking, not done inline: show()/navigate()/build() all marshal onto the main thread
     // and wait for it, so they must never be called from it - running them on a real background
@@ -2524,7 +2617,7 @@ async fn create_or_replace_rec_completed_modal(
                 .url()
                 .map_err(|e| format!("Failed to read popup URL: {}", e))?;
             target.set_path("/completed_recording.html");
-            target.set_query(Some(&format!("path={}", encoded_path)));
+            target.set_query(Some(&query));
             window
                 .navigate(target)
                 .map_err(|e| format!("Failed to load recording into popup: {}", e))?;

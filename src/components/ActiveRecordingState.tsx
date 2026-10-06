@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoMicCircle, IoPauseCircle, IoPlayCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoMapOutline, IoCutOutline } from 'react-icons/io5'
+import { IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoMapOutline, IoCutOutline } from 'react-icons/io5'
 
 export type RecordSource = "screen" | "video" | "audio";
 
@@ -310,35 +310,55 @@ const ActiveRecordingState = (
                                 ))}
                             </div>
                         )}
-                        {isRecording && (
-                            <div className={`ml-1 text-xs font-mono ${isPaused ? "text-amber-500" : "text-neutral-700 dark:text-white"}`}>
-                                {formatTime(elapsedTime)}{isPaused ? " (paused)" : ""}
+                        {isRecording ? (
+                            // One capsule for the recording in progress: state + time, pause, and a
+                            // Stop that says what it does. It used to be a pulsing green "radio"
+                            // dot, which read as "on" rather than as the way to stop.
+                            <div
+                                className={`ml-2 flex items-center gap-1 h-8 pl-2.5 pr-1 rounded-full ring-1 transition-colors ${
+                                    isPaused
+                                        ? "bg-amber-500/10 ring-amber-500/30"
+                                        : "bg-red-500/10 ring-red-500/25"
+                                }`}
+                            >
+                                <span className="relative flex h-2 w-2 mr-1">
+                                    {!isPaused && <span className="absolute inset-0 rounded-full bg-red-500 opacity-60 animate-ping" />}
+                                    <span className={`relative h-2 w-2 rounded-full ${isPaused ? "bg-amber-500" : "bg-red-500"}`} />
+                                </span>
+                                <span
+                                    className={`text-xs font-mono font-semibold tabular-nums ${isPaused ? "text-amber-600 dark:text-amber-400" : "text-neutral-800 dark:text-white"}`}
+                                    title={isPaused ? "Paused" : "Recording"}
+                                >
+                                    {formatTime(elapsedTime)}
+                                </span>
+                                <button
+                                    type="button"
+                                    title={isPaused ? "Resume recording" : "Pause recording"}
+                                    onClick={isPaused ? handleResumeRecording : handlePauseRecording}
+                                    className="ml-1 h-6 w-6 flex items-center justify-center rounded-full text-neutral-700 dark:text-neutral-200 hover:bg-black/10 dark:hover:bg-white/15 active:scale-90 transition"
+                                >
+                                    {isPaused ? <IoPlay size={12} className="ml-px" /> : <IoPause size={12} />}
+                                </button>
+                                <button
+                                    type="button"
+                                    title="Stop recording"
+                                    onClick={handleStopRecording}
+                                    className="h-6 flex items-center gap-1 pl-2 pr-2.5 rounded-full bg-red-500 hover:bg-red-600 text-white text-[11px] font-semibold active:scale-95 transition shadow-sm"
+                                >
+                                    <IoSquare size={8} />
+                                    Stop
+                                </button>
                             </div>
-                        )}
-                        {isRecording && (
+                        ) : (
                             <button
                                 type="button"
-                                title={isPaused ? "Resume recording" : "Pause recording"}
-                                onClick={isPaused ? handleResumeRecording : handlePauseRecording}
-                                className={`ml-1 ${iconButtonClass()}`}
+                                title="Start recording"
+                                onClick={onStartRecordingClick}
+                                className="cursor-pointer ml-1.5 h-7 w-7 flex items-center justify-center rounded-full ring-2 ring-red-500/80 hover:ring-red-500 hover:bg-red-500/10 active:scale-90 transition-all duration-150 outline-none focus-visible:ring-blue-400"
                             >
-                                {isPaused ? <IoPlayCircle /> : <IoPauseCircle />}
+                                <span className="h-3 w-3 rounded-full bg-red-500" />
                             </button>
                         )}
-                        <button
-                            type="button"
-                            title={isRecording ? "Stop recording" : "Start recording"}
-                            onClick={isRecording ? handleStopRecording : onStartRecordingClick}
-                            className={`cursor-pointer ml-1 p-1.5 rounded-full text-sm text-white active:scale-90 transition-all duration-150 outline-none ${
-                                !isRecording
-                                    ? "bg-red-500 hover:bg-red-400"
-                                    : isPaused
-                                    ? "bg-amber-500 hover:bg-amber-400"
-                                    : "bg-green-500 hover:bg-green-400 animate-pulse"
-                            }`}
-                        >
-                            <IoRadioButtonOn />
-                        </button>
                     </div>
                     )}
 

@@ -15,7 +15,8 @@
       "binaries/heif/*",
       "binaries/whisper/*.exe",
       "binaries/whisper/*.dll",
-      "binaries/rnnoise/*"
+      "binaries/rnnoise/*",
+      "licenses/*"
     ],
     "icon": [
       "icons/32x32.png",
@@ -109,6 +110,21 @@
         "height": 600,
         "resizable": false,
         "minimizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "visible": false,
+        "focus": false
+      },
+      {
+        "label": "countdown-overlay",
+        "title": "Countdown",
+        "url": "/countdown",
+        "width": 220,
+        "height": 220,
+        "resizable": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "decorations": false,

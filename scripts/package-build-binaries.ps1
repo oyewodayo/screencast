@@ -21,7 +21,11 @@ Copy-Item -Recurse "$src/heif", "$src/rnnoise" "$stage/binaries/"
 Copy-Item "$src/whisper/*.exe", "$src/whisper/*.dll" "$stage/binaries/whisper/"
 
 if (Test-Path $zip) { Remove-Item $zip }
-Compress-Archive -Path "$stage/binaries" -DestinationPath $zip -CompressionLevel Optimal
+# tar.exe (built into Windows 10+) rather than Compress-Archive: Windows PowerShell's
+# Compress-Archive stores paths with backslashes, which standard unzip tools reject.
+# Full path so a Git-for-Windows GNU tar on PATH (which can't write zips) is never picked up.
+& "$env:SystemRoot\System32\tar.exe" -a -c -f $zip -C $stage binaries
+if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
 Remove-Item -Recurse -Force $stage
 
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()

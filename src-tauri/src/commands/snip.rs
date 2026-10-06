@@ -352,7 +352,7 @@ pub async fn snip_begin(app_handle: AppHandle, delay_ms: Option<u64>) -> Result<
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn snip_info() -> Option<SnipInfo> {
     #[cfg(windows)]
     {
@@ -366,7 +366,7 @@ pub fn snip_info() -> Option<SnipInfo> {
 
 // The frozen image as raw RGBA, for the overlay to put straight into a canvas - no encoding on
 // either side, which is what makes the overlay appear instantly even on a 4K desktop.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn snip_frame() -> tauri::ipc::Response {
     #[cfg(windows)]
     {
@@ -489,7 +489,7 @@ pub async fn snip_finish(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn snip_cancel(app_handle: AppHandle) {
     #[cfg(windows)]
     {

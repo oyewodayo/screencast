@@ -38,6 +38,7 @@ import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
+import FileInfoModal from "../components/Modals/FileInfoModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
 import { PresentationLiveBar } from "../components/PresentationControls";
 import { getPresentationState, visibleCameras } from "../services/presentation";
@@ -54,6 +55,9 @@ import {
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
 import UpdateBanner from "../components/custom/UpdateBanner";
+import TelemetryNotice from "../components/custom/TelemetryNotice";
+import type { RecordingStatus } from "../utils/recordingStatus";
+import { cancelCountdown, isCountdownRunning, runRecordingCountdown } from "../utils/recordingCountdown";
 import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
 import type { Update } from "@tauri-apps/plugin-updater";
@@ -105,6 +109,7 @@ import {
   IoSwapVerticalOutline,
   IoEyeOffOutline,
   IoEyeOutline,
+  IoInformationCircleOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -606,6 +611,10 @@ const Dashboard = () => {
     setIsCroppingClip(false);
   }, [selectedFile?.path]);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
+// File whose "Info" panel (FileInfoModal) is open, from the sidebar file menu.
+const [infoFile, setInfoFile] = useState<{path: string; name: string} | null>(null);
+// Same panel for a Trash row, which is addressed by its trashed name rather than a live path.
+const [infoTrashItem, setInfoTrashItem] = useState<TrashEntry | null>(null);
 const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | null>(null);
   // What BottomDocker's collapsible panel shows: the default recording-setup controls, or quick
   // tools (rename/convert/reveal/delete + at-a-glance info) for whichever file is currently open.
@@ -1057,6 +1066,12 @@ const setScreen = () => {
   };
 
   const handleStartRecording = async (formData: any) => {
+    // Record pressed again (button or hotkey) while the countdown is still running: that's a
+    // change of mind - cancel it rather than queue a second start.
+    if (isCountdownRunning()) {
+      cancelCountdown();
+      return;
+    }
     // Read at the moment of recording rather than threaded through every caller - the panel and
     // the record hotkey both land here.
     const recordingPrefs = loadSettings();
@@ -1083,6 +1098,12 @@ const setScreen = () => {
         );
         return;
       }
+    }
+    // Optional "3, 2, 1" (Settings > Recording) - after the checks above, so a start that's going to
+    // be refused anyway doesn't make the user wait through a countdown first.
+    if (recordingPrefs.recordingCountdownEnabled) {
+      const go = await runRecordingCountdown(recordingPrefs.recordingCountdownSeconds);
+      if (!go) return;
     }
     try {
         await activateTargetWindowIfNeeded();
@@ -1191,11 +1212,14 @@ const setScreen = () => {
           await bindShortcut(VIEW_SWITCH_SHORTCUT, () => void switchViewRef.current('toggle'));
         }
 
-        setMessage(
-          switchable
-            ? `${response} (Alt+Shift+V switches between screen and camera, Ctrl+Shift+H shows the recording overlay)`
-            : `${response} (Ctrl+Shift+H to show/hide the recording overlay)`
-        );
+        // Opt-in (Settings > Recording) - see AppSettings.notifyOnRecordingStart.
+        if (loadSettings().notifyOnRecordingStart) {
+          setMessage(
+            switchable
+              ? `${response} (Alt+Shift+V switches between screen and camera, Ctrl+Shift+H shows the recording overlay)`
+              : `${response} (Ctrl+Shift+H to show/hide the recording overlay)`
+          );
+        }
 
     } catch (error) {
         console.error("Error starting recording:", error);
@@ -1283,31 +1307,22 @@ const setScreen = () => {
       }
     }
 
-    try {
-      const response = await invoke<string>("stop_recording");
-      // Wall-clock span (includes any paused time) - the overlay's own stop path reports the exact
-      // pause-aware duration instead.
-      trackEvent("recording_finished", {
-        durationSeconds: recordingStartTime ? Math.round((Date.now() - recordingStartTime) / 1000) : 0,
-        stoppedFrom: "main",
-      });
-      const audio = new Audio("/sounds/option-3.mp3");
-      audio.play().catch(err => console.error("Error playing audio:", err));
-      setMessage(response);
-    } catch (error) {
-      console.error("Error stopping recording:", error);
-      setError(`Failed to stop recording: ${error}`);
-    }
-
-    // ffmpeg has already been asked to stop and torn down on the backend by the time
-    // stop_recording rejects (e.g. the capture device disappeared mid-recording and no output
-    // file was produced), so this window's own state still needs resetting either way - same
-    // reasoning as RecordingOverlayWindow.tsx's own handleStopRecording.
+    // Everything the user sees changes NOW, not when stop_recording returns: capture ends within a
+    // moment, but cleaning the audio and assembling the file can take minutes for a long
+    // recording, and a Stop that leaves the timer running that long reads as ignored (it got
+    // pressed again, on the overlay, which then failed with "No recording in progress"). The
+    // backend shows the completion window in a "finishing" state meanwhile.
+    // Wall-clock span (includes any paused time) - the overlay's own stop path reports the exact
+    // pause-aware duration instead.
+    const durationSeconds = recordingStartTime ? Math.round((Date.now() - recordingStartTime) / 1000) : 0;
     setIsRecording(false);
     setRecordingStartTime(null);
     setIsPaused(false);
     setPauseStartedAt(null);
     setPausedAccumulatedMs(0);
+    setCanSwitchView(false);
+    const audio = new Audio("/sounds/option-3.mp3");
+    audio.play().catch(err => console.error("Error playing audio:", err));
 
     // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
     const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
@@ -1316,7 +1331,19 @@ const setScreen = () => {
     }
     await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
     await unbindShortcut(VIEW_SWITCH_SHORTCUT);
-    setCanSwitchView(false);
+
+    try {
+      // The finished path is shown by the completion window, so no toast repeats it here.
+      await invoke<string>("stop_recording");
+      trackEvent("recording_finished", { durationSeconds, stoppedFrom: "main" });
+    } catch (error) {
+      // A second Stop (from the overlay, a shortcut) while the first is still finishing - the
+      // recording is already being saved, so there is nothing to report.
+      if (!String(error).includes("No recording in progress")) {
+        console.error("Error stopping recording:", error);
+        setError(`Failed to stop recording: ${error}`);
+      }
+    }
 
     if (isMonitoring) {
       try {
@@ -1442,6 +1469,22 @@ const setScreen = () => {
 				if (purgedCount > 0) console.log(`Purged ${purgedCount} expired trash item(s)`);
 			})
 			.catch((error) => console.error("Error purging expired trash:", error));
+	}, []);
+
+	// A recording can outlive this page: services/webview_recovery.rs reloads it if its renderer
+	// crashes. Picking the running recording back up keeps the Stop button (and timer) working -
+	// otherwise the page would offer Record, which the backend refuses while one is in progress.
+	useEffect(() => {
+		invoke<RecordingStatus>("get_recording_status")
+			.then(({ recording, clock }) => {
+				if (!recording || !clock) return;
+				setIsRecording(true);
+				setRecordingStartTime(clock.startedAt);
+				setIsPaused(clock.pauseStartedAt !== null);
+				setPauseStartedAt(clock.pauseStartedAt);
+				setPausedAccumulatedMs(clock.pausedAccumulatedMs);
+			})
+			.catch((error) => console.error("Error checking for a recording in progress:", error));
 	}, []);
 
 	// One update check per launch, delayed so it never competes with startup work (device probes,
@@ -3183,6 +3226,14 @@ const setScreen = () => {
                             <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
                               <button
                                 type="button"
+                                title="Info"
+                                onClick={() => setInfoTrashItem(item)}
+                                className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                              >
+                                <IoInformationCircleOutline size={14} />
+                              </button>
+                              <button
+                                type="button"
                                 title="Restore"
                                 onClick={() => handleRestoreFromTrash(item)}
                                 className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
@@ -3598,6 +3649,18 @@ const setScreen = () => {
                                         </div>
                                       )}
 
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setInfoFile({ path: file.path, name: file.name });
+                                          setOpenMenu(null);
+                                        }}
+                                      >
+                                        <IoInformationCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">Info</span>
+                                      </button>
+
                                       <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
                                       <button
                                           className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
@@ -3624,6 +3687,22 @@ const setScreen = () => {
               </div>
             )}
           </div>
+
+          {infoTrashItem && (
+            <FileInfoModal
+              item={{ kind: "trash", id: infoTrashItem.trashed_name }}
+              fileName={infoTrashItem.name}
+              onClose={() => setInfoTrashItem(null)}
+            />
+          )}
+
+          {infoFile && (
+            <FileInfoModal
+              filePath={infoFile.path}
+              fileName={infoFile.name}
+              onClose={() => setInfoFile(null)}
+            />
+          )}
 
           {/* Conversion Dialog */}
           {conversionFile && (
@@ -3917,6 +3996,7 @@ const setScreen = () => {
               resolveFullUrl={resolveImageDisplayUrl}
               onOpenImage={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
+              onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
               renamingFile={renamingFile}
               renameValue={renameValue}
@@ -3941,6 +4021,7 @@ const setScreen = () => {
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
               onOpenVideo={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
+              onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
               renamingFile={renamingFile}
               renameValue={renameValue}
@@ -3965,6 +4046,7 @@ const setScreen = () => {
               resolveAssetUrl={resolvePreviewAssetUrl}
               onOpenPdf={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
+              onShowInfo={(file) => setInfoFile(file)}
               renamingFile={renamingFile}
               renameValue={renameValue}
               onRenameValueChange={setRenameValue}
@@ -3987,6 +4069,7 @@ const setScreen = () => {
               folderLabel={folderDisplayName(selectedFolder)}
               onOpenDocument={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
+              onShowInfo={(file) => setInfoFile(file)}
               renamingFile={renamingFile}
               renameValue={renameValue}
               onRenameValueChange={setRenameValue}
@@ -4244,6 +4327,7 @@ const setScreen = () => {
         {pendingUpdate && (
           <UpdateBanner update={pendingUpdate} isRecording={isRecording} onDismiss={() => setPendingUpdate(null)} />
         )}
+        <TelemetryNotice />
       </div>
     </div>
   );

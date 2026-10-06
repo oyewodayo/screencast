@@ -49,7 +49,7 @@
     "lowlight": "^3.3.0",
     "mammoth": "^1.12.1",
     "pdf-lib": "^1.17.1",
-    "pdfjs-dist": "6.1.200",
+    "pdfjs-dist": "6.4.299",
     "perfect-freehand": "1.2.3",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
