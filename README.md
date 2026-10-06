@@ -7,6 +7,8 @@ built with [Tauri](https://tauri.app/) (Rust) and [React](https://react.dev/) +
 TypeScript, and uses bundled [FFmpeg](https://ffmpeg.org/) binaries for capture,
 transcoding, and probing.
 
+**User guide:** see the [documentation at withbriefs.com/briefcast/docs](https://withbriefs.com/briefcast/docs) for how to use every feature, from your first recording to the keyboard shortcuts. This README covers the project from a developer's side.
+
 ## Features
 
 ### Recording

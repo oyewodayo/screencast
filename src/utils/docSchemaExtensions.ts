@@ -32,6 +32,7 @@ import DocIndent from "./docIndentExtension";
 import CommentMark from "./docCommentMark";
 import DocPageBreak from "./docPageBreakExtension";
 import DocLink from "./docLinkExtension";
+import { MathBlock, MathInline } from "./docMathExtension";
 
 // `common` (not `all`) - covers every mainstream language (JS/TS, Python, Rust, Go, JSON, etc.)
 // without bundling lowlight's full ~190-grammar set, which this doc editor has no need for.
@@ -123,6 +124,8 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     Superscript,
     CommentMark,
     DocPageBreak,
+    MathInline,
+    MathBlock,
   ];
 }
 

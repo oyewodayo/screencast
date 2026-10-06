@@ -557,6 +557,18 @@ fn main() {
         .build(context)
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // Closing the main window quits Briefcast. Tauri only exits once EVERY window is gone,
+            // and the overlay windows (recording bar, screenshot picker, annotation, countdown,
+            // live display, completion popup) are pre-built and merely hidden - so the process used
+            // to stay alive invisibly after the user closed the app, and the single-instance guard
+            // then turned every relaunch into "focus a main window that no longer exists": nothing
+            // happened at all. Destroyed, not CloseRequested, so the editors' own save-on-quit
+            // handlers (which delay the close until they've flushed) always finish first.
+            if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } = &event {
+                if label == "main" {
+                    app_handle.exit(0);
+                }
+            }
             if let tauri::RunEvent::Exit = event {
                 commands::window_capture::cleanup_stale_window_screenshots();
                 commands::native_playback::cleanup_all_sessions(

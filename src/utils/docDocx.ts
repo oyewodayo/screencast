@@ -22,6 +22,7 @@ import {
   IBordersOptions,
   type ICommentOptions,
   ImageRun,
+  ImportedXmlComponent,
   LevelFormat,
   Packer,
   PageBreak,
@@ -31,6 +32,8 @@ import {
   Table,
   TableCell,
   TableRow,
+  Tab,
+  TabStopType,
   TextRun,
   UnderlineType,
   WidthType,
@@ -38,6 +41,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import type { DocComment, DocMargins, DocPageSize } from "./docTypes";
 import { PAGE_DIMENSIONS_IN, resolveMargins } from "./docPageGeometry";
+import { latexToOmml } from "./docMathOmml";
 
 const ALIGNMENT_BY_TEXT_ALIGN: Record<string, (typeof AlignmentType)[keyof typeof AlignmentType]> = {
   left: AlignmentType.LEFT,
@@ -126,6 +130,20 @@ async function buildImageRun(src: string, width?: number | null, height?: number
   }
 }
 
+// docMathOmml.ts's OMML as a run-level child. fromXmlString wraps what it parses in a nameless
+// root element; its one child is the <m:oMath> / <m:oMathPara> itself. Word reads <m:oMath>
+// directly inside a <w:p> - the `docx` library already declares the m: namespace on the document.
+function ommlChild(xml: string): ParagraphChild {
+  const wrapper = ImportedXmlComponent.fromXmlString(xml) as unknown as { root: unknown[] };
+  return wrapper.root[0] as ParagraphChild;
+}
+
+// An equation KaTeX can't parse still exports - as its LaTeX source, in the same monospace style
+// inline code gets, so it's obvious in Word what needs fixing.
+function mathFallbackRun(latex: string, display: boolean): TextRun {
+  return new TextRun({ text: display ? `$$${latex}$$` : `$${latex}$`, font: "Consolas" });
+}
+
 // Flat TextRun properties, unlike docMarkdown.ts's string-wrapping - a docx run's formatting is a
 // property bag, not markup, so there's no nesting/precedence concern here. forceBold is used by
 // table-header cells (docx has no distinct header-cell type, unlike tableHeader in the schema).
@@ -206,6 +224,11 @@ async function renderInline(content: JSONContent[] | undefined, commentIdFor: (u
       const src = (node.attrs?.src as string) ?? "";
       const image = await buildImageRun(src, node.attrs?.width, node.attrs?.height);
       if (image) runs.push(image);
+    } else if (node.type === "mathInline") {
+      const latex = (node.attrs?.latex as string) ?? "";
+      const omml = latex ? latexToOmml(latex, false) : null;
+      if (omml) runs.push(ommlChild(omml));
+      else if (latex) runs.push(mathFallbackRun(latex, false));
     }
   }
   closeComment();
@@ -249,6 +272,11 @@ class DocxBuilder {
   private comments: DocComment[] = [];
   private commentNumericIds = new Map<string, number>();
   private nextCommentNumericId = 0;
+  // Display equations numbered so far - the same document-order count docMath.css's counter shows.
+  private equationNumber = 0;
+  // Width between the margins in twips, set by build() before rendering - where a numbered
+  // equation's centre and right tab stops go.
+  private textWidthTwips = 0;
 
   // An arrow class field (auto-bound), not a plain method, so it can be passed directly as
   // renderInline's commentIdFor callback without a separate .bind(this) at every call site.
@@ -438,6 +466,28 @@ class DocxBuilder {
         const table = await this.renderTable(node);
         return table ? [table] : [];
       }
+      // A numbered equation is centred with its number flush right via a centre and a right tab
+      // stop, the usual Word layout; an unnumbered one is a display-math paragraph of its own.
+      case "mathBlock": {
+        const latex = ((node.attrs?.latex as string) ?? "").trim();
+        if (!latex) return [];
+        const numbered = node.attrs?.numbered !== false;
+        const number = numbered ? ++this.equationNumber : 0;
+        const omml = latexToOmml(latex, true);
+        const math = omml ? ommlChild(numbered ? omml : `<m:oMathPara>${omml}</m:oMathPara>`) : mathFallbackRun(latex, true);
+        if (!numbered) return [new Paragraph({ children: [math], alignment: AlignmentType.CENTER, indent, border })];
+        return [
+          new Paragraph({
+            tabStops: [
+              { type: TabStopType.CENTER, position: Math.round(this.textWidthTwips / 2) },
+              { type: TabStopType.RIGHT, position: this.textWidthTwips },
+            ],
+            children: [new TextRun({ children: [new Tab()] }), math, new TextRun({ children: [new Tab(), `(${number})`] })],
+            indent,
+            border,
+          }),
+        ];
+      }
       // docx's own PageBreak is a Run (extends Run - see its own import), the standard idiom for
       // forcing one is a Paragraph containing nothing but it.
       case "pageBreak":
@@ -455,6 +505,11 @@ class DocxBuilder {
 
   async build(json: JSONContent, title: string, options: DocxExportOptions = {}): Promise<Uint8Array> {
     this.comments = options.comments ?? [];
+    // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
+    // the doc's own margins, not docx's unrelated defaults.
+    const dims = PAGE_DIMENSIONS_IN[options.pageSize ?? "letter"];
+    const m = resolveMargins(options.margins);
+    this.textWidthTwips = Math.round((dims.width - m.left - m.right) * TWIPS_PER_IN);
     const children = await this.renderBlocks(json.content ?? []);
 
     // Only comments whose mark actually appears somewhere in the rendered content end up here -
@@ -476,12 +531,8 @@ class DocxBuilder {
       };
     });
 
-    // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
-    // the doc's own margins, not docx's unrelated defaults.
-    const dims = PAGE_DIMENSIONS_IN[options.pageSize ?? "letter"];
     const width = `${dims.width}in` as PositiveUniversalMeasure;
     const height = `${dims.height}in` as PositiveUniversalMeasure;
-    const m = resolveMargins(options.margins);
     const inch = (v: number) => `${v}in` as PositiveUniversalMeasure;
 
     const doc = new Document({

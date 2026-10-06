@@ -22,7 +22,7 @@ import {
   MdShortText,
   MdInsertPageBreak,
 } from "react-icons/md";
-import { TbTable } from "react-icons/tb";
+import { TbMath, TbMathFunction, TbTable } from "react-icons/tb";
 import SlashCommandMenu, { SlashCommandItem } from "../components/docs/SlashCommandMenu";
 import { uploadImageFromPath } from "./docImagePaste";
 
@@ -82,6 +82,18 @@ function buildItems(docId: string): SlashCommandItem[] {
       icon: TbTable,
       run: (editor, range) =>
         editor.chain().focus().deleteRange(range).insertTable({ rows: 3, cols: 4, withHeaderRow: true }).run(),
+    },
+    {
+      title: "Equation",
+      keywords: ["equation", "math", "latex", "formula", "katex", "display"],
+      icon: TbMathFunction,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertMathBlock().run(),
+    },
+    {
+      title: "Inline equation",
+      keywords: ["inline", "equation", "math", "latex", "formula", "katex"],
+      icon: TbMath,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertMathInline().run(),
     },
     {
       title: "Divider",

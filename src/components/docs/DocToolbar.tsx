@@ -54,7 +54,7 @@ import {
   MdUndo,
 } from "react-icons/md";
 import { BiHighlight } from "react-icons/bi";
-import { TbTable, TbTableOptions } from "react-icons/tb";
+import { TbMath, TbMathFunction, TbTable, TbTableOptions } from "react-icons/tb";
 import DocColorPicker from "./DocColorPicker";
 import { DICTATION_LANGUAGES, DocDictation } from "../../hooks/useDocDictation";
 import { PaintKind, getPaintState } from "../../utils/docPaintExtension";
@@ -683,6 +683,14 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
       {opts.keys && <span className="text-xs text-neutral-400">{opts.keys}</span>}
     </button>
   );
+  // Shared by the bar's equation menu and the More menu's Insert section. Inline equation turns
+  // any selected text into the equation's source.
+  const equationItems = (
+    <>
+      {menuAction("Equation", TbMathFunction, () => editor.chain().focus().insertMathBlock().run(), { keys: "$$" })}
+      {menuAction("Inline equation", TbMath, () => editor.chain().focus().insertMathInline().run(), { keys: "$…$" })}
+    </>
+  );
 
   return (
     <div className="@container relative shrink-0 px-3 pt-1.5 pb-2 print:hidden">
@@ -940,6 +948,9 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
               }}
             />
           </Dropdown>
+          <Dropdown {...bind("equation")} label="Insert equation" trigger={<TbMathFunction size={19} strokeWidth={1.75} />} panelClassName="w-60 py-1.5">
+            {equationItems}
+          </Dropdown>
         </div>
 
         {inTable && (
@@ -1057,6 +1068,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
           <MenuSection title="Insert" className="@4xl:hidden">
             {menuAction("Image", MdImage, onInsertImage)}
             {menuAction("Table (3 × 3)", TbTable, () => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run())}
+            {equationItems}
           </MenuSection>
           <MenuSection title="Align" className="@5xl:hidden">
             {alignItems}

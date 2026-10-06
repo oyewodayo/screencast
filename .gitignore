@@ -41,3 +41,8 @@ RECORDING_UPGRADE_NOTES.md
 /src-tauri/binaries/bin/ffmpeg/ffmpeg
 /src-tauri/binaries/bin/ffmpeg/ffprobe
 /src-tauri/binaries/bin/ffmpeg/ffplay
+
+# The user guide lives in the website repo (served at withbriefs.com/briefcast/docs), not here.
+# Only docs/README.md - a pointer to it - is published with the app source.
+docs/*
+!docs/README.md

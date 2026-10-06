@@ -71,6 +71,9 @@ function renderInline(content: JSONContent[] | undefined, comments: DocComment[]
     // - one can appear anywhere inside a paragraph/heading/list item's own content array, not just
     // as its own top-level block (see renderBlock's "image" case below for that path).
     else if (node.type === "image") result += imageMarkdown(node);
+    // The `$...$` / `$$...$$` convention Pandoc, Obsidian, GitHub and most KaTeX/MathJax-enabled
+    // Markdown renderers read.
+    else if (node.type === "mathInline") result += `$${(node.attrs?.latex as string) ?? ""}$`;
   }
   closeComment();
   return result;
@@ -121,6 +124,13 @@ function renderBlock(node: JSONContent, comments: DocComment[]): string {
     }
     case "image":
       return imageMarkdown(node);
+    // 	ag{n} keeps the number the equation has in Docs - KaTeX and MathJax both honour it.
+    case "mathBlock": {
+      const latex = ((node.attrs?.latex as string) ?? "").trim();
+      if (!latex) return "";
+      const number = equationNumbers.get(node);
+      return `$$\n${latex}${number ? ` \\tag{${number}}` : ""}\n$$`;
+    }
     // No CommonMark syntax for a page break either - "\n\n---\n\n" would be indistinguishable from
     // a real horizontal rule if this schema had one, so this uses the same defanged HTML-comment
     // convention as commentAnnotation above instead of overloading `---`.
@@ -150,10 +160,23 @@ function renderBlock(node: JSONContent, comments: DocComment[]): string {
   }
 }
 
+// Display equations' numbers, in document order - assigned up front because renderBlock recurses
+// through lists, quotes and tables without a shared counter.
+let equationNumbers = new WeakMap<JSONContent, number>();
+
+function numberEquations(node: JSONContent, next: { n: number }): void {
+  if (node.type === "mathBlock" && node.attrs?.numbered !== false && ((node.attrs?.latex as string) ?? "").trim()) {
+    equationNumbers.set(node, ++next.n);
+  }
+  for (const child of node.content ?? []) numberEquations(child, next);
+}
+
 function renderBlocks(nodes: JSONContent[], comments: DocComment[]): string {
   return nodes.map((node) => renderBlock(node, comments)).join("\n\n");
 }
 
 export function docJsonToMarkdown(json: JSONContent, comments: DocComment[] = []): string {
+  equationNumbers = new WeakMap();
+  numberEquations(json, { n: 0 });
   return renderBlocks(json.content ?? [], comments);
 }

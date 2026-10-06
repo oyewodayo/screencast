@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as Y from "yjs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
+import { ask, open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import BottomDocker from "../components/BottomDocker";
 import { listen, emit } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
@@ -1486,6 +1486,35 @@ const setScreen = () => {
 			})
 			.catch((error) => console.error("Error checking for a recording in progress:", error));
 	}, []);
+
+	// Closing the main window quits Briefcast (main.rs), which would end a recording in progress
+	// abruptly - its parts never assembled into a file. So while recording, closing asks first, and
+	// "Stop and quit" saves the recording properly before letting the close through.
+	useEffect(() => {
+		if (!isRecording) return;
+		let ownClose = false;
+		const unlistenPromise = appWindow.onCloseRequested(async (event) => {
+			if (ownClose) return;
+			event.preventDefault();
+			const stopAndQuit = await ask("A recording is in progress. Stop and save it, then quit Briefcast?", {
+				title: "Recording in progress",
+				kind: "warning",
+				okLabel: "Stop and quit",
+				cancelLabel: "Keep recording",
+			});
+			if (!stopAndQuit) return;
+			try {
+				await invoke("stop_recording");
+			} catch (error) {
+				console.error("Error stopping recording before quitting:", error);
+			}
+			ownClose = true;
+			await appWindow.close();
+		});
+		return () => {
+			unlistenPromise.then((unlisten) => unlisten());
+		};
+	}, [isRecording]);
 
 	// One update check per launch, delayed so it never competes with startup work (device probes,
 	// file list, thumbnails). Shown as a dismissible card - see UpdateBanner.

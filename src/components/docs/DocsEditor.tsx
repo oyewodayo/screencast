@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { Extension } from "@tiptap/core";
 import { useEditor, EditorContent } from "@tiptap/react";
+import katex from "katex";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
 import { IoArrowBack, IoChatbubbleOutline, IoClose, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
@@ -112,6 +113,24 @@ async function buildStandaloneHtml(title: string, bodyHtml: string): Promise<str
       }
     })
   );
+  // Equations as native MathML (every current browser renders it, no fonts or stylesheet to
+  // bundle); the LaTeX source stays in data-latex. Numbered display equations get their (n).
+  let equationNumber = 0;
+  dom.querySelectorAll<HTMLElement>("[data-math-inline], [data-math-block]").forEach((el) => {
+    const display = el.hasAttribute("data-math-block");
+    const latex = el.getAttribute("data-latex") ?? "";
+    try {
+      el.innerHTML = katex.renderToString(latex, { displayMode: display, output: "mathml", throwOnError: false, strict: "ignore" });
+    } catch {
+      el.textContent = display ? `$$${latex}$$` : `$${latex}$`;
+    }
+    if (display && latex.trim() && el.getAttribute("data-numbered") !== "false") {
+      const tag = dom.createElement("span");
+      tag.className = "eq-number";
+      tag.textContent = `(${++equationNumber})`;
+      el.appendChild(tag);
+    }
+  });
   const css = [
     "body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;line-height:1.6;color:#1f1f1f;max-width:7.5in;margin:48px auto;padding:0 24px}",
     "h1,h2,h3,h4{line-height:1.25;margin:1.4em 0 .5em}",
@@ -119,6 +138,7 @@ async function buildStandaloneHtml(title: string, bodyHtml: string): Promise<str
     "table{border-collapse:collapse;width:100%;margin:1em 0}th,td{border:1px solid #d0d0d0;padding:6px 10px;vertical-align:top;text-align:left}th{background:#f3f3f3}",
     "blockquote{margin:1em 0;padding:.2em 1em;border-left:3px solid #d0d0d0;color:#555}",
     "pre{background:#f6f8fa;padding:12px 14px;border-radius:6px;overflow:auto}code{font-family:Consolas,'Courier New',monospace;font-size:.92em}",
+    "[data-math-block]{position:relative;text-align:center;margin:1em 0;padding:0 3.5em}[data-math-block] math{display:block}.eq-number{position:absolute;right:0;top:50%;transform:translateY(-50%)}",
     "a{color:#1a56db}[data-page-break]{break-after:page}hr{border:0;border-top:1px solid #d0d0d0;margin:1.5em 0}",
   ].join("");
   return `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>${escapeHtml(title || "Document")}</title>\n<style>${css}</style>\n</head>\n<body>\n${dom.body.innerHTML}\n</body>\n</html>\n`;
