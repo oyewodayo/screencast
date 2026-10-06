@@ -125,7 +125,7 @@ const DocVersionHistoryPanel: React.FC<DocVersionHistoryPanelProps> = ({ docId, 
           <h2 className="text-sm font-medium text-neutral-800 dark:text-neutral-100">Version history</h2>
           <button
             type="button"
-            title="Close"
+            data-tip="Close"
             onClick={onClose}
             className="ml-auto p-1.5 rounded-md text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800"
           >

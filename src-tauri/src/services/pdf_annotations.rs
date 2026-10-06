@@ -15,8 +15,9 @@ fn sidecar_path_for(pdf_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-#[command]
+#[command(async)]
 pub fn save_pdf_annotations(pdf_path: String, json: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let pdf = PathBuf::from(&pdf_path);
     if !pdf.exists() {
         return Err(format!("PDF does not exist: {}", pdf_path));
@@ -33,8 +34,9 @@ pub fn save_pdf_annotations(pdf_path: String, json: String) -> Result<(), String
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn load_pdf_annotations(pdf_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sidecar = sidecar_path_for(&PathBuf::from(&pdf_path));
     if !sidecar.exists() {
         return Ok(None);
@@ -48,8 +50,9 @@ pub fn load_pdf_annotations(pdf_path: String) -> Result<Option<String>, String> 
 // pdf-lib) to "<name> (annotated).pdf" next to the source PDF - same naming convention
 // export_trimmed_video uses for its own sibling output file. Unlike the sidecar JSON, this is a
 // real, standalone PDF: readable in any viewer, not just this app.
-#[command]
+#[command(async)]
 pub fn save_exported_pdf(pdf_path: String, bytes: Vec<u8>) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let pdf = PathBuf::from(&pdf_path);
     if !pdf.exists() {
         return Err(format!("PDF does not exist: {}", pdf_path));

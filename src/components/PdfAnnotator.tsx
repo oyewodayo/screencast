@@ -21,7 +21,6 @@ const IMAGE_MAX_INITIAL_WIDTH_FRACTION = 0.5; // fraction of the page's width, a
 interface PdfAnnotatorProps {
   src: string; // asset:// URL, for loading PDF bytes via pdf.js
   sourcePath: string; // raw filesystem path, for the annotations sidecar
-  title?: string;
   isFullscreen: boolean;
   onToggleFullscreen: () => void;
 }
@@ -39,7 +38,7 @@ const MAX_ZOOM = 3;
 // the old plain <iframe> viewer (which couldn't support drawing at all). Owns the active tool
 // and viewport state; delegates PDF loading to usePdfDocument and annotation persistence/
 // undo-redo to useAnnotationStore.
-const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isFullscreen, onToggleFullscreen }) => {
+const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscreen, onToggleFullscreen }) => {
   const { pdfDoc, numPages, loading: pdfLoading, error: pdfError } = usePdfDocument(src);
   const store = useAnnotationStore(sourcePath);
   const pageCache = usePageRenderCache();
@@ -555,7 +554,9 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
         // the toolbar is on screen).
         <button
           type="button"
-          title="Exit fullscreen (F or Esc)"
+          data-tip="Exit fullscreen"
+          data-tip-kbd="F"
+          aria-label="Exit fullscreen"
           onClick={onToggleFullscreen}
           className="fixed top-4 right-4 z-50 flex items-center justify-center w-9 h-9 rounded-full bg-black/40 text-white hover:bg-black/60 backdrop-blur-sm transition-colors"
         >
@@ -563,7 +564,6 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, title, isF
         </button>
       ) : (
         <AnnotationToolbar
-          title={title}
           sidebarView={sidebarView}
           onSidebarViewChange={handleSidebarViewChange}
           tool={tool}

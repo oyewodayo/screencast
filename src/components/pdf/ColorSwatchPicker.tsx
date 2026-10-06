@@ -64,7 +64,8 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
       <button
         ref={buttonRef}
         type="button"
-        title="Color"
+        data-tip="Color"
+        aria-label="Color"
         // Callers can embed this next to a focused input (e.g. a text note's textarea) that
         // commits/closes itself on blur — suppressing the default mousedown focus-shift here
         // keeps that input focused instead of stealing it, so opening the picker doesn't trigger

@@ -5,7 +5,7 @@
 // meant the whole binary couldn't compile on macOS/Linux regardless of anything else — moved
 // here and given a real implementation per platform, same pattern as recording.rs.
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_ram_info() -> Result<(u64, u64), String> {
     #[cfg(target_os = "windows")]
     return windows::ram_info();

@@ -38,7 +38,7 @@ fn whiteboards_root() -> Result<PathBuf, String> {
 // but every command below is directly reachable, so this boundary is enforced here regardless of
 // caller - rejects anything that could escape whiteboards_root() via a path separator or a
 // "." / ".." segment.
-fn whiteboard_dir(id: &str) -> Result<PathBuf, String> {
+pub(crate) fn whiteboard_dir(id: &str) -> Result<PathBuf, String> {
     if id.is_empty() || id.contains(['/', '\\']) || id == "." || id == ".." {
         return Err("Invalid whiteboard id".to_string());
     }
@@ -73,8 +73,9 @@ fn read_summary(dir: &PathBuf, id: &str) -> Option<WhiteboardSummary> {
     })
 }
 
-#[command]
+#[command(async)]
 pub fn list_whiteboards() -> Result<Vec<WhiteboardSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = whiteboards_root()?;
     let mut summaries: Vec<WhiteboardSummary> = Vec::new();
 
@@ -99,8 +100,9 @@ pub fn list_whiteboards() -> Result<Vec<WhiteboardSummary>, String> {
     Ok(summaries)
 }
 
-#[command]
+#[command(async)]
 pub fn create_whiteboard(id: String, name: String, json: String) -> Result<WhiteboardSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = whiteboard_dir(&id)?;
     if dir.exists() {
         return Err("A whiteboard with that id already exists".to_string());
@@ -140,8 +142,9 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 // same "frontend owns the document shape" division of labor as boards.rs's duplicate_board:
 // the frontend calls load_whiteboard/save_whiteboard right after this to patch those fields in.
 // `new_id` is frontend-generated (crypto.randomUUID()), same convention create_whiteboard's `id` uses.
-#[command]
+#[command(async)]
 pub fn duplicate_whiteboard(source_id: String, new_id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let source_dir = whiteboard_dir(&source_id)?;
     if !source_dir.is_dir() {
         return Err("Source whiteboard does not exist".to_string());
@@ -153,8 +156,9 @@ pub fn duplicate_whiteboard(source_id: String, new_id: String) -> Result<(), Str
     copy_dir_recursive(&source_dir, &dest_dir)
 }
 
-#[command]
+#[command(async)]
 pub fn save_whiteboard(id: String, json: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = whiteboard_dir(&id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create whiteboard folder: {}", e))?;
 
@@ -165,14 +169,16 @@ pub fn save_whiteboard(id: String, json: String) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn load_whiteboard(id: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let target = whiteboard_dir(&id)?.join("whiteboard.json");
     fs::read_to_string(&target).map_err(|e| format!("Failed to load whiteboard: {}", e))
 }
 
-#[command]
+#[command(async)]
 pub fn delete_whiteboard(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = whiteboard_dir(&id)?;
     fs::remove_dir_all(&dir).map_err(|e| format!("Failed to delete whiteboard: {}", e))
 }
@@ -197,12 +203,13 @@ fn whiteboard_assets_dir(whiteboard_id: &str) -> Result<PathBuf, String> {
 // original file later moves/is renamed/deleted. Always copies (never moves) - the source lives
 // outside this whiteboard's folder and must be left untouched. asset_id comes from the frontend's
 // own crypto.randomUUID(), same reasoning as boards.rs's import_board_image.
-#[command]
+#[command(async)]
 pub fn import_whiteboard_image(
     whiteboard_id: String,
     source_path: String,
     asset_id: String,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let source = PathBuf::from(&source_path);
     if !source.is_file() {
         return Err(format!("Image does not exist: {}", source_path));
@@ -227,13 +234,14 @@ pub fn import_whiteboard_image(
 // Returns the asset FILE NAME (not the full path) so both import paths hand the frontend the same
 // thing to store in WhiteboardNode.assetFileName; the frontend resolves it to a real path itself
 // (see whiteboardImageCache.ts's whiteboardAssetPath), exactly as it already does for boards.
-#[command]
+#[command(async)]
 pub fn save_whiteboard_image(
     whiteboard_id: String,
     asset_id: String,
     extension: String,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let ext = extension.to_ascii_lowercase();
     if !ALLOWED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
         return Err(format!("Unsupported image extension: {}", ext));
@@ -249,8 +257,9 @@ pub fn save_whiteboard_image(
     Ok(asset_file_name)
 }
 
-#[command]
+#[command(async)]
 pub fn save_whiteboard_thumbnail(whiteboard_id: String, bytes: Vec<u8>) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = whiteboard_dir(&whiteboard_id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create whiteboard folder: {}", e))?;
 
@@ -270,12 +279,13 @@ pub fn save_whiteboard_thumbnail(whiteboard_id: String, bytes: Vec<u8>) -> Resul
 // `extension` is what lets this serve both the PNG and PDF exports from one implementation.
 // Whitelisted rather than trusted: a command is directly reachable, and this decides a filename on
 // disk. Same shape as mindmaps.rs's own export_mindmap_file.
-#[command]
+#[command(async)]
 pub fn export_whiteboard_file(
     whiteboard_name: String,
     extension: String,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     const ALLOWED: [&str; 2] = ["png", "pdf"];
     let ext = extension.to_ascii_lowercase();
     if !ALLOWED.contains(&ext.as_str()) {
@@ -313,8 +323,9 @@ pub fn export_whiteboard_file(
 // frontend already resolved via its own native save-file dialog, rather than always landing in
 // briefcast_dir()/Whiteboard/. Same write-then-rename crash-safety convention as every other save
 // in this file.
-#[command]
+#[command(async)]
 pub fn export_whiteboard_to_path(dest_path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dest = PathBuf::from(&dest_path);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)

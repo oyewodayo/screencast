@@ -2,8 +2,9 @@ import './player.css';
 import React, { useState, useRef, useEffect, useMemo, useImperativeHandle, ChangeEvent, MouseEvent } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { trackEvent } from '../utils/telemetry';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { IoPause, IoPlay, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose } from 'react-icons/io5';
+import { IoPause, IoPlay, IoPlaySkipBack, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -30,7 +31,11 @@ import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
 import { ActiveClipEffects, cropStaticTransform, cssFilterForColorPreset, kenBurnsTransform } from '../utils/videoColorFilters';
-import { ClipCrop } from '../utils/videoEditTypes';
+import { ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
+import { loadRnnoise, RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
+import rnnoiseWorkletPath from '@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url';
+import rnnoiseWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise.wasm?url';
+import rnnoiseSimdWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url';
 
 
 
@@ -100,7 +105,7 @@ const srtToVtt = (srtText: string): string => {
 // the exact MIME type itself instead of depending on that guess. media-src in tauri.conf.json's
 // CSP was widened to include blob: specifically to allow this.
 const loadCaptionsSrc = async (path: string): Promise<string> => {
-  const bytes = await invoke<number[]>('read_file_bytes', { path });
+  const bytes = await invoke<ArrayBuffer>('read_file_bytes', { path });
   const text = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
   const vttText = path.toLowerCase().endsWith('.srt') ? srtToVtt(text) : text;
   return URL.createObjectURL(new Blob([vttText], { type: 'text/vtt' }));
@@ -126,6 +131,8 @@ interface KeyboardHandlerActions {
   stepFrameBackward: () => void;
   stepFrameForward: () => void;
   toggleShortcutsOverlay: () => void;
+  playPrevious?: () => void;
+  playNext?: () => void;
 }
 
 // Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
@@ -187,6 +194,11 @@ interface VideoPlayerProps {
   // sibling, VideoTimelineDocker) surfaces this as its spinner - same "report state upward for a
   // sibling to consume" shape as onActiveClipChange itself.
   onNoiseReductionStatusChange?: (status: "idle" | "calibrating" | "active") => void;
+  // Previous/next file in the same category (Dashboard's navigateAudio/navigateVideo) - shown as
+  // skip buttons either side of play/pause so switching files doesn't need the sidebar. Omitted
+  // (no buttons) when there's nothing else to switch to.
+  onPrevious?: () => void;
+  onNext?: () => void;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -214,24 +226,76 @@ export interface VideoPlayerHandle {
   // whole tree every few milliseconds, so this writes video.style.transform directly instead, the
   // same "bypass React for a hot path" idiom the Ken Burns rAF loop below already uses.
   previewCropLive: (crop: ClipCrop | null) => void;
-  // Re-learns the live noise-reduction profile from whatever this clip is playing at the moment
-  // this is called, discarding whatever got auto-captured the instant the effect first turned on -
-  // NoiseReductionPopover's "Recalibrate from current playback" button calls this so a user who
-  // scrubs to an actual noise-only stretch (no speech) can point the profile at THAT instead of
-  // whatever happened to be playing when they first turned the effect on. A no-op when there's no
-  // live graph yet to recalibrate (noiseReduction strength is still 0 - see noiseGraphRef itself).
-  recalibrateNoiseReduction: () => void;
+  // A/B compare: true routes the untouched original audio to the speakers instead of the cleaned
+  // signal (NoiseReductionPopover's "Hold to hear original"), false switches back.
+  setNoisePreviewBypass: (bypass: boolean) => void;
 }
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange }, ref) => {
+// Decoded noise samples (mono 48kHz PCM from decode_audio_range), keyed by file+range. A handful
+// of entries at most - each is <= 10s (~1.9MB) - so the oldest is evicted past NOISE_PCM_CACHE_MAX.
+const NOISE_PCM_CACHE_MAX = 6;
+const noisePcmCache = new Map<string, Promise<Float32Array>>();
+function loadNoiseSamplePcm(sourcePath: string, start: number, end: number): Promise<Float32Array> {
+  const key = `${sourcePath}|${start.toFixed(3)}|${end.toFixed(3)}`;
+  let cached = noisePcmCache.get(key);
+  if (!cached) {
+    cached = invoke<ArrayBuffer>('decode_audio_range', { sourcePath, start, end }).then((buf) => new Float32Array(buf));
+    cached.catch(() => noisePcmCache.delete(key));
+    noisePcmCache.set(key, cached);
+    if (noisePcmCache.size > NOISE_PCM_CACHE_MAX) noisePcmCache.delete(noisePcmCache.keys().next().value!);
+  }
+  return cached;
+}
+
+// Settings > Noise - the player's own "just make this sound better while I watch" choice, separate
+// from any clip edit: never saved into the file or its edit sidecar, only remembered as a viewing
+// preference (localStorage, same as the captions prefs) so it carries over to the next file.
+export type PlayerNoise = { mode: 'reduce' | 'remove'; strength: number } | null;
+const PLAYER_NOISE_KEY = 'briefcast:playerNoise';
+const readPlayerNoise = (): PlayerNoise => {
+  try {
+    const v = JSON.parse(localStorage.getItem(PLAYER_NOISE_KEY) ?? 'null');
+    if ((v?.mode === 'reduce' || v?.mode === 'remove') && typeof v.strength === 'number') {
+      return { mode: v.mode, strength: Math.max(0.05, Math.min(1, v.strength)) };
+    }
+  } catch {
+    // Missing/corrupt/locked-down storage - start with it off.
+  }
+  return null;
+};
+// Layers the player's noise choice over the active clip's own effects (or stands alone when no
+// timeline clip is tracked), so the one cleanup graph below serves both. While it's on it decides
+// the denoise mode/strength; the clip's own extras (low-cut, hum, gate, levelling) still apply.
+const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): ActiveClipEffects | null => {
+  if (!noise) return fx;
+  const base: ActiveClipEffects = fx ?? { id: 'player', sourceStart: 0, sourceEnd: 0 };
+  return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
+};
+
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange, onPrevious, onNext }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
   // (called both from the effect below AND imperatively from previewCropLive, whose own closure is
   // frozen at mount - see the comment on the useImperativeHandle factory) always reads the current
   // value instead of whatever activeClipEffects happened to be at mount time.
-  const activeClipEffectsRef = useRef(activeClipEffects);
-  activeClipEffectsRef.current = activeClipEffects;
+  //
+  // Holds audioEffects (the clip's effects with Settings > Noise layered on top) - identical to the
+  // prop for every visual field, which withPlayerNoise never touches.
+  const [playerNoise, setPlayerNoiseState] = useState<PlayerNoise>(readPlayerNoise);
+  const setPlayerNoise = (next: PlayerNoise): void => {
+    setPlayerNoiseState(next);
+    try {
+      localStorage.setItem(PLAYER_NOISE_KEY, JSON.stringify(next));
+    } catch {
+      // Private/locked-down storage - still works for this session.
+    }
+  };
+  const audioEffects = useMemo(() => withPlayerNoise(activeClipEffects, playerNoise), [activeClipEffects, playerNoise]);
+  const activeClipEffectsRef = useRef(audioEffects);
+  activeClipEffectsRef.current = audioEffects;
+  // Mirrors the cleanup graph's status for the Settings > Noise row.
+  const [noiseStatus, setNoiseStatus] = useState<'idle' | 'calibrating' | 'active'>('idle');
   // Non-null exactly while ClipCropOverlay has an in-progress drag - see previewCropLive below and
   // VideoPlayerHandle's own doc comment on it.
   const liveCropOverrideRef = useRef<ClipCrop | null>(null);
@@ -249,24 +313,58 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // clock could stall on, which read as "clicking the clip stopped playback".
   const noiseCtxRef = useRef<AudioContext | null>(null);
   const noiseWorkletReadyRef = useRef<Promise<void> | null>(null);
-  // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only) - a
-  // completely separate AudioContext/graph from the noise-reduction one above, not a shared one:
-  // noiseCtxRef's own createMediaElementSource call only ever fires when activeClipEffects has a
-  // noiseReduction value, which only the timeline editor (video-only) ever sets, so the two never
-  // actually compete for this element's one-time-only createMediaElementSource call in practice,
-  // and keeping them separate avoids retrofitting that already-working code to share a source.
-  const audioVisualizerCtxRef = useRef<AudioContext | null>(null);
+  // This element's one MediaElementAudioSourceNode (createMediaElementSource can only ever be called
+  // once per element) and the bus everything audible flows through to the speakers, both on
+  // noiseCtxRef. Shared by the audio-file visualizer (which taps `bus`) and the cleanup graph
+  // (which takes over from the direct source -> bus passthrough) - Settings > Noise means cleanup
+  // can now run on audio files too, so the two can no longer live in separate contexts.
+  const mediaSourceRef = useRef<{ source: MediaElementAudioSourceNode; bus: GainNode } | null>(null);
+  const attachMediaSource = (ctx: AudioContext, video: HTMLVideoElement) => {
+    if (!mediaSourceRef.current) {
+      const source = ctx.createMediaElementSource(video);
+      const bus = new GainNode(ctx, { gain: 1 });
+      bus.connect(ctx.destination);
+      source.connect(bus);
+      mediaSourceRef.current = { source, bus };
+    }
+    return mediaSourceRef.current;
+  };
+  // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only).
   const audioAnalyserRef = useRef<AnalyserNode | null>(null);
-  const audioVisualizerSetupRef = useRef(false);
   const visualizerCanvasRef = useRef<HTMLCanvasElement>(null);
-  // The graph itself (source/node), set only once addModule has resolved AND a clip has actually
-  // asked for noise reduction - null until then, so a session that never touches the feature never
-  // pays for a MediaElementAudioSourceNode at all (the AudioContext/worklet-load above is cheap and
-  // touches nothing about this element's audio by itself; only createMediaElementSource does).
-  // Kept for the rest of this mount once created (a clip's own strength dropping back to 0 just
-  // tells the worklet to bypass, see its own "strength <= 0" passthrough branch) - never torn down
-  // mid-session, only on unmount.
-  const noiseGraphRef = useRef<{ ctx: AudioContext; node: AudioWorkletNode } | null>(null);
+  // The cleanup graph, built once addModule has resolved AND a clip has actually asked for any
+  // audio cleanup - null until then, so a session that never touches the feature never pays for a
+  // MediaElementAudioSourceNode (the AudioContext/worklet-load above touches nothing about this
+  // element's audio by itself; only createMediaElementSource does). Kept for the rest of this
+  // mount once created (turning everything off just sets every stage transparent) - never torn
+  // down mid-session, since createMediaElementSource can only ever be called once per element.
+  //
+  // source -> lowCut -> hum[0..2] -> reduce (spectral worklet)      -> reduceGain -+
+  //                                -> rnnoise (added lazily)        -> wetGain    -+-> gate -> leveler -> processedGain -> out
+  //                                -> dryDelay                      -> dryGain    -+
+  // source ----------------------------------------------------------------------------------> originalGain -> out
+  //
+  // "Remove" mode mixes RNNoise's output with the delay-aligned original (strength = wet share),
+  // the same thing arnndn's `mix` does on export. originalGain/processedGain crossfade for the A/B
+  // "hold to hear original" compare.
+  const noiseGraphRef = useRef<{
+    ctx: AudioContext;
+    source: MediaElementAudioSourceNode;
+    lowCut: BiquadFilterNode;
+    hum: BiquadFilterNode[];
+    reduce: AudioWorkletNode;
+    reduceGain: GainNode;
+    rnnoise: AudioWorkletNode | null;
+    wetGain: GainNode;
+    dryGain: GainNode;
+    gate: AudioWorkletNode;
+    leveler: AudioWorkletNode;
+    processedGain: GainNode;
+    originalGain: GainNode;
+  } | null>(null);
+  // In-flight RNNoise load (wasm fetch + worklet module) - started the first time any clip uses
+  // "Remove" mode, shared by every later request.
+  const rnnoiseLoadRef = useRef<Promise<void> | null>(null);
   // True from the moment graph attachment (awaiting noiseWorkletReadyRef, then
   // createMediaElementSource+connect) starts until it either succeeds (noiseGraphRef.current gets
   // set) or fails - guards against a second concurrent attempt if the effect below re-fires (the
@@ -277,19 +375,34 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Set once on unmount so a still-in-flight attachment doesn't try to wire up a node after the
   // fact.
   const noiseGraphUnmountedRef = useRef(false);
-  // Which clip id the worklet's current noise profile was learned from, so the effect below only
-  // sends {type:'recalibrate'} when the ACTIVE CLIP actually changes, not on every strength tweak.
+  // Which clip id the spectral worklet's noise estimate belongs to, so the effect below only sends
+  // {type:'reset'} when the ACTIVE CLIP actually changes, not on every strength tweak.
   const lastCalibratedClipIdRef = useRef<string | null>(null);
-  const onNoiseReductionStatusChangeRef = useRef(onNoiseReductionStatusChange);
-  onNoiseReductionStatusChangeRef.current = onNoiseReductionStatusChange;
+  // True while a picked noise sample is being decoded and handed to the spectral worklet (it posts
+  // 'calibrated' once the profile is in) - keeps the status reported as "calibrating" meanwhile.
+  const noiseLearningRef = useRef(false);
+  // Which noise sample (sourcePath|start|end) the worklet currently holds a profile for, or null
+  // for "adaptive tracking" - so a profile is only re-decoded/re-sent when the pick changes.
+  const noiseProfileKeyRef = useRef<string | null>(null);
+  // Fresh every render so the keyboard handler (bound once per mediaType) never calls a stale one.
+  const onPreviousRef = useRef(onPrevious);
+  onPreviousRef.current = onPrevious;
+  const onNextRef = useRef(onNext);
+  onNextRef.current = onNext;
+  const onNoiseReductionStatusChangeRef = useRef<VideoPlayerProps['onNoiseReductionStatusChange']>(undefined);
+  onNoiseReductionStatusChangeRef.current = (status) => {
+    setNoiseStatus(status);
+    onNoiseReductionStatusChange?.(status);
+  };
 
   // Pre-warm: kicks off the AudioContext + worklet module load immediately on mount, well before
   // any clip has actually asked for noise reduction - see noiseCtxRef's own doc comment for why.
   // Constructing an AudioContext and loading a module into it touches nothing about this <video>
   // element's own audio output, so this is free/invisible for the (common) case where noise
-  // reduction is never used at all this session.
+  // reduction is never used at all this session. 48kHz because RNNoise ("Remove" mode) only works
+  // at that rate - the media element source is resampled into it automatically.
   useEffect(() => {
-    const ctx = new AudioContext();
+    const ctx = new AudioContext({ sampleRate: 48000 });
     noiseCtxRef.current = ctx;
     noiseWorkletReadyRef.current = ctx.audioWorklet
       .addModule("/audio-worklets/noise-reduction-processor.js")
@@ -299,7 +412,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       });
     return () => {
       noiseGraphUnmountedRef.current = true;
-      noiseGraphRef.current?.node.disconnect();
+      mediaSourceRef.current?.source.disconnect();
       ctx.close().catch(() => {});
     };
   }, []);
@@ -362,15 +475,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       liveCropOverrideRef.current = crop;
       applyCropAndKenBurns();
     },
-    recalibrateNoiseReduction: () => {
+    setNoisePreviewBypass: (bypass: boolean) => {
       const graph = noiseGraphRef.current;
       if (!graph) return;
-      graph.node.port.postMessage({ type: "recalibrate" });
-      onNoiseReductionStatusChangeRef.current?.("calibrating");
-      // Marks this clip as "already (re)calibrated" so the id-change-driven effect further down
-      // doesn't immediately fire a SECOND, redundant recalibrate right on top of this deliberate
-      // one the next time it re-runs (e.g. the strength slider moving again).
-      lastCalibratedClipIdRef.current = activeClipEffectsRef.current?.id ?? null;
+      const t = graph.ctx.currentTime;
+      graph.originalGain.gain.setTargetAtTime(bypass ? 1 : 0, t, 0.015);
+      graph.processedGain.gain.setTargetAtTime(bypass ? 0 : 1, t, 0.015);
     },
   }), []);
 
@@ -433,6 +543,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [hoveredChapter, setHoveredChapter] = useState<Chapter | null>(null);
   const chaptersBtnRef = useRef<HTMLButtonElement>(null);
   const chaptersMenuRef = useRef<HTMLDivElement>(null);
+  // Wraps both skip buttons and their skip-amount picker - clicks inside it don't count as
+  // "outside" (the buttons' own double-click is what toggles the picker).
+  const skipControlsRef = useRef<HTMLDivElement>(null);
   // "?" toggles this - see keyboardHandlers.ts's own comment on why a keyboard-only affordance
   // (no toolbar button) matches the convention this mirrors.
   const [showShortcutsOverlay, setShowShortcutsOverlay] = useState<boolean>(false);
@@ -493,12 +606,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       return 'auto';
     }
   });
+  // The language the captions currently on screen were generated in, or null when they came from
+  // a file (or there are none). Lets a language change re-run generation for what's showing -
+  // otherwise picking "English" after an auto-detect run that guessed French only changed the
+  // preference for the *next* manual Generate, leaving the French captions on screen.
+  const [generatedCaptionsLanguage, setGeneratedCaptionsLanguage] = useState<string | null>(null);
   const handleCaptionsLanguageChange = (lang: string): void => {
     setCaptionsLanguage(lang);
     try {
       localStorage.setItem('briefcast:captionsLanguage', lang);
     } catch {
       // Private/locked-down storage - still works for this session.
+    }
+    // generate_captions caches per language, so switching back to one already generated is instant.
+    if (generatedCaptionsLanguage !== null && lang !== generatedCaptionsLanguage && !isGeneratingCaptions) {
+      void generateCaptionsFromAudio(lang);
     }
   };
   // True only while a "Generate from audio" transcription is actually running - real model
@@ -509,6 +631,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // transcription progress, not a guess, so the button can show something more honest than an
   // indefinite spinner for what can be a multi-minute wait on a long recording.
   const [captionsGenerationProgress, setCaptionsGenerationProgress] = useState<number | null>(null);
+  // True while the first-ever run is still fetching the speech model (whisper_model.rs) - the
+  // progress above then tracks that download instead of transcription.
+  const [isDownloadingSpeechModel, setIsDownloadingSpeechModel] = useState<boolean>(false);
   const [captionsGenerationError, setCaptionsGenerationError] = useState<string | null>(null);
   const [thumbnailStatus, setThumbnailStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   // A visible snapshot of the exact frame about to become the thumbnail, plus the timestamp it was
@@ -653,41 +778,42 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     };
   }, [mediaType, filePath]);
 
-  // Sets up the real-time audio-reactive visualizer graph once, the first time this element is
-  // actually playing audio (mediaType 'audio') - a completely separate AudioContext/graph from the
-  // noise-reduction one above (see audioVisualizerCtxRef's own doc comment for why that's fine).
-  // createMediaElementSource detaches the element's native audio output the instant it's called,
-  // so this resumes the (possibly suspended, per browser autoplay policy) context and reconnects
-  // through the analyser in the same synchronous block - otherwise there'd be an audible gap where
-  // the file kept "playing" but produced no sound at all until some later resume.
+  // Sets up the real-time audio-reactive visualizer the first time this element is actually playing
+  // audio (mediaType 'audio') - an analyser tapping the shared output bus (see mediaSourceRef), so
+  // it draws what's actually heard, cleaned or not. createMediaElementSource detaches the element's
+  // native audio output the instant it's called, so attachMediaSource reconnects it to the speakers
+  // in the same synchronous block, and the (possibly suspended, per browser autoplay policy) context
+  // is resumed right after - otherwise there'd be an audible gap where the file kept "playing" but
+  // produced no sound at all until some later resume.
   useEffect(() => {
-    if (mediaType !== 'audio' || audioVisualizerSetupRef.current) return;
+    if (mediaType !== 'audio') return;
     const video = videoRef.current;
-    if (!video) return;
-    audioVisualizerSetupRef.current = true;
+    const ctx = noiseCtxRef.current;
+    if (!video || !ctx) return;
 
-    const ctx = new AudioContext();
+    let bus: GainNode;
     try {
-      const source = ctx.createMediaElementSource(video);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.8;
-      source.connect(analyser);
-      analyser.connect(ctx.destination);
-      if (ctx.state === "suspended") ctx.resume().catch(() => {});
-      audioVisualizerCtxRef.current = ctx;
-      audioAnalyserRef.current = analyser;
+      bus = attachMediaSource(ctx, video).bus;
     } catch (err) {
       console.error("Failed to set up audio visualizer:", err);
-      ctx.close().catch(() => {});
+      return;
     }
+    // Left unconnected downstream - an analyser is pulled on its own, and the bus already feeds
+    // the speakers.
+    const analyser = new AnalyserNode(ctx, { fftSize: 1024, smoothingTimeConstant: 0.8 });
+    bus.connect(analyser);
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    audioAnalyserRef.current = analyser;
 
     return () => {
       audioAnalyserRef.current = null;
-      audioVisualizerCtxRef.current = null;
-      audioVisualizerSetupRef.current = false;
-      ctx.close().catch(() => {});
+      try {
+        bus.disconnect(analyser);
+      } catch {
+        // Context already closed on unmount.
+      }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mediaType]);
 
   // Draws the live waveform while playing; shows a flat idle line otherwise. Measures the canvas
@@ -826,6 +952,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
     setCaptionsUrl(null);
     setCaptionsVisible(false);
+    setGeneratedCaptionsLanguage(null);
     setCaptionsGenerationError(null);
     if (mediaType !== 'video' || !filePath || !autoDetectCaptions) return;
 
@@ -864,12 +991,34 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // The <track> element has no reactive "visible" prop - its `default` attribute only picks the
   // INITIAL mode when the track is first added to the text track list, and never again after that.
   // Actually showing/hiding cues once a track exists requires setting textTracks[0].mode directly.
+  // The track is never put in 'showing' mode: the browser's native cue rendering pins captions to
+  // the very bottom of the <video> box, which is exactly where BottomDocker's fixed overlay (and the
+  // control bar) sit, so they ended up hidden underneath. 'hidden' still loads cues and fires
+  // cuechange, so the active cue text is mirrored into state and drawn by our own overlay instead,
+  // positioned to clear both (see .caption-overlay in player.css).
+  const [activeCaptionText, setActiveCaptionText] = useState<string>('');
   useEffect(() => {
     const video = videoRef.current;
     const track = video?.textTracks[0];
-    if (!track) return;
-    track.mode = captionsVisible ? 'showing' : 'hidden';
-  }, [captionsVisible, captionsUrl]);
+    if (!track || !captionsUrl) {
+      setActiveCaptionText('');
+      return;
+    }
+    track.mode = 'hidden';
+    const syncCue = () => {
+      const cues = track.activeCues;
+      const text = cues
+        ? Array.from(cues)
+            .map((cue) => ((cue as VTTCue).text ?? '').replace(/<[^>]+>/g, '').trim())
+            .filter(Boolean)
+            .join('\n')
+        : '';
+      setActiveCaptionText(text);
+    };
+    syncCue();
+    track.addEventListener('cuechange', syncCue);
+    return () => track.removeEventListener('cuechange', syncCue);
+  }, [captionsUrl]);
 
   // Revokes whatever caption Blob URL is current when this player unmounts entirely (a file
   // switch already revokes the previous one itself, in the effect above) - reads captionsUrlRef
@@ -1164,6 +1313,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
       setCaptionsUrl(url);
       setCaptionsVisible(true);
+      setGeneratedCaptionsLanguage(null);
     } catch (err) {
       console.error('Failed to load captions file:', err);
     }
@@ -1174,27 +1324,37 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // for it here, never automatically. Surfaces a failure inline (missing model/whisper-cli, no
   // audio track, etc) rather than just console.error - unlike the silent auto-detect/file-picker
   // paths, the user was just waiting on this, so silence would read as "why isn't this working".
-  const generateCaptionsFromAudio = async (): Promise<void> => {
+  const generateCaptionsFromAudio = async (language: string = captionsLanguage): Promise<void> => {
     setShowCaptionsSourceMenu(false);
     if (!filePath) return;
     setIsGeneratingCaptions(true);
     setCaptionsGenerationProgress(0);
     setCaptionsGenerationError(null);
     const unlisten = await listen<number>('captions-progress', (event) => {
+      setIsDownloadingSpeechModel(false);
       setCaptionsGenerationProgress(event.payload);
     });
+    const unlistenModel = await listen<{ downloaded: number; total: number }>('whisper-model-download', (event) => {
+      const { downloaded, total } = event.payload;
+      setIsDownloadingSpeechModel(downloaded < total);
+      setCaptionsGenerationProgress(downloaded < total ? (downloaded / total) * 100 : 0);
+    });
     try {
-      const vttText = await invoke<string>('generate_captions', { inputPath: filePath, language: captionsLanguage });
+      const vttText = await invoke<string>('generate_captions', { inputPath: filePath, language });
       const url = URL.createObjectURL(new Blob([vttText], { type: 'text/vtt' }));
       if (captionsUrlRef.current) URL.revokeObjectURL(captionsUrlRef.current);
       setCaptionsUrl(url);
       setCaptionsVisible(true);
+      setGeneratedCaptionsLanguage(language);
+      trackEvent('captions_generated', { language });
     } catch (err) {
       console.error('Caption generation failed:', err);
       setCaptionsGenerationError(String(err));
     } finally {
       unlisten();
+      unlistenModel();
       setIsGeneratingCaptions(false);
+      setIsDownloadingSpeechModel(false);
       setCaptionsGenerationProgress(null);
     }
   };
@@ -1297,46 +1457,117 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     video.playbackRate = activeClipEffects?.speed ?? 1;
   }, [activeClipEffects?.speed]);
 
-  // Live noise-reduction preview - wires this <video> element's audio through a Web Audio graph
-  // (MediaElementAudioSourceNode -> AudioWorkletNode running noise-reduction-processor.js ->
-  // destination) the first time any clip's noiseReduction is actually turned on, then reuses that
-  // same graph for the rest of this mount (see noiseGraphRef's own doc comment for why - a clip's
-  // own strength dropping back to 0 just tells the worklet to bypass, never tears the graph down).
-  // Export counterpart is afftdn (conversion.rs) - same algorithm family (FFT magnitude-domain
-  // noise-profile subtraction), not the same code, so preview and export are perceptually
-  // consistent without needing to be bit-identical.
+  // Live audio-cleanup preview - wires this <video> element's audio through the graph described at
+  // noiseGraphRef the first time any clip turns any cleanup on, then just retunes it for whichever
+  // clip is active. Export counterpart is audio_cleanup_filters (conversion.rs): highpass ->
+  // bandreject x3 -> afftdn|arnndn -> agate, the same order and roughly the same settings, so the
+  // preview and export sound alike without being bit-identical.
+  const audioCleanupKey = JSON.stringify(audioEffects?.audioCleanup ?? null);
   useEffect(() => {
-    const strength = activeClipEffects?.noiseReduction ?? 0;
-    const clipId = activeClipEffects?.id ?? null;
+    const effects = activeClipEffectsRef.current;
+    const enabled = !!effects && hasAudioCleanup(effects);
+    const clipId = effects?.id ?? null;
 
-    if (strength <= 0) {
-      onNoiseReductionStatusChangeRef.current?.("idle");
-      if (noiseGraphRef.current) {
-        const { ctx, node } = noiseGraphRef.current;
-        node.parameters.get("strength")?.setTargetAtTime(0, ctx.currentTime, 0.05);
+    const applySettings = () => {
+      const graph = noiseGraphRef.current;
+      if (!graph) return;
+      const fx = activeClipEffectsRef.current;
+      const cleanup = fx?.audioCleanup;
+      const strength = fx?.noiseReduction ?? 0;
+      const t = graph.ctx.currentTime;
+      const ramp = (param: AudioParam | undefined, value: number) => param?.setTargetAtTime(value, t, 0.03);
+
+      // Transparent stages are switched to allpass (flat magnitude) rather than unwired, so the
+      // chain never has to be re-connected mid-playback.
+      graph.lowCut.type = cleanup?.lowCut ? 'highpass' : 'allpass';
+      graph.hum.forEach((notch, i) => {
+        notch.type = cleanup?.hum ? 'notch' : 'allpass';
+        if (cleanup?.hum) notch.frequency.setValueAtTime(cleanup.hum * (i + 1), t);
+      });
+
+      const useRemove = cleanup?.mode === 'remove' && !!graph.rnnoise && strength > 0;
+      ramp(graph.reduce.parameters.get('strength'), useRemove ? 0 : strength);
+      ramp(graph.reduceGain.gain, useRemove ? 0 : 1);
+      ramp(graph.wetGain.gain, useRemove ? strength : 0);
+      ramp(graph.dryGain.gain, useRemove ? 1 - strength : 0);
+      ramp(graph.gate.parameters.get('enabled'), cleanup?.gate ? 1 : 0);
+      ramp(graph.leveler.parameters.get('enabled'), cleanup?.level ? 1 : 0);
+
+      // Reset the spectral tracker when the active clip changes - one clip's room tone says
+      // nothing about another's.
+      if (clipId !== lastCalibratedClipIdRef.current) {
+        lastCalibratedClipIdRef.current = clipId;
+        noiseLearningRef.current = false;
+        noiseProfileKeyRef.current = null;
+        graph.reduce.port.postMessage({ type: 'reset' });
       }
+
+      // Picked noise sample -> fixed profile in the spectral worklet (the live twin of the export's
+      // afftdn sample_noise). "Remove" mode doesn't use it.
+      const sample = cleanup?.mode !== 'remove' ? cleanup?.noiseSample : undefined;
+      const sampleKey = sample && fx?.sourcePath ? `${fx.sourcePath}|${sample.start.toFixed(3)}|${sample.end.toFixed(3)}` : null;
+      if (sampleKey !== noiseProfileKeyRef.current) {
+        noiseProfileKeyRef.current = sampleKey;
+        if (!sampleKey || !sample || !fx?.sourcePath) {
+          noiseLearningRef.current = false;
+          graph.reduce.port.postMessage({ type: 'profile', pcm: null });
+        } else {
+          noiseLearningRef.current = true;
+          loadNoiseSamplePcm(fx.sourcePath, sample.start, sample.end)
+            .then((pcm) => {
+              if (noiseProfileKeyRef.current !== sampleKey) return; // superseded by a newer pick
+              graph.reduce.port.postMessage({ type: 'profile', pcm });
+            })
+            .catch((err) => {
+              console.error('Failed to decode noise sample:', err);
+              if (noiseProfileKeyRef.current !== sampleKey) return;
+              noiseLearningRef.current = false;
+              applySettings();
+            });
+        }
+      }
+
+      const waitingForRnnoise = cleanup?.mode === 'remove' && strength > 0 && !graph.rnnoise;
+      onNoiseReductionStatusChangeRef.current?.(
+        !hasAudioCleanup(fx ?? {}) ? 'idle' : waitingForRnnoise || noiseLearningRef.current ? 'calibrating' : 'active'
+      );
+    };
+
+    // RNNoise is only fetched (wasm + its own worklet module) the first time "Remove" is used.
+    const ensureRnnoise = () => {
+      const graph = noiseGraphRef.current;
+      if (!graph || graph.rnnoise || rnnoiseLoadRef.current) return;
+      rnnoiseLoadRef.current = (async () => {
+        const wasmBinary = await loadRnnoise({ url: rnnoiseWasmPath, simdUrl: rnnoiseSimdWasmPath });
+        await graph.ctx.audioWorklet.addModule(rnnoiseWorkletPath);
+        if (noiseGraphUnmountedRef.current) return;
+        const rnnoise = new RnnoiseWorkletNode(graph.ctx, { wasmBinary, maxChannels: 2 });
+        graph.hum[graph.hum.length - 1].connect(rnnoise);
+        rnnoise.connect(graph.wetGain);
+        graph.rnnoise = rnnoise;
+        applySettings();
+      })().catch((err) => {
+        console.error('Failed to load RNNoise - "Remove" mode will fall back to spectral reduction:', err);
+        rnnoiseLoadRef.current = null;
+      });
+    };
+
+    if (!enabled) {
+      applySettings();
+      if (!noiseGraphRef.current) onNoiseReductionStatusChangeRef.current?.('idle');
       return;
     }
 
-    const needsRecalibration = clipId !== lastCalibratedClipIdRef.current;
-    lastCalibratedClipIdRef.current = clipId;
-
     if (noiseGraphRef.current) {
-      const { ctx, node } = noiseGraphRef.current;
-      node.parameters.get("strength")?.setTargetAtTime(strength, ctx.currentTime, 0.05);
-      if (needsRecalibration) {
-        onNoiseReductionStatusChangeRef.current?.("calibrating");
-        node.port.postMessage({ type: "recalibrate" });
-      } else {
-        onNoiseReductionStatusChangeRef.current?.("active");
-      }
+      if (effects?.audioCleanup?.mode === 'remove') ensureRnnoise();
+      applySettings();
       return;
     }
 
     // No graph yet - either this is the very first activation this mount, or an earlier
     // activation's attachment is still in flight (see noiseGraphSetupInProgressRef's own doc
     // comment). Either way this IS "calibrating" from the UI's point of view.
-    onNoiseReductionStatusChangeRef.current?.("calibrating");
+    onNoiseReductionStatusChangeRef.current?.('calibrating');
     if (noiseGraphSetupInProgressRef.current) return;
 
     const video = videoRef.current;
@@ -1351,34 +1582,59 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         // synchronous block, with no further `await` in between - createMediaElementSource(video)
         // detaches the element's native audio path the instant it's called, and the worklet module
         // is already guaranteed loaded (this whole callback only runs after that promise resolved),
-        // so the AudioWorkletNode can be constructed and both connect() calls made on the very next
-        // lines. That's what avoids the gap an earlier version of this had (async module-load
-        // happening AFTER the detach), which could stall the element's own AV-sync clock and read
-        // as "clicking the clip stopped playback".
-        const source = ctx.createMediaElementSource(video);
-        const node = new AudioWorkletNode(ctx, "noise-reduction-processor");
-        node.port.onmessage = (e) => {
-          if (e.data?.type === "calibrating") onNoiseReductionStatusChangeRef.current?.("calibrating");
-          else if (e.data?.type === "calibrated") onNoiseReductionStatusChangeRef.current?.("active");
+        // so every node can be constructed and connected on the very next lines. That's what avoids
+        // the gap an earlier version of this had (async module-load happening AFTER the detach),
+        // which could stall the element's own AV-sync clock and read as "clicking the clip stopped
+        // playback".
+        // Reuses the visualizer's source if it already exists, taking over from its direct
+        // source -> bus passthrough.
+        const { source, bus } = attachMediaSource(ctx, video);
+        source.disconnect(bus);
+        const lowCut = new BiquadFilterNode(ctx, { type: 'allpass', frequency: 80, Q: 0.707 });
+        const hum = [1, 2, 3].map((h) => new BiquadFilterNode(ctx, { type: 'allpass', frequency: 50 * h, Q: 8 }));
+        const reduce = new AudioWorkletNode(ctx, 'noise-reduction-processor', { outputChannelCount: [2] });
+        const gate = new AudioWorkletNode(ctx, 'noise-gate-processor', { outputChannelCount: [2] });
+        const leveler = new AudioWorkletNode(ctx, 'leveler-processor', { outputChannelCount: [2] });
+        const reduceGain = new GainNode(ctx, { gain: 1 });
+        const wetGain = new GainNode(ctx, { gain: 0 });
+        const dryGain = new GainNode(ctx, { gain: 0 });
+        // RNNoise works on 480-sample (10ms @ 48kHz) frames - delaying the dry branch by the same
+        // amount keeps the "Remove" strength blend from comb-filtering.
+        const dryDelay = new DelayNode(ctx, { delayTime: 480 / 48000 });
+        const processedGain = new GainNode(ctx, { gain: 1 });
+        const originalGain = new GainNode(ctx, { gain: 0 });
+
+        reduce.port.onmessage = (e) => {
+          if (e.data?.type === 'calibrated') {
+            noiseLearningRef.current = false;
+            applySettings();
+          }
         };
-        // Reads the CURRENT value (via the same ref applyCropAndKenBurns already relies on for
-        // the same reason) rather than the `strength` this effect run closed over - a re-run (the
-        // slider moving again) could in principle have happened in the brief window before this
-        // resolved.
-        node.parameters.get("strength")?.setValueAtTime(activeClipEffectsRef.current?.noiseReduction ?? 0, ctx.currentTime);
-        source.connect(node);
-        node.connect(ctx.destination);
-        noiseGraphRef.current = { ctx, node };
-        if (ctx.state === "suspended") ctx.resume().catch(() => {});
+
+        let tail: AudioNode = source.connect(lowCut);
+        for (const notch of hum) tail = tail.connect(notch);
+        tail.connect(reduce).connect(reduceGain).connect(gate);
+        tail.connect(dryDelay).connect(dryGain).connect(gate);
+        wetGain.connect(gate);
+        gate.connect(leveler).connect(processedGain).connect(bus);
+        source.connect(originalGain).connect(bus);
+
+        noiseGraphRef.current = { ctx, source, lowCut, hum, reduce, reduceGain, rnnoise: null, wetGain, dryGain, gate, leveler, processedGain, originalGain };
+        applySettings();
+        if (activeClipEffectsRef.current?.audioCleanup?.mode === 'remove') ensureRnnoise();
+        if (ctx.state === 'suspended') ctx.resume().catch(() => {});
       })
       .catch(() => {
         // Already logged by the pre-warm effect itself - the video's audio was never touched
         // (createMediaElementSource is only called after this promise resolves, never before), so
         // it just continues playing on its normal native path, unprocessed.
-        onNoiseReductionStatusChangeRef.current?.("idle");
+        onNoiseReductionStatusChangeRef.current?.('idle');
+      })
+      .finally(() => {
+        noiseGraphSetupInProgressRef.current = false;
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.id, activeClipEffects?.noiseReduction]);
+  }, [audioEffects?.id, audioEffects?.noiseReduction, audioEffects?.sourcePath, audioCleanupKey]);
 
   // Live-preview crop + Ken Burns, combined into the one thing that's ever allowed to write
   // video.style.transform (two separate effects each writing it independently would race and
@@ -1613,6 +1869,28 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showChaptersMenu]);
 
+  // Same click-outside pattern again, for the skip-amount picker - plus Escape, since it has no
+  // close button of its own.
+  useEffect(() => {
+    if (!showSkipTime) return;
+
+    const handleClickOutside = (event: globalThis.MouseEvent): void => {
+      if (skipControlsRef.current?.contains(event.target as Node)) return;
+      setShowSkipTime(false);
+      suppressNextVideoClickRef.current = true;
+    };
+    const handleEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setShowSkipTime(false);
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [showSkipTime]);
+
   const handleAutoplay = (): void => {
     if (onAutoplayNextChange) {
       onAutoplayNextChange();
@@ -1696,7 +1974,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       seekForward,
       stepFrameBackward: () => stepFrame(-1),
       stepFrameForward: () => stepFrame(1),
-      toggleShortcutsOverlay: () => setShowShortcutsOverlay((prev) => !prev)
+      toggleShortcutsOverlay: () => setShowShortcutsOverlay((prev) => !prev),
+      playPrevious: () => onPreviousRef.current?.(),
+      playNext: () => onNextRef.current?.()
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -1847,7 +2127,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					</div>
 					<div className="flex flex-col gap-3 text-sm">
 						{[
-							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame']] },
+							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame'], ['Shift+P / Shift+N', 'Previous / next file']] },
 							{ title: 'Volume', rows: [['M', 'Mute / unmute']] },
 							{ title: 'Display', rows: [['F', 'Fullscreen'], ['T', 'Theater mode'], ['I', 'Picture in picture']] },
 							{ title: 'Captions', rows: [['C', 'Toggle captions']] },
@@ -1919,9 +2199,19 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					
 					<div className="controls flex flex-row justify-between mt-2">
 						<div className='flex gap-5'>
+						{onPrevious && (
+							<button className="w-7" onClick={onPrevious} data-tip={`Previous ${mediaType === 'audio' ? 'track' : 'video'}`} data-tip-kbd="Shift+P" aria-label="Previous">
+								<IoPlaySkipBack className='text-2xl' />
+							</button>
+						)}
 						<button className="play-pause-btn" onClick={togglePauseAndPlay} title={isPlaying ? 'Pause (k)' : 'Play (k)'}>
 							{isPlaying ? <IoPause className='text-3xl' /> : <IoPlay className='text-3xl' />}
 						</button>
+						{onNext && (
+							<button className="w-7" onClick={onNext} data-tip={`Next ${mediaType === 'audio' ? 'track' : 'video'}`} data-tip-kbd="Shift+N" aria-label="Next">
+								<IoPlaySkipForward className='text-2xl' />
+							</button>
+						)}
 
 						<div className="volume-container">
 							<button className="mute-btn z-20 w-7" onClick={toggleMute} title="Mute (m)">
@@ -1951,7 +2241,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 						
 						<div className="flex flex-col place-items-center items-center">
-						<div className='flex gap-4'>
+						<div ref={skipControlsRef} className='relative flex gap-4'>
 							<button
 							className='flex justify-center place-items-center'
 							onClick={handleBackwardSkipTime}
@@ -1973,7 +2263,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							</button>
 
 							{showSkipTime && (
-							<Dropdown onCallback={selectSkipTiming} />
+							<Dropdown value={currentSkipTime} onCallback={selectSkipTiming} />
 							)}
 						</div>
 						</div>
@@ -2030,53 +2320,74 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								: <IoBookmarkOutline className='w-[100%] text-2xl text-white' />}
 							</button>
 
-							{showChaptersMenu && (
-								<div
-									ref={chaptersMenuRef}
-									className="origin-bottom-right absolute bottom-full right-0 mb-1 w-72 rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 overflow-hidden"
-								>
-									{chapters.length > 0 && (
-										<div className="max-h-48 overflow-y-auto divide-y divide-gray-100 dark:divide-neutral-700">
-											{chapters.map((chapter) => (
-												<div key={chapter.id} className="flex items-center gap-2 px-3 py-2">
-													<button
-														className="text-xs tabular-nums text-gray-400 dark:text-neutral-500 shrink-0 hover:text-red-500"
-														onClick={() => seekToChapter(chapter.time)}
-														title="Jump to this chapter"
-													>
-														{formatChapterTime(chapter.time)}
-													</button>
-													<input
-														className="flex-1 min-w-0 text-sm bg-transparent border-none outline-none focus:ring-1 focus:ring-red-400 rounded px-1"
-														value={chapter.label}
-														onChange={(e) => renameChapter(chapter.id, e.target.value)}
-													/>
-													<button
-														className="shrink-0 text-gray-400 hover:text-red-500"
-														onClick={() => deleteChapter(chapter.id)}
-														title="Delete chapter"
-													>
-														<IoTrashOutline size={14} />
-													</button>
-												</div>
-											))}
+							{showChaptersMenu && (() => {
+								const now = videoRef.current?.currentTime ?? 0;
+								const activeChapterId = [...chapters].reverse().find((c) => c.time <= now + 0.05)?.id;
+								return (
+									<div
+										ref={chaptersMenuRef}
+										className="origin-bottom-right absolute bottom-full right-0 mb-2 settings-menu chapters-menu rounded-lg shadow-xl bg-white dark:bg-neutral-800 text-gray-800 dark:text-neutral-100 ring-1 ring-black/5 dark:ring-white/10 z-50"
+									>
+										<div className="settings-menu-header flex items-center justify-between">
+											<span>Chapters</span>
+											{chapters.length > 0 && <span className="normal-case tracking-normal font-normal">{chapters.length}</span>}
 										</div>
-									)}
-									<button
-										className="flex items-center gap-2 w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
-										onClick={addChapterAtCurrentTime}
-									>
-										<IoBookmarkOutline size={14} /> Add chapter at current time
-									</button>
-									<button
-										className="flex items-center gap-2 w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
-										onClick={() => void detectChaptersFromSilence()}
-										disabled={isDetectingChapters}
-									>
-										<IoSparklesOutline size={14} /> {isDetectingChapters ? 'Detecting…' : 'Detect from silence'}
-									</button>
-								</div>
-							)}
+										{chapters.length > 0 ? (
+											<div className="chapters-list">
+												{chapters.map((chapter, i) => {
+													const untitled = chapter.label === formatChapterTime(chapter.time);
+													return (
+														<div key={chapter.id} className={`chapter-row ${chapter.id === activeChapterId ? 'chapter-row-active' : ''}`}>
+															<button
+																className="chapter-time"
+																onClick={() => seekToChapter(chapter.time)}
+																title="Jump to this chapter"
+															>
+																{formatChapterTime(chapter.time)}
+															</button>
+															<input
+																className="chapter-label"
+																value={untitled ? '' : chapter.label}
+																placeholder={`Chapter ${i + 1}`}
+																onChange={(e) => renameChapter(chapter.id, e.target.value || formatChapterTime(chapter.time))}
+																onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+															/>
+															<button
+																className="chapter-delete"
+																onClick={() => deleteChapter(chapter.id)}
+																title="Delete chapter"
+															>
+																<IoTrashOutline size={14} />
+															</button>
+														</div>
+													);
+												})}
+											</div>
+										) : (
+											<div className="chapters-empty">No chapters yet. Mark moments to jump between them.</div>
+										)}
+										<div className="settings-divider" />
+										<button className="settings-row" onClick={addChapterAtCurrentTime}>
+											<span className="settings-row-label">
+												<IoAddCircleOutline />
+												Add chapter here
+											</span>
+											<span className="settings-row-value tabular-nums">{currentTimeElement}</span>
+										</button>
+										<button
+											className="settings-row"
+											onClick={() => void detectChaptersFromSilence()}
+											disabled={isDetectingChapters}
+										>
+											<span className="settings-row-label">
+												<IoSparklesOutline />
+												{isDetectingChapters ? 'Detecting…' : 'Detect from silence'}
+											</span>
+											<span className="settings-row-value">Auto</span>
+										</button>
+									</div>
+								);
+							})()}
 						</div>
 
 						<div className="relative">
@@ -2087,7 +2398,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								disabled={isGeneratingCaptions}
 								title={
 									isGeneratingCaptions
-										? `Generating captions from audio… ${Math.round(captionsGenerationProgress ?? 0)}% (can take a while on a long recording)`
+										? isDownloadingSpeechModel
+											? `Downloading the speech-to-text model (one time only)… ${Math.round(captionsGenerationProgress ?? 0)}%`
+											: `Generating captions from audio… ${Math.round(captionsGenerationProgress ?? 0)}% (can take a while on a long recording)`
 										: !captionsUrl
 										? 'Add captions (load a file, or generate from audio)'
 										: captionsVisible
@@ -2108,18 +2421,24 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							{showCaptionsSourceMenu && (
 								<div
 									ref={captionsMenuRef}
-									className="origin-bottom-right absolute bottom-full right-0 mb-1 w-64 rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 ring-1 ring-black dark:ring-white/10 ring-opacity-5 divide-y divide-gray-100 dark:divide-neutral-700 overflow-hidden"
+									className="origin-bottom-right absolute bottom-full right-0 mb-2 settings-menu rounded-lg shadow-xl bg-white dark:bg-neutral-800 text-gray-800 dark:text-neutral-100 ring-1 ring-black/5 dark:ring-white/10 z-50"
 								>
-									<button
-										className="block w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700"
-										onClick={() => void pickCaptionsFile()}
-									>
-										Load caption file…
+									<div className="settings-menu-header">Add captions</div>
+									<button className="settings-row" onClick={() => void pickCaptionsFile()}>
+										<span className="settings-row-label">
+											<IoDocumentTextOutline />
+											Load caption file…
+										</span>
+										<span className="settings-row-value">.vtt / .srt</span>
 									</button>
-									<div className="flex items-center justify-between gap-2 px-3.5 py-2 text-xs text-gray-500 dark:text-neutral-400">
-										<span>Language</span>
+									<div className="settings-divider" />
+									<div className="settings-row">
+										<span className="settings-row-label">
+											<IoLanguageOutline />
+											Language
+										</span>
 										<select
-											className="text-xs rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 px-1.5 py-1 focus:outline-none"
+											className="settings-select"
 											value={captionsLanguage}
 											onChange={(e) => handleCaptionsLanguageChange(e.target.value)}
 										>
@@ -2128,11 +2447,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 											))}
 										</select>
 									</div>
-									<button
-										className="block w-full px-3.5 py-2.5 text-sm text-left whitespace-nowrap hover:bg-gray-100 dark:hover:bg-neutral-700"
-										onClick={() => void generateCaptionsFromAudio()}
-									>
-										Generate from audio (offline)
+									<button className="settings-row" onClick={() => void generateCaptionsFromAudio()}>
+										<span className="settings-row-label">
+											<IoMicOutline />
+											Generate from audio
+										</span>
+										<span className="settings-row-value">Offline</span>
 									</button>
 								</div>
 							)}
@@ -2165,14 +2485,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							autoDetectCaptions={autoDetectCaptions}
 							onAutoDetectCaptionsChange={toggleAutoDetectCaptions}
 							hasCaptions={!!captionsUrl}
+							captionsVisible={captionsVisible}
+							onCaptionsVisibleChange={() => setCaptionsVisible((prev) => !prev)}
+							generatedCaptionsLanguage={generatedCaptionsLanguage}
 							onLoadCaptionsFile={() => { setShowSettings(false); void pickCaptionsFile(); }}
 							onGenerateCaptions={() => { setShowSettings(false); void generateCaptionsFromAudio(); }}
 							isGeneratingCaptions={isGeneratingCaptions}
 							captionsGenerationProgress={captionsGenerationProgress}
+							isDownloadingSpeechModel={isDownloadingSpeechModel}
 							captionsLanguage={captionsLanguage}
 							onCaptionsLanguageChange={handleCaptionsLanguageChange}
 							onSetThumbnail={() => { setShowSettings(false); openThumbnailPicker(); }}
 							thumbnailStatus={thumbnailStatus}
+							noise={playerNoise}
+							noiseStatus={noiseStatus}
+							onNoiseChange={setPlayerNoise}
 							/>
 							</div>
 						)}
@@ -2217,6 +2544,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							/>
 						)}
 					</video>
+					{captionsVisible && activeCaptionText && (
+						<div className="caption-overlay" aria-live="polite">
+							<span className="caption-text">{activeCaptionText}</span>
+						</div>
+					)}
 					{mediaType === 'audio' && (
 						<canvas ref={visualizerCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
 					)}

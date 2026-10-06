@@ -1,0 +1,12 @@
+/* Highlighter mode (docPaintExtension.ts). While a stroke is in progress the selection shows the
+   colour being applied (an inline decoration) - the browser's own blue selection is toned down so
+   it doesn't hide that preview. */
+.doc-paint-active ::selection {
+  background: rgba(0, 0, 0, 0.08);
+}
+.dark .doc-paint-active ::selection {
+  background: rgba(255, 255, 255, 0.12);
+}
+.doc-paint-preview {
+  border-radius: 2px;
+}

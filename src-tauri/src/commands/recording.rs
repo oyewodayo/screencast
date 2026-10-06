@@ -16,6 +16,7 @@ use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::async_runtime::Mutex;
 use tauri::AppHandle;
 use tauri::Emitter;
@@ -24,6 +25,10 @@ use tauri::State;
 
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
+#[cfg(target_os = "windows")]
+mod assembly;
+#[cfg(target_os = "windows")]
+mod gpu_capture;
 #[cfg(target_os = "windows")]
 mod win;
 // pub(crate): window_capture::macos (a sibling module, not a descendant of this one) needs
@@ -41,9 +46,31 @@ use macos as platform;
 #[cfg(target_os = "windows")]
 use win as platform;
 
+// The in-flight phone-camera capture's paths, held in AppState for the life of one recording.
+#[derive(Clone)]
+pub struct PhoneCaptureTarget {
+    // The screen recording this camera file belongs beside - decides the `_webcam.mp4` name.
+    video_path: PathBuf,
+    // Where MediaRecorder's bytes are being appended as they arrive.
+    raw_path: PathBuf,
+}
+
 #[derive(Default)]
 pub struct AppState {
     output_path: Arc<Mutex<Option<PathBuf>>>,
+    // Newest live-preview frame for the recording in progress, fed straight from ffmpeg's stdout
+    // by services/preview_stream.rs. Not behind the async Mutex the rest of this struct uses: the
+    // producer is a blocking reader thread with no runtime to yield to.
+    preview_frame: crate::services::preview_stream::PreviewFrame,
+    // Where the phone camera's own recording is accumulating, for the recording in progress.
+    //
+    // Resolved once, on the first chunk, from output_path below - NOT passed in from the
+    // frontend. start_recording returns a human-readable message ("Recording started. File will
+    // be saved as:\n<path>"), not a bare path, and an earlier version of this feature handed that
+    // whole string back as the video path: every chunk write then tried to open a file named after
+    // a sentence. Deriving it here means the frontend never has to know the path at all, so it
+    // cannot get it wrong.
+    phone_capture: Arc<Mutex<Option<PhoneCaptureTarget>>>,
     ffmpeg_process: Arc<Mutex<Option<Child>>>, // NEW: Store the process
     // Whether the in-progress recording is currently paused (see pause_recording/resume_recording
     // below). Kept separately from ffmpeg_process's mere presence since "a process is running" and
@@ -51,17 +78,15 @@ pub struct AppState {
     // recording checks this to resume a paused process before asking it to shut down gracefully,
     // since a suspended process can't act on the 'q' written to its stdin either.
     paused: Arc<Mutex<bool>>,
-    // System-audio (WASAPI loopback) capture session for the recording currently in progress, if
-    // one was requested - Windows-only, see services/loopback_audio.rs's doc comment for why this
-    // exists at all (ffmpeg/dshow alone can't capture "what you hear" on a machine with no Stereo
-    // Mix-equivalent device). `recording_has_own_audio` records whether *this* recording's own
-    // ffmpeg output already has a mic audio track - stop_recording needs that later to decide
-    // whether to mix the two together or just add the WAV as the sole track, and by the time it
-    // runs there's no FormData left to check it against directly.
+    // Whether stop_recording should enhance the finished file's audio in place - a recording with
+    // audio that isn't assembled (which enhances as it assembles): camera and audio-only modes, and
+    // every mode outside Windows. See services/audio_enhance.rs.
+    post_enhance: Arc<Mutex<bool>>,
+    // The parts of a screen recording in progress (Windows) - the picture-only intermediate, its
+    // frame timing, and the mic/system audio captured beside it - which stop_recording assembles
+    // into the final file. See recording/assembly.rs.
     #[cfg(target_os = "windows")]
-    loopback_capture: Arc<Mutex<Option<crate::services::loopback_audio::LoopbackCapture>>>,
-    #[cfg(target_os = "windows")]
-    recording_has_own_audio: Arc<Mutex<bool>>,
+    assembly: Arc<Mutex<Option<assembly::Assembly>>>,
     // Click-tracking session for the recording currently in progress, if FormData.track_clicks
     // asked for one - Windows-only, see services/click_tracker.rs's own doc comment. stop_recording
     // stops it and writes its collected clicks to a sidecar JSON file next to the finished video.
@@ -76,6 +101,50 @@ pub struct AppState {
     // non-empty) as a sidecar JSON by stop_recording, same convention as click_capture's own
     // sidecar.
     view_switches: Arc<Mutex<Vec<ViewSwitchEvent>>>,
+    // The live timer's inputs for the recording in progress - see get_recording_status.
+    clock: Arc<std::sync::Mutex<Option<RecordingClock>>>,
+}
+
+// Wall-clock milliseconds, the same unit as the frontend's Date.now() its timer is built from.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingClock {
+    pub record_type: String,
+    pub started_at: i64,
+    pub pause_started_at: Option<i64>,
+    pub paused_accumulated_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStatus {
+    pub recording: bool,
+    pub clock: Option<RecordingClock>,
+}
+
+// Lets a page that lost its state - reloaded after its renderer crashed (services/
+// webview_recovery.rs), or opened while a recording runs - take control of the recording in
+// progress again. Without this the page shows "Record", pressing it fails with "already in
+// progress", and nothing on screen can stop the capture.
+#[tauri::command]
+pub async fn get_recording_status(state: State<'_, AppState>) -> Result<RecordingStatus, String> {
+    let recording = state.output_path.lock().await.is_some()
+        && state
+            .ffmpeg_process
+            .lock()
+            .await
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+    let clock = if recording {
+        state.clock.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    } else {
+        None
+    };
+    Ok(RecordingStatus { recording, clock })
 }
 
 // One user-initiated toggle between "Screen" and "Camera" as the primary view during a recording
@@ -104,6 +173,12 @@ pub struct FormData {
     overlay_shape: String,
     overlay_position: String,
     overlay_size: String,
+    // Camera bubble border: "none" | "thin" | "medium" | "thick", and its "#rrggbb" colour - see
+    // OverlayStyle. Defaults keep an older caller's recording exactly as before (no border).
+    #[serde(default = "default_border")]
+    overlay_border: String,
+    #[serde(default = "default_border_color")]
+    overlay_border_color: String,
     // The title of the window screen_size names (as "window:<hwnd>") — the hwnd alone isn't
     // enough to actually *capture* that window on Windows (gdigrab targets windows by title, not
     // handle), so the frontend sends this alongside it. #[serde(default)] so a caller that
@@ -112,7 +187,7 @@ pub struct FormData {
     window_title: String,
     // Whether to also capture system/"what you hear" audio (WASAPI loopback, Windows-only) -
     // only meaningful for the screen-capture modes (sva/sa/s); ignored otherwise. See
-    // start_recording's handling of this field and services/loopback_audio.rs.
+    // start_recording's handling of this field and services/audio_capture.rs.
     #[serde(default)]
     include_system_audio: bool,
     // Opt-in (default false via #[serde(default)], so an older/unaware caller reproduces today's
@@ -140,6 +215,62 @@ pub struct FormData {
     // per-mode default exactly (60 for sva, 30 for sa/s).
     #[serde(default)]
     framerate: Option<i32>,
+    // Studio cleanup of the audio once the recording stops (Settings > "Enhance audio
+    // automatically", services/audio_enhance.rs). Defaults on for a caller that doesn't send it.
+    #[serde(default = "enhance_by_default")]
+    enhance_audio: bool,
+    // Set by start_recording, never sent by the frontend: where ffmpeg writes when the recording is
+    // assembled at stop (Windows screen modes - see recording/assembly.rs) instead of written
+    // straight to its final path.
+    #[serde(skip)]
+    capture_path: Option<PathBuf>,
+    // Set by start_recording: the app is capturing the mic itself, so ffmpeg mustn't.
+    #[serde(skip)]
+    mic_external: bool,
+}
+
+fn default_border() -> String {
+    "none".to_string()
+}
+
+fn default_border_color() -> String {
+    "#ffffff".to_string()
+}
+
+fn enhance_by_default() -> bool {
+    true
+}
+
+impl AppState {
+    /// A handle on the live-preview slot, for the reader thread that fills it.
+    ///
+    /// Cloning the Arc rather than lending a reference matters: the thread outlives this call and
+    /// runs until ffmpeg closes its stdout.
+    pub(crate) fn preview_frame_handle(&self) -> crate::services::preview_stream::PreviewFrame {
+        self.preview_frame.clone()
+    }
+}
+
+impl FormData {
+    // Removes the phone-camera sentinel (services/phone_camera.rs) from video_devices, reporting
+    // whether it was there.
+    //
+    // This MUST run before any platform::recording_with_output_* sees the FormData. Every one of
+    // them treats video_devices as a list of real capture-device names and interpolates them
+    // straight into ffmpeg input args (`-f dshow -i video=<name>` on Windows, and the avfoundation
+    // /v4l2 equivalents elsewhere), so leaving the sentinel in would hand ffmpeg a device that
+    // cannot exist and kill the whole recording - not just the camera.
+    //
+    // The phone's video never reaches ffmpeg at record time at all: it arrives over WebRTC in the
+    // WebView, which records it itself and hands the finished file to save_phone_camera_capture
+    // below. So as far as the ffmpeg side is concerned, stripping the sentinel leaves exactly the
+    // right thing behind - the real cameras, if any, and nothing else.
+    fn strip_phone_camera(&mut self) -> bool {
+        let before = self.video_devices.len();
+        self.video_devices
+            .retain(|d| d != crate::services::phone_camera::PHONE_DEVICE_SENTINEL);
+        before != self.video_devices.len()
+    }
 }
 
 // What a "screen" capture should actually point ffmpeg at, resolved once from FormData.screen_size
@@ -202,7 +333,7 @@ pub(crate) fn resolve_capture_target(
 // monitor sits left of/above the primary) since that's what a plain "-i desktop" with no offset/
 // crop actually grabs - not just the primary monitor.
 #[cfg(target_os = "windows")]
-fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32, i32, i32)> {
+pub(crate) fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32, i32, i32)> {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN,
@@ -247,8 +378,9 @@ fn click_sidecar_path(video_path: &Path) -> PathBuf {
 // Reads back whatever click_sidecar_path holds for `video_path`, if anything - None (not an
 // error) when the video was never recorded with track_clicks on, same "no sidecar yet is normal,
 // not a failure" convention load_video_edit_state (video_edits.rs) already uses.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sidecar = click_sidecar_path(&PathBuf::from(&video_path));
     if !sidecar.exists() {
         return Ok(None);
@@ -271,8 +403,9 @@ fn view_switch_sidecar_path(video_path: &Path) -> PathBuf {
 // Reads back whatever view_switch_sidecar_path holds for `video_path`, if anything - None (not an
 // error) when the video was never recorded with any view switches, same convention
 // load_click_sidecar above uses.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn load_view_switch_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sidecar = view_switch_sidecar_path(&PathBuf::from(&video_path));
     if !sidecar.exists() {
         return Ok(None);
@@ -288,8 +421,9 @@ pub fn load_view_switch_sidecar(video_path: String) -> Result<Option<String>, St
 // error) if no such file exists - the normal case for any recording that didn't have
 // FormData.separate_webcam_capture on, same "missing is fine" convention load_click_sidecar and
 // load_view_switch_sidecar both use.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_webcam_sidecar_path(video_path: String) -> Option<String> {
+    let _serial = crate::services::responsiveness::serial();
     let path = PathBuf::from(&video_path);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
     let webcam_path = path.with_file_name(format!("{}_webcam.mp4", stem));
@@ -297,6 +431,438 @@ pub fn get_webcam_sidecar_path(video_path: String) -> Option<String> {
         path_to_str(&webcam_path).ok().map(|s| s.to_string())
     } else {
         None
+    }
+}
+
+// Where the phone-camera capture accumulates on disk while it's still being recorded. Next to
+// the recording itself rather than in a temp dir so it's on the same volume as its final output.
+fn phone_capture_raw_path(video_path: &Path, mime_type: &str) -> PathBuf {
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording");
+    // MediaRecorder hands back webm, or fragmented mp4 on newer Chromium.
+    let ext = if mime_type.contains("mp4") { "mp4" } else { "webm" };
+    video_path.with_file_name(format!("{}_webcam_raw.{}", stem, ext))
+}
+
+// Appends one MediaRecorder chunk to the in-progress phone capture.
+//
+// The recording is streamed to disk a chunk at a time rather than handed over in one piece at the
+// end, because the whole thing has to cross Tauri's IPC boundary as JSON. A few minutes of 1080p
+// is well into the hundreds of megabytes; as a JSON array of byte-numbers that inflates roughly
+// fourfold and has to be held in memory whole on both sides at once - enough to wedge or kill the
+// WebView outright. Per-chunk base64 keeps each message around a megabyte, bounds memory to one
+// chunk, and means a crash mid-recording leaves everything already written still on disk.
+//
+// `first` truncates rather than appends, so a previous run's leftovers can't be prefixed onto this
+// one - the frontend sets it on the first chunk of each recording.
+#[tauri::command]
+pub async fn phone_camera_capture_chunk(
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    // The chunk arrives as a raw body with its metadata in headers, rather than as base64 inside a
+    // JSON object. Video is the one thing that genuinely does not belong in Tauri's JSON IPC: at
+    // the bitrates that look good, base64 inflates every chunk by a third, has to be built as a
+    // string on the WebView's main thread, and parsed back out of a multi-megabyte JSON document
+    // on this side - once every couple of seconds, for the whole recording. That overhead was what
+    // forced the capture bitrate down in the first place; removing it is what lets the phone layer
+    // record at full quality again.
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("Phone camera chunk arrived as JSON rather than raw bytes.".to_string())
+        }
+    };
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string())
+    };
+    let mime_type = header("x-briefcast-mime").unwrap_or_else(|| "video/webm".to_string());
+    let first = header("x-briefcast-first").as_deref() == Some("1");
+    // On the first chunk, resolve the destination from the recording that's actually in progress
+    // and remember it; every later chunk reuses it, so the answer can't drift mid-recording (and
+    // stop_recording clearing output_path can't strand the final flush).
+    let target = {
+        let mut guard = state.phone_capture.lock().await;
+        if first || guard.is_none() {
+            let video_path = state
+                .output_path
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| {
+                    "No recording is in progress, so there's nowhere to save the phone camera \
+                     video."
+                        .to_string()
+                })?;
+            let resolved = PhoneCaptureTarget {
+                raw_path: phone_capture_raw_path(&video_path, &mime_type),
+                video_path,
+            };
+            *guard = Some(resolved.clone());
+            resolved
+        } else {
+            guard.as_ref().unwrap().clone()
+        }
+    };
+
+    // Write on a blocking thread, for the same reason get_recording_preview_frame does above:
+    // synchronous file I/O on the async runtime's workers starves it, and a starved runtime means
+    // every other IPC call - including the ones the UI is waiting on - queues behind this one.
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(first)
+            .append(!first)
+            .open(&target.raw_path)
+            .map_err(|e| {
+                format!(
+                    "Failed to open the phone camera capture file at {}: {e}",
+                    target.raw_path.display()
+                )
+            })?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("Failed to write the phone camera recording: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Failed to save the phone camera recording: {e}"))?
+}
+
+// Finishes the phone-camera recording accumulated by phone_camera_capture_chunk, landing it as
+// the `<stem>_webcam.mp4` sidecar that get_webcam_sidecar_path (above) and the editor's PiP layer
+// already know how to find - so a phone ends up indistinguishable from a real webcam recorded
+// with FormData.separate_webcam_capture, and needs no new editor code at all.
+//
+// `start_offset_ms` is how long after ffmpeg started that the WebView's MediaRecorder actually
+// began producing frames. It's never zero: start_recording has to spawn ffmpeg and wait out its
+// own early-exit check before the frontend can even begin recording the phone stream. Rather than
+// leaving the editor to reconcile two files with different zero points, the gap is padded onto the
+// front of the camera file here so both share a t=0 - which is exactly what the PiP overlay and
+// the view-switch timeline (buildViewSwitchOverlays, videoEditHandlers.ts) already assume.
+#[tauri::command]
+pub async fn save_phone_camera_capture(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    start_offset_ms: f64,
+) -> Result<String, String> {
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+
+    // Taken, not borrowed: this capture is finished either way, and leaving it behind would let a
+    // later recording pick up a stale target.
+    let capture = state
+        .phone_capture
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| "The phone camera never recorded anything.".to_string())?;
+
+    let target = capture.video_path;
+    let raw_path = capture.raw_path;
+    let stem = target
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording")
+        .to_string();
+    let webcam_path = target.with_file_name(format!("{}_webcam.mp4", stem));
+
+    match fs::metadata(&raw_path) {
+        Ok(meta) if meta.len() > 0 => {}
+        _ => {
+            let _ = fs::remove_file(&raw_path);
+            return Err("The phone camera recording came back empty.".to_string());
+        }
+    }
+
+    let raw_str = path_to_str(&raw_path)?.to_string();
+    let out_str = path_to_str(&webcam_path)?.to_string();
+
+    let mut args: Vec<String> = vec!["-y".into(), "-i".into(), raw_str];
+
+    // The frontend measures the offset from when it asked ffmpeg to start, but an assembled
+    // screen recording begins at its first frame, which arrives later (GPU capture takes about a
+    // second to come up) - re-based here onto that frame.
+    #[cfg(target_os = "windows")]
+    let start_offset_ms = {
+        let parts = state.assembly.lock().await;
+        let first_frame = parts.as_ref().and_then(|p| {
+            let timing = p.timing.as_ref()?.lock().ok()?;
+            Some((p.launch_hns, timing.segments(&p.pauses)?.start_hns()))
+        });
+        match first_frame {
+            Some((launch, first)) => start_offset_ms - (first - launch) as f64 / 1e4,
+            None => start_offset_ms,
+        }
+    };
+
+    // Line the camera file up with the screen file: pad its head when it started later, trim it
+    // when it started earlier. Sub-frame offsets aren't worth a filter pass.
+    let offset_secs = start_offset_ms / 1000.0;
+    if offset_secs > 0.02 {
+        args.push("-vf".into());
+        args.push(format!(
+            "tpad=start_duration={:.3}:start_mode=add:color=black",
+            offset_secs
+        ));
+    } else if offset_secs < -0.02 {
+        args.push("-vf".into());
+        args.push(format!("trim=start={:.3},setpts=PTS-STARTPTS", -offset_secs));
+    }
+
+    // A WebRTC-sourced MediaRecorder file is variable-frame-rate and, for webm, carries no
+    // duration in its header at all (it was written as a live stream). Both are re-encoded away
+    // here into a plain CFR mp4, which is what the editor's seeking assumes. Hardware encoding
+    // when the machine has it, for the same reason the main recording path uses it.
+    #[cfg(target_os = "windows")]
+    let hw = crate::services::hw_encoder::detect(&ffmpeg_path);
+    #[cfg(not(target_os = "windows"))]
+    let hw: Option<()> = None;
+
+    // Quality here is deliberately higher than the main recording's.
+    //
+    // This is a *second* encode of footage the phone already compressed once, so whatever it
+    // spends is spent on top of an existing generation loss. The main recording encodes camera
+    // frames straight from the sensor and can afford an ordinary quality target; this one is
+    // re-compressing an H.264 stream, where the same target would visibly stack artefacts.
+    //
+    // (A straight `-c copy` would avoid the second encode entirely - measured at 9x faster and
+    // half the size with every frame preserved - but it can only express the start offset below as
+    // a container start_time, which the editor's PiP layer assumes is zero. Not worth trading
+    // correct A/V alignment for, so the re-encode stays and simply pays for quality instead.)
+    match hw {
+        #[cfg(target_os = "windows")]
+        Some(encoder) => {
+            args.push("-c:v".into());
+            args.push(encoder.name().to_string());
+            args.extend(encoder.high_quality_args());
+        }
+        _ => {
+            args.push("-c:v".into());
+            args.push("libx264".into());
+            args.push("-preset".into());
+            args.push("faster".into());
+            args.push("-crf".into());
+            args.push("18".into());
+        }
+    }
+
+    args.extend([
+        // CFR, but at whatever rate the source actually ran at rather than a hardcoded 30 - a
+        // phone sending 60fps was previously having half its frames thrown away here. `-fps_mode
+        // cfr` alone still produces a constant rate (which is what the editor's seeking wants),
+        // it just derives it from the input instead of overriding it.
+        "-fps_mode".to_string(),
+        "cfr".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        // The editor scrubs this file; without a relocated moov it has to read to the end first.
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        // The phone sends video only (the page requests audio:false - the mic stays whichever
+        // device the user picked on the PC), so there is deliberately no audio stream to map.
+        "-an".to_string(),
+        out_str,
+    ]);
+
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(&args);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    hide_console_window(&mut cmd);
+
+    let output = tauri::async_runtime::spawn_blocking(move || cmd.output())
+        .await
+        .map_err(|e| format!("Failed to run ffmpeg for the phone camera recording: {e}"))?
+        .map_err(|e| format!("Failed to run ffmpeg for the phone camera recording: {e}"))?;
+
+    if !output.status.success() {
+        // Deliberately NOT cleaned up on failure. The raw file is the only copy of footage the
+        // user cannot re-shoot - whatever went wrong in the conversion, throwing the recording
+        // away on top of it is strictly worse. Tell them where it is instead.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::error!(
+            "Phone camera conversion failed, raw capture kept at {:?}: {}",
+            raw_path,
+            stderr
+        );
+        return Err(format!(
+            "Couldn't convert the phone camera recording ({}). The raw footage was kept at {} - \
+             it will play in VLC, and Briefcast can import it.",
+            stderr.lines().last().unwrap_or("unknown ffmpeg error"),
+            raw_path.display()
+        ));
+    }
+
+    let _ = fs::remove_file(&raw_path);
+    info!("Phone camera recording saved to {:?}", webcam_path);
+    out_str_owned(&webcam_path)
+}
+
+// Small helper so save_phone_camera_capture can return an owned path string without borrowing a
+// temporary - path_to_str hands back a &str tied to its argument.
+fn out_str_owned(path: &Path) -> Result<String, String> {
+    path_to_str(path).map(|s| s.to_string())
+}
+
+// Hands the frontend the newest live-preview frame, as raw JPEG bytes.
+//
+// The frame comes from memory, not from disk: ffmpeg streams the preview as MJPEG on its stdout
+// and services/preview_stream.rs keeps the latest complete frame. So this is a buffer copy, which
+// is what makes it safe to poll many times a second for the whole length of a recording.
+//
+// Raw, not a base64 data URL - base64 would cost 33% more bytes across the IPC boundary plus an
+// encode here and a decode there, all of it to hand the frontend something it immediately turns
+// back into binary. An empty response means "nothing to show yet", which covers both "no recording
+// in progress" and "ffmpeg hasn't produced a frame yet"; a polling caller has no use for the
+// distinction.
+#[tauri::command]
+pub async fn get_recording_preview_frame(
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let frame = state
+        .preview_frame
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or(None);
+    Ok(tauri::ipc::Response::new(frame.unwrap_or_default()))
+}
+
+// Waits for ffmpeg to finish writing after it has been asked to stop, force-killing only once it
+// is demonstrably no longer making progress. Returns whether it had to resort to the kill.
+//
+// The previous version waited a flat two seconds and then killed unconditionally, which is the
+// wrong shape for this problem: finalizing is not a fixed-cost operation. How long ffmpeg needs
+// after 'q' scales with the recording - flushing encoder queues, writing an index, and for some
+// containers rewriting structure at the head of the file - so a long or high-resolution capture
+// can legitimately need far longer than two seconds, and killing it mid-write is precisely what
+// corrupts the output. The frag-mp4 flags limit the damage for mp4 (the file stays playable up to
+// the last complete fragment) but do nothing for avi/mkv/mov, and even for mp4 they only bound
+// the loss rather than prevent it.
+//
+// So the timeout is on *progress*, not on elapsed time: as long as the output file keeps growing,
+// ffmpeg is still doing the work it was asked to do and is left alone. Only when it has stopped
+// both exiting and writing for IDLE_GRACE is it considered hung. A hard cap still exists so this
+// can never wait forever on a pathological process.
+fn wait_for_ffmpeg_to_finalize(process: &mut Child, output_path: &Path) -> bool {
+    const POLL: Duration = Duration::from_millis(100);
+    // No growth for this long, with the process still alive, means it is stuck rather than busy.
+    // Matches the old flat timeout, which is a reasonable "it really isn't doing anything" bar.
+    const IDLE_GRACE: Duration = Duration::from_secs(2);
+    // Absolute ceiling, so a process that somehow keeps touching the file can't hold Stop open
+    // indefinitely. Generous enough that only a genuinely stuck ffmpeg should ever reach it.
+    const HARD_CAP: Duration = Duration::from_secs(120);
+
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut last_size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+
+    loop {
+        match process.try_wait() {
+            // Exited on its own - the file was finalized properly.
+            Ok(Some(_)) => return false,
+            Ok(None) => {}
+            // Can't observe it any more; nothing useful left to do here.
+            Err(_) => return false,
+        }
+
+        let size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(last_size);
+        if size != last_size {
+            last_size = size;
+            last_progress = Instant::now();
+        }
+
+        if started.elapsed() >= HARD_CAP {
+            warn!(
+                "ffmpeg still running {}s after being asked to stop, force-killing - the recording may be incomplete",
+                HARD_CAP.as_secs()
+            );
+            let _ = process.kill();
+            return true;
+        }
+
+        if last_progress.elapsed() >= IDLE_GRACE {
+            warn!(
+                "ffmpeg stopped writing {}s ago but hasn't exited, force-killing - the recording may be incomplete",
+                IDLE_GRACE.as_secs()
+            );
+            let _ = process.kill();
+            return true;
+        }
+
+        std::thread::sleep(POLL);
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod shutdown_tests {
+    use super::*;
+    use std::process::Stdio;
+
+    fn ps(script: &str) -> Child {
+        Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn powershell")
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("briefcast_shutdown_test_{name}"));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn a_process_that_exits_promptly_is_not_killed() {
+        let path = temp("quick");
+        fs::write(&path, b"done").unwrap();
+        let mut child = ps("exit 0");
+        assert!(!wait_for_ffmpeg_to_finalize(&mut child, &path));
+        let _ = fs::remove_file(&path);
+    }
+
+    // The regression this whole change exists for: ffmpeg still writing when the old flat
+    // two-second timeout would have expired must be left alone, not killed mid-write.
+    #[test]
+    fn a_slow_but_still_writing_process_is_left_alone() {
+        let path = temp("writing");
+        fs::write(&path, b"").unwrap();
+        let script = format!(
+            "1..24 | ForEach-Object {{ Add-Content -LiteralPath '{}' -Value 'x'; Start-Sleep -Milliseconds 200 }}",
+            path.display()
+        );
+        let mut child = ps(&script);
+        let started = Instant::now();
+        let killed = wait_for_ffmpeg_to_finalize(&mut child, &path);
+        assert!(!killed, "a process still growing the output file must not be force-killed");
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "should have waited out the writes rather than giving up at the old 2s mark"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    // The other half: alive but doing nothing is exactly what the kill is for.
+    #[test]
+    fn a_hung_process_is_killed_after_the_idle_grace() {
+        let path = temp("hung");
+        fs::write(&path, b"stalled").unwrap();
+        let mut child = ps("Start-Sleep -Seconds 30");
+        let started = Instant::now();
+        assert!(wait_for_ffmpeg_to_finalize(&mut child, &path));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "should give up shortly after the idle grace, not wait for the hard cap"
+        );
+        let _ = child.wait();
+        let _ = fs::remove_file(&path);
     }
 }
 
@@ -345,6 +911,56 @@ pub(crate) fn extract_ffmpeg_error(stderr: &str) -> String {
     lines[lines.len() - tail_len..].join(" | ")
 }
 
+// Shared by every platform backend (win/macos/linux) - the swap is pure argument-vector
+// surgery with nothing OS-specific in it, and hw_encoder handles which encoders are even worth
+// probing per platform.
+//
+// Swaps codec_args_for_ext's software video-encode segment (`-c:v libx264 -preset ultrafast
+// [-crf N]`) for a detected hardware encoder's own, when one actually works on this machine (see
+// services/hw_encoder.rs) - CPU usage on a long/high-res recording is the single biggest
+// encoding-side complaint this app's software-only libx264 path has (see
+// RECORDING_UPGRADE_NOTES.md). Only for the h264-targeting containers that path already covers
+// (mp4/mkv/avi/mov); webm's target codec is VP8, which has no equivalent widely-available
+// hardware path, so it's left on software regardless. Finds the software segment by locating
+// "-pix_fmt" (which immediately follows it in every one of those four branches) rather than
+// hardcoding each branch's exact offset, so this stays correct if codec_args_for_ext's own args
+// ever get reordered.
+pub(crate) fn codec_args_for_ext_hw(ext: &str, ffmpeg_path: &std::path::Path) -> Vec<String> {
+    let Some(encoder) = crate::services::hw_encoder::detect(ffmpeg_path) else {
+        return codec_args_for_ext(ext);
+    };
+    let mut video = vec!["-c:v".to_string(), encoder.name().to_string()];
+    video.extend(encoder.quality_args());
+    codec_args_with_video_encoder(ext, &video, true).unwrap_or_else(|| codec_args_for_ext(ext))
+}
+
+// codec_args_for_ext's container/audio args with its software video-encoder segment (`-c:v ...`
+// up to `-pix_fmt`) replaced by `video` - None for a container that segment doesn't exist in
+// (webm, whose VP8 has no hardware path). `keep_pix_fmt` is false for encoders fed GPU-resident
+// frames: -pix_fmt names a system-memory format, and asking for one would make ffmpeg try to
+// convert frames it can't reach.
+pub(crate) fn codec_args_with_video_encoder(
+    ext: &str,
+    video: &[String],
+    keep_pix_fmt: bool,
+) -> Option<Vec<String>> {
+    if !matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "avi" | "mov") {
+        return None;
+    }
+    let args = codec_args_for_ext(ext);
+    let cv_idx = args.iter().position(|a| a == "-c:v")?;
+    let pix_fmt_idx = args.iter().position(|a| a == "-pix_fmt")?;
+    if pix_fmt_idx <= cv_idx {
+        return None;
+    }
+
+    let mut patched = args[..cv_idx].to_vec();
+    patched.extend(video.iter().cloned());
+    let rest = if keep_pix_fmt { pix_fmt_idx } else { pix_fmt_idx + 2 };
+    patched.extend(args[rest..].iter().cloned());
+    Some(patched)
+}
+
 // Caps the encoded/composited frame width for every desktop-capture recording mode - screen
 // capture otherwise grabs at the monitor's exact native pixel resolution (see win.rs's
 // desktop_crop_args) with no downscale at all, so a 4K/5K display produces files whose frames a
@@ -381,158 +997,228 @@ pub(crate) fn resolved_max_width(form_data: &FormData) -> i32 {
 // 60 keeps that to at most 2s (30fps) or 1s (60fps) without meaningfully hurting compression.
 const KEYFRAME_INTERVAL: &str = "60";
 
+// The resolution a camera is captured at (dshow/avfoundation/v4l2 `-video_size`). Every named
+// bubble size captures at 640x480 - a mode practically every webcam supports - and the bubble is
+// scaled from that: the old "small" captured at 320x240, which looked soft even small, and asking
+// a camera for a size it doesn't offer fails the whole recording. A literal "WxH" passes through.
 pub fn map_overlay_size(size: &str) -> String {
     match size {
-        "small" => "320x240".to_string(),
-        "medium" => "640x480".to_string(),
+        "xs" | "small" | "medium" | "large" | "xl" => "640x480".to_string(),
         _ => size.to_string(),
     }
 }
 
-// The real on-screen footprint of one camera bubble, needed to space multiple bubbles apart
-// without overlapping. circle/rounded collapse to a square the way get_overlay_shape's own
-// scale=w='min(iw,ih)':h='min(iw,ih)' already does per-camera - this just mirrors that math so
-// the position math agrees with what the filter graph actually produces.
-fn overlay_pixel_dimensions(shape: &str, size: &str) -> (i32, i32) {
-    let mapped = map_overlay_size(size);
-    let (w, h) = mapped
-        .split_once('x')
-        .and_then(|(w, h)| Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?)))
-        .unwrap_or((320, 240));
+// How a camera bubble looks, as chosen in the Screen Options modal. Sizes, margins and border
+// thickness are all fractions of the recorded frame's width, so a bubble looks the same at 1080p
+// and at 4K - and so the modal's preview (CameraOverlayPreview.tsx, which mirrors every number
+// here) can draw it exactly.
+pub(crate) struct OverlayStyle<'a> {
+    pub shape: &'a str,
+    pub position: &'a str,
+    pub size: &'a str,
+    // "none" | "thin" | "medium" | "thick".
+    pub border: &'a str,
+    // "#rrggbb".
+    pub border_color: &'a str,
+}
 
-    match shape {
-        "circle" | "rounded" => {
-            let s = w.min(h);
-            (s, s)
-        }
-        _ => (w, h),
+fn even(v: f64) -> i32 {
+    ((v.round() as i32) / 2 * 2).max(2)
+}
+
+// Bubble width as a share of the frame's.
+fn bubble_fraction(size: &str) -> f64 {
+    match size {
+        "xs" => 0.10,
+        "medium" => 0.18,
+        "large" => 0.24,
+        "xl" => 0.30,
+        _ => 0.14, // "small" and anything unrecognised
     }
 }
 
-// Shared by every platform's overlay compositing (a webcam bubble drawn over the screen
-// capture) — only the *inputs* feeding this filter graph differ per OS (dshow/avfoundation/v4l2
-// device syntax), the graph itself is plain ffmpeg filter syntax and has no OS dependency.
-//
-// With N cameras selected, each one is stacked outward from the chosen anchor corner (gap of
-// 20px, same margin the single-camera positions already used) rather than all landing on top of
-// each other at the same x/y. Covers all 6 positions the Camera Position buttons in
-// EnhancedScreenOptions.tsx can send - top_left/top_center/top_right previously fell through to
-// the bottom_right default below (silently, since nothing ever rendered a preview to notice),
-// same bug class as the "bottom_center" vs "bottom_middle" mismatch fixed above.
-fn overlay_position_expr(
-    anchor: &str,
-    index: usize,
-    count: usize,
-    cam_w: i32,
-    cam_h: i32,
-) -> String {
-    let _ = cam_h; // width alone (via cam_w) is enough since margins are fixed constants.
-    let gap = 20;
-    let step = index as i32 * (cam_w + gap);
+// The camera picture inside one bubble (border excluded): square for circle/rounded, 4:3 for the
+// plain rectangle.
+fn overlay_pixel_dimensions(shape: &str, size: &str, frame_width: i32) -> (i32, i32) {
+    let side = even(frame_width as f64 * bubble_fraction(size));
+    match shape {
+        "circle" | "rounded" => (side, side),
+        _ => (side, even(side as f64 * 3.0 / 4.0)),
+    }
+}
 
-    let (x_base, y_top) = match anchor {
-        "top_left" => ("left", true),
-        "top_center" => ("center", true),
-        "top_right" => ("right", true),
-        "bottom_left" => ("left", false),
-        "bottom_center" => ("center", false),
-        // "bottom_right" and any unrecognized anchor fall back to this, matching the old
-        // single-camera default.
-        _ => ("right", false),
+fn border_px(border: &str, frame_width: i32) -> i32 {
+    let w = frame_width as f64;
+    match border {
+        "thin" => even((w * 0.003).max(2.0)),
+        "medium" => even((w * 0.006).max(4.0)),
+        "thick" => even((w * 0.011).max(6.0)),
+        _ => 0,
+    }
+}
+
+// "#rrggbb" for ffmpeg's color source; anything malformed falls back to white.
+fn ffmpeg_color(hex: &str) -> String {
+    let h = hex.trim().trim_start_matches('#');
+    if h.len() == 6 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("0x{}", h)
+    } else {
+        "white".to_string()
+    }
+}
+
+// geq: 255 inside a rounded rectangle inset `o` px into the frame with corner radius `r`, else 0.
+fn rounded_mask(o: i32, r: i32) -> String {
+    format!(
+        "if(lte(pow(max(max({o}+{r}-X,X-(W-1-{o}-{r})),0),2)+pow(max(max({o}+{r}-Y,Y-(H-1-{o}-{r})),0),2),{r}*{r}),255,0)",
+        o = o,
+        r = r
+    )
+}
+
+// geq: 255 inside a centred circle inset `o` px into the frame, else 0.
+fn circle_mask(o: i32) -> String {
+    format!("if(lte((X-W/2+0.5)^2+(Y-H/2+0.5)^2,(W/2-{o})^2),255,0)", o = o)
+}
+
+// Where bubble `index` of `count` goes, for bubbles `bubble_w` wide (border included). Bubbles
+// stack outward from the anchor corner; margin and gap scale with the frame like everything else.
+fn overlay_position_expr(anchor: &str, index: usize, count: usize, bubble_w: i32, frame_width: i32) -> String {
+    let margin = even(frame_width as f64 * 0.025);
+    let gap = even(frame_width as f64 * 0.012);
+    let step = index as i32 * (bubble_w + gap);
+
+    // (horizontal, vertical) - the 3x3 grid the modal offers.
+    let (x_base, y_base) = match anchor {
+        "top_left" => ("left", "top"),
+        "top_center" => ("center", "top"),
+        "top_right" => ("right", "top"),
+        "center_left" => ("left", "middle"),
+        "center" => ("center", "middle"),
+        "center_right" => ("right", "middle"),
+        "bottom_left" => ("left", "bottom"),
+        "bottom_center" => ("center", "bottom"),
+        // "bottom_right" and any unrecognized anchor.
+        _ => ("right", "bottom"),
     };
-
     let x_expr = match x_base {
-        "left" => format!("{}+{}", 100, step),
+        "left" => format!("{}+{}", margin, step),
         "center" => {
-            let total = count as i32 * cam_w + (count.saturating_sub(1)) as i32 * gap;
+            let total = count as i32 * bubble_w + (count.saturating_sub(1)) as i32 * gap;
             format!("(W-{})/2+{}", total, step)
         }
-        _ => format!("W-w-{}-{}", 100, step),
+        _ => format!("W-w-{}-{}", margin, step),
     };
-
-    let y_expr = if y_top {
-        "50".to_string()
-    } else {
-        "H-h-50".to_string()
+    let y_expr = match y_base {
+        "top" => format!("{}", margin),
+        "middle" => "(H-h)/2".to_string(),
+        _ => format!("H-h-{}", margin),
     };
-
     format!("overlay=x={}:y={}", x_expr, y_expr)
 }
 
-// One stage of the overlay chain: reads `prev_label` (the running composite so far, "[0:v]" for
-// the first camera or "[tmpN]" for subsequent ones) and `input_label` (this camera's raw input,
-// "[1:v]", "[2:v]", ...), and writes either an intermediate "[tmpN]" label (out_label = Some) for
-// the next stage to read, or nothing (out_label = None) on the final stage so ffmpeg auto-selects
-// it as the sole unlabeled filter output, same as the old single-camera graph did.
+// One camera's bubble, composited onto `prev_label` into `out_label`.
+//
+// Everything that defines the bubble's shape and border is drawn ONCE and looped: masks and the
+// border ring are static images, merged with each camera frame. Computing them per frame (geq)
+// measured ~1.8 CPU cores on its own; looped, the whole composite costs ~0.3. The camera is
+// center-cropped to the bubble's aspect rather than squeezed into it.
+#[allow(clippy::too_many_arguments)]
 fn overlay_stage_filter(
-    shape: &str,
-    stage_index: usize,
+    style: &OverlayStyle,
+    n: usize,
     input_label: &str,
     prev_label: &str,
-    out_label: Option<&str>,
+    out_label: &str,
     position_expr: &str,
+    pic: (i32, i32),
+    border: i32,
 ) -> String {
-    // Just the trailing "[label]" to append when this stage feeds another one, or nothing when
-    // it's the final stage (left for ffmpeg to auto-select, as today's single-camera graph did).
-    let out_suffix = match out_label {
-        Some(label) => format!("[{}]", label),
-        None => String::new(),
+    let (w, h) = pic;
+    let (bw, bh) = (w + 2 * border, h + 2 * border);
+    let color = ffmpeg_color(style.border_color);
+    let radius = (w / 8).max(4);
+    let shaped = style.shape == "circle" || style.shape == "rounded";
+    // The camera, cropped to the bubble's aspect and scaled into it.
+    let crop = if shaped {
+        "crop='min(iw,ih)':'min(iw,ih)'"
+    } else {
+        "crop='min(iw,ih*4/3)':'min(ih,iw*3/4)'"
     };
+    let mut picture = format!(
+        "{input}{crop},scale={w}:{h},setsar=1,format=yuva420p",
+        input = input_label,
+        crop = crop,
+        w = w,
+        h = h
+    );
+    let mut stages = Vec::new();
+    let mut cam = format!("cam{}", n);
 
-    match shape {
-        "circle" => format!(
-            "{input}scale=w='min(iw,ih)':h='min(iw,ih)', \
-            geq=lum_expr='if(gt((X-W/2)^2+(Y-H/2)^2,(W/2)^2),0,255)', \
-            format=yuva420p[alpha{n}]; \
-            {input}scale=w='min(iw,ih)':h='min(iw,ih)'[video{n}]; \
-            [video{n}][alpha{n}]alphamerge[overlay{n}]; \
-            {prev}[overlay{n}]{position_expr}{out_suffix}",
-            input = input_label,
-            n = stage_index,
-            prev = prev_label,
-            position_expr = position_expr,
-            out_suffix = out_suffix,
-        ),
-        "rounded" => format!(
-            "{input}scale=w='min(iw,ih)':h='min(iw,ih)', \
-            geq=lum_expr='if(gte(X,{r})*gte(Y,{r})*gte(W-{r}-X,0)*gte(H-{r}-Y,0),255,0)', \
-            format=yuva420p[alpha{n}]; \
-            {input}scale=w='min(iw,ih)':h='min(iw,ih)'[video{n}]; \
-            [video{n}][alpha{n}]alphamerge[overlay{n}]; \
-            {prev}[overlay{n}]{position_expr}{out_suffix}",
-            input = input_label,
-            n = stage_index,
-            r = 20,
-            prev = prev_label,
-            position_expr = position_expr,
-            out_suffix = out_suffix,
-        ),
-        _ => format!(
-            "{}{}{}{}",
-            prev_label, input_label, position_expr, out_suffix
-        ),
+    if border > 0 {
+        // The picture sits inside a border-coloured frame. For shaped bubbles a looped ring
+        // (border colour between the outer and inner shape) covers the frame's square corners
+        // inside the outer shape, so the border follows the curve.
+        picture.push_str(&format!(",pad={bw}:{bh}:{b}:{b}:color={c}", bw = bw, bh = bh, b = border, c = color));
+        stages.push(format!("{}[{}]", picture, cam));
+        let ring = match style.shape {
+            "circle" => Some((circle_mask(0), circle_mask(border))),
+            "rounded" => Some((rounded_mask(0, radius + border), rounded_mask(border, radius))),
+            _ => None,
+        };
+        if let Some((outer, inner)) = ring {
+            stages.push(format!(
+                "color=c={c}:s={bw}x{bh}:r=1:d=1,format=yuva420p[ringc{n}]; \
+                 color=black:s={bw}x{bh}:r=1:d=1,format=gray,geq=lum='if(gt({outer},0)*eq({inner},0),255,0)'[ringm{n}]; \
+                 [ringc{n}][ringm{n}]alphamerge,loop=-1:1:0[ring{n}]; \
+                 [{cam}][ring{n}]overlay=0:0:eof_action=repeat[camr{n}]",
+                c = color,
+                bw = bw,
+                bh = bh,
+                outer = outer,
+                inner = inner,
+                n = n,
+                cam = cam
+            ));
+            cam = format!("camr{}", n);
+        }
+    } else {
+        stages.push(format!("{}[{}]", picture, cam));
     }
+
+    // The outer shape, cut out of the (bordered) picture.
+    let outer = match style.shape {
+        "circle" => Some(circle_mask(0)),
+        "rounded" => Some(rounded_mask(0, radius + border)),
+        _ => None,
+    };
+    let bubble = match outer {
+        Some(mask) => {
+            stages.push(format!(
+                "color=black:s={bw}x{bh}:r=1:d=1,format=gray,geq=lum='{mask}',loop=-1:1:0[mask{n}]; \
+                 [{cam}][mask{n}]alphamerge[bubble{n}]",
+                bw = bw,
+                bh = bh,
+                mask = mask,
+                n = n,
+                cam = cam
+            ));
+            format!("[bubble{}]", n)
+        }
+        None => format!("[{}]", cam),
+    };
+    stages.push(format!("{}{}{}[{}]", prev_label, bubble, position_expr, out_label));
+    stages.join("; ")
 }
 
-// Builds the full filter_complex chaining one overlay stage per camera - two or more cameras
-// each get masked/shaped independently and composited onto the running result in sequence
-// ([0:v] + cam0 -> tmp1, tmp1 + cam1 -> tmp2, ...), then a final downscale stage capping the
-// composited output at `max_width` (left unlabeled so ffmpeg picks it automatically as this
-// output's video stream, same as the old last overlay stage did before this one existed). Every
-// overlay stage is labeled now (including what used to be the final, unlabeled one) since the
-// downscale stage needs a named input to read the finished composite from. `max_width` is caller-
-// resolved (see resolved_max_width) rather than always MAX_RECORDING_WIDTH so Windows callers can
-// honor FormData.resolution_width - macOS/Linux callers still just pass MAX_RECORDING_WIDTH,
-// unchanged from before this parameter existed.
+// Builds the full filter_complex chaining one overlay stage per camera onto the screen ([0:v],
+// or `screen` - see build_camera_overlay_filter_complex_from), then a final downscale stage
+// capping the composite at `max_width`, left unlabeled so ffmpeg maps it automatically.
 //
 // `crop` (w, h, x, y) is Some only for macOS's own window-capture path: avfoundation has no
-// per-window capture mode at all (only whole displays or camera devices - unlike gdigrab, which
-// at least offers one even though win.rs deliberately doesn't use it either), so a specific
-// window has to be cropped out of a full-display capture instead - see
-// window_capture::macos::get_window_rect_by_title's own doc comment for how that rect is
-// obtained and its known multi-monitor caveat. Windows/Linux callers always pass None - their own
-// window-region cropping happens at the input-arg level (offset_x/video_size, x11grab's own
-// video_size+i), before any camera overlay is ever composited on top, so they never needed this.
+// per-window capture mode at all, so a specific window has to be cropped out of a full-display
+// capture instead - see window_capture::macos::get_window_rect_by_title.
+#[cfg_attr(target_os = "windows", allow(dead_code))] // Windows uses the _from form below
 pub fn build_camera_overlay_filter_complex(
     shape: &str,
     position: &str,
@@ -541,37 +1227,48 @@ pub fn build_camera_overlay_filter_complex(
     max_width: i32,
     crop: Option<(i32, i32, i32, i32)>,
 ) -> String {
-    let (cam_w, cam_h) = overlay_pixel_dimensions(shape, size);
+    let style = OverlayStyle { shape, position, size, border: "none", border_color: "#ffffff" };
+    build_camera_overlay_filter_complex_from(
+        &style,
+        camera_count,
+        max_width,
+        max_width.min(MAX_RECORDING_WIDTH),
+        crop.map(|(w, h, x, y)| format!("[0:v]crop={}:{}:{}:{}", w, h, x, y)).as_deref(),
+        1,
+    )
+}
+
+// Same graph, with `screen` - a filter chain producing the screen picture - in place of the raw
+// [0:v] input, and the cameras starting at input `first_camera`. `frame_width` is the width of
+// the picture the bubbles are composited onto, which every bubble dimension scales with.
+pub(crate) fn build_camera_overlay_filter_complex_from(
+    style: &OverlayStyle,
+    camera_count: usize,
+    max_width: i32,
+    frame_width: i32,
+    screen: Option<&str>,
+    first_camera: usize,
+) -> String {
+    let pic = overlay_pixel_dimensions(style.shape, style.size, frame_width);
+    let border = border_px(style.border, frame_width);
+    let bubble_w = pic.0 + 2 * border;
     let mut stages: Vec<String> = Vec::with_capacity(camera_count + 2);
     let mut prev_label = "[0:v]".to_string();
 
-    if let Some((w, h, x, y)) = crop {
-        stages.push(format!("[0:v]crop={}:{}:{}:{}[cropped]", w, h, x, y));
-        prev_label = "[cropped]".to_string();
+    if let Some(chain) = screen {
+        stages.push(format!("{}[src]", chain));
+        prev_label = "[src]".to_string();
     }
 
     for index in 0..camera_count {
-        let input_label = format!("[{}:v]", index + 1);
-        let position_expr = overlay_position_expr(position, index, camera_count, cam_w, cam_h);
+        let input_label = format!("[{}:v]", index + first_camera);
+        let position_expr = overlay_position_expr(style.position, index, camera_count, bubble_w, frame_width);
         let out_label = format!("comp{}", index + 1);
-
-        stages.push(overlay_stage_filter(
-            shape,
-            index,
-            &input_label,
-            &prev_label,
-            Some(&out_label),
-            &position_expr,
-        ));
-
+        stages.push(overlay_stage_filter(style, index, &input_label, &prev_label, &out_label, &position_expr, pic, border));
         prev_label = format!("[{}]", out_label);
     }
 
-    stages.push(format!(
-        "{}scale='min({},iw)':-2",
-        prev_label, max_width
-    ));
-
+    stages.push(format!("{}scale='min({},iw)':-2", prev_label, max_width));
     stages.join("; ")
 }
 
@@ -620,6 +1317,10 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             // fix as the "mp4"/"mov"/"webm"/fallback branches, just closing this one gap.
             "-b:a".into(),
             "192k".into(),
+            // Same live-capture interleaving stall the "avi" branch above documents - measured
+            // 5.7 fps written into mkv against 59.5 into mp4 for the same capture.
+            "-max_interleave_delta".into(),
+            "0".into(),
         ],
         "avi" => vec![
             "-c:v".into(),
@@ -632,6 +1333,19 @@ pub(crate) fn codec_args_for_ext(ext: &str) -> Vec<String> {
             KEYFRAME_INTERVAL.into(),
             "-c:a".into(),
             "pcm_s16le".into(), // Better audio codec for AVI
+            // AVI interleaves audio and video strictly, and with a *live* capture whose audio
+            // arrives in bursts the muxer ends up holding video back waiting for audio to catch
+            // up. Measured on a 4K desktop capture with a microphone: 4.7 fps written, against
+            // 59.5 fps for the same capture into mp4. Relaxing the interleave constraint recovers
+            // most of it (10.4 fps) - the muxer writes each packet when it has it instead of
+            // stalling for its counterpart.
+            //
+            // It does not close the gap entirely: AVI caps out around 11-12 fps here even with no
+            // audio at all, where mp4 sustains 60. AVI is simply a poor container for a live
+            // high-resolution capture, which is why mp4 is the default (see defaultFileExt in
+            // src/utils/appSettings.ts) - this only makes the explicit choice less punishing.
+            "-max_interleave_delta".into(),
+            "0".into(),
         ],
         "mov" => vec![
             "-c:v".into(),
@@ -727,17 +1441,6 @@ pub(crate) fn audio_codec_args_for_ext(ext: &str) -> Vec<String> {
     }
 }
 
-// Boosts captured mic audio that's otherwise noticeably quiet, and compresses its dynamic range
-// first so that boost doesn't clip whatever passages are already loud (voice trailing off vs.
-// leaning into the mic, etc). Deliberately NOT dynaudnorm/loudnorm - both are meant for
-// normalizing a finished file, and empirically (measured against this app's own bundled ffmpeg
-// and real mic) dynaudnorm runs at ~0.1x real-time speed here, which would make it fall further
-// and further behind during any real recording and risk the same "force-killed with a large
-// unflushed backlog, corrupt output" failure mode already documented for other slow encoders in
-// this codebase (see win.rs's webm comments). acompressor+volume are cheap per-sample filters
-// with no lookahead buffering, confirmed to run at real-time speed in the same test.
-pub(crate) const AUDIO_ENHANCE_FILTER: &str =
-    "acompressor=threshold=-25dB:ratio=3:attack=5:release=200,volume=6dB";
 
 // Hides the console window a spawned child would otherwise flash open on Windows (a no-op
 // everywhere else, since spawning a child process never pops up a console on macOS/Linux in the
@@ -786,10 +1489,13 @@ pub(crate) async fn spawn_recording(
 
     log::debug!("FFmpeg args: {:?}", args);
 
-    let child = silent_command(ffmpeg_path)
-        .args(&args)
+    let mut cmd = silent_command(ffmpeg_path);
+    cmd.args(&args);
+    crate::services::orphan_guard::before_spawn(&mut cmd);
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    crate::services::orphan_guard::after_spawn(&child);
 
     {
         let mut process_state = state.ffmpeg_process.lock().await;
@@ -802,19 +1508,86 @@ pub(crate) async fn spawn_recording(
     ))
 }
 
-#[tauri::command]
-pub fn get_connected_devices(app_handle: AppHandle) -> (Vec<String>, Vec<String>) {
-    platform::get_connected_devices(&app_handle)
+// Device enumeration shells out to ffmpeg (`-list_devices` on Windows), which takes a second or
+// more and can take far longer while a recording already holds the camera/mic. It used to run on
+// the UI thread on every call - twice in a row from the device pickers - which was one of the
+// main "Not responding" triggers. Now: probed on a blocking thread, cached briefly, with
+// concurrent callers sharing one probe (the cache lock is held across it), and never re-probed
+// while a recording is running if there's any answer to give already.
+type DeviceLists = (Vec<String>, Vec<String>);
+
+struct CachedDevices {
+    probed_at: Instant,
+    devices: DeviceLists,
+}
+
+static DEVICE_CACHE: std::sync::Mutex<Option<CachedDevices>> = std::sync::Mutex::new(None);
+const DEVICE_CACHE_TTL: Duration = Duration::from_secs(15);
+
+fn connected_devices_cached(app_handle: &AppHandle, recording: bool) -> DeviceLists {
+    let mut cache = DEVICE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.as_ref() {
+        if recording || cached.probed_at.elapsed() < DEVICE_CACHE_TTL {
+            return cached.devices.clone();
+        }
+    }
+    let devices = platform::get_connected_devices(app_handle);
+    *cache = Some(CachedDevices {
+        probed_at: Instant::now(),
+        devices: devices.clone(),
+    });
+    devices
+}
+
+fn recording_in_progress(app_handle: &AppHandle) -> bool {
+    app_handle
+        .try_state::<AppState>()
+        .map(|state| {
+            state
+                .ffmpeg_process
+                .try_lock()
+                // Locked means a start/stop is mid-flight - treat as recording.
+                .map(|process| process.is_some())
+                .unwrap_or(true)
+        })
+        .unwrap_or(false)
+}
+
+/// Fills the device cache in the background at startup so the first picker opens instantly.
+// Probes GPU screen capture (see gpu_capture.rs) so the first recording doesn't wait on it. Blocks
+// for as long as the probes take - call from a background thread.
+pub fn warm_screen_capture(_ffmpeg_path: &Path) {
+    #[cfg(target_os = "windows")]
+    gpu_capture::warm(_ffmpeg_path);
+}
+
+pub fn warm_device_cache(app_handle: &AppHandle) {
+    let app_handle = app_handle.clone();
+    std::thread::spawn(move || {
+        connected_devices_cached(&app_handle, false);
+    });
 }
 
 #[tauri::command]
-pub fn get_connected_audios(app_handle: AppHandle) -> Vec<String> {
-    get_connected_devices(app_handle).1
+pub async fn get_connected_devices(app_handle: AppHandle) -> DeviceLists {
+    let recording = recording_in_progress(&app_handle);
+    crate::services::responsiveness::blocking(move || {
+        connected_devices_cached(&app_handle, recording)
+    })
+    .await
+    .unwrap_or_else(|e| (vec![e.clone()], vec![e]))
 }
 
 #[tauri::command]
-pub fn get_connected_cameras(app_handle: AppHandle) -> Vec<String> {
-    get_connected_devices(app_handle).0
+pub async fn get_connected_audios(app_handle: AppHandle) -> Vec<String> {
+    get_connected_devices(app_handle).await.1
+}
+
+#[tauri::command]
+pub async fn get_connected_cameras(app_handle: AppHandle) -> Vec<String> {
+    get_connected_devices(app_handle).await.0
 }
 
 // Shared by resolve_output_path and resolve_recording_output_path below - both need "figure out
@@ -879,6 +1652,54 @@ pub async fn start_recording(
     state: State<'_, AppState>,
     form_data: FormData,
 ) -> Result<String, String> {
+    // Taken by value, so this local shadow is the only copy anything downstream will see - see
+    // FormData::strip_phone_camera for why the sentinel must never reach an ffmpeg arg builder.
+    let mut form_data = form_data;
+    let uses_phone_camera = form_data.strip_phone_camera();
+
+    // A second start (the hotkey and a button, say) used to replace the running ffmpeg in state
+    // without stopping it - the first kept recording, unreachable by Stop, until the app exited.
+    // A process that has already died on its own is just cleared.
+    {
+        let mut process = state.ffmpeg_process.lock().await;
+        if let Some(child) = process.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                return Err("A recording is already in progress - stop it before starting another.".to_string());
+            }
+            *process = None;
+        }
+    }
+
+    // The phone is always recorded by the WebView into the `<stem>_webcam.mp4` sidecar, never by
+    // ffmpeg (it isn't a capture device ffmpeg can open - see FormData::strip_phone_camera). That
+    // works alongside any mode where ffmpeg still has a picture of its own to record: a screen for
+    // the screen modes, or a computer camera for the camera-only ones.
+    //
+    // The single case that genuinely cannot work is a camera-only recording where the phone is the
+    // ONLY camera selected: stripping the sentinel leaves ffmpeg with no video input at all, so
+    // the main recording would have no picture. Everything else is now allowed.
+    if uses_phone_camera
+        && matches!(form_data.record_type.as_str(), "v" | "va")
+        && form_data.video_devices.is_empty()
+    {
+        return Err(
+            "The phone can't be the only camera for this recording type yet. Also tick a camera \
+             attached to this computer, or pick a \"Screen…\" recording option - either way the \
+             phone is recorded as its own layer you can position in the editor."
+                .to_string(),
+        );
+    }
+
+    // The phone claims the `<stem>_webcam.mp4` sidecar slot (save_phone_camera_capture writes
+    // it), and win.rs's separate-webcam path writes to that exact same name. With the phone AND a
+    // single real camera both selected, the strip above leaves video_devices.len() == 1, which is
+    // precisely what that path's gate looks for - so without this, two writers would race for one
+    // file. The phone wins and the real camera falls back to being baked in as an overlay, which
+    // is also the more predictable reading of "I picked both".
+    if uses_phone_camera {
+        form_data.separate_webcam_capture = false;
+    }
+
     log::debug!("Form data {:?}", form_data);
     #[cfg(target_os = "windows")]
     log::debug!(
@@ -892,6 +1713,19 @@ pub async fn start_recording(
     // shouldn't be, stop_recording already clears this, but a recording that failed to start
     // cleanly could in principle skip that) must not leak into this one's sidecar.
     state.view_switches.lock().await.clear();
+    // Same reasoning as the view-switch log above: a previous recording that failed partway could
+    // otherwise leave a phone-capture target behind for this one to append to.
+    *state.phone_capture.lock().await = None;
+    if let Ok(mut guard) = state.preview_frame.lock() {
+        *guard = None;
+    }
+
+    {
+        let has_audio = matches!(form_data.record_type.as_str(), "sva" | "sa" | "va" | "a");
+        let assembled = cfg!(target_os = "windows")
+            && matches!(form_data.record_type.as_str(), "sva" | "sa" | "s" | "va" | "v");
+        *state.post_enhance.lock().await = has_audio && !assembled && form_data.enhance_audio;
+    }
 
     // Cloned before the match below moves `state` into whichever platform::recording_with_output_*
     // arm actually runs - these are Arc<Mutex<..>> clones of the same shared AppState fields, so
@@ -901,36 +1735,63 @@ pub async fn start_recording(
     let ffmpeg_process = state.ffmpeg_process.clone();
     let output_path_state = state.output_path.clone();
     #[cfg(target_os = "windows")]
-    let loopback_capture = state.loopback_capture.clone();
+    let assembly_state = state.assembly.clone();
     #[cfg(target_os = "windows")]
     let click_capture = state.click_capture.clone();
 
-    // System audio (WASAPI loopback), Windows-only and only for the screen-capture modes this was
-    // actually built for. Started before dispatching to the platform-specific ffmpeg spawn below
-    // (which returns quickly - just building args and calling Command::spawn()) so the two starts
-    // land as close together as practical, minimizing how far system audio drifts out of sync
-    // with the picture.
+    // Screen recordings are assembled at stop from separately captured parts, in exact sync - see
+    // recording/assembly.rs. The audio captures start here, before ffmpeg, so they're already
+    // running when the first frame arrives; anything before it is trimmed off at assembly.
     #[cfg(target_os = "windows")]
     {
-        let wants_system_audio = form_data.include_system_audio
-            && matches!(form_data.record_type.as_str(), "sva" | "sa" | "s");
-        if wants_system_audio {
-            let stem = output_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("recording");
-            let wav_path = output_path.with_file_name(format!("{}.system_audio.wav", stem));
-            match crate::services::loopback_audio::start(wav_path) {
-                Ok(capture) => {
-                    *state.loopback_capture.lock().await = Some(capture);
-                    *state.recording_has_own_audio.lock().await =
-                        form_data.record_type.as_str() != "s";
+        // Screen and camera recordings alike: the camera is timed against the same clock as the mic.
+        let assembled_mode = matches!(form_data.record_type.as_str(), "sva" | "sa" | "s" | "va" | "v");
+        let screen_mode = matches!(form_data.record_type.as_str(), "sva" | "sa" | "s");
+        *state.assembly.lock().await = None;
+        if assembled_mode {
+            use crate::services::audio_capture::{self, AudioSource};
+            let launch_hns = audio_capture::now_hns();
+            let (video_path, mic_path, system_path) = assembly::intermediate_paths(&output_path);
+            let wants_mic = matches!(form_data.record_type.as_str(), "sva" | "sa" | "va")
+                && !form_data.audio_device.is_empty();
+            let wants_system = form_data.include_system_audio && screen_mode;
+            let mic_name = form_data.audio_device.clone();
+            let (mic, system) = crate::services::responsiveness::blocking(move || {
+                let mic = wants_mic.then(|| audio_capture::start(AudioSource::Microphone(mic_name), mic_path));
+                let system = wants_system.then(|| audio_capture::start(AudioSource::SystemOutput, system_path));
+                (mic, system)
+            })
+            .await?;
+            let mic = match mic {
+                Some(Ok(capture)) => Some(capture),
+                Some(Err(e)) => {
+                    warn!("Couldn't capture the microphone directly ({}), ffmpeg will record it instead", e);
+                    None
                 }
-                Err(e) => warn!(
-                    "Failed to start system-audio capture, recording will proceed without it: {}",
-                    e
-                ),
-            }
+                None => None,
+            };
+            let system = match system {
+                Some(Ok(capture)) => Some(capture),
+                Some(Err(e)) => {
+                    warn!("Failed to start system-audio capture, recording will proceed without it: {}", e);
+                    None
+                }
+                None => None,
+            };
+            form_data.mic_external = mic.is_some();
+            form_data.capture_path = Some(video_path.clone());
+            *state.assembly.lock().await = Some(assembly::Assembly {
+                video_path,
+                timing: None,
+                video_has_audio: wants_mic && mic.is_none(),
+                mic,
+                system,
+                launch_hns,
+                pauses: Vec::new(),
+                timer_zero_hns: None,
+                camera: None,
+                enhance: form_data.enhance_audio,
+            });
         }
 
         // Click tracking for the editor's own "auto zoom on click" feature - see
@@ -951,75 +1812,373 @@ pub async fn start_recording(
         }
     }
 
-    let result = match form_data.record_type.as_str() {
-        "sva" => {
-            platform::recording_with_output_sva(&app_handle, state, &output_path, &form_data).await
-        }
-        "sa" => {
-            platform::recording_with_output_sa(&app_handle, state, &output_path, &form_data).await
-        }
-        "va" => {
-            platform::recording_with_output_va(&app_handle, state, &output_path, &form_data).await
-        }
-        "s" => {
-            platform::recording_with_output_s(&app_handle, state, &output_path, &form_data).await
-        }
-        "v" => {
-            platform::recording_with_output_v(&app_handle, state, &output_path, &form_data).await
-        }
-        "a" => {
-            platform::recording_with_output_a(&app_handle, state, &output_path, &form_data).await
-        }
-        "c" => Err(
-            "Screenshot capture doesn't go through start_recording — use take_screenshot instead"
-                .to_string(),
-        ),
-        _ => Err("Invalid recording type".to_string()),
-    };
-    let output = result?;
-
     // ffmpeg's Command::spawn() only fails if the executable itself can't launch - a bad device
-    // name, a device already in use, or a permission error all still let spawn() succeed, then
-    // exit ffmpeg almost immediately with nothing useful written to output_path. Previously that
-    // failure was completely silent until the user hit Stop and stop_recording's own end-of-run
-    // empty-file check (below) finally caught it - wasting however long they thought they were
-    // recording. A short wait-then-check here catches the common "died immediately" case while
-    // still returning quickly for the (overwhelming majority) success case. Plain
-    // std::thread::sleep inside spawn_blocking rather than an async sleep, matching how
-    // stop_recording's own polling loop below waits without a direct tokio dependency.
-    let _ = tauri::async_runtime::spawn_blocking(|| {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    })
-    .await;
-    let early_exit_status = {
-        let mut process_guard = ffmpeg_process.lock().await;
-        match process_guard.as_mut().and_then(|child| child.try_wait().ok().flatten()) {
-            Some(status) => {
-                *process_guard = None;
-                Some(status)
+    // name, a device already in use, a GPU session that won't open or a permission error all still
+    // let spawn() succeed, then exit ffmpeg almost immediately with nothing written. So this waits
+    // until ffmpeg reports output actually being produced (or dies) before returning: failures
+    // surface here instead of at Stop, and the frontend's timer starts when capture really does.
+    //
+    // A recording that went through GPU capture and died at start gets one more attempt through
+    // gdigrab, with GPU capture switched off for the session - a driver that won't cooperate
+    // costs the user a second's delay, not a failed recording.
+    let progress_path = crate::services::progress_watch::progress_sidecar_path(&output_path);
+    let mut attempts = 0;
+    let (output, early_exit_status) = loop {
+        attempts += 1;
+        #[cfg(target_os = "windows")]
+        gpu_capture::USED_BY_LAST_START.store(false, std::sync::atomic::Ordering::SeqCst);
+        // A previous attempt's progress file would read as this one having started already.
+        let _ = fs::remove_file(&progress_path);
+
+        let output = match dispatch_recording(&app_handle, state.clone(), &output_path, &form_data).await {
+            Ok(output) => output,
+            Err(e) => {
+                #[cfg(target_os = "windows")]
+                discard_start(&assembly_state, &click_capture).await;
+                return Err(e);
             }
-            None => None,
+        };
+        let exited = wait_for_capture_start(&ffmpeg_process, &progress_path).await;
+
+        #[cfg(target_os = "windows")]
+        if exited.is_some()
+            && attempts == 1
+            && gpu_capture::USED_BY_LAST_START.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            gpu_capture::disable_for_session(&format!(
+                "ffmpeg exited at start with {}",
+                exited.unwrap()
+            ));
+            continue;
         }
+        break (output, exited);
     };
 
     if let Some(status) = early_exit_status {
         *output_path_state.lock().await = None;
         #[cfg(target_os = "windows")]
-        {
-            if let Some(capture) = loopback_capture.lock().await.take() {
-                let _ = capture.stop();
-            }
-            if let Some(capture) = click_capture.lock().await.take() {
-                let _ = capture.stop();
-            }
-        }
+        discard_start(&assembly_state, &click_capture).await;
         return Err(format!(
             "Recording failed to start (ffmpeg exited immediately with {}). The selected device may be in use by another app, or unavailable.",
             status
         ));
     }
 
+    #[cfg(target_os = "windows")]
+    if let Some(parts) = assembly_state.lock().await.as_mut() {
+        parts.timer_zero_hns = Some(crate::services::audio_capture::now_hns());
+    }
+
+    *state.clock.lock().unwrap_or_else(|p| p.into_inner()) = Some(RecordingClock {
+        record_type: form_data.record_type.clone(),
+        started_at: now_ms(),
+        pause_started_at: None,
+        paused_accumulated_ms: 0,
+    });
+
     Ok(output)
+}
+
+// Stops a screen recording's audio captures and assembles its final file at `output_path` (see
+// recording/assembly.rs). Returns the timeline mapping, for placing the recording's sidecar events,
+// and how far into the final file the frontend's own timer started.
+//
+// If the full assembly fails the picture is still saved without the captured audio, and the WAVs
+// are left in the temp capture folder rather than deleted, so nothing recorded is lost.
+#[cfg(target_os = "windows")]
+async fn finish_assembly(
+    app_handle: &AppHandle,
+    parts: assembly::Assembly,
+    output_path: &Path,
+) -> Result<(assembly::Segments, f64), String> {
+    use crate::services::audio_enhance as enhance;
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let rnnoise_model = crate::services::utility::get_rnnoise_model_path(app_handle)
+        .ok()
+        .filter(|p| p.exists())
+        .map(|p| enhance::escape_filter_path(&p));
+    let output_path = output_path.to_path_buf();
+    crate::services::responsiveness::blocking(move || {
+        let stop = |capture: Option<crate::services::audio_capture::AudioCapture>, what: &str| {
+            capture.and_then(|c| match c.stop() {
+                // Loopback with nothing played the whole time: no track at all, rather than an
+                // empty one the mix can't read.
+                Ok(timeline) if timeline.frames == 0 => {
+                    let _ = fs::remove_file(&timeline.wav_path);
+                    None
+                }
+                Ok(timeline) => Some(timeline),
+                Err(e) => {
+                    warn!("{} capture failed, the recording will be saved without it: {}", what, e);
+                    None
+                }
+            })
+        };
+        let mut parts = parts;
+        // The separately recorded webcam: finalized the same way the screen was.
+        let mut camera = parts.camera.take();
+        if let Some(process) = camera.as_mut().and_then(|c| c.process.take()) {
+            let mut process = process;
+            if let Some(stdin) = process.stdin.as_mut() {
+                let _ = stdin.write_all(b"q");
+                let _ = stdin.flush();
+            }
+            let path = camera.as_ref().map(|c| c.video_path.clone()).unwrap_or_default();
+            if wait_for_ffmpeg_to_finalize(&mut process, &path) {
+                warn!("The webcam recording was force-stopped; its end may be cut short");
+            }
+        }
+        let mic = stop(parts.mic, "Microphone");
+        let system = stop(parts.system, "System-audio");
+
+        let timing = parts.timing.as_ref().map(|t| t.lock().unwrap_or_else(|p| p.into_inner()));
+        let Some(segments) = timing.as_ref().and_then(|t| t.segments(&parts.pauses)) else {
+            if let Some(t) = &timing {
+                warn!("ffmpeg's last output:
+{}", t.diagnostics());
+            }
+            return Err("Recording failed: no video frames were captured. The selected screen may be unavailable.".to_string());
+        };
+        drop(timing);
+        let timer_lead = parts
+            .timer_zero_hns
+            .map(|z| (z - segments.start_hns()) as f64 / 1e7)
+            .unwrap_or(0.0)
+            .max(0.0);
+
+        let run = |p: &assembly::Parts| -> Result<(), String> {
+            let args = assembly::assemble_args(p, &output_path)?;
+            log::debug!("Assembly args: {:?}", args);
+            let mut cmd = Command::new(&ffmpeg_path);
+            cmd.args(&args).stdin(Stdio::null());
+            hide_console_window(&mut cmd);
+            let out = cmd.output().map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(extract_ffmpeg_error(&String::from_utf8_lossy(&out.stderr)))
+            }
+        };
+
+        info!("Assembly timing: {:?}; mic {:?}; system {:?}", segments, mic, system);
+        // Diagnostics: keep the parts for inspection instead of deleting them.
+        let keep_parts = std::env::var_os("BRIEFCAST_KEEP_CAPTURE").is_some();
+
+        // Enhancement pass 1 (services/audio_enhance.rs): the voice cleaned and measured, the
+        // system audio measured - side by side, since they're independent.
+        let with_voice = mic.is_some() || parts.video_has_audio;
+        let raw_mic = mic.as_ref().map(|m| m.wav_path.clone());
+        let enhance_audio = parts.enhance;
+        let (mic, mic_gain_db, system_gain_db) = if !enhance_audio {
+            (mic, 0.0, 0.0)
+        } else { std::thread::scope(|scope| {
+            let system_loudness = system.as_ref().map(|s| {
+                let (ff, wav) = (&ffmpeg_path, s.wav_path.clone());
+                scope.spawn(move || enhance::measure(ff, &wav, "0:a"))
+            });
+            let (mic, mic_gain) = match mic {
+                Some(mut tl) => {
+                    let clean = tl.wav_path.with_extension("clean.wav");
+                    match enhance::clean_voice(&ffmpeg_path, &tl.wav_path, "0:a", &clean, rnnoise_model.as_deref()) {
+                        Ok(loudness) => {
+                            tl.wav_path = clean;
+                            (Some(tl), enhance::gain_to(enhance::TARGET_LUFS, loudness))
+                        }
+                        Err(e) => {
+                            warn!("Voice cleanup failed, using the microphone as recorded: {}", e);
+                            (Some(tl), 0.0)
+                        }
+                    }
+                }
+                None => (None, 0.0),
+            };
+            let system_gain = system_loudness
+                .and_then(|h| h.join().ok())
+                .and_then(|r| r.ok())
+                .map(|l| enhance::gain_to(enhance::system_target(with_voice), l))
+                .unwrap_or(0.0);
+            (mic, mic_gain, system_gain)
+        }) };
+
+        let full = assembly::Parts {
+            video_path: parts.video_path.clone(),
+            segments: segments.clone(),
+            mic,
+            system,
+            video_has_audio: parts.video_has_audio,
+            mic_gain_db,
+            system_gain_db,
+            rnnoise_model: rnnoise_model.clone(),
+            enhance: enhance_audio,
+        };
+        let started = Instant::now();
+        match run(&full) {
+            Ok(()) if keep_parts => info!("Assembled {:?} in {:?}, parts kept", output_path, started.elapsed()),
+            Ok(()) => {
+                info!("Assembled {:?} in {:?}", output_path, started.elapsed());
+                for wav in [&full.mic, &full.system].into_iter().flatten() {
+                    let _ = fs::remove_file(&wav.wav_path);
+                }
+                if let Some(raw) = &raw_mic {
+                    let _ = fs::remove_file(raw);
+                }
+            }
+            Err(e) => {
+                // One bad track shouldn't cost the others: the voice alone, then the picture alone.
+                warn!("Assembling the recording failed ({}), retrying without system audio", e);
+                let keep_wavs = [&full.mic, &full.system].into_iter().flatten().map(|t| t.wav_path.clone()).collect::<Vec<_>>();
+                let voice_only = assembly::Parts { system: None, ..full };
+                if let Err(e) = run(&voice_only) {
+                    warn!("Still failing ({}), saving the picture alone - audio kept in {:?}", e, keep_wavs);
+                    let picture_only = assembly::Parts { mic: None, video_has_audio: false, ..voice_only };
+                    run(&picture_only).map_err(|e| format!("Recording failed: couldn't write the finished file: {}", e))?;
+                }
+            }
+        }
+        if let Some(camera) = camera {
+            retime_webcam(&ffmpeg_path, &segments, &camera);
+            if !keep_parts {
+                let _ = fs::remove_file(&camera.video_path);
+            }
+        }
+        if !keep_parts {
+            let _ = fs::remove_file(&parts.video_path);
+        }
+        Ok((segments, timer_lead))
+    })
+    .await?
+}
+
+// Writes the separately recorded webcam's `<stem>_webcam.mp4`, re-timed onto the final recording
+// (see assembly::webcam_args). A failure costs the PiP layer, never the recording.
+#[cfg(target_os = "windows")]
+fn retime_webcam(ffmpeg_path: &Path, segments: &assembly::Segments, camera: &assembly::CameraSidecar) {
+    let offset = camera.timing.lock().unwrap_or_else(|p| p.into_inner()).offset_hns();
+    let Some(offset) = offset else {
+        warn!("The webcam recorded no frames, so there's no webcam layer for this recording");
+        return;
+    };
+    let args = match assembly::webcam_args(segments, offset, &camera.video_path, &camera.final_path) {
+        Ok(args) => args,
+        Err(e) => return warn!("Couldn't build the webcam layer: {}", e),
+    };
+    info!("Webcam timing offset {}; re-timing with {:?}", offset, args);
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    hide_console_window(&mut cmd);
+    match cmd.output() {
+        Ok(out) if out.status.success() => {}
+        // A half-written sidecar has no moov atom and can't be opened - the editor would show a
+        // broken PiP layer and the thumbnailer would retry it forever. No file is better.
+        Ok(out) => {
+            let _ = fs::remove_file(&camera.final_path);
+            warn!("Couldn't write the webcam layer: {}", extract_ffmpeg_error(&String::from_utf8_lossy(&out.stderr)))
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&camera.final_path);
+            warn!("Couldn't write the webcam layer: {}", e)
+        }
+    }
+}
+
+// Undoes a start that failed: stops the side captures and deletes the intermediates.
+#[cfg(target_os = "windows")]
+async fn discard_start(
+    assembly_state: &Arc<Mutex<Option<assembly::Assembly>>>,
+    click_capture: &Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
+) {
+    if let Some(mut parts) = assembly_state.lock().await.take() {
+        if let Some(mut camera) = parts.camera.take() {
+            if let Some(mut process) = camera.process.take() {
+                let _ = process.kill();
+                let _ = process.wait();
+            }
+            let _ = fs::remove_file(&camera.video_path);
+        }
+        let _ = crate::services::responsiveness::blocking(move || {
+            for capture in [parts.mic, parts.system].into_iter().flatten() {
+                if let Ok(timeline) = capture.stop() {
+                    let _ = fs::remove_file(timeline.wav_path);
+                }
+            }
+            let _ = fs::remove_file(parts.video_path);
+        })
+        .await;
+    }
+    if let Some(capture) = click_capture.lock().await.take() {
+        let _ = capture.stop();
+    }
+}
+
+async fn dispatch_recording(
+    app_handle: &AppHandle,
+    state: State<'_, AppState>,
+    output_path: &PathBuf,
+    form_data: &FormData,
+) -> Result<String, String> {
+    match form_data.record_type.as_str() {
+        "sva" => platform::recording_with_output_sva(app_handle, state, output_path, form_data).await,
+        "sa" => platform::recording_with_output_sa(app_handle, state, output_path, form_data).await,
+        "va" => platform::recording_with_output_va(app_handle, state, output_path, form_data).await,
+        "s" => platform::recording_with_output_s(app_handle, state, output_path, form_data).await,
+        "v" => platform::recording_with_output_v(app_handle, state, output_path, form_data).await,
+        "a" => platform::recording_with_output_a(app_handle, state, output_path, form_data).await,
+        "c" => Err(
+            "Screenshot capture doesn't go through start_recording — use take_screenshot instead"
+                .to_string(),
+        ),
+        _ => Err("Invalid recording type".to_string()),
+    }
+}
+
+// How long to wait for a started ffmpeg to report output before assuming it's fine anyway - long
+// enough for the slowest legitimate start measured (a GPU session plus a dshow device, ~1s).
+const CAPTURE_START_TIMEOUT: Duration = Duration::from_secs(4);
+
+// Waits until the recording ffmpeg has produced output (per its -progress file) or has exited,
+// returning the exit status in the latter case - and clearing it from state, so nothing later
+// mistakes a dead process for a live recording.
+async fn wait_for_capture_start(
+    ffmpeg_process: &Arc<Mutex<Option<Child>>>,
+    progress_path: &Path,
+) -> Option<std::process::ExitStatus> {
+    let started = Instant::now();
+    loop {
+        {
+            let mut guard = ffmpeg_process.lock().await;
+            if let Some(status) = guard.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+                *guard = None;
+                return Some(status);
+            }
+        }
+        if started.elapsed() >= CAPTURE_START_TIMEOUT {
+            warn!("ffmpeg hasn't reported output after {:?}, continuing anyway", CAPTURE_START_TIMEOUT);
+            return None;
+        }
+        let path = progress_path.to_path_buf();
+        let producing = crate::services::responsiveness::blocking(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            progress_shows_output(&fs::read_to_string(&path).unwrap_or_default())
+        })
+        .await
+        .unwrap_or(false);
+        if producing {
+            info!("Capture producing output after {:?}", started.elapsed());
+            return None;
+        }
+    }
+}
+
+// Whether an ffmpeg -progress file shows any output yet: a frame encoded, or (for audio-only
+// recordings, which never count frames) any output time.
+fn progress_shows_output(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        matches!(key.trim(), "frame" | "out_time_us")
+            && value.trim().parse::<i64>().map(|n| n > 0).unwrap_or(false)
+    })
 }
 
 // A real instant screenshot: one ffmpeg invocation that grabs a single frame and exits on its
@@ -1073,12 +2232,22 @@ pub async fn stop_recording(
                 }
             }
             #[cfg(target_os = "windows")]
-            if let Some(capture) = state.loopback_capture.lock().await.as_ref() {
-                capture.resume();
-            }
+            mark_pause(&state, false).await;
             *paused = false;
         }
     }
+
+    // A recording being assembled at stop has ffmpeg writing its intermediate, not output_path.
+    #[cfg(target_os = "windows")]
+    let capture_path = state
+        .assembly
+        .lock()
+        .await
+        .as_ref()
+        .map(|a| a.video_path.clone())
+        .unwrap_or_else(|| output_path.clone());
+    #[cfg(not(target_os = "windows"))]
+    let capture_path = output_path.clone();
 
     // Try graceful shutdown first: send 'q' to ffmpeg's stdin (every platform's ffmpeg treats
     // this as "finalize the file and exit cleanly"), then poll off the async runtime's worker
@@ -1087,24 +2256,19 @@ pub async fn stop_recording(
     // to be a Windows-only `taskkill` fallback here too, which was both redundant (kill() already
     // ran) and the one piece of this function that wasn't portable.
     let mut process_state = state.ffmpeg_process.lock().await;
+    let mut force_killed = false;
     if let Some(mut process) = process_state.take() {
         if let Some(stdin) = process.stdin.as_mut() {
             let _ = stdin.write_all(b"q");
             let _ = stdin.flush();
         }
 
-        let _ = tauri::async_runtime::spawn_blocking(move || {
-            for _ in 0..20 {
-                match process.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
-                    Err(_) => return,
-                }
-            }
-            warn!("Graceful ffmpeg shutdown timed out, force-killing");
-            let _ = process.kill();
+        let wait_path = capture_path.clone();
+        force_killed = tauri::async_runtime::spawn_blocking(move || {
+            wait_for_ffmpeg_to_finalize(&mut process, &wait_path)
         })
-        .await;
+        .await
+        .unwrap_or(false);
     }
     drop(process_state);
 
@@ -1115,28 +2279,37 @@ pub async fn stop_recording(
         let mut app_state = state.output_path.lock().await;
         *app_state = None;
     }
+    *state.clock.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     info!("Recording stopped");
 
-    // Stop the system-audio capture (if this recording had one running) and mux it into the
-    // just-finished file. Must happen after ffmpeg has actually exited above - muxing stream-
-    // copies the video below, which needs to read a fully finalized, already-closed file.
-    #[cfg(target_os = "windows")]
-    {
-        let loopback = state.loopback_capture.lock().await.take();
-        if let Some(capture) = loopback {
-            let has_own_audio = *state.recording_has_own_audio.lock().await;
-            match capture.stop() {
-                Ok(wav_path) => {
-                    if let Err(e) = mux_system_audio(&app_handle, &output_path, &wav_path, has_own_audio).await {
-                        warn!("Failed to mix system audio into the recording, keeping it without: {}", e);
-                    }
-                    let _ = fs::remove_file(&wav_path);
-                }
-                Err(e) => warn!("System-audio capture ended with an error, recording will have no system audio: {}", e),
-            }
-        }
+    // Drop the last preview frame now that there is nothing live to preview. The reader thread
+    // has already ended with ffmpeg's stdout closing; this just stops the final frame lingering
+    // into whatever recording comes next.
+    if let Ok(mut guard) = state.preview_frame.lock() {
+        *guard = None;
     }
+
+    // Capture has ended, but cleaning the audio and assembling the file still lie ahead - minutes,
+    // for a long recording on a busy machine. Showing the completion window now (as "finishing")
+    // rather than at the end is what tells the user their Stop registered; with nothing on screen
+    // for that long it looked ignored and got pressed again. It's reloaded with the outcome below.
+    let modal_path = path_to_str(&output_path)?.to_string();
+    if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, "processing", None).await {
+        warn!("Couldn't show the recording-finishing window: {}", e);
+    }
+
+    let finished: Result<String, String> = async {
+    // Assemble a screen recording's final file from its parts (see recording/assembly.rs). Must
+    // happen after ffmpeg has exited above - the video is stream-copied from its finished file.
+    #[cfg(target_os = "windows")]
+    let segments = {
+        let parts = state.assembly.lock().await.take();
+        match parts {
+            Some(parts) => Some(finish_assembly(&app_handle, parts, &output_path).await?),
+            None => None,
+        }
+    };
 
     // ffmpeg's Command::spawn() only fails if the executable itself can't launch - a bad
     // device name, a closed capture window, or a permission error all still let spawn()
@@ -1145,6 +2318,14 @@ pub async fn stop_recording(
     // failure is otherwise silent: the caller would get back an apparent success and the
     // completed-recording popup would open pointing at a file that was never created. Checking
     // for a real, non-empty file here is what turns that into a visible error instead.
+    // A force-killed ffmpeg may have been interrupted mid-write. The file is usually still
+    // playable (especially mp4, whose fragment flags bound the loss to the last fragment), so
+    // this is a warning on an otherwise successful stop rather than an error - but it must not
+    // pass silently, because the damage is at the end of the file where it is easy to miss.
+    if force_killed {
+        warn!("Recording was force-stopped; the end of {:?} may be truncated", output_path);
+    }
+
     match fs::metadata(&output_path) {
         Ok(meta) if meta.len() > 0 => {}
         Ok(_) => {
@@ -1153,6 +2334,25 @@ pub async fn stop_recording(
         }
         Err(_) => {
             return Err("Recording failed: no output file was created. The selected screen, camera, or microphone may be unavailable, or recording may have been stopped before it could start.".to_string());
+        }
+    }
+
+    // Studio cleanup of the audio, for recordings that weren't assembled (which already got it).
+    // A failure keeps the recording exactly as captured.
+    if std::mem::take(&mut *state.post_enhance.lock().await) {
+        let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+        let model = crate::services::utility::get_rnnoise_model_path(&app_handle)
+            .ok()
+            .filter(|p| p.exists())
+            .map(|p| crate::services::audio_enhance::escape_filter_path(&p));
+        let path = output_path.clone();
+        let result = crate::services::responsiveness::blocking(move || {
+            crate::services::audio_enhance::enhance_in_place(&ffmpeg_path, &path, model.as_deref())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => info!("Enhanced the audio of {:?}", output_path),
+            Ok(Err(e)) | Err(e) => warn!("Audio enhancement skipped, keeping the recording as captured: {}", e),
         }
     }
 
@@ -1167,7 +2367,20 @@ pub async fn stop_recording(
     {
         let click_capture = state.click_capture.lock().await.take();
         if let Some(capture) = click_capture {
-            let clicks = capture.stop();
+            let started_hns = capture.started_hns;
+            let mut clicks = capture.stop();
+            // Onto the final file's own timeline: clicks before the first frame or during a pause
+            // have no picture to zoom into and are dropped.
+            if let Some((segments, _)) = &segments {
+                clicks = clicks
+                    .into_iter()
+                    .filter_map(|mut c| {
+                        let hns = started_hns + (c.elapsed_secs * 1e7) as i64;
+                        c.elapsed_secs = segments.output_time(hns)?;
+                        Some(c)
+                    })
+                    .collect();
+            }
             if !clicks.is_empty() {
                 let clicks_path = click_sidecar_path(&output_path);
                 match serde_json::to_string(&clicks) {
@@ -1187,7 +2400,16 @@ pub async fn stop_recording(
     // already confirmed non-empty above, then cleared either way so a future recording never
     // inherits stale switches from this one.
     {
-        let switches = std::mem::take(&mut *state.view_switches.lock().await);
+        #[allow(unused_mut)]
+        let mut switches = std::mem::take(&mut *state.view_switches.lock().await);
+        // The frontend times these from when start_recording returned, a moment after the first
+        // frame - the final file's t=0.
+        #[cfg(target_os = "windows")]
+        if let Some((_, timer_lead)) = &segments {
+            for s in &mut switches {
+                s.elapsed_secs = (s.elapsed_secs + timer_lead).max(0.0);
+            }
+        }
         if !switches.is_empty() {
             let switches_path = view_switch_sidecar_path(&output_path);
             match serde_json::to_string(&switches) {
@@ -1201,26 +2423,56 @@ pub async fn stop_recording(
         }
     }
 
-    let output_str = path_to_str(&output_path)?;
+    let output_str = path_to_str(&output_path)?.to_string();
 
     if let Err(e) = app_handle.emit("refresh-file-list", ()) {
         warn!("Failed to emit refresh-file-list: {}", e);
     }
 
-    if let Err(e) = create_or_replace_rec_completed_modal(app_handle, output_str).await {
-        return Err(format!("Failed to show completion modal: {}", e));
+    Ok(output_str)
+    }
+    .await;
+
+    // A cosmetic popup must not turn a successful recording into a failed stop. The file is
+    // already written and verified by this point; reporting "Failed to stop recording" because a
+    // window wouldn't open tells the user their recording is lost when it is sitting on disk.
+    let (status, error) = match &finished {
+        Ok(_) => ("done", None),
+        Err(e) => ("failed", Some(e.as_str())),
+    };
+    if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, status, error).await {
+        warn!("Recording finished, but the completion popup could not be updated: {}", e);
     }
 
-    Ok(output_str.to_string())
+    finished
 }
 
 // Pauses the in-progress recording: suspends every thread of the ffmpeg process (see each
 // platform module's suspend_process - Windows approximates POSIX's SIGSTOP by hand since it has
-// no direct equivalent) so no frames/samples are captured or encoded while paused, and - Windows
-// only - pauses the WASAPI loopback capture the same way if system audio was requested, so its
-// WAV file's timeline stays aligned with the paused video instead of drifting ahead of it. Screen/
-// camera/mic capture and system-audio capture are otherwise two independent pipelines (see
-// AppState's own doc comments) that would fall out of sync with each other if only one paused.
+// no direct equivalent) so no frames are captured or encoded while paused. On Windows the audio
+// captures keep running; the paused stretch shows up as a gap in the video's timeline and is cut
+// from video and audio alike when the recording is assembled (see recording/assembly.rs).
+// Marks a pause starting (`starting`) or ending in the recording being assembled, so assembly cuts
+// exactly that stretch (see recording/assembly.rs).
+#[cfg(target_os = "windows")]
+async fn mark_pause(state: &State<'_, AppState>, starting: bool) {
+    let now = crate::services::audio_capture::now_hns();
+    if let Some(parts) = state.assembly.lock().await.as_mut() {
+        if starting {
+            parts.pauses.push((now, i64::MAX));
+        } else if let Some(open) = parts.pauses.last_mut().filter(|p| p.1 == i64::MAX) {
+            open.1 = now;
+        }
+        // A separately recorded webcam pauses with the screen.
+        if let Some(pid) = parts.camera.as_ref().and_then(|c| c.process.as_ref()).map(|p| p.id()) {
+            let result = if starting { platform::suspend_process(pid) } else { platform::resume_process(pid) };
+            if let Err(e) = result {
+                warn!("Failed to {} the webcam recording: {}", if starting { "pause" } else { "resume" }, e);
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
     let mut paused = state.paused.lock().await;
@@ -1237,13 +2489,14 @@ pub async fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
     };
 
     platform::suspend_process(pid)?;
-
     #[cfg(target_os = "windows")]
-    if let Some(capture) = state.loopback_capture.lock().await.as_ref() {
-        capture.pause();
-    }
+    mark_pause(&state, true).await;
+
 
     *paused = true;
+    if let Some(clock) = state.clock.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        clock.pause_started_at = Some(now_ms());
+    }
     info!("Recording paused");
     Ok(())
 }
@@ -1264,163 +2517,150 @@ pub async fn resume_recording(state: State<'_, AppState>) -> Result<(), String> 
     };
 
     platform::resume_process(pid)?;
-
     #[cfg(target_os = "windows")]
-    if let Some(capture) = state.loopback_capture.lock().await.as_ref() {
-        capture.resume();
-    }
+    mark_pause(&state, false).await;
+
 
     *paused = false;
+    if let Some(clock) = state.clock.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        if let Some(since) = clock.pause_started_at.take() {
+            clock.paused_accumulated_ms += now_ms() - since;
+        }
+    }
     info!("Recording resumed");
     Ok(())
 }
 
-// Combines the just-recorded system-audio WAV into `video_path`, replacing it in place. When the
-// video already has its own audio track (mic, in "sva"/"sa" - `video_has_audio: true`) the two
-// are blended together via `amix`; otherwise ("s", no audio at all) the WAV becomes the sole
-// audio track. The video stream itself is always stream-copied (`-c:v copy`) rather than
-// re-encoded - it's already correctly encoded, this step only ever needs to touch audio.
-#[cfg(target_os = "windows")]
-async fn mux_system_audio(
-    app_handle: &AppHandle,
-    video_path: &Path,
-    wav_path: &Path,
-    video_has_audio: bool,
-) -> Result<(), String> {
-    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+const REC_COMPLETED_LABEL: &str = "completed_recording";
 
-    let stem = video_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("recording");
-    let ext = video_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp4");
-    let muxed_path = video_path.with_file_name(format!("{}.system_audio_mux.{}", stem, ext));
+// Building a WebView2 window always runs on the UI thread and takes one to two seconds - long
+// enough that stopping a recording visibly froze the app while this popup was created (caught by
+// services::responsiveness's watchdog). So the popup's window is built once, hidden, shortly
+// after startup (prewarm_rec_completed_modal), and every stop just points it at the new file and
+// shows it. Closing it hides it instead of destroying it, so it's ready for the next recording.
+fn build_rec_completed_window(
+    app_handle: &tauri::AppHandle,
+    url: String,
+    visible: bool,
+) -> tauri::Result<tauri::WebviewWindow> {
+    let window = tauri::WebviewWindowBuilder::new(
+        app_handle,
+        REC_COMPLETED_LABEL,
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title("Recording completed")
+    .center()
+    .resizable(false)
+    .inner_size(420.0, 480.0)
+    .always_on_top(true)
+    .minimizable(false)
+    .visible(visible)
+    .build()?;
 
-    // Match the audio codec to whatever this container already expects elsewhere in this file
-    // (codec_args_for_ext) - re-muxing an mp4/mkv/mov's mic track through `amix` still wants
-    // aac, and avi still wants pcm, same reasoning as codec_args_for_ext's own per-extension match.
-    let (audio_codec, extra_audio_args): (&str, Vec<String>) = match ext.to_lowercase().as_str() {
-        "avi" => ("pcm_s16le", vec![]),
-        "webm" => ("libvorbis", vec!["-b:a".to_string(), "192k".to_string()]),
-        _ => ("aac", vec!["-b:a".to_string(), "192k".to_string()]),
-    };
-
-    let mut args: Vec<String> = vec![
-        "-y".to_string(),
-        "-i".to_string(),
-        path_to_str(video_path)?.to_string(),
-        "-i".to_string(),
-        path_to_str(wav_path)?.to_string(),
-    ];
-
-    if video_has_audio {
-        args.extend(vec![
-            "-filter_complex".to_string(),
-            "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[aout]".to_string(),
-            "-map".to_string(),
-            "0:v".to_string(),
-            "-map".to_string(),
-            "[aout]".to_string(),
-        ]);
-    } else {
-        // No existing audio to mix with - the WAV becomes the only audio track. -shortest
-        // trims to the video's own length, since the WASAPI capture and ffmpeg's screen capture
-        // don't start/stop at exactly the same wall-clock instant.
-        args.extend(vec![
-            "-map".to_string(),
-            "0:v".to_string(),
-            "-map".to_string(),
-            "1:a".to_string(),
-            "-shortest".to_string(),
-        ]);
-    }
-
-    args.extend(vec![
-        "-c:v".to_string(),
-        "copy".to_string(),
-        "-c:a".to_string(),
-        audio_codec.to_string(),
-    ]);
-    args.extend(extra_audio_args);
-    args.push(path_to_str(&muxed_path)?.to_string());
-
-    let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new(&ffmpeg_path);
-        cmd.args(&args);
-        hide_console_window(&mut cmd);
-        cmd.output()
-    })
-    .await
-    .map_err(|e| format!("System-audio mux task panicked: {}", e))?
-    .map_err(|e| format!("Failed to run system-audio mux: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "System-audio mux failed: {}",
-            extract_ffmpeg_error(&stderr)
-        ));
-    }
-
-    fs::rename(&muxed_path, video_path).map_err(|e| {
-        format!(
-            "Failed to replace recording with the system-audio mix: {}",
-            e
-        )
-    })?;
-
-    Ok(())
+    let handle = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            // Only kept alive while the app itself is - once the main window is gone, a hidden
+            // popup must not be what keeps the process running.
+            if handle.app_handle().get_webview_window("main").is_some() {
+                api.prevent_close();
+                let _ = handle.hide();
+            }
+        }
+    });
+    Ok(window)
 }
 
+/// Builds the recording-completed popup hidden, in the background, once the app has settled.
+pub fn prewarm_rec_completed_modal(app_handle: &tauri::AppHandle) {
+    let app_handle = app_handle.clone();
+    std::thread::spawn(move || {
+        // Let the main window finish its own startup work first.
+        std::thread::sleep(Duration::from_secs(4));
+        if app_handle.get_webview_window(REC_COMPLETED_LABEL).is_none() {
+            if let Err(e) =
+                build_rec_completed_window(&app_handle, "completed_recording.html".into(), false)
+            {
+                warn!("Could not pre-create the recording-completed window: {}", e);
+            }
+        }
+    });
+}
+
+// `status` is "processing" (shown the moment Stop is pressed, while the file is still being finished),
+// "done" or "failed" (with `error`) - see FileModal.tsx's RecordingModalStatus.
 async fn create_or_replace_rec_completed_modal(
     app_handle: tauri::AppHandle,
     file_path: &str,
+    status: &str,
+    error: Option<&str>,
 ) -> Result<String, String> {
-    // The file path is baked into the window's own URL (rather than sent via a
-    // 'display-file-modal' event emitted from here) because emit only reaches windows that
-    // already exist at the moment it's called - this window doesn't exist yet until `build()`
-    // below returns, and even then its webview/JS hasn't loaded far enough to have registered
-    // a listener. An event fired here would always be missed. A URL query param has no such
-    // race: the page reads it on its very first render.
-    let url = format!(
-        "src-tauri/src/views/completed_recording.html?path={}",
-        urlencoding::encode(file_path)
-    );
+    // The file path is baked into the window's own URL (rather than sent via an event) because
+    // the page reads it synchronously on its first render - an event emitted before its listener
+    // registers would be missed. Re-navigating the pre-built window reloads that page with the
+    // new path, so the same mechanism works for both the reused and the freshly built window.
+    // Root-relative: the entry HTML sits beside index.html (see vite.config.ts's rollup input for
+    // why it can't live under src-tauri/), which is where both the dev server and the bundled
+    // frontend serve it from.
+    let mut query = format!("path={}&status={}", urlencoding::encode(file_path), urlencoding::encode(status));
+    if let Some(error) = error {
+        query.push_str(&format!("&error={}", urlencoding::encode(error)));
+    }
+    let url = format!("completed_recording.html?{}", query);
 
-    // spawn_blocking, not done inline: under Tauri v2's IPC bridge, an async command's own
-    // execution was observed running ON the main/UI thread itself (see ensure_annotation_overlay's
-    // own doc comment for the full live-reproduced hang this caused). Both `.close()` and
-    // `WebviewWindowBuilder::build()` need to marshal onto the main thread and wait for it -
-    // calling either from a command already on the main thread self-deadlocks. Running both on a
-    // real background thread guarantees neither is ever called from the main thread either way.
+    // spawn_blocking, not done inline: show()/navigate()/build() all marshal onto the main thread
+    // and wait for it, so they must never be called from it - running them on a real background
+    // thread guarantees that.
     tauri::async_runtime::spawn_blocking(move || {
-        if let Some(modal_window) = app_handle.get_webview_window("completed_recording") {
-            if let Err(e) = modal_window.close() {
-                return Err(format!("Failed to close existing modal window: {}", e));
-            }
+        if let Some(window) = app_handle.get_webview_window(REC_COMPLETED_LABEL) {
+            let mut target = window
+                .url()
+                .map_err(|e| format!("Failed to read popup URL: {}", e))?;
+            target.set_path("/completed_recording.html");
+            target.set_query(Some(&query));
+            window
+                .navigate(target)
+                .map_err(|e| format!("Failed to load recording into popup: {}", e))?;
+            let _ = window.center();
+            window
+                .show()
+                .map_err(|e| format!("Failed to show popup: {}", e))?;
+            let _ = window.set_focus();
+            return Ok("Recording completed".to_string());
         }
 
-        let result = tauri::WebviewWindowBuilder::new(
-            &app_handle,
-            "completed_recording",
-            tauri::WebviewUrl::App(url.into()),
-        )
-        .title("Recording completed")
-        .center()
-        .resizable(false)
-        .inner_size(420.0, 480.0)
-        .always_on_top(true)
-        .minimizable(false)
-        .build();
-
-        match result {
-            Ok(_) => Ok("Recording completed".to_string()),
-            Err(e) => Err(format!("Failed to create modal window: {}", e)),
-        }
+        // Not pre-built yet (a recording stopped within seconds of launch) - build it now.
+        build_rec_completed_window(&app_handle, url, true)
+            .map(|_| "Recording completed".to_string())
+            .map_err(|e| format!("Failed to create modal window: {}", e))
     })
     .await
     .map_err(|e| format!("Modal window creation task panicked: {}", e))?
+}
+
+#[cfg(test)]
+mod overlay_style_tests {
+    use super::*;
+
+    #[test]
+    #[ignore] // prints graphs for a manual ffmpeg render check
+    fn print_overlay_graphs() {
+        for shape in ["circle", "rounded", "square"] {
+            let style = OverlayStyle { shape, position: "bottom_right", size: "large", border: "thick", border_color: "#ff3355" };
+            println!("GRAPH {} {}", shape, build_camera_overlay_filter_complex_from(&style, 1, 1920, 1920, None, 1));
+        }
+    }
+
+    #[test]
+    fn bubbles_scale_with_the_frame() {
+        assert_eq!(overlay_pixel_dimensions("circle", "medium", 1920), (346, 346));
+        assert_eq!(overlay_pixel_dimensions("circle", "medium", 3840), (690, 690));
+        assert_eq!(overlay_pixel_dimensions("square", "small", 1920), (268, 200));
+        assert_eq!(border_px("none", 1920), 0);
+        assert!(border_px("thick", 1920) > border_px("thin", 1920));
+        assert_eq!(ffmpeg_color("#FF3355"), "0xFF3355");
+        assert_eq!(ffmpeg_color("red; drop"), "white");
+        assert!(overlay_position_expr("center", 0, 1, 300, 1920).ends_with("y=(H-h)/2"));
+        assert!(overlay_position_expr("center_left", 0, 1, 300, 1920).starts_with("overlay=x=48+0"));
+    }
 }

@@ -17,12 +17,12 @@ import {
   MdFormatListNumbered,
   MdFormatQuote,
   MdDataObject,
-  MdTableChart,
   MdImage,
   MdHorizontalRule,
   MdShortText,
   MdInsertPageBreak,
 } from "react-icons/md";
+import { TbTable } from "react-icons/tb";
 import SlashCommandMenu, { SlashCommandItem } from "../components/docs/SlashCommandMenu";
 import { uploadImageFromPath } from "./docImagePaste";
 
@@ -79,7 +79,7 @@ function buildItems(docId: string): SlashCommandItem[] {
     {
       title: "Table",
       keywords: ["table", "grid"],
-      icon: MdTableChart,
+      icon: TbTable,
       run: (editor, range) =>
         editor.chain().focus().deleteRange(range).insertTable({ rows: 3, cols: 4, withHeaderRow: true }).run(),
     },

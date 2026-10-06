@@ -37,6 +37,7 @@ import {
   resolveImageCrop,
   resolveSeriesData,
   resolveTableGrid,
+  resolveNodeFill,
 } from "../utils/whiteboardTypes";
 import { getCachedWhiteboardImage, preloadWhiteboardImage } from "../utils/whiteboardImageCache";
 // Not a component import in spirit - latticeRenderOnDemand is a plain module-level Map, not React
@@ -2932,10 +2933,10 @@ function imageMaskPath(node: WhiteboardNode): Path2D {
 export function paintImageNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, image: CanvasImageSource | null, sourceW: number, sourceH: number): void {
   const maskPath = imageMaskPath(node);
 
-  if (node.fillColor) {
+  if (resolveNodeFill(node)) {
     ctx.save();
     ctx.clip(maskPath);
-    ctx.fillStyle = node.fillColor;
+    ctx.fillStyle = resolveNodeFill(node)!;
     ctx.fillRect(0, 0, node.width, node.height);
     ctx.restore();
   }
@@ -3284,8 +3285,8 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
   const outline = shapeOutlineFor(node.shapeType, w, h, outlineOptionsFor(node));
 
   const fillAndStroke = (path: Path2D) => {
-    if (node.fillColor) {
-      ctx.fillStyle = node.fillColor;
+    if (resolveNodeFill(node)) {
+      ctx.fillStyle = resolveNodeFill(node)!;
       ctx.fill(path);
     }
     if (node.strokeWidth > 0) {
@@ -3388,8 +3389,8 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
       for (const part of outline.parts) {
         const path = new Path2D(part.d);
         if (part.role === "fill") {
-          if (node.fillColor) {
-            ctx.fillStyle = node.fillColor;
+          if (resolveNodeFill(node)) {
+            ctx.fillStyle = resolveNodeFill(node)!;
             ctx.fill(path);
           }
         } else if (part.role === "marker") {
@@ -3559,7 +3560,7 @@ function paintTable(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
       const merge = mergeAt.get(`${r}-${c}`);
       const spanRows = merge?.rowSpan ?? 1;
       const spanCols = merge?.colSpan ?? 1;
-      const fill = grid.cellFill[r][c] ?? node.fillColor;
+      const fill = grid.cellFill[r][c] ?? resolveNodeFill(node);
       if (fill) {
         ctx.fillStyle = fill;
         ctx.fillRect(colBounds[c], rowBounds[r], colBounds[c + spanCols] - colBounds[c], rowBounds[r + spanRows] - rowBounds[r]);

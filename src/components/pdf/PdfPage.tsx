@@ -20,6 +20,7 @@ import { preloadImage } from "../../utils/imageObjectCache";
 import TextNoteEditor from "./TextNoteEditor";
 import ImageAnnotationEditor from "./ImageAnnotationEditor";
 import PdfTextLayer from "./PdfTextLayer";
+import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 const TEXT_NOTE_DEFAULT_WIDTH_PDF = 160;
 const DRAG_THRESHOLD_DEVICE_PX = 5; // below this, a pointerdown+up on a note is a tap (edit), not a drag (move)
@@ -135,6 +136,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
   const liveBoldRunsRef = useRef<TextRange[]>([]);
   const liveItalicRunsRef = useRef<TextRange[]>([]);
   const liveTextAlignRef = useRef<TextAlign>("left");
+  const canvasRestoreTick = useCanvasRestoreTick();
 
   useEffect(() => {
     let cancelled = false;
@@ -184,7 +186,8 @@ const PdfPage: React.FC<PdfPageProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [pdfDoc, pageIndex, zoom, numPages, cache]);
+    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
+  }, [pdfDoc, pageIndex, zoom, numPages, cache, canvasRestoreTick]);
 
   // Text geometry for the highlighter's auto-height snapping. Deliberately a separate effect
   // keyed only on [pdfDoc, pageIndex] (not zoom) — text positions are already in zoom-independent

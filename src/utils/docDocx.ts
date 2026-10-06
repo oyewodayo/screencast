@@ -36,8 +36,8 @@ import {
   WidthType,
 } from "docx";
 import { invoke } from "@tauri-apps/api/core";
-import type { DocComment, DocPageSize } from "./docTypes";
-import { PAGE_DIMENSIONS_IN, PAGE_MARGIN_IN } from "./docPageGeometry";
+import type { DocComment, DocMargins, DocPageSize } from "./docTypes";
+import { PAGE_DIMENSIONS_IN, resolveMargins } from "./docPageGeometry";
 
 const ALIGNMENT_BY_TEXT_ALIGN: Record<string, (typeof AlignmentType)[keyof typeof AlignmentType]> = {
   left: AlignmentType.LEFT,
@@ -49,6 +49,25 @@ const ALIGNMENT_BY_TEXT_ALIGN: Record<string, (typeof AlignmentType)[keyof typeo
 function alignmentFor(node: JSONContent) {
   const align = node.attrs?.textAlign as string | undefined;
   return align ? ALIGNMENT_BY_TEXT_ALIGN[align] : undefined;
+}
+
+const TWIPS_PER_IN = 1440;
+
+// docIndentExtension.ts's indents in Word's twips, added on top of any structural indent the
+// caller passes (blockquote/list nesting). Legacy indentLevel counts as 0.29in per level, the
+// same conversion the extension itself uses.
+function indentFor(node: JSONContent, base?: { left: number }) {
+  const attrs = node.attrs ?? {};
+  const leftIn = typeof attrs.indentLeft === "number" ? attrs.indentLeft : ((attrs.indentLevel as number | undefined) ?? 0) * 0.29;
+  const rightIn = typeof attrs.indentRight === "number" ? attrs.indentRight : 0;
+  const firstIn = typeof attrs.indentFirst === "number" ? attrs.indentFirst : 0;
+  const left = (base?.left ?? 0) + Math.round(leftIn * TWIPS_PER_IN);
+  if (!left && !rightIn && !firstIn) return base;
+  return {
+    left,
+    ...(rightIn ? { right: Math.round(rightIn * TWIPS_PER_IN) } : {}),
+    ...(firstIn > 0 ? { firstLine: Math.round(firstIn * TWIPS_PER_IN) } : firstIn < 0 ? { hanging: Math.round(-firstIn * TWIPS_PER_IN) } : {}),
+  };
 }
 
 // docx's ImageRun only accepts these four raster types (confirmed from the library's own
@@ -95,7 +114,7 @@ async function buildImageRun(src: string, width?: number | null, height?: number
     return null;
   }
   try {
-    const bytes = await invoke<number[]>("read_file_bytes", { path });
+    const bytes = await invoke<ArrayBuffer>("read_file_bytes", { path });
     return new ImageRun({
       type,
       data: new Uint8Array(bytes),
@@ -366,7 +385,7 @@ class DocxBuilder {
           new Paragraph({
             children: await renderInline(node.content, this.commentIdFor, forceBold),
             alignment: alignmentFor(node),
-            indent,
+            indent: indentFor(node, indent),
             border,
           }),
         ];
@@ -377,7 +396,7 @@ class DocxBuilder {
             children: await renderInline(node.content, this.commentIdFor, forceBold),
             heading: HEADING_BY_LEVEL[level],
             alignment: alignmentFor(node),
-            indent,
+            indent: indentFor(node, indent),
             border,
           }),
         ];
@@ -458,11 +477,12 @@ class DocxBuilder {
     });
 
     // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
-    // the same real 1in margin on every side, not docx's own unrelated defaults.
+    // the doc's own margins, not docx's unrelated defaults.
     const dims = PAGE_DIMENSIONS_IN[options.pageSize ?? "letter"];
     const width = `${dims.width}in` as PositiveUniversalMeasure;
     const height = `${dims.height}in` as PositiveUniversalMeasure;
-    const margin = `${PAGE_MARGIN_IN}in` as PositiveUniversalMeasure;
+    const m = resolveMargins(options.margins);
+    const inch = (v: number) => `${v}in` as PositiveUniversalMeasure;
 
     const doc = new Document({
       title,
@@ -473,7 +493,7 @@ class DocxBuilder {
           properties: {
             page: {
               size: { width, height },
-              margin: { top: margin, bottom: margin, left: margin, right: margin },
+              margin: { top: inch(m.top), bottom: inch(m.bottom), left: inch(m.left), right: inch(m.right) },
             },
           },
           // Repeats on every page in real Word, unlike the CSS position:fixed trick the live
@@ -502,6 +522,7 @@ export interface DocxExportOptions {
   pageSize?: DocPageSize | null;
   headerText?: string | null;
   footerText?: string | null;
+  margins?: DocMargins | null;
 }
 
 export async function buildDocxBytes(json: JSONContent, title: string, options?: DocxExportOptions): Promise<Uint8Array> {

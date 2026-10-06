@@ -39,6 +39,7 @@ import {
   MINDMAP_TYPE_DEFAULTS,
   MINDMAP_TYPE_LABEL,
   MINDMAP_CHECK_GLYPH,
+  MindmapEdge,
   MindmapNode,
   MindmapNodeType,
   MindmapSide,
@@ -49,12 +50,36 @@ import {
 } from "../../utils/mindmapTypes";
 import { autoSizedBox, buildAddTopic, canAutoSize, computeContentBounds } from "../../handlers/mindmapHandlers";
 import { wrapTextToWidth } from "../../utils/canvasText";
+import { EXTENSION_BY_MIME } from "../../utils/whiteboardImageCache";
+import { isTypingInField, readPastePayload, writeInternalMarker } from "../../utils/canvasClipboard";
 import { canvasToPdfBytes, canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import MindmapCanvas, { MindmapCanvasHandle } from "./MindmapCanvas";
 import MindmapPanel from "./MindmapPanel";
 import MindmapLiveView from "./MindmapLiveView";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
+
+// Private OS-clipboard type written on Ctrl+C of nodes - see canvasClipboard.ts.
+const MINDMAP_CLIPBOARD_MARKER = "application/x-briefcast-mindmap";
+// Each repeated Ctrl+V of the same copy lands this much further down-right, so pastes cascade
+// instead of stacking exactly on top of each other - same step the whiteboard uses.
+const PASTE_OFFSET_STEP = 24;
+// A pasted screenshot starts with its long edge at most this big - a 4K capture at 1:1 would bury
+// the whole roadmap. Same cap the whiteboard's image import uses.
+const PASTED_IMAGE_MAX_EDGE = 420;
+// Pasted text longer than one short line becomes a paragraph wrapped at this width rather than a
+// single-line label stretching off the screen.
+const PASTED_TEXT_MAX_WIDTH = 360;
+const PASTED_LABEL_MAX_CHARS = 60;
+
+function loadImageSize(src: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth || 1, height: img.naturalHeight || 1 });
+    img.onerror = () => reject(new Error("Failed to load pasted image"));
+    img.src = src;
+  });
+}
 
 // Below this pointer travel a palette press is a click, not a drag - mirrors Dashboard.tsx's own
 // SIDEBAR_DRAG_THRESHOLD_PX, which exists for the same reason (pointer-event dragging has to
@@ -325,6 +350,113 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
     store.deleteNodes(selectedNodes);
     setSelectedIds(new Set());
   }, [selectedNodes, store]);
+
+  // ---- Clipboard (Ctrl+C / Ctrl+V) ----------------------------------------------------------------
+  //
+  // Native copy/paste events, same scheme as the whiteboard (see canvasClipboard.ts): copied nodes
+  // live in an in-memory ref and a marker on the OS clipboard says they are still the latest copy;
+  // otherwise a screenshot pastes as an image node and plain text as a label/paragraph.
+  const clipboardRef = useRef<{ nodes: MindmapNode[]; edges: MindmapEdge[] } | null>(null);
+  const pasteCountRef = useRef(0);
+
+  const handleCopyNodes = useCallback(() => {
+    if (!doc || selectedIds.size === 0) return false;
+    const nodes = doc.nodes.filter((n) => selectedIds.has(n.id));
+    // Connectors running between two copied nodes come along, so a copied branch keeps its shape.
+    const edges = doc.edges.filter((e) => selectedIds.has(e.sourceId) && selectedIds.has(e.targetId));
+    clipboardRef.current = JSON.parse(JSON.stringify({ nodes, edges }));
+    pasteCountRef.current = 0;
+    return nodes.length > 0;
+  }, [doc, selectedIds]);
+
+  const handlePasteNodes = useCallback(() => {
+    const clipboard = clipboardRef.current;
+    if (!clipboard || clipboard.nodes.length === 0) return;
+    pasteCountRef.current += 1;
+    const offset = pasteCountRef.current * PASTE_OFFSET_STEP;
+    const idMap = new Map<string, string>();
+    const nodes = clipboard.nodes.map((n) => {
+      const id = crypto.randomUUID();
+      idMap.set(n.id, id);
+      return { ...n, id, x: n.x + offset, y: n.y + offset };
+    });
+    const edges = clipboard.edges.flatMap((e) => {
+      const sourceId = idMap.get(e.sourceId);
+      const targetId = idMap.get(e.targetId);
+      return sourceId && targetId ? [{ ...e, id: crypto.randomUUID(), sourceId, targetId }] : [];
+    });
+    store.addNodes(nodes, edges);
+    setSelectedIds(new Set(nodes.map((n) => n.id)));
+  }, [store]);
+
+  const handlePasteImages = useCallback(
+    async (files: File[]) => {
+      const at = centerDocPoint();
+      for (let i = 0; i < files.length; i++) {
+        try {
+          const extension = EXTENSION_BY_MIME[files[i].type];
+          if (!extension) throw new Error(`Unsupported image type: "${files[i].type || "unknown"}"`);
+          const bytes = Array.from(new Uint8Array(await files[i].arrayBuffer()));
+          const assetFileName = await invoke<string>("save_mindmap_image", { mindmapId, assetId: crypto.randomUUID(), extension, bytes });
+          // Sized from the in-memory blob rather than the saved asset, so it doesn't wait on the
+          // library root having resolved.
+          const blobUrl = URL.createObjectURL(files[i]);
+          const natural = await loadImageSize(blobUrl).finally(() => URL.revokeObjectURL(blobUrl));
+          const scale = Math.min(1, PASTED_IMAGE_MAX_EDGE / Math.max(natural.width, natural.height));
+          const node = createMindmapNode(crypto.randomUUID(), "image", at.x + i * PASTE_OFFSET_STEP, at.y + i * PASTE_OFFSET_STEP, {
+            width: Math.max(1, Math.round(natural.width * scale)),
+            height: Math.max(1, Math.round(natural.height * scale)),
+          });
+          const placed = { ...node, label: files[i].name && files[i].name !== "image.png" ? files[i].name : "Pasted image", assetFileName };
+          store.addNodes([placed]);
+          setSelectedIds(new Set([placed.id]));
+        } catch (err) {
+          console.error("Failed to paste image:", err);
+          setExportError(err instanceof Error ? err.message : String(err));
+        }
+      }
+    },
+    [centerDocPoint, mindmapId, store]
+  );
+
+  const handlePasteText = useCallback(
+    (text: string) => {
+      const at = centerDocPoint();
+      const isShort = !text.includes("\n") && text.length <= PASTED_LABEL_MAX_CHARS;
+      const type: MindmapNodeType = isShort ? "label" : "paragraph";
+      const defaults = MINDMAP_TYPE_DEFAULTS[type];
+      const fontPx = MINDMAP_FONT_PX[defaults.fontSize];
+      const lineWidths = text.split("\n").map((line) => measureLabel(line, fontPx, defaults.bold).width);
+      const wrappedLines = lineWidths.reduce((sum, w) => sum + Math.max(1, Math.ceil(w / PASTED_TEXT_MAX_WIDTH)), 0);
+      const box = autoSizedBox(Math.min(PASTED_TEXT_MAX_WIDTH, Math.max(...lineWidths)), wrappedLines * fontPx * 1.3);
+      const node = { ...createMindmapNode(crypto.randomUUID(), type, at.x, at.y, box), label: text };
+      store.addNodes([node]);
+      setSelectedIds(new Set([node.id]));
+    },
+    [centerDocPoint, store]
+  );
+
+  useEffect(() => {
+    if (liveView) return;
+    const onCopy = (e: ClipboardEvent) => {
+      if (isTypingInField()) return;
+      if (handleCopyNodes()) writeInternalMarker(e, MINDMAP_CLIPBOARD_MARKER);
+    };
+    const onPaste = (e: ClipboardEvent) => {
+      if (isTypingInField()) return;
+      const payload = readPastePayload(e, MINDMAP_CLIPBOARD_MARKER);
+      e.preventDefault();
+      if (payload.kind === "images") void handlePasteImages(payload.files);
+      else if (payload.kind === "text") handlePasteText(payload.text);
+      else handlePasteNodes();
+    };
+    window.addEventListener("copy", onCopy);
+    window.addEventListener("paste", onPaste);
+    return () => {
+      window.removeEventListener("copy", onCopy);
+      window.removeEventListener("paste", onPaste);
+    };
+  }, [liveView, handleCopyNodes, handlePasteNodes, handlePasteImages, handlePasteText]);
 
   const reorder = useCallback(
     (toFront: boolean) => {

@@ -1,12 +1,55 @@
 // RecordingOverlayWindow.tsx - This should be a separate component/page
 import { useEffect, useState } from 'react'
-import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoMicCircle, IoPauseCircle, IoPlayCircle, IoScanSharp, IoStopSharp, IoVideocam } from 'react-icons/io5'
+import { IoContractOutline, IoExpandOutline, IoMic, IoPause, IoPlay, IoScanSharp, IoSquare, IoVideocam } from 'react-icons/io5'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { LogicalSize } from '@tauri-apps/api/dpi';
 import { listen, emit } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { message } from '@tauri-apps/plugin-dialog';
+import { trackEvent } from "../utils/telemetry";
+import type { RecordingStatus } from "../utils/recordingStatus";
 const appWindow = getCurrentWebviewWindow()
+
+// The window is sized to the pill it's showing (plus room for the shadow) rather than staying at
+// the full bar's size when minimized - a transparent window still takes clicks across its whole
+// rectangle, so a small pill in a big window blocked whatever was underneath it.
+const FULL_SIZE = new LogicalSize(380, 68);
+const MINI_SIZE = new LogicalSize(196, 52);
+
+// Which inputs this recording captures, as small icons - the same set in both sizes of the bar.
+function SourceIcons({ recordType }: { recordType: string }) {
+    const screen = ["sva", "sa", "s", "c"].includes(recordType);
+    const camera = ["sva", "va", "v"].includes(recordType);
+    const mic = ["sva", "sa", "va", "a"].includes(recordType);
+    return (
+        <span className="flex items-center gap-1.5 text-white/60">
+            {screen && <IoScanSharp size={14} title="Screen" />}
+            {camera && <IoVideocam size={14} title="Camera" />}
+            {mic && <IoMic size={14} title="Microphone" />}
+        </span>
+    );
+}
+
+// The live dot + timer. Red and pulsing while capturing, amber and still while paused, so the
+// state reads from across the screen without having to look at the buttons.
+function RecTimer({ time, paused, compact }: { time: string; paused: boolean; compact?: boolean }) {
+    return (
+        <span data-tauri-drag-region className="flex items-center gap-2 select-none">
+            <span data-tauri-drag-region className="relative flex h-2.5 w-2.5">
+                {!paused && <span className="absolute inset-0 rounded-full bg-red-500 opacity-60 animate-ping" />}
+                <span className={`relative h-2.5 w-2.5 rounded-full ${paused ? "bg-amber-400" : "bg-red-500"}`} />
+            </span>
+            <span data-tauri-drag-region className={`font-mono tabular-nums ${compact ? "text-[13px]" : "text-[15px]"} font-semibold tracking-tight ${paused ? "text-amber-300" : "text-white"}`}>
+                {time}
+            </span>
+        </span>
+    );
+}
+
+const PILL_CLASS =
+    "flex items-center rounded-full bg-neutral-900/90 backdrop-blur-xl ring-1 ring-white/10 shadow-[0_8px_24px_rgba(0,0,0,0.35)] text-white cursor-move";
+const ICON_BUTTON_CLASS =
+    "h-8 w-8 shrink-0 flex items-center justify-center rounded-full transition active:scale-95";
 
 const RecordingOverlayWindow = () => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -47,21 +90,31 @@ const RecordingOverlayWindow = () => {
         setIsMinimized(!isMinimized);
     };
 
+    useEffect(() => {
+        appWindow.setSize(isMinimized ? MINI_SIZE : FULL_SIZE).catch((err) => console.error("Couldn't resize the recording bar:", err));
+    }, [isMinimized]);
+
     const handleStopRecording = async () => {
         // ffmpeg has already been asked to stop and torn down on the backend by the time
         // stop_recording rejects (e.g. the capture device disappeared mid-recording and no
         // output file was produced) - so the main window's state still needs resetting and
         // this overlay still needs to go away even on failure. Only the "tell the user what
         // happened" step differs between the two branches below.
+        //
+        // Hidden and announced first, before stop_recording returns - finishing a long recording
+        // takes minutes, and the backend shows the completion window as "finishing" meanwhile.
+        setIsRecording(false);
+        await appWindow.hide();
+        await emit('recording-stopped');
         try {
             await invoke("stop_recording");
+            trackEvent("recording_finished", { durationSeconds: elapsedTime, stoppedFrom: "overlay" });
         } catch (error) {
+            // Already stopped from the main window and still finishing - nothing to report.
+            if (String(error).includes("No recording in progress")) return;
             console.error("Error stopping recording:", error);
             await message(String(error), { title: 'Recording failed', kind: 'error' });
         }
-
-        await emit('recording-stopped');
-        await appWindow.hide();
     };
 
     const handlePauseRecording = async () => {
@@ -91,6 +144,23 @@ const RecordingOverlayWindow = () => {
             await message(String(error), { title: 'Failed to resume recording', kind: 'error' });
         }
     };
+
+    // This window's page can be reloaded mid-recording (renderer crash recovery, see
+    // services/webview_recovery.rs) - take the timer and controls back from the backend rather
+    // than waiting for a 'recording-state-update' that already came and went.
+    useEffect(() => {
+        invoke<RecordingStatus>("get_recording_status")
+            .then(({ recording, clock }) => {
+                if (!recording || !clock) return;
+                setIsRecording(true);
+                setRecordType(clock.recordType);
+                setStartTime(clock.startedAt);
+                setIsPaused(clock.pauseStartedAt !== null);
+                setPauseStartedAt(clock.pauseStartedAt);
+                setPausedAccumulatedMs(clock.pausedAccumulatedMs);
+            })
+            .catch(() => {});
+    }, []);
 
     // Listen for recording updates from main window
     useEffect(() => {
@@ -169,16 +239,24 @@ const RecordingOverlayWindow = () => {
     // logged mid-pause still lines up with what the displayed timer read at that moment.
     const handleSwitchView = async (mode: 'screen' | 'camera') => {
         if (mode === viewMode) return;
+        // The main window owns the view (it also takes the Alt+Shift+V hotkey) and logs the cut;
+        // this window just asks, and follows 'view-mode-changed' like every other control.
         setViewMode(mode);
-        if (!startTime) return;
-        const effectiveNow = isPaused && pauseStartedAt ? pauseStartedAt : Date.now();
-        const elapsedSecs = Math.max(0, (effectiveNow - startTime - pausedAccumulatedMs) / 1000);
         try {
-            await invoke('record_view_switch', { elapsedSecs, mode });
+            await emit('view-switch-requested', { mode });
         } catch (error) {
-            console.error('Error recording view switch:', error);
+            console.error('Error requesting view switch:', error);
         }
     };
+
+    useEffect(() => {
+        const unlisten = listen<{ mode: 'screen' | 'camera' }>('view-mode-changed', (event) => {
+            setViewMode(event.payload.mode);
+        });
+        return () => {
+            unlisten.then((fn) => fn());
+        };
+    }, []);
 
     // Derive elapsed time from the shared start timestamp (see Dashboard.tsx /
     // ActiveRecordingState.tsx) so this window's timer can't drift apart from the main window's -
@@ -200,156 +278,94 @@ const RecordingOverlayWindow = () => {
         return () => clearInterval(interval);
     }, [isRecording, startTime, isPaused, pauseStartedAt, pausedAccumulatedMs]);
 
-    // Render minimized version
+    const pauseButton = (
+        <button
+            type="button"
+            className={`${ICON_BUTTON_CLASS} bg-white/10 hover:bg-white/20 text-white`}
+            onClick={isPaused ? handleResumeRecording : handlePauseRecording}
+            title={isPaused ? "Resume recording" : "Pause recording"}
+        >
+            {isPaused ? <IoPlay size={15} className="ml-0.5" /> : <IoPause size={15} />}
+        </button>
+    );
+    const stopButton = (
+        <button
+            type="button"
+            className={`${ICON_BUTTON_CLASS} bg-red-500 hover:bg-red-600 text-white shadow-[0_0_0_3px_rgba(239,68,68,0.25)]`}
+            onClick={handleStopRecording}
+            title="Stop recording"
+        >
+            <IoSquare size={11} />
+        </button>
+    );
+
+    // Minimized: just the state, the time, and the one action that matters - stopping.
     if (isMinimized) {
         return (
-            <div className="w-full h-full flex items-center justify-center bg-black/90 rounded-lg">
-                <div className="flex items-center gap-3 p-2">
-                    <div className="flex items-center gap-2 text-white">
-                        {recordType === "sva" && (
-                            <>
-                                <IoScanSharp className="text-green-500 text-base" />
-                                <IoVideocam className="text-green-500 text-base" />
-                                <IoMicCircle className="text-green-500 text-base" />
-                            </>
-                        )}
-                        {recordType === "sa" && (
-                            <>
-                                <IoScanSharp className="text-green-500 text-base" />
-                                <IoMicCircle className="text-green-500 text-base" />
-                            </>
-                        )}
-                        {recordType === "va" && (
-                            <>
-                                <IoVideocam className="text-green-500 text-base" />
-                                <IoMicCircle className="text-green-500 text-base" />
-                            </>
-                        )}
-                        {recordType === "s" && <IoScanSharp className="text-green-500 text-base" />}
-                        {recordType === "v" && <IoVideocam className="text-green-500 text-base" />}
-                        {recordType === "a" && <IoMicCircle className="text-green-500 text-base" />}
-                        {recordType === "c" && <IoScanSharp className="text-green-500 text-base" />}
-                        
-                        <span className={`text-xs font-mono ${isPaused ? "text-amber-400" : ""}`}>{formatTime(elapsedTime)}</span>
+            <div className="w-full h-full flex items-center justify-center p-1.5">
+                <div data-tauri-drag-region className={`${PILL_CLASS} gap-2 h-10 pl-3.5 pr-1`}>
+                    <RecTimer time={formatTime(elapsedTime)} paused={isPaused} compact />
+                    <div className="flex items-center gap-1">
+                        <span className="scale-[0.85] flex">{stopButton}</span>
+                        <button type="button" onClick={toggleMinimize} title="Expand" className={`${ICON_BUTTON_CLASS} h-7 w-7 text-white/60 hover:text-white hover:bg-white/10`}>
+                            <IoExpandOutline size={14} />
+                        </button>
                     </div>
-                    <button 
-                        onClick={toggleMinimize}
-                        className="text-white hover:text-gray-300"
-                    >
-                        <IoIosArrowUp className="text-lg" />
-                    </button>
                 </div>
             </div>
         );
     }
 
-    // Render full overlay
     return (
-        <div className="w-full h-full flex flex-col bg-white/95 dark:bg-neutral-900/95 backdrop-blur-sm rounded-lg">
-            {/* Draggable header */}
-            <div
-                data-tauri-drag-region
-                className="bg-gray-800 dark:bg-neutral-950 rounded-t-lg px-3 py-2 cursor-move flex justify-between items-center"
-            >
-                <div className="flex items-center gap-2">
-                    <div className="w-2.5 h-2.5 rounded-full bg-red-500"></div>
-                    <div className="w-2.5 h-2.5 rounded-full bg-yellow-500"></div>
-                    <div className="w-2.5 h-2.5 rounded-full bg-green-500"></div>
-                    <span className="ml-2 text-xs font-medium text-white">Recording</span>
+        <div className="w-full h-full flex items-center justify-center p-1.5">
+            <div data-tauri-drag-region className={`${PILL_CLASS} gap-3 h-[52px] pl-4 pr-1.5`}>
+                <div data-tauri-drag-region className="flex flex-col justify-center min-w-[64px]">
+                    <RecTimer time={formatTime(elapsedTime)} paused={isPaused} />
+                    <span data-tauri-drag-region className="pl-[18px] font-mono text-[10px] leading-tight text-white/45 select-none">
+                        {isPaused ? (
+                            <span className="text-amber-300/80">paused</span>
+                        ) : droppedFrames > 0 ? (
+                            <span className="text-amber-300/90" title="Frames dropped during capture - the encoder may be falling behind">
+                                {droppedFrames} dropped
+                            </span>
+                        ) : captureFps !== null ? (
+                            `${Math.round(captureFps)} fps`
+                        ) : (
+                            "recording"
+                        )}
+                    </span>
                 </div>
-                <button 
-                    onClick={toggleMinimize}
-                    className="text-white hover:text-gray-300"
-                >
-                    <IoIosArrowDown className="text-lg" />
-                </button>
-            </div>
 
-            {/* Content */}
-            <div className="flex-1 p-3 flex flex-col justify-center">
-                {isRecording && (
-                    <div className="bg-black rounded-lg text-white text-xs py-2 px-3 flex items-center justify-between gap-2">              
-                        <div className="flex gap-2 items-center">
-                            <button
-                                className="flex items-center gap-1 hover:text-gray-300"
-                                onClick={handleStopRecording}
-                                title="Stop recording"
-                            >
-                                <IoStopSharp className="text-lg" />
-                            </button>
-                            <button
-                                className="flex items-center gap-1 hover:text-gray-300"
-                                onClick={isPaused ? handleResumeRecording : handlePauseRecording}
-                                title={isPaused ? "Resume recording" : "Pause recording"}
-                            >
-                                {isPaused ? <IoPlayCircle className="text-lg" /> : <IoPauseCircle className="text-lg" />}
-                            </button>
-                            <div className={`font-mono text-sm ml-1 ${isPaused ? "text-amber-400" : ""}`}>
-                                {formatTime(elapsedTime)}{isPaused ? " (paused)" : ""}
-                            </div>
-                            {captureFps !== null && (
-                                <div className="font-mono text-[10px] text-gray-400 ml-1">
-                                    {Math.round(captureFps)}fps
-                                </div>
-                            )}
-                            {droppedFrames > 0 && (
-                                <div
-                                    className="font-mono text-[10px] text-amber-400 ml-1"
-                                    title="Frames dropped during capture - the encoder may be falling behind"
-                                >
-                                    {droppedFrames} dropped
-                                </div>
-                            )}
-                        </div>
+                <div className="flex items-center gap-1.5">
+                    {pauseButton}
+                    {stopButton}
+                </div>
 
-                        <div className='flex items-center gap-2 pl-2 border-l border-gray-600'>
-                            {canSwitchView ? (
-                                // Interactive - which one is "live" as the main view right now,
-                                // not just a static "here's what this recording captures" readout
-                                // the plain icons below are for every other mode. See
-                                // handleSwitchView's own doc comment for what a click here does.
-                                <div className="flex gap-1" title="Switch the main view between screen and camera">
-                                    <button
-                                        onClick={() => handleSwitchView('screen')}
-                                        className={`p-1 rounded ${viewMode === 'screen' ? 'bg-green-500/30 text-green-400' : 'text-gray-500 hover:text-gray-300'}`}
-                                        title="Show screen as the main view"
-                                    >
-                                        <IoScanSharp className="text-base" />
-                                    </button>
-                                    <button
-                                        onClick={() => handleSwitchView('camera')}
-                                        className={`p-1 rounded ${viewMode === 'camera' ? 'bg-green-500/30 text-green-400' : 'text-gray-500 hover:text-gray-300'}`}
-                                        title="Show camera as the main view"
-                                    >
-                                        <IoVideocam className="text-base" />
-                                    </button>
-                                </div>
-                            ) : recordType === "sva" && (
-                                <div className="flex gap-2">
-                                    <IoScanSharp className="text-green-500 text-base" />
-                                    <IoVideocam className="text-green-500 text-base" />
-                                    <IoMicCircle className="text-green-500 text-base" />
-                                </div>
-                            )}
-                            {recordType === "sa" && (
-                                <div className="flex gap-2">
-                                    <IoScanSharp className="text-green-500 text-base" />
-                                    <IoMicCircle className="text-green-500 text-base" />
-                                </div>
-                            )}
-                            {recordType === "va" && (
-                                <div className="flex gap-2">
-                                    <IoVideocam className="text-green-500 text-base" />
-                                    <IoMicCircle className="text-green-500 text-base" />
-                                </div>
-                            )}
-                            {recordType === "s" && <IoScanSharp className="text-green-500 text-base" />}
-                            {recordType === "v" && <IoVideocam className="text-green-500 text-base" />}
-                            {recordType === "a" && <IoMicCircle className="text-green-500 text-base" />}
-                            {recordType === "c" && <IoScanSharp className="text-green-500 text-base" />}
-                        </div>
+                <span className="w-px h-6 bg-white/15" />
+
+                {canSwitchView ? (
+                    // Interactive - which one is "live" as the main view right now. See
+                    // handleSwitchView's own doc comment for what a click here does.
+                    <div className="flex items-center p-0.5 rounded-full bg-white/10" title="Switch the main view between screen and camera">
+                        {(["screen", "camera"] as const).map((mode) => (
+                            <button
+                                key={mode}
+                                type="button"
+                                onClick={() => handleSwitchView(mode)}
+                                className={`h-7 w-7 flex items-center justify-center rounded-full transition ${viewMode === mode ? "bg-white text-neutral-900" : "text-white/60 hover:text-white"}`}
+                                title={mode === "screen" ? "Show screen as the main view" : "Show camera as the main view"}
+                            >
+                                {mode === "screen" ? <IoScanSharp size={14} /> : <IoVideocam size={14} />}
+                            </button>
+                        ))}
                     </div>
+                ) : (
+                    <SourceIcons recordType={recordType} />
                 )}
+
+                <button type="button" onClick={toggleMinimize} title="Minimize" className={`${ICON_BUTTON_CLASS} text-white/60 hover:text-white hover:bg-white/10`}>
+                    <IoContractOutline size={15} />
+                </button>
             </div>
         </div>
     );

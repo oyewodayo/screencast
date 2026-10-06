@@ -123,7 +123,36 @@ export interface Clip {
   // afftdn but not bit-identical) so NoiseReductionPopover's strength slider is audible while
   // editing, not just after export.
   noiseReduction?: number;
+  // How noiseReduction is applied plus the extra cleanup stages around it - see AudioCleanup.
+  // Undefined keeps the original behaviour (spectral "reduce" mode, no extra stages).
+  audioCleanup?: AudioCleanup;
 }
+
+// Optional audio-cleanup stages for one clip, applied in this order in both the live preview
+// (VideoPlayer.tsx's Web Audio graph) and the export (conversion.rs's audio_cleanup_filters):
+// low-cut -> hum notches -> denoise (Clip.noiseReduction, in `mode`) -> gate.
+export interface AudioCleanup {
+  // "reduce": spectral noise reduction (afftdn on export) - keeps some room tone, safest on
+  // music/ambience. "remove": RNNoise voice isolation (arnndn on export) - strips everything that
+  // isn't voice, for speech-only footage. Undefined means "reduce".
+  mode?: "reduce" | "remove";
+  // 80Hz high-pass - rumble, handling noise, wind, AC/traffic low end.
+  lowCut?: boolean;
+  // Mains hum (and its first harmonics) at 50Hz (Europe/Africa/Asia) or 60Hz (Americas).
+  hum?: 50 | 60;
+  // Downward expander that silences what's left between phrases.
+  gate?: boolean;
+  // Loudness levelling - evens out quiet and loud speakers (speechnorm + loudnorm on export, a
+  // slow AGC + limiter worklet in the live preview). Runs last.
+  level?: boolean;
+  // A noise-only stretch of this clip's own source file, in source seconds, that "reduce" mode
+  // learns its noise profile from (afftdn sample_noise on export, the spectral worklet's learned
+  // profile live). Picked on the popover's waveform; ignored by "remove" mode.
+  noiseSample?: { start: number; end: number };
+}
+
+export const hasAudioCleanup = (clip: { noiseReduction?: number; audioCleanup?: AudioCleanup }): boolean =>
+  (clip.noiseReduction ?? 0) > 0 || !!clip.audioCleanup?.lowCut || !!clip.audioCleanup?.hum || !!clip.audioCleanup?.gate || !!clip.audioCleanup?.level;
 
 // Background shape behind a text overlay's box - "rounded"/"pill" only actually differ visually
 // when a backgroundColor is set (an invisible box has no edges to round). Video-only: TextObject
@@ -285,6 +314,13 @@ export interface AudioOverlay {
   fadeInSec?: number; // undefined/0 means no fade
   fadeOutSec?: number;
   muted?: boolean;
+  // Short name shown on the timeline chip - set by "Detach audio" ("Voice", "Music", "Track 2 ·
+  // eng"); user-added music has none and shows its file name in the tooltip only.
+  label?: string;
+  // True for overlays produced by "Detach audio" (the video's own sound, split out). A later detach
+  // replaces all of these rather than stacking a second copy on top - which would otherwise keep
+  // playing the old Music/Voice underneath the new ones, hidden in lower lane rows.
+  detached?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -308,7 +344,11 @@ export interface PipOverlay {
   width: number;
   height: number;
   shape: PipShape;
-  cornerRadius?: number; // fraction of frame height, "rounded" only - undefined means a modest default
+  cornerRadius?: number; // fraction of this PiP box's own height, "rounded" only - undefined means a modest default
+  // Region of the pip SOURCE frame actually shown (fractions of the source's own width/height, same
+  // basis as Clip.crop) - applied before the box's own cover-fit, in both the preview
+  // (PipOverlayLayer.tsx) and export (pip_overlay_chain, conversion.rs). Undefined means the whole frame.
+  crop?: ClipCrop;
   trimStart: number;
   sourceDuration: number;
   startTime: number;
@@ -341,6 +381,7 @@ export interface KeepSegment {
   flipHorizontal?: boolean;
   speed?: number;
   noiseReduction?: number;
+  audioCleanup?: AudioCleanup;
 }
 
 export interface VideoEditState {
@@ -411,7 +452,8 @@ export interface VideoEditCommand {
     | "edit-pip"
     | "delete-pip"
     | "view-switch-cut"
-    | "edit-track-audio";
+    | "edit-track-audio"
+    | "detach-audio";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {

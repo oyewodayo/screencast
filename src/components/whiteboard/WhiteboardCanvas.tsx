@@ -43,6 +43,7 @@ import {
   WhiteboardNode,
   WhiteboardPage,
   WhiteboardShapeType,
+  resolveNodeFill,
 } from "../../utils/whiteboardTypes";
 import {
   AMP_MINUS_Y_FRAC,
@@ -176,7 +177,7 @@ function WhiteboardImageBody({ node, src, cropping }: { node: WhiteboardNode; sr
     inset: 0,
     overflow: "hidden",
     borderRadius,
-    backgroundColor: node.fillColor ?? "transparent",
+    backgroundColor: resolveNodeFill(node) ?? "transparent",
   };
 
   // The ring is its OWN empty overlay rather than an inset box-shadow on the frame, because an inset
@@ -885,7 +886,16 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // An in-progress canvas drag wins over a style-panel preview: both are "uncommitted display-only
   // state", but only one gesture can be happening at a time, and the drag is the one the pointer is
   // currently driving.
-  const nodes = liveNodes ?? previewNodes ?? page.nodes;
+  //
+  // The preview holds only the shapes being previewed (the selection), so it's merged over the page
+  // rather than standing in for it - used as the whole node list, every unselected shape vanished
+  // for as long as a style slider was held.
+  const previewedNodes = useMemo(() => {
+    if (!previewNodes) return null;
+    const byId = new Map(previewNodes.map((n) => [n.id, n]));
+    return page.nodes.map((n) => byId.get(n.id) ?? n);
+  }, [previewNodes, page.nodes]);
+  const nodes = liveNodes ?? previewedNodes ?? page.nodes;
   const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const edges = liveEdges ?? page.edges;
 
@@ -2387,7 +2397,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   style={{
                     position: "absolute",
                     inset: 0,
-                    backgroundColor: node.fillColor ?? "transparent",
+                    backgroundColor: resolveNodeFill(node) ?? "transparent",
                     border: node.strokeWidth > 0 ? `${node.strokeWidth}px solid ${node.strokeColor}` : undefined,
                     borderRadius: "50%",
                     boxSizing: "border-box",
@@ -2403,7 +2413,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   style={{
                     position: "absolute",
                     inset: 0,
-                    backgroundColor: node.fillColor ?? "transparent",
+                    backgroundColor: resolveNodeFill(node) ?? "transparent",
                     border: node.strokeWidth > 0 ? `${node.strokeWidth}px solid ${node.strokeColor}` : undefined,
                     borderRadius: node.cornerRadius ?? 0,
                     boxSizing: "border-box",
@@ -2415,7 +2425,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
                   <path
                     d={`M0,${node.height * CYLINDER_CAP_RATIO} L0,${node.height * (1 - CYLINDER_CAP_RATIO)} A${node.width / 2},${node.height * CYLINDER_CAP_RATIO} 0 0,0 ${node.width},${node.height * (1 - CYLINDER_CAP_RATIO)} L${node.width},${node.height * CYLINDER_CAP_RATIO} Z`}
-                    fill={node.fillColor ?? "none"}
+                    fill={resolveNodeFill(node) ?? "none"}
                     stroke={node.strokeColor}
                     strokeWidth={node.strokeWidth}
                   />
@@ -2424,14 +2434,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     cy={node.height * CYLINDER_CAP_RATIO}
                     rx={node.width / 2}
                     ry={node.height * CYLINDER_CAP_RATIO}
-                    fill={node.fillColor ?? "none"}
+                    fill={resolveNodeFill(node) ?? "none"}
                     stroke={node.strokeColor}
                     strokeWidth={node.strokeWidth}
                   />
                 </svg>
               ) : outline.kind === "polygon" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  <polygon points={outline.points.map(([px, py]) => `${px},${py}`).join(" ")} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
+                  <polygon points={outline.points.map(([px, py]) => `${px},${py}`).join(" ")} fill={resolveNodeFill(node) ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
                   {outline.innerLines?.map((line, i) => (
                     <polyline key={i} points={line.map(([px, py]) => `${px},${py}`).join(" ")} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
                   ))}
@@ -2441,7 +2451,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 </svg>
               ) : outline.kind === "path" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  <path d={outline.d} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
+                  <path d={outline.d} fill={resolveNodeFill(node) ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
                 </svg>
               ) : outline.kind === "chart" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
@@ -2451,7 +2461,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   <g transform={outline.inset ? `translate(${outline.inset.dx},${outline.inset.dy})` : undefined}>
                     {outline.parts.map((part, i) =>
                       part.role === "fill" ? (
-                        <path key={i} d={part.d} fill={node.fillColor ?? "none"} stroke="none" />
+                        <path key={i} d={part.d} fill={resolveNodeFill(node) ?? "none"} stroke="none" />
                       ) : part.role === "marker" ? (
                         <path key={i} d={part.d} fill={node.strokeColor} stroke="none" />
                       ) : part.role === "slice" ? (
