@@ -57,6 +57,7 @@ import Toast from "../components/custom/Toast";
 import UpdateBanner from "../components/custom/UpdateBanner";
 import TelemetryNotice from "../components/custom/TelemetryNotice";
 import type { RecordingStatus } from "../utils/recordingStatus";
+import { cancelCountdown, isCountdownRunning, runRecordingCountdown } from "../utils/recordingCountdown";
 import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
 import type { Update } from "@tauri-apps/plugin-updater";
@@ -1065,6 +1066,12 @@ const setScreen = () => {
   };
 
   const handleStartRecording = async (formData: any) => {
+    // Record pressed again (button or hotkey) while the countdown is still running: that's a
+    // change of mind - cancel it rather than queue a second start.
+    if (isCountdownRunning()) {
+      cancelCountdown();
+      return;
+    }
     // Read at the moment of recording rather than threaded through every caller - the panel and
     // the record hotkey both land here.
     const recordingPrefs = loadSettings();
@@ -1091,6 +1098,12 @@ const setScreen = () => {
         );
         return;
       }
+    }
+    // Optional "3, 2, 1" (Settings > Recording) - after the checks above, so a start that's going to
+    // be refused anyway doesn't make the user wait through a countdown first.
+    if (recordingPrefs.recordingCountdownEnabled) {
+      const go = await runRecordingCountdown(recordingPrefs.recordingCountdownSeconds);
+      if (!go) return;
     }
     try {
         await activateTargetWindowIfNeeded();
@@ -1199,11 +1212,14 @@ const setScreen = () => {
           await bindShortcut(VIEW_SWITCH_SHORTCUT, () => void switchViewRef.current('toggle'));
         }
 
-        setMessage(
-          switchable
-            ? `${response} (Alt+Shift+V switches between screen and camera, Ctrl+Shift+H shows the recording overlay)`
-            : `${response} (Ctrl+Shift+H to show/hide the recording overlay)`
-        );
+        // Opt-in (Settings > Recording) - see AppSettings.notifyOnRecordingStart.
+        if (loadSettings().notifyOnRecordingStart) {
+          setMessage(
+            switchable
+              ? `${response} (Alt+Shift+V switches between screen and camera, Ctrl+Shift+H shows the recording overlay)`
+              : `${response} (Ctrl+Shift+H to show/hide the recording overlay)`
+          );
+        }
 
     } catch (error) {
         console.error("Error starting recording:", error);
@@ -1291,31 +1307,22 @@ const setScreen = () => {
       }
     }
 
-    try {
-      const response = await invoke<string>("stop_recording");
-      // Wall-clock span (includes any paused time) - the overlay's own stop path reports the exact
-      // pause-aware duration instead.
-      trackEvent("recording_finished", {
-        durationSeconds: recordingStartTime ? Math.round((Date.now() - recordingStartTime) / 1000) : 0,
-        stoppedFrom: "main",
-      });
-      const audio = new Audio("/sounds/option-3.mp3");
-      audio.play().catch(err => console.error("Error playing audio:", err));
-      setMessage(response);
-    } catch (error) {
-      console.error("Error stopping recording:", error);
-      setError(`Failed to stop recording: ${error}`);
-    }
-
-    // ffmpeg has already been asked to stop and torn down on the backend by the time
-    // stop_recording rejects (e.g. the capture device disappeared mid-recording and no output
-    // file was produced), so this window's own state still needs resetting either way - same
-    // reasoning as RecordingOverlayWindow.tsx's own handleStopRecording.
+    // Everything the user sees changes NOW, not when stop_recording returns: capture ends within a
+    // moment, but cleaning the audio and assembling the file can take minutes for a long
+    // recording, and a Stop that leaves the timer running that long reads as ignored (it got
+    // pressed again, on the overlay, which then failed with "No recording in progress"). The
+    // backend shows the completion window in a "finishing" state meanwhile.
+    // Wall-clock span (includes any paused time) - the overlay's own stop path reports the exact
+    // pause-aware duration instead.
+    const durationSeconds = recordingStartTime ? Math.round((Date.now() - recordingStartTime) / 1000) : 0;
     setIsRecording(false);
     setRecordingStartTime(null);
     setIsPaused(false);
     setPauseStartedAt(null);
     setPausedAccumulatedMs(0);
+    setCanSwitchView(false);
+    const audio = new Audio("/sounds/option-3.mp3");
+    audio.play().catch(err => console.error("Error playing audio:", err));
 
     // Hide the overlay window and drop the toggle shortcut now that there's nothing to show
     const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
@@ -1324,7 +1331,19 @@ const setScreen = () => {
     }
     await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
     await unbindShortcut(VIEW_SWITCH_SHORTCUT);
-    setCanSwitchView(false);
+
+    try {
+      // The finished path is shown by the completion window, so no toast repeats it here.
+      await invoke<string>("stop_recording");
+      trackEvent("recording_finished", { durationSeconds, stoppedFrom: "main" });
+    } catch (error) {
+      // A second Stop (from the overlay, a shortcut) while the first is still finishing - the
+      // recording is already being saved, so there is nothing to report.
+      if (!String(error).includes("No recording in progress")) {
+        console.error("Error stopping recording:", error);
+        setError(`Failed to stop recording: ${error}`);
+      }
+    }
 
     if (isMonitoring) {
       try {

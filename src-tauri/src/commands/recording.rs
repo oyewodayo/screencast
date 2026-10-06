@@ -2290,6 +2290,16 @@ pub async fn stop_recording(
         *guard = None;
     }
 
+    // Capture has ended, but cleaning the audio and assembling the file still lie ahead - minutes,
+    // for a long recording on a busy machine. Showing the completion window now (as "finishing")
+    // rather than at the end is what tells the user their Stop registered; with nothing on screen
+    // for that long it looked ignored and got pressed again. It's reloaded with the outcome below.
+    let modal_path = path_to_str(&output_path)?.to_string();
+    if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, "processing", None).await {
+        warn!("Couldn't show the recording-finishing window: {}", e);
+    }
+
+    let finished: Result<String, String> = async {
     // Assemble a screen recording's final file from its parts (see recording/assembly.rs). Must
     // happen after ffmpeg has exited above - the video is stream-copied from its finished file.
     #[cfg(target_os = "windows")]
@@ -2413,20 +2423,28 @@ pub async fn stop_recording(
         }
     }
 
-    let output_str = path_to_str(&output_path)?;
+    let output_str = path_to_str(&output_path)?.to_string();
 
     if let Err(e) = app_handle.emit("refresh-file-list", ()) {
         warn!("Failed to emit refresh-file-list: {}", e);
     }
 
+    Ok(output_str)
+    }
+    .await;
+
     // A cosmetic popup must not turn a successful recording into a failed stop. The file is
     // already written and verified by this point; reporting "Failed to stop recording" because a
     // window wouldn't open tells the user their recording is lost when it is sitting on disk.
-    if let Err(e) = create_or_replace_rec_completed_modal(app_handle, output_str).await {
-        warn!("Recording saved, but the completion popup could not be shown: {}", e);
+    let (status, error) = match &finished {
+        Ok(_) => ("done", None),
+        Err(e) => ("failed", Some(e.as_str())),
+    };
+    if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, status, error).await {
+        warn!("Recording finished, but the completion popup could not be updated: {}", e);
     }
 
-    Ok(output_str.to_string())
+    finished
 }
 
 // Pauses the in-progress recording: suspends every thread of the ffmpeg process (see each
@@ -2569,9 +2587,13 @@ pub fn prewarm_rec_completed_modal(app_handle: &tauri::AppHandle) {
     });
 }
 
+// `status` is "processing" (shown the moment Stop is pressed, while the file is still being finished),
+// "done" or "failed" (with `error`) - see FileModal.tsx's RecordingModalStatus.
 async fn create_or_replace_rec_completed_modal(
     app_handle: tauri::AppHandle,
     file_path: &str,
+    status: &str,
+    error: Option<&str>,
 ) -> Result<String, String> {
     // The file path is baked into the window's own URL (rather than sent via an event) because
     // the page reads it synchronously on its first render - an event emitted before its listener
@@ -2580,8 +2602,11 @@ async fn create_or_replace_rec_completed_modal(
     // Root-relative: the entry HTML sits beside index.html (see vite.config.ts's rollup input for
     // why it can't live under src-tauri/), which is where both the dev server and the bundled
     // frontend serve it from.
-    let encoded_path = urlencoding::encode(file_path).into_owned();
-    let url = format!("completed_recording.html?path={}", encoded_path);
+    let mut query = format!("path={}&status={}", urlencoding::encode(file_path), urlencoding::encode(status));
+    if let Some(error) = error {
+        query.push_str(&format!("&error={}", urlencoding::encode(error)));
+    }
+    let url = format!("completed_recording.html?{}", query);
 
     // spawn_blocking, not done inline: show()/navigate()/build() all marshal onto the main thread
     // and wait for it, so they must never be called from it - running them on a real background
@@ -2592,7 +2617,7 @@ async fn create_or_replace_rec_completed_modal(
                 .url()
                 .map_err(|e| format!("Failed to read popup URL: {}", e))?;
             target.set_path("/completed_recording.html");
-            target.set_query(Some(&format!("path={}", encoded_path)));
+            target.set_query(Some(&query));
             window
                 .navigate(target)
                 .map_err(|e| format!("Failed to load recording into popup: {}", e))?;

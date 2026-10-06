@@ -20,6 +20,7 @@ import {
   TbLayoutAlignMiddle,
   TbLayoutAlignRight,
   TbLayoutAlignTop,
+  TbRotateClockwise,
   TbStackBack,
   TbStackFront,
   TbUnderline,
@@ -1112,52 +1113,6 @@ function ImageFields({
   );
 }
 
-// The 4-direction nudge button grid - shared by the node section's own "Nudge" field and the
-// connector section's (see nudgeEdgeBy's own doc comment for why an edge can be nudged too, not
-// just moved by dragging its body). 1px per click, 10px with Shift held - same step sizes as the
-// arrow-key shortcut (WhiteboardCanvas.tsx's keydown handler) so both controls move a selection by
-// identical, predictable amounts.
-function NudgeGrid({ onNudge }: { onNudge: (dx: number, dy: number) => void }) {
-  return (
-    <div className="grid grid-cols-3 grid-rows-2 gap-0.5">
-      <span />
-      <button
-        type="button"
-        onClick={(e) => onNudge(0, e.shiftKey ? -10 : -1)}
-        title="Nudge up (↑, Shift for 10px)"
-        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-      >
-        ↑
-      </button>
-      <span />
-      <button
-        type="button"
-        onClick={(e) => onNudge(e.shiftKey ? -10 : -1, 0)}
-        title="Nudge left (←, Shift for 10px)"
-        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-      >
-        ←
-      </button>
-      <button
-        type="button"
-        onClick={(e) => onNudge(0, e.shiftKey ? 10 : 1)}
-        title="Nudge down (↓, Shift for 10px)"
-        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-      >
-        ↓
-      </button>
-      <button
-        type="button"
-        onClick={(e) => onNudge(e.shiftKey ? 10 : 1, 0)}
-        title="Nudge right (→, Shift for 10px)"
-        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-      >
-        →
-      </button>
-    </div>
-  );
-}
-
 // Rotates a fully free-floating edge (both ends unattached to any shape - see this field's own
 // call site for the `bothFree` gate) around the bounding-box center of its own CURRENT point set -
 // an edge has no persisted `rotation` field the way a WhiteboardNode does (nothing else about an
@@ -1211,6 +1166,177 @@ function EdgeRotateField({ edge, onCommit }: { edge: WhiteboardEdge; onCommit: (
     </Field>
   );
 }
+
+// A colour well plus its hex code - the code is what a researcher matches against a journal's or a
+// palette's spec, and a bare swatch gives no way to read it back.
+function ColorField({ label, value, onChange }: { label: string; value: string; onChange: (color: string) => void }) {
+  return (
+    <Field label={label}>
+      <span className="flex items-center gap-1.5 h-7 pl-0.5 pr-2 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-500/20 transition">
+        <input type="color" value={value} onChange={(e) => onChange(e.target.value)} className="w-6 h-6 rounded cursor-pointer bg-transparent p-0 border-0" />
+        <span className="w-14 text-[11px] font-mono uppercase text-gray-500 dark:text-neutral-400 tabular-nums">{value}</span>
+      </span>
+    </Field>
+  );
+}
+
+// A row of mutually-related toggle buttons drawn as one control (B/I/U, alignment, flip) - the
+// segmented look the Mindmap inspector uses for its font steps.
+function Segmented({ children }: { children: React.ReactNode }) {
+  return <div className="flex items-center p-0.5 gap-0.5 rounded-md bg-gray-100 dark:bg-neutral-800">{children}</div>;
+}
+
+function SegmentButton({ active, onClick, title, children }: { active: boolean; onClick: (e: React.MouseEvent) => void; title: string; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-pressed={active}
+      className={`h-6 min-w-[26px] px-1.5 flex items-center justify-center rounded text-xs transition ${
+        active ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-300 shadow-sm" : "text-gray-500 dark:text-neutral-400 hover:text-gray-800 dark:hover:text-neutral-100"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+// A number field with its label inside the box ("X 120"), the compact form design tools use for
+// geometry - the label reads as part of the value rather than a separate row competing with it.
+function PrefixedNumber({
+  prefix,
+  title,
+  suffix,
+  resetKey,
+  value,
+  min,
+  max,
+  onCommit,
+}: {
+  prefix: React.ReactNode;
+  title: string;
+  suffix?: string;
+  resetKey: string;
+  value: number;
+  min: number;
+  max: number;
+  onCommit: (n: number) => void;
+}) {
+  return (
+    <label
+      title={title}
+      className="flex items-center h-8 min-w-0 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 hover:border-gray-300 dark:hover:border-neutral-600 focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-500/20 transition"
+    >
+      <span className="shrink-0 w-7 flex justify-center text-[11px] font-semibold text-gray-400 dark:text-neutral-500 select-none">{prefix}</span>
+      <ClampedNumberField
+        key={resetKey}
+        initialValue={Math.round(value)}
+        min={min}
+        max={max}
+        onCommit={onCommit}
+        className="flex-1 min-w-0 h-full bg-transparent text-xs tabular-nums outline-none pr-1"
+      />
+      {suffix && <span className="shrink-0 pr-2 text-[11px] text-gray-400 dark:text-neutral-500 select-none">{suffix}</span>}
+    </label>
+  );
+}
+
+// Position, size, rotation and flip for the selection, as one compact block: X/Y and W/H in a 2x2
+// grid (single shape only - a multi-selection shares no one position), then rotation and the flip
+// toggles side by side.
+function TransformBlock({ nodes, onCommit }: { nodes: WhiteboardNode[]; onCommit: (patch: Partial<WhiteboardNode>) => void }) {
+  const node = nodes[0];
+  const ids = nodes.map((n) => n.id).join(",");
+  return (
+    <div className="flex flex-col gap-2">
+      {nodes.length === 1 && (
+        <div className="grid grid-cols-2 gap-2">
+          <PrefixedNumber prefix="X" title="Horizontal position" resetKey={`${ids}-x-${Math.round(node.x)}`} value={node.x} min={-100000} max={100000} onCommit={(x) => onCommit({ x })} />
+          <PrefixedNumber prefix="Y" title="Vertical position" resetKey={`${ids}-y-${Math.round(node.y)}`} value={node.y} min={-100000} max={100000} onCommit={(y) => onCommit({ y })} />
+          <PrefixedNumber prefix="W" title="Width" resetKey={`${ids}-w-${Math.round(node.width)}`} value={node.width} min={1} max={100000} onCommit={(width) => onCommit({ width })} />
+          <PrefixedNumber prefix="H" title="Height" resetKey={`${ids}-h-${Math.round(node.height)}`} value={node.height} min={1} max={100000} onCommit={(height) => onCommit({ height })} />
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-2">
+        <PrefixedNumber
+          prefix={<TbRotateClockwise size={13} />}
+          title="Rotation in degrees"
+          suffix="°"
+          resetKey={`${ids}-r-${node.rotation ?? 0}`}
+          value={node.rotation ?? 0}
+          min={0}
+          max={360}
+          // 360 is visually identical to 0 (no rotation) - normalize both to "unset" rather than
+          // clamping a typed 360 down to 359, which read as an arbitrary, unexplained cap.
+          onCommit={(n) => onCommit({ rotation: n === 0 || n === 360 ? undefined : n })}
+        />
+        <div className="flex items-center justify-end">
+          <Segmented>
+            <SegmentButton active={node.flipHorizontal ?? false} onClick={() => onCommit({ flipHorizontal: !(node.flipHorizontal ?? false) })} title="Flip horizontal">
+              <TbFlipHorizontal size={15} />
+            </SegmentButton>
+            <SegmentButton active={node.flipVertical ?? false} onClick={() => onCommit({ flipVertical: !(node.flipVertical ?? false) })} title="Flip vertical">
+              <TbFlipVertical size={15} />
+            </SegmentButton>
+          </Segmented>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Four arrows in one row - the same 1px (10px with Shift) steps as the canvas's arrow keys.
+function NudgeBar({ onNudge }: { onNudge: (dx: number, dy: number) => void }) {
+  const steps: [string, string, (big: boolean) => [number, number]][] = [
+    ["←", "left", (b) => [b ? -10 : -1, 0]],
+    ["↑", "up", (b) => [0, b ? -10 : -1]],
+    ["↓", "down", (b) => [0, b ? 10 : 1]],
+    ["→", "right", (b) => [b ? 10 : 1, 0]],
+  ];
+  return (
+    <Segmented>
+      {steps.map(([glyph, name, delta]) => (
+        <SegmentButton
+          key={name}
+          active={false}
+          onClick={(e) => {
+            const [dx, dy] = delta(e.shiftKey);
+            onNudge(dx, dy);
+          }}
+          title={`Nudge ${name} (Shift for 10px)`}
+        >
+          {glyph}
+        </SegmentButton>
+      ))}
+    </Segmented>
+  );
+}
+
+// One bordered tile per layering/grouping action, icon over label - reads as a toolbar rather than
+// a stack of form buttons.
+function LayerTile({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      className="flex-1 min-w-0 h-12 flex flex-col items-center justify-center gap-0.5 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-gray-600 dark:text-neutral-300 hover:border-blue-300 hover:text-blue-600 dark:hover:text-blue-300 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 active:scale-[0.97] transition"
+    >
+      {icon}
+      <span className="text-[10px] font-medium">{label}</span>
+    </button>
+  );
+}
+
+// Thin rule + spacing between the panel's three groups (Arrange, Style, Text), so a long scroll
+// still reads as three distinct blocks.
+function GroupDivider() {
+  return <div className="h-px -mx-3 bg-gray-100 dark:bg-neutral-800" />;
+}
+
+const FOOTER_BUTTON_CLASS =
+  "h-7 w-7 flex items-center justify-center rounded-md text-gray-500 dark:text-neutral-400 hover:bg-gray-100 dark:hover:bg-neutral-800 hover:text-gray-800 dark:hover:text-neutral-100 transition";
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -1407,72 +1533,87 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
 
   if (selectedNodes.length === 0 && selectedEdges.length === 0) return null;
 
+  // Freehand ink and the lattice widget carry no text, so the Text group only shows when some
+  // selected shape can show text.
+  const hasText = selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge");
+
   return (
     <div className="absolute top-3 right-3 bottom-3 w-72 bg-white/90 dark:bg-neutral-900/90 backdrop-blur-xl border border-gray-200/80 dark:border-neutral-700/80 rounded-xl shadow-xl shadow-black/5 flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200">
       {/* Sticky header - a long panel scrolls well past its own top, and without this there's no
           persistent indication of WHAT the controls below are acting on. */}
-      <div className="shrink-0 px-3 py-2.5 border-b border-gray-100 dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/70">
-        <p className="text-xs font-semibold tracking-tight">
-          {selectedNodes.length > 1
-            ? `${selectedNodes.length} shapes selected`
-            : selectedNodes.length === 1
-              ? shapeLabel(selectedNodes[0].shapeType)
-              : selectedEdges.length > 1
-                ? `${selectedEdges.length} connectors`
-                : "Connector"}
-        </p>
+      <div className="shrink-0 border-b border-gray-100 dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/70">
+        <div className="px-3 pt-2.5 pb-2 flex items-baseline gap-2">
+          <p className="text-xs font-semibold tracking-tight truncate">
+            {selectedNodes.length > 1
+              ? `${selectedNodes.length} shapes selected`
+              : selectedNodes.length === 1
+                ? shapeLabel(selectedNodes[0].shapeType)
+                : selectedEdges.length > 1
+                  ? `${selectedEdges.length} connectors`
+                  : "Connector"}
+          </p>
+          {selectedNodes.length === 1 && (
+            <span className="ml-auto shrink-0 text-[10px] tabular-nums text-gray-400 dark:text-neutral-500">
+              {Math.round(selectedNodes[0].width)} × {Math.round(selectedNodes[0].height)}
+            </span>
+          )}
+        </div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto px-3 py-3 flex flex-col gap-4">
       {selectedNodes.length > 0 && (
         <>
-          <Section title="Position" dense>
-          {selectedNodes.length === 1 && (
-            <>
-              <Field label="X">
-                <ClampedNumberField
-                  key={selectedNodes[0].id}
-                  initialValue={Math.round(selectedNodes[0].x)}
-                  min={-100000}
-                  max={100000}
-                  onCommit={(n) => updateNodes({ x: n })}
-                  className={NUMBER_INPUT_CLASS}
-                />
-              </Field>
-              <Field label="Y">
-                <ClampedNumberField
-                  key={selectedNodes[0].id}
-                  initialValue={Math.round(selectedNodes[0].y)}
-                  min={-100000}
-                  max={100000}
-                  onCommit={(n) => updateNodes({ y: n })}
-                  className={NUMBER_INPUT_CLASS}
-                />
-              </Field>
-            </>
-          )}
-          <Field label="Nudge">
-            <NudgeGrid onNudge={nudgeSelected} />
-          </Field>
-
-          {selectedNodes.length > 1 && <FigureLayoutFields nodes={selectedNodes} onBatchEditNodes={onBatchEditNodes} />}
+          <Section title="Arrange" dense>
+            <TransformBlock nodes={selectedNodes} onCommit={updateNodes} />
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-gray-600 dark:text-neutral-300">Nudge</span>
+              <NudgeBar onNudge={nudgeSelected} />
+            </div>
+            <div className="flex gap-1.5 pt-0.5">
+              <LayerTile icon={<TbStackFront size={16} />} label="Front" onClick={onBringToFront} />
+              <LayerTile icon={<TbStackBack size={16} />} label="Back" onClick={onSendToBack} />
+              {selectedNodes.length >= 2 && <LayerTile icon={<TbComponents size={16} />} label="Group" onClick={onGroup} />}
+              {selectedNodes.some((n) => n.groupId) && <LayerTile icon={<TbComponentsOff size={16} />} label="Ungroup" onClick={onUngroup} />}
+            </div>
           </Section>
 
+          {selectedNodes.length > 1 && (
+            <Section title="Layout" dense>
+              <FigureLayoutFields nodes={selectedNodes} onBatchEditNodes={onBatchEditNodes} />
+            </Section>
+          )}
+          <GroupDivider />
+        </>
+      )}
+
+      {selectedNodes.length > 0 && (
+        <>
           <Section title="Appearance" dense>
           {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
-            <Field label="Fill">
-              <input
-                type="color"
-                value={selectedNodes[0].fillColor ?? "#ffffff"}
-                onChange={(e) => updateNodes({ fillColor: e.target.value })}
-                className={SWATCH_CLASS}
+            <>
+              <ColorField label="Fill" value={selectedNodes[0].fillColor ?? "#ffffff"} onChange={(fillColor) => updateNodes({ fillColor })} />
+              {/* Fades only the interior - outline and text stay solid - so a shape can sit over the
+                  image or plot it annotates without hiding it. Shown as transparency (0% = solid)
+                  because "make it see-through" is the intent; stored as fillOpacity. */}
+              <SliderField
+                label="Transparency (%)"
+                resetKey={`fo-${selectedNodes.map((n) => n.id).join(",")}`}
+                value={Math.round((1 - (selectedNodes[0].fillOpacity ?? 1)) * 100)}
+                min={0}
+                max={100}
+                step={1}
+                onCommit={(n) => updateNodes({ fillOpacity: n <= 0 ? undefined : 1 - n / 100, fillColor: selectedNodes[0].fillColor ?? "#ffffff" })}
+                onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillOpacity: 1 - n / 100, fillColor: selectedNodes[0].fillColor ?? "#ffffff" })}
+                title="0% is a solid fill, 100% fully see-through - the outline and text are unaffected"
               />
-            </Field>
+            </>
           )}
           {selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
             <>
-              <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink color" : "Stroke color"}>
-                <input type="color" value={selectedNodes[0].strokeColor} onChange={(e) => updateNodes({ strokeColor: e.target.value })} className={SWATCH_CLASS} />
-              </Field>
+              <ColorField
+                label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink color" : "Stroke color"}
+                value={selectedNodes[0].strokeColor}
+                onChange={(strokeColor) => updateNodes({ strokeColor })}
+              />
               {/* The slider's top end scales with the shape itself. A fixed max of 12 is right for a
                   flowchart box, but meaningless on a 3000px-wide imported screenshot, where a 12px
                   ring is a hairline - the control looked like it was doing nothing. Quarter of the
@@ -1500,47 +1641,6 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               })()}
             </>
           )}
-          <Field label="Rotation (°)">
-            <ClampedNumberField
-              key={selectedNodes.map((n) => n.id).join(",")}
-              initialValue={selectedNodes[0].rotation ?? 0}
-              min={0}
-              max={360}
-              // 360 is visually identical to 0 (no rotation) - normalize both to "unset" rather than
-              // clamping a typed 360 down to 359, which read as an arbitrary, unexplained cap.
-              onCommit={(n) => updateNodes({ rotation: n === 0 || n === 360 ? undefined : n })}
-              className={NUMBER_INPUT_CLASS}
-            />
-          </Field>
-          <Field label="Locked">
-            <input
-              type="checkbox"
-              checked={selectedNodes.every((n) => n.locked ?? false)}
-              onChange={(e) => updateNodes({ locked: e.target.checked })}
-              className={CHECKBOX_CLASS}
-              title="Prevents dragging, resizing, rotating, or nudging this shape until unlocked again - handy while manually plotting onto a graph, or annotating around a shape you don't want to bump"
-            />
-          </Field>
-          <Field label="Flip">
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => updateNodes({ flipHorizontal: !(selectedNodes[0].flipHorizontal ?? false) })}
-                title="Flip horizontal"
-                className={`p-1.5 rounded ${selectedNodes[0].flipHorizontal ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-              >
-                <TbFlipHorizontal size={16} />
-              </button>
-              <button
-                type="button"
-                onClick={() => updateNodes({ flipVertical: !(selectedNodes[0].flipVertical ?? false) })}
-                title="Flip vertical"
-                className={`p-1.5 rounded ${selectedNodes[0].flipVertical ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-              >
-                <TbFlipVertical size={16} />
-              </button>
-            </div>
-          </Field>
           {/* An image only uses cornerRadius when its mask is "rounded" - showing the slider for a
               rect/ellipse-masked image would be a control with no visible effect. */}
           {selectedNodes.every(
@@ -2416,8 +2516,13 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           )}
 
           </Section>
+        </>
+      )}
 
-          {selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge") && (
+      {selectedNodes.length > 0 && hasText && (
+        <>
+          <GroupDivider />
+          {hasText && (
             <Section title="Text" dense>
               {/* Font family/Bold/Italic/Underline are meaningless for "equation" - KaTeX typesets
                   with its own math font regardless, so these controls would sit there doing nothing
@@ -2448,109 +2553,64 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   className={NUMBER_INPUT_CLASS}
                 />
               </Field>
-              <Field label="Font color">
-                <input type="color" value={selectedNodes[0].fontColor} onChange={(e) => updateNodes({ fontColor: e.target.value })} className={SWATCH_CLASS} />
-              </Field>
+              <ColorField label="Font color" value={selectedNodes[0].fontColor} onChange={(fontColor) => updateNodes({ fontColor })} />
               {selectedNodes.every((n) => n.shapeType !== "equation") && (
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-600 dark:text-neutral-300">Style</span>
-                  <div className="flex gap-1">
-                    <button
-                      type="button"
+                <Field label="Style">
+                  <Segmented>
+                    <SegmentButton
+                      active={selectedNodes[0].fontWeight === "bold"}
                       onClick={() => updateNodes({ fontWeight: selectedNodes[0].fontWeight === "bold" ? "normal" : "bold" })}
-                      className={`px-2 py-1 rounded font-bold text-xs ${selectedNodes[0].fontWeight === "bold" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
+                      title="Bold"
                     >
-                      B
-                    </button>
-                    <button
-                      type="button"
+                      <span className="font-bold">B</span>
+                    </SegmentButton>
+                    <SegmentButton
+                      active={selectedNodes[0].fontStyle === "italic"}
                       onClick={() => updateNodes({ fontStyle: selectedNodes[0].fontStyle === "italic" ? "normal" : "italic" })}
-                      className={`p-1.5 rounded ${selectedNodes[0].fontStyle === "italic" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
+                      title="Italic"
                     >
                       <TbItalic size={14} />
-                    </button>
-                    <button
-                      type="button"
+                    </SegmentButton>
+                    <SegmentButton
+                      active={selectedNodes[0].textDecoration === "underline"}
                       onClick={() => updateNodes({ textDecoration: selectedNodes[0].textDecoration === "underline" ? "none" : "underline" })}
-                      className={`p-1.5 rounded ${selectedNodes[0].textDecoration === "underline" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
+                      title="Underline"
                     >
                       <TbUnderline size={14} />
-                    </button>
-                  </div>
-                </div>
+                    </SegmentButton>
+                  </Segmented>
+                </Field>
               )}
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-gray-600 dark:text-neutral-300">Align</span>
-                <div className="flex gap-1">
+              <Field label="Align">
+                <Segmented>
                   {(["left", "center", "right"] as const).map((align) => (
-                    <button
-                      key={align}
-                      type="button"
-                      onClick={() => updateNodes({ textAlign: align })}
-                      className={`p-1.5 rounded ${selectedNodes[0].textAlign === align ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                    >
+                    <SegmentButton key={align} active={selectedNodes[0].textAlign === align} onClick={() => updateNodes({ textAlign: align })} title={`Align ${align}`}>
                       {align === "left" ? <TbLayoutAlignLeft size={14} /> : align === "center" ? <TbLayoutAlignCenter size={14} /> : <TbLayoutAlignRight size={14} />}
-                    </button>
+                    </SegmentButton>
                   ))}
+                </Segmented>
+              </Field>
+              <Field label="Vertical">
+                <Segmented>
                   {(["top", "middle", "bottom"] as const).map((align) => (
-                    <button
-                      key={align}
-                      type="button"
-                      onClick={() => updateNodes({ verticalAlign: align })}
-                      className={`p-1.5 rounded ${selectedNodes[0].verticalAlign === align ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                    >
+                    <SegmentButton key={align} active={selectedNodes[0].verticalAlign === align} onClick={() => updateNodes({ verticalAlign: align })} title={`Align ${align}`}>
                       {align === "top" ? <TbLayoutAlignTop size={14} /> : align === "middle" ? <TbLayoutAlignMiddle size={14} /> : <TbLayoutAlignBottom size={14} />}
-                    </button>
+                    </SegmentButton>
                   ))}
-                </div>
-              </div>
+                </Segmented>
+              </Field>
             </Section>
           )}
-
-          <div className="border-t border-gray-100 dark:border-neutral-800 pt-3 flex items-center gap-1">
-            <button type="button" onClick={onBringToFront} title="Bring to front" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-              <TbStackFront size={16} />
-            </button>
-            <button type="button" onClick={onSendToBack} title="Send to back" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-              <TbStackBack size={16} />
-            </button>
-            {selectedNodes.length >= 2 && (
-              <button type="button" onClick={onGroup} title="Group" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-                <TbComponents size={16} />
-              </button>
-            )}
-            {selectedNodes.some((n) => n.groupId) && (
-              <button type="button" onClick={onUngroup} title="Ungroup" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-                <TbComponentsOff size={16} />
-              </button>
-            )}
-            {selectedNodes.length === 1 && (
-              <button type="button" onClick={() => onDuplicateNode(selectedNodes[0])} title="Duplicate" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-                <IoCopyOutline size={16} />
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => selectedNodes.forEach((n) => onDeleteNode(n))}
-              title="Delete"
-              className="p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 text-red-600 dark:text-red-400 ml-auto"
-            >
-              <IoTrashOutline size={16} />
-            </button>
-          </div>
         </>
       )}
 
       {edge && (
         <>
-          <p className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-neutral-500">Connector</p>
           <Field label="Nudge">
-            <NudgeGrid onNudge={(dx, dy) => updateEdge(nudgeEdgeBy(edge, dx, dy))} />
+            <NudgeBar onNudge={(dx, dy) => updateEdge(nudgeEdgeBy(edge, dx, dy))} />
           </Field>
           {!edge.source.nodeId && !edge.target.nodeId && <EdgeRotateField key={edge.id} edge={edge} onCommit={updateEdge} />}
-          <Field label="Color">
-            <input type="color" value={edge.strokeColor} onChange={(e) => updateEdge({ strokeColor: e.target.value })} className={SWATCH_CLASS} />
-          </Field>
+          <ColorField label="Color" value={edge.strokeColor} onChange={(strokeColor) => updateEdge({ strokeColor })} />
           {/* No live preview here: previewNodes only replaces NODES, and an edge's width isn't part
               of that channel. The thumb still tracks the drag, and the width commits on release. */}
           <SliderField label="Width" resetKey={edge.id} value={edge.strokeWidth} min={0.5} max={40} sliderMax={12} step={0.5} onCommit={(n) => updateEdge({ strokeWidth: n })} />
@@ -2631,24 +2691,55 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               ))}
             </select>
           </Field>
-          <input
-            type="text"
-            value={edge.label}
-            placeholder="Label"
-            onChange={(e) => updateEdge({ label: e.target.value })}
-            className={`w-full ${TEXT_INPUT_CLASS}`}
-          />
-          <button
-            type="button"
-            onClick={() => onDeleteEdge(edge)}
-            title="Delete"
-            className="self-start p-1.5 rounded-md hover:bg-red-50 dark:hover:bg-red-500/10 text-red-600 dark:text-red-400 transition"
-          >
-            <IoTrashOutline size={16} />
-          </button>
+          <Section title="Label" dense>
+            <input
+              type="text"
+              value={edge.label}
+              placeholder="Text shown on the line"
+              onChange={(e) => updateEdge({ label: e.target.value })}
+              className={`w-full ${TEXT_INPUT_CLASS} !w-full`}
+            />
+          </Section>
         </>
       )}
       </div>
+
+      {/* Pinned rather than at the end of the scroll, as in the Mindmap inspector: lock, duplicate and
+          delete are the actions reached for most, and on a chart's long Style tab they used to be a
+          scroll away. */}
+      {(selectedNodes.length > 0 || edge) && (
+        <div className="shrink-0 flex items-center gap-1 px-3 py-2 border-t border-gray-100 dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/70">
+          {selectedNodes.length > 0 && (
+            <label
+              className="flex items-center gap-1.5 text-[11px] text-gray-600 dark:text-neutral-300 cursor-pointer select-none"
+              title="Prevents dragging, resizing, rotating, or nudging this shape until unlocked again - handy while manually plotting onto a graph, or annotating around a shape you don't want to bump"
+            >
+              <input
+                type="checkbox"
+                checked={selectedNodes.every((n) => n.locked ?? false)}
+                onChange={(e) => updateNodes({ locked: e.target.checked })}
+                className={CHECKBOX_CLASS}
+              />
+              Locked
+            </label>
+          )}
+          <div className="ml-auto flex items-center gap-0.5">
+            {selectedNodes.length === 1 && (
+              <button type="button" onClick={() => onDuplicateNode(selectedNodes[0])} title="Duplicate" className={FOOTER_BUTTON_CLASS}>
+                <IoCopyOutline size={15} />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => (selectedNodes.length > 0 ? selectedNodes.forEach((n) => onDeleteNode(n)) : edge && onDeleteEdge(edge))}
+              title="Delete"
+              className={`${FOOTER_BUTTON_CLASS} !text-red-600 dark:!text-red-400 hover:!bg-red-50 dark:hover:!bg-red-500/10`}
+            >
+              <IoTrashOutline size={15} />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

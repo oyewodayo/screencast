@@ -119,6 +119,21 @@
         "focus": false
       },
       {
+        "label": "countdown-overlay",
+        "title": "Countdown",
+        "url": "/countdown",
+        "width": 220,
+        "height": 220,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "visible": false,
+        "focus": false
+      },
+      {
         "label": "presentation",
         "title": "Briefcast Live Display",
         "url": "/presentation",

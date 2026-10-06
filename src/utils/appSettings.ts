@@ -51,6 +51,14 @@ export interface AppSettings {
   // it can be hidden right before presenting/recording a screen that includes this app's own
   // window, without those controls ending up baked into the video.
   showRecordingPanelButtons: boolean;
+  // The "Recording started - saved to <path>" toast (plus its shortcut hints). Off by default: the
+  // overlay and the bottom-bar timer already say a recording is running, and the path is shown by
+  // the completion window when it's actually there to open.
+  notifyOnRecordingStart: boolean;
+  // A "3, 2, 1" shown in the middle of the screen between pressing Record and capture starting - time
+  // to switch to the window being recorded and get ready. See utils/recordingCountdown.ts.
+  recordingCountdownEnabled: boolean;
+  recordingCountdownSeconds: number;
   defaultAudioDevice: string;
   defaultVideoDevices: string[];
   defaultIncludeSystemAudio: boolean;
@@ -104,6 +112,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // primary way to start a recording now; the full panel is an opt-in for anyone who wants it.
   showRecordingDocker: false,
   showRecordingPanelButtons: true,
+  notifyOnRecordingStart: false,
+  recordingCountdownEnabled: false,
+  recordingCountdownSeconds: 3,
   defaultAudioDevice: "",
   defaultVideoDevices: [],
   defaultIncludeSystemAudio: false,

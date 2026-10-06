@@ -14,6 +14,7 @@ const ScreenshotOverlayWindow = lazy(() => import("./components/ScreenshotOverla
 const AnnotationOverlayWindow = lazy(() => import("./components/AnnotationOverlayWindow"));
 const PresentationWindow = lazy(() => import("./components/PresentationWindow"));
 const SnipOverlay = lazy(() => import("./components/SnipOverlay"));
+const CountdownOverlay = lazy(() => import("./components/CountdownOverlay"));
 import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
 
 // WebView2 (like any Chromium-based browser) reloads the whole page on Ctrl+R/Cmd+R/F5 by
@@ -60,6 +61,7 @@ function App() {
             <Route path="/annotation-overlay" element={<AnnotationOverlayWindow />} />
             <Route path="/presentation" element={<PresentationWindow />} />
             <Route path="/snip" element={<SnipOverlay />} />
+            <Route path="/countdown" element={<CountdownOverlay />} />
             {/* <Route path="/file-modal" element={<FileModal />} /> */}
             {/* <Route path="/settings" element={} /> */}
           </Routes>

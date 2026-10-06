@@ -482,6 +482,45 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   the video.
                 </p>
 
+                <Field label="Notify when a recording starts">
+                  <input
+                    type="checkbox"
+                    checked={settings.notifyOnRecordingStart}
+                    onChange={(e) => update("notifyOnRecordingStart", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Shows where the file will be saved and the recording shortcuts each time you start.
+                </p>
+
+                <Field label="Countdown before recording">
+                  <div className="flex items-center gap-2">
+                    <select
+                      className={`${fieldInputClass} w-20`}
+                      value={settings.recordingCountdownSeconds}
+                      disabled={!settings.recordingCountdownEnabled}
+                      onChange={(e) => update("recordingCountdownSeconds", Number(e.target.value))}
+                    >
+                      {[3, 5, 10].map((s) => (
+                        <option key={s} value={s}>
+                          {s} sec
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="checkbox"
+                      checked={settings.recordingCountdownEnabled}
+                      onChange={(e) => update("recordingCountdownEnabled", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer"
+                    />
+                  </div>
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Counts down in the middle of the screen before capture starts, so you can get ready. Click the
+                  countdown, or press Record again, to cancel.
+                </p>
+
                 <Field label="Recording type">
                   <select className={fieldInputClass} value={settings.defaultRecordType} onChange={(e) => handleRecordTypeChange(e.target.value)}>
                     {RECORD_TYPE_OPTIONS.map((o) => (
