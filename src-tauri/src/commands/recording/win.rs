@@ -400,6 +400,13 @@ async fn start_recording_process(
 
     if let (Some((fps, latency)), Some(stderr), Some(parts)) = (frame_timing, child.stderr.take(), assembly.as_mut()) {
         parts.timing = Some(super::assembly::spawn_frame_timing(stderr, fps, latency));
+        parts.command = Some(super::assembly::CaptureCommand {
+            ffmpeg_path: ffmpeg_path.to_path_buf(),
+            args: args.to_vec(),
+            progress_path: progress_sidecar.clone(),
+            framerate: fps,
+            latency_hns: latency,
+        });
     }
     drop(assembly);
 
@@ -427,6 +434,30 @@ async fn start_recording_process(
     );
 
     Ok(())
+}
+
+// Starts a capture again from the command it was first started with, writing to `video_path`
+// instead of the original intermediate - for the watchdog, when the first one died mid-recording
+// (see capture_watchdog.rs). Spawned exactly as start_recording_process does.
+pub(crate) fn respawn_capture(
+    command: &super::assembly::CaptureCommand,
+    original: &std::path::Path,
+    video_path: &std::path::Path,
+) -> Result<(std::process::Child, std::sync::Arc<std::sync::Mutex<super::assembly::FrameTiming>>), String> {
+    let (original, video_path) = (path_to_str(original)?, path_to_str(video_path)?);
+    let args: Vec<&str> = command
+        .args
+        .iter()
+        .map(|a| if a == original { video_path } else { a.as_str() })
+        .collect();
+    let mut cmd = silent_command(&command.ffmpeg_path);
+    cmd.args(&args).stderr(Stdio::piped());
+    crate::services::orphan_guard::before_spawn(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to restart the capture: {}", e))?;
+    crate::services::orphan_guard::after_spawn(&child);
+    let stderr = child.stderr.take().ok_or("The restarted capture has no output to time")?;
+    let timing = super::assembly::spawn_frame_timing(stderr, command.framerate, command.latency_hns);
+    Ok((child, timing))
 }
 
 // Starts the separately recorded webcam's own ffmpeg (see assembly::CameraSidecar), into the temp

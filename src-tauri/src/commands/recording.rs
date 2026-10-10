@@ -28,6 +28,8 @@ use crate::services::utility::{get_ffmpeg_path, path_to_str};
 #[cfg(target_os = "windows")]
 mod assembly;
 #[cfg(target_os = "windows")]
+mod capture_watchdog;
+#[cfg(target_os = "windows")]
 mod gpu_capture;
 #[cfg(target_os = "windows")]
 mod win;
@@ -1783,6 +1785,8 @@ pub async fn start_recording(
             *state.assembly.lock().await = Some(assembly::Assembly {
                 video_path,
                 timing: None,
+                command: None,
+                restarts: Vec::new(),
                 video_has_audio: wants_mic && mic.is_none(),
                 mic,
                 system,
@@ -1867,6 +1871,8 @@ pub async fn start_recording(
     #[cfg(target_os = "windows")]
     if let Some(parts) = assembly_state.lock().await.as_mut() {
         parts.timer_zero_hns = Some(crate::services::audio_capture::now_hns());
+        // From here on a capture that dies is restarted rather than silently ending the picture.
+        capture_watchdog::watch(app_handle.clone(), parts.video_path.clone());
     }
 
     *state.clock.lock().unwrap_or_else(|p| p.into_inner()) = Some(RecordingClock {
@@ -1897,6 +1903,7 @@ async fn finish_assembly(
         .ok()
         .filter(|p| p.exists())
         .map(|p| enhance::escape_filter_path(&p));
+    let ffprobe_path = crate::services::utility::get_ffprobe_path(app_handle).ok();
     let output_path = output_path.to_path_buf();
     crate::services::responsiveness::blocking(move || {
         let stop = |capture: Option<crate::services::audio_capture::AudioCapture>, what: &str| {
@@ -1915,6 +1922,9 @@ async fn finish_assembly(
             })
         };
         let mut parts = parts;
+        // Every intermediate the capture wrote - more than one when it died mid-recording and was
+        // restarted (see recording/capture_watchdog.rs).
+        let video_parts = parts.video_parts();
         // The separately recorded webcam: finalized the same way the screen was.
         let mut camera = parts.camera.take();
         if let Some(process) = camera.as_mut().and_then(|c| c.process.take()) {
@@ -1931,15 +1941,30 @@ async fn finish_assembly(
         let mic = stop(parts.mic, "Microphone");
         let system = stop(parts.system, "System-audio");
 
-        let timing = parts.timing.as_ref().map(|t| t.lock().unwrap_or_else(|p| p.into_inner()));
-        let Some(segments) = timing.as_ref().and_then(|t| t.segments(&parts.pauses)) else {
-            if let Some(t) = &timing {
-                warn!("ffmpeg's last output:
-{}", t.diagnostics());
+        // A part that never got a frame holds nothing.
+        let mut captured = Vec::new();
+        for (path, timing) in &video_parts {
+            match timing {
+                Some(t) if t.lock().unwrap_or_else(|p| p.into_inner()).frames() > 0 => captured.push((path.clone(), t.clone())),
+                _ => {}
             }
-            return Err("Recording failed: no video frames were captured. The selected screen may be unavailable.".to_string());
-        };
-        drop(timing);
+        }
+        let (video_input, segments) = match captured.as_slice() {
+            [] => None,
+            [(path, timing)] => timing
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .segments(&parts.pauses)
+                .map(|s| (path.clone(), s)),
+            many => join_video_parts(&ffmpeg_path, ffprobe_path.as_deref(), many, &parts.video_path, &parts.pauses),
+        }
+        .ok_or_else(|| {
+            if let Some((_, Some(t))) = video_parts.last() {
+                warn!("ffmpeg's last output:
+{}", t.lock().unwrap_or_else(|p| p.into_inner()).diagnostics());
+            }
+            "Recording failed: no video frames were captured. The selected screen may be unavailable.".to_string()
+        })?;
         let timer_lead = parts
             .timer_zero_hns
             .map(|z| (z - segments.start_hns()) as f64 / 1e7)
@@ -2001,7 +2026,7 @@ async fn finish_assembly(
         }) };
 
         let full = assembly::Parts {
-            video_path: parts.video_path.clone(),
+            video_path: video_input,
             segments: segments.clone(),
             mic,
             system,
@@ -2042,11 +2067,69 @@ async fn finish_assembly(
             }
         }
         if !keep_parts {
-            let _ = fs::remove_file(&parts.video_path);
+            for (path, _) in &video_parts {
+                let _ = fs::remove_file(path);
+                let _ = fs::remove_file(path.with_extension("norm.mkv"));
+            }
+            let _ = fs::remove_file(parts.video_path.with_extension("ffconcat"));
         }
         Ok((segments, timer_lead))
     })
     .await?
+}
+
+// The input for assembling a capture restarted mid-recording: its parts joined into one stream on
+// the first part's clock by an ffconcat list beside `video_path`, and the timeline they make
+// together. Parts that don't match (the display mode changed in between, say) can't be
+// stream-copied into one, so then each is first re-encoded to the first one's size.
+#[cfg(target_os = "windows")]
+fn join_video_parts(
+    ffmpeg_path: &Path,
+    ffprobe_path: Option<&Path>,
+    parts: &[(PathBuf, Arc<std::sync::Mutex<assembly::FrameTiming>>)],
+    video_path: &Path,
+    pauses: &[(i64, i64)],
+) -> Option<(PathBuf, assembly::Segments)> {
+    let guards: Vec<_> = parts.iter().map(|(_, t)| t.lock().unwrap_or_else(|p| p.into_inner())).collect();
+    let timings: Vec<&assembly::FrameTiming> = guards.iter().map(|g| &**g).collect();
+    let (merged, shifts) = assembly::merge_timings(&timings)?;
+    let segments = merged.segments(pauses)?;
+    drop(guards);
+
+    let params: Vec<Option<String>> = match ffprobe_path {
+        Some(probe) => parts.iter().map(|(p, _)| assembly::probe_video_params(probe, p)).collect(),
+        None => vec![None; parts.len()],
+    };
+    let matching = params.iter().all(|p| p.is_some() && *p == params[0]);
+    let mut paths: Vec<PathBuf> = parts.iter().map(|(p, _)| p.clone()).collect();
+    if !matching {
+        let size = params[0].as_deref().and_then(assembly::probed_size)?;
+        warn!("The restarted capture's parts differ ({:?}), re-encoding them to {:?} to join them", params, size);
+        for path in paths.iter_mut() {
+            let normalized = path.with_extension("norm.mkv");
+            let args = assembly::normalize_part_args(path, &normalized, size).ok()?;
+            let mut cmd = Command::new(ffmpeg_path);
+            cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+            hide_console_window(&mut cmd);
+            match cmd.output() {
+                Ok(out) if out.status.success() => *path = normalized,
+                Ok(out) => {
+                    warn!("Re-encoding {:?} failed: {}", path, extract_ffmpeg_error(&String::from_utf8_lossy(&out.stderr)));
+                    return None;
+                }
+                Err(e) => {
+                    warn!("Re-encoding {:?} failed: {}", path, e);
+                    return None;
+                }
+            }
+        }
+    }
+
+    let list_path = video_path.with_extension("ffconcat");
+    let list: Vec<(PathBuf, f64)> = paths.into_iter().zip(shifts).collect();
+    fs::write(&list_path, assembly::concat_list(&list)).ok()?;
+    info!("Joining {} capture parts: {:?}", list.len(), list);
+    Some((list_path, segments))
 }
 
 // Writes the separately recorded webcam's `<stem>_webcam.mp4`, re-timed onto the final recording
@@ -2244,7 +2327,7 @@ pub async fn stop_recording(
         .lock()
         .await
         .as_ref()
-        .map(|a| a.video_path.clone())
+        .map(|a| a.current_video_path().to_path_buf())
         .unwrap_or_else(|| output_path.clone());
     #[cfg(not(target_os = "windows"))]
     let capture_path = output_path.clone();

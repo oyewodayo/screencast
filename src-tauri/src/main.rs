@@ -256,10 +256,13 @@ fn main() {
     // terminal never blocks - see NonBlockingStdout for why.
     let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = Vec::new();
     if let Some(log_file) = log_file {
-        // Everything while developing; INFO and up for users, which still keeps every warning,
-        // error, watchdog stall and recording milestone without per-frame noise.
+        // DEBUG while developing; INFO and up for users, which still keeps every warning,
+        // error, watchdog stall and recording milestone without per-frame noise. Not TRACE even
+        // in development: wasapi alone logs every 10ms audio packet at it, which rotated the
+        // 10MB log in eight minutes - taking the start of any longer recording with it, along
+        // with whatever went wrong there.
         loggers.push(WriteLogger::new(
-            if cfg!(debug_assertions) { LevelFilter::Trace } else { LevelFilter::Info },
+            if cfg!(debug_assertions) { LevelFilter::Debug } else { LevelFilter::Info },
             config.clone(),
             log_file,
         ));

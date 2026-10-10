@@ -46,6 +46,9 @@ pub(crate) struct FrameTiming {
     // caused are cut (see segments); a stall - the system briefly too busy to deliver frames - is
     // kept, holding the last frame, with its audio intact.
     gaps: Vec<(f64, f64)>,
+    // Frames seen so far - what the capture watchdog checks to tell a live capture from a stalled
+    // one (see capture_watchdog.rs).
+    frames: u64,
     // ffmpeg's other output, for diagnosing a failed capture.
     tail: VecDeque<String>,
 }
@@ -70,6 +73,11 @@ impl FrameTiming {
             _ => {}
         }
         self.last_pts = Some(pts);
+        self.frames += 1;
+    }
+
+    pub(crate) fn frames(&self) -> u64 {
+        self.frames
     }
 
     fn other_line(&mut self, line: String) {
@@ -107,6 +115,117 @@ impl FrameTiming {
     pub(crate) fn diagnostics(&self) -> String {
         self.tail.iter().cloned().collect::<Vec<_>>().join("\n")
     }
+}
+
+// The timing of a capture restarted mid-recording (see capture_watchdog.rs), across all its parts:
+// every part moved onto the first one's clock, so the merged timing reads as if one ffmpeg had
+// captured the lot. The stretch between two parts is a gap like any other - kept as a stall, the
+// last picture held and the audio intact, unless a pause covers it. Also returns where each part's
+// pts 0 lands on that clock (seconds), which is what places it in the concat list.
+//
+// Every part must have frames.
+pub(crate) fn merge_timings(parts: &[&FrameTiming]) -> Option<(FrameTiming, Vec<f64>)> {
+    let first = parts.first()?;
+    let base = first.offset_hns?;
+    let mut merged = FrameTiming {
+        frame_secs: first.frame_secs,
+        latency_hns: first.latency_hns,
+        offset_hns: Some(base),
+        ..Default::default()
+    };
+    let mut shifts = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (offset, first_pts, last_pts) = (part.offset_hns?, part.first_pts?, part.last_pts?);
+        let shift = (offset - base) as f64 / 1e7;
+        match merged.last_pts {
+            Some(before) => merged.gaps.push((before, first_pts + shift)),
+            None => merged.first_pts = Some(first_pts + shift),
+        }
+        merged.gaps.extend(part.gaps.iter().map(|(a, b)| (a + shift, b + shift)));
+        merged.last_pts = Some(last_pts + shift);
+        merged.frames += part.frames;
+        shifts.push(shift);
+    }
+    Some((merged, shifts))
+}
+
+// An ffconcat list joining a restarted capture's parts (`(path, shift)` - shift from
+// merge_timings) back into one stream on the first part's clock, for a stream copy. The concat
+// demuxer places each file the summed `duration`s of the files before it later, measured from its
+// `inpoint`, so pinning every inpoint to 0 and giving each file the distance to the next one's
+// start puts every packet at exactly its own pts plus its part's shift.
+pub(crate) fn concat_list(parts: &[(PathBuf, f64)]) -> String {
+    let mut list = String::from("ffconcat version 1.0\n");
+    for (k, (path, shift)) in parts.iter().enumerate() {
+        // Forward slashes, and quotes escaped the way the concat demuxer reads them.
+        let path = path.to_string_lossy().replace('\\', "/").replace('\'', r"'\''");
+        list.push_str(&format!("file '{}'\ninpoint 0\n", path));
+        if let Some((_, next)) = parts.get(k + 1) {
+            list.push_str(&format!("duration {:.6}\n", next - shift));
+        }
+    }
+    list
+}
+
+// A restarted capture's parts can only be stream-copied into one when they match - not after the
+// display mode changed between them, say. This is what has to agree.
+pub(crate) fn probe_video_params(ffprobe_path: &Path, video: &Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(ffprobe_path);
+    cmd.args(["-v", "error", "-select_streams", "v:0", "-show_data_hash", "MD5", "-show_entries"])
+        .arg("stream=codec_name,profile,width,height,pix_fmt,extradata_hash")
+        .args(["-of", "default=nw=1"])
+        .arg(video)
+        .stdin(std::process::Stdio::null());
+    super::hide_console_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !text.is_empty()).then_some(text)
+}
+
+// The width and height in probe_video_params's output.
+pub(crate) fn probed_size(params: &str) -> Option<(i32, i32)> {
+    let field = |key: &str| {
+        params
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('=')?.trim().parse::<i32>().ok())
+    };
+    Some((field("width")?, field("height")?))
+}
+
+// ffmpeg arguments re-encoding one part of a restarted capture to `size`, so mismatched parts can
+// still be joined: letterboxed rather than stretched, every timestamp kept as captured (-copyts,
+// passthrough) since the concat list places the parts by them, and no B-frames for the same reason
+// the capture has none (see Segments::setts_expr).
+pub(crate) fn normalize_part_args(input: &Path, output: &Path, size: (i32, i32)) -> Result<Vec<String>, String> {
+    let path = |p: &Path| crate::services::utility::path_to_str(p).map(|s| s.to_string());
+    let (w, h) = size;
+    Ok(vec![
+        "-y".into(),
+        "-copyts".into(),
+        "-i".into(),
+        path(input)?,
+        "-map".into(),
+        "0:v".into(),
+        "-map".into(),
+        "0:a?".into(),
+        "-vf".into(),
+        format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"),
+        "-fps_mode".into(),
+        "passthrough".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "veryfast".into(),
+        "-crf".into(),
+        "20".into(),
+        "-bf".into(),
+        "0".into(),
+        "-c:a".into(),
+        "copy".into(),
+        "-f".into(),
+        "matroska".into(),
+        path(output)?,
+    ])
 }
 
 // Capture latency of the screen: Desktop Duplication hands over a frame as it's composed, so the
@@ -293,6 +412,11 @@ pub(crate) struct Assembly {
     // The picture-only intermediate ffmpeg writes (see intermediate_paths).
     pub video_path: PathBuf,
     pub timing: Option<Arc<Mutex<FrameTiming>>>,
+    // How the capture was started, so the watchdog can start it again if it dies mid-recording
+    // (see capture_watchdog.rs).
+    pub command: Option<CaptureCommand>,
+    // The intermediates of those restarts, in order, after video_path's.
+    pub restarts: Vec<VideoPart>,
     pub mic: Option<AudioCapture>,
     pub system: Option<AudioCapture>,
     // Whether ffmpeg is capturing the mic itself - only when the app's own capture couldn't open
@@ -310,6 +434,43 @@ pub(crate) struct Assembly {
     pub camera: Option<CameraSidecar>,
     // Whether the audio gets the studio cleanup at assembly (FormData.enhance_audio).
     pub enhance: bool,
+}
+
+impl Assembly {
+    // The intermediate the running ffmpeg is writing.
+    pub(crate) fn current_video_path(&self) -> &Path {
+        self.restarts.last().map_or(&self.video_path, |p| &p.path)
+    }
+
+    pub(crate) fn current_timing(&self) -> Option<&Arc<Mutex<FrameTiming>>> {
+        match self.restarts.last() {
+            Some(p) => Some(&p.timing),
+            None => self.timing.as_ref(),
+        }
+    }
+
+    // Every intermediate the capture wrote, in order, with its timing.
+    pub(crate) fn video_parts(&self) -> Vec<(PathBuf, Option<Arc<Mutex<FrameTiming>>>)> {
+        std::iter::once((self.video_path.clone(), self.timing.clone()))
+            .chain(self.restarts.iter().map(|p| (p.path.clone(), Some(p.timing.clone()))))
+            .collect()
+    }
+}
+
+// The ffmpeg command line a screen capture was started with - its output, the intermediate.
+#[derive(Clone)]
+pub(crate) struct CaptureCommand {
+    pub ffmpeg_path: PathBuf,
+    pub args: Vec<String>,
+    pub progress_path: PathBuf,
+    pub framerate: i32,
+    pub latency_hns: i64,
+}
+
+// One restart's intermediate (see Assembly::restarts).
+pub(crate) struct VideoPart {
+    pub path: PathBuf,
+    pub timing: Arc<Mutex<FrameTiming>>,
 }
 
 // A webcam recorded by its own ffmpeg beside a screen recording (FormData.separate_webcam_capture).
@@ -367,7 +528,12 @@ pub(crate) fn assemble_args(parts: &Parts, output: &Path) -> Result<Vec<String>,
     let ext = output.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_lowercase();
     let path = |p: &Path| crate::services::utility::path_to_str(p).map(|s| s.to_string());
 
-    let mut args = vec!["-y".to_string(), "-i".to_string(), path(&parts.video_path)?];
+    let mut args = vec!["-y".to_string()];
+    // A capture restarted mid-recording comes as a list of its parts (see concat_list).
+    if parts.video_path.extension().is_some_and(|e| e == "ffconcat") {
+        args.extend(["-f", "concat", "-safe", "0"].map(String::from));
+    }
+    args.extend(["-i".to_string(), path(&parts.video_path)?]);
     let mut chains = Vec::new();
     let mut voices = Vec::new();
     let mut input = 1;
@@ -528,6 +694,38 @@ mod tests {
     fn offset_is_the_earliest_arrival() {
         let t = timing(&[(0.0, 2_000_100), (1.0, 12_000_050), (2.0, 22_000_000), (3.0, 32_300_000)]);
         assert_eq!(t.offset_hns, Some(2_000_000));
+    }
+
+    // Two seconds of 60fps capture whose pts 0 was at QPC `at` (hns).
+    fn part(at: i64) -> FrameTiming {
+        let frames: Vec<(f64, i64)> = (0..120).map(|i| (i as f64 / 60.0, at + (i as f64 / 60.0 * 1e7) as i64)).collect();
+        timing(&frames)
+    }
+
+    #[test]
+    fn a_restarted_capture_reads_as_one_with_its_outage_held() {
+        // Died after 2s; the restart's first frame came 5s after the first part's.
+        let (a, b) = (part(100_000_000), part(150_000_000));
+        let (merged, shifts) = merge_timings(&[&a, &b]).unwrap();
+        assert_eq!(shifts, vec![0.0, 5.0]);
+        assert_eq!(merged.frames(), 240);
+        // The outage isn't a pause, so nothing is cut: 7s of picture, audio unbroken under it.
+        let s = merged.segments(&[]).unwrap();
+        assert_eq!(s.kept.len(), 1);
+        assert!((s.duration() - 7.0).abs() < 1e-6, "{:?}", s);
+        assert!((s.output_time(160_000_000).unwrap() - 6.0).abs() < 1e-6);
+        // A pause across the outage cuts it like any other.
+        let s = merged.segments(&[(125_000_000, 140_000_000)]).unwrap();
+        assert_eq!(s.kept.len(), 2);
+    }
+
+    #[test]
+    fn the_concat_list_places_each_part_at_its_shift() {
+        let list = concat_list(&[(PathBuf::from(r"C:\t\a.video.mkv"), 0.0), (PathBuf::from(r"C:\t\it's.mkv"), 5.25)]);
+        assert_eq!(
+            list,
+            "ffconcat version 1.0\nfile 'C:/t/a.video.mkv'\ninpoint 0\nduration 5.250000\nfile 'C:/t/it'\\''s.mkv'\ninpoint 0\n"
+        );
     }
 
     #[test]
