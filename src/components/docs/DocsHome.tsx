@@ -8,7 +8,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import { IoAdd, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoOpenOutline, IoPin, IoSearch, IoTrashOutline, IoInformationCircleOutline } from "react-icons/io5";
-import { MdFileUpload } from "react-icons/md";
+import { MdFileUpload, MdPictureAsPdf } from "react-icons/md";
 import * as Y from "yjs";
 import { DOC_DRAG_MIME, DocFolder, DocSummary, flattenFolderTree } from "../../utils/docTypes";
 import { getPinnedDocIds, toggleDocPin, forgetDocPin } from "../../utils/docLibraryHistory";
@@ -16,6 +16,7 @@ import { importDocxFile } from "../../utils/docxImport";
 import { extractPlainText } from "../../utils/docYjsText";
 import DocFolderSidebar from "./DocFolderSidebar";
 import FileInfoModal from "../Modals/FileInfoModal";
+import DocPdfImportDialog from "./DocPdfImportDialog";
 
 interface DocsHomeProps {
   onOpenDoc: (id: string) => void;
@@ -33,6 +34,8 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   const [infoItem, setInfoItem] = useState<{ id: string; name: string } | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  // The PDF picked for "Import PDF", while its import dialog is open.
+  const [pdfImport, setPdfImport] = useState<{ path: string; name: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Which card's 3-dot menu is open, if any - and, within that menu, whether "Delete" has already
   // been clicked once (turning it into "Confirm delete?"). Same two-step-confirm-in-menu UX as
@@ -331,6 +334,13 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     }
   }, [onOpenDoc]);
 
+  const handleImportPdf = useCallback(async () => {
+    setError(null);
+    const selected = await openFileDialog({ multiple: false, filters: [{ name: "PDF", extensions: ["pdf"] }] });
+    if (!selected || Array.isArray(selected)) return;
+    setPdfImport({ path: selected, name: selected.split(/[\\/]/).pop() ?? selected });
+  }, []);
+
   const isSearching = searchQuery.trim().length > 0;
   // Search deliberately ignores the selected folder (searches every doc) - folder selection only
   // scopes the plain browse view, so switching into a folder never hides a search result that
@@ -546,6 +556,13 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
         </button>
         <button
           type="button"
+          onClick={() => void handleImportPdf()}
+          className="flex items-center gap-1.5 px-4 py-2 rounded-md border border-gray-300 dark:border-neutral-700 text-gray-700 dark:text-neutral-200 text-sm font-medium hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors"
+        >
+          <MdPictureAsPdf size={16} /> Import PDF
+        </button>
+        <button
+          type="button"
           onClick={() => setShowTrash((v) => !v)}
           className="text-xs text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:underline"
         >
@@ -647,6 +664,17 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
         </div>
       )}
       </div>
+      {pdfImport && (
+        <DocPdfImportDialog
+          path={pdfImport.path}
+          fileName={pdfImport.name}
+          onClose={() => setPdfImport(null)}
+          onOpenDoc={(id) => {
+            setPdfImport(null);
+            onOpenDoc(id);
+          }}
+        />
+      )}
       {infoItem && (
         <FileInfoModal item={{ kind: "doc", id: infoItem.id }} fileName={infoItem.name} onClose={() => setInfoItem(null)} />
       )}

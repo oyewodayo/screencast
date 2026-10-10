@@ -13,13 +13,21 @@ import { useEditor, EditorContent } from "@tiptap/react";
 import katex from "katex";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
-import { IoArrowBack, IoChatbubbleOutline, IoClose, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
+import { IoArrowBack, IoChatbubbleOutline, IoHelpCircleOutline, IoClose, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
 import { MdArrowDropDown, MdDescription, MdFileDownload, MdInsertLink, MdPrint } from "react-icons/md";
-import { TbBooks, TbListTree } from "react-icons/tb";
+import { TbBooks, TbListTree, TbTypography } from "react-icons/tb";
+import DocHelpPanel from "./DocHelpPanel";
+import DocStyleDialog from "./DocStyleDialog";
+import { PAPER_STYLES } from "../../utils/docPaperStyles";
 import { BsFiletypeDocx, BsFiletypeHtml, BsFiletypeMd, BsFiletypePdf, BsFiletypeTxt } from "react-icons/bs";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
 import useDocDictation from "../../hooks/useDocDictation";
 import useBibliography from "../../hooks/useBibliography";
+import useDocFonts from "../../hooks/useDocFonts";
+import useDocLayout from "../../hooks/useDocLayout";
+import { bodyStyleVars, writeLayout } from "../../utils/docLayout";
+import { DEFAULT_NUMBERING } from "../../utils/docNumbering";
+import { addFontFilesToDocument } from "../../utils/docFonts";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
 import { buildDocxBytes } from "../../utils/docDocx";
 import { LibraryFileEntry } from "../../utils/docTypes";
@@ -29,9 +37,8 @@ import DocFindReplace from "../../utils/docFindReplace";
 import DocDictation from "../../utils/docDictationExtension";
 import DocPaint from "../../utils/docPaintExtension";
 import { getDocContentExtensions, docProseClassName } from "../../utils/docSchemaExtensions";
-import { CAPTION_NAMES, computeStructureFromJson, createDocStructureExtension, getDocStructure, type DocStructure } from "../../utils/docStructure";
+import { captionLabel, crossRefText, computeStructureFromJson, createDocStructureExtension, getDocStructure, type DocStructure } from "../../utils/docStructure";
 import { citationSpaceBefore, formatCitation, styleInfo, segmentsToText } from "../../utils/docCitationStyles";
-import { pageAtPos } from "./DocTocView";
 import { CITATION_EDIT_EVENT, CROSSREF_EDIT_EVENT, OPEN_PICKER_EVENT, type InlineEditDetail, type OpenPickerDetail } from "../../utils/docStructureNodes";
 import DocVersionHistoryPanel from "./DocVersionHistoryPanel";
 import DocReferencesSidebar from "./DocReferencesSidebar";
@@ -42,8 +49,8 @@ import DocFindReplaceBar from "./DocFindReplaceBar";
 import DocCommentsSidebar from "./DocCommentsSidebar";
 import DocPageSetupPopover from "./DocPageSetupPopover";
 import DocToolbar, { Dropdown, menuItemClass } from "./DocToolbar";
-import DocAutoPaginate, { getPaginationPageCount } from "../../utils/docAutoPaginate";
-import { PAGE_DIMENSIONS_IN, pageHeightPx, pageWidthPx, resolveMargins } from "../../utils/docPageGeometry";
+import DocAutoPaginate, { columnRowGapPx, getPaginationPageCount, pageAtPos } from "../../utils/docAutoPaginate";
+import { PAGE_DIMENSIONS_IN, PAGE_GAP_PX, pageContentHeightPx, pageHeightPx, pageWidthPx, resolveMargins } from "../../utils/docPageGeometry";
 import { DocHorizontalRuler, DocVerticalRuler, RULER_SIZE, useRulerUnit } from "./DocRuler";
 import "./docCodeHighlight.css";
 import "./docFindReplace.css";
@@ -53,6 +60,8 @@ import "./docLinks.css";
 import "./docDictation.css";
 import "./docPaint.css";
 import "./docStructure.css";
+import "./docFonts.css";
+import "./docLayout.css";
 import "../board/boardFonts.css";
 
 interface DocsEditorProps {
@@ -139,7 +148,9 @@ async function buildStandaloneHtml(title: string, bodyHtml: string, structure: D
   dom.querySelectorAll<HTMLElement>("[data-caption]").forEach((el) => {
     const kind = el.getAttribute("data-caption") === "table" ? "table" : "figure";
     const label = dom.createElement("strong");
-    label.textContent = `${CAPTION_NAMES[kind]} ${++captionCounts[kind]}.`;
+    const numbering = structure?.numbering ?? DEFAULT_NUMBERING;
+    const index = captionCounts[kind]++;
+    label.textContent = `${structure?.captionLabels[kind][index] ?? captionLabel(kind, index + 1, numbering)}${numbering.captionSeparator}`;
     el.prepend(label, "\u00a0 ");
     const id = el.getAttribute("data-caption-id");
     if (id) el.id = id;
@@ -156,7 +167,7 @@ async function buildStandaloneHtml(title: string, bodyHtml: string, structure: D
     }
     const a = dom.createElement("a");
     a.href = `#${id}`;
-    a.textContent = target.label;
+    a.textContent = crossRefText(target, el.getAttribute("data-xref-form") === "number" ? "number" : "label");
     el.replaceChildren(a);
   });
   dom.querySelectorAll<HTMLElement>("[data-cite]").forEach((el) => {
@@ -236,7 +247,8 @@ async function buildStandaloneHtml(title: string, bodyHtml: string, structure: D
     if (display && latex.trim() && el.getAttribute("data-numbered") !== "false") {
       const tag = dom.createElement("span");
       tag.className = "eq-number";
-      tag.textContent = `(${++equationNumber})`;
+      tag.textContent = `(${structure?.equationLabels[equationNumber] ?? equationNumber + 1})`;
+      equationNumber++;
       el.appendChild(tag);
     }
   });
@@ -350,9 +362,14 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const [showFindReplace, setShowFindReplace] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [showReferences, setShowReferences] = useState(false);
+  // The two-column paper guide ("?") shares the right-hand slot with Comments and References.
+  const [showHelp, setShowHelp] = useState(false);
+  const [showStyle, setShowStyle] = useState(false);
   const [showOutline, setShowOutline] = useState(readOutlineVisible);
   const [picker, setPicker] = useState<FloatingPicker | null>(null);
   const bib = useBibliography(store.ydoc);
+  const docFonts = useDocFonts(store.ydoc);
+  const layout = useDocLayout(store.ydoc);
   const toggleOutline = useCallback(() => {
     setShowOutline((v) => {
       try {
@@ -366,11 +383,18 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   // Comments and References share the right-hand slot.
   const toggleComments = useCallback(() => {
     setShowReferences(false);
+    setShowHelp(false);
     setShowComments((v) => !v);
   }, []);
   const toggleReferences = useCallback(() => {
     setShowComments(false);
+    setShowHelp(false);
     setShowReferences((v) => !v);
+  }, []);
+  const toggleHelp = useCallback(() => {
+    setShowComments(false);
+    setShowReferences(false);
+    setShowHelp((v) => !v);
   }, []);
 
   const menuProps = (id: "export" | "pageSetup" | "linkFile") => ({
@@ -503,8 +527,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   // wouldn't notice on its own).
   useEffect(() => {
     if (!editor) return;
-    editor.commands.setPaginationLayout(pageSize, margins);
-  }, [editor, pageSize, margins]);
+    editor.commands.setPaginationLayout(pageSize, margins, layout.columns);
+  }, [editor, pageSize, margins, layout.columns]);
 
   const handleBack = useCallback(() => {
     dictation.stop();
@@ -628,7 +652,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                       caption: ({ node }) => {
                         const kindName = node.attrs.kind === "table" ? "table" : "figure";
                         const n = structure.targets.get(String(node.attrs.id ?? ""))?.number;
-                        return `${CAPTION_NAMES[kindName]}${n ? ` ${n}` : ""}. ${node.textContent}`;
+                        return `${n ? captionLabel(kindName, n, structure.numbering) : ""}${structure.numbering.captionSeparator} ${node.textContent}`;
                       },
                       bibliography: () =>
                         structure.bibliography.map((ref) => `${ref.label ? `${ref.label} ` : ""}${segmentsToText(ref.segments)}`).join("\n"),
@@ -677,6 +701,38 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const statusNotice: Notice | null = dictation.message ? { text: dictation.message } : notice;
   const showRuler = rulerVisible && !store.loading && !store.loadError;
   const pageCount = editor ? getPaginationPageCount(editor.state) : 1;
+  // A ready-made style (docPaperStyles.ts) in one step - also what the guide's button does.
+  const applyPaperStyle = (id: (typeof PAPER_STYLES)[number]["id"]) => {
+    const p = PAPER_STYLES.find((x) => x.id === id);
+    if (!p || !store.ydoc || !bib.store) return;
+    const bibStore = bib.store;
+    store.ydoc.transact(() => {
+      writeLayout(store.ydoc!, { columns: p.columns, columnGap: p.columnGap, body: p.body });
+      bibStore.setNumbering(p.numbering);
+      bibStore.setStyle(p.citationStyle);
+    });
+    void store.setPageSetup({ margins: p.margins });
+  };
+  const twoColumns = layout.columns === 2;
+  // Page card classes and custom properties for the document's body style and columns
+  // (docLayout.css).
+  const cardClass = [layout.body ? "doc-typeset" : "", layout.body?.justify ? "doc-justify" : "", layout.body?.hyphenate ? "doc-hyphenate" : "", twoColumns ? "doc-cols-2" : ""]
+    .filter(Boolean)
+    .join(" ");
+  const cardStyle = {
+    ...bodyStyleVars(layout.body),
+    ...(twoColumns
+      ? {
+          "--doc-col-gap": `${layout.columnGap}in`,
+          "--doc-col-height": `${pageContentHeightPx(pageSize, margins)}px`,
+          "--doc-row-gap": `${columnRowGapPx(margins)}px`,
+          minHeight: pageCount * pageHeightPx(pageSize) + (pageCount - 1) * PAGE_GAP_PX,
+          // A two-column page never narrows with the window (the view scrolls sideways instead):
+          // its columns, page breaks and page count must be exactly the printed ones.
+          minWidth: pageWidthPx(pageSize),
+        }
+      : {}),
+  } as React.CSSProperties;
 
   return (
     <div
@@ -847,6 +903,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         >
           <IoTimeOutline size={20} />
         </button>
+        <button type="button" data-tip="Document style: font, spacing, columns, captions" aria-label="Document style" aria-pressed={showStyle} onClick={() => setShowStyle(true)} className={headerIconClass(showStyle)}>
+          <TbTypography size={20} strokeWidth={1.75} />
+        </button>
         <button type="button" data-tip="References" aria-label="References" aria-pressed={showReferences} onClick={toggleReferences} className={headerIconClass(showReferences)}>
           <TbBooks size={20} strokeWidth={1.75} />
           {bib.entries.length > 0 && (
@@ -854,6 +913,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               {bib.entries.length}
             </span>
           )}
+        </button>
+        <button type="button" data-tip="Guide: writing a two-column paper" aria-label="Help: writing a two-column paper" aria-pressed={showHelp} onClick={toggleHelp} className={headerIconClass(showHelp)}>
+          <IoHelpCircleOutline size={21} />
         </button>
         <button type="button" data-tip="Comments" aria-label="Comments" onClick={toggleComments} className={headerIconClass(showComments)}>
           <IoChatbubbleOutline size={19} />
@@ -917,6 +979,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             footerText={store.footerText}
             margins={store.margins}
             unit={rulerUnit}
+            columns={layout.columns}
+            columnGap={layout.columnGap}
+            onColumnsChange={(columns, columnGap) => store.ydoc && writeLayout(store.ydoc, { columns, columnGap })}
             onApply={(patch) => void store.setPageSetup(patch)}
             onClose={() => setHeaderMenu(null)}
           />
@@ -966,6 +1031,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           rulerVisible={rulerVisible}
           onToggleRuler={toggleRuler}
           onOpenPicker={openPicker}
+          docFonts={docFonts}
+          onAddFont={() => (store.ydoc ? addFontFilesToDocument(docId, store.ydoc) : Promise.resolve([]))}
+          twoColumns={layout.columns === 2}
+          typeset={!!layout.body}
         />
       )}
 
@@ -985,7 +1054,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             // Sticky inside the scroller and exactly as wide as the page card, so ruler positions
             // line up with the page at any window width.
             <div className="sticky top-0 z-20 -mx-4 sm:-mx-8 px-4 sm:px-8 pt-1.5 pb-2 mb-2 bg-[var(--doc-canvas)] print:hidden">
-              <div className="mx-auto" style={{ maxWidth: pageWidthPx(pageSize) }}>
+              <div className="mx-auto" style={{ maxWidth: pageWidthPx(pageSize), minWidth: layout.columns === 2 ? pageWidthPx(pageSize) : undefined }}>
                 <DocHorizontalRuler
                   editor={editor}
                   pageSize={pageSize}
@@ -1022,7 +1091,17 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               <tbody>
                 <tr>
                   <td>
-                    <div ref={pageRef} className="doc-page-card mx-auto bg-white dark:bg-neutral-900 ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0">
+                    <div
+                      ref={pageRef}
+                      lang="en"
+                      style={cardStyle}
+                      className={`doc-page-card ${cardClass} mx-auto bg-white dark:bg-neutral-900 ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
+                    >
+                      {/* Two columns: one drawn sheet per page behind the multicol rows. */}
+                      {twoColumns &&
+                        Array.from({ length: pageCount }, (_, k) => (
+                          <div key={k} className="doc-sheet" aria-hidden style={{ top: k * (pageHeightPx(pageSize) + PAGE_GAP_PX), height: pageHeightPx(pageSize) }} />
+                        ))}
                       <EditorContent editor={editor} className={docProseClassName} />
                     </div>
                   </td>
@@ -1065,6 +1144,14 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             onClose={() => setShowComments(false)}
           />
         )}
+        {editor && showHelp && bib.store && (
+          <DocHelpPanel
+            isJournal={layout.columns === 2 && !!layout.body}
+            onApplyJournal={() => applyPaperStyle("journal")}
+            onOpenStyle={() => setShowStyle(true)}
+            onClose={() => setShowHelp(false)}
+          />
+        )}
         {editor && showReferences && bib.store && (
           <DocReferencesSidebar editor={editor} store={bib.store} entries={bib.entries} style={bib.style} onClose={() => setShowReferences(false)} />
         )}
@@ -1078,6 +1165,18 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             <DocCrossRefPicker editor={editor} mode={picker.mode} onClose={closePicker} />
           )}
         </FloatingPanel>
+      )}
+
+      {showStyle && store.ydoc && bib.store && (
+        <DocStyleDialog
+          ydoc={store.ydoc}
+          layout={layout}
+          bib={bib.store}
+          citationStyle={bib.style}
+          docFonts={docFonts}
+          onMargins={(m) => void store.setPageSetup({ margins: m })}
+          onClose={() => setShowStyle(false)}
+        />
       )}
 
       {showVersionHistory && (

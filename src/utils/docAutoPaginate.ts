@@ -25,13 +25,16 @@ interface PaginationState {
   pageCount: number;
   pageSize: DocPageSize;
   margins: DocMargins;
+  // 2 = two-column page (docLayout.ts): the browser's own multicol layout breaks columns and pages
+  // (see DocsEditor.tsx's column rules), so this plugin draws no gaps and only counts the pages.
+  columns: 1 | 2;
   decorations: DecorationSet;
 }
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
     docAutoPaginate: {
-      setPaginationLayout: (pageSize: DocPageSize, margins: DocMargins) => ReturnType;
+      setPaginationLayout: (pageSize: DocPageSize, margins: DocMargins, columns?: 1 | 2) => ReturnType;
     };
   }
 }
@@ -127,6 +130,8 @@ interface PaginationResult {
 function keepsWithNext(block: import("@tiptap/pm/model").Node, next: import("@tiptap/pm/model").Node): boolean {
   if (block.type.name === "heading") return true;
   if (block.type.name === "caption" && block.attrs.kind === "table") return next.type.name === "table";
+  // A table captioned underneath (theses often do) keeps its caption on its page.
+  if (block.type.name === "table" && next.type.name === "caption") return true;
   if (next.type.name === "caption" && next.attrs.kind === "figure") {
     let hasImage = false;
     block.descendants((n) => {
@@ -142,8 +147,61 @@ function keepsWithNext(block: import("@tiptap/pm/model").Node, next: import("@ti
 // measured more than once, and no mid-pass re-measurement is needed, since every decoration this
 // produces only adds vertical space *after* the point it's measuring (so earlier measurements in
 // the same pass are never invalidated by a later decoration).
-function computeDecorations(view: EditorView, pageSize: DocPageSize, margins: DocMargins): PaginationResult {
+// Distance from one page's text area to the next in the two-column view: the text height plus the
+// bottom margin, the canvas strip and the next top margin - the multicol row gap.
+export function columnRowGapPx(margins: DocMargins): number {
+  return inToPx(margins.bottom + margins.top) + PAGE_GAP_PX;
+}
+
+// The page (1-based) a top-level block at `top` px below the editor's top lands on, in the
+// two-column view.
+function columnPageAt(top: number, pageSize: DocPageSize, margins: DocMargins): number {
+  const pitch = pageContentHeightPx(pageSize, margins) + columnRowGapPx(margins);
+  return Math.max(1, Math.floor((top + 0.5) / pitch) + 1);
+}
+
+function columnPageCount(view: EditorView, pageSize: DocPageSize, margins: DocMargins): number {
+  const content = pageContentHeightPx(pageSize, margins);
+  const gap = columnRowGapPx(margins);
+  return Math.max(1, Math.round((view.dom.getBoundingClientRect().height + gap) / (content + gap)));
+}
+
+function computeDecorations(view: EditorView, pageSize: DocPageSize, margins: DocMargins, columns: 1 | 2): PaginationResult & { pageCount?: number } {
   const { state } = view;
+  if (columns === 2) {
+    // A page break is a forced column break (docLayout.css); one in the left column gets a second
+    // break right after it, so what follows starts the next page, not the right-hand column.
+    const decorations: Decoration[] = [];
+    const breaks: number[] = [];
+    const box = view.dom.getBoundingClientRect();
+    state.doc.forEach((node, offset) => {
+      if (node.type.name !== "pageBreak") return;
+      const dom = view.nodeDOM(offset);
+      if (!(dom instanceof HTMLElement)) return;
+      if (dom.getBoundingClientRect().left - box.left < box.width / 3) {
+        const pos = offset + node.nodeSize;
+        decorations.push(
+          Decoration.widget(
+            pos,
+            () => {
+              const el = document.createElement("div");
+              el.className = "doc-col-break";
+              el.contentEditable = "false";
+              return el;
+            },
+            { side: -1, key: `colbreak:${pos}` }
+          )
+        );
+        breaks.push(pos);
+      }
+    });
+    const pageCount = columnPageCount(view, pageSize, margins);
+    return {
+      decorations: DecorationSet.create(state.doc, decorations),
+      pageCount,
+      signature: `cols:${pageSize}:${margins.top},${margins.right},${margins.bottom},${margins.left}|${pageCount}|${breaks.join(",")}`,
+    };
+  }
   const contentHeight = pageContentHeightPx(pageSize, margins);
   const containerTop = view.dom.getBoundingClientRect().top;
   const decorations: Decoration[] = [];
@@ -248,9 +306,9 @@ const DocAutoPaginate = Extension.create({
   addCommands() {
     return {
       setPaginationLayout:
-        (pageSize: DocPageSize, margins: DocMargins) =>
+        (pageSize: DocPageSize, margins: DocMargins, columns: 1 | 2 = 1) =>
         ({ tr, dispatch }) => {
-          if (dispatch) dispatch(tr.setMeta(DocAutoPaginatePluginKey, { pageSize, margins }));
+          if (dispatch) dispatch(tr.setMeta(DocAutoPaginatePluginKey, { pageSize, margins, columns }));
           return true;
         },
     };
@@ -261,11 +319,16 @@ const DocAutoPaginate = Extension.create({
       new Plugin<PaginationState>({
         key: DocAutoPaginatePluginKey,
         state: {
-          init: (): PaginationState => ({ pageSize: "letter", margins: DEFAULT_MARGINS, decorations: DecorationSet.empty, pageCount: 1 }),
+          init: (): PaginationState => ({ pageSize: "letter", margins: DEFAULT_MARGINS, columns: 1, decorations: DecorationSet.empty, pageCount: 1 }),
           apply(tr, prev) {
             const meta = tr.getMeta(DocAutoPaginatePluginKey) as Partial<PaginationState> | undefined;
-            if (meta?.pageSize) return { ...prev, pageSize: meta.pageSize, margins: meta.margins ?? prev.margins };
-            if (meta?.decorations) return { ...prev, decorations: meta.decorations, pageCount: meta.decorations.find(undefined, undefined, (spec) => String(spec.key ?? "").startsWith("gap:")).length + 1 };
+            if (meta?.pageSize) return { ...prev, pageSize: meta.pageSize, margins: meta.margins ?? prev.margins, columns: meta.columns ?? prev.columns };
+            if (meta?.decorations)
+              return {
+                ...prev,
+                decorations: meta.decorations,
+                pageCount: meta.pageCount ?? meta.decorations.find(undefined, undefined, (spec) => String(spec.key ?? "").startsWith("gap:")).length + 1,
+              };
             // Map existing decorations through the edit so they don't vanish/misplace for the
             // brief window before the next debounced recompute (triggered by the ResizeObserver
             // below, since view.dom's own height changes on essentially every edit that matters
@@ -287,10 +350,10 @@ const DocAutoPaginate = Extension.create({
             frame = requestAnimationFrame(() => {
               frame = null;
               const st = DocAutoPaginatePluginKey.getState(editorView.state);
-              const result = computeDecorations(editorView, st?.pageSize ?? "letter", st?.margins ?? DEFAULT_MARGINS);
+              const result = computeDecorations(editorView, st?.pageSize ?? "letter", st?.margins ?? DEFAULT_MARGINS, st?.columns ?? 1);
               if (result.signature === lastSignature) return;
               lastSignature = result.signature;
-              editorView.dispatch(editorView.state.tr.setMeta(DocAutoPaginatePluginKey, { decorations: result.decorations }));
+              editorView.dispatch(editorView.state.tr.setMeta(DocAutoPaginatePluginKey, { decorations: result.decorations, pageCount: result.pageCount }));
               // New gaps move everything after them; check once more against that layout rather
               // than relying on the ResizeObserver, which stays silent when the total height
               // happens not to change. Settles as soon as a pass reproduces the same signature.
@@ -311,7 +374,10 @@ const DocAutoPaginate = Extension.create({
               // the ResizeObserver above wouldn't fire for it on its own - catch that case here.
               const prev = DocAutoPaginatePluginKey.getState(prevState);
               const next = DocAutoPaginatePluginKey.getState(view.state);
-              if (prev?.pageSize !== next?.pageSize || prev?.margins !== next?.margins) scheduleRecompute();
+              if (prev?.pageSize !== next?.pageSize || prev?.margins !== next?.margins || prev?.columns !== next?.columns) scheduleRecompute();
+              // Two columns: the rows have a fixed height, so an edit that moves a page break
+              // between columns may not resize anything - re-check after every edit (one per frame).
+              else if (next?.columns === 2 && !prevState.doc.eq(view.state.doc)) scheduleRecompute();
             },
             destroy() {
               observer.disconnect();
@@ -328,4 +394,24 @@ export default DocAutoPaginate;
 
 export function getPaginationPageCount(state: import("@tiptap/pm/state").EditorState): number {
   return DocAutoPaginatePluginKey.getState(state)?.pageCount ?? 1;
+}
+
+// The page (1-based) that the top-level block containing `pos` starts on, in the live view - what
+// the table of contents prints. Single column: one page per gap widget before it. Two columns: from
+// the block's rendered position in the multicol rows.
+export function pageAtPos(view: EditorView, pos: number): number {
+  const $pos = view.state.doc.resolve(Math.min(pos, view.state.doc.content.size));
+  const top = $pos.depth >= 1 ? $pos.before(1) : pos;
+  const st = DocAutoPaginatePluginKey.getState(view.state);
+  if (st?.columns === 2) {
+    const dom = view.nodeDOM(top);
+    if (!(dom instanceof HTMLElement)) return 1;
+    return columnPageAt(dom.getBoundingClientRect().top - view.dom.getBoundingClientRect().top, st.pageSize, st.margins);
+  }
+  let page = 1;
+  view.dom.querySelectorAll<HTMLElement>(".doc-page-gap").forEach((gap) => {
+    const gapPos = Number(gap.dataset.pos);
+    if (!Number.isNaN(gapPos) && gapPos <= top) page++;
+  });
+  return page;
 }

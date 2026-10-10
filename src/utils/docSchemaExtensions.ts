@@ -29,6 +29,9 @@ import DocImageView from "../components/docs/DocImageView";
 import FontSize from "./docFontSizeExtension";
 import LineSpacing from "./docLineSpacingExtension";
 import DocIndent from "./docIndentExtension";
+import DocBlockFormat from "./docBlockFormat";
+import DocPdfPage from "./docPdfPage";
+import DocTextOverrides from "./docTextOverrides";
 import CommentMark from "./docCommentMark";
 import DocPageBreak from "./docPageBreakExtension";
 import DocLink from "./docLinkExtension";
@@ -116,11 +119,15 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     Color,
     FontFamily,
     FontSize,
+    // "Not bold" / "not italic" direct formatting over a style that is (a heading, a caption).
+    DocTextOverrides,
     // multicolor: true - without it, Highlight has no `color` attribute at all (a single fixed
     // highlight color, not a picker) - see @tiptap/extension-highlight's own addAttributes().
     Highlight.configure({ multicolor: true }),
     LineSpacing,
     DocIndent,
+    // Column spanning, block spacing, first-line indent control, table rule styles.
+    DocBlockFormat,
     Subscript,
     Superscript,
     CommentMark,
@@ -135,6 +142,8 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     Citation,
     Bibliography,
     TableOfContents,
+    // A PDF page kept exactly as printed (PDF import, "Exact pages").
+    DocPdfPage,
   ];
 }
 

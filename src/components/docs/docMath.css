@@ -25,6 +25,9 @@
 
 .doc-math-inline {
   display: inline-block;
+  /* An inline-block starts its own line box, which would inherit the paragraph's first-line indent
+     (text-indent) and push the formula right of where it sits. */
+  text-indent: 0;
   padding: 0 1px;
   border-radius: 3px;
   cursor: pointer;

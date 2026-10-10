@@ -6,7 +6,8 @@
 // tree directly is simpler and more predictable than round-tripping through HTML.
 import type { JSONContent } from "@tiptap/core";
 import type { DocComment } from "./docTypes";
-import { CAPTION_NAMES, type DocStructure } from "./docStructure";
+import { captionLabel, crossRefText, type DocStructure } from "./docStructure";
+import { DEFAULT_NUMBERING } from "./docNumbering";
 import { citationSpaceBefore, formatCitation, lastCharOf, styleInfo, type Segment } from "./docCitationStyles";
 
 // Numbers, citations and the reference list for the export in progress (set by
@@ -88,7 +89,7 @@ function renderInline(content: JSONContent[] | undefined, comments: DocComment[]
       result += cite?.superscript ? `<sup>${text}</sup>` : text;
     } else if (node.type === "crossRef") {
       const target = structure?.targets.get(String(node.attrs?.targetId ?? ""));
-      result += target ? `[${target.label}](#${target.id})` : "??";
+      result += target ? `[${crossRefText(target, node.attrs?.form)}](#${target.id})` : "??";
     }
   }
   closeComment();
@@ -202,16 +203,20 @@ function renderBlock(node: JSONContent, comments: DocComment[]): string {
 
 // Display equations' numbers, in document order - assigned up front because renderBlock recurses
 // through lists, quotes and tables without a shared counter.
-let equationNumbers = new WeakMap<JSONContent, number>();
+let equationNumbers = new WeakMap<JSONContent, string>();
 let captionLabels = new WeakMap<JSONContent, string>();
 
+// The numbers the document shows (docStructure.ts, chapter-aware) in document order.
 function numberEquations(node: JSONContent, next: { n: number; figure: number; table: number }): void {
   if (node.type === "mathBlock" && node.attrs?.numbered !== false && ((node.attrs?.latex as string) ?? "").trim()) {
-    equationNumbers.set(node, ++next.n);
+    const i = next.n++;
+    equationNumbers.set(node, structure?.equationLabels[i] ?? String(i + 1));
   }
   if (node.type === "caption") {
     const kind = node.attrs?.kind === "table" ? "table" : "figure";
-    captionLabels.set(node, `${CAPTION_NAMES[kind]} ${++next[kind]}.`);
+    const numbering = structure?.numbering ?? DEFAULT_NUMBERING;
+    const i = next[kind]++;
+    captionLabels.set(node, `${structure?.captionLabels[kind][i] ?? captionLabel(kind, i + 1, numbering)}${numbering.captionSeparator}`);
   }
   for (const child of node.content ?? []) numberEquations(child, next);
 }

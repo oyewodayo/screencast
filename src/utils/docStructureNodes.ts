@@ -12,17 +12,17 @@ import type { Decoration } from "@tiptap/pm/view";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 import DocBibliographyView from "../components/docs/DocBibliographyView";
 import DocTocView from "../components/docs/DocTocView";
-import { getDocStructure, type CaptionKind } from "./docStructure";
+import { crossRefText, getDocStructure, type CaptionKind } from "./docStructure";
 import { citationSpaceBefore } from "./docCitationStyles";
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
     docStructure: {
       insertCaption: (kind: CaptionKind) => ReturnType;
-      insertCrossRef: (targetId: string) => ReturnType;
+      insertCrossRef: (targetId: string, form?: "label" | "number") => ReturnType;
       insertCitation: (refIds: string[], locator?: string | null) => ReturnType;
       updateCitationAt: (pos: number, refIds: string[], locator?: string | null) => ReturnType;
-      updateCrossRefAt: (pos: number, targetId: string) => ReturnType;
+      updateCrossRefAt: (pos: number, targetId: string, form?: "label" | "number") => ReturnType;
       insertBibliography: () => ReturnType;
       insertTableOfContents: () => ReturnType;
     };
@@ -258,7 +258,8 @@ function editorLabel(editor: Editor | undefined, pos: number | undefined, kind: 
   if (!s) return null;
   if (kind === "cite") return s.citationAt.get(pos)?.text ?? null;
   const node = editor.state.doc.nodeAt(pos);
-  return s.targets.get(String(node?.attrs.targetId ?? ""))?.label ?? null;
+  const target = s.targets.get(String(node?.attrs.targetId ?? ""));
+  return target ? crossRefText(target, node?.attrs.form) : null;
 }
 
 export const CrossRef = Node.create({
@@ -274,6 +275,12 @@ export const CrossRef = Node.create({
         default: null,
         parseHTML: (el: HTMLElement) => el.getAttribute("data-xref"),
         renderHTML: (attrs: Record<string, unknown>) => ({ "data-xref": (attrs.targetId as string) ?? "" }),
+      },
+      // "label" reads "Fig. 3"; "number" just "3" (or "(2)" for an equation), for "Figs. 2 and 3".
+      form: {
+        default: "label",
+        parseHTML: (el: HTMLElement) => (el.getAttribute("data-xref-form") === "number" ? "number" : "label"),
+        renderHTML: (attrs: Record<string, unknown>) => (attrs.form === "number" ? { "data-xref-form": "number" } : {}),
       },
     };
   },
@@ -292,17 +299,17 @@ export const CrossRef = Node.create({
   addCommands() {
     return {
       insertCrossRef:
-        (targetId) =>
+        (targetId, form = "label") =>
         ({ tr, state, dispatch }) => {
-          if (dispatch) tr.replaceSelectionWith(state.schema.nodes.crossRef.create({ targetId }), false).scrollIntoView();
+          if (dispatch) tr.replaceSelectionWith(state.schema.nodes.crossRef.create({ targetId, form }), false).scrollIntoView();
           return true;
         },
       updateCrossRefAt:
-        (pos, targetId) =>
+        (pos, targetId, form) =>
         ({ tr, state }) => {
           const node = state.doc.nodeAt(pos);
           if (node?.type.name !== "crossRef") return false;
-          tr.setNodeMarkup(pos, undefined, { ...node.attrs, targetId });
+          tr.setNodeMarkup(pos, undefined, { ...node.attrs, targetId, ...(form ? { form } : {}) });
           return true;
         },
     };

@@ -4,7 +4,8 @@ import { xml2js } from "xml-js";
 import type { JSONContent } from "@tiptap/core";
 import { latexToUnicode, normalizeCsl, parseBibName, parseBibtex, parseReferenceInput, staticBibliography, toBibtex, type BibEntry, type CitationStyleId } from "./docBibliography";
 import { buildCitationContext, citationSpaceBefore, formatCitation, formatReference, initials, segmentsToText } from "./docCitationStyles";
-import { computeStructureFromJson } from "./docStructure";
+import { computeStructureFromJson, crossRefText } from "./docStructure";
+import { formatNumeral, parseNumeral, readNumbering } from "./docNumbering";
 import { docJsonToMarkdown } from "./docMarkdown";
 import { buildDocxBytes } from "./docDocx";
 
@@ -255,11 +256,37 @@ const library = staticBibliography([scholl, leclerc], "nature");
 describe("document structure", () => {
   it("numbers figures, tables and equations separately, in document order", () => {
     const s = computeStructureFromJson(sample, library);
-    expect(s.targets.get("fig1")?.label).toBe("Figure 1");
-    expect(s.targets.get("fig2")?.label).toBe("Figure 2");
-    expect(s.targets.get("tab1")?.label).toBe("Table 1");
-    expect(s.targets.get("eq1")?.label).toBe("Eq. (1)");
+    // A no-break space: a cross-reference never splits across lines.
+    expect(s.targets.get("fig1")?.label).toBe("Figure 1");
+    expect(s.targets.get("fig2")?.label).toBe("Figure 2");
+    expect(s.targets.get("tab1")?.label).toBe("Table 1");
+    expect(s.targets.get("eq1")?.label).toBe("Eq. (1)");
     expect(s.headings.map((h) => h.text)).toEqual(["Introduction", "Model", "References"]);
+  });
+
+  it("follows the document's numbering style: APS captions, roman tables, short references", () => {
+    const aps = { ...library, numbering: () => readNumbering({
+      figure: { caption: "FIG.", ref: "Fig.", numerals: "arabic" },
+      table: { caption: "TABLE", ref: "Table", numerals: "upper-roman" },
+      boldCaptionLabel: false,
+    }) };
+    const s = computeStructureFromJson(sample, aps);
+    expect(s.targets.get("fig2")?.captionLabel).toBe("FIG. 2");
+    expect(s.targets.get("fig2")?.label).toBe("Fig. 2");
+    expect(s.targets.get("tab1")?.captionLabel).toBe("TABLE I");
+    expect(s.targets.get("tab1")?.numberText).toBe("I");
+    expect(crossRefText(s.targets.get("eq1")!, "number")).toBe("(1)");
+    const md = docJsonToMarkdown(sample, [], s);
+    expect(md).toContain("**TABLE I.** Parameters.");
+  });
+
+  it("reads numerals back from print", () => {
+    expect(parseNumeral("IV")).toEqual({ n: 4, style: "upper-roman" });
+    expect(parseNumeral("XII")).toEqual({ n: 12, style: "upper-roman" });
+    expect(parseNumeral("IIII")).toBeNull();
+    expect(parseNumeral("12")).toEqual({ n: 12, style: "arabic" });
+    expect(formatNumeral(14, "upper-roman")).toBe("XIV");
+    expect(formatNumeral(28, "upper-alpha")).toBe("AB");
   });
 
   it("numbers references by first citation and builds the reference list in that order", () => {
@@ -274,7 +301,7 @@ describe("structure in exports", () => {
   it("Markdown: labelled captions with anchors, linked cross-references, citations, reference list, contents", () => {
     const s = computeStructureFromJson(sample, library);
     const md = docJsonToMarkdown(sample, [], s);
-    expect(md).toContain("Rydberg arrays<sup>1</sup> and <sup>1,2</sup>, see [Figure 2](#fig2) and [Eq. (1)](#eq1).");
+    expect(md).toContain("Rydberg arrays<sup>1</sup> and <sup>1,2</sup>, see [Figure 2](#fig2) and [Eq. (1)](#eq1).");
     expect(md).toContain('<a id="fig2"></a>**Figure 2.** Phase diagram.');
     expect(md).toContain("**Table 1.** Parameters.");
     expect(md).toContain("??");

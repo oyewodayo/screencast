@@ -9,22 +9,10 @@ import { NodeViewWrapper, type NodeViewProps } from "@tiptap/react";
 import { TextSelection } from "@tiptap/pm/state";
 import { IoTrashOutline } from "react-icons/io5";
 import { getDocStructure, revealPos, type HeadingEntry } from "../../utils/docStructure";
+import { pageAtPos } from "../../utils/docAutoPaginate";
 
 interface TocEntry extends HeadingEntry {
   page: number;
-}
-
-// The page a document position is on: one more than the number of page breaks before the
-// top-level block holding it.
-export function pageAtPos(view: import("@tiptap/pm/view").EditorView, pos: number): number {
-  const $pos = view.state.doc.resolve(Math.min(pos, view.state.doc.content.size));
-  const top = $pos.depth >= 1 ? $pos.before(1) : pos;
-  let page = 1;
-  view.dom.querySelectorAll<HTMLElement>(".doc-page-gap").forEach((gap) => {
-    const gapPos = Number(gap.dataset.pos);
-    if (!Number.isNaN(gapPos) && gapPos <= top) page++;
-  });
-  return page;
 }
 
 function sameEntries(a: TocEntry[], b: TocEntry[]): boolean {

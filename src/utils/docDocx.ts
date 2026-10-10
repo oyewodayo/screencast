@@ -46,7 +46,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type { DocComment, DocMargins, DocPageSize } from "./docTypes";
 import { PAGE_DIMENSIONS_IN, resolveMargins } from "./docPageGeometry";
 import { latexToOmml } from "./docMathOmml";
-import { CAPTION_NAMES, type DocStructure } from "./docStructure";
+import { wordFontFor } from "./docFonts";
+import { captionLabel, crossRefText, type DocStructure } from "./docStructure";
+import { DEFAULT_NUMBERING } from "./docNumbering";
 import { citationSpaceBefore, formatCitation, lastCharOf, styleInfo, type Segment } from "./docCitationStyles";
 
 const ALIGNMENT_BY_TEXT_ALIGN: Record<string, (typeof AlignmentType)[keyof typeof AlignmentType]> = {
@@ -165,12 +167,14 @@ function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
   // table-cell/code shading already is: a background fill on the run.
   const highlightColor = marks?.find((m) => m.type === "highlight")?.attrs?.color as string | undefined;
   return {
-    bold: has("bold") || forceBold || undefined,
-    italics: has("italic") || undefined,
+    // A "not bold"/"not italic" override (docTextOverrides.ts) beats the heading style's own.
+    bold: textStyle?.attrs?.fontWeight === "normal" ? false : has("bold") || forceBold || undefined,
+    italics: textStyle?.attrs?.fontStyle === "normal" ? false : has("italic") || undefined,
     strike: has("strike") || undefined,
     ...(has("underline") ? { underline: { type: UnderlineType.SINGLE } } : {}),
     ...(color ? { color: color.replace("#", "") } : {}),
-    ...(fontFamily ? { font: fontFamily } : {}),
+    // A CSS stack ("STIX Two Text", Georgia, serif) -> the one real font name Word should use.
+    ...(wordFontFor(fontFamily) ? { font: wordFontFor(fontFamily) } : {}),
     // docx's own run size is in half-points (OOXML convention), not points.
     ...(fontSizePt ? { size: fontSizePt * 2 } : {}),
     ...(highlightColor ? { shading: { fill: highlightColor.replace("#", "") } } : {}),
@@ -271,7 +275,7 @@ async function renderInline(content: JSONContent[] | undefined, ctx: InlineConte
     } else if (node.type === "crossRef") {
       const targetId = String(node.attrs?.targetId ?? "");
       const target = structure?.targets.get(targetId);
-      const run = new TextRun({ text: target?.label ?? "??", ...runOptionsFromMarks(node.marks, forceBold) });
+      const run = new TextRun({ text: target ? crossRefText(target, node.attrs?.form) : "??", ...runOptionsFromMarks(node.marks, forceBold) });
       // A real internal link: Ctrl+click in Word jumps to the figure, table or equation.
       runs.push(target ? new InternalHyperlink({ anchor: bookmarkName(targetId), children: [run] }) : run);
     } else if (node.type === "mathInline") {
@@ -532,7 +536,8 @@ class DocxBuilder {
         const latex = ((node.attrs?.latex as string) ?? "").trim();
         if (!latex) return [];
         const numbered = node.attrs?.numbered !== false;
-        const number = numbered ? ++this.equationNumber : 0;
+        const index = numbered ? this.equationNumber++ : -1;
+        const number = index < 0 ? "" : (this.structure?.equationLabels[index] ?? String(index + 1));
         const omml = latexToOmml(latex, true);
         const math = omml ? ommlChild(numbered ? omml : `<m:oMathPara>${omml}</m:oMathPara>`) : mathFallbackRun(latex, true);
         if (!numbered) return [new Paragraph({ children: [math], alignment: AlignmentType.CENTER, indent, border })];
@@ -559,8 +564,10 @@ class DocxBuilder {
       // kept on the table's page).
       case "caption": {
         const kind = node.attrs?.kind === "table" ? "table" : "figure";
-        const label = `${CAPTION_NAMES[kind]} ${++this.captionCounts[kind]}.`;
-        const labelRun = new TextRun({ text: label, bold: true });
+        const numbering = this.structure?.numbering ?? DEFAULT_NUMBERING;
+        const index = this.captionCounts[kind]++;
+        const label = `${this.structure?.captionLabels[kind][index] ?? captionLabel(kind, index + 1, numbering)}${numbering.captionSeparator}`;
+        const labelRun = new TextRun({ text: label, bold: numbering.boldCaptionLabel || undefined });
         const id = node.attrs?.id as string | null | undefined;
         return [
           new Paragraph({

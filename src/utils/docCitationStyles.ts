@@ -328,8 +328,10 @@ const sortKey = (e: BibEntry) =>
   `${(e.author ?? []).map((n) => familyOf(n).toLowerCase()).join(" ") || (e.title ?? "").toLowerCase()}\u0000${String(yearOf(e) ?? 9999).padStart(4, "0")}\u0000${(e.title ?? "").toLowerCase()}`;
 
 // citedIds: every cited reference id in order of first appearance in the document.
-export function buildCitationContext(citedIds: string[], lookup: (id: string) => BibEntry | undefined, style: CitationStyleId): CitationContext {
-  const entries = citedIds.map(lookup).filter((e): e is BibEntry => !!e);
+// listed: the whole library in its own order, when the document numbers references by list order
+// (an imported paper) - every entry is printed and keeps its place, cited yet or not.
+export function buildCitationContext(citedIds: string[], lookup: (id: string) => BibEntry | undefined, style: CitationStyleId, listed?: BibEntry[]): CitationContext {
+  const entries = listed ?? citedIds.map(lookup).filter((e): e is BibEntry => !!e);
   const numbers = new Map<string, number>();
   const suffixes = new Map<string, string>();
   let ordered = entries;
@@ -349,8 +351,18 @@ export function buildCitationContext(citedIds: string[], lookup: (id: string) =>
   return { style, numbers, suffixes, ordered };
 }
 
+// Enough parsed fields to typeset the entry in any style.
+function wellFormed(e: BibEntry): boolean {
+  return !!e.title && ((e.author?.length ?? 0) > 0 || !!e.editor?.length) && (!!e["container-title"] || !!e.publisher || isPreprint(e) || !!e.URL);
+}
+
 export function formatReference(entry: BibEntry, ctx: CitationContext): FormattedReference {
   const n = ctx.numbers.get(entry.id);
+  if (entry.printed?.length && (entry.printedStyle === ctx.style || !wellFormed(entry))) {
+    const info = styleInfo(ctx.style);
+    const label = !info.numeric ? "" : ctx.style === "nature" ? `${n}.` : `[${n}]`;
+    return { id: entry.id, label, segments: entry.printed.map((s) => ({ ...s })) };
+  }
   switch (ctx.style) {
     case "nature":
       return { id: entry.id, label: `${n}.`, segments: nature(entry) };
@@ -442,6 +454,6 @@ export function referenceSummary(entry: BibEntry): { authors: string; year: stri
     authors: names,
     year: String(yearOf(entry) ?? "n.d."),
     venue: isPreprint(entry) ? `arXiv:${entry.arxiv}` : (journalShort(entry) ?? entry.publisher ?? ""),
-    title: entry.title ?? "Untitled",
+    title: entry.title ?? (entry.printed ? segmentsToText(entry.printed) : "Untitled"),
   };
 }

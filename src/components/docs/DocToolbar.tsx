@@ -54,30 +54,14 @@ import {
   MdUndo,
 } from "react-icons/md";
 import { BiHighlight } from "react-icons/bi";
-import { TbBooks, TbCornerDownRight, TbListDetails, TbMath, TbMathFunction, TbPhoto, TbQuote, TbTable, TbTableOptions } from "react-icons/tb";
+import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbListDetails, TbMath, TbMathFunction, TbPhoto, TbQuote, TbTable, TbTableOptions } from "react-icons/tb";
+import { topBlockAt, type TableRules } from "../../utils/docBlockFormat";
 import DocColorPicker from "./DocColorPicker";
 import { DICTATION_LANGUAGES, DocDictation } from "../../hooks/useDocDictation";
 import { PaintKind, getPaintState } from "../../utils/docPaintExtension";
 import { markKeyHandled } from "../../utils/keyEvents";
-
-// Classic web-safe fonts (what .docx documents and Word itself most commonly use, for import/export
-// fidelity) plus a handful of modern ones self-hosted via boardFonts.css - renders the same on
-// every machine. Bebas Neue is left out: a display-only all-caps face doesn't suit document prose.
-const FONT_FAMILIES = [
-  "Arial",
-  "Calibri",
-  "Cambria",
-  "Courier New",
-  "Georgia",
-  "Helvetica",
-  "Times New Roman",
-  "Verdana",
-  "Inter",
-  "Poppins",
-  "Montserrat",
-  "Space Grotesk",
-  "Playfair Display",
-];
+import { FONT_LIBRARY, documentFontEntries, fontLabelFor, primaryFamily, renderedFamily, type DocFontFace } from "../../utils/docFonts";
+import DocFontMenu from "./DocFontMenu";
 
 // Google Docs' own size ladder for the -/+ buttons.
 const FONT_SIZE_STEPS = [6, 7, 8, 9, 10, 11, 12, 14, 18, 24, 30, 36, 48, 60, 72, 96];
@@ -277,12 +261,25 @@ function currentParagraphStyle(editor: Editor): string {
 
 // The explicit fontSize mark if there is one, else the rendered size at the cursor (so headings and
 // the default body size show a real number instead of a blank box).
+// The element the text at the cursor is drawn in (the innermost one: a mark's span, not the
+// paragraph around it).
+function elementAtCursor(editor: Editor): Element | null {
+  try {
+    const { node, offset } = editor.view.domAtPos(editor.state.selection.from);
+    if (node.nodeType !== Node.ELEMENT_NODE) return node.parentElement;
+    const child = node.childNodes[offset - 1] ?? node.childNodes[offset];
+    if (!child) return node as Element;
+    return child.nodeType === Node.ELEMENT_NODE ? (child as Element) : child.parentElement;
+  } catch {
+    return null;
+  }
+}
+
 function currentFontSizePt(editor: Editor): number | null {
   const explicit = editor.getAttributes("textStyle").fontSize as number | undefined;
   if (explicit) return explicit;
   try {
-    const { node } = editor.view.domAtPos(editor.state.selection.from);
-    const el = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+    const el = elementAtCursor(editor);
     if (!el) return null;
     const px = parseFloat(getComputedStyle(el).fontSize);
     return Number.isFinite(px) ? Math.round(px * 0.75 * 2) / 2 : null;
@@ -291,10 +288,69 @@ function currentFontSizePt(editor: Editor): number | null {
   }
 }
 
-function currentFontFamily(editor: Editor): string | null {
-  const raw = editor.getAttributes("textStyle").fontFamily as string | undefined;
-  if (!raw) return null;
-  return raw.replace(/["']/g, "").split(",")[0].trim();
+function currentFontValue(editor: Editor): string | null {
+  return (editor.getAttributes("textStyle").fontFamily as string | undefined) ?? null;
+}
+
+// The face the text at the cursor is actually drawn in - the run's own font, the document's body
+// font (an imported paper's Latin Modern or Times), or the editor default - whether or not the
+// text carries an explicit font.
+// How the text at the cursor is actually drawn - the source of truth for the formatting buttons,
+// so text that is bold, italic or justified through its style (a heading, an imported paper's
+// body style, a caption) lights them up just like explicit formatting does.
+interface RenderedFormat {
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  strike: boolean;
+  sup: boolean;
+  sub: boolean;
+  // The same, from the block's style alone (what an override has to switch off).
+  styleBold: boolean;
+  styleItalic: boolean;
+  align: string | null;
+}
+
+const BLOCK_SELECTOR = "p, h1, h2, h3, h4, h5, h6, li, td, th, blockquote, pre";
+
+function renderedFormat(editor: Editor): RenderedFormat | null {
+  const el = elementAtCursor(editor);
+  if (!el || !editor.view.dom.contains(el)) return null;
+  const cs = getComputedStyle(el);
+  const block = el.closest(BLOCK_SELECTOR) ?? editor.view.dom;
+  const bs = getComputedStyle(block);
+  // Decorations and vertical alignment don't inherit as computed values: look at every element
+  // from the text up to its block.
+  let underline = false;
+  let strike = false;
+  let sup = false;
+  let sub = false;
+  for (let e: Element | null = el; e && e !== block.parentElement; e = e.parentElement) {
+    const s = getComputedStyle(e);
+    const line = s.textDecorationLine || "";
+    if (line.includes("underline")) underline = true;
+    if (line.includes("line-through")) strike = true;
+    if (s.verticalAlign === "super" || e.tagName === "SUP") sup = true;
+    if (s.verticalAlign === "sub" || e.tagName === "SUB") sub = true;
+    if (e === block) break;
+  }
+  const align = bs.textAlign === "start" || bs.textAlign === "left" || bs.textAlign === "-webkit-left" ? "left" : bs.textAlign;
+  return {
+    bold: parseInt(cs.fontWeight, 10) >= 600,
+    italic: cs.fontStyle !== "normal",
+    underline,
+    strike,
+    sup,
+    sub,
+    styleBold: parseInt(bs.fontWeight, 10) >= 600,
+    styleItalic: bs.fontStyle !== "normal",
+    align,
+  };
+}
+
+function renderedFontAtCursor(editor: Editor): string | null {
+  const el = elementAtCursor(editor);
+  return el ? renderedFamily(getComputedStyle(el).fontFamily) : null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -525,9 +581,16 @@ export interface DocToolbarProps {
   onToggleRuler: () => void;
   // Citation / cross-reference pickers, hosted by DocsEditor and anchored to `anchor`.
   onOpenPicker: (kind: "cite" | "xref", anchor: DOMRect) => void;
+  // Fonts stored with this document (uploads, PDF-embedded) and adding new ones.
+  docFonts: DocFontFace[];
+  onAddFont: () => Promise<DocFontFace[]>;
+  // The document is laid out in two columns (docLayout.ts): offers "Span both columns".
+  twoColumns: boolean;
+  // The document has its own body style (docLayout.ts), which indents paragraphs.
+  typeset: boolean;
 }
 
-const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, onLinkOpenChange, onInsertImage, onAddComment, rulerVisible, onToggleRuler, onOpenPicker }) => {
+const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, onLinkOpenChange, onInsertImage, onAddComment, rulerVisible, onToggleRuler, onOpenPicker, docFonts, onAddFont, twoColumns, typeset }) => {
   const { bind, setOpenMenu } = useOpenMenu();
   const close = () => setOpenMenu(null);
   const [linkUrl, setLinkUrl] = useState("");
@@ -546,10 +609,25 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
   const canUndo = editor.can().undo?.() ?? false;
   const canRedo = editor.can().redo?.() ?? false;
   const paragraphStyle = currentParagraphStyle(editor);
-  const fontFamily = currentFontFamily(editor);
+  const fontValue = currentFontValue(editor);
+  const fontFamily = primaryFamily(fontValue);
+  const fontLabel = fontFamily ? (documentFontEntries(docFonts).find((f) => f.family === fontFamily)?.label ?? FONT_LIBRARY.find((f) => f.family === fontFamily)?.label ?? fontFamily) : null;
+  // Without an explicit font the box names the face actually in use rather than "Default".
+  const shownFamily = fontFamily ? null : renderedFontAtCursor(editor);
+  const shownLabel = fontLabel ?? (shownFamily ? fontLabelFor(shownFamily, docFonts) : null);
   const textColor = (editor.getAttributes("textStyle").color as string | undefined) ?? null;
   const highlightColor = (editor.getAttributes("highlight").color as string | undefined) ?? null;
-  const activeAlign = ALIGNMENTS.find((a) => editor.isActive({ textAlign: a.value })) ?? ALIGNMENTS[0];
+  // Formatting typed next (Ctrl+B with nothing selected) is in stored marks, not yet in the DOM -
+  // it decides; otherwise the rendered text does.
+  const rendered = editor.state.storedMarks ? null : renderedFormat(editor);
+  const markOr = (name: string, renderedValue: boolean | undefined) => editor.isActive(name) || (rendered ? !!renderedValue : false);
+  const boldActive = rendered ? rendered.bold : editor.isActive("bold");
+  const italicActive = rendered ? rendered.italic : editor.isActive("italic");
+  const strikeActive = markOr("strike", rendered?.strike);
+  const supActive = markOr("superscript", rendered?.sup);
+  const subActive = markOr("subscript", rendered?.sub);
+  const activeAlign =
+    ALIGNMENTS.find((a) => editor.isActive({ textAlign: a.value })) ?? ALIGNMENTS.find((a) => a.value === rendered?.align) ?? ALIGNMENTS[0];
   const lineSpacing = (editor.getAttributes("paragraph").lineSpacing ?? editor.getAttributes("heading").lineSpacing ?? null) as number | null;
   const paint = getPaintState(editor);
 
@@ -586,12 +664,16 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
 
   const onLink = editor.isActive("link");
   const inTable = editor.isActive("table");
+  const topBlock = topBlockAt(editor.state);
+  const spansColumns = topBlock?.node.attrs.span === "all";
+  const tableNode = topBlock?.node.type.name === "table" ? topBlock.node : null;
+  const tableRules = (tableNode?.attrs.rules as TableRules | null) ?? null;
   const hasSelection = !editor.state.selection.empty;
 
   // On a link, Underline toggles the link's own underlineOff attribute (docLinkExtension.ts) - an
   // autolinked URL's underline comes from docLinks.css, not an underline mark.
   const linkUnderlineOff = editor.getAttributes("link").underlineOff === true;
-  const underlineActive = onLink ? !linkUnderlineOff : editor.isActive("underline");
+  const underlineActive = onLink ? !linkUnderlineOff : markOr("underline", rendered?.underline);
   const toggleUnderline = () =>
     onLink
       ? editor.chain().focus().updateAttributes("link", { underlineOff: !linkUnderlineOff }).run()
@@ -755,42 +837,36 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
           label="Font"
           trigger={
             <>
-              <span className="w-24 text-left text-sm truncate" style={{ fontFamily: fontFamily ?? undefined }}>
-                {fontFamily ?? "Default"}
+              <span className="w-28 text-left text-sm truncate" style={{ fontFamily: fontValue ?? (shownFamily ? `"${shownFamily}"` : undefined) }}>
+                {shownLabel ?? "Default"}
               </span>
               <MdArrowDropDown size={18} />
             </>
           }
           triggerClassName={`${toolClass(false)} pl-2 pr-0.5`}
           className="hidden @3xl:block"
-          panelClassName="w-56 py-1.5 max-h-80 overflow-y-auto"
+          panelClassName=""
         >
-          <button
-            type="button"
-            className={menuItemClass}
-            onClick={() => {
-              editor.chain().focus().unsetFontFamily().run();
+          <DocFontMenu
+            current={fontValue}
+            defaultLabel={(() => {
+              // The document's own font: what the page itself is set in.
+              const family = renderedFamily(getComputedStyle(editor.view.dom).fontFamily);
+              return family ? fontLabelFor(family, docFonts) : null;
+            })()}
+            docFonts={docFonts}
+            onPick={(entry) => {
+              if (entry) editor.chain().focus().setFontFamily(entry.stack).run();
+              else editor.chain().focus().unsetFontFamily().run();
               close();
             }}
-          >
-            <span className="w-4 shrink-0">{fontFamily === null && <MdCheck size={16} />}</span>
-            Default
-          </button>
-          <div className="my-1 h-px bg-neutral-200 dark:bg-neutral-700" />
-          {FONT_FAMILIES.map((font) => (
-            <button
-              key={font}
-              type="button"
-              className={menuItemClass}
-              onClick={() => {
-                editor.chain().focus().setFontFamily(font).run();
-                close();
-              }}
-            >
-              <span className="w-4 shrink-0">{fontFamily === font && <MdCheck size={16} />}</span>
-              <span style={{ fontFamily: font }}>{font}</span>
-            </button>
-          ))}
+            onAddFont={() => {
+              close();
+              void onAddFont().then((added) => {
+                if (added[0]) editor.chain().focus().setFontFamily(added[0].stack).run();
+              });
+            }}
+          />
         </Dropdown>
 
         <Divider className="hidden @3xl:block" />
@@ -799,10 +875,20 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
 
         <Divider />
 
-        <ToolButton label="Bold" shortcut="Ctrl+B" active={editor.isActive("bold")} onClick={() => editor.chain().focus().toggleBold().run()}>
+        <ToolButton
+          label="Bold"
+          shortcut="Ctrl+B"
+          active={boldActive}
+          onClick={() => (rendered ? editor.chain().focus().toggleRenderedBold(rendered.bold, rendered.styleBold).run() : editor.chain().focus().toggleBold().run())}
+        >
           <MdFormatBold size={19} />
         </ToolButton>
-        <ToolButton label="Italic" shortcut="Ctrl+I" active={editor.isActive("italic")} onClick={() => editor.chain().focus().toggleItalic().run()}>
+        <ToolButton
+          label="Italic"
+          shortcut="Ctrl+I"
+          active={italicActive}
+          onClick={() => (rendered ? editor.chain().focus().toggleRenderedItalic(rendered.italic, rendered.styleItalic).run() : editor.chain().focus().toggleItalic().run())}
+        >
           <MdFormatItalic size={19} />
         </ToolButton>
         <ToolButton label="Underline" shortcut="Ctrl+U" active={underlineActive} onClick={toggleUnderline}>
@@ -981,6 +1067,19 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
           >
             <TbCornerDownRight size={19} strokeWidth={1.75} />
           </button>
+          {twoColumns && (
+            <button
+              type="button"
+              {...tipProps(spansColumns ? "Back to one column" : "Span both columns (title, abstract, wide figure, table or equation)")}
+              aria-label="Span both columns"
+              aria-pressed={spansColumns}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => editor.chain().focus().toggleSpanColumns().run()}
+              className={toolClass(spansColumns)}
+            >
+              <TbArrowAutofitWidth size={19} strokeWidth={1.75} />
+            </button>
+          )}
         </div>
 
         {inTable && (
@@ -996,6 +1095,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
                 ["Split cell", () => editor.chain().focus().splitCell().run(), editor.can().splitCell()],
                 ["Toggle header row", () => editor.chain().focus().toggleHeaderRow().run(), editor.can().toggleHeaderRow()],
                 ["Toggle header column", () => editor.chain().focus().toggleHeaderColumn().run(), editor.can().toggleHeaderColumn()],
+                ["Toggle header cell", () => editor.chain().focus().toggleHeaderCell().run(), editor.can().toggleHeaderCell()],
                 null,
                 ["Delete row", () => editor.chain().focus().deleteRow().run(), editor.can().deleteRow()],
                 ["Delete column", () => editor.chain().focus().deleteColumn().run(), editor.can().deleteColumn()],
@@ -1020,6 +1120,61 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
                 <div key={i} className="my-1 h-px bg-neutral-200 dark:bg-neutral-700" />
               )
             )}
+            <div className="my-1 h-px bg-neutral-200 dark:bg-neutral-700" />
+            <div className="px-3 pt-1 pb-0.5 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Table style</div>
+            {(
+              [
+                [null, "Grid", "Every cell outlined"],
+                ["booktabs", "Booktabs", "Rules above, below and under the header"],
+                ["doubled", "Journal", "Double rules, as in APS and RevTeX"],
+                ["leaders", "Contents", "Number | title | page, with dot leaders - for a list of figures or tables"],
+              ] as [TableRules | null, string, string][]
+            ).map(([value, label, hint]) => (
+              <button
+                key={label}
+                type="button"
+                role="menuitemradio"
+                aria-checked={tableRules === value}
+                className={menuItemClass}
+                data-tip={hint}
+                onClick={() => {
+                  editor.chain().focus().setTableRules(value).run();
+                  close();
+                }}
+              >
+                <span className="w-4 shrink-0">{tableRules === value && <TbCheck size={15} />}</span>
+                {label}
+              </button>
+            ))}
+            <button
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={!!tableNode?.attrs.fit}
+              className={menuItemClass}
+              onClick={() => {
+                editor.chain().focus().toggleTableFit().run();
+                close();
+              }}
+            >
+              <span className="w-4 shrink-0">{tableNode?.attrs.fit && <TbCheck size={15} />}</span>
+              Fit width to content
+            </button>
+            {twoColumns && (
+              <button
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={spansColumns}
+                className={menuItemClass}
+                onClick={() => {
+                  editor.chain().focus().toggleSpanColumns().run();
+                  close();
+                }}
+              >
+                <span className="w-4 shrink-0">{spansColumns && <TbCheck size={15} />}</span>
+                Span both columns
+              </button>
+            )}
+            <div className="my-1 h-px bg-neutral-200 dark:bg-neutral-700" />
             <button
               type="button"
               className={`${menuItemClass} text-red-600 dark:text-red-400`}
@@ -1068,10 +1223,10 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
 
         <Dropdown {...bind("more")} label="More" align="right" trigger={<MdMoreVert size={18} />} panelClassName="w-64 pb-1.5 max-h-[70vh] overflow-y-auto">
           <MenuSection title="Text">
-            {menuAction("Strikethrough", MdStrikethroughS, () => editor.chain().focus().toggleStrike().run(), { active: editor.isActive("strike"), keys: "Alt+Shift+5" })}
+            {menuAction("Strikethrough", MdStrikethroughS, () => editor.chain().focus().toggleStrike().run(), { active: strikeActive, keys: "Alt+Shift+5" })}
             {menuAction("Inline code", MdCode, () => editor.chain().focus().toggleCode().run(), { active: editor.isActive("code"), keys: "Ctrl+E" })}
-            {menuAction("Superscript", MdSuperscript, () => editor.chain().focus().toggleSuperscript().run(), { active: editor.isActive("superscript"), keys: "Ctrl+." })}
-            {menuAction("Subscript", MdSubscript, () => editor.chain().focus().toggleSubscript().run(), { active: editor.isActive("subscript"), keys: "Ctrl+," })}
+            {menuAction("Superscript", MdSuperscript, () => editor.chain().focus().toggleSuperscript().run(), { active: supActive, keys: "Ctrl+." })}
+            {menuAction("Subscript", MdSubscript, () => editor.chain().focus().toggleSubscript().run(), { active: subActive, keys: "Ctrl+," })}
           </MenuSection>
           <MenuSection title="View">
             {menuAction("Show ruler", MdStraighten, onToggleRuler, { active: rulerVisible })}
@@ -1081,6 +1236,11 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
             {menuAction("Code block", MdDataObject, () => editor.chain().focus().toggleCodeBlock().run(), { active: editor.isActive("codeBlock") })}
             {menuAction("Horizontal line", MdHorizontalRule, () => editor.chain().focus().setHorizontalRule().run())}
             {menuAction("Page break", MdInsertPageBreak, () => editor.chain().focus().setPageBreak().run(), { keys: "Ctrl+Enter" })}
+            {twoColumns && menuAction("Span both columns", TbArrowAutofitWidth, () => editor.chain().focus().toggleSpanColumns().run(), { active: spansColumns })}
+            {typeset &&
+              menuAction("No first-line indent", MdFormatIndentDecrease, () => editor.chain().focus().toggleNoIndent().run(), {
+                active: editor.isActive("paragraph", { noIndent: true }),
+              })}
           </MenuSection>
           {/* Mirrors of whatever the bar has hidden at the current width. */}
           <MenuSection title="Style" className="@2xl:hidden">

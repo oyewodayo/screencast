@@ -16,6 +16,7 @@ import { Plugin, PluginKey, type EditorState, type Transaction } from "@tiptap/p
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { BibliographySource, BibEntry, CitationStyleId } from "./docBibliography";
 import { DEFAULT_CITATION_STYLE } from "./docBibliography";
+import { DEFAULT_NUMBERING, chapterLabel, formatNumeral, type NumberingStyle } from "./docNumbering";
 import {
   citationSpaceBefore,
   buildCitationContext,
@@ -29,14 +30,17 @@ import {
 export type CaptionKind = "figure" | "table";
 export type TargetKind = CaptionKind | "equation";
 
-export const CAPTION_NAMES: Record<CaptionKind, string> = { figure: "Figure", table: "Table" };
-
 export interface StructureTarget {
   id: string;
   kind: TargetKind;
   number: number;
-  // How a cross-reference reads: "Figure 3", "Table 1", "Eq. (2)".
+  // The number as printed: "3", "IV", "(2)".
+  numberText: string;
+  // How a cross-reference reads: "Figure 3", "Table 1", "Eq. (2)" - or in the document's own
+  // style, "Fig. 3", "Table IV".
   label: string;
+  // Caption label (figures and tables): "Figure 3", "FIG. 3", "TABLE IV".
+  captionLabel: string;
   // Caption text, or the equation's LaTeX - what the cross-reference picker shows.
   text: string;
   pos: number;
@@ -57,8 +61,12 @@ export interface CitationOccurrence {
 export interface DocStructure {
   targets: Map<string, StructureTarget>;
   targetList: StructureTarget[];
-  // Display equation number by node position (live doc only - exporters number as they walk).
-  equationAt: Map<number, number>;
+  // Display equation number by node position, as printed without the parentheses: "4", "2.1".
+  equationAt: Map<number, string>;
+  // Every number in document order, for the exporters (which walk the document the same way):
+  // caption labels ("Figure 4.6") per kind and equation numbers ("2.1").
+  captionLabels: Record<CaptionKind, string[]>;
+  equationLabels: string[];
   captionAt: Map<number, StructureTarget>;
   headings: HeadingEntry[];
   citations: CitationOccurrence[];
@@ -67,19 +75,50 @@ export interface DocStructure {
   context: CitationContext;
   bibliography: FormattedReference[];
   style: CitationStyleId;
+  numbering: NumberingStyle;
   lookup: (id: string) => BibEntry | undefined;
 }
 
-export function crossRefLabel(kind: TargetKind, number: number): string {
-  return kind === "equation" ? `Eq. (${number})` : `${CAPTION_NAMES[kind]} ${number}`;
+// The number as printed: "3", "IV", "(2)" - or within a chapter "4.6", "(2.1)", "A.3".
+export function numberText(kind: TargetKind, number: number, numbering: NumberingStyle = DEFAULT_NUMBERING, chapter: string | null = null): string {
+  const core = `${chapter ? `${chapter}.` : ""}${kind === "equation" ? number : formatNumeral(number, numbering[kind].numerals)}`;
+  return kind === "equation" ? `(${core})` : core;
+}
+
+export function crossRefLabel(kind: TargetKind, number: number, numbering: NumberingStyle = DEFAULT_NUMBERING, chapter: string | null = null): string {
+  const name = kind === "equation" ? numbering.equation.ref : numbering[kind].ref;
+  return `${name ? `${name}\u00a0` : ""}${numberText(kind, number, numbering, chapter)}`;
+}
+
+export function captionLabel(kind: CaptionKind, number: number, numbering: NumberingStyle = DEFAULT_NUMBERING, chapter: string | null = null): string {
+  const name = numbering[kind].caption;
+  return `${name ? `${name} ` : ""}${numberText(kind, number, numbering, chapter)}`;
+}
+
+// What a cross-reference shows: the full label ("Fig. 3"), just the number ("3", "(2)") for
+// running text like "Figs. 2 and 3" or "Eqs. (4)-(6)", or for an equation the bare number without
+// its parentheses ("Eq. 4.6", as some theses write it).
+export type CrossRefForm = "label" | "number" | "bare";
+
+export function crossRefText(target: StructureTarget, form: unknown): string {
+  if (form === "bare") return target.numberText.replace(/^\((.*)\)$/, "$1");
+  return form === "number" ? target.numberText : target.label;
 }
 
 const isNumberedEquation = (attrs: Record<string, unknown>) => attrs.numbered !== false && String(attrs.latex ?? "").trim() !== "";
 
 class StructureBuilder {
+  // explicitChapters: some chapter heading carries its own number ("CHAPTER 2", "APPENDIX A") -
+  // then those numbers are used and unnumbered headings at that level (References) don't start a
+  // chapter; otherwise every heading at the chapter level is counted as the next chapter.
+  constructor(private numbering: NumberingStyle, private explicitChapters: boolean) {}
   private counts: Record<TargetKind, number> = { figure: 0, table: 0, equation: 0 };
+  private chapter: string | null = null;
+  private chapterCount = 0;
   targetList: StructureTarget[] = [];
-  equationAt = new Map<number, number>();
+  equationAt = new Map<number, string>();
+  captionLabels: Record<CaptionKind, string[]> = { figure: [], table: [] };
+  equationLabels: string[] = [];
   captionAt = new Map<number, StructureTarget>();
   headings: HeadingEntry[] = [];
   citations: CitationOccurrence[] = [];
@@ -89,21 +128,55 @@ class StructureBuilder {
       case "caption": {
         const kind: CaptionKind = attrs.kind === "table" ? "table" : "figure";
         const number = ++this.counts[kind];
-        const target: StructureTarget = { id: String(attrs.id ?? ""), kind, number, label: crossRefLabel(kind, number), text: text(), pos };
+        const chapter = this.chapter;
+        const target: StructureTarget = {
+          id: String(attrs.id ?? ""),
+          kind,
+          number,
+          numberText: numberText(kind, number, this.numbering, chapter),
+          label: crossRefLabel(kind, number, this.numbering, chapter),
+          captionLabel: captionLabel(kind, number, this.numbering, chapter),
+          text: text(),
+          pos,
+        };
         this.captionAt.set(pos, target);
+        this.captionLabels[kind].push(target.captionLabel);
         if (target.id) this.targetList.push(target);
         break;
       }
       case "mathBlock":
         if (isNumberedEquation(attrs)) {
           const number = ++this.counts.equation;
-          this.equationAt.set(pos, number);
-          if (attrs.id) this.targetList.push({ id: String(attrs.id), kind: "equation", number, label: crossRefLabel("equation", number), text: String(attrs.latex ?? ""), pos });
+          const printed = numberText("equation", number, this.numbering, this.chapter).replace(/^\((.*)\)$/, "$1");
+          this.equationAt.set(pos, printed);
+          this.equationLabels.push(printed);
+          if (attrs.id)
+            this.targetList.push({
+              id: String(attrs.id),
+              kind: "equation",
+              number,
+              numberText: numberText("equation", number, this.numbering, this.chapter),
+              label: crossRefLabel("equation", number, this.numbering, this.chapter),
+              captionLabel: "",
+              text: String(attrs.latex ?? ""),
+              pos,
+            });
         }
         break;
-      case "heading":
-        this.headings.push({ level: Number(attrs.level ?? 1), text: text().trim(), pos });
+      case "heading": {
+        const level = Number(attrs.level ?? 1);
+        const headingText = text().trim();
+        this.headings.push({ level, text: headingText, pos });
+        if (this.numbering.chapterLevel !== null && level === this.numbering.chapterLevel) {
+          const label = this.explicitChapters ? chapterLabel(headingText) : String(++this.chapterCount);
+          if (label) {
+            // A new chapter: its figures, tables and equations number from 1 again.
+            this.chapter = label;
+            this.counts = { figure: 0, table: 0, equation: 0 };
+          }
+        }
         break;
+      }
       case "citation":
         this.citations.push({ refIds: Array.isArray(attrs.refIds) ? (attrs.refIds as string[]) : [], locator: (attrs.locator as string | null) ?? null, pos });
         break;
@@ -123,7 +196,8 @@ class StructureBuilder {
         }
       }
     }
-    const context = buildCitationContext(citedIds, lookup, style);
+    const listed = bib?.referenceOrder?.() === "list" ? bib.all() : undefined;
+    const context = buildCitationContext(citedIds, lookup, style, listed);
     const citationAt = new Map<number, InTextCitation>();
     for (const c of this.citations) citationAt.set(c.pos, formatCitation(c.refIds, c.locator, lookup, context));
     const targets = new Map<string, StructureTarget>();
@@ -132,6 +206,8 @@ class StructureBuilder {
       targets,
       targetList: this.targetList,
       equationAt: this.equationAt,
+      captionLabels: this.captionLabels,
+      equationLabels: this.equationLabels,
       captionAt: this.captionAt,
       headings: this.headings,
       citations: this.citations,
@@ -140,15 +216,25 @@ class StructureBuilder {
       context,
       bibliography: formatBibliography(context),
       style,
+      numbering: this.numbering,
       lookup,
     };
   }
 }
 
+// A heading's text with its line breaks as spaces ("CHAPTER 2" / "LITERATURE REVIEW").
+const nodeText = (node: PmNode) => node.textBetween(0, node.content.size, " ", " ");
+
 export function computeStructure(doc: PmNode, bib: BibliographySource | null): DocStructure {
-  const builder = new StructureBuilder();
+  const numbering = bib?.numbering?.() ?? DEFAULT_NUMBERING;
+  let explicit = false;
+  if (numbering.chapterLevel !== null)
+    doc.forEach((n) => {
+      if (n.type.name === "heading" && n.attrs.level === numbering.chapterLevel && chapterLabel(nodeText(n))) explicit = true;
+    });
+  const builder = new StructureBuilder(numbering, explicit);
   doc.descendants((node, pos) => {
-    builder.visit(node.type.name, node.attrs, () => node.textContent, pos);
+    builder.visit(node.type.name, node.attrs, () => (node.type.name === "heading" ? nodeText(node) : node.textContent), pos);
     // Nothing numbered lives inside these.
     return node.type.name !== "codeBlock" && !node.isAtom;
   });
@@ -157,11 +243,16 @@ export function computeStructure(doc: PmNode, bib: BibliographySource | null): D
 
 function jsonText(node: JSONContent): string {
   if (node.type === "text") return node.text ?? "";
+  if (node.type === "hardBreak") return " ";
   return (node.content ?? []).map(jsonText).join("");
 }
 
 export function computeStructureFromJson(json: JSONContent, bib: BibliographySource | null): DocStructure {
-  const builder = new StructureBuilder();
+  const numbering = bib?.numbering?.() ?? DEFAULT_NUMBERING;
+  const explicit =
+    numbering.chapterLevel !== null &&
+    (json.content ?? []).some((n) => n.type === "heading" && n.attrs?.level === numbering.chapterLevel && chapterLabel(jsonText(n)) !== null);
+  const builder = new StructureBuilder(numbering, explicit);
   const walk = (node: JSONContent) => {
     if (node.type && node.type !== "doc") builder.visit(node.type, node.attrs ?? {}, () => jsonText(node), -1);
     if (node.type === "codeBlock") return;
@@ -211,7 +302,8 @@ function buildDecorations(doc: PmNode, s: DocStructure): DecorationSet {
         if (target) {
           decos.push(
             Decoration.node(pos, end, {
-              "data-caption-label": target.label,
+              "data-caption-label": target.captionLabel + s.numbering.captionSeparator,
+              "data-caption-plain": s.numbering.boldCaptionLabel ? "false" : "true",
               class: node.content.size === 0 ? "doc-caption-empty" : "",
             })
           );
@@ -220,7 +312,7 @@ function buildDecorations(doc: PmNode, s: DocStructure): DecorationSet {
       }
       case "crossRef": {
         const target = s.targets.get(String(node.attrs.targetId ?? ""));
-        const label = target ? target.label : "??";
+        const label = target ? crossRefText(target, node.attrs.form) : "??";
         decos.push(Decoration.node(pos, end, { "data-label": label, "data-missing": target ? "false" : "true" }, { label, missing: !target, kind: target?.kind }));
         return false;
       }
@@ -236,7 +328,7 @@ function buildDecorations(doc: PmNode, s: DocStructure): DecorationSet {
       }
       case "mathBlock": {
         const number = s.equationAt.get(pos);
-        decos.push(Decoration.node(pos, end, { "data-eq-number": number ? String(number) : "" }, { eqNumber: number ?? null }));
+        decos.push(Decoration.node(pos, end, { "data-eq-number": number ?? "" }, { eqNumber: number ?? null }));
         return false;
       }
       case "bibliography":

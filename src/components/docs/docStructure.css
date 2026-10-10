@@ -33,8 +33,13 @@
   color: inherit;
 }
 .ProseMirror .doc-caption[data-caption-label]::before {
-  content: attr(data-caption-label) ".\00a0\00a0";
+  content: attr(data-caption-label) "\00a0\00a0";
   font-weight: 600;
+}
+/* Journal style (docNumbering.ts): "FIG. 3. Text" with the label in the caption's own weight. */
+.ProseMirror .doc-caption[data-caption-plain="true"]::before {
+  content: attr(data-caption-label) "\00a0";
+  font-weight: inherit;
 }
 .ProseMirror .doc-caption.doc-caption-empty::after {
   content: "Write a caption";

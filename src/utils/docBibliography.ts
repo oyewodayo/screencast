@@ -11,6 +11,8 @@
 // is normalized to the same CSL shape on the way in, so the formatters in docCitationStyles.ts
 // only ever see one format.
 import * as Y from "yjs";
+import { readNumbering, type NumberingStyle } from "./docNumbering";
+import type { Segment } from "./docCitationStyles";
 
 export interface CslName {
   family?: string;
@@ -57,10 +59,17 @@ export interface BibEntry {
   arxiv?: string;
   // The BibTeX key it was imported with, kept for exporting back to BibTeX and for de-duplication.
   citationKey?: string;
+  // The reference exactly as a source document printed it (PDF import), with its italics and
+  // links. Shown verbatim while the document keeps the style it was printed in (printedStyle), and
+  // whenever the parsed fields are too thin to format it in another style.
+  printed?: Segment[];
+  printedStyle?: CitationStyleId;
   addedAt?: number;
 }
 
 export type CitationStyleId = "nature" | "aps" | "ieee" | "apa";
+
+export type ReferenceOrder = "citation" | "list";
 
 export const DEFAULT_CITATION_STYLE: CitationStyleId = "nature";
 
@@ -73,6 +82,12 @@ export interface BibliographySource {
   get(id: string): BibEntry | undefined;
   all(): BibEntry[];
   style(): CitationStyleId;
+  // Caption and cross-reference naming (docNumbering.ts) - a document setting kept beside the
+  // citation style.
+  numbering?(): NumberingStyle;
+  // "list": numbered in library order and every reference listed, cited or not - an imported
+  // paper's reference list, which must keep its numbers. Default: by first citation.
+  referenceOrder?(): ReferenceOrder;
   subscribe(listener: () => void): () => void;
 }
 
@@ -101,6 +116,22 @@ export class BibliographyStore implements BibliographySource {
   style(): CitationStyleId {
     const value = this.settings.get("citationStyle");
     return isCitationStyle(value) ? value : DEFAULT_CITATION_STYLE;
+  }
+
+  numbering(): NumberingStyle {
+    return readNumbering(this.settings.get("numbering"));
+  }
+
+  setNumbering(numbering: NumberingStyle): void {
+    this.settings.set("numbering", numbering);
+  }
+
+  referenceOrder(): ReferenceOrder {
+    return this.settings.get("referenceOrder") === "list" ? "list" : "citation";
+  }
+
+  setReferenceOrder(order: ReferenceOrder): void {
+    this.settings.set("referenceOrder", order);
   }
 
   setStyle(style: CitationStyleId): void {
@@ -167,7 +198,10 @@ export function snapshotBibliography(ydoc: Y.Doc): BibliographySource {
   const entries = new Map<string, BibEntry>(Object.entries(ydoc.getMap<BibEntry>(LIBRARY_KEY).toJSON() as Record<string, BibEntry>));
   const styleValue = ydoc.getMap(SETTINGS_KEY).get("citationStyle");
   const style = isCitationStyle(styleValue) ? styleValue : DEFAULT_CITATION_STYLE;
-  return staticBibliography([...entries.values()], style);
+  const numbering = readNumbering(ydoc.getMap(SETTINGS_KEY).get("numbering"));
+  const order: ReferenceOrder = ydoc.getMap(SETTINGS_KEY).get("referenceOrder") === "list" ? "list" : "citation";
+  const sorted = [...entries.values()].sort((a, b) => (a.addedAt ?? 0) - (b.addedAt ?? 0));
+  return { ...staticBibliography(sorted, style), numbering: () => numbering, referenceOrder: () => order };
 }
 
 export function staticBibliography(entries: BibEntry[], style: CitationStyleId = DEFAULT_CITATION_STYLE): BibliographySource {

@@ -43,10 +43,10 @@ export function renderLatex(latex: string, displayMode: boolean): Rendered {
 const POPOVER_WIDTH = 420;
 
 // The equation's number, delivered by docStructure.ts as a node decoration.
-function equationNumber(decorations: NodeViewProps["decorations"]): number | null {
+function equationNumber(decorations: NodeViewProps["decorations"]): string | null {
   for (const d of decorations) {
-    const n = (d.spec as { eqNumber?: number | null }).eqNumber;
-    if (typeof n === "number") return n;
+    const n = (d.spec as { eqNumber?: string | null }).eqNumber;
+    if (typeof n === "string" && n) return n;
   }
   return null;
 }
@@ -73,6 +73,34 @@ const DocMathView: React.FC<NodeViewProps> = ({ node, editor, getPos, selected, 
     setDraftNumbered(node.attrs.numbered !== false);
     setEditing(true);
   }, [editor, node, editing]);
+
+  // A display equation wider than its column (a two-column page) is set smaller to fit, the way a
+  // journal sets a long equation, instead of scrolling sideways.
+  useLayoutEffect(() => {
+    if (!isBlock) return;
+    const wrapper = wrapperRef.current;
+    const render = wrapper?.querySelector<HTMLElement>(".doc-math-render");
+    if (!wrapper || !render) return;
+    const fit = () => {
+      render.style.fontSize = "";
+      const math = render.querySelector<HTMLElement>(".katex");
+      if (!math) return;
+      const cs = getComputedStyle(wrapper);
+      const available = wrapper.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      const natural = math.scrollWidth;
+      if (available > 0 && natural > available + 1) render.style.fontSize = `${Math.max(0.6, available / natural)}em`;
+    };
+    fit();
+    // KaTeX's fonts may still be loading on first render, which changes the formula's width.
+    let alive = true;
+    void document.fonts.ready.then(() => alive && fit());
+    const observer = new ResizeObserver(fit);
+    observer.observe(wrapper);
+    return () => {
+      alive = false;
+      observer.disconnect();
+    };
+  }, [isBlock, rendered]);
 
   // Keyboard (Enter on a selected equation) and the insert commands open the editor through a DOM
   // event on this NodeView's root - see docMathExtension.ts.

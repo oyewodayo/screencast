@@ -8,7 +8,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { Editor } from "@tiptap/core";
 import { IoArrowForward, IoImageOutline } from "react-icons/io5";
 import { TbMathFunction, TbTable } from "react-icons/tb";
-import { getDocStructure, revealPos, crossRefLabel, type TargetKind } from "../../utils/docStructure";
+import { getDocStructure, revealPos, type TargetKind } from "../../utils/docStructure";
 import { renderLatex } from "./DocMathView";
 
 export type CrossRefPickerMode = { kind: "insert" } | { kind: "edit"; pos: number; targetId: string | null };
@@ -33,9 +33,11 @@ function candidates(editor: Editor): Candidate[] {
   if (!s) return [];
   const out: Candidate[] = [];
   for (const [pos, t] of s.captionAt) out.push({ kind: t.kind, number: t.number, label: t.label, text: t.text, pos, id: t.id || null });
-  for (const [pos, number] of s.equationAt) {
+  let n = 0;
+  for (const [pos, printed] of s.equationAt) {
     const node = editor.state.doc.nodeAt(pos);
-    out.push({ kind: "equation", number, label: crossRefLabel("equation", number), text: String(node?.attrs.latex ?? ""), pos, id: (node?.attrs.id as string | null) ?? null });
+    const ref = s.numbering.equation.ref;
+    out.push({ kind: "equation", number: ++n, label: `${ref ? `${ref} ` : ""}(${printed})`, text: String(node?.attrs.latex ?? ""), pos, id: (node?.attrs.id as string | null) ?? null });
   }
   return out.sort((a, b) => a.pos - b.pos);
 }
@@ -45,6 +47,9 @@ const DocCrossRefPicker: React.FC<{ editor: Editor; mode: CrossRefPickerMode; on
   const current = mode.kind === "edit" ? all.find((c) => c.id && c.id === mode.targetId) : undefined;
   const [tab, setTab] = useState<TargetKind>(current?.kind ?? TABS.find((t) => all.some((c) => c.kind === t.kind))?.kind ?? "figure");
   const [active, setActive] = useState(0);
+  // "Number only" reads "3" or "(2)" instead of "Fig. 3" / "Eq. (2)" - for "Figs. 2 and 3".
+  const [numberOnly, setNumberOnly] = useState(() => mode.kind === "edit" && editor.state.doc.nodeAt(mode.pos)?.attrs.form === "number");
+  const form = numberOnly ? "number" : "label";
   const listRef = useRef<HTMLDivElement>(null);
   const items = all.filter((c) => c.kind === tab);
 
@@ -67,8 +72,8 @@ const DocCrossRefPicker: React.FC<{ editor: Editor; mode: CrossRefPickerMode; on
         return true;
       });
     }
-    if (mode.kind === "edit") chain.updateCrossRefAt(mode.pos, id);
-    else chain.insertCrossRef(id);
+    if (mode.kind === "edit") chain.updateCrossRefAt(mode.pos, id, form);
+    else chain.insertCrossRef(id, form);
     chain.run();
     onClose();
   };
@@ -181,8 +186,21 @@ const DocCrossRefPicker: React.FC<{ editor: Editor; mode: CrossRefPickerMode; on
           ))
         )}
       </div>
-      <div className="px-3 py-2 border-t border-neutral-200 dark:border-neutral-700 text-[11.5px] text-neutral-400">
-        Numbers update on their own when things move.
+      <div className="flex items-center gap-3 px-3 py-2 border-t border-neutral-200 dark:border-neutral-700 text-[11.5px] text-neutral-400">
+        <span className="flex-1">Numbers update on their own when things move.</span>
+        <label className="shrink-0 inline-flex items-center gap-1.5 text-neutral-600 dark:text-neutral-300 cursor-pointer" data-tip="Show just the number, for “Figs. 2 and 3” or “Eqs. (4)–(6)”">
+          <input
+            type="checkbox"
+            checked={numberOnly}
+            onChange={(e) => {
+              setNumberOnly(e.target.checked);
+              // Editing an existing reference: switch its form at once.
+              if (mode.kind === "edit" && mode.targetId) editor.chain().updateCrossRefAt(mode.pos, mode.targetId, e.target.checked ? "number" : "label").run();
+            }}
+            className="accent-blue-600"
+          />
+          Number only
+        </label>
       </div>
     </div>
   );

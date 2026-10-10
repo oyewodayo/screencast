@@ -1,0 +1,417 @@
+/* components/docs/docLayout.css
+ *
+ * Document layout (docLayout.ts) and block formats (docBlockFormat.ts).
+ *
+ * .doc-typeset - the document has its own body style (an imported paper, or one set by hand): the
+ *   page uses its font, size, leading and paragraph rhythm instead of the editor defaults - no
+ *   space between paragraphs and a first-line indent, the way typeset text is set.
+ * .doc-cols-2  - two text columns per page. The page card's text area is one CSS multicol
+ *   container whose rows are exactly one page's text height (column-height) and wrap onto new
+ *   rows (column-wrap), so the browser itself balances text into columns and pages, while a
+ *   row gap of bottom margin + canvas strip + top margin lines each row up with a drawn sheet
+ *   (.doc-sheet, DocsEditor.tsx). Blocks marked span="all" cross both columns.
+ */
+
+/* ---------- Body style ---------- */
+
+.doc-page-card.doc-typeset .ProseMirror {
+  font-family: var(--doc-body-font, inherit);
+  font-size: var(--doc-body-size, inherit);
+  line-height: var(--doc-body-leading, inherit);
+  color: var(--doc-body-color, inherit);
+  /* Kerning and standard ligatures, as TeX sets them. */
+  font-kerning: normal;
+  font-variant-ligatures: common-ligatures;
+}
+
+.doc-page-card.doc-typeset .ProseMirror > * + * {
+  margin-top: var(--doc-block-space, 1rem);
+}
+
+.doc-page-card.doc-typeset .ProseMirror > p:not(.doc-caption) {
+  text-indent: var(--doc-par-indent, 0);
+}
+
+/* Vertical rhythm of a typeset page: paragraphs run on with no gap (the body style's block
+   spacing), but headings, displays, tables and captions keep the skips LaTeX gives them. A
+   block's own space-before/after (docBlockFormat.ts, set by an import or by hand) still wins. */
+.doc-page-card.doc-typeset .ProseMirror > h1 {
+  margin-bottom: 0.7em;
+}
+.doc-page-card.doc-typeset .ProseMirror > h2 {
+  margin-top: 1.4em;
+  margin-bottom: 0.7em;
+}
+.doc-page-card.doc-typeset .ProseMirror > :is(h3, h4) {
+  margin-top: 1.1em;
+  margin-bottom: 0.5em;
+}
+.doc-page-card.doc-typeset .ProseMirror > h1 + *,
+.doc-page-card.doc-typeset .ProseMirror > :is(h2, h3, h4) + * {
+  margin-top: 0;
+}
+.doc-page-card.doc-typeset .ProseMirror > .doc-math-block {
+  margin-top: 0.6em;
+  margin-bottom: 0.6em;
+}
+.doc-page-card.doc-typeset .ProseMirror > .tableWrapper {
+  margin-top: 0.5em;
+  margin-bottom: 1em;
+}
+.doc-page-card.doc-typeset .ProseMirror > .doc-caption[data-caption="table"] {
+  margin-top: 1em;
+}
+.doc-page-card.doc-typeset .ProseMirror > .doc-caption[data-caption="figure"] {
+  margin-top: 0.4em;
+  margin-bottom: 1em;
+}
+.doc-page-card.doc-typeset .ProseMirror > p:has(img) {
+  margin-top: 1em;
+}
+/* LaTeX's rule: no indent on a paragraph right after a heading, nor where one was suppressed. */
+.doc-page-card.doc-typeset .ProseMirror > :is(h1, h2, h3, h4, h5, h6) + p,
+.doc-page-card.doc-typeset .ProseMirror > p[data-no-indent],
+.doc-page-card.doc-typeset .ProseMirror > p:first-child {
+  text-indent: 0;
+}
+
+.doc-page-card.doc-typeset.doc-justify .ProseMirror p {
+  text-align: justify;
+}
+.doc-page-card.doc-typeset.doc-hyphenate .ProseMirror p {
+  hyphens: auto;
+  -webkit-hyphens: auto;
+}
+
+/* Headings take their size from the text runs inside them (an imported heading carries its own
+   font size); by level they follow the article classes: sections and subsections bold,
+   subsubsections italic. */
+.doc-page-card.doc-typeset .ProseMirror :is(h1, h2, h3, h4) {
+  font-size: var(--doc-body-size, inherit);
+  line-height: var(--doc-body-leading, inherit);
+  font-family: inherit;
+  color: inherit;
+  letter-spacing: normal;
+}
+.doc-page-card.doc-typeset .ProseMirror :is(h1, h2) {
+  font-weight: 700;
+}
+.doc-page-card.doc-typeset .ProseMirror :is(h3, h4) {
+  font-weight: 400;
+  font-style: italic;
+}
+
+.doc-page-card.doc-typeset .ProseMirror :is(td, th) {
+  line-height: var(--doc-body-leading, inherit);
+}
+
+/* ---------- Two columns ---------- */
+
+.doc-page-card.doc-cols-2 {
+  position: relative;
+  /* The sheets are drawn by .doc-sheet elements; the card itself is just the frame. */
+  background: transparent !important;
+  box-shadow: none !important;
+  --tw-ring-shadow: 0 0 #0000 !important;
+}
+
+.doc-page-card.doc-cols-2 .ProseMirror {
+  position: relative;
+  z-index: 1;
+  min-height: 0 !important;
+  column-count: 2;
+  column-gap: var(--doc-col-gap, 0.25in);
+  column-fill: auto;
+  column-height: var(--doc-col-height);
+  column-wrap: wrap;
+  row-gap: var(--doc-row-gap);
+}
+
+.doc-page-card.doc-cols-2 .ProseMirror > [data-span="all"] {
+  column-span: all;
+}
+
+/* A block's top margin must not survive at the top of a column (CSS keeps it after a forced
+   break only; at a natural column break it is truncated already). */
+.doc-page-card.doc-cols-2 .ProseMirror > :is(h1, h2, h3, h4, h5, h6) {
+  break-after: avoid;
+}
+.doc-page-card.doc-cols-2 .ProseMirror > :is(.doc-math-block, .tableWrapper, [data-caption], figure, p:has(img)) {
+  break-inside: avoid;
+}
+/* A caption stays with what it labels: a table caption with the table under it, a figure with the
+   caption under it. */
+.doc-page-card.doc-cols-2 .ProseMirror > [data-caption="table"],
+.doc-page-card.doc-cols-2 .ProseMirror > p:has(img):has(+ [data-caption="figure"]),
+.doc-page-card.doc-cols-2 .ProseMirror > .tableWrapper:has(+ [data-caption]) {
+  break-after: avoid;
+}
+
+/* Wide content keeps to its column. */
+.doc-page-card.doc-cols-2 .ProseMirror img {
+  max-width: 100%;
+}
+.doc-page-card.doc-cols-2 .ProseMirror table {
+  min-width: 0 !important;
+}
+
+.doc-sheet {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: #ffffff;
+  box-shadow:
+    0 0 0 1px #e5e5e5,
+    0 1px 3px rgba(60, 64, 67, 0.15);
+  pointer-events: none;
+}
+.dark .doc-sheet {
+  background: #171717;
+  box-shadow: 0 0 0 1px #262626;
+}
+
+@media print {
+  .doc-sheet {
+    display: none;
+  }
+  /* On paper the print engine itself breaks columns across pages (each printed page's text area
+     is the same height as a screen row), so rows and their gaps are dropped. */
+  .doc-page-card.doc-cols-2 .ProseMirror {
+    column-height: auto;
+    column-wrap: nowrap;
+    row-gap: 0;
+  }
+}
+
+/* ---------- Typeset tables ---------- */
+
+.ProseMirror .tableWrapper[data-fit] {
+  overflow-x: auto;
+}
+.ProseMirror .tableWrapper[data-fit] table {
+  width: auto !important;
+  min-width: 0 !important;
+  table-layout: auto !important;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.ProseMirror .tableWrapper[data-rules] table {
+  border-collapse: collapse;
+  /* Typography's 2em above and below every table: the wrapper's own spacing applies instead. */
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+}
+.ProseMirror .tableWrapper[data-rules] :is(th, td) {
+  border: 0 !important;
+  background: transparent !important;
+  padding: 0.12em 0.6em !important;
+  font-weight: inherit;
+}
+.ProseMirror .tableWrapper[data-rules] :is(th, td) > p {
+  text-indent: 0 !important;
+}
+/* Rule under the header rows: on the first body row after a run of header cells. */
+.ProseMirror .tableWrapper[data-rules] tr:has(> th) + tr:not(:has(> th)) > td {
+  border-top: 0.5pt solid currentColor !important;
+}
+.ProseMirror .tableWrapper[data-rules="booktabs"] table {
+  border-top: 0.8pt solid currentColor;
+  border-bottom: 0.8pt solid currentColor;
+}
+.ProseMirror .tableWrapper[data-rules="doubled"] table {
+  border-top: 2.2pt double currentColor;
+  border-bottom: 2.2pt double currentColor;
+}
+/* The double rule of an APS table, with a single rule under the header. */
+.ProseMirror .tableWrapper[data-rules="doubled"] tr:first-child > :is(th, td) {
+  padding-top: 0.3em !important;
+}
+.ProseMirror .tableWrapper[data-rules="doubled"] tr:last-child > :is(th, td) {
+  padding-bottom: 0.3em !important;
+}
+/* Selection outline stays visible on a rule-less table. */
+.ProseMirror .tableWrapper[data-rules] .selectedCell::after {
+  background: rgba(96, 165, 250, 0.2);
+}
+
+/* ---------- Exact pages (docPdfPage.ts) ---------- */
+
+.doc-pdf-page {
+  position: relative;
+  margin: 0 auto;
+  overflow: hidden;
+  background: #ffffff;
+}
+.doc-pdf-page-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none !important;
+  margin: 0 !important;
+  user-select: none;
+  pointer-events: none;
+}
+.doc-pdf-page-text {
+  position: absolute;
+  inset: 0;
+  line-height: 1;
+  font-family: sans-serif;
+}
+.doc-pdf-page-text span {
+  position: absolute;
+  white-space: pre;
+  color: transparent;
+  transform-origin: 0 0;
+  cursor: text;
+}
+.doc-pdf-page-text span::selection {
+  background: rgba(26, 115, 232, 0.28);
+}
+.ProseMirror-selectednode.doc-pdf-page {
+  outline: 2px solid #1a73e8;
+  outline-offset: -2px;
+}
+
+/* ---------- Typeset math and captions ---------- */
+
+/* KaTeX draws math at 1.21em so it matches UI fonts' larger x-height; beside Latin Modern - the
+   same Computer Modern design as KaTeX's own fonts - TeX's 1em is the exact match. */
+.doc-page-card.doc-typeset .ProseMirror .katex {
+  font-size: 1em;
+}
+.doc-page-card.doc-typeset .ProseMirror .doc-math-block {
+  padding: 0 2.6em;
+}
+.doc-page-card.doc-typeset .ProseMirror .doc-math-number {
+  font-size: 1em;
+  right: 0;
+}
+.doc-page-card.doc-typeset .ProseMirror .doc-math-inline {
+  padding: 0;
+}
+/* A narrow column: very wide display math scales into it rather than scrolling. */
+.doc-page-card.doc-cols-2 .ProseMirror .doc-math-block {
+  overflow-x: visible;
+}
+
+.doc-page-card.doc-typeset .ProseMirror .doc-caption {
+  font-size: inherit;
+  line-height: var(--doc-body-leading, 1.5);
+}
+/* Inline math never opens up the line spacing: as in TeX, scripts and fractions may reach into the
+   leading. The negative vertical margins take the formula's box out of the line-height
+   calculation without moving it. */
+.doc-page-card.doc-typeset .ProseMirror .doc-math-inline {
+  margin-top: -0.4em;
+  margin-bottom: -0.4em;
+  vertical-align: baseline;
+}
+
+/* Typography's own row rules (tbody tr border-bottom) on a ruled table. */
+.ProseMirror .tableWrapper[data-rules] :is(thead, tbody, tr) {
+  border: 0 !important;
+}
+
+/* The reference list as journals set it: small type at its own tight leading, entries flush. */
+.doc-page-card.doc-typeset .ProseMirror .doc-bib-list {
+  font-size: 0.9em;
+  line-height: var(--doc-body-leading, 1.2);
+}
+.doc-page-card.doc-typeset .ProseMirror .doc-bib-item + .doc-bib-item {
+  margin-top: 0.1em;
+}
+.doc-page-card.doc-typeset .ProseMirror .doc-bibliography-numeric .doc-bib-item {
+  grid-template-columns: 2em 1fr;
+  column-gap: 0.4em;
+}
+
+@media print {
+  /* The card's on-screen height (whole sheets, an inline style) would print as blank pages. */
+  .doc-page-card.doc-cols-2 {
+    min-height: 0 !important;
+    min-width: 0 !important;
+  }
+}
+
+/* A page break in two columns: a forced column break (and a second one after a break in the left
+   column - docAutoPaginate.ts), so what follows starts the next page, on screen and on paper. */
+.doc-page-card.doc-cols-2 .ProseMirror > [data-page-break] {
+  /* Not page-break-after: it's an alias of break-after and would override this. */
+  break-after: column !important;
+}
+.doc-page-card.doc-cols-2 .ProseMirror > .doc-col-break {
+  height: 0;
+  margin: 0 !important;
+  break-after: column;
+}
+
+/* ---------- Contents lists with dot leaders (table rules "leaders") ----------
+   Label | text | page. The leader dots sit behind the text cell's last line and run out to the
+   page number; the text itself is set inline on the page colour, which covers the dots wherever
+   there is text - the classic CSS leader technique, so the dots start right after the text on
+   whatever line it ends. */
+.doc-page-card {
+  --doc-paper: #ffffff;
+}
+.dark .doc-page-card {
+  --doc-paper: #171717;
+}
+.ProseMirror .tableWrapper[data-rules="leaders"] table {
+  width: 100% !important;
+  min-width: 0 !important;
+  table-layout: auto !important;
+  border: 0 !important;
+}
+.ProseMirror .tableWrapper[data-rules="leaders"] :is(th, td) {
+  padding: 0 0 0.35em 0 !important;
+  vertical-align: top;
+}
+.ProseMirror .tableWrapper[data-rules="leaders"] td:first-child {
+  width: 1%;
+  white-space: nowrap;
+  padding-right: 0.9em !important;
+}
+.ProseMirror .tableWrapper[data-rules="leaders"] td:last-child {
+  width: 1%;
+  white-space: nowrap;
+  vertical-align: bottom;
+  padding-left: 0.5em !important;
+}
+.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2) {
+  position: relative;
+  /* Keeps the text-over-dots layering inside the cell, under the app's own bars. */
+  isolation: isolate;
+  overflow: hidden;
+  text-align: justify;
+}
+.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2)::after {
+  content: ". . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0.35em;
+  z-index: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  direction: rtl;
+  letter-spacing: 0.18em;
+  pointer-events: none;
+}
+.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2) > p {
+  display: inline;
+  position: relative;
+  z-index: 1;
+  padding-right: 0.4em;
+  background: var(--doc-paper);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* Sub- and superscripts don't open up the line spacing in typeset text (TeX lets them reach into
+   the leading), and leader dots stay on the line's baseline. */
+.doc-page-card.doc-typeset .ProseMirror :is(sub, sup),
+.ProseMirror .tableWrapper[data-rules="leaders"] :is(sub, sup) {
+  line-height: 0;
+}

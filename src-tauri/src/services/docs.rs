@@ -928,10 +928,11 @@ pub fn save_doc_image(
 ) -> Result<String, String> {
     let _serial = crate::services::responsiveness::serial();
     // extension comes from a clipboard MIME type, not a real file extension - whitelist rather
-    // than trust it verbatim.
-    const ALLOWED: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+    // than trust it verbatim. Besides images, a document can keep the fonts it uses (uploaded, or
+    // embedded in an imported PDF) and the original PDF behind an "exact pages" import.
+    const ALLOWED: [&str; 10] = ["png", "jpg", "jpeg", "gif", "webp", "otf", "ttf", "woff", "woff2", "pdf"];
     if !ALLOWED.contains(&extension.as_str()) {
-        return Err(format!("Unsupported image extension: {}", extension));
+        return Err(format!("Unsupported asset extension: {}", extension));
     }
 
     let dir = doc_dir(&id)?;

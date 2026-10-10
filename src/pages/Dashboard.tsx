@@ -4162,7 +4162,9 @@ const setScreen = () => {
                   <IoVideocam size={28} />
                 </div>
                 <div>
-                  <p className="text-gray-700 dark:text-neutral-200 font-medium">Nothing playing yet</p>
+                  <p className="text-gray-700 dark:text-neutral-200 font-medium">
+                    Nothing playing yet
+                    </p>
                   <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
                     Pick a file from the sidebar, or open one from your computer.
                   </p>
