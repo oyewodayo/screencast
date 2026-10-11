@@ -30,7 +30,7 @@ import { DEFAULT_NUMBERING } from "../../utils/docNumbering";
 import { addFontFilesToDocument } from "../../utils/docFonts";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
 import { buildDocxBytes } from "../../utils/docDocx";
-import { LibraryFileEntry } from "../../utils/docTypes";
+import { LibraryFileEntry, type DocMargins } from "../../utils/docTypes";
 import { createDocImagePasteExtension, uploadImageFromPath } from "../../utils/docImagePaste";
 import { createSlashCommandExtension } from "../../utils/docSlashCommand";
 import DocFindReplace from "../../utils/docFindReplace";
@@ -50,7 +50,7 @@ import DocCommentsSidebar from "./DocCommentsSidebar";
 import DocPageSetupPopover from "./DocPageSetupPopover";
 import DocToolbar, { Dropdown, menuItemClass } from "./DocToolbar";
 import DocAutoPaginate, { columnRowGapPx, getPaginationPageCount, pageAtPos } from "../../utils/docAutoPaginate";
-import { PAGE_DIMENSIONS_IN, PAGE_GAP_PX, pageContentHeightPx, pageHeightPx, pageWidthPx, resolveMargins } from "../../utils/docPageGeometry";
+import { MIN_CONTENT_IN, PAGE_GAP_PX, cssPageSize, isDarkPageColor, normalizePageColor, pageContentHeightPx, pageDimensionsIn, pageFormat, pageHeightPx, pageWidthPx, resolveMargins, type PageFormat } from "../../utils/docPageGeometry";
 import { DocHorizontalRuler, DocVerticalRuler, RULER_SIZE, useRulerUnit } from "./DocRuler";
 import "./docCodeHighlight.css";
 import "./docFindReplace.css";
@@ -102,6 +102,22 @@ interface Notice {
   error?: boolean;
 }
 
+// Runs `task` with the app in its light theme, restoring dark mode afterwards - see the
+// beforeprint/afterprint effect in DocsEditor for why printed output is always light. Two frames
+// first, so the style change has been laid out and painted before the print engine reads the page.
+async function withLightTheme<T>(task: () => Promise<T>): Promise<T> {
+  const root = document.documentElement;
+  const wasDark = root.classList.contains("dark");
+  if (!wasDark) return task();
+  root.classList.remove("dark");
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  try {
+    return await task();
+  } finally {
+    root.classList.add("dark");
+  }
+}
+
 function exportBaseName(title: string): string {
   const cleaned = title.replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim();
   return (cleaned || "Document").slice(0, 120);
@@ -122,7 +138,12 @@ function slugify(text: string): string {
     .replace(/\s/g, "-");
 }
 
-async function buildStandaloneHtml(title: string, bodyHtml: string, structure: DocStructure | null): Promise<string> {
+async function buildStandaloneHtml(
+  title: string,
+  bodyHtml: string,
+  structure: DocStructure | null,
+  paper: { page: PageFormat; pageColor: string | null; margins: DocMargins }
+): Promise<string> {
   const dom = new DOMParser().parseFromString(`<body>${bodyHtml}</body>`, "text/html");
   await Promise.all(
     Array.from(dom.querySelectorAll("img")).map(async (img) => {
@@ -252,8 +273,18 @@ async function buildStandaloneHtml(title: string, bodyHtml: string, structure: D
       el.appendChild(tag);
     }
   });
+  // The page setup carried over: the text column is the page's own (wider when landscape), the
+  // background is its paper colour (light text on dark paper), and printing the HTML from a browser
+  // uses the same paper size and orientation.
+  const dims = pageDimensionsIn(paper.page);
+  const textWidthIn = Math.max(MIN_CONTENT_IN, dims.width - paper.margins.left - paper.margins.right);
+  const dark = isDarkPageColor(paper.pageColor);
   const css = [
-    "body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;line-height:1.6;color:#1f1f1f;max-width:7.5in;margin:48px auto;padding:0 24px}",
+    `@page{size:${cssPageSize(paper.page)};margin:${paper.margins.top}in ${paper.margins.right}in ${paper.margins.bottom}in ${paper.margins.left}in}`,
+    paper.pageColor ? `html{background:${paper.pageColor};-webkit-print-color-adjust:exact;print-color-adjust:exact}` : "",
+    `body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;line-height:1.6;color:${dark ? "#f5f5f5" : "#1f1f1f"};max-width:${textWidthIn}in;margin:48px auto;padding:0 24px}`,
+    dark ? "a{color:#93c5fd!important}th{background:rgba(255,255,255,.08)!important}blockquote{color:#d4d4d4!important}pre{background:rgba(255,255,255,.08)!important}" : "",
+    "@media print{body{margin:0 auto;padding:0;max-width:none}}",
     "h1,h2,h3,h4{line-height:1.25;margin:1.4em 0 .5em}",
     "p{margin:0 0 .9em}img{max-width:100%;height:auto}",
     "table{border-collapse:collapse;width:100%;margin:1em 0}th,td{border:1px solid #d0d0d0;padding:6px 10px;vertical-align:top;text-align:left}th{background:#f3f3f3}",
@@ -495,7 +526,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     };
   }, [editor, openPicker]);
 
-  const pageSize = store.pageSize ?? "letter";
+  // Paper size + orientation, stable across renders (the pagination plugin compares it by identity).
+  const page = useMemo(() => pageFormat(store.pageSize, store.orientation), [store.pageSize, store.orientation]);
+  // The paper colour (null = white), and whether it's dark enough to need light text.
+  const pageColor = normalizePageColor(store.pageColor);
+  const pageDark = isDarkPageColor(pageColor);
   const margins = resolveMargins(store.margins);
   const [rulerUnit, setRulerUnit] = useRulerUnit();
   const [rulerVisible, setRulerVisible] = useState(readRulerVisible);
@@ -527,8 +562,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   // wouldn't notice on its own).
   useEffect(() => {
     if (!editor) return;
-    editor.commands.setPaginationLayout(pageSize, margins, layout.columns);
-  }, [editor, pageSize, margins, layout.columns]);
+    editor.commands.setPaginationLayout(page, margins, layout.columns);
+  }, [editor, page, margins, layout.columns]);
 
   const handleBack = useCallback(() => {
     dictation.stop();
@@ -544,6 +579,29 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   }, []);
   useEffect(() => () => {
     if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
+  }, []);
+
+  // Paper is printed as paper: Print and Download PDF always render the page in the light theme,
+  // so a dark-mode session doesn't produce a dark PDF (or, with a page colour, light text on light
+  // paper). The browser fires beforeprint/afterprint around window.print(); WebView2's PrintToPdf
+  // fires neither, so the PDF export wraps itself in withLightTheme() instead.
+  useEffect(() => {
+    let restoreDark = false;
+    const before = () => {
+      restoreDark = document.documentElement.classList.contains("dark");
+      if (restoreDark) document.documentElement.classList.remove("dark");
+    };
+    const after = () => {
+      if (restoreDark) document.documentElement.classList.add("dark");
+      restoreDark = false;
+    };
+    window.addEventListener("beforeprint", before);
+    window.addEventListener("afterprint", after);
+    return () => {
+      window.removeEventListener("beforeprint", before);
+      window.removeEventListener("afterprint", after);
+      after();
+    };
   }, []);
 
   const handlePrint = useCallback(() => {
@@ -623,7 +681,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       try {
         let saved: string;
         if (kind === "pdf") {
-          saved = await invoke<string>("export_doc_pdf", { docTitle: store.title, pageSize: store.pageSize, outputPath });
+          saved = await withLightTheme(() =>
+            invoke<string>("export_doc_pdf", { docTitle: store.title, pageSize: store.pageSize, orientation: store.orientation, outputPath })
+          );
         } else if (kind === "docx") {
           const json = editor.getJSON();
           const live = getDocStructure(editor.state);
@@ -632,6 +692,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             headingPages: (live?.headings ?? []).map((h) => pageAtPos(editor.view, h.pos)),
             comments: store.comments,
             pageSize: store.pageSize,
+            orientation: store.orientation,
+            pageColor: store.pageColor,
             headerText: store.headerText,
             footerText: store.footerText,
             margins: store.margins,
@@ -644,7 +706,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             kind === "md"
               ? docJsonToMarkdown(json, store.comments, structure)
               : kind === "html"
-                ? await buildStandaloneHtml(store.title, editor.getHTML(), structure)
+                ? await buildStandaloneHtml(store.title, editor.getHTML(), structure, {
+                    page: pageFormat(store.pageSize, store.orientation),
+                    pageColor: normalizePageColor(store.pageColor),
+                    margins: resolveMargins(store.margins),
+                  })
                 : editor.getText({
                     blockSeparator: "\n\n",
                     // Generated blocks have no text of their own; write out what they show.
@@ -668,7 +734,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         showNotice({ text: err instanceof Error ? err.message : String(err), error: true }, 8000);
       }
     },
-    [editor, store.title, store.comments, store.pageSize, store.headerText, store.footerText, store.margins, showNotice, bib.store]
+    [editor, store.title, store.comments, store.pageSize, store.orientation, store.pageColor, store.headerText, store.footerText, store.margins, showNotice, bib.store]
   );
 
   const handleSaveNow = useCallback(async () => {
@@ -724,12 +790,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     ...(twoColumns
       ? {
           "--doc-col-gap": `${layout.columnGap}in`,
-          "--doc-col-height": `${pageContentHeightPx(pageSize, margins)}px`,
+          "--doc-col-height": `${pageContentHeightPx(page, margins)}px`,
           "--doc-row-gap": `${columnRowGapPx(margins)}px`,
-          minHeight: pageCount * pageHeightPx(pageSize) + (pageCount - 1) * PAGE_GAP_PX,
+          minHeight: pageCount * pageHeightPx(page) + (pageCount - 1) * PAGE_GAP_PX,
           // A two-column page never narrows with the window (the view scrolls sideways instead):
           // its columns, page breaks and page count must be exactly the printed ones.
-          minWidth: pageWidthPx(pageSize),
+          minWidth: pageWidthPx(page),
         }
       : {}),
   } as React.CSSProperties;
@@ -771,10 +837,20 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           override can win - inline style beats any class regardless of media query. On screen the
           card is one sheet tall at minimum; docAutoPaginate.ts pads the last page to full height. */}
       <style>{`
-        @page { size: ${PAGE_DIMENSIONS_IN[pageSize].cssSize}; margin: 0; }
-        .doc-page-card { max-width: ${pageWidthPx(pageSize)}px; padding: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(pageSize)}px; }
+        @page { size: ${cssPageSize(page)}; margin: 0; }
+        .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
         @media print {
           .doc-page-card { max-width: none; padding: 0 ${margins.right}in 0 ${margins.left}in; min-height: 0; }
+        }
+        ${
+          // Page colour on paper and in the PDF: edge to edge. @page has no margin, so painting the
+          // whole print chain (html, body and every ancestor of the frame, which flatten to plain
+          // blocks in print - docPageLayout.css) fills each sheet completely, margins included.
+          pageColor
+            ? `@media print {
+          html, body, *:has(.doc-print-frame), .doc-print-frame { background: ${pageColor} !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        }`
+            : ""
         }
       `}</style>
 
@@ -783,7 +859,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           page chrome out of a print engine with no margin-box content support. */}
       {store.headerText && (
         <div
-          className="doc-print-keep hidden print:block fixed text-xs text-neutral-500 -translate-y-1/2"
+          className={`doc-print-keep hidden print:block fixed text-xs ${pageDark ? "text-neutral-300" : "text-neutral-500"} -translate-y-1/2`}
           style={{ top: `${margins.top / 2}in`, left: `${margins.left}in`, right: `${margins.right}in` }}
         >
           {store.headerText}
@@ -791,7 +867,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       )}
       {store.footerText && (
         <div
-          className="doc-print-keep hidden print:block fixed text-xs text-neutral-500 translate-y-1/2"
+          className={`doc-print-keep hidden print:block fixed text-xs ${pageDark ? "text-neutral-300" : "text-neutral-500"} translate-y-1/2`}
           style={{ bottom: `${margins.bottom / 2}in`, left: `${margins.left}in`, right: `${margins.right}in` }}
         >
           {store.footerText}
@@ -978,6 +1054,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             headerText={store.headerText}
             footerText={store.footerText}
             margins={store.margins}
+            orientation={store.orientation}
+            pageColor={store.pageColor}
             unit={rulerUnit}
             columns={layout.columns}
             columnGap={layout.columnGap}
@@ -1054,10 +1132,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             // Sticky inside the scroller and exactly as wide as the page card, so ruler positions
             // line up with the page at any window width.
             <div className="sticky top-0 z-20 -mx-4 sm:-mx-8 px-4 sm:px-8 pt-1.5 pb-2 mb-2 bg-[var(--doc-canvas)] print:hidden">
-              <div className="mx-auto" style={{ maxWidth: pageWidthPx(pageSize), minWidth: layout.columns === 2 ? pageWidthPx(pageSize) : undefined }}>
+              <div className="mx-auto" style={{ maxWidth: pageWidthPx(page), minWidth: layout.columns === 2 ? pageWidthPx(page) : undefined }}>
                 <DocHorizontalRuler
                   editor={editor}
-                  pageSize={pageSize}
+                  page={page}
                   margins={margins}
                   unit={rulerUnit}
                   onUnitChange={setRulerUnit}
@@ -1091,18 +1169,25 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               <tbody>
                 <tr>
                   <td>
+                    {/* Paper colour: --doc-paper (docLayout.css) is the page's one fill - the card,
+                        two-column sheets, page-break gaps and leader backgrounds all read it - and
+                        data-page-color swaps it for the document's colour. */}
                     <div
                       ref={pageRef}
                       lang="en"
-                      style={cardStyle}
-                      className={`doc-page-card ${cardClass} mx-auto bg-white dark:bg-neutral-900 ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
+                      style={pageColor ? ({ ...cardStyle, "--doc-page-color": pageColor } as React.CSSProperties) : cardStyle}
+                      data-page-color={pageColor ?? undefined}
+                      data-page-dark={pageDark ? "" : undefined}
+                      className={`doc-page-card ${cardClass} mx-auto bg-[var(--doc-paper)] ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
                     >
                       {/* Two columns: one drawn sheet per page behind the multicol rows. */}
                       {twoColumns &&
                         Array.from({ length: pageCount }, (_, k) => (
-                          <div key={k} className="doc-sheet" aria-hidden style={{ top: k * (pageHeightPx(pageSize) + PAGE_GAP_PX), height: pageHeightPx(pageSize) }} />
+                          <div key={k} className="doc-sheet" aria-hidden style={{ top: k * (pageHeightPx(page) + PAGE_GAP_PX), height: pageHeightPx(page) }} />
                         ))}
-                      <EditorContent editor={editor} className={docProseClassName} />
+                      {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
+                          flips the editor's text, heading and link colours. */}
+                      <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
                     </div>
                   </td>
                 </tr>
@@ -1120,7 +1205,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         {showRuler && (
           <div className="hidden sm:block print:hidden">
             <DocVerticalRuler
-              pageSize={pageSize}
+              page={page}
               margins={margins}
               unit={rulerUnit}
               onMarginsChange={(m) => void store.setPageSetup({ margins: m })}

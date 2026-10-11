@@ -23,7 +23,8 @@ import { ensureWorkerConfigured } from "../../hooks/usePdfDocument";
 import { getDocContentExtensions } from "../docSchemaExtensions";
 import { docFontsMap, registerDocFont, type DocFontFace } from "../docFonts";
 import { docSettingsMap, writeLayout } from "../docLayout";
-import type { DocMargins, DocPageSize } from "../docTypes";
+import type { DocMargins } from "../docTypes";
+import { DEFAULT_PAGE, pageFormatForPoints, type PageFormat } from "../docPageGeometry";
 import type { PdfTextRun } from "../docPdfPage";
 import { readOtf } from "./otf";
 import { classifyFont, collectFontChars, extractGlyphs, type FontMeta, type RawTextItem } from "./glyphs";
@@ -63,11 +64,7 @@ const EXACT_SCALE = 2.5;
 
 const yieldToUi = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-function pageSizeFor(width: number, height: number): DocPageSize {
-  if (Math.abs(width - 595) < 12 && Math.abs(height - 842) < 12) return "a4";
-  if (Math.abs(height - 1008) < 12) return "legal";
-  return "letter";
-}
+
 
 async function renderPage(page: PDFPageProxy, scale: number): Promise<HTMLCanvasElement> {
   const viewport = page.getViewport({ scale });
@@ -160,9 +157,17 @@ async function createShell(title: string): Promise<string> {
   return id;
 }
 
-async function finishDoc(id: string, title: string, ydoc: Y.Doc, pageSize: DocPageSize, margins: DocMargins): Promise<void> {
+async function finishDoc(id: string, title: string, ydoc: Y.Doc, page: PageFormat, margins: DocMargins): Promise<void> {
   await invoke("save_doc", { id, bytes: Array.from(Y.encodeStateAsUpdate(ydoc)), title });
-  await invoke("set_doc_page_setup", { id, pageSize, headerText: null, footerText: null, margins });
+  await invoke("set_doc_page_setup", {
+    id,
+    pageSize: page.size,
+    orientation: page.orientation === "landscape" ? "landscape" : null,
+    pageColor: null,
+    headerText: null,
+    footerText: null,
+    margins,
+  });
 }
 
 export async function importPdfFile(path: string, fileName: string, mode: PdfImportMode, onProgress: (p: PdfImportProgress) => void): Promise<PdfImportResult> {
@@ -331,7 +336,7 @@ async function importEditable(pdf: PDFDocumentProxy, id: string, baseTitle: stri
   });
   for (const face of faces.values()) if (face.asset) void registerDocFont(face);
   const title = built.title || baseTitle;
-  await finishDoc(id, title, ydoc, built.pageSize, built.margins);
+  await finishDoc(id, title, ydoc, built.page, built.margins);
   return { id, title, stats: built.stats };
 }
 
@@ -372,7 +377,8 @@ async function importExact(pdf: PDFDocumentProxy, id: string, baseTitle: string,
   docSettingsMap(ydoc).set("source", source);
   writeLayout(ydoc, { columns: 1, body: { fontFamily: null, fontSize: null, lineHeight: null, blockSpacing: 0, paragraphIndent: null, color: null, justify: false, hyphenate: false } });
   const finalTitle = title.replace(/\s+/g, " ").trim().slice(0, 160) || baseTitle;
-  const size = first ? pageSizeFor(first.width, first.height) : "letter";
+  // A landscape PDF imports as a landscape document, so its exact pages fit the page.
+  const size = first ? pageFormatForPoints(first.width, first.height) : DEFAULT_PAGE;
   await finishDoc(id, finalTitle, ydoc, size, { top: 0, right: 0, bottom: 0, left: 0 });
   return { id, title: finalTitle, stats: null };
 }

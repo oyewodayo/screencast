@@ -15,6 +15,7 @@ import { DOMParser as ProseMirrorDOMParser, type Node as ProseMirrorNode, type S
 import { prosemirrorToYDoc } from "y-prosemirror";
 import { invoke } from "@tauri-apps/api/core";
 import { getDocContentExtensions } from "./docSchemaExtensions";
+import { normalizePageColor, pageFormat } from "./docPageGeometry";
 import { docSettingsMap, writeLayout, type DocLayout, DEFAULT_COLUMN_GAP_IN } from "./docLayout";
 import { DEFAULT_CITATION_STYLE, type BibEntry } from "./docBibliography";
 import type { DocPreviewData } from "./docPreview";
@@ -65,7 +66,14 @@ export function templatePreview(template: DocTemplate): DocPreviewData {
   } catch (err) {
     console.error(`Failed to render preview for template ${template.id}:`, err);
   }
-  const preview = { html, layout: templateLayout(template), references: template.references ?? [], citationStyle: template.citationStyle ?? DEFAULT_CITATION_STYLE };
+  const preview: DocPreviewData = {
+    html,
+    layout: templateLayout(template),
+    references: template.references ?? [],
+    citationStyle: template.citationStyle ?? DEFAULT_CITATION_STYLE,
+    page: pageFormat(template.pageSetup?.pageSize, template.pageSetup?.orientation),
+    pageColor: normalizePageColor(template.pageSetup?.pageColor),
+  };
   previewCache.set(template.id, preview);
   return preview;
 }
@@ -90,8 +98,8 @@ export async function createDocFromTemplate(template: DocTemplate, folderId: str
   const title = template.docTitle(today);
   await invoke("create_doc", { id, title, bytes: Array.from(Y.encodeStateAsUpdate(ydoc)), folderId });
   if (template.pageSetup) {
-    const { pageSize = null, margins = null, headerText = null, footerText = null } = template.pageSetup;
-    await invoke("set_doc_page_setup", { id, pageSize, headerText, footerText, margins });
+    const { pageSize = null, orientation = null, pageColor = null, margins = null, headerText = null, footerText = null } = template.pageSetup;
+    await invoke("set_doc_page_setup", { id, pageSize, orientation: orientation === "landscape" ? "landscape" : null, pageColor, headerText, footerText, margins });
   }
   return id;
 }

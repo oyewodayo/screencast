@@ -19,10 +19,10 @@ import "./docFonts.css";
 import "./docLayout.css";
 import { docProseClassName } from "../../utils/docSchemaExtensions";
 import { bodyStyleVars } from "../../utils/docLayout";
+import { DEFAULT_PAGE, isDarkPageColor, pageWidthPx } from "../../utils/docPageGeometry";
 import { buildCitationContext, formatBibliography, formatCitation, styleInfo } from "../../utils/docCitationStyles";
 import type { DocPreviewData } from "../../utils/docPreview";
 
-const PAGE_WIDTH_PX = 816;
 const PAGE_MARGIN_PX = 72;
 
 interface DocPagePreviewProps {
@@ -132,18 +132,20 @@ function finishPage(root: HTMLElement, preview: DocPreviewData): void {
 const DocPagePreview: React.FC<DocPagePreviewProps> = ({ preview, aspectClassName = "aspect-[8.5/11]" }) => {
   const frameRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  // The page is laid out at its real width - a landscape page is wider - then scaled to the card.
+  const pageWidth = pageWidthPx(preview?.page ?? DEFAULT_PAGE);
   const [scale, setScale] = useState(0);
   const isMeasured = scale > 0;
 
   useLayoutEffect(() => {
     const frame = frameRef.current;
     if (!frame) return;
-    const update = () => setScale(frame.clientWidth / PAGE_WIDTH_PX);
+    const update = () => setScale(frame.clientWidth / pageWidth);
     update();
     const observer = new ResizeObserver(update);
     observer.observe(frame);
     return () => observer.disconnect();
-  }, []);
+  }, [pageWidth]);
 
   useEffect(() => {
     const root = contentRef.current;
@@ -157,6 +159,15 @@ const DocPagePreview: React.FC<DocPagePreviewProps> = ({ preview, aspectClassNam
   }, [preview, isMeasured]);
 
   const layout = preview?.layout;
+  const pageColor = preview?.pageColor ?? null;
+  const pageDark = isDarkPageColor(pageColor);
+  // Paper attributes shared by the frame (which paints the paper) and the page inside it (whose
+  // leader dots and the like read the same --doc-paper).
+  const paperAttrs = {
+    "data-page-color": pageColor ?? undefined,
+    "data-page-dark": pageDark ? "" : undefined,
+  };
+  const paperVars = pageColor ? ({ "--doc-page-color": pageColor } as React.CSSProperties) : undefined;
   const cardClass = [
     "doc-page-card",
     layout?.body ? "doc-typeset" : "",
@@ -171,7 +182,9 @@ const DocPagePreview: React.FC<DocPagePreviewProps> = ({ preview, aspectClassNam
     <div
       ref={frameRef}
       aria-hidden
-      className={`relative w-full overflow-hidden bg-white dark:bg-neutral-900 pointer-events-none select-none ${aspectClassName}`}
+      {...paperAttrs}
+      style={paperVars}
+      className={`doc-preview-paper relative w-full overflow-hidden pointer-events-none select-none ${aspectClassName}`}
     >
       {preview === null ? (
         <div className="absolute inset-0 p-[9%] flex flex-col gap-2 animate-pulse">
@@ -183,13 +196,15 @@ const DocPagePreview: React.FC<DocPagePreviewProps> = ({ preview, aspectClassNam
       ) : (
         isMeasured && (
           <div
-            className={`${cardClass} ${docProseClassName}`}
+            {...paperAttrs}
+            className={`${cardClass} ${docProseClassName}${pageDark ? " prose-invert" : ""}`}
             style={{
               ...(bodyStyleVars(layout?.body ?? null) as React.CSSProperties),
+              ...paperVars,
               position: "absolute",
               top: 0,
               left: 0,
-              width: PAGE_WIDTH_PX,
+              width: pageWidth,
               padding: PAGE_MARGIN_PX * 0.75,
               transform: `scale(${scale})`,
               transformOrigin: "top left",

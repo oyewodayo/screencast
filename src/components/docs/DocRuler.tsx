@@ -28,8 +28,8 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Editor } from "@tiptap/core";
 import type { Node as PMNode } from "@tiptap/pm/model";
-import type { DocMargins, DocPageSize } from "../../utils/docTypes";
-import { PAGE_DIMENSIONS_IN, PAGE_GAP_PX, PX_PER_IN, clampMargin, pageHeightPx } from "../../utils/docPageGeometry";
+import type { DocMargins } from "../../utils/docTypes";
+import { PAGE_GAP_PX, PX_PER_IN, clampMargin, pageHeightPx, pageWidthPx, type PageFormat } from "../../utils/docPageGeometry";
 import { effectiveLeftIn } from "../../utils/docIndentExtension";
 
 export type RulerUnit = "in" | "cm";
@@ -251,7 +251,8 @@ function measureParagraph(editor: Editor, pageEl: HTMLElement): ParagraphMetrics
 
 export interface DocHorizontalRulerProps {
   editor: Editor;
-  pageSize: DocPageSize;
+  // Paper size and orientation - the ruler spans the page as laid out.
+  page: PageFormat;
   margins: DocMargins;
   unit: RulerUnit;
   onUnitChange: (u: RulerUnit) => void;
@@ -265,7 +266,7 @@ export interface DocHorizontalRulerProps {
 
 export const DocHorizontalRuler: React.FC<DocHorizontalRulerProps> = ({
   editor,
-  pageSize,
+  page,
   margins,
   unit,
   onUnitChange,
@@ -275,7 +276,7 @@ export const DocHorizontalRuler: React.FC<DocHorizontalRulerProps> = ({
   guideLengthPx,
 }) => {
   const boxRef = useRef<HTMLDivElement>(null);
-  const [widthPx, setWidthPx] = useState(() => PAGE_DIMENSIONS_IN[pageSize].width * PX_PER_IN);
+  const [widthPx, setWidthPx] = useState(() => pageWidthPx(page));
   const [para, setPara] = useState<ParagraphMetrics | null>(null);
   const [optionsOpen, setOptionsOpen] = useState(false);
   const { drag, begin } = useRulerDrag();
@@ -315,7 +316,7 @@ export const DocHorizontalRuler: React.FC<DocHorizontalRulerProps> = ({
       (dx, ev) => {
         const raw = startIn + (side === "left" ? dx : -dx) / PX_PER_IN;
         const { value, locked } = snapValue(raw, unit, ev.altKey, []);
-        const v = clampMargin(pageSize, margins, side, value);
+        const v = clampMargin(page, margins, side, value);
         return {
           kind: `margin-${side}`,
           valueIn: v,
@@ -387,7 +388,7 @@ export const DocHorizontalRuler: React.FC<DocHorizontalRulerProps> = ({
     if (step === null) return;
     e.preventDefault();
     const raw = margins[side] + (side === "left" ? step : -step);
-    onMarginsChange({ ...margins, [side]: clampMargin(pageSize, margins, side, raw) });
+    onMarginsChange({ ...margins, [side]: clampMargin(page, margins, side, raw) });
   };
 
   // While dragging a marker, show it at the dragged position.
@@ -617,7 +618,8 @@ const IndentOptions: React.FC<{
 // Vertical ruler
 
 export interface DocVerticalRulerProps {
-  pageSize: DocPageSize;
+  // Paper size and orientation - the ruler spans the page as laid out.
+  page: PageFormat;
   margins: DocMargins;
   unit: RulerUnit;
   onMarginsChange: (m: DocMargins) => void;
@@ -631,7 +633,7 @@ export interface DocVerticalRulerProps {
 }
 
 export const DocVerticalRuler: React.FC<DocVerticalRulerProps> = ({
-  pageSize,
+  page,
   margins,
   unit,
   onMarginsChange,
@@ -641,7 +643,7 @@ export const DocVerticalRuler: React.FC<DocVerticalRulerProps> = ({
   topInset,
   guideLengthPx,
 }) => {
-  const pageH = pageHeightPx(pageSize);
+  const pageH = pageHeightPx(page);
   const [pageTop, setPageTop] = useState(0); // current page's top, relative to this ruler's top
   const { drag, begin } = useRulerDrag();
 
@@ -687,7 +689,7 @@ export const DocVerticalRuler: React.FC<DocVerticalRulerProps> = ({
       (dy, ev) => {
         const raw = startIn + (side === "top" ? dy : -dy) / PX_PER_IN;
         const { value, locked } = snapValue(raw, unit, ev.altKey, []);
-        const v = clampMargin(pageSize, margins, side, value);
+        const v = clampMargin(page, margins, side, value);
         return {
           kind: side,
           valueIn: v,
@@ -703,7 +705,7 @@ export const DocVerticalRuler: React.FC<DocVerticalRulerProps> = ({
     const step = keyStep(e, unit);
     if (step === null) return;
     e.preventDefault();
-    onMarginsChange({ ...margins, [side]: clampMargin(pageSize, margins, side, margins[side] + (side === "top" ? step : -step)) });
+    onMarginsChange({ ...margins, [side]: clampMargin(page, margins, side, margins[side] + (side === "top" ? step : -step)) });
   };
 
   const shownTop = drag?.kind === "top" ? drag.posPx : topPx;

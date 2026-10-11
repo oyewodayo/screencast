@@ -23,7 +23,8 @@ import { latexToUnicode } from "../docBibliography";
 import type { Segment } from "../docCitationStyles";
 import type { DocBodyStyle, DocLayout } from "../docLayout";
 import { DEFAULT_NUMBERING, parseNumeral, type LabelStyle, type NumberingStyle } from "../docNumbering";
-import type { DocMargins, DocPageSize } from "../docTypes";
+import type { DocMargins } from "../docTypes";
+import { pageFormatForPoints, type PageFormat } from "../docPageGeometry";
 
 export interface BuildAssets {
   // CSS font-family stack for a PDF font (its own embedded face or a bundled equivalent).
@@ -47,7 +48,7 @@ export interface BuildInput {
 export interface BuildResult {
   doc: JSONContent;
   title: string;
-  pageSize: DocPageSize;
+  page: PageFormat;
   margins: DocMargins;
   layout: DocLayout;
   numbering: NumberingStyle;
@@ -92,10 +93,10 @@ function validLatex(latex: string, display: boolean): boolean {
 // ----------------------------------------------------------------------------------------------
 // Page setup
 
-function pageSetup(pages: PageAnalysis[], lines: FlowLine[]): { pageSize: DocPageSize; margins: DocMargins; columns: 1 | 2; gutterIn: number } {
+function pageSetup(pages: PageAnalysis[], lines: FlowLine[]): { page: PageFormat; margins: DocMargins; columns: 1 | 2; gutterIn: number } {
   const w = median(pages.map((p) => p.width));
   const h = median(pages.map((p) => p.height));
-  const pageSize: DocPageSize = Math.abs(w - 595) < 12 && Math.abs(h - 842) < 12 ? "a4" : Math.abs(h - 1008) < 12 ? "legal" : "letter";
+  const page = pageFormatForPoints(w, h);
   const twoCol = pages.filter((p) => p.columns.twoColumn);
   const columns: 1 | 2 = twoCol.length >= Math.max(1, pages.length / 2) ? 2 : 1;
   const left = median(pages.map((p) => p.columns.full[0]));
@@ -117,7 +118,7 @@ function pageSetup(pages: PageAnalysis[], lines: FlowLine[]): { pageSize: DocPag
   const bottom = bottoms.length ? median(bottoms) : 72;
   const gutter = twoCol.length ? median(twoCol.map((p) => p.columns.right[0] - p.columns.left[1])) : 18;
   const clampIn = (pt: number) => Math.max(0.25, Math.min(2.5, toIn(pt)));
-  return { pageSize, margins: { top: clampIn(top), bottom: clampIn(bottom), left: clampIn(left), right: clampIn(right) }, columns, gutterIn: toIn(Math.max(6, gutter)) };
+  return { page, margins: { top: clampIn(top), bottom: clampIn(bottom), left: clampIn(left), right: clampIn(right) }, columns, gutterIn: toIn(Math.max(6, gutter)) };
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -600,7 +601,7 @@ export function buildDocument(input: BuildInput): BuildResult {
   if (content.length === 0) content.push({ type: "paragraph" });
 
   const layout: DocLayout = { columns: setup.columns, columnGap: setup.gutterIn, body };
-  return { doc: { type: "doc", content }, title: title || "Imported PDF", pageSize: setup.pageSize, margins: setup.margins, layout, numbering, references, stats };
+  return { doc: { type: "doc", content }, title: title || "Imported PDF", page: setup.page, margins: setup.margins, layout, numbering, references, stats };
 }
 
 // A contents list as a rule-less three-column table - label, text, page - drawn with dot leaders

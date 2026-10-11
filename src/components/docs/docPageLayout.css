@@ -30,7 +30,8 @@
 .doc-page-gap-start {
   position: relative;
   margin: 0 3px;
-  background: #ffffff;
+  /* The page's own paper (docLayout.css) - white, the dark-mode page, or the document's colour. */
+  background: var(--doc-paper, #ffffff);
   border-left: 1px solid #e5e5e5;
   border-right: 1px solid #e5e5e5;
 }
@@ -47,7 +48,6 @@
 
 .dark .doc-page-gap-end,
 .dark .doc-page-gap-start {
-  background: #171717;
   border-color: #262626;
   box-shadow: none;
 }

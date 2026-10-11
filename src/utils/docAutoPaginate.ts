@@ -17,13 +17,14 @@ import { Extension } from "@tiptap/core";
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { EditorView } from "@tiptap/pm/view";
-import type { DocMargins, DocPageSize } from "./docTypes";
-import { DEFAULT_MARGINS, PAGE_GAP_PX, inToPx, pageContentHeightPx } from "./docPageGeometry";
+import type { DocMargins } from "./docTypes";
+import { DEFAULT_MARGINS, DEFAULT_PAGE, PAGE_GAP_PX, inToPx, pageContentHeightPx, type PageFormat } from "./docPageGeometry";
 
 interface PaginationState {
   // Pages in the live preview (gaps + 1) - shown in the editor header next to the word count.
   pageCount: number;
-  pageSize: DocPageSize;
+  // Paper size and orientation - landscape pages are wider and shorter, so they break sooner.
+  page: PageFormat;
   margins: DocMargins;
   // 2 = two-column page (docLayout.ts): the browser's own multicol layout breaks columns and pages
   // (see DocsEditor.tsx's column rules), so this plugin draws no gaps and only counts the pages.
@@ -34,7 +35,7 @@ interface PaginationState {
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
     docAutoPaginate: {
-      setPaginationLayout: (pageSize: DocPageSize, margins: DocMargins, columns?: 1 | 2) => ReturnType;
+      setPaginationLayout: (page: PageFormat, margins: DocMargins, columns?: 1 | 2) => ReturnType;
     };
   }
 }
@@ -155,18 +156,18 @@ export function columnRowGapPx(margins: DocMargins): number {
 
 // The page (1-based) a top-level block at `top` px below the editor's top lands on, in the
 // two-column view.
-function columnPageAt(top: number, pageSize: DocPageSize, margins: DocMargins): number {
-  const pitch = pageContentHeightPx(pageSize, margins) + columnRowGapPx(margins);
+function columnPageAt(top: number, page: PageFormat, margins: DocMargins): number {
+  const pitch = pageContentHeightPx(page, margins) + columnRowGapPx(margins);
   return Math.max(1, Math.floor((top + 0.5) / pitch) + 1);
 }
 
-function columnPageCount(view: EditorView, pageSize: DocPageSize, margins: DocMargins): number {
-  const content = pageContentHeightPx(pageSize, margins);
+function columnPageCount(view: EditorView, page: PageFormat, margins: DocMargins): number {
+  const content = pageContentHeightPx(page, margins);
   const gap = columnRowGapPx(margins);
   return Math.max(1, Math.round((view.dom.getBoundingClientRect().height + gap) / (content + gap)));
 }
 
-function computeDecorations(view: EditorView, pageSize: DocPageSize, margins: DocMargins, columns: 1 | 2): PaginationResult & { pageCount?: number } {
+function computeDecorations(view: EditorView, page: PageFormat, margins: DocMargins, columns: 1 | 2): PaginationResult & { pageCount?: number } {
   const { state } = view;
   if (columns === 2) {
     // A page break is a forced column break (docLayout.css); one in the left column gets a second
@@ -195,14 +196,14 @@ function computeDecorations(view: EditorView, pageSize: DocPageSize, margins: Do
         breaks.push(pos);
       }
     });
-    const pageCount = columnPageCount(view, pageSize, margins);
+    const pageCount = columnPageCount(view, page, margins);
     return {
       decorations: DecorationSet.create(state.doc, decorations),
       pageCount,
-      signature: `cols:${pageSize}:${margins.top},${margins.right},${margins.bottom},${margins.left}|${pageCount}|${breaks.join(",")}`,
+      signature: `cols:${page.size}-${page.orientation}:${margins.top},${margins.right},${margins.bottom},${margins.left}|${pageCount}|${breaks.join(",")}`,
     };
   }
-  const contentHeight = pageContentHeightPx(pageSize, margins);
+  const contentHeight = pageContentHeightPx(page, margins);
   const containerTop = view.dom.getBoundingClientRect().top;
   const decorations: Decoration[] = [];
   const signatureParts: string[] = [];
@@ -296,7 +297,7 @@ function computeDecorations(view: EditorView, pageSize: DocPageSize, margins: Do
 
   // Layout is part of the signature: gap widgets carry the side margins, so a margin change must
   // redraw them even when every break lands in the same place.
-  const layout = `${pageSize}:${margins.top},${margins.right},${margins.bottom},${margins.left}`;
+  const layout = `${page.size}-${page.orientation}:${margins.top},${margins.right},${margins.bottom},${margins.left}`;
   return { decorations: DecorationSet.create(state.doc, decorations), signature: `${layout}|${signatureParts.join("|")}` };
 }
 
@@ -306,9 +307,9 @@ const DocAutoPaginate = Extension.create({
   addCommands() {
     return {
       setPaginationLayout:
-        (pageSize: DocPageSize, margins: DocMargins, columns: 1 | 2 = 1) =>
+        (page: PageFormat, margins: DocMargins, columns: 1 | 2 = 1) =>
         ({ tr, dispatch }) => {
-          if (dispatch) dispatch(tr.setMeta(DocAutoPaginatePluginKey, { pageSize, margins, columns }));
+          if (dispatch) dispatch(tr.setMeta(DocAutoPaginatePluginKey, { page, margins, columns }));
           return true;
         },
     };
@@ -319,10 +320,10 @@ const DocAutoPaginate = Extension.create({
       new Plugin<PaginationState>({
         key: DocAutoPaginatePluginKey,
         state: {
-          init: (): PaginationState => ({ pageSize: "letter", margins: DEFAULT_MARGINS, columns: 1, decorations: DecorationSet.empty, pageCount: 1 }),
+          init: (): PaginationState => ({ page: DEFAULT_PAGE, margins: DEFAULT_MARGINS, columns: 1, decorations: DecorationSet.empty, pageCount: 1 }),
           apply(tr, prev) {
             const meta = tr.getMeta(DocAutoPaginatePluginKey) as Partial<PaginationState> | undefined;
-            if (meta?.pageSize) return { ...prev, pageSize: meta.pageSize, margins: meta.margins ?? prev.margins, columns: meta.columns ?? prev.columns };
+            if (meta?.page) return { ...prev, page: meta.page, margins: meta.margins ?? prev.margins, columns: meta.columns ?? prev.columns };
             if (meta?.decorations)
               return {
                 ...prev,
@@ -350,7 +351,7 @@ const DocAutoPaginate = Extension.create({
             frame = requestAnimationFrame(() => {
               frame = null;
               const st = DocAutoPaginatePluginKey.getState(editorView.state);
-              const result = computeDecorations(editorView, st?.pageSize ?? "letter", st?.margins ?? DEFAULT_MARGINS, st?.columns ?? 1);
+              const result = computeDecorations(editorView, st?.page ?? DEFAULT_PAGE, st?.margins ?? DEFAULT_MARGINS, st?.columns ?? 1);
               if (result.signature === lastSignature) return;
               lastSignature = result.signature;
               editorView.dispatch(editorView.state.tr.setMeta(DocAutoPaginatePluginKey, { decorations: result.decorations, pageCount: result.pageCount }));
@@ -374,7 +375,7 @@ const DocAutoPaginate = Extension.create({
               // the ResizeObserver above wouldn't fire for it on its own - catch that case here.
               const prev = DocAutoPaginatePluginKey.getState(prevState);
               const next = DocAutoPaginatePluginKey.getState(view.state);
-              if (prev?.pageSize !== next?.pageSize || prev?.margins !== next?.margins || prev?.columns !== next?.columns) scheduleRecompute();
+              if (prev?.page !== next?.page || prev?.margins !== next?.margins || prev?.columns !== next?.columns) scheduleRecompute();
               // Two columns: the rows have a fixed height, so an edit that moves a page break
               // between columns may not resize anything - re-check after every edit (one per frame).
               else if (next?.columns === 2 && !prevState.doc.eq(view.state.doc)) scheduleRecompute();
@@ -406,7 +407,7 @@ export function pageAtPos(view: EditorView, pos: number): number {
   if (st?.columns === 2) {
     const dom = view.nodeDOM(top);
     if (!(dom instanceof HTMLElement)) return 1;
-    return columnPageAt(dom.getBoundingClientRect().top - view.dom.getBoundingClientRect().top, st.pageSize, st.margins);
+    return columnPageAt(dom.getBoundingClientRect().top - view.dom.getBoundingClientRect().top, st.page, st.margins);
   }
   let page = 1;
   view.dom.querySelectorAll<HTMLElement>(".doc-page-gap").forEach((gap) => {

@@ -14,6 +14,7 @@ import {
   BookmarkStart,
   BorderStyle,
   ShadingType,
+  PageOrientation,
   CommentReference,
   CommentRangeEnd,
   CommentRangeStart,
@@ -44,8 +45,8 @@ import {
   WidthType,
 } from "docx";
 import { invoke } from "@tauri-apps/api/core";
-import type { DocComment, DocMargins, DocPageSize } from "./docTypes";
-import { PAGE_DIMENSIONS_IN, resolveMargins } from "./docPageGeometry";
+import type { DocComment, DocMargins, DocOrientation, DocPageSize } from "./docTypes";
+import { PAGE_DIMENSIONS_IN, normalizePageColor, pageDimensionsIn, pageFormat, resolveMargins } from "./docPageGeometry";
 import { latexToOmml } from "./docMathOmml";
 import { wordFontFor } from "./docFonts";
 import { captionLabel, crossRefText, type DocStructure } from "./docStructure";
@@ -674,7 +675,12 @@ class DocxBuilder {
     this.headingPages = options.headingPages ?? [];
     // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
     // the doc's own margins, not docx's unrelated defaults.
-    const dims = PAGE_DIMENSIONS_IN[options.pageSize ?? "letter"];
+    // `dims` is the page as laid out (swapped for landscape) - the text width comes from it; Word
+    // itself wants the portrait size plus an orientation flag, and swaps them (docx's PageSize).
+    const page = pageFormat(options.pageSize, options.orientation);
+    const dims = pageDimensionsIn(page);
+    const paper = PAGE_DIMENSIONS_IN[page.size];
+    const pageColor = normalizePageColor(options.pageColor);
     const m = resolveMargins(options.margins);
     this.textWidthTwips = Math.round((dims.width - m.left - m.right) * TWIPS_PER_IN);
     const children = await this.renderBlocks(json.content ?? []);
@@ -698,19 +704,22 @@ class DocxBuilder {
       };
     });
 
-    const width = `${dims.width}in` as PositiveUniversalMeasure;
-    const height = `${dims.height}in` as PositiveUniversalMeasure;
+    const width = `${paper.width}in` as PositiveUniversalMeasure;
+    const height = `${paper.height}in` as PositiveUniversalMeasure;
     const inch = (v: number) => `${v}in` as PositiveUniversalMeasure;
 
     const doc = new Document({
       title,
       numbering: { config: this.numberingConfigs },
       comments: commentChildren.length > 0 ? { children: commentChildren } : undefined,
+      // Page colour - Word shows it because docx also writes w:displayBackgroundShape. Text left at
+      // Word's "automatic" colour turns white on a dark page by itself, as it does on screen here.
+      background: pageColor ? { color: pageColor.slice(1).toUpperCase() } : undefined,
       sections: [
         {
           properties: {
             page: {
-              size: { width, height },
+              size: { width, height, orientation: page.orientation === "landscape" ? PageOrientation.LANDSCAPE : PageOrientation.PORTRAIT },
               margin: { top: inch(m.top), bottom: inch(m.bottom), left: inch(m.left), right: inch(m.right) },
             },
           },
@@ -742,6 +751,8 @@ export interface DocxExportOptions {
   // Page of each heading in document order, as Docs paginates it - the table of contents' numbers.
   headingPages?: number[];
   pageSize?: DocPageSize | null;
+  orientation?: DocOrientation | null;
+  pageColor?: string | null;
   headerText?: string | null;
   footerText?: string | null;
   margins?: DocMargins | null;

@@ -43,11 +43,17 @@ export interface DocMargins {
   left: number;
 }
 
+// null on a doc = portrait (docs.rs DocMeta.orientation stores only "landscape").
+export type DocOrientation = "portrait" | "landscape";
+
 export interface DocPageSetupPatch {
   pageSize?: DocPageSize | null;
   headerText?: string | null;
   footerText?: string | null;
   margins?: DocMargins | null;
+  orientation?: DocOrientation | null;
+  // "#rrggbb" paper colour; null = white.
+  pageColor?: string | null;
 }
 
 // Frontend mirror of docs.rs's DocComment - see its own header comment on why the anchored text

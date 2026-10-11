@@ -1,7 +1,7 @@
 // utils/templates/types.ts
 import type { BibEntry, CitationStyleId } from "../docBibliography";
 import type { DocBodyStyle } from "../docLayout";
-import type { DocMargins, DocPageSize } from "../docTypes";
+import type { DocMargins, DocOrientation, DocPageSize } from "../docTypes";
 
 export type DocTemplateCategory = "Research" | "Work" | "Personal";
 
@@ -23,7 +23,7 @@ export interface DocTemplate {
   docTitle: (today: string) => string;
   html: (today: string) => string;
   layout?: DocTemplateLayout;
-  pageSetup?: { pageSize?: DocPageSize; margins?: DocMargins; headerText?: string; footerText?: string };
+  pageSetup?: { pageSize?: DocPageSize; orientation?: DocOrientation; pageColor?: string; margins?: DocMargins; headerText?: string; footerText?: string };
   // Seeds the document's reference library, so citations in the template resolve on first open.
   references?: BibEntry[];
   citationStyle?: CitationStyleId;

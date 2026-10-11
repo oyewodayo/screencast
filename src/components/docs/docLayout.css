@@ -159,14 +159,13 @@
   position: absolute;
   left: 0;
   right: 0;
-  background: #ffffff;
+  background: var(--doc-paper, #ffffff);
   box-shadow:
     0 0 0 1px #e5e5e5,
     0 1px 3px rgba(60, 64, 67, 0.15);
   pointer-events: none;
 }
 .dark .doc-sheet {
-  background: #171717;
   box-shadow: 0 0 0 1px #262626;
 }
 
@@ -273,6 +272,13 @@
 .ProseMirror :is(th, td)[data-shade="dark"],
 .ProseMirror :is(th, td)[data-shade="dark"] :is(h1, h2, h3, h4, h5, h6, strong, a) {
   color: #ffffff;
+}
+/* On dark paper (a page colour like navy) the text turns light, but a light cell fill keeps its
+   full colour in the light theme - so text inside it goes back to dark. (In the dark theme those
+   fills are tinted down, below, and light text is right.) */
+:root:not(.dark) :is(.doc-page-card, .doc-preview-paper)[data-page-dark] .ProseMirror :is(th, td)[data-background]:not([data-shade="dark"]),
+:root:not(.dark) :is(.doc-page-card, .doc-preview-paper)[data-page-dark] .ProseMirror :is(th, td)[data-background]:not([data-shade="dark"]) :is(p, li, strong, em, a, h1, h2, h3, h4, h5, h6, code) {
+  color: #1f2937;
 }
 /* On the dark page a full-strength pastel would glare behind light text - keep the hue, drop it
    to a tint. Dark fills stay as they are. */
@@ -442,6 +448,34 @@
 }
 .dark .doc-page-card {
   --doc-paper: #171717;
+}
+/* Page colour (Page setup): the document's own paper. In dark mode a light colour is kept as a
+   tint over the dark page - its hue shows, but the app's light text stays readable on it; a dark
+   colour (data-page-dark, which also flips the text light) is shown as it is. Print and PDF always
+   render in the light theme (DocsEditor.tsx), so paper is printed in its true colour. */
+/* DocsHome's page previews (DocPagePreview.tsx): the same paper as the editor's page. Before the
+   page-colour rules below, which must win over these at equal specificity. */
+.doc-preview-paper {
+  --doc-paper: #ffffff;
+  background: var(--doc-paper);
+}
+.dark .doc-preview-paper {
+  --doc-paper: #171717;
+}
+.doc-page-card[data-page-color],
+.doc-preview-paper[data-page-color] {
+  --doc-paper: var(--doc-page-color);
+}
+.dark .doc-page-card[data-page-color]:not([data-page-dark]),
+.dark .doc-preview-paper[data-page-color]:not([data-page-dark]) {
+  --doc-paper: color-mix(in srgb, var(--doc-page-color) 22%, #171717);
+}
+@media print {
+  .doc-page-card[data-page-color] {
+    --doc-paper: var(--doc-page-color) !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
 }
 .ProseMirror .tableWrapper[data-rules="leaders"] table {
   width: 100% !important;
