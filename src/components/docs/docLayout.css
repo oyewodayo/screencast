@@ -235,6 +235,91 @@
   background: rgba(96, 165, 250, 0.2);
 }
 
+/* ---------- Layout tables (rules "none") ---------- */
+/* No rules at all - a table used to place things side by side (a résumé's sidebar, a letterhead,
+   a two-column signature block). Roomier padding than a typeset table, since shaded layout cells
+   read as panels. While editing, faint dashed guides show where the cells are; they never print. */
+.ProseMirror .tableWrapper[data-rules="none"] :is(th, td) {
+  padding: 0.45em 0.75em !important;
+  vertical-align: top;
+}
+.ProseMirror .tableWrapper[data-rules="none"] tr:has(> th) + tr:not(:has(> th)) > td {
+  border-top: 0 !important;
+}
+.ProseMirror[contenteditable="true"] .tableWrapper[data-rules="none"] :is(th, td) {
+  outline: 1px dashed rgba(148, 163, 184, 0.45);
+  outline-offset: -1px;
+}
+@media print {
+  .ProseMirror .tableWrapper[data-rules="none"] :is(th, td) {
+    outline: 0 !important;
+  }
+}
+
+/* A heading or list at the top of a cell sits at the cell's top edge, not a heading's page-level
+   skip below it (a résumé sidebar's first section title, a callout's opening line). */
+.ProseMirror :is(td, th) > :first-child {
+  margin-top: 0 !important;
+}
+
+/* ---------- Cell shading (docTableCellShading.ts) ---------- */
+/* Beats both the grid's header tint and the rule styles' forced-transparent cells. */
+.ProseMirror :is(th, td)[data-background],
+.ProseMirror .tableWrapper[data-rules] :is(th, td)[data-background] {
+  background-color: var(--cell-bg) !important;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+.ProseMirror :is(th, td)[data-shade="dark"],
+.ProseMirror :is(th, td)[data-shade="dark"] :is(h1, h2, h3, h4, h5, h6, strong, a) {
+  color: #ffffff;
+}
+/* On the dark page a full-strength pastel would glare behind light text - keep the hue, drop it
+   to a tint. Dark fills stay as they are. */
+.dark .ProseMirror :is(th, td)[data-background]:not([data-shade="dark"]) {
+  background-color: color-mix(in srgb, var(--cell-bg) 22%, transparent) !important;
+}
+
+/* ---------- Checklists (task lists) ---------- */
+.ProseMirror ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0.1em;
+}
+.ProseMirror ul[data-type="taskList"] li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55em;
+  padding-left: 0;
+}
+.ProseMirror ul[data-type="taskList"] li::marker {
+  content: none;
+}
+.ProseMirror ul[data-type="taskList"] li > label {
+  flex: none;
+  display: flex;
+  align-items: center;
+  height: 1.6em;
+  user-select: none;
+}
+.ProseMirror ul[data-type="taskList"] li > label input {
+  width: 1em;
+  height: 1em;
+  margin: 0;
+  accent-color: #2563eb;
+  cursor: pointer;
+}
+.ProseMirror ul[data-type="taskList"] li > div {
+  flex: 1;
+  min-width: 0;
+}
+.ProseMirror ul[data-type="taskList"] li > div > p {
+  margin: 0;
+}
+.ProseMirror ul[data-type="taskList"] li[data-checked="true"] > div {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
 /* ---------- Exact pages (docPdfPage.ts) ---------- */
 
 .doc-pdf-page {

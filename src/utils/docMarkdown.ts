@@ -103,7 +103,7 @@ function renderListItem(node: JSONContent, prefix: string, comments: DocComment[
     .map((p) => renderInline(p.content, comments))
     .join(" ");
   let result = prefix + text;
-  const nestedLists = children.filter((c) => c.type === "bulletList" || c.type === "orderedList");
+  const nestedLists = children.filter((c) => c.type === "bulletList" || c.type === "orderedList" || c.type === "taskList");
   for (const nested of nestedLists) {
     const indented = renderBlock(nested, comments)
       .split("\n")
@@ -124,6 +124,9 @@ function renderBlock(node: JSONContent, comments: DocComment[]): string {
     }
     case "bulletList":
       return (node.content ?? []).map((li) => renderListItem(li, "- ", comments)).join("\n");
+    // GitHub-flavoured task list syntax.
+    case "taskList":
+      return (node.content ?? []).map((li) => renderListItem(li, li.attrs?.checked ? "- [x] " : "- [ ] ", comments)).join("\n");
     case "orderedList": {
       const start = (node.attrs?.start as number) ?? 1;
       return (node.content ?? []).map((li, i) => renderListItem(li, `${start + i}. `, comments)).join("\n");

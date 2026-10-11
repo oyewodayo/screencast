@@ -99,7 +99,9 @@ export const Caption = Node.create({
     };
   },
   parseHTML() {
-    return [{ tag: "p[data-caption]" }, { tag: "figcaption" }];
+    // Above the default 50 so this wins over the paragraph node's plain "p" rule - otherwise a
+    // pasted/templated caption parses as an ordinary paragraph and loses its numbering.
+    return [{ tag: "p[data-caption]", priority: 60 }, { tag: "figcaption" }];
   },
   renderHTML({ HTMLAttributes }) {
     return ["p", mergeAttributes(HTMLAttributes, { class: "doc-caption" }), 0];

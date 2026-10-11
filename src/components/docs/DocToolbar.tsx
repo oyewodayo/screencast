@@ -34,6 +34,7 @@ import {
   MdFormatLineSpacing,
   MdFormatListBulleted,
   MdFormatListNumbered,
+  MdChecklist,
   MdFormatQuote,
   MdFormatUnderlined,
   MdHorizontalRule,
@@ -56,6 +57,7 @@ import {
 import { BiHighlight } from "react-icons/bi";
 import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbListDetails, TbMath, TbMathFunction, TbPhoto, TbQuote, TbTable, TbTableOptions } from "react-icons/tb";
 import { topBlockAt, type TableRules } from "../../utils/docBlockFormat";
+import { CELL_SHADES } from "../../utils/docTableCellShading";
 import DocColorPicker from "./DocColorPicker";
 import { DICTATION_LANGUAGES, DocDictation } from "../../hooks/useDocDictation";
 import { PaintKind, getPaintState } from "../../utils/docPaintExtension";
@@ -1128,6 +1130,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
                 ["booktabs", "Booktabs", "Rules above, below and under the header"],
                 ["doubled", "Journal", "Double rules, as in APS and RevTeX"],
                 ["leaders", "Contents", "Number | title | page, with dot leaders - for a list of figures or tables"],
+                ["none", "Layout (no lines)", "No borders - for side-by-side panels such as a résumé sidebar"],
               ] as [TableRules | null, string, string][]
             ).map(([value, label, hint]) => (
               <button
@@ -1159,6 +1162,34 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
               <span className="w-4 shrink-0">{tableNode?.attrs.fit && <TbCheck size={15} />}</span>
               Fit width to content
             </button>
+            <div className="my-1 h-px bg-neutral-200 dark:bg-neutral-700" />
+            <div className="px-3 pt-1 pb-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Cell shading</div>
+            <div className="px-3 pb-1.5 flex flex-wrap gap-1.5">
+              <button
+                type="button"
+                aria-label="No shading"
+                data-tip="No shading"
+                onClick={() => {
+                  editor.chain().focus().setCellAttribute("background", null).run();
+                  close();
+                }}
+                className="w-6 h-6 rounded border border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 bg-[linear-gradient(135deg,transparent_45%,#ef4444_45%,#ef4444_55%,transparent_55%)]"
+              />
+              {CELL_SHADES.map((shade) => (
+                <button
+                  key={shade.value}
+                  type="button"
+                  aria-label={`${shade.label} shading`}
+                  data-tip={shade.label}
+                  onClick={() => {
+                    editor.chain().focus().setCellAttribute("background", shade.value).run();
+                    close();
+                  }}
+                  className="w-6 h-6 rounded border border-neutral-300 dark:border-neutral-600"
+                  style={{ backgroundColor: shade.value }}
+                />
+              ))}
+            </div>
             {twoColumns && (
               <button
                 type="button"
@@ -1205,6 +1236,9 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
           </ToolButton>
           <ToolButton label="Numbered list" shortcut="Ctrl+Shift+7" active={editor.isActive("orderedList")} onClick={() => editor.chain().focus().toggleOrderedList().run()}>
             <MdFormatListNumbered size={19} />
+          </ToolButton>
+          <ToolButton label="Checklist" shortcut="Ctrl+Shift+9" active={editor.isActive("taskList")} onClick={() => editor.chain().focus().toggleTaskList().run()}>
+            <MdChecklist size={19} />
           </ToolButton>
         </div>
 
@@ -1256,6 +1290,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
           <MenuSection title="Lists" className="@3xl:hidden">
             {menuAction("Bulleted list", MdFormatListBulleted, () => editor.chain().focus().toggleBulletList().run(), { active: editor.isActive("bulletList") })}
             {menuAction("Numbered list", MdFormatListNumbered, () => editor.chain().focus().toggleOrderedList().run(), { active: editor.isActive("orderedList") })}
+            {menuAction("Checklist", MdChecklist, () => editor.chain().focus().toggleTaskList().run(), { active: editor.isActive("taskList") })}
           </MenuSection>
           <MenuSection title="Insert" className="@4xl:hidden">
             {menuAction("Image", MdImage, onInsertImage)}

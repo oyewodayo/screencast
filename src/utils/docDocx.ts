@@ -13,6 +13,7 @@ import {
   BookmarkEnd,
   BookmarkStart,
   BorderStyle,
+  ShadingType,
   CommentReference,
   CommentRangeEnd,
   CommentRangeStart,
@@ -429,7 +430,14 @@ class DocxBuilder {
       children.push(...rendered);
     }
     if (children.length === 0) children.push(new Paragraph({}));
-    return new TableCell({ children, width: { size: 100 / (cell.attrs?.colspan ?? 1), type: WidthType.PERCENTAGE } });
+    const background = cell.attrs?.background as string | null | undefined;
+    return new TableCell({
+      children,
+      width: { size: 100 / (cell.attrs?.colspan ?? 1), type: WidthType.PERCENTAGE },
+      columnSpan: (cell.attrs?.colspan as number | undefined) ?? undefined,
+      shading: background ? { fill: background.slice(1).toUpperCase(), type: ShadingType.CLEAR, color: "auto" } : undefined,
+      margins: background ? { top: 100, bottom: 100, left: 140, right: 140 } : undefined,
+    });
   }
 
   private async renderTable(node: JSONContent): Promise<Table | null> {
@@ -455,9 +463,39 @@ class DocxBuilder {
         left: { style: BorderStyle.NONE, size: 0, color: "auto" },
         right: { style: BorderStyle.NONE, size: 0, color: "auto" },
         insideVertical: { style: BorderStyle.NONE, size: 0, color: "auto" },
-        insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: "D1D5DB" },
+        // A layout table (rules "none" - résumé sidebars, callout boxes) has no lines at all.
+        insideHorizontal:
+          node.attrs?.rules === "none" ? { style: BorderStyle.NONE, size: 0, color: "auto" } : { style: BorderStyle.SINGLE, size: 4, color: "D1D5DB" },
       },
     });
+  }
+
+  // ☐ / ☒ glyphs in front of each item - Word's own checkbox content controls aren't something the
+  // docx library can build, and the glyphs print and convert to PDF identically everywhere.
+  private async renderTaskList(node: JSONContent, level: number): Promise<Paragraph[]> {
+    const out: Paragraph[] = [];
+    for (const item of node.content ?? []) {
+      const checked = item.attrs?.checked === true;
+      let first = true;
+      for (const child of item.content ?? []) {
+        if (child.type === "paragraph") {
+          const runs = await renderInline(child.content, this.inline);
+          out.push(
+            new Paragraph({
+              children: first ? [new TextRun({ text: checked ? "☒ " : "☐ ", font: "Segoe UI Symbol" }), ...runs] : runs,
+              indent: { left: 360 * (level + 1), hanging: first ? 300 : 0 },
+              alignment: alignmentFor(child),
+            })
+          );
+          first = false;
+        } else if (child.type === "taskList") {
+          out.push(...(await this.renderTaskList(child, level + 1)));
+        } else {
+          for (const block of await this.renderBlock(child)) if (block instanceof Paragraph) out.push(block);
+        }
+      }
+    }
+    return out;
   }
 
   // extraParagraphProps carries context a container passes down into any Paragraph it produces -
@@ -497,6 +535,8 @@ class DocxBuilder {
         return this.renderBulletList(node, 0);
       case "orderedList":
         return this.renderOrderedList(node, 0);
+      case "taskList":
+        return this.renderTaskList(node, 0);
       case "blockquote": {
         // docx has no first-class blockquote - approximated with an indent + left border, passed
         // down into whatever paragraphs its contained blocks produce.

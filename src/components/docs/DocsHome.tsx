@@ -4,17 +4,22 @@
 // BoardHome.tsx's list/create/delete UX closely (including its two-step delete confirm and
 // click-outside-closes-menu handling) since Docs and Board are both per-item project folders under
 // briefcast_dir(), just with a Y.Doc instead of a canvas as the content.
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
-import { IoAdd, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoOpenOutline, IoPin, IoSearch, IoTrashOutline, IoInformationCircleOutline } from "react-icons/io5";
+import { IoAdd, IoChevronDown, IoChevronUp, IoClose, IoDocumentText, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoOpenOutline, IoPin, IoSearch, IoTrashOutline, IoInformationCircleOutline } from "react-icons/io5";
 import { MdFileUpload, MdPictureAsPdf } from "react-icons/md";
 import * as Y from "yjs";
 import { DOC_DRAG_MIME, DocFolder, DocSummary, flattenFolderTree } from "../../utils/docTypes";
 import { getPinnedDocIds, toggleDocPin, forgetDocPin } from "../../utils/docLibraryHistory";
 import { importDocxFile } from "../../utils/docxImport";
 import { extractPlainText } from "../../utils/docYjsText";
+import { DOC_TEMPLATES, DOC_TEMPLATE_CATEGORIES, DocTemplate, createDocFromTemplate, templatePreview } from "../../utils/docTemplates";
+import { loadDocPreview, type DocPreviewData } from "../../utils/docPreview";
+import DocTemplateVariantPicker from "./DocTemplateVariantPicker";
 import DocFolderSidebar from "./DocFolderSidebar";
+import DocPagePreview from "./DocPagePreview";
+import DocTemplateCard from "./DocTemplateCard";
 import FileInfoModal from "../Modals/FileInfoModal";
 import DocPdfImportDialog from "./DocPdfImportDialog";
 
@@ -27,6 +32,53 @@ function formatUpdatedAt(iso: string): string {
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
+
+const DOC_GRID_CLASS = "grid gap-5 grid-cols-[repeat(auto-fill,minmax(180px,1fr))]";
+
+// Templates shown in the "Start a new document" row without opening the full gallery.
+const FEATURED_TEMPLATE_IDS = ["research-paper", "lab-notebook", "report", "meeting-notes", "project-proposal", "resume"];
+
+// A doc card's first-page thumbnail - only loaded once the card scrolls into view, so a large
+// library doesn't decode every document up front just to show the top of the grid.
+const DocCardThumbnail: React.FC<{ doc: DocSummary }> = ({ doc }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const [isVisible, setIsVisible] = useState(false);
+  const [preview, setPreview] = useState<DocPreviewData | null>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setIsVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "200px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!isVisible) return;
+    let cancelled = false;
+    void loadDocPreview(doc.id, doc.updated_at).then((result) => {
+      if (!cancelled) setPreview(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isVisible, doc.id, doc.updated_at]);
+
+  return (
+    <div ref={ref} className="border-b border-gray-200 dark:border-neutral-800 rounded-t-md overflow-hidden">
+      <DocPagePreview preview={preview} aspectClassName="aspect-[4/5]" />
+    </div>
+  );
+};
+
 
 const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   const [docs, setDocs] = useState<DocSummary[] | null>(null);
@@ -303,6 +355,40 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     }
   }, [docs, selectedFolderId, onOpenDoc]);
 
+  // Which template (or "blank") is being created right now - drives the "Creating…" overlay on that
+  // card and disables the others so a double click can't make two docs.
+  const [creatingTemplateId, setCreatingTemplateId] = useState<string | null>(null);
+  const [showGallery, setShowGallery] = useState(false);
+  // Which template family (Resume) has its style picker open.
+  const [variantPickerFor, setVariantPickerFor] = useState<DocTemplate | null>(null);
+  const featuredTemplates = useMemo(
+    () => FEATURED_TEMPLATE_IDS.map((id) => DOC_TEMPLATES.find((t) => t.id === id)).filter((t): t is DocTemplate => !!t),
+    []
+  );
+
+  const handleCreateFromTemplate = useCallback(
+    async (template: DocTemplate) => {
+      // A template family (Resume / CV) first asks which style.
+      if (template.variants?.length) {
+        setVariantPickerFor(template);
+        return;
+      }
+      setCreatingTemplateId(template.id);
+      setError(null);
+      try {
+        const id = await createDocFromTemplate(template, selectedFolderId);
+        setVariantPickerFor(null);
+        onOpenDoc(id);
+      } catch (err) {
+        console.error("Failed to create document from template:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setCreatingTemplateId(null);
+      }
+    },
+    [selectedFolderId, onOpenDoc]
+  );
+
   const handleImportDocx = useCallback(async () => {
     setError(null);
     // Both extensions listed so a .doc file is actually pickable - hiding it from the dialog
@@ -375,7 +461,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
         e.dataTransfer.setData(DOC_DRAG_MIME, doc.id);
         e.dataTransfer.effectAllowed = "move";
       }}
-      className="group relative flex flex-col rounded-md bg-white/90 dark:bg-neutral-900/90 border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors cursor-pointer"
+      className="group relative flex flex-col rounded-md bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 hover:shadow-md text-left transition cursor-pointer"
     >
       <div className="absolute top-1.5 right-1.5 z-10">
         <button
@@ -502,14 +588,15 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
         </div>
       )}
 
-      <div className="aspect-video rounded-t-md overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center">
-        <IoDocumentTextOutline size={22} className="text-gray-300 dark:text-neutral-600" />
-      </div>
-      <div className="px-2.5 py-2">
-        <p className="text-sm text-gray-700 dark:text-neutral-200 truncate" data-tip={doc.title || "Untitled document"}>
+      <DocCardThumbnail doc={doc} />
+      <div className="px-3 py-2.5">
+        <p className="text-sm font-medium text-gray-800 dark:text-neutral-100 truncate" data-tip={doc.title || "Untitled document"}>
           {doc.title || "Untitled document"}
         </p>
-        <p className="text-xs text-gray-400 dark:text-neutral-500">{formatUpdatedAt(doc.updated_at)}</p>
+        <p className="mt-0.5 flex items-center gap-1.5 text-xs text-gray-500 dark:text-neutral-400">
+          <IoDocumentText size={13} className="shrink-0 text-blue-500" />
+          Edited {formatUpdatedAt(doc.updated_at)}
+        </p>
       </div>
     </div>
   );
@@ -527,143 +614,219 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
           onDropDoc={handleMoveDocToFolder}
         />
       )}
-      <div className="relative flex-1 min-w-0 flex flex-col items-center justify-start h-full gap-6 px-8 py-10 overflow-y-auto">
-      <div className="relative flex flex-col items-center gap-3 text-center">
-        <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
-          <IoDocumentTextOutline size={28} />
-        </div>
-        <div>
-          <p className="text-gray-700 dark:text-neutral-200 font-medium">Docs</p>
-          <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
-            Write and edit documents right inside Briefcast.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => void handleCreate()}
-          disabled={isCreating}
-          className="mt-1 flex items-center gap-1.5 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
-        >
-          <IoAdd size={16} /> New document
-        </button>
-        <button
-          type="button"
-          onClick={() => void handleImportDocx()}
-          disabled={isImporting}
-          className="flex items-center gap-1.5 px-4 py-2 rounded-md border border-gray-300 dark:border-neutral-700 text-gray-700 dark:text-neutral-200 text-sm font-medium hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors disabled:opacity-50"
-        >
-          <MdFileUpload size={16} /> {isImporting ? "Importing…" : "Import .docx"}
-        </button>
-        <button
-          type="button"
-          onClick={() => void handleImportPdf()}
-          className="flex items-center gap-1.5 px-4 py-2 rounded-md border border-gray-300 dark:border-neutral-700 text-gray-700 dark:text-neutral-200 text-sm font-medium hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors"
-        >
-          <MdPictureAsPdf size={16} /> Import PDF
-        </button>
-        <button
-          type="button"
-          onClick={() => setShowTrash((v) => !v)}
-          className="text-xs text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:underline"
-        >
-          {showTrash ? "Back to documents" : "Trash"}
-        </button>
-        {error && <p className="text-red-500 dark:text-red-400 text-xs">{error}</p>}
-      </div>
-
-      {showTrash && (
-        <div className="relative w-full max-w-3xl">
-          <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
-            Trash - deleted documents are kept here until permanently deleted
-          </p>
-          {trashedDocs === null ? (
-            <p className="text-center text-sm text-gray-400 dark:text-neutral-500">Loading…</p>
-          ) : trashedDocs.length === 0 ? (
-            <p className="text-center text-sm text-gray-400 dark:text-neutral-500">Trash is empty</p>
-          ) : (
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-              {trashedDocs.map((doc) => (
-                <div
-                  key={doc.id}
-                  className="flex flex-col rounded-md bg-white/90 dark:bg-neutral-900/90 border border-gray-200 dark:border-neutral-800"
-                >
-                  <div className="aspect-video rounded-t-md overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center">
-                    <IoDocumentTextOutline size={22} className="text-gray-300 dark:text-neutral-600" />
-                  </div>
-                  <div className="px-2.5 py-2">
-                    <p className="text-sm text-gray-700 dark:text-neutral-200 truncate">{doc.title || "Untitled document"}</p>
-                    <p className="text-xs text-gray-400 dark:text-neutral-500">Deleted {formatUpdatedAt(doc.deleted_at ?? doc.updated_at)}</p>
-                  </div>
-                  <div className="flex border-t border-gray-100 dark:border-neutral-800">
-                    <button
-                      type="button"
-                      onClick={() => void handleRestoreDoc(doc.id)}
-                      className="flex-1 px-2 py-1.5 text-xs text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-500/10"
-                    >
-                      Restore
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        confirmPermanentDeleteId === doc.id ? void handleDeleteForever(doc.id) : setConfirmPermanentDeleteId(doc.id)
-                      }
-                      className="flex-1 px-2 py-1.5 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 border-l border-gray-100 dark:border-neutral-800"
-                    >
-                      {confirmPermanentDeleteId === doc.id ? "Confirm?" : "Delete forever"}
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {!showTrash && docs && docs.length > 0 && (
-        <div className="relative w-full max-w-3xl">
-          <div className="relative mb-4">
-            <IoSearch size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 dark:text-neutral-500 pointer-events-none" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search documents"
-              className="w-full pl-7 pr-7 py-1.5 rounded-md text-xs bg-gray-100 dark:bg-neutral-800 border border-transparent focus:border-blue-400 dark:focus:border-blue-500 outline-none text-neutral-800 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500"
-            />
-            {searchQuery && (
+      <div className="relative flex-1 min-w-0 h-full overflow-y-auto">
+      {/* "Start a new document" band - Blank plus the featured templates as real page previews,
+          with the full gallery (every template, grouped by category) one click away. */}
+      <section className="bg-gray-100 dark:bg-neutral-900/60 border-b border-gray-200 dark:border-neutral-800">
+        <div className="mx-auto w-full max-w-6xl px-8 pt-6 pb-7">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <h2 className="text-base font-medium text-gray-800 dark:text-neutral-100">Start a new document</h2>
+            <div className="flex items-center gap-1">
               <button
                 type="button"
-                data-tip="Clear search"
-                onClick={() => setSearchQuery("")}
-                className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                onClick={() => void handleImportDocx()}
+                disabled={isImporting}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-200 dark:hover:bg-neutral-800 transition-colors disabled:opacity-50"
               >
-                <IoClose size={13} />
+                <MdFileUpload size={16} /> {isImporting ? "Importing…" : "Import .docx"}
               </button>
-            )}
+              <button
+                type="button"
+                onClick={() => void handleImportPdf()}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-200 dark:hover:bg-neutral-800 transition-colors"
+              >
+                <MdPictureAsPdf size={16} /> Import PDF
+              </button>
+              <div className="w-px h-5 mx-1 bg-gray-300 dark:bg-neutral-700" />
+              <button
+                type="button"
+                onClick={() => setShowGallery((v) => !v)}
+                aria-expanded={showGallery}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium text-gray-700 dark:text-neutral-200 hover:bg-gray-200 dark:hover:bg-neutral-800 transition-colors"
+              >
+                Template gallery {showGallery ? <IoChevronUp size={14} /> : <IoChevronDown size={14} />}
+              </button>
+            </div>
           </div>
 
-          {pinnedDocs.length > 0 && (
-            <div className="mb-4">
-              <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">Pinned</p>
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">{pinnedDocs.map(renderCard)}</div>
-            </div>
-          )}
+          {(() => {
+            const isBusy = isCreating || creatingTemplateId !== null;
+            const blankCard = (
+              <DocTemplateCard name="Blank document" disabled={isBusy} isBusy={isCreating} onClick={() => void handleCreate()}>
+                <div className="aspect-[8.5/11] bg-white dark:bg-neutral-900 flex items-center justify-center">
+                  <IoAdd size={56} className="text-blue-500" />
+                </div>
+              </DocTemplateCard>
+            );
+            const templateCard = (template: DocTemplate) => (
+              <DocTemplateCard
+                key={template.id}
+                name={template.name}
+                description={template.description}
+                badge={template.variants ? `${template.variants.length} styles` : undefined}
+                disabled={isBusy}
+                isBusy={creatingTemplateId === template.id}
+                onClick={() => void handleCreateFromTemplate(template)}
+              >
+                <DocPagePreview preview={templatePreview(template)} />
+              </DocTemplateCard>
+            );
+            const gridClass = "grid gap-4 grid-cols-[repeat(auto-fill,minmax(128px,1fr))]";
 
-          <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
-            {isSearching ? "Search results" : selectedFolderId ? folders.find((f) => f.id === selectedFolderId)?.name ?? "Folder" : "Your documents"}
-          </p>
-          {filteredDocs && filteredDocs.length > 0 ? (
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">{filteredDocs.map(renderCard)}</div>
-          ) : isSearching ? (
-            <p className="text-center text-sm text-gray-400 dark:text-neutral-500">No documents match "{searchQuery}"</p>
-          ) : (
-            <p className="text-center text-sm text-gray-400 dark:text-neutral-500">
-              {selectedFolderId ? "No documents in this folder yet" : "No unfiled documents - everything is organized into folders"}
-            </p>
-          )}
+            return showGallery ? (
+              <div className="flex flex-col gap-6">
+                <div className={gridClass}>{blankCard}</div>
+                {DOC_TEMPLATE_CATEGORIES.map((category) => (
+                  <div key={category}>
+                    <p className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-neutral-400 mb-3">{category}</p>
+                    <div className={gridClass}>{DOC_TEMPLATES.filter((t) => t.category === category).map(templateCard)}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className={gridClass}>
+                {blankCard}
+                {featuredTemplates.map(templateCard)}
+              </div>
+            );
+          })()}
+          {error && <p className="mt-3 text-red-500 dark:text-red-400 text-xs">{error}</p>}
         </div>
-      )}
+      </section>
+
+      <section className="mx-auto w-full max-w-6xl px-8 py-6">
+
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <h2 className="text-base font-medium text-gray-800 dark:text-neutral-100">
+            {showTrash
+              ? "Trash"
+              : isSearching
+                ? "Search results"
+                : selectedFolderId
+                  ? folders.find((f) => f.id === selectedFolderId)?.name ?? "Folder"
+                  : "Recent documents"}
+          </h2>
+          <div className="flex items-center gap-2">
+            {!showTrash && docs && docs.length > 0 && (
+              <div className="relative w-64">
+                <IoSearch size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 dark:text-neutral-500 pointer-events-none" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search documents"
+                  className="w-full pl-8 pr-7 py-1.5 rounded-full text-sm bg-gray-100 dark:bg-neutral-800 border border-transparent focus:border-blue-400 dark:focus:border-blue-500 focus:bg-white dark:focus:bg-neutral-900 outline-none text-neutral-800 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    data-tip="Clear search"
+                    onClick={() => setSearchQuery("")}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded-full text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                  >
+                    <IoClose size={13} />
+                  </button>
+                )}
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => setShowTrash((v) => !v)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm text-gray-600 dark:text-neutral-300 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+            >
+              {showTrash ? (
+                "Back to documents"
+              ) : (
+                <>
+                  <IoTrashOutline size={15} /> Trash
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {showTrash && (
+          <>
+            <p className="text-xs text-gray-500 dark:text-neutral-400 mb-4">Deleted documents are kept here until you delete them permanently.</p>
+            {trashedDocs === null ? (
+              <p className="text-sm text-gray-400 dark:text-neutral-500">Loading…</p>
+            ) : trashedDocs.length === 0 ? (
+              <p className="text-sm text-gray-400 dark:text-neutral-500">Trash is empty</p>
+            ) : (
+              <div className={DOC_GRID_CLASS}>
+                {trashedDocs.map((doc) => (
+                  <div key={doc.id} className="flex flex-col rounded-md bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-800">
+                    <div className="opacity-60">
+                      <DocCardThumbnail doc={doc} />
+                    </div>
+                    <div className="px-3 py-2.5">
+                      <p className="text-sm font-medium text-gray-700 dark:text-neutral-200 truncate">{doc.title || "Untitled document"}</p>
+                      <p className="text-xs text-gray-500 dark:text-neutral-400">Deleted {formatUpdatedAt(doc.deleted_at ?? doc.updated_at)}</p>
+                    </div>
+                    <div className="flex border-t border-gray-100 dark:border-neutral-800">
+                      <button
+                        type="button"
+                        onClick={() => void handleRestoreDoc(doc.id)}
+                        className="flex-1 px-2 py-1.5 text-xs text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-500/10 rounded-bl-md"
+                      >
+                        Restore
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          confirmPermanentDeleteId === doc.id ? void handleDeleteForever(doc.id) : setConfirmPermanentDeleteId(doc.id)
+                        }
+                        className="flex-1 px-2 py-1.5 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 border-l border-gray-100 dark:border-neutral-800 rounded-br-md"
+                      >
+                        {confirmPermanentDeleteId === doc.id ? "Confirm?" : "Delete forever"}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {!showTrash && docs && docs.length === 0 && (
+          <div className="flex flex-col items-center gap-2 py-12 text-center">
+            <IoDocumentTextOutline size={32} className="text-gray-300 dark:text-neutral-600" />
+            <p className="text-sm text-gray-500 dark:text-neutral-400">No documents yet. Start from a blank page or one of the templates above.</p>
+          </div>
+        )}
+
+        {!showTrash && docs && docs.length > 0 && (
+          <>
+            {pinnedDocs.length > 0 && (
+              <div className="mb-6">
+                <p className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-neutral-400 mb-3">Pinned</p>
+                <div className={DOC_GRID_CLASS}>{pinnedDocs.map(renderCard)}</div>
+              </div>
+            )}
+            {pinnedDocs.length > 0 && (
+              <p className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-neutral-400 mb-3">All</p>
+            )}
+            {filteredDocs && filteredDocs.length > 0 ? (
+              <div className={DOC_GRID_CLASS}>{filteredDocs.map(renderCard)}</div>
+            ) : isSearching ? (
+              <p className="text-sm text-gray-400 dark:text-neutral-500">No documents match "{searchQuery}"</p>
+            ) : (
+              <p className="text-sm text-gray-400 dark:text-neutral-500">
+                {selectedFolderId ? "No documents in this folder yet" : "No unfiled documents - everything is organized into folders"}
+              </p>
+            )}
+          </>
+        )}
+      </section>
       </div>
+      {variantPickerFor && (
+        <DocTemplateVariantPicker
+          family={variantPickerFor}
+          creatingId={creatingTemplateId}
+          onPick={(variant) => void handleCreateFromTemplate(variant)}
+          onClose={() => setVariantPickerFor(null)}
+        />
+      )}
       {pdfImport && (
         <DocPdfImportDialog
           path={pdfImport.path}

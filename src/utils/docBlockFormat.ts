@@ -70,7 +70,8 @@ export const BLOCK_FORMAT_TYPES = [
 ];
 
 // "leaders": a contents list (label | text | page) with dot leaders and no rules.
-export type TableRules = "booktabs" | "doubled" | "leaders";
+// "none": a layout table - no rules at all (side-by-side panels, a résumé sidebar).
+export type TableRules = "booktabs" | "doubled" | "leaders" | "none";
 
 const ptAttr = (name: "spaceBefore" | "spaceAfter", css: string) => ({
   default: null,
@@ -93,7 +94,7 @@ function decorationAttrs(node: PMNode): Record<string, string> | null {
   if (typeof a.spaceAfter === "number") style.push(`margin-bottom: ${a.spaceAfter}pt !important`);
   if (a.noIndent === true) out["data-no-indent"] = "";
   if (node.type.name === "table") {
-    if (a.rules === "booktabs" || a.rules === "doubled" || a.rules === "leaders") out["data-rules"] = a.rules;
+    if (a.rules === "booktabs" || a.rules === "doubled" || a.rules === "leaders" || a.rules === "none") out["data-rules"] = a.rules;
     if (a.fit === true) out["data-fit"] = "";
   }
   if (style.length) out.style = style.join("; ");
@@ -147,7 +148,7 @@ const DocBlockFormat = Extension.create({
             default: null,
             parseHTML: (el: HTMLElement) => {
               const v = el.getAttribute("data-rules");
-              return v === "booktabs" || v === "doubled" || v === "leaders" ? v : null;
+              return v === "booktabs" || v === "doubled" || v === "leaders" || v === "none" ? v : null;
             },
             renderHTML: (attrs: Record<string, unknown>) => (attrs.rules ? { "data-rules": String(attrs.rules) } : {}),
           },

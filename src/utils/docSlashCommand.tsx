@@ -21,6 +21,8 @@ import {
   MdHorizontalRule,
   MdShortText,
   MdInsertPageBreak,
+  MdChecklist,
+  MdInfoOutline,
 } from "react-icons/md";
 import { TbListDetails, TbMath, TbMathFunction, TbQuote, TbTable, TbBooks, TbCornerDownRight, TbPhoto } from "react-icons/tb";
 import { OPEN_PICKER_EVENT, type OpenPickerDetail } from "./docStructureNodes";
@@ -64,6 +66,29 @@ function buildItems(docId: string): SlashCommandItem[] {
       keywords: ["numbered", "list", "ordered", "ol"],
       icon: MdFormatListNumbered,
       run: (editor, range) => editor.chain().focus().deleteRange(range).toggleOrderedList().run(),
+    },
+    {
+      title: "Checklist",
+      keywords: ["checklist", "todo", "task", "checkbox", "action"],
+      icon: MdChecklist,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).toggleTaskList().run(),
+    },
+    {
+      // A one-cell, borderless, shaded table - reads as a tinted panel, and exports to Word as one.
+      title: "Callout box",
+      keywords: ["callout", "note", "box", "highlight", "panel", "info", "tip"],
+      icon: MdInfoOutline,
+      run: (editor, range) =>
+        editor
+          .chain()
+          .focus()
+          .deleteRange(range)
+          .insertContent({
+            type: "table",
+            attrs: { rules: "none" },
+            content: [{ type: "tableRow", content: [{ type: "tableCell", attrs: { background: "#dbeafe" }, content: [{ type: "paragraph" }] }] }],
+          })
+          .run(),
     },
     {
       title: "Blockquote",

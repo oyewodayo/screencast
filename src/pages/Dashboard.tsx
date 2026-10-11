@@ -110,6 +110,12 @@ import {
   IoEyeOffOutline,
   IoEyeOutline,
   IoInformationCircleOutline,
+  IoCutOutline,
+  IoDocumentTextOutline,
+  IoGitNetworkOutline,
+  IoMapOutline,
+  IoImagesOutline,
+  IoFolderOpenOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -4157,25 +4163,37 @@ const setScreen = () => {
               {isRecording && CAMERA_ONLY_RECORD_TYPES.includes(recordType) ? (
                 <LiveCameraRecordingView videoDevices={videoDevices} isPaused={isPaused} />
               ) : (
-              <div className="relative flex flex-col items-center gap-3 text-center">
-                <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
-                  <IoVideocam size={28} />
-                </div>
+              <div className="relative flex flex-col items-center gap-5 text-center w-full max-w-3xl">
                 <div>
-                  <p className="text-gray-700 dark:text-neutral-200 font-medium">
-                    Nothing playing yet
-                    </p>
+                  <p className="text-xl text-gray-800 dark:text-neutral-100 font-semibold">
+                    What would you like to create today?
+                  </p>
                   <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
-                    Pick a file from the sidebar, or open one from your computer.
+                    Jump into a tool, open a file from your computer, or pick up something from your library.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleOpenExternalFile}
-                  className="mt-1 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity"
-                >
-                  Open a file
-                </button>
+                {/* Same tools (and icons) as the bottom dock's tool row, surfaced here with labels
+                    so a first-time user can see what the app does without hovering icons. */}
+                <div className="flex flex-wrap justify-center gap-2">
+                  {[
+                    { label: "Edit a video", icon: <IoCutOutline size={22} />, onClick: handleOpenVideoEditor },
+                    { label: "Write a document", icon: <IoDocumentTextOutline size={22} />, onClick: handleOpenDocs },
+                    { label: "Whiteboard", icon: <IoGitNetworkOutline size={22} />, onClick: handleOpenWhiteboard },
+                    { label: "Mind map", icon: <IoMapOutline size={22} />, onClick: handleOpenMindmap },
+                    { label: "Board", icon: <IoImagesOutline size={22} />, onClick: handleOpenBoard },
+                    { label: "Open a file", icon: <IoFolderOpenOutline size={22} />, onClick: handleOpenExternalFile },
+                  ].map((action) => (
+                    <button
+                      key={action.label}
+                      type="button"
+                      onClick={action.onClick}
+                      className="flex flex-col items-center justify-center gap-2 w-28 h-24 rounded-lg bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-gray-600 dark:text-neutral-300 hover:border-blue-400 dark:hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+                    >
+                      {action.icon}
+                      <span className="text-xs font-medium">{action.label}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
               )}
 
