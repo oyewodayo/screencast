@@ -5,8 +5,10 @@ import { DEFAULT_PAGE_CHROME, type DocPageChrome } from "./docPageChrome";
 
 const doc = { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Hello" }] }] };
 
-async function parts(pageChrome: DocPageChrome | null) {
-  const zip = await JSZip.loadAsync(await buildDocxBytes(doc, "Quarterly report", { pageChrome }));
+type Watermark = Parameters<typeof buildDocxBytes>[2] extends infer O ? (O extends { watermark?: infer W } ? W : never) : never;
+
+async function parts(pageChrome: DocPageChrome | null, watermark: Watermark = null) {
+  const zip = await JSZip.loadAsync(await buildDocxBytes(doc, "Quarterly report", { pageChrome, watermark }));
   const read = async (prefix: string) =>
     Promise.all(
       Object.keys(zip.files)
@@ -47,5 +49,26 @@ describe("Word export headers, footers and page numbers", () => {
     expect(document).toMatch(/<w:pgNumType w:start="3" w:fmt="lowerRoman"\/>/);
     expect(document).toContain("<w:titlePg/>");
     expect(document).toMatch(/w:headerReference w:type="first"/);
+  });
+});
+
+// A 1x1 PNG.
+const PNG = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+
+describe("Word export watermark", () => {
+  it("anchors the watermark behind the text, centred on the page, in the header", async () => {
+    const { headers } = await parts(null, { png: PNG, widthPx: 816, heightPx: 1056, skipFirstPage: false });
+    const header = headers.join("");
+    expect(header).toContain('behindDoc="1"');
+    expect(header).toMatch(/<wp:positionH relativeFrom="page"><wp:align>center<\/wp:align>/);
+  });
+
+  it("leaves it off a first page whose footer still shows", async () => {
+    const footerOnly: DocPageChrome = { ...DEFAULT_PAGE_CHROME, footer: { left: "Certified", center: "", right: "" } };
+    const { document, headers, footers } = await parts(footerOnly, { png: PNG, widthPx: 816, heightPx: 1056, skipFirstPage: true });
+    expect(document).toContain("<w:titlePg/>");
+    // Default header has the picture, the first-page one doesn't; both footers carry the text.
+    expect(headers.filter((h) => h.includes('behindDoc="1"'))).toHaveLength(1);
+    expect(footers.filter((f) => f.includes("Certified"))).toHaveLength(2);
   });
 });

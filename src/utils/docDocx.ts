@@ -25,6 +25,11 @@ import {
   HeadingLevel,
   NumberFormat,
   PageNumber,
+  HorizontalPositionAlign,
+  HorizontalPositionRelativeFrom,
+  VerticalPositionAlign,
+  VerticalPositionRelativeFrom,
+  TextWrappingType,
   IBordersOptions,
   type ICommentOptions,
   ImageRun,
@@ -711,30 +716,62 @@ class DocxBuilder {
     const height = `${paper.height}in` as PositiveUniversalMeasure;
     const inch = (v: number) => `${v}in` as PositiveUniversalMeasure;
 
-    // One paragraph per band: left text, a centre tab stop, a right tab stop - the three slots.
+    // Page furniture. Each header/footer part is one paragraph: left text, a centre tab stop, a
+    // right tab stop - the three slots. The watermark rides in the header paragraph as a page-sized
+    // picture anchored to the page centre behind the text, which is how Word itself places one.
+    // "Different first page" (titlePage) is on when either the chrome or the watermark leaves page
+    // 1 out; the first-page parts then carry whichever of the two still belongs there.
     const chrome = options.pageChrome ?? null;
-    const chromePart = <T extends typeof Header | typeof Footer>(Part: T, band: ChromeBand) => {
-      const c = chrome!;
-      const runs: TextRun[] = [];
-      const style = { size: c.fontSize * 2, color: "5F6368" };
-      CHROME_SLOTS.forEach((slot, i) => {
-        if (i > 0) runs.push(new TextRun({ ...style, children: [new Tab()] }));
-        for (const seg of slotSegments(c, band, slot)) {
-          if (seg.kind === "text") runs.push(new TextRun({ ...style, text: seg.text }));
-          else if (seg.kind === "page") runs.push(new TextRun({ ...style, children: [PageNumber.CURRENT] }));
-          else if (seg.kind === "pages") runs.push(new TextRun({ ...style, children: [PageNumber.TOTAL_PAGES] }));
-          else runs.push(new TextRun({ ...style, text: seg.kind === "title" ? title : todayLabel() }));
-        }
-      });
-      const paragraph = new Paragraph({
+    const wm = options.watermark?.png ? options.watermark : null;
+    const chromeHas = (band: ChromeBand) => !!chrome && bandHasContent(chrome, band);
+    const bandParagraph = (band: ChromeBand, withText: boolean, withWatermark: boolean) => {
+      const children: (TextRun | ImageRun)[] = [];
+      if (withText && chrome) {
+        const style = { size: chrome.fontSize * 2, color: "5F6368" };
+        CHROME_SLOTS.forEach((slot, i) => {
+          if (i > 0) children.push(new TextRun({ ...style, children: [new Tab()] }));
+          for (const seg of slotSegments(chrome, band, slot)) {
+            if (seg.kind === "text") children.push(new TextRun({ ...style, text: seg.text }));
+            else if (seg.kind === "page") children.push(new TextRun({ ...style, children: [PageNumber.CURRENT] }));
+            else if (seg.kind === "pages") children.push(new TextRun({ ...style, children: [PageNumber.TOTAL_PAGES] }));
+            else children.push(new TextRun({ ...style, text: seg.kind === "title" ? title : todayLabel() }));
+          }
+        });
+      }
+      if (withWatermark && wm) {
+        children.push(
+          new ImageRun({
+            type: "png",
+            data: wm.png!,
+            transformation: { width: wm.widthPx, height: wm.heightPx },
+            floating: {
+              horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, align: HorizontalPositionAlign.CENTER },
+              verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, align: VerticalPositionAlign.CENTER },
+              behindDocument: true,
+              allowOverlap: true,
+              wrap: { type: TextWrappingType.NONE },
+            },
+          })
+        );
+      }
+      return new Paragraph({
         tabStops: [
           { type: TabStopType.CENTER, position: Math.round(this.textWidthTwips / 2) },
           { type: TabStopType.RIGHT, position: this.textWidthTwips },
         ],
-        children: runs,
+        children,
       });
-      const part = new Part({ children: [paragraph] }) as InstanceType<T>;
-      return c.differentFirstPage ? { default: part, first: new Part({ children: [new Paragraph({})] }) as InstanceType<T> } : { default: part };
+    };
+    const textOnFirst = !chrome?.differentFirstPage;
+    const markOnFirst = !wm?.skipFirstPage;
+    const titlePage = (chrome?.differentFirstPage && (chromeHas("header") || chromeHas("footer"))) || (!!wm && wm.skipFirstPage);
+    const parts = <T extends typeof Header | typeof Footer>(Part: T, band: ChromeBand) => {
+      const text = chromeHas(band);
+      const mark = band === "header" && !!wm;
+      if (!text && !mark) return undefined;
+      const part = (withText: boolean, withMark: boolean) => new Part({ children: [bandParagraph(band, withText, withMark)] }) as InstanceType<T>;
+      const main = part(text, mark);
+      return titlePage ? { default: main, first: part(text && textOnFirst, mark && markOnFirst) } : { default: main };
     };
 
     const doc = new Document({
@@ -752,13 +789,13 @@ class DocxBuilder {
               margin: { top: inch(m.top), bottom: inch(m.bottom), left: inch(m.left), right: inch(m.right) },
               pageNumbers: chrome ? { start: chrome.pageNumber.start, formatType: WORD_NUMBER_FORMAT[chrome.pageNumber.format] } : undefined,
             },
-            titlePage: chrome?.differentFirstPage || undefined,
+            titlePage: titlePage || undefined,
           },
           // Word's own header/footer parts, with live PAGE/NUMPAGES fields - Word numbers the pages
           // itself, in the chosen numerals from the chosen start (pageNumbers above). A different
           // first page is Word's "Different First Page" (titlePage) with empty first-page parts.
-          headers: chrome && bandHasContent(chrome, "header") ? chromePart(Header, "header") : undefined,
-          footers: chrome && bandHasContent(chrome, "footer") ? chromePart(Footer, "footer") : undefined,
+          headers: parts(Header, "header"),
+          footers: parts(Footer, "footer"),
           children,
         },
       ],
@@ -782,6 +819,8 @@ export interface DocxExportOptions {
   pageColor?: string | null;
   // Header, footer and page numbers (docPageChrome.ts).
   pageChrome?: DocPageChrome | null;
+  // The watermark (docWatermark.ts), already drawn as a PNG of the whole sheet (CSS px size).
+  watermark?: { png: Uint8Array | null; widthPx: number; heightPx: number; skipFirstPage: boolean } | null;
   margins?: DocMargins | null;
 }
 

@@ -53,9 +53,10 @@ import {
   MdSuperscript,
   MdTitle,
   MdUndo,
+  MdBrandingWatermark,
 } from "react-icons/md";
 import { BiHighlight } from "react-icons/bi";
-import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbListDetails, TbMath, TbMathFunction, TbPhoto, TbQuote, TbTable, TbTableOptions } from "react-icons/tb";
+import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbLayoutNavbar, TbListDetails, TbMath, TbMathFunction, TbNumbers, TbPhoto, TbQuote, TbTable, TbTableOptions } from "react-icons/tb";
 import { topBlockAt, type TableRules } from "../../utils/docBlockFormat";
 import { CELL_SHADES } from "../../utils/docTableCellShading";
 import DocColorPicker from "./DocColorPicker";
@@ -590,9 +591,29 @@ export interface DocToolbarProps {
   twoColumns: boolean;
   // The document has its own body style (docLayout.ts), which indents paragraphs.
   typeset: boolean;
+  // Page furniture panels, hosted by DocsEditor: header/footer (or straight to page numbers) and
+  // the watermark.
+  onOpenHeaderFooter: (focus: "header" | "pageNumbers") => void;
+  onOpenWatermark: () => void;
 }
 
-const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, onLinkOpenChange, onInsertImage, onAddComment, rulerVisible, onToggleRuler, onOpenPicker, docFonts, onAddFont, twoColumns, typeset }) => {
+const DocToolbar: React.FC<DocToolbarProps> = ({
+  editor,
+  dictation,
+  linkOpen,
+  onLinkOpenChange,
+  onInsertImage,
+  onAddComment,
+  rulerVisible,
+  onToggleRuler,
+  onOpenPicker,
+  docFonts,
+  onAddFont,
+  twoColumns,
+  typeset,
+  onOpenHeaderFooter,
+  onOpenWatermark,
+}) => {
   const { bind, setOpenMenu } = useOpenMenu();
   const close = () => setOpenMenu(null);
   const [linkUrl, setLinkUrl] = useState("");
@@ -1264,6 +1285,11 @@ const DocToolbar: React.FC<DocToolbarProps> = ({ editor, dictation, linkOpen, on
           </MenuSection>
           <MenuSection title="View">
             {menuAction("Show ruler", MdStraighten, onToggleRuler, { active: rulerVisible })}
+          </MenuSection>
+          <MenuSection title="Page">
+            {menuAction("Header & footer…", TbLayoutNavbar, () => onOpenHeaderFooter("header"))}
+            {menuAction("Page numbers…", TbNumbers, () => onOpenHeaderFooter("pageNumbers"))}
+            {menuAction("Watermark…", MdBrandingWatermark, onOpenWatermark)}
           </MenuSection>
           <MenuSection title="Blocks">
             {menuAction("Quote", MdFormatQuote, () => editor.chain().focus().toggleBlockquote().run(), { active: editor.isActive("blockquote") })}

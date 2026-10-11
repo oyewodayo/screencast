@@ -22,6 +22,10 @@ import DocShareDialog, { type ShareMode } from "./DocShareDialog";
 import DocHeaderFooterDialog from "./DocHeaderFooterDialog";
 import DocPageChromeOverlay from "./DocPageChromeOverlay";
 import useDocPageChrome from "../../hooks/useDocPageChrome";
+import DocWatermarkDialog from "./DocWatermarkDialog";
+import DocWatermarkOverlay from "./DocWatermarkOverlay";
+import useDocWatermark from "../../hooks/useDocWatermark";
+import { hasWatermark, printWatermarkCss, svgDataUrl, watermarkPngBytes, watermarkSvg, writeWatermark, type DocWatermark } from "../../utils/docWatermark";
 import { hasPageChrome, printChromeCss, todayLabel, writePageChrome, type ChromeBand, type DocPageChrome } from "../../utils/docPageChrome";
 import { PAPER_STYLES } from "../../utils/docPaperStyles";
 import { BsFiletypeDocx, BsFiletypeHtml, BsFiletypeMd, BsFiletypePdf, BsFiletypeTxt } from "react-icons/bs";
@@ -410,6 +414,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const pageChrome = useDocPageChrome(store.ydoc, store.headerText, store.footerText);
   // The header/footer panel, and which band to focus in it (a double-clicked margin).
   const [chromeEditor, setChromeEditor] = useState<{ focus: ChromeBand | null } | null>(null);
+  const watermark = useDocWatermark(store.ydoc);
+  const [showWatermark, setShowWatermark] = useState(false);
   const toggleOutline = useCallback(() => {
     setShowOutline((v) => {
       try {
@@ -541,6 +547,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const pageColor = normalizePageColor(store.pageColor);
   const pageDark = isDarkPageColor(pageColor);
   const margins = resolveMargins(store.margins);
+  // The watermark as one sheet-sized SVG - the screen overlay's and the printed page's background.
+  const watermarkUrl = useMemo(() => {
+    const svg = watermarkSvg(watermark, pageWidthPx(page), pageHeightPx(page));
+    return svg ? svgDataUrl(svg) : "";
+  }, [watermark, page]);
   const [rulerUnit, setRulerUnit] = useRulerUnit();
   const [rulerVisible, setRulerVisible] = useState(readRulerVisible);
   const toggleRuler = useCallback(() => {
@@ -701,6 +712,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           orientation: store.orientation,
           pageColor: store.pageColor,
           pageChrome,
+          watermark: hasWatermark(watermark)
+            ? { png: await watermarkPngBytes(watermark, pageWidthPx(page), pageHeightPx(page)), widthPx: pageWidthPx(page), heightPx: pageHeightPx(page), skipFirstPage: watermark.skipFirstPage }
+            : null,
           margins: store.margins,
         });
         saved = await invoke<string>("export_doc_binary", { docTitle: store.title, extension: "docx", bytes: Array.from(bytes), outputPath });
@@ -735,7 +749,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       }
       return saved;
     },
-    [editor, store.title, store.comments, store.pageSize, store.orientation, store.pageColor, pageChrome, store.margins, bib.store]
+    [editor, store.title, store.comments, store.pageSize, store.orientation, store.pageColor, pageChrome, watermark, page, store.margins, bib.store]
   );
 
   // Every format goes through a real Save dialog now - exports used to land silently in the
@@ -786,6 +800,16 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       if (store.headerText || store.footerText) void store.setPageSetup({ headerText: null, footerText: null });
     },
     [store]
+  );
+  const updateWatermark = useCallback((next: DocWatermark) => store.ydoc && writeWatermark(store.ydoc, next), [store.ydoc]);
+  // More menu: "Page numbers…" switches them on (bottom centre by default) and opens the panel on
+  // them; "Header & footer…" just opens it.
+  const openHeaderFooter = useCallback(
+    (focus: "header" | "pageNumbers") => {
+      if (focus === "pageNumbers" && !pageChrome.pageNumber.enabled) updatePageChrome({ ...pageChrome, pageNumber: { ...pageChrome.pageNumber, enabled: true } });
+      setChromeEditor({ focus: focus === "header" ? "header" : null });
+    },
+    [pageChrome, updatePageChrome]
   );
   const pageChromeSummary = useMemo(() => {
     if (!hasPageChrome(pageChrome)) return null;
@@ -902,20 +926,17 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           the last page to full height. */}
       <style>{`
         @page { size: ${cssPageSize(page)}; margin: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in;${pageColor ? ` background: ${pageColor};` : ""} }
+        ${printWatermarkCss(watermark, watermarkUrl)}
         ${printChromeCss(pageChrome, { title: store.title, date: todayLabel(), fontFamily: textFont, color: pageDark ? "#d4d4d4" : "#5f6368", pagesHint: pageCount })}
         .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
         @media print {
           .doc-page-card { max-width: none; padding: 0; min-height: 0; }
         }
-        ${
-          // The page colour under the text as well: the print chain (html, body and every ancestor of
-          // the frame, flattened to plain blocks in print - docPageLayout.css) would otherwise paint
-          // the app's own background over @page's.
-          pageColor
-            ? `@media print {
-          html, body, *:has(.doc-print-frame), .doc-print-frame { background: ${pageColor} !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-        }`
-            : ""
+        @media print {
+          /* The paper is @page's background (colour and watermark), so everything above it -
+             html, body, the print chain (flattened to plain blocks in print, docPageLayout.css) and
+             the page card - must be see-through, or it would paint the app's white over both. */
+          html, body, *:has(.doc-print-frame), .doc-print-frame, .doc-page-card { background: transparent !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
         }
       `}</style>
 
@@ -1177,6 +1198,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           onAddComment={(text) => void submitComment(text)}
           rulerVisible={rulerVisible}
           onToggleRuler={toggleRuler}
+          onOpenHeaderFooter={openHeaderFooter}
+          onOpenWatermark={() => setShowWatermark(true)}
           onOpenPicker={openPicker}
           docFonts={docFonts}
           onAddFont={() => (store.ydoc ? addFontFilesToDocument(docId, store.ydoc) : Promise.resolve([]))}
@@ -1257,6 +1280,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                       {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
                           flips the editor's text, heading and link colours. */}
                       <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
+                      <DocWatermarkOverlay dataUrl={watermarkUrl} pageCount={pageCount} page={page} skipFirstPage={watermark.skipFirstPage} dark={pageDark} />
                       <DocPageChromeOverlay
                         chrome={pageChrome}
                         pageCount={pageCount}
@@ -1342,6 +1366,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           onClose={() => setShowStyle(false)}
         />
       )}
+
+      {showWatermark && store.ydoc && <DocWatermarkDialog watermark={watermark} onChange={updateWatermark} onClose={() => setShowWatermark(false)} />}
 
       {chromeEditor && store.ydoc && (
         <DocHeaderFooterDialog chrome={pageChrome} focusBand={chromeEditor.focus} onChange={updatePageChrome} onClose={() => setChromeEditor(null)} />
