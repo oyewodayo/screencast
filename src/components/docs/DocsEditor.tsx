@@ -14,10 +14,11 @@ import katex from "katex";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
 import { IoArrowBack, IoChatbubbleOutline, IoHelpCircleOutline, IoClose, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
-import { MdArrowDropDown, MdDescription, MdFileDownload, MdInsertLink, MdPrint } from "react-icons/md";
+import { MdArrowDropDown, MdDescription, MdFileDownload, MdInsertLink, MdIosShare, MdMailOutline, MdPrint } from "react-icons/md";
 import { TbBooks, TbListTree, TbTypography } from "react-icons/tb";
 import DocHelpPanel from "./DocHelpPanel";
 import DocStyleDialog from "./DocStyleDialog";
+import DocShareDialog, { type ShareMode } from "./DocShareDialog";
 import { PAPER_STYLES } from "../../utils/docPaperStyles";
 import { BsFiletypeDocx, BsFiletypeHtml, BsFiletypeMd, BsFiletypePdf, BsFiletypeTxt } from "react-icons/bs";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
@@ -396,6 +397,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   // The two-column paper guide ("?") shares the right-hand slot with Comments and References.
   const [showHelp, setShowHelp] = useState(false);
   const [showStyle, setShowStyle] = useState(false);
+  const [shareMode, setShareMode] = useState<ShareMode | null>(null);
   const [showOutline, setShowOutline] = useState(readOutlineVisible);
   const [picker, setPicker] = useState<FloatingPicker | null>(null);
   const bib = useBibliography(store.ydoc);
@@ -664,6 +666,65 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     }
   }, [editor, docId]);
 
+  // Writes the document as `kind` to outputPath and returns where it landed - shared by Download
+  // (a Save dialog path) and the Share dialog (a staging path from share_staging_path).
+  const writeExport = useCallback(
+    async (kind: ExportKind, outputPath: string): Promise<string> => {
+      if (!editor) throw new Error("The document isn't ready yet");
+      let saved: string;
+      if (kind === "pdf") {
+        saved = await withLightTheme(() =>
+          invoke<string>("export_doc_pdf", { docTitle: store.title, pageSize: store.pageSize, orientation: store.orientation, outputPath })
+        );
+      } else if (kind === "docx") {
+        const json = editor.getJSON();
+        const live = getDocStructure(editor.state);
+        const bytes = await buildDocxBytes(json, store.title, {
+          structure: computeStructureFromJson(json, bib.store),
+          headingPages: (live?.headings ?? []).map((h) => pageAtPos(editor.view, h.pos)),
+          comments: store.comments,
+          pageSize: store.pageSize,
+          orientation: store.orientation,
+          pageColor: store.pageColor,
+          headerText: store.headerText,
+          footerText: store.footerText,
+          margins: store.margins,
+        });
+        saved = await invoke<string>("export_doc_binary", { docTitle: store.title, extension: "docx", bytes: Array.from(bytes), outputPath });
+      } else {
+        const json = editor.getJSON();
+        const structure = computeStructureFromJson(json, bib.store);
+        const content =
+          kind === "md"
+            ? docJsonToMarkdown(json, store.comments, structure)
+            : kind === "html"
+              ? await buildStandaloneHtml(store.title, editor.getHTML(), structure, {
+                  page: pageFormat(store.pageSize, store.orientation),
+                  pageColor: normalizePageColor(store.pageColor),
+                  margins: resolveMargins(store.margins),
+                })
+              : editor.getText({
+                  blockSeparator: "\n\n",
+                  // Generated blocks have no text of their own; write out what they show.
+                  textSerializers: {
+                    caption: ({ node }) => {
+                      const kindName = node.attrs.kind === "table" ? "table" : "figure";
+                      const n = structure.targets.get(String(node.attrs.id ?? ""))?.number;
+                      return `${n ? captionLabel(kindName, n, structure.numbering) : ""}${structure.numbering.captionSeparator} ${node.textContent}`;
+                    },
+                    bibliography: () =>
+                      structure.bibliography.map((ref) => `${ref.label ? `${ref.label} ` : ""}${segmentsToText(ref.segments)}`).join("\n"),
+                    tableOfContents: ({ node }) =>
+                      ["Contents", ...structure.headings.filter((h) => h.text && h.level <= Number(node.attrs.maxLevel ?? 3)).map((h) => `${"  ".repeat(h.level - 1)}${h.text}`)].join("\n"),
+                  },
+                });
+        saved = await invoke<string>("export_doc", { docTitle: store.title, extension: kind, content, outputPath });
+      }
+      return saved;
+    },
+    [editor, store.title, store.comments, store.pageSize, store.orientation, store.pageColor, store.headerText, store.footerText, store.margins, bib.store]
+  );
+
   // Every format goes through a real Save dialog now - exports used to land silently in the
   // Briefcast folder under a timestamped name with only an "Exported" flash, so finding the file
   // meant going looking for it. The result line then offers Open / Show in folder.
@@ -679,63 +740,28 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       if (!outputPath) return; // cancelled
       showNotice({ text: `Exporting ${format.short}…` }, 0);
       try {
-        let saved: string;
-        if (kind === "pdf") {
-          saved = await withLightTheme(() =>
-            invoke<string>("export_doc_pdf", { docTitle: store.title, pageSize: store.pageSize, orientation: store.orientation, outputPath })
-          );
-        } else if (kind === "docx") {
-          const json = editor.getJSON();
-          const live = getDocStructure(editor.state);
-          const bytes = await buildDocxBytes(json, store.title, {
-            structure: computeStructureFromJson(json, bib.store),
-            headingPages: (live?.headings ?? []).map((h) => pageAtPos(editor.view, h.pos)),
-            comments: store.comments,
-            pageSize: store.pageSize,
-            orientation: store.orientation,
-            pageColor: store.pageColor,
-            headerText: store.headerText,
-            footerText: store.footerText,
-            margins: store.margins,
-          });
-          saved = await invoke<string>("export_doc_binary", { docTitle: store.title, extension: "docx", bytes: Array.from(bytes), outputPath });
-        } else {
-          const json = editor.getJSON();
-          const structure = computeStructureFromJson(json, bib.store);
-          const content =
-            kind === "md"
-              ? docJsonToMarkdown(json, store.comments, structure)
-              : kind === "html"
-                ? await buildStandaloneHtml(store.title, editor.getHTML(), structure, {
-                    page: pageFormat(store.pageSize, store.orientation),
-                    pageColor: normalizePageColor(store.pageColor),
-                    margins: resolveMargins(store.margins),
-                  })
-                : editor.getText({
-                    blockSeparator: "\n\n",
-                    // Generated blocks have no text of their own; write out what they show.
-                    textSerializers: {
-                      caption: ({ node }) => {
-                        const kindName = node.attrs.kind === "table" ? "table" : "figure";
-                        const n = structure.targets.get(String(node.attrs.id ?? ""))?.number;
-                        return `${n ? captionLabel(kindName, n, structure.numbering) : ""}${structure.numbering.captionSeparator} ${node.textContent}`;
-                      },
-                      bibliography: () =>
-                        structure.bibliography.map((ref) => `${ref.label ? `${ref.label} ` : ""}${segmentsToText(ref.segments)}`).join("\n"),
-                      tableOfContents: ({ node }) =>
-                        ["Contents", ...structure.headings.filter((h) => h.text && h.level <= Number(node.attrs.maxLevel ?? 3)).map((h) => `${"  ".repeat(h.level - 1)}${h.text}`)].join("\n"),
-                    },
-                  });
-          saved = await invoke<string>("export_doc", { docTitle: store.title, extension: kind, content, outputPath });
-        }
+        const saved = await writeExport(kind, outputPath);
         showNotice({ text: `Saved ${saved.split(/[\\/]/).pop()}`, path: saved }, 10000);
       } catch (err) {
         console.error(`Failed to export document as .${kind}:`, err);
         showNotice({ text: err instanceof Error ? err.message : String(err), error: true }, 8000);
       }
     },
-    [editor, store.title, store.comments, store.pageSize, store.orientation, store.pageColor, store.headerText, store.footerText, store.margins, showNotice, bib.store]
+    [editor, store.title, writeExport, showNotice]
   );
+
+  // "Copy contents" in the Share dialog: the same self-contained HTML as the .html export (images
+  // inlined, so they survive the paste) plus plain text for apps that only take that.
+  const getClipboardContent = useCallback(async () => {
+    if (!editor) throw new Error("The document isn't ready yet");
+    const structure = computeStructureFromJson(editor.getJSON(), bib.store);
+    const html = await buildStandaloneHtml(store.title, editor.getHTML(), structure, {
+      page: pageFormat(store.pageSize, store.orientation),
+      pageColor: normalizePageColor(store.pageColor),
+      margins: resolveMargins(store.margins),
+    });
+    return { html, text: editor.getText({ blockSeparator: "\n\n" }) };
+  }, [editor, bib.store, store.title, store.pageSize, store.orientation, store.pageColor, store.margins]);
 
   const handleSaveNow = useCallback(async () => {
     try {
@@ -1079,6 +1105,27 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           triggerClassName="ml-1 h-9 pl-3.5 pr-3 inline-flex items-center gap-1.5 rounded-full text-sm font-medium bg-[#c2e7ff] hover:bg-[#b0dcf7] text-[#001d35] dark:bg-blue-500/25 dark:hover:bg-blue-500/35 dark:text-blue-50 transition-colors"
           panelClassName="w-64 py-1.5"
         >
+          <div className="px-3 pt-1 pb-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Send</div>
+          {(
+            [
+              ["email", "Email this file…", MdMailOutline],
+              ["share", "Share this file…", MdIosShare],
+            ] as const
+          ).map(([mode, text, Icon]) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => {
+                setHeaderMenu(null);
+                setShareMode(mode);
+              }}
+              className={menuItemClass}
+            >
+              <Icon size={18} className="shrink-0 text-neutral-500 dark:text-neutral-400" />
+              {text}
+            </button>
+          ))}
+          <div className="my-1.5 h-px bg-neutral-200 dark:bg-neutral-700" />
           <div className="px-3 pt-1 pb-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Download as</div>
           {(Object.keys(EXPORT_FORMATS) as ExportKind[]).map((kind) => {
             const { label, icon: Icon } = EXPORT_FORMATS[kind];
@@ -1261,6 +1308,19 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           docFonts={docFonts}
           onMargins={(m) => void store.setPageSetup({ margins: m })}
           onClose={() => setShowStyle(false)}
+        />
+      )}
+
+      {shareMode && editor && (
+        <DocShareDialog
+          title={store.title}
+          pageCount={pageCount}
+          wordCount={wordCount}
+          initialMode={shareMode}
+          writeExport={writeExport}
+          getClipboardContent={getClipboardContent}
+          onSaveCopy={(kind) => void handleExport(kind)}
+          onClose={() => setShareMode(null)}
         />
       )}
 

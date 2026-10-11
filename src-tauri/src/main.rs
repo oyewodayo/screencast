@@ -42,6 +42,7 @@ mod services {
     // Keeps the window from ever going "Not responding" - see the module's own comment for the
     // threading rules every command follows and the test that enforces them.
     pub mod responsiveness;
+    pub mod share;
     // Opt-out analytics + crash reports, compiled in only for release builds with keys.
     pub mod telemetry;
     pub mod trash;
@@ -523,6 +524,12 @@ fn main() {
             services::docs::export_doc,
             services::docs::export_doc_binary,
             services::docs::export_doc_pdf,
+            services::share::share_staging_path,
+            services::share::share_capabilities,
+            services::share::open_share_url,
+            services::share::copy_file_to_clipboard,
+            services::share::share_file_native,
+            services::share::email_file,
             services::docs::save_doc_image,
             services::docs::list_trashed_docs,
             services::docs::restore_doc,
