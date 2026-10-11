@@ -1,8 +1,7 @@
 // components/docs/DocPageSetupPopover.tsx
 //
-// Page setup: paper size, orientation, page colour, margins, and repeating header/footer text -
-// see DocsEditor.tsx's own comment on how the print frame and position:fixed make these show up
-// correctly at print time. Local draft state so typing doesn't fire a set_doc_page_setup invoke on
+// Page setup: paper size, orientation, page colour and margins, plus the way into the header,
+// footer and page number editor (DocHeaderFooterDialog.tsx). Local draft state so typing doesn't fire a set_doc_page_setup invoke on
 // every keystroke; applied together with the Apply button (or Enter). Margins are shown in the
 // ruler's unit. Columns and the gutter are document settings in the Y.Doc (docLayout.ts), applied
 // by the same button.
@@ -22,8 +21,9 @@ import type { RulerUnit } from "./DocRuler";
 
 interface DocPageSetupPopoverProps {
   pageSize: DocPageSize | null;
-  headerText: string | null;
-  footerText: string | null;
+  // One line describing the current header/footer/page numbers, or null when there are none.
+  headerFooterSummary: string | null;
+  onOpenHeaderFooter: () => void;
   margins: DocMargins | null;
   orientation: DocOrientation | null;
   pageColor: string | null;
@@ -67,8 +67,8 @@ const PageIcon: React.FC<{ landscape: boolean }> = ({ landscape }) => (
 
 const DocPageSetupPopover: React.FC<DocPageSetupPopoverProps> = ({
   pageSize,
-  headerText,
-  footerText,
+  headerFooterSummary,
+  onOpenHeaderFooter,
   margins,
   orientation,
   pageColor,
@@ -86,8 +86,6 @@ const DocPageSetupPopover: React.FC<DocPageSetupPopoverProps> = ({
   const [draftOrientation, setDraftOrientation] = useState<DocOrientation>(orientation ?? "portrait");
   const [draftColor, setDraftColor] = useState<string | null>(normalizePageColor(pageColor));
   const [colorOpen, setColorOpen] = useState(false);
-  const [draftHeader, setDraftHeader] = useState(headerText ?? "");
-  const [draftFooter, setDraftFooter] = useState(footerText ?? "");
   const [draftMargins, setDraftMargins] = useState(() => marginDrafts(margins ?? DEFAULT_MARGINS));
   const [draftColumns, setDraftColumns] = useState<1 | 2>(columns);
   const [draftGap, setDraftGap] = useState(() => toUnit(columnGap));
@@ -99,13 +97,11 @@ const DocPageSetupPopover: React.FC<DocPageSetupPopoverProps> = ({
     setDraftSize(pageSize ?? "letter");
     setDraftOrientation(orientation ?? "portrait");
     setDraftColor(normalizePageColor(pageColor));
-    setDraftHeader(headerText ?? "");
-    setDraftFooter(footerText ?? "");
     setDraftMargins(marginDrafts(margins ?? DEFAULT_MARGINS));
     setDraftColumns(columns);
     setDraftGap(toUnit(columnGap));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pageSize, orientation, pageColor, headerText, footerText, margins, unit, columns, columnGap]);
+  }, [pageSize, orientation, pageColor, margins, unit, columns, columnGap]);
 
   const toInches = (s: string) => {
     const n = parseFloat(s);
@@ -142,8 +138,6 @@ const DocPageSetupPopover: React.FC<DocPageSetupPopoverProps> = ({
       pageSize: draftSize,
       orientation: draftOrientation === "landscape" ? "landscape" : null,
       pageColor: normalizePageColor(draftColor),
-      headerText: draftHeader.trim() || null,
-      footerText: draftFooter.trim() || null,
       margins: isDefault ? null : parsed,
     });
     if (draftColumns !== columns || (draftColumns === 2 && Math.abs(gapIn - columnGap) > 0.001)) onColumnsChange(draftColumns, draftColumns === 2 ? gapIn : columnGap);
@@ -360,12 +354,15 @@ const DocPageSetupPopover: React.FC<DocPageSetupPopoverProps> = ({
       </div>
 
       <div>
-        <label className={label}>Header (repeats on every printed page)</label>
-        <input value={draftHeader} onChange={(e) => setDraftHeader(e.target.value)} placeholder="e.g. document title" className={field} />
-      </div>
-      <div>
-        <label className={label}>Footer (repeats on every printed page)</label>
-        <input value={draftFooter} onChange={(e) => setDraftFooter(e.target.value)} placeholder="e.g. confidential" className={field} />
+        <span className={label}>Header, footer &amp; page numbers</span>
+        <button
+          type="button"
+          onClick={onOpenHeaderFooter}
+          className="w-full flex items-center gap-2 px-2 py-1.5 text-sm text-left rounded-md border border-neutral-300 dark:border-neutral-600 hover:bg-neutral-50 dark:hover:bg-neutral-700/50 text-neutral-800 dark:text-neutral-100"
+        >
+          <span className={`flex-1 truncate ${headerFooterSummary ? "" : "text-neutral-400"}`}>{headerFooterSummary ?? "None - add a header, footer or page numbers"}</span>
+          <span className="shrink-0 text-xs font-medium text-blue-600 dark:text-blue-400">Edit…</span>
+        </button>
       </div>
       <div className="flex justify-end gap-1.5 pt-1">
         <button type="button" onClick={onClose} className="px-3 py-1 text-sm rounded-md text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700">

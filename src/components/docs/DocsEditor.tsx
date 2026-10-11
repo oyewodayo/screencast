@@ -19,6 +19,10 @@ import { TbBooks, TbListTree, TbTypography } from "react-icons/tb";
 import DocHelpPanel from "./DocHelpPanel";
 import DocStyleDialog from "./DocStyleDialog";
 import DocShareDialog, { type ShareMode } from "./DocShareDialog";
+import DocHeaderFooterDialog from "./DocHeaderFooterDialog";
+import DocPageChromeOverlay from "./DocPageChromeOverlay";
+import useDocPageChrome from "../../hooks/useDocPageChrome";
+import { hasPageChrome, printChromeCss, todayLabel, writePageChrome, type ChromeBand, type DocPageChrome } from "../../utils/docPageChrome";
 import { PAPER_STYLES } from "../../utils/docPaperStyles";
 import { BsFiletypeDocx, BsFiletypeHtml, BsFiletypeMd, BsFiletypePdf, BsFiletypeTxt } from "react-icons/bs";
 import useDocsEditStore from "../../hooks/useDocsEditStore";
@@ -403,6 +407,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   const bib = useBibliography(store.ydoc);
   const docFonts = useDocFonts(store.ydoc);
   const layout = useDocLayout(store.ydoc);
+  const pageChrome = useDocPageChrome(store.ydoc, store.headerText, store.footerText);
+  // The header/footer panel, and which band to focus in it (a double-clicked margin).
+  const [chromeEditor, setChromeEditor] = useState<{ focus: ChromeBand | null } | null>(null);
   const toggleOutline = useCallback(() => {
     setShowOutline((v) => {
       try {
@@ -548,6 +555,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   }, []);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const pageRef = useRef<HTMLDivElement>(null);
+  // Printed headers and footers use the document's own text face. Margin boxes can't read the
+  // card's CSS variables, so the resolved font stack is read off the rendered text.
+  const [textFont, setTextFont] = useState("sans-serif");
+  useEffect(() => {
+    const pm = pageRef.current?.querySelector(".ProseMirror");
+    if (pm) setTextFont(getComputedStyle(pm).fontFamily || "sans-serif");
+  }, [layout.body, editor, store.loading]);
   // Visible size of the page scroller - how far the rulers' drag guide lines reach.
   const [frameSize, setFrameSize] = useState({ width: 0, height: 0 });
   useEffect(() => {
@@ -674,7 +688,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       let saved: string;
       if (kind === "pdf") {
         saved = await withLightTheme(() =>
-          invoke<string>("export_doc_pdf", { docTitle: store.title, pageSize: store.pageSize, orientation: store.orientation, outputPath })
+          invoke<string>("export_doc_pdf", { docTitle: store.title, pageSize: store.pageSize, orientation: store.orientation, margins: resolveMargins(store.margins), outputPath })
         );
       } else if (kind === "docx") {
         const json = editor.getJSON();
@@ -686,8 +700,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           pageSize: store.pageSize,
           orientation: store.orientation,
           pageColor: store.pageColor,
-          headerText: store.headerText,
-          footerText: store.footerText,
+          pageChrome,
           margins: store.margins,
         });
         saved = await invoke<string>("export_doc_binary", { docTitle: store.title, extension: "docx", bytes: Array.from(bytes), outputPath });
@@ -722,7 +735,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
       }
       return saved;
     },
-    [editor, store.title, store.comments, store.pageSize, store.orientation, store.pageColor, store.headerText, store.footerText, store.margins, bib.store]
+    [editor, store.title, store.comments, store.pageSize, store.orientation, store.pageColor, pageChrome, store.margins, bib.store]
   );
 
   // Every format goes through a real Save dialog now - exports used to land silently in the
@@ -762,6 +775,29 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     });
     return { html, text: editor.getText({ blockSeparator: "\n\n" }) };
   }, [editor, bib.store, store.title, store.pageSize, store.orientation, store.pageColor, store.margins]);
+
+  // Header/footer edits go into the Y.Doc. A document still carrying the old single-line
+  // header/footer in its page setup (meta.json) hands it over on the first edit: the panel started
+  // from it (readPageChrome), so clearing the meta copy loses nothing.
+  const updatePageChrome = useCallback(
+    (next: DocPageChrome) => {
+      if (!store.ydoc) return;
+      writePageChrome(store.ydoc, next);
+      if (store.headerText || store.footerText) void store.setPageSetup({ headerText: null, footerText: null });
+    },
+    [store]
+  );
+  const pageChromeSummary = useMemo(() => {
+    if (!hasPageChrome(pageChrome)) return null;
+    const parts: string[] = [];
+    const pn = pageChrome.pageNumber;
+    if (pn.enabled) parts.push(`Page numbers, ${pn.position.startsWith("header") ? "top" : "bottom"} ${pn.position.split("-")[1]}`);
+    const text = (band: "header" | "footer") => Object.values(pageChrome[band]).some((t) => t.trim());
+    if (text("header")) parts.push("header");
+    if (text("footer")) parts.push("footer");
+    const line = parts.join(", ");
+    return line.charAt(0).toUpperCase() + line.slice(1);
+  }, [pageChrome]);
 
   const handleSaveNow = useCallback(async () => {
     try {
@@ -855,23 +891,26 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         }
       }}
     >
-      {/* Paper size for Print and Download PDF. Page margin is 0 on purpose: with no margin there is
-          nowhere for Chromium to stamp its own date/title/URL header and footer. The doc's margins
-          come from the print frame around the page instead (top/bottom: its repeating thead/tfoot
-          spacer rows, docPageLayout.css; left/right: the card's print padding below). The card's
-          width/padding are a real stylesheet rule (not inline style) so the `@media print`
-          override can win - inline style beats any class regardless of media query. On screen the
-          card is one sheet tall at minimum; docAutoPaginate.ts pads the last page to full height. */}
+      {/* Paper size, margins and page colour for Print and Download PDF, as @page rules. The header,
+          footer and page numbers are @page margin boxes (docPageChrome.ts's printChromeCss), which
+          Chromium draws on every printed page; that CSS always fills the four corner boxes too,
+          and a page that defines them gets none of Chromium's own date/title/URL stamps, whatever
+          the print dialog's "Headers and footers" box says. @page background covers the whole
+          sheet, margins included. The card's width/padding are a real stylesheet rule (not inline
+          style) so the `@media print` override can win - inline style beats any class regardless
+          of media query. On screen the card is one sheet tall at minimum; docAutoPaginate.ts pads
+          the last page to full height. */}
       <style>{`
-        @page { size: ${cssPageSize(page)}; margin: 0; }
+        @page { size: ${cssPageSize(page)}; margin: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in;${pageColor ? ` background: ${pageColor};` : ""} }
+        ${printChromeCss(pageChrome, { title: store.title, date: todayLabel(), fontFamily: textFont, color: pageDark ? "#d4d4d4" : "#5f6368", pagesHint: pageCount })}
         .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
         @media print {
-          .doc-page-card { max-width: none; padding: 0 ${margins.right}in 0 ${margins.left}in; min-height: 0; }
+          .doc-page-card { max-width: none; padding: 0; min-height: 0; }
         }
         ${
-          // Page colour on paper and in the PDF: edge to edge. @page has no margin, so painting the
-          // whole print chain (html, body and every ancestor of the frame, which flatten to plain
-          // blocks in print - docPageLayout.css) fills each sheet completely, margins included.
+          // The page colour under the text as well: the print chain (html, body and every ancestor of
+          // the frame, flattened to plain blocks in print - docPageLayout.css) would otherwise paint
+          // the app's own background over @page's.
           pageColor
             ? `@media print {
           html, body, *:has(.doc-print-frame), .doc-print-frame { background: ${pageColor} !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
@@ -879,26 +918,6 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             : ""
         }
       `}</style>
-
-      {/* Repeating header/footer: hidden on screen, shown only for print. `position: fixed` makes an
-          element repeat on every printed page in Chromium - the only reliable way to get repeating
-          page chrome out of a print engine with no margin-box content support. */}
-      {store.headerText && (
-        <div
-          className={`doc-print-keep hidden print:block fixed text-xs ${pageDark ? "text-neutral-300" : "text-neutral-500"} -translate-y-1/2`}
-          style={{ top: `${margins.top / 2}in`, left: `${margins.left}in`, right: `${margins.right}in` }}
-        >
-          {store.headerText}
-        </div>
-      )}
-      {store.footerText && (
-        <div
-          className={`doc-print-keep hidden print:block fixed text-xs ${pageDark ? "text-neutral-300" : "text-neutral-500"} translate-y-1/2`}
-          style={{ bottom: `${margins.bottom / 2}in`, left: `${margins.left}in`, right: `${margins.right}in` }}
-        >
-          {store.footerText}
-        </div>
-      )}
 
       <header className="shrink-0 flex items-center gap-2 pl-2 pr-3 pt-2 print:hidden">
         <button type="button" onClick={handleBack} data-tip="Back to docs" aria-label="Back to docs" className={headerIconClass()}>
@@ -1077,8 +1096,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         >
           <DocPageSetupPopover
             pageSize={store.pageSize}
-            headerText={store.headerText}
-            footerText={store.footerText}
+            headerFooterSummary={pageChromeSummary}
+            onOpenHeaderFooter={() => {
+              setHeaderMenu(null);
+              setChromeEditor({ focus: null });
+            }}
             margins={store.margins}
             orientation={store.orientation}
             pageColor={store.pageColor}
@@ -1225,7 +1247,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                       style={pageColor ? ({ ...cardStyle, "--doc-page-color": pageColor } as React.CSSProperties) : cardStyle}
                       data-page-color={pageColor ?? undefined}
                       data-page-dark={pageDark ? "" : undefined}
-                      className={`doc-page-card ${cardClass} mx-auto bg-[var(--doc-paper)] ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
+                      className={`doc-page-card ${cardClass} relative mx-auto bg-[var(--doc-paper)] ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
                     >
                       {/* Two columns: one drawn sheet per page behind the multicol rows. */}
                       {twoColumns &&
@@ -1235,6 +1257,16 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                       {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
                           flips the editor's text, heading and link colours. */}
                       <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
+                      <DocPageChromeOverlay
+                        chrome={pageChrome}
+                        pageCount={pageCount}
+                        page={page}
+                        margins={margins}
+                        title={store.title}
+                        date={todayLabel()}
+                        dark={pageDark}
+                        onEdit={(band) => setChromeEditor({ focus: band })}
+                      />
                     </div>
                   </td>
                 </tr>
@@ -1309,6 +1341,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           onMargins={(m) => void store.setPageSetup({ margins: m })}
           onClose={() => setShowStyle(false)}
         />
+      )}
+
+      {chromeEditor && store.ydoc && (
+        <DocHeaderFooterDialog chrome={pageChrome} focusBand={chromeEditor.focus} onChange={updatePageChrome} onClose={() => setChromeEditor(null)} />
       )}
 
       {shareMode && editor && (

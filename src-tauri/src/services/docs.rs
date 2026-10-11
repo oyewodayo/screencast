@@ -901,20 +901,23 @@ pub fn export_doc_binary(
 // engine as window.print(), so the @media print CSS in DocsEditor.tsx lays the pages out, but with
 // no dialog and with Chromium's date/title/URL/page-number header and footer switched off (the
 // print dialog defaults them on, which is what stamped "10/2/26, 11:53 PM" and the doc title across
-// the top of every exported page). Margins are zero here because the page frame in DocsEditor.tsx's
-// print CSS supplies the 1in margins itself, identically for this path and for Print.
+// the top of every exported page). The margins are the document's own, the same as the CSS @page
+// margin - the document's header, footer and page numbers are drawn in those margins.
 #[command]
 pub async fn export_doc_pdf(
     webview: tauri::Webview,
     doc_title: String,
     page_size: Option<String>,
     orientation: Option<String>,
+    margins: Option<DocMargins>,
     output_path: Option<String>,
 ) -> Result<String, String> {
     let output = resolve_export_path(output_path, &doc_title, "pdf")?;
     // Landscape is expressed through the page dimensions themselves (width > height) with the
     // print orientation left at portrait - setting both would rotate the page twice.
     let (width_in, height_in) = page_dimensions_in(page_size.as_deref(), orientation.as_deref());
+    let m = margins.map(|m| m.sanitized(width_in, height_in));
+    let (m_top, m_right, m_bottom, m_left) = m.map(|m| (m.top, m.right, m.bottom, m.left)).unwrap_or((1.0, 1.0, 1.0, 1.0));
 
     #[cfg(windows)]
     {
@@ -938,10 +941,10 @@ pub async fn export_doc_pdf(
                         settings.SetOrientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT)?;
                         settings.SetPageWidth(width_in)?;
                         settings.SetPageHeight(height_in)?;
-                        settings.SetMarginTop(0.0)?;
-                        settings.SetMarginBottom(0.0)?;
-                        settings.SetMarginLeft(0.0)?;
-                        settings.SetMarginRight(0.0)?;
+                        settings.SetMarginTop(m_top)?;
+                        settings.SetMarginBottom(m_bottom)?;
+                        settings.SetMarginLeft(m_left)?;
+                        settings.SetMarginRight(m_right)?;
                         settings.SetShouldPrintBackgrounds(true)?;
                         settings.SetShouldPrintHeaderAndFooter(false)?;
                         let handler = PrintToPdfCompletedHandler::create(Box::new(move |result, ok| {
@@ -971,7 +974,7 @@ pub async fn export_doc_pdf(
 
     #[cfg(not(windows))]
     {
-        let _ = (webview, width_in, height_in, output);
+        let _ = (webview, width_in, height_in, output, m_top, m_right, m_bottom, m_left);
         Err("Download as PDF is only available on Windows - use Print and choose Save as PDF".to_string())
     }
 }

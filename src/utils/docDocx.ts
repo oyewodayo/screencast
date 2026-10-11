@@ -23,6 +23,8 @@ import {
   Footer,
   Header,
   HeadingLevel,
+  NumberFormat,
+  PageNumber,
   IBordersOptions,
   type ICommentOptions,
   ImageRun,
@@ -47,6 +49,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import type { DocComment, DocMargins, DocOrientation, DocPageSize } from "./docTypes";
 import { PAGE_DIMENSIONS_IN, normalizePageColor, pageDimensionsIn, pageFormat, resolveMargins } from "./docPageGeometry";
+import { CHROME_SLOTS, bandHasContent, slotSegments, todayLabel, type ChromeBand, type DocPageChrome, type PageNumberFormat } from "./docPageChrome";
 import { latexToOmml } from "./docMathOmml";
 import { wordFontFor } from "./docFonts";
 import { captionLabel, crossRefText, type DocStructure } from "./docStructure";
@@ -708,6 +711,32 @@ class DocxBuilder {
     const height = `${paper.height}in` as PositiveUniversalMeasure;
     const inch = (v: number) => `${v}in` as PositiveUniversalMeasure;
 
+    // One paragraph per band: left text, a centre tab stop, a right tab stop - the three slots.
+    const chrome = options.pageChrome ?? null;
+    const chromePart = <T extends typeof Header | typeof Footer>(Part: T, band: ChromeBand) => {
+      const c = chrome!;
+      const runs: TextRun[] = [];
+      const style = { size: c.fontSize * 2, color: "5F6368" };
+      CHROME_SLOTS.forEach((slot, i) => {
+        if (i > 0) runs.push(new TextRun({ ...style, children: [new Tab()] }));
+        for (const seg of slotSegments(c, band, slot)) {
+          if (seg.kind === "text") runs.push(new TextRun({ ...style, text: seg.text }));
+          else if (seg.kind === "page") runs.push(new TextRun({ ...style, children: [PageNumber.CURRENT] }));
+          else if (seg.kind === "pages") runs.push(new TextRun({ ...style, children: [PageNumber.TOTAL_PAGES] }));
+          else runs.push(new TextRun({ ...style, text: seg.kind === "title" ? title : todayLabel() }));
+        }
+      });
+      const paragraph = new Paragraph({
+        tabStops: [
+          { type: TabStopType.CENTER, position: Math.round(this.textWidthTwips / 2) },
+          { type: TabStopType.RIGHT, position: this.textWidthTwips },
+        ],
+        children: runs,
+      });
+      const part = new Part({ children: [paragraph] }) as InstanceType<T>;
+      return c.differentFirstPage ? { default: part, first: new Part({ children: [new Paragraph({})] }) as InstanceType<T> } : { default: part };
+    };
+
     const doc = new Document({
       title,
       numbering: { config: this.numberingConfigs },
@@ -721,17 +750,15 @@ class DocxBuilder {
             page: {
               size: { width, height, orientation: page.orientation === "landscape" ? PageOrientation.LANDSCAPE : PageOrientation.PORTRAIT },
               margin: { top: inch(m.top), bottom: inch(m.bottom), left: inch(m.left), right: inch(m.right) },
+              pageNumbers: chrome ? { start: chrome.pageNumber.start, formatType: WORD_NUMBER_FORMAT[chrome.pageNumber.format] } : undefined,
             },
+            titlePage: chrome?.differentFirstPage || undefined,
           },
-          // Repeats on every page in real Word, unlike the CSS position:fixed trick the live
-          // print/PDF path needs (see DocsEditor.tsx's own comment on that) - .docx's header/footer
-          // model is native page-chrome, no workaround required here.
-          headers: options.headerText
-            ? { default: new Header({ children: [new Paragraph({ children: [new TextRun(options.headerText)] })] }) }
-            : undefined,
-          footers: options.footerText
-            ? { default: new Footer({ children: [new Paragraph({ children: [new TextRun(options.footerText)] })] }) }
-            : undefined,
+          // Word's own header/footer parts, with live PAGE/NUMPAGES fields - Word numbers the pages
+          // itself, in the chosen numerals from the chosen start (pageNumbers above). A different
+          // first page is Word's "Different First Page" (titlePage) with empty first-page parts.
+          headers: chrome && bandHasContent(chrome, "header") ? chromePart(Header, "header") : undefined,
+          footers: chrome && bandHasContent(chrome, "footer") ? chromePart(Footer, "footer") : undefined,
           children,
         },
       ],
@@ -753,10 +780,18 @@ export interface DocxExportOptions {
   pageSize?: DocPageSize | null;
   orientation?: DocOrientation | null;
   pageColor?: string | null;
-  headerText?: string | null;
-  footerText?: string | null;
+  // Header, footer and page numbers (docPageChrome.ts).
+  pageChrome?: DocPageChrome | null;
   margins?: DocMargins | null;
 }
+
+const WORD_NUMBER_FORMAT: Record<PageNumberFormat, (typeof NumberFormat)[keyof typeof NumberFormat]> = {
+  decimal: NumberFormat.DECIMAL,
+  "lower-roman": NumberFormat.LOWER_ROMAN,
+  "upper-roman": NumberFormat.UPPER_ROMAN,
+  "lower-alpha": NumberFormat.LOWER_LETTER,
+  "upper-alpha": NumberFormat.UPPER_LETTER,
+};
 
 export async function buildDocxBytes(json: JSONContent, title: string, options?: DocxExportOptions): Promise<Uint8Array> {
   return new DocxBuilder().build(json, title, options);
