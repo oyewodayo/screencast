@@ -99,6 +99,27 @@ jobs:
           EOF
           echo "args=--config src-tauri/tauri.signing.conf.json" >> "$GITHUB_OUTPUT"
 
+      # The release's notes: release-notes/<tag>.md (e.g. release-notes/v0.1.2.md) when there is
+      # one, then the install line. The website's release notes page renders this same body.
+      - name: Release notes
+        id: notes
+        shell: bash
+        run: |
+          file="release-notes/${GITHUB_REF_NAME}.md"
+          [ -f "$file" ] || echo "::warning::No $file - the release has only the install instructions."
+          {
+            echo "body<<BRIEFCAST_RELEASE_NOTES_EOF"
+            if [ -f "$file" ]; then
+              cat "$file"
+              echo
+              echo "---"
+              echo
+            fi
+            echo "To install, download the file ending in **x64-setup.exe** below."
+            echo "Already installed? Briefcast will offer this update on its next launch."
+            echo "BRIEFCAST_RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -115,9 +136,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Briefcast v__VERSION__
-          releaseBody: |
-            To install, download the file ending in **x64-setup.exe** below.
-            Already installed? Briefcast will offer this update on its next launch.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true

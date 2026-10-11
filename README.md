@@ -109,7 +109,11 @@ transcoding, and probing.
   delete forever), with an optional auto-purge after a configurable number of days.
 - **Rename** files inline from the sidebar.
 - **Import** files from anywhere on disk into the Briefcast library via the sidebar's
-  "Open file from anywhere" icon, or open one ad hoc without importing it.
+  "Open file from anywhere" icon, or open one ad hoc without importing it. Word,
+  Markdown and text files open in Docs (see **Opening documents** under Docs).
+- **Home screen** — "From your library" lists recordings and files together with Docs
+  documents, whiteboards and mindmaps, most recent first (by last opened or last
+  changed), with pinned files on top; each opens in its own editor.
 - **Collapsible folders** — folder rows in the sidebar have a chevron to collapse/
   expand their contents, state remembered per folder for the session.
 - **File tools docker** — select a file and toggle the wrench icon next to "new
@@ -298,8 +302,15 @@ type, and can be attached to a recording as its notes.
 
 **Documents page**
 
-- **New document** and **Import .docx** — imported Word files keep their headings,
-  lists, tables, images, links and per-paragraph colours, fonts and sizes.
+- **Start a new document** — Blank or a template, shown as real page previews, with a
+  **Template gallery** of complete examples: Research (research paper, two-column
+  journal letter, thesis, lab notebook entry, literature review, lecture notes), Work
+  (business report, meeting notes, project proposal, weekly update, invoice) and
+  Personal (resume/CV, cover letter).
+- **Import Word / Markdown / text** and **Import PDF** — imported Word files keep their
+  headings, lists, tables, images, links and per-paragraph colours, fonts and sizes; a PDF
+  comes in either rebuilt as an editable document (equations, tables, captions,
+  citations and cross-references) or as exact page images with selectable text.
 - **Folders** — nested folders in a sidebar; drag a document onto a folder or use
   **Move to…** from its ⋮ menu.
 - **Card menu** — **Open**, **Pin** (pinned documents sort first), **Move to…** and
@@ -348,8 +359,22 @@ type, and can be attached to a recording as its notes.
 - **Live pages** — the document is laid out as separate sheets with the real page
   margins and gaps between them, matching what Print and PDF export produce. Manual page
   breaks (`Ctrl+Enter`) start a new page.
-- **Page setup** — paper size (Letter, A4, Legal), margins for each side with Normal /
-  Narrow / Moderate / Wide presets, and header/footer text repeated on every printed page.
+- **Page setup** — paper size (Letter, A4, Legal), portrait or landscape, page colour
+  (edge to edge in print), margins for each side with Normal / Narrow / Moderate / Wide
+  presets, and one or two columns.
+- **Headers, footers and page numbers** — shown on every page while you write, exactly
+  where they print. Double-click a page's top or bottom margin (or **⋮ More → Header &
+  footer…** / **Page numbers…**) to open the side panel: left/centre/right text for the
+  header and footer with `{page}`, `{pages}`, `{title}` and `{date}` fields; page numbers
+  in six positions, five wordings (`1`, `Page 1`, `Page 1 of 9`, `1 / 9`, `– 1 –`), five
+  numeral styles (1, i, I, a, A) and any starting number; a different first page; and the
+  text size. Print/PDF draw them as CSS `@page` margin boxes; Word export writes real
+  header/footer parts with PAGE/NUMPAGES fields.
+- **Watermark** — **⋮ More → Watermark…**: text (presets such as DRAFT and
+  CONFIDENTIAL, diagonal or horizontal, sans or serif, four sizes, any colour) or an image
+  (logo, seal; size and washout), with strength and "not on the first page". It prints
+  behind the text on every page, and goes into Word exports as a picture anchored behind
+  the text.
 - **Rulers** — a horizontal ruler above the page and a vertical one beside it (toggle in
   **⋮ More → Show ruler**). Drag the edges of the grey margin areas to change the
   margins, and the blue markers to set the current paragraph's first-line, left and
@@ -387,6 +412,25 @@ type, and can be attached to a recording as its notes.
 - **PDF** is written directly, without a print dialog and without the browser's own
   date/title header and footer.
 - **Print** (`Ctrl+P`) uses the same page layout.
+- **Email this file / Share this file** (Export menu) — pick a format (PDF, Word, web
+  page, Markdown, text) and send it without saving it somewhere first:
+  - **Email** — the desktop mail client (Outlook, Thunderbird; Simple MAPI) opens a new
+    message with the file attached; or Gmail, Outlook.com, Yahoo Mail or the default
+    mail app open pre-filled (to, subject, message), with the file copied to the
+    clipboard and its folder opened for dragging in. Recent recipients are remembered.
+  - **Share** — the Windows share sheet (every share target on the PC), WhatsApp,
+    Telegram, Teams, Slack or Discord (the app, or its web version, opened with the file
+    on the clipboard), **Copy file**, **Copy contents** (formatted HTML plus plain text)
+    and **Save a copy**.
+
+**Opening documents**
+
+- Word (.docx), Markdown (.md) and text (.txt) files open in Docs from anywhere: the
+  home screen's **Open a file**, the paperclip, the library, or Docs' **Import**. The file
+  becomes a Briefcast document and the original is left untouched. Opening the same,
+  unchanged file again reopens that document; if the file has changed since, it's
+  imported afresh. Markdown images stored next to the file are copied into the
+  document.
 
 ### Customization
 
@@ -564,6 +608,12 @@ npm run tauri build
 
 Produces a release build and installer(s) under `src-tauri/target/release/bundle/`.
 
+**Publishing a release:** bump the version in `package.json`, `src-tauri/tauri.conf.json` and
+`src-tauri/Cargo.toml`, write what changed for users in `release-notes/vX.Y.Z.md`, then push
+the tag `vX.Y.Z`. The release workflow builds a draft GitHub release whose notes are that file
+(plus the install line); publishing the draft makes it the update existing installs are offered,
+and the website's release notes page shows the same notes.
+
 To type-check and build just the frontend bundle (without packaging the Tauri app):
 
 ```bash
@@ -590,6 +640,11 @@ npm run build
   an `assets/` folder for images and a `versions/` folder of snapshots), with
   `folders.json` for the folder tree, `search.db` for full-text search, and deleted
   documents in a hidden `.trash` folder. Exports go wherever you choose in the Save dialog.
+  A document's header/footer/page-number settings and watermark are stored inside its
+  `doc.bin` (the Yjs document), so they undo and come back with a restored version.
+- **Shared and emailed documents** are exported to `%TEMP%\Briefcast Share\` (one
+  subfolder per share; ones older than a day are cleared on the next share) before being handed to the mail client, share
+  sheet or clipboard.
 - **The speech model** for captions and voice typing is downloaded to
   `%LOCALAPPDATA%\com.withbriefs.briefcast\whisper\` on first use.
 - **Logs** (`app.log`, `panic.log`) are written to the app's data directory, typically
@@ -607,7 +662,7 @@ screencast/
 │   │   ├── video/                   # Video editor landing screen + overlay editing surface (text/image overlays, crop panel)
 │   │   ├── whiteboard/              # Whiteboard canvas, style panel, table/lattice widgets (see Whiteboard)
 │   │   ├── mindmap/                 # Mindmap canvas, component palette, inspector, Live View (see Mindmap)
-│   │   ├── docs/                    # Docs: documents page, editor, toolbar, rulers, comments, version history, page setup (see Docs)
+│   │   ├── docs/                    # Docs: documents page, editor, toolbar, rulers, comments, version history, page setup, header/footer, watermark, share (see Docs)
 │   │   ├── Modals/                  # Settings and recording-completed modals
 │   │   ├── custom/                  # Small shared UI primitives (toasts, dropdowns, alerts)
 │   │   ├── BottomDocker.tsx         # Switches between the docker/ panels above
@@ -645,6 +700,7 @@ screencast/
 │   │   │   ├── mindmaps.rs          # Mindmap document CRUD, thumbnails, image assets, PNG/PDF export
 │   │   │   ├── docs.rs              # Docs CRUD, folders, trash, versions, comments, links, page setup, export (incl. direct PDF)
 │   │   │   ├── docs_search.rs       # Docs full-text search index (SQLite FTS5)
+│   │   │   ├── share.rs             # Email (Simple MAPI) / Windows share sheet / file-to-clipboard for Docs sharing
 │   │   │   └── whisper_model.rs     # Downloads/verifies the whisper speech model on first use
 │   │   └── views/                   # Standalone window (recording-completed popup)
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
