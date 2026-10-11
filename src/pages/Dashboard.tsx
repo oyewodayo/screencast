@@ -64,7 +64,6 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
 import {
-  MAX_HOME_SCREEN_FILES,
   getPinnedPaths,
   getRecentPaths,
   togglePin,
@@ -72,6 +71,11 @@ import {
   repathFile,
   forgetFile,
 } from "../utils/homeScreenFiles";
+import { getOpenedAt, recordItemOpened } from "../utils/homeScreenFiles";
+import { buildHomeItems, homeItemKey, relativeTime, type HomeItem } from "../utils/homeLibraryItems";
+import { isOpenableDocument, openDocumentFile } from "../utils/docFileImport";
+import type { WhiteboardSummary } from "../utils/whiteboardTypes";
+import type { MindmapSummary } from "../utils/mindmapTypes";
 import {
   getResumeTime,
   recordPlaybackPosition,
@@ -439,6 +443,11 @@ const Dashboard = () => {
   // pattern as boardScreen/docsScreen. See handleOpenWhiteboard.
   const [whiteboardScreen, setWhiteboardScreen] = useState<WhiteboardScreen | null>(null);
   const [mindmapScreen, setMindmapScreen] = useState<MindmapScreen | null>(null);
+  // Whiteboards and mind maps for the home screen's "From your library" list (documents come from
+  // docsIndex below), and when each library item was last opened - see utils/homeLibraryItems.ts.
+  const [whiteboardIndex, setWhiteboardIndex] = useState<WhiteboardSummary[]>([]);
+  const [mindmapIndex, setMindmapIndex] = useState<MindmapSummary[]>([]);
+  const [openedAt, setOpenedAt] = useState<Record<string, number>>(() => getOpenedAt());
   // Which Video Editor screen (if any) is active - same null-means-off pattern as the tool
   // screens above, but with one deliberate difference: "editing" renders nothing of its own. The
   // video editor has always been "an open video in VideoPlayer + FileToolsDocker's video tools",
@@ -1558,6 +1567,41 @@ const setScreen = () => {
 		refreshDocsIndex();
 	}, [refreshDocsIndex]);
 
+	// Opening a document, whiteboard or mind map counts as "recent" for the home screen even if
+	// nothing in it changes.
+	const openedDocId = docsScreen?.mode === "editor" ? docsScreen.docId : null;
+	const openedWhiteboardId = whiteboardScreen?.mode === "editor" ? whiteboardScreen.whiteboardId : null;
+	const openedMindmapId = mindmapScreen?.mode === "editor" ? mindmapScreen.mindmapId : null;
+	useEffect(() => {
+		if (openedDocId) setOpenedAt(recordItemOpened(homeItemKey("doc", openedDocId)));
+	}, [openedDocId]);
+	useEffect(() => {
+		if (openedWhiteboardId) setOpenedAt(recordItemOpened(homeItemKey("whiteboard", openedWhiteboardId)));
+	}, [openedWhiteboardId]);
+	useEffect(() => {
+		if (openedMindmapId) setOpenedAt(recordItemOpened(homeItemKey("mindmap", openedMindmapId)));
+	}, [openedMindmapId]);
+
+	// The home screen is whatever shows when no tool and no file is open. Its library list is
+	// refreshed every time it comes back into view, so a document just written or a whiteboard just
+	// drawn is there straight away.
+	const onHomeScreen = videoEditorScreen?.mode !== "home" && !mindmapScreen && !whiteboardScreen && !boardScreen && !docsScreen && !selectedFile;
+	useEffect(() => {
+		if (!onHomeScreen) return;
+		let live = true;
+		void refreshDocsIndex();
+		setOpenedAt(getOpenedAt());
+		invoke<WhiteboardSummary[]>("list_whiteboards")
+			.then((list) => live && setWhiteboardIndex(list))
+			.catch((error) => console.error("Failed to load whiteboards for the home screen:", error));
+		invoke<MindmapSummary[]>("list_mindmaps")
+			.then((list) => live && setMindmapIndex(list))
+			.catch((error) => console.error("Failed to load mind maps for the home screen:", error));
+		return () => {
+			live = false;
+		};
+	}, [onHomeScreen, refreshDocsIndex]);
+
 	// file.path -> every doc linked to it, derived once per docsIndex change rather than filtered
 	// per row on every render.
 	const linkedDocsByPath = useMemo(() => {
@@ -2015,6 +2059,23 @@ const setScreen = () => {
   // Shared by the sidebar (files already in the Briefcast library) and the "open file from
   // anywhere" picker below — both just need a raw filesystem path turned into a playable URL.
 	const loadFileForPlayback = async (filePath: string, fileName: string) => {
+	// Document files (.docx/.md/.txt) open in Briefcast Docs - converted into a Briefcast document,
+	// or the one already made from the same unchanged file - rather than in another app.
+	if (isOpenableDocument(fileName)) {
+		setMessage(`Opening ${fileName}…`);
+		try {
+			const { docId } = await openDocumentFile(filePath, fileName);
+			handleOpenDocs();
+			setDocsScreen({ mode: "editor", docId });
+			setMessage("");
+			void refreshDocsIndex();
+		} catch (error) {
+			console.error("Error opening document:", error);
+			setMessage("");
+			setError(`Couldn't open ${fileName}: ${error instanceof Error ? error.message : error}`);
+		}
+		return;
+	}
 	try {
 		// Images (including HEIC/HEIF, auto-decoded to a cached PNG - see resolveImageDisplayUrl)
 		// resolve through their own path; everything else is the plain convert_file_path_to_url +
@@ -2094,28 +2155,46 @@ const setScreen = () => {
 	const categoryIconColorClassName = (category: FileCategory | null): string =>
 		category ? CATEGORY_ICON_COLOR[category] : "text-neutral-400 dark:text-neutral-500";
 
-	// What to surface on the empty home screen so it isn't just a blank void. Pinned files (in pin
-	// order — see utils/homeScreenFiles.ts's newest-pin-first toggling) always come first, but they
-	// only ever ADD to the top of the list — they never wholesale replace what's already showing
-	// below. The rest of the slots fill in with recently opened/edited/viewed files (or, absent any
-	// open history, just a taste of the library), skipping anything already pinned so nothing shows
-	// twice.
+	// What to surface on the empty home screen so it isn't just a blank void: library files and
+	// Briefcast's own documents, whiteboards and mind maps in one most-recent-first list, with
+	// pinned files (in pin order - see utils/homeScreenFiles.ts) always on top. See
+	// utils/homeLibraryItems.ts for the ranking.
 	const allLibraryFiles = Object.values(files).flat();
 	const libraryFilesByPath = new Map(allLibraryFiles.map((file) => [file.path, file]));
-	const pinnedLibraryFiles = pinnedPaths
-		.map((path) => libraryFilesByPath.get(path))
-		.filter((file): file is FileEntry => !!file);
-	const recentLibraryFiles = recentPaths
-		.map((path) => libraryFilesByPath.get(path))
-		.filter((file): file is FileEntry => !!file);
-	const fillerFiles = (recentLibraryFiles.length > 0 ? recentLibraryFiles : allLibraryFiles).filter(
-		(file) => !pinnedPaths.includes(file.path)
-	);
-	const libraryPreviewFiles = [...pinnedLibraryFiles, ...fillerFiles].slice(0, MAX_HOME_SCREEN_FILES);
+	const homeItems = buildHomeItems({
+		files: allLibraryFiles,
+		pinnedPaths,
+		recentPaths,
+		openedAt,
+		docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
+		whiteboards: whiteboardIndex,
+		mindmaps: mindmapIndex,
+	});
+	const homeFiles = homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : []));
+	const openHomeItem = (item: HomeItem) => {
+		if (item.kind === "file") {
+			const file = libraryFilesByPath.get(item.id);
+			if (file) handleFileClick(file);
+		} else if (item.kind === "doc") {
+			handleOpenDocs();
+			setDocsScreen({ mode: "editor", docId: item.id });
+		} else if (item.kind === "whiteboard") {
+			handleOpenWhiteboard();
+			setWhiteboardScreen({ mode: "editor", whiteboardId: item.id });
+		} else {
+			handleOpenMindmap();
+			setMindmapScreen({ mode: "editor", mindmapId: item.id });
+		}
+	};
+	const HOME_KIND: Record<Exclude<HomeItem["kind"], "file">, { label: string; icon: React.ReactNode; color: string }> = {
+		doc: { label: "Document", icon: <IoDocumentTextOutline size={18} />, color: "text-blue-500 dark:text-blue-400" },
+		whiteboard: { label: "Whiteboard", icon: <IoGitNetworkOutline size={18} />, color: "text-amber-500 dark:text-amber-400" },
+		mindmap: { label: "Mind map", icon: <IoMapOutline size={18} />, color: "text-teal-500 dark:text-teal-400" },
+	};
 	// Length shown next to each audio/video row's size - probed only for those (at most
-	// MAX_HOME_SCREEN_FILES) rows, never the whole library.
+	// HOME_LIST_SIZE) rows, never the whole library.
 	const libraryPreviewDurations = useMediaDurations(
-		libraryPreviewFiles.filter((file) => {
+		homeFiles.filter((file) => {
 			const category = getFileCategory(file.name);
 			return category === "video" || category === "audio";
 		})
@@ -4197,37 +4276,55 @@ const setScreen = () => {
               </div>
               )}
 
-              {libraryPreviewFiles.length > 0 && (
+              {homeItems.length > 0 && (
                 <div className="relative w-full max-w-md">
                   <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
                     From your library
                   </p>
                   <div className="flex flex-col gap-1">
-                    {libraryPreviewFiles.map((file) => (
-                      <button
-                        key={file.path}
-                        type="button"
-                        onClick={() => handleFileClick(file)}
-                        className="flex items-center gap-3 px-3 py-2 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
-                      >
-                        <span className="text-gray-400 dark:text-neutral-500 shrink-0">
-                          {categoryIcon(getFileCategory(file.name))}
-                        </span>
-                        <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
-                          {truncateFileName(file.name)}
-                        </span>
-                        <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
-                          {libraryPreviewDurations.has(file.path) && (
-                            <>
-                              <span>{formatMediaDuration(libraryPreviewDurations.get(file.path)!)}</span>
-                              <span aria-hidden>·</span>
-                            </>
-                          )}
-                          <span>{formatFileSize(file.size)}</span>
-                          {pinnedPaths.includes(file.path) && <IoPin size={13} />}
-                        </span>
-                      </button>
-                    ))}
+                    {homeItems.map((item) => {
+                      const file = item.kind === "file" ? libraryFilesByPath.get(item.id) : undefined;
+                      const kind = item.kind === "file" ? null : HOME_KIND[item.kind];
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          onClick={() => openHomeItem(item)}
+                          className="flex items-center gap-3 px-3 py-2 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
+                        >
+                          <span className={`shrink-0 ${kind ? kind.color : "text-gray-400 dark:text-neutral-500"}`}>
+                            {kind ? kind.icon : categoryIcon(getFileCategory(item.name))}
+                          </span>
+                          <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
+                            {file ? truncateFileName(file.name) : item.name}
+                          </span>
+                          <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
+                            {file ? (
+                              <>
+                                {libraryPreviewDurations.has(file.path) && (
+                                  <>
+                                    <span>{formatMediaDuration(libraryPreviewDurations.get(file.path)!)}</span>
+                                    <span aria-hidden>·</span>
+                                  </>
+                                )}
+                                <span>{formatFileSize(file.size)}</span>
+                              </>
+                            ) : (
+                              <>
+                                <span>{kind!.label}</span>
+                                {item.time > 0 && (
+                                  <>
+                                    <span aria-hidden>·</span>
+                                    <span>{relativeTime(item.time)}</span>
+                                  </>
+                                )}
+                              </>
+                            )}
+                            {item.pinned && <IoPin size={13} />}
+                          </span>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               )}

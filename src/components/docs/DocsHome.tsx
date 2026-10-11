@@ -12,7 +12,7 @@ import { MdFileUpload, MdPictureAsPdf } from "react-icons/md";
 import * as Y from "yjs";
 import { DOC_DRAG_MIME, DocFolder, DocSummary, flattenFolderTree } from "../../utils/docTypes";
 import { getPinnedDocIds, toggleDocPin, forgetDocPin } from "../../utils/docLibraryHistory";
-import { importDocxFile } from "../../utils/docxImport";
+import { openDocumentFile } from "../../utils/docFileImport";
 import { extractPlainText } from "../../utils/docYjsText";
 import { DOC_TEMPLATES, DOC_TEMPLATE_CATEGORIES, DocTemplate, createDocFromTemplate, templatePreview } from "../../utils/docTemplates";
 import { loadDocPreview, type DocPreviewData } from "../../utils/docPreview";
@@ -396,11 +396,19 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     // clear message once it's picked explains the real limitation (no import path exists for the
     // legacy binary format - see utils/docxImport.ts's own header comment for why mammoth.js,
     // which does the actual .docx -> HTML conversion, only supports the modern OOXML format).
-    const selected = await openFileDialog({ multiple: false, filters: [{ name: "Word Document", extensions: ["docx", "doc"] }] });
+    const selected = await openFileDialog({
+      multiple: false,
+      filters: [
+        { name: "Documents", extensions: ["docx", "doc", "md", "markdown", "txt"] },
+        { name: "Word Document", extensions: ["docx", "doc"] },
+        { name: "Markdown", extensions: ["md", "markdown"] },
+        { name: "Plain text", extensions: ["txt"] },
+      ],
+    });
     if (!selected || Array.isArray(selected)) return;
     const name = selected.split(/[\\/]/).pop() ?? selected;
 
-    if (!/\.docx$/i.test(name)) {
+    if (/\.doc$/i.test(name)) {
       await showMessageDialog(
         "This looks like an older .doc file. Please save it as .docx (in Word, Google Docs, or LibreOffice) and import again.",
         { title: "Unsupported file", kind: "warning" }
@@ -410,8 +418,8 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
 
     setIsImporting(true);
     try {
-      const { id } = await importDocxFile(selected, name);
-      onOpenDoc(id);
+      const { docId } = await openDocumentFile(selected, name);
+      onOpenDoc(docId);
     } catch (err) {
       console.error("Failed to import document:", err);
       setError(err instanceof Error ? err.message : String(err));
@@ -628,7 +636,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
                 disabled={isImporting}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-200 dark:hover:bg-neutral-800 transition-colors disabled:opacity-50"
               >
-                <MdFileUpload size={16} /> {isImporting ? "Importing…" : "Import .docx"}
+                <MdFileUpload size={16} /> {isImporting ? "Importing…" : "Import Word / Markdown / text"}
               </button>
               <button
                 type="button"
