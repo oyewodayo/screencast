@@ -628,6 +628,16 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // container, held in state (callback ref) so the context re-renders the popovers once it mounts.
   const [videoSidebarTab, setVideoSidebarTab] = useState<"tools" | "media">("tools");
   const [toolPanelHostEl, setToolPanelHostEl] = useState<HTMLDivElement | null>(null);
+  // The player's own sidebar panels (viewing captions, chapters) are open - shows the Tools tab
+  // for them even when no video is being edited. See VideoPlayer's onSidebarPanelChange.
+  const [playerSidebarOpen, setPlayerSidebarOpen] = useState<boolean>(false);
+  const handlePlayerSidebarPanelChange = useCallback((open: boolean) => {
+    setPlayerSidebarOpen(open);
+    if (open) {
+      setShowFileList(true);
+      setVideoSidebarTab("tools");
+    }
+  }, []);
   // Opening a tool from the timeline while the Media tab is showing brings its panel into view.
   useEffect(() => {
     if (!toolPanelHostEl) return;
@@ -2985,6 +2995,8 @@ const setScreen = () => {
     !whiteboardScreen &&
     !mindmapScreen &&
     videoEditorScreen?.mode !== "home";
+  // Tools/Media tabs (and a docking host) whenever something wants the sidebar's Tools tab.
+  const showToolsSidebar = isEditingVideo || playerSidebarOpen;
 
   // The "Back to …" button for whatever VideoPlayer is showing - rendered at the left end of its
   // control bar (fading with it) rather than as a row above the picture.
@@ -3007,7 +3019,7 @@ const setScreen = () => {
     ) : undefined;
 
   return (
-    <ToolPanelHostContext.Provider value={isEditingVideo ? toolPanelHostEl : null}>
+    <ToolPanelHostContext.Provider value={showToolsSidebar ? toolPanelHostEl : null}>
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
       {/* flex-1 min-h-0 here (and h-full min-h-0 on the row below) is load-bearing, not
           cosmetic: without a real height bound propagated all the way down, the main content
@@ -3030,7 +3042,7 @@ const setScreen = () => {
           >
             {showFileList && !isPdfFullscreen && (
               <div className="flex flex-col h-full">
-                {isEditingVideo && (
+                {showToolsSidebar && (
                   <div className="flex items-center gap-1 p-2 border-b border-gray-300 dark:border-neutral-700 shrink-0">
                     {([
                       { tab: "tools", label: "Tools", icon: <IoOptionsOutline size={15} /> },
@@ -3055,7 +3067,7 @@ const setScreen = () => {
                 {/* Tools tab - the timeline's settings popovers portal into the host div below
                     (ToolPanelHost.tsx). Kept mounted (just hidden) on the Media tab so an open
                     panel isn't torn down, and so a panel opening there can flip back to it. */}
-                {isEditingVideo && (
+                {showToolsSidebar && (
                   <div
                     className={`flex-1 min-h-0 overflow-y-auto overscroll-contain p-3 pb-[var(--docker-height,64px)] ${
                       videoSidebarTab === "tools" ? "" : "hidden"
@@ -3071,7 +3083,7 @@ const setScreen = () => {
                     </div>
                   </div>
                 )}
-                <div className={`flex flex-col flex-1 min-h-0 ${isEditingVideo && videoSidebarTab === "tools" ? "hidden" : ""}`}>
+                <div className={`flex flex-col flex-1 min-h-0 ${showToolsSidebar && videoSidebarTab === "tools" ? "hidden" : ""}`}>
                 {/* File type tabs */}
                 <div className="flex items-center justify-around border-b border-gray-300 dark:border-neutral-700 py-2 shrink-0">
                   {FILE_CATEGORY_TABS.map(({ category, label, icon }) => (
@@ -4128,6 +4140,12 @@ const setScreen = () => {
                           onUpdateBlurOverlayContent={editStore.updateBlurOverlayContent}
                           onDeleteBlurOverlay={editStore.deleteBlurOverlay}
                           onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
+                          onSetOverlayTime={(kind, id, edge, time) => {
+                            const clamped = Math.max(0, Math.min(totalOutputDuration, time));
+                            if (kind === "text") editStore.resizeTextOverlayTime(id, edge, clamped);
+                            else if (kind === "image") editStore.resizeImageOverlayTime(id, edge, clamped);
+                            else editStore.resizeBlurOverlayTime(id, edge, clamped);
+                          }}
                           totalOutputDuration={totalOutputDuration}
                         />
                         <PipOverlayLayer
@@ -4177,6 +4195,7 @@ const setScreen = () => {
                     : undefined
                 }
                 controlsLeading={playerBackButton}
+                onSidebarPanelChange={handlePlayerSidebarPanelChange}
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted}
                 activeClipEffects={activeClipEffects}

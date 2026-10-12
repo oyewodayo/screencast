@@ -4,6 +4,7 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { trackEvent } from '../utils/telemetry';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { createPortal } from 'react-dom';
 import { IoPause, IoPlay, IoPlaySkipBack, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
@@ -31,7 +32,12 @@ import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
 import { ActiveClipEffects, cropStaticTransform, cssFilterForColorPreset, kenBurnsTransform } from '../utils/videoColorFilters';
-import { ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
+import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
+import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile } from '../utils/captions';
+import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
+import CaptionOverlayLayer from './video/CaptionOverlayLayer';
+import { PlayerCaptionsPanel, PlayerChaptersPanel } from './video/PlayerSidePanels';
+import { useToolPanelHost } from './docker/ToolPanelHost';
 import { loadRnnoise, RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 import rnnoiseWorkletPath from '@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url';
 import rnnoiseWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise.wasm?url';
@@ -176,6 +182,10 @@ interface VideoPlayerProps {
   // Pinned to the left end of the control bar, showing/hiding with it - Dashboard's "Back to …"
   // button, which used to be its own row above the player and cost the picture that height.
   controlsLeading?: React.ReactNode;
+  // Opens/closes the player's own sidebar panels (viewing captions, chapters). When set, the
+  // parent shows its Tools tab for them (and provides ToolPanelHost); when absent, chapters keep
+  // their popup menu and captions have no sidebar option.
+  onSidebarPanelChange?: (open: boolean) => void;
   // The primary video's own persisted/exported audio level (useVideoEditStore's
   // videoAudioMuted/videoAudioVolume) - distinct from this component's own volume slider/mute
   // button just below, which is pure local listening convenience that never leaves this session.
@@ -275,7 +285,7 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -1022,6 +1032,73 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     track.addEventListener('cuechange', syncCue);
     return () => track.removeEventListener('cuechange', syncCue);
   }, [captionsUrl]);
+
+  // Viewing captions drawn with the caption presets (CaptionOverlayLayer, the same renderer as the
+  // editor's burned-in captions) instead of the plain cue box: the whole cue list is read from the
+  // caption Blob once, and lines/words are timed off it (word timing estimated within each cue,
+  // since a subtitle file only times whole cues). Style is a viewer preference, never saved into a
+  // file - see playerCaptionSettings.ts. The plain cue box below remains the fallback.
+  const [playerCaptionSettings, setPlayerCaptionSettings] = useState<CaptionSettings>(loadPlayerCaptionSettings);
+  const updatePlayerCaptionSettings = (patch: Partial<CaptionSettings>): void => {
+    setPlayerCaptionSettings((prev) => {
+      const next = { ...prev, ...patch };
+      savePlayerCaptionSettings(next);
+      return next;
+    });
+  };
+  const [playerCues, setPlayerCues] = useState<SubtitleCue[]>([]);
+  useEffect(() => {
+    if (!captionsUrl) {
+      setPlayerCues([]);
+      return;
+    }
+    let cancelled = false;
+    fetch(captionsUrl)
+      .then((r) => r.text())
+      .then((text) => !cancelled && setPlayerCues(parseSubtitleFile(text)))
+      .catch(() => !cancelled && setPlayerCues([]));
+    return () => {
+      cancelled = true;
+    };
+  }, [captionsUrl]);
+  const playerCaptionLines = useMemo(
+    () =>
+      playerCues.length === 0
+        ? []
+        : buildCaptionLines([{ id: 'player', sourcePath: 'player', start: 0, end: Number.MAX_SAFE_INTEGER }], {
+            language: '',
+            transcripts: { player: cuesToCaptionWords(playerCues) },
+            settings: playerCaptionSettings,
+          }),
+    [playerCues, playerCaptionSettings]
+  );
+
+  // The player's sidebar panels (PlayerSidePanels.tsx), portaled into the parent's Tools tab.
+  const toolPanelHost = useToolPanelHost();
+  const [sidebarPanel, setSidebarPanel] = useState<null | 'captions' | 'chapters'>(null);
+  const onSidebarPanelChangeRef = useRef(onSidebarPanelChange);
+  onSidebarPanelChangeRef.current = onSidebarPanelChange;
+  useEffect(() => {
+    onSidebarPanelChangeRef.current?.(sidebarPanel !== null);
+  }, [sidebarPanel]);
+  useEffect(() => () => onSidebarPanelChangeRef.current?.(false), []);
+
+  // Numeric playback time for the caption renderer and the panels (timeupdate, ~4Hz - the caption
+  // layer interpolates between ticks itself). Only listened to while something needs it.
+  const [playbackClock, setPlaybackClock] = useState(0);
+  const needsPlaybackClock = (captionsVisible && playerCaptionLines.length > 0) || sidebarPanel !== null;
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !needsPlaybackClock) return;
+    const tick = () => setPlaybackClock(video.currentTime);
+    tick();
+    video.addEventListener('timeupdate', tick);
+    video.addEventListener('seeked', tick);
+    return () => {
+      video.removeEventListener('timeupdate', tick);
+      video.removeEventListener('seeked', tick);
+    };
+  }, [needsPlaybackClock]);
 
   // Revokes whatever caption Blob URL is current when this player unmounts entirely (a file
   // switch already revokes the previous one itself, in the effect above) - reads captionsUrlRef
@@ -2328,7 +2405,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							<button
 								ref={chaptersBtnRef}
 								className="chapters-btn w-7"
-								onClick={() => setShowChaptersMenu((prev) => !prev)}
+								onClick={() =>
+									onSidebarPanelChange
+										? setSidebarPanel((prev) => (prev === 'chapters' ? null : 'chapters'))
+										: setShowChaptersMenu((prev) => !prev)
+								}
 								title={chapters.length > 0 ? `${chapters.length} chapter${chapters.length === 1 ? '' : 's'}` : 'Chapters'}
 							>
 								{chapters.length > 0
@@ -2503,6 +2584,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							hasCaptions={!!captionsUrl}
 							captionsVisible={captionsVisible}
 							onCaptionsVisibleChange={() => setCaptionsVisible((prev) => !prev)}
+							onShowCaptionsInSidebar={
+								onSidebarPanelChange
+									? () => {
+											setShowSettings(false);
+											setSidebarPanel('captions');
+										}
+									: undefined
+							}
 							generatedCaptionsLanguage={generatedCaptionsLanguage}
 							onLoadCaptionsFile={() => { setShowSettings(false); void pickCaptionsFile(); }}
 							onGenerateCaptions={() => { setShowSettings(false); void generateCaptionsFromAudio(); }}
@@ -2562,11 +2651,68 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							/>
 						)}
 					</video>
-					{captionsVisible && activeCaptionText && (
-						<div className="caption-overlay" aria-live="polite">
-							<span className="caption-text">{activeCaptionText}</span>
+					{captionsVisible && playerCaptionLines.length > 0 && frameRect ? (
+						<div
+							className="absolute pointer-events-none"
+							style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height, zIndex: 90 }}
+							aria-live="polite"
+						>
+							<CaptionOverlayLayer
+								frameRect={frameRect}
+								lines={playerCaptionLines}
+								settings={{ ...playerCaptionSettings, enabled: true }}
+								currentOutputTime={playbackClock}
+								isPlaying={isPlaying}
+								clipSpeed={1}
+							/>
 						</div>
+					) : (
+						captionsVisible &&
+						activeCaptionText && (
+							<div className="caption-overlay" aria-live="polite">
+								<span className="caption-text">{activeCaptionText}</span>
+							</div>
+						)
 					)}
+					{toolPanelHost &&
+						sidebarPanel === 'captions' &&
+						createPortal(
+							<PlayerCaptionsPanel
+								hasCaptions={!!captionsUrl}
+								visible={captionsVisible}
+								onVisibleChange={setCaptionsVisible}
+								settings={playerCaptionSettings}
+								onUpdateSettings={updatePlayerCaptionSettings}
+								lines={playerCaptionLines}
+								currentTime={playbackClock}
+								onSeek={(t) => {
+									if (videoRef.current) videoRef.current.currentTime = t;
+								}}
+								exportBaseName={(filePath?.split(/[\\/]/).pop() ?? 'video').replace(/\.[^.]+$/, '')}
+								onLoadFile={() => void pickCaptionsFile()}
+								onGenerate={() => void generateCaptionsFromAudio()}
+								generating={isGeneratingCaptions ? { progress: captionsGenerationProgress ?? 0, downloadingModel: isDownloadingSpeechModel } : null}
+								onClose={() => setSidebarPanel(null)}
+							/>,
+							toolPanelHost
+						)}
+					{toolPanelHost &&
+						sidebarPanel === 'chapters' &&
+						createPortal(
+							<PlayerChaptersPanel
+								chapters={chapters}
+								activeChapterId={[...chapters].reverse().find((c) => c.time <= playbackClock + 0.05)?.id}
+								currentTime={playbackClock}
+								isDetecting={isDetectingChapters}
+								onSeek={seekToChapter}
+								onRename={renameChapter}
+								onDelete={deleteChapter}
+								onAdd={addChapterAtCurrentTime}
+								onDetect={() => void detectChaptersFromSilence()}
+								onClose={() => setSidebarPanel(null)}
+							/>,
+							toolPanelHost
+						)}
 					{mediaType === 'audio' && (
 						<canvas ref={visualizerCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
 					)}
