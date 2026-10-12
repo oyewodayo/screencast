@@ -19,6 +19,9 @@ body {
 
 .video-container {
     position: relative;
+    /* Named size container for the responsive control bar (the @container player rules below, and
+       Dashboard's @max-[...]/player label variant on the "Back to …" button). */
+    container: player / inline-size;
     background-color: #000;
     /* Prevent overflow */
     overflow: hidden;
@@ -85,14 +88,11 @@ video {
 /* Video controls */
 .video-controls-container {
     position: absolute;
-    /* The app's own docker bar (BottomDocker/ActiveRecordingState) is a `fixed bottom-0` overlay
-       that sits on top of the video player, and its height changes a lot depending on whether the
-       full file-name/type/recording-options panel is expanded or collapsed. BottomDocker measures
-       its own real height with a ResizeObserver and publishes it as --docker-height, so these
-       controls always clear it instead of assuming one fixed height (which put them out of view
-       under the docker any time it was taller than that guess). 64px is only the fallback for
-       before that var is set on first paint. */
-    bottom: var(--docker-height, 64px);
+    /* Flush with the container's bottom: VideoPlayer's wrapper already reserves --docker-height
+       (BottomDocker's live height, published by its ResizeObserver) below the container, so the
+       container's bottom edge is the top of the docker - and in native fullscreen it's the screen's
+       bottom edge, where lifting the controls by a docker that isn't shown would be wrong. */
+    bottom: 0;
     left: 0;
     right: 0;
     color: white;
@@ -302,7 +302,10 @@ video {
     display: flex;
     width: 100%;
     align-items: center;
-    padding: 10px 0;
+    /* Kept tight (and the controls row below has no top margin, the container little bottom
+       padding) so the scrubber sits low - bottom-positioned captions in the preview stay readable
+       above it instead of being struck through. */
+    padding: 7px 0;
 }
 
 .timeline {
@@ -562,10 +565,73 @@ input:focus-visible {
 }
 
 /* Better button spacing */
-.video-controls-container .controls > div {
+.video-controls-container .controls > div,
+.video-controls-container .controls .ctl-cluster > div {
     display: flex;
     align-items: center;
     gap: 0.5rem;
+}
+
+/* Control row layout - see the comment on .controls in VideoPlayer.tsx. */
+.video-controls-container .controls {
+    /* Full width, or the flex-1 sides have no room and the leading "Back to …" button gets squeezed
+       up against the playback cluster instead of sitting at the player's left edge. */
+    width: 100%;
+}
+.video-controls-container .controls .ctl-side {
+    flex: 1 1 0;
+    min-width: 0;
+}
+.video-controls-container .controls .ctl-leading {
+    justify-content: flex-start;
+    padding-left: 0.5rem;
+}
+.video-controls-container .controls .ctl-cluster {
+    flex: 0 0 auto;
+    margin: 0 0.75rem;
+}
+
+/* Responsive control bar - sized off the player's own width (the `player` container on
+   .video-container), not the window, since the sidebar and docker change how wide the player is
+   at any given window size. Each tier first shrinks, then drops the least-used buttons (all
+   still reachable from the keyboard: j/l speed, arrows to seek, i for PiP). */
+/* Base icon size - one step down from the markup's text-2xl/text-3xl (1.5rem/1.875rem), which
+   read too heavy next to the editor's own compact toolbar. */
+.video-controls-container .controls .text-2xl { font-size: 1.25rem; line-height: 1; }
+.video-controls-container .controls .text-3xl { font-size: 1.5rem; line-height: 1; }
+.video-controls-container .controls .w-7 { width: 1.5rem; }
+.video-controls-container .controls button.wide-btn { width: 44px; font-size: 0.8rem; }
+.video-controls-container .duration-container { font-size: 0.8rem; }
+
+@container player (max-width: 1100px) {
+    .video-controls-container .controls .ctl-cluster { margin: 0 0.5rem; }
+    .video-controls-container .controls .ctl-cluster .gap-5 { gap: 0.75rem; }
+    .video-controls-container .controls .ctl-cluster .gap-4 { gap: 0.5rem; }
+    .video-controls-container .controls .text-2xl { font-size: 1.125rem; }
+    .video-controls-container .controls .text-3xl { font-size: 1.3rem; }
+    .video-controls-container .controls .w-7 { width: 1.375rem; }
+    .video-controls-container .controls button.wide-btn { width: 38px; font-size: 0.75rem; }
+    .video-controls-container .duration-container { font-size: 0.75rem; }
+}
+
+@container player (max-width: 800px) {
+    .video-controls-container .controls .ctl-skip,
+    .video-controls-container .controls .ctl-cluster div:has(> .playback-reduce),
+    .video-controls-container .controls .autoplay-btn,
+    .video-controls-container .controls .loop-btn,
+    .video-controls-container .controls .ctl-cluster div:has(> .chapters-btn),
+    .video-controls-container .controls .mini-player-btn {
+        display: none;
+    }
+}
+
+@container player (max-width: 520px) {
+    .video-controls-container .controls .ctl-cluster div:has(> .captions-btn),
+    .video-controls-container .controls .volume-slider {
+        display: none;
+    }
+    .video-controls-container .controls .ctl-cluster .gap-5 { gap: 0.5rem; }
+    .video-controls-container .controls .ctl-cluster { margin: 0 0.25rem; }
 }
 
 /* Toggle switch (Autoplay, and any future on/off setting) - used by PlaytimeSettings and the
@@ -633,6 +699,12 @@ input:focus-visible {
     max-width: 300px;
     padding: 0.4rem 0;
     font-size: 0.8125rem;
+    /* The player clips overflow, and these open upward from the control bar - so cap them to the
+       space above it (--player-h is set on .video-container by VideoPlayer; ~76px is the scrubber +
+       control row + gap) and scroll the rest rather than losing the top rows off-screen. */
+    max-height: calc(var(--player-h, 100vh) - 76px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 /* .settings-menu button.settings-row (not just .settings-row) - every row here is rendered
@@ -894,13 +966,13 @@ input:focus-visible {
 }
 
 /* Our own caption renderer (VideoPlayer.tsx keeps the <track> in 'hidden' mode and mirrors the
-   active cue here). Native cues sit at the very bottom of the <video> box, under BottomDocker's
-   fixed overlay - this clears the docker, and lifts further while the control bar is showing so
-   the two never overlap. */
+   active cue here). The container already ends above BottomDocker (VideoPlayer reserves
+   --docker-height below it), so this sits just above its bottom edge and lifts further while the
+   control bar is showing so the two never overlap. */
 .caption-overlay {
     position: absolute;
     left: 50%;
-    bottom: calc(var(--docker-height, 64px) + 1.5rem);
+    bottom: 1.5rem;
     transform: translateX(-50%);
     width: max-content;
     max-width: min(80%, 56rem);
@@ -914,7 +986,7 @@ input:focus-visible {
 .video-container:hover .caption-overlay,
 .video-container.paused .caption-overlay,
 .video-container.controls-visible .caption-overlay {
-    bottom: calc(var(--docker-height, 64px) + 6rem);
+    bottom: 6rem;
 }
 
 .caption-text {

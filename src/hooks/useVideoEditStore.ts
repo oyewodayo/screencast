@@ -1,10 +1,11 @@
 // hooks/useVideoEditStore.ts
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { CaptionLine, buildCaptionLines, buildCaptionsAss, defaultCaptionSettings, replaceCaptionLineText } from "../utils/captions";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AudioOverlay, BlurOverlay, Clip, EditableFields, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, EditableFields, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
@@ -197,6 +198,15 @@ export interface UseVideoEditStoreResult {
   videoAudioVolume: number;
   setVideoAudioMuted: (muted: boolean) => void;
   setVideoAudioVolume: (volume: number) => void;
+  // Burned-in captions (the Captions tool) - see CaptionTrack, videoEditTypes.ts. null until the
+  // first transcript is added.
+  captions: CaptionTrack | null;
+  // Adds/replaces word transcripts (keyed by source path), creating the track with default
+  // settings the first time.
+  setCaptionTranscripts: (language: string, transcripts: Record<string, CaptionWord[]>) => void;
+  updateCaptionSettings: (patch: Partial<CaptionSettings>) => void;
+  editCaptionLine: (line: CaptionLine, text: string) => void;
+  clearCaptions: () => void;
   // Called once the real video duration is known (from the hidden capture <video>'s
   // loadedmetadata) - only seeds a fresh, unedited state; a no-op once real state exists (either
   // loaded from the sidecar or already seeded), so it's safe to call on every metadata load.
@@ -319,7 +329,16 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     }
     prevSourcePathRef.current = sourcePath;
 
-    if (!sourcePath) return;
+    // No file open (e.g. "Back" to the Video Editor's home) - drop the outgoing file's clips too,
+    // or the next video opened would briefly mount its timeline on THEM, and that timeline's first
+    // seek would point the player back at the previous file. (The pending autosave is already
+    // flushed by the cleanup below, which runs before this.)
+    if (!sourcePath) {
+      setState(null);
+      setUndoStack([]);
+      setRedoStack([]);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setState(null);
@@ -347,6 +366,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 pipOverlays: parsed.pipOverlays ?? [],
                 videoAudioMuted: parsed.videoAudioMuted ?? false,
                 videoAudioVolume: parsed.videoAudioVolume ?? 1,
+                captions: parsed.captions ?? null,
               });
               // Any clip referencing a file other than the primary one (dragged in from
               // elsewhere) needs its duration re-fetched after a reload, since the cache above is
@@ -482,6 +502,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     pipOverlays: current.pipOverlays,
     videoAudioMuted: current.videoAudioMuted,
     videoAudioVolume: current.videoAudioVolume,
+    captions: current.captions ?? null,
     ...patch,
   });
 
@@ -1021,6 +1042,48 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const setCaptionTranscripts = useCallback(
+    (language: string, transcripts: Record<string, CaptionWord[]>) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const existing = current.captions;
+      const captions: CaptionTrack = {
+        language,
+        transcripts: { ...(existing?.transcripts ?? {}), ...transcripts },
+        settings: existing?.settings ?? defaultCaptionSettings(),
+      };
+      pushCommand(snapshot(current, {}), snapshot(current, { captions }), "edit-captions");
+    },
+    [pushCommand]
+  );
+
+  const updateCaptionSettings = useCallback(
+    (patch: Partial<CaptionSettings>) => {
+      const current = stateRef.current;
+      if (!current?.captions) return;
+      const captions: CaptionTrack = { ...current.captions, settings: { ...current.captions.settings, ...patch } };
+      pushCommand(snapshot(current, {}), snapshot(current, { captions }), "edit-captions");
+    },
+    [pushCommand]
+  );
+
+  const editCaptionLine = useCallback(
+    (line: CaptionLine, text: string) => {
+      const current = stateRef.current;
+      if (!current?.captions) return;
+      const captions = replaceCaptionLineText(current.captions, line, text);
+      if (captions === current.captions) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { captions }), "edit-captions");
+    },
+    [pushCommand]
+  );
+
+  const clearCaptions = useCallback(() => {
+    const current = stateRef.current;
+    if (!current?.captions) return;
+    pushCommand(snapshot(current, {}), snapshot(current, { captions: null }), "edit-captions");
+  }, [pushCommand]);
+
   const insertClipAt = useCallback(
     async (newClipSourcePath: string, atIndex: number) => {
       const current = stateRef.current;
@@ -1191,6 +1254,15 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             fadeOut: o.fadeOutSec ?? 0,
           }));
 
+        // Captions go to Rust as a finished ASS script (burned in last, with libass) rather than
+        // per-line PNGs - hundreds of timed lines, each re-drawn per word for emphasis, is exactly
+        // what a subtitle renderer is for and far too many overlay inputs for the PNG path.
+        const captionLines = current.captions?.settings.enabled ? buildCaptionLines(current.clips, current.captions) : [];
+        const captionsAss =
+          videoPixelSize && current.captions && captionLines.length > 0
+            ? buildCaptionsAss(captionLines, current.captions.settings, videoPixelSize.width, videoPixelSize.height)
+            : null;
+
         const resultPath = await invoke<string>("export_trimmed_video", {
           outputBasePath: sourcePath,
           segments: toKeepSegments(current.clips),
@@ -1204,6 +1276,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           videoHeight: videoPixelSize?.height ?? null,
           quality: options?.quality ?? null,
           outputPath: options?.outputPath ?? null,
+          captionsAss,
         });
         const name = resultPath.split(/[\\/]/).pop() ?? resultPath;
         return { path: resultPath, name };
@@ -1267,6 +1340,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     videoAudioVolume: state?.videoAudioVolume ?? 1,
     setVideoAudioMuted,
     setVideoAudioVolume,
+    captions: state?.captions ?? null,
+    setCaptionTranscripts,
+    updateCaptionSettings,
+    editCaptionLine,
+    clearCaptions,
     setDuration,
     getSourceDuration,
     splitAt,

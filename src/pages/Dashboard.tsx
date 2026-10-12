@@ -1,5 +1,8 @@
 // Dashboard.tsx
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { ToolPanelHostContext } from "../components/docker/ToolPanelHost";
+import CaptionOverlayLayer from "../components/video/CaptionOverlayLayer";
+import { buildCaptionLines } from "../utils/captions";
 import * as Y from "yjs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ask, open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
@@ -102,6 +105,7 @@ import {
   IoFolderOutline,
   IoAddCircleOutline,
   IoBuildOutline,
+  IoOptionsOutline,
   IoPin,
   IoPinOutline,
   IoCreateOutline,
@@ -264,38 +268,6 @@ interface FileMap {
 // there is now open in the editor". See videoEditorScreen's own doc comment below for why the
 // second carries no payload of its own.
 type VideoEditorScreen = { mode: "home" } | { mode: "editing" };
-
-// True while the cursor has moved (or a key/click/wheel happened) within the last `idleMs`, the
-// same "controls fade out while you're just watching" behaviour as the player's own control bar.
-// Only flips state on an actual active<->idle transition, so mousemove doesn't re-render per event.
-function useCursorActive(enabled: boolean, idleMs = 2500): boolean {
-  const [active, setActive] = useState(true);
-  const activeRef = useRef(true);
-  useEffect(() => {
-    if (!enabled) {
-      activeRef.current = true;
-      setActive(true);
-      return;
-    }
-    let timer: ReturnType<typeof setTimeout>;
-    const arm = () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => { activeRef.current = false; setActive(false); }, idleMs);
-    };
-    const wake = () => {
-      if (!activeRef.current) { activeRef.current = true; setActive(true); }
-      arm();
-    };
-    const events = ["mousemove", "mousedown", "keydown", "wheel", "touchstart"] as const;
-    events.forEach((e) => window.addEventListener(e, wake, { passive: true }));
-    arm();
-    return () => {
-      clearTimeout(timer);
-      events.forEach((e) => window.removeEventListener(e, wake));
-    };
-  }, [enabled, idleMs]);
-  return active;
-}
 
 const Dashboard = () => {
   const [message, setMessage] = useState<string>("");
@@ -577,17 +549,15 @@ const Dashboard = () => {
   // default end time clamps against the timeline's REAL length instead of a stale, too-long value
   // that ignores every sped-up clip already on it.
   const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + Math.max(0, (c.end - c.start) / (c.speed ?? 1)), 0);
+  // Burned-in captions preview (CaptionOverlayLayer) - the same lines Save exports.
+  const captionLines = useMemo(() => buildCaptionLines(editStore.clips, editStore.captions), [editStore.clips, editStore.captions]);
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
   // load_image_edit_state invoke. HEIC/HEIF included - selectedFile.path is already a decoded
   // PNG for them by the time this reads it (see resolveImageDisplayUrl/loadFileForPlayback), so
   // there's nothing left to fail decoding.
   const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
-  // While a video/audio file is playing, the floating "Back to …" button fades out once the cursor
-  // goes idle (like the player's own controls) so it isn't sitting on top of the picture.
   const selectedCategory = selectedFile ? getFileCategory(selectedFile.name) : null;
   const isMediaFileSelected = selectedCategory === "video" || selectedCategory === "audio";
-  const cursorActive = useCursorActive(isMediaFileSelected);
-  const backButtonFade = `transition-opacity duration-300 ${cursorActive ? "opacity-100" : "opacity-0 [&>button]:pointer-events-none"}`;
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
@@ -615,6 +585,22 @@ const Dashboard = () => {
   const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
   const [selectedPipOverlayId, setSelectedPipOverlayId] = useState<string | null>(null);
   const [isPlacingPip, setIsPlacingPip] = useState<boolean>(false);
+  // Esc disarms whichever placement tool is armed (and with it the "Click anywhere on the video
+  // to place …" banner), the same as clicking its toolbar button again.
+  const isPlacingAny = isPlacingText || isPlacingImage || isPlacingBlur || isPlacingPip;
+  useEffect(() => {
+    if (!isPlacingAny) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      setIsPlacingText(false);
+      setIsPlacingImage(false);
+      setIsPlacingBlur(false);
+      setIsPlacingPip(false);
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [isPlacingAny]);
   // Arms the on-canvas crop tool (ClipCropOverlay, mounted as a sibling to VideoOverlayLayer just
   // below) - unlike the placement tools above, there's no "consumed" step, it just shows/hides a
   // drag window over whichever clip activeClipEffects currently points at. Deliberately NOT reset
@@ -636,6 +622,21 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // Toggled from the sidebar header's tools icon (next to "new folder"); falls back to "record"
   // whenever there's no open file to show tools for, so it never gets stuck on an empty panel.
   const [dockerMode, setDockerMode] = useState<"record" | "file-tools">("record");
+  // While a video is being edited, the sidebar swaps between the timeline tools' docked settings
+  // panels ("tools" - see components/docker/ToolPanelHost.tsx) and the usual file list ("media",
+  // still needed there to drag clips onto the timeline). toolPanelHostEl is the Tools tab's panel
+  // container, held in state (callback ref) so the context re-renders the popovers once it mounts.
+  const [videoSidebarTab, setVideoSidebarTab] = useState<"tools" | "media">("tools");
+  const [toolPanelHostEl, setToolPanelHostEl] = useState<HTMLDivElement | null>(null);
+  // Opening a tool from the timeline while the Media tab is showing brings its panel into view.
+  useEffect(() => {
+    if (!toolPanelHostEl) return;
+    const observer = new MutationObserver((records) => {
+      if (records.some((r) => r.addedNodes.length > 0)) setVideoSidebarTab("tools");
+    });
+    observer.observe(toolPanelHostEl, { childList: true });
+    return () => observer.disconnect();
+  }, [toolPanelHostEl]);
   useEffect(() => {
     if (!selectedFile) setDockerMode("record");
   }, [selectedFile]);
@@ -774,7 +775,13 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       return;
     }
     resolvePreviewAssetUrl(sourcePath)
-      .then((url) => videoPlayerRef.current?.loadSource(url, time))
+      .then((url) => {
+        // Dropped if the player has moved on while the URL resolved - opening a different file
+        // resets previewSourcePathRef (effect above), and a late load here would otherwise swap
+        // the newly opened video back out for this one.
+        if (previewSourcePathRef.current !== sourcePath) return;
+        videoPlayerRef.current?.loadSource(url, time);
+      })
       .catch((error) => console.error("Failed to load preview source for", sourcePath, error));
   };
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
@@ -2968,7 +2975,39 @@ const setScreen = () => {
 		(selectedMediaCategory === "audio" || selectedMediaCategory === "video") &&
 		getFlatFilesForCategory(selectedMediaCategory).length > 1;
 
+  // The timeline (VideoTimelineDocker) is showing for the open video - see BottomDocker.
+  const isEditingVideo =
+    dockerMode === "file-tools" &&
+    !!selectedFile &&
+    getFileCategory(selectedFile.name) === "video" &&
+    !boardScreen &&
+    !docsScreen &&
+    !whiteboardScreen &&
+    !mindmapScreen &&
+    videoEditorScreen?.mode !== "home";
+
+  // The "Back to …" button for whatever VideoPlayer is showing - rendered at the left end of its
+  // control bar (fading with it) rather than as a row above the picture.
+  const playerBackButtonClass =
+    "flex items-center gap-1 min-w-0 max-w-full px-2 py-1 rounded-md bg-white/10 hover:bg-white/20 text-xs font-medium text-white whitespace-nowrap transition-colors";
+  // Just "Back" - the title says where to (video editor / which folder) on hover. Drops to the
+  // bare chevron once the player is very narrow (VideoPlayer's `player` size container).
+  const playerBackLabelClass = "@max-[520px]/player:hidden";
+  const playerBackButton =
+    videoEditorScreen?.mode === "editing" ? (
+      <button type="button" title="Back to video editor" className={playerBackButtonClass} onClick={() => { setSelectedFile(null); setVideoEditorScreen({ mode: "home" }); }}>
+        <IoChevronBack size={12} className="shrink-0" />
+        <span className={playerBackLabelClass}>Back</span>
+      </button>
+    ) : selectedFolder !== null ? (
+      <button type="button" title={`Back to ${folderDisplayName(selectedFolder)}`} className={playerBackButtonClass} onClick={() => setSelectedFile(null)}>
+        <IoChevronBack size={12} className="shrink-0" />
+        <span className={playerBackLabelClass}>Back</span>
+      </button>
+    ) : undefined;
+
   return (
+    <ToolPanelHostContext.Provider value={isEditingVideo ? toolPanelHostEl : null}>
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
       {/* flex-1 min-h-0 here (and h-full min-h-0 on the row below) is load-bearing, not
           cosmetic: without a real height bound propagated all the way down, the main content
@@ -2991,6 +3030,48 @@ const setScreen = () => {
           >
             {showFileList && !isPdfFullscreen && (
               <div className="flex flex-col h-full">
+                {isEditingVideo && (
+                  <div className="flex items-center gap-1 p-2 border-b border-gray-300 dark:border-neutral-700 shrink-0">
+                    {([
+                      { tab: "tools", label: "Tools", icon: <IoOptionsOutline size={15} /> },
+                      { tab: "media", label: "Media", icon: <IoFolderOpenOutline size={15} /> },
+                    ] as const).map(({ tab, label, icon }) => (
+                      <button
+                        key={tab}
+                        type="button"
+                        onClick={() => setVideoSidebarTab(tab)}
+                        className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                          videoSidebarTab === tab
+                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        }`}
+                      >
+                        {icon}
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {/* Tools tab - the timeline's settings popovers portal into the host div below
+                    (ToolPanelHost.tsx). Kept mounted (just hidden) on the Media tab so an open
+                    panel isn't torn down, and so a panel opening there can flip back to it. */}
+                {isEditingVideo && (
+                  <div
+                    className={`flex-1 min-h-0 overflow-y-auto overscroll-contain p-3 pb-[var(--docker-height,64px)] ${
+                      videoSidebarTab === "tools" ? "" : "hidden"
+                    }`}
+                  >
+                    <div ref={setToolPanelHostEl} className="peer flex flex-col gap-3" />
+                    <div className="hidden peer-empty:flex flex-col items-center text-center gap-2 px-4 pt-10 text-neutral-500 dark:text-neutral-400">
+                      <IoOptionsOutline size={28} className="text-neutral-300 dark:text-neutral-600" />
+                      <p className="text-sm font-medium text-neutral-700 dark:text-neutral-300">No tool selected</p>
+                      <p className="text-xs leading-relaxed">
+                        Select a clip on the timeline, then choose Effects, Speed or Reduce noise from the toolbar - or click an audio clip - to adjust it here.
+                      </p>
+                    </div>
+                  </div>
+                )}
+                <div className={`flex flex-col flex-1 min-h-0 ${isEditingVideo && videoSidebarTab === "tools" ? "hidden" : ""}`}>
                 {/* File type tabs */}
                 <div className="flex items-center justify-around border-b border-gray-300 dark:border-neutral-700 py-2 shrink-0">
                   {FILE_CATEGORY_TABS.map(({ category, label, icon }) => (
@@ -3798,6 +3879,7 @@ const setScreen = () => {
                   ))
                 )}
                 </div>
+                </div>
               </div>
             )}
           </div>
@@ -3888,29 +3970,15 @@ const setScreen = () => {
               directly: only the filename's tail end still peeked out past this button's right
               edge). Stacking it as its own shrink-0 row instead means every viewer's own header,
               image/pdf included, renders in the space actually left for it. */}
-          {/* relative z-20 + the pointer-events dance: VideoPlayer's own wrapper is h-screen inside
-              a shorter, items-center pane below this row, so it overflows *upward* and paints over
-              this strip - without a stacking context of its own the button here renders behind the
-              <video> and can't be clicked at all (elementFromPoint over it returns VIDEO). The row
-              is full-width, so only the button itself takes pointer events back; the rest of the
-              strip stays click-through to the player underneath. */}
-          {videoEditorScreen?.mode === "editing" && selectedFile ? (
-            <div className={`shrink-0 px-3 pt-3 relative z-20 pointer-events-none ${backButtonFade}`}>
-              <button
-                type="button"
-                onClick={() => { setSelectedFile(null); setVideoEditorScreen({ mode: "home" }); }}
-                className="pointer-events-auto flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
-              >
-                <IoChevronBack size={14} />
-                Back to video editor
-              </button>
-            </div>
-          ) : selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
-            <div className={`shrink-0 px-3 pt-3 relative z-20 pointer-events-none ${backButtonFade}`}>
+          {/* Video/audio files (VideoPlayer) carry their "Back to …" button inside the player's own
+              control bar instead (playerBackButton below), so the picture gets this row's height
+              back - this row is only for the image/pdf/document viewers. */}
+          {selectedFolder !== null && selectedFile && !isMediaFileSelected && !boardScreen && !docsScreen && (
+            <div className="shrink-0 px-3 pt-3">
               <button
                 type="button"
                 onClick={() => setSelectedFile(null)}
-                className="pointer-events-auto flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
+                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
               >
                 <IoChevronBack size={14} />
                 Back to {folderDisplayName(selectedFolder)}
@@ -4076,6 +4144,18 @@ const setScreen = () => {
                           onUpdatePipOverlayContent={editStore.updatePipOverlayContent}
                           onDeletePipOverlay={editStore.deletePipOverlay}
                         />
+                        {/* Above PiP and every other overlay - same stacking as the export, where the
+                            captions are the last video stage (export_trimmed_video). */}
+                        {editStore.captions?.settings.enabled && captionLines.length > 0 && (
+                          <CaptionOverlayLayer
+                            frameRect={frameRect}
+                            lines={captionLines}
+                            settings={editStore.captions.settings}
+                            currentOutputTime={currentOutputTime}
+                            isPlaying={playerIsPlaying}
+                            clipSpeed={activeClipEffects?.speed ?? 1}
+                          />
+                        )}
                         {isCroppingClip && activeClipEffects && (
                           // Keyed on the active clip's own id so a clip change mid-drag (playback
                           // crossing a cut while the user is still holding a handle down - rare,
@@ -4096,6 +4176,7 @@ const setScreen = () => {
                       )
                     : undefined
                 }
+                controlsLeading={playerBackButton}
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted}
                 activeClipEffects={activeClipEffects}
@@ -4476,6 +4557,7 @@ const setScreen = () => {
         <TelemetryNotice />
       </div>
     </div>
+    </ToolPanelHostContext.Provider>
   );
 };
 

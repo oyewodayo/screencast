@@ -553,9 +553,9 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
         const aspect = metadata.height > 0 ? metadata.width / metadata.height : 1;
         const height = frameRect.height > 0 ? (width * frameRect.width) / aspect / frameRect.height : width;
         const x = Math.max(0, 1 - width - DEFAULT_PIP_MARGIN_FRACTION);
-        // Bottom-right of the part of the frame actually visible - VideoPlayer is full window height
-        // and BottomDocker (publishing its height as --docker-height) is drawn over its lower edge,
-        // so the frame's true bottom corner is often hidden behind the timeline, where the new pip
+        // Bottom-right of the part of the frame actually visible - VideoPlayer now reserves
+        // --docker-height so this is normally the frame's own corner, but this stays as a guard
+        // for any frame BottomDocker still overlaps, where a new pip hidden behind the timeline
         // could be neither seen nor grabbed.
         const y = Math.max(0, visibleFrameBottomFraction(originRef.current, frameRect) - height - DEFAULT_PIP_MARGIN_FRACTION);
         const startTime = currentOutputTime;

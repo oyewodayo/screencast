@@ -21,6 +21,7 @@ import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
 import { AudioOverlay } from "../../utils/videoEditTypes";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
+import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
 
 export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted">>;
 
@@ -35,8 +36,12 @@ interface AudioOverlayPopoverProps {
 
 const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onDelete, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
+  // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
+  const dockHost = useToolPanelHost();
 
   useEffect(() => {
+    // A docked panel stays open until its X / toolbar button closes it.
+    if (dockHost) return;
     const close = (e: PointerEvent) => {
       // Ignore the click that's still landing on the popover itself (or the chip that opened it -
       // that click already toggles selection on its own, this listener would otherwise immediately
@@ -46,7 +51,7 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
     };
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
-  }, [onClose]);
+  }, [onClose, dockHost]);
 
   const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
 
@@ -54,8 +59,8 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
     <div
       ref={popoverRef}
       data-audio-overlay-popover
-      style={{ position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
-      className="w-64 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-2.5"
+      style={dockHost ? undefined : { position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
+      className={dockHost ? `${DOCKED_PANEL_CLASS} p-3 gap-2.5` : "w-64 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-2.5"}
     >
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs font-medium truncate" title={fileName}>
@@ -128,7 +133,7 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
         </div>
       </div>
     </div>,
-    document.body
+    dockHost ?? document.body
   );
 };
 

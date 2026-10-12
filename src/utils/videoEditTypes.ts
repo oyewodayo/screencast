@@ -367,6 +367,57 @@ export interface PipOverlay {
 }
 
 // What export_trimmed_video (Rust) actually consumes - plain, ordered [start,end) ranges, each
+// Burned-in captions (the editor's Captions tool) - one word-timed transcript per SOURCE file, in
+// that file's own seconds, rather than a list of output-timed caption cues. The visible lines are
+// derived from these through the current clips at preview/export time (buildCaptionLines,
+// captions.ts), so captions stay in sync through every trim/cut/reorder/speed change made after
+// they were generated, with nothing to re-time by hand.
+export interface CaptionWord {
+  start: number;
+  end: number;
+  text: string;
+  // Forces a new caption line at this word - set on each imported subtitle cue's first word, so
+  // an .srt/.vtt keeps its own line breaks instead of being regrouped.
+  lineStart?: boolean;
+}
+export type CaptionStylePreset =
+  | "highlight"
+  | "outline"
+  | "clean"
+  | "card"
+  | "classic"
+  | "pop"
+  | "neon"
+  | "bubble"
+  | "typewriter"
+  | "comic"
+  | "tv"
+  | "headline"
+  | "button"
+  | "spotlight"
+  | "chip";
+export type CaptionPosition = "top" | "middle" | "bottom";
+export interface CaptionSettings {
+  enabled: boolean;
+  preset: CaptionStylePreset;
+  // Highlights the word being spoken (karaoke-style) in emphasisColor; off shows plain lines.
+  emphasis: boolean;
+  emphasisColor: string;
+  position: CaptionPosition;
+  // Gap from the anchored edge as a fraction of frame height (ignored for "middle").
+  offset: number;
+  // Multiplier on the preset's base text size (frame height based).
+  size: number;
+  maxWordsPerLine: number;
+  uppercase: boolean;
+}
+export interface CaptionTrack {
+  language: string;
+  // Keyed by Clip.sourcePath.
+  transcripts: Record<string, CaptionWord[]>;
+  settings: CaptionSettings;
+}
+
 // naming its own source file. Kept as a separate type from Clip (rather than reusing Clip
 // directly) so call sites are explicit about which shape they need; the id is UI-only and never
 // crosses the invoke boundary.
@@ -402,6 +453,8 @@ export interface VideoEditState {
   // - there's only ever one of these per edit session, never a list.
   videoAudioMuted: boolean;
   videoAudioVolume: number; // 0..1, defaults to 1
+  // null until captions are first generated - see CaptionTrack.
+  captions: CaptionTrack | null;
   updatedAt: string;
 }
 
@@ -417,6 +470,7 @@ export interface EditableFields {
   pipOverlays: PipOverlay[];
   videoAudioMuted: boolean;
   videoAudioVolume: number;
+  captions: CaptionTrack | null;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -453,7 +507,8 @@ export interface VideoEditCommand {
     | "delete-pip"
     | "view-switch-cut"
     | "edit-track-audio"
-    | "detach-audio";
+    | "detach-audio"
+    | "edit-captions";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {
@@ -467,6 +522,7 @@ export function createEmptyState(sourcePath: string, duration: number): VideoEdi
     pipOverlays: [],
     videoAudioMuted: false,
     videoAudioVolume: 1,
+    captions: null,
     updatedAt: new Date().toISOString(),
   };
 }

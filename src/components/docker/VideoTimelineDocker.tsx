@@ -6,7 +6,7 @@ import { appCacheDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdBlurOn, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt } from "react-icons/md";
+import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -58,6 +58,9 @@ import SilenceDetectionPopover, { SilenceDetectionState } from "./SilenceDetecti
 import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
 import ViewSwitchPopover, { ViewSwitchDetectState } from "./ViewSwitchPopover";
 import ToolModePopover, { TimelineToolMode } from "./ToolModePopover";
+import { useToolPanelHost } from "./ToolPanelHost";
+import CaptionsPanel from "./CaptionsPanel";
+import { buildCaptionLines } from "../../utils/captions";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
@@ -467,6 +470,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   isCroppingClip = false,
   onToggleCroppingClip,
 }) => {
+  // The sidebar's Tools tab while it's open (see ToolPanelHost.tsx) - the clip/audio settings
+  // popovers dock into it instead of floating, which changes how they open and close below.
+  const toolPanelHost = useToolPanelHost();
+  const rootRef = useRef<HTMLDivElement>(null);
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
   // One hidden <audio> per audio overlay, kept in sync with the main player below - no existing
@@ -660,8 +667,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [effectsPopoverAnchor, setEffectsPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
   const effectsButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    setEffectsPopoverAnchor(null);
-  }, [selectedClipId]);
+    if (!toolPanelHost) setEffectsPopoverAnchor(null);
+  }, [selectedClipId, toolPanelHost]);
 
   // Speed popover - split out of ClipEffectsPopover into its own standalone toolbar button/popover
   // (same "select a clip first" gating, closed the same way on selection change) since speed has
@@ -670,8 +677,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [speedPopoverAnchor, setSpeedPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
   const speedButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    setSpeedPopoverAnchor(null);
-  }, [selectedClipId]);
+    if (!toolPanelHost) setSpeedPopoverAnchor(null);
+  }, [selectedClipId, toolPanelHost]);
 
   // Noise reduction popover - same standalone toolbar button/popover shape as Speed just above,
   // for the same reason: an audio-cleanup feature with its own presets/strength control earns its
@@ -681,8 +688,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [noiseReductionPopoverAnchor, setNoiseReductionPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
   const noiseReductionButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    setNoiseReductionPopoverAnchor(null);
-  }, [selectedClipId]);
+    if (!toolPanelHost) setNoiseReductionPopoverAnchor(null);
+  }, [selectedClipId, toolPanelHost]);
 
   // Extract-audio popover - same standalone toolbar button/popover shape as Speed/Reduce noise
   // above. isExtractingAudio is local (not threaded through editStore's isExporting/exportProgress)
@@ -725,6 +732,38 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // original data" split handleDetectAutoZoom/handleApplyAutoZoom already use) but
   // ViewSwitchDetectState's own "results" variant only carries a count for display.
   const [viewSwitchAnchor, setViewSwitchAnchor] = useState<{ left: number; top: number } | null>(null);
+
+  // Captions tool (CaptionsPanel) - whole-timeline, so unlike Effects/Speed it needs no selected
+  // clip and isn't closed by selection changes.
+  const [captionsAnchor, setCaptionsAnchor] = useState<{ left: number; top: number } | null>(null);
+  const captionsButtonRef = useRef<HTMLButtonElement>(null);
+  const captionLines = useMemo(() => buildCaptionLines(editStore.clips, editStore.captions), [editStore.clips, editStore.captions]);
+  const captionSourcePaths = useMemo(() => Array.from(new Set(editStore.clips.map((c) => c.sourcePath))), [editStore.clips]);
+
+  // Docked, the settings panels follow the clip selection (effects above skip their close when
+  // docked) and nothing closes them on an outside click - so opening one closes whichever other
+  // was showing, keeping the sidebar's Tools tab to the one tool you're working with.
+  const dockedPanelsOpen = {
+    effects: effectsPopoverAnchor !== null,
+    speed: speedPopoverAnchor !== null,
+    noise: noiseReductionPopoverAnchor !== null,
+    audio: audioPopoverAnchor !== null,
+    captions: captionsAnchor !== null,
+  };
+  const prevDockedPanelsOpen = useRef(dockedPanelsOpen);
+  useEffect(() => {
+    const prev = prevDockedPanelsOpen.current;
+    prevDockedPanelsOpen.current = dockedPanelsOpen;
+    if (!toolPanelHost) return;
+    const opened = (Object.keys(dockedPanelsOpen) as (keyof typeof dockedPanelsOpen)[]).find((k) => dockedPanelsOpen[k] && !prev[k]);
+    if (!opened) return;
+    if (opened !== "effects") setEffectsPopoverAnchor(null);
+    if (opened !== "speed") setSpeedPopoverAnchor(null);
+    if (opened !== "noise") setNoiseReductionPopoverAnchor(null);
+    if (opened !== "audio") setAudioPopoverAnchor(null);
+    if (opened !== "captions") setCaptionsAnchor(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions]);
   const [viewSwitchState, setViewSwitchState] = useState<ViewSwitchDetectState>({ status: "loading" });
   const viewSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const viewSwitchDataRef = useRef<{ events: ViewSwitchEvent[]; webcamPath: string; clipOutputStart: number } | null>(null);
@@ -1574,6 +1613,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      // Minimized docker (BottomDocker keeps this mounted, display:none, so docked tool panels
+      // survive) - no Delete/Split/undo on a timeline nobody can see.
+      if (rootRef.current && rootRef.current.offsetParent === null) return;
 
       // Ctrl/Cmd+Z undoes, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redoes - the two conventional redo
       // bindings, kept both since Windows apps commonly use either. Checked ahead of Delete/
@@ -2151,7 +2193,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [currentOutputTime, isPlaying, editStore.audioOverlays]);
 
   return (
-    <div className="w-full flex flex-col gap-2">
+    <div ref={rootRef} className="w-full flex flex-col gap-2">
       {/* Hidden capture rig - never shown, just decodes frames for the filmstrip/cover. */}
       {/* crossOrigin="anonymous" is required here, not optional - without it, drawing this asset://-
           sourced video onto captureCanvasRef taints the canvas, and toDataURL() throws
@@ -2395,6 +2437,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoText size={15} className={isPlacingText ? "text-blue-400" : undefined} />
           </ActionButton>
+          <button
+            ref={captionsButtonRef}
+            type="button"
+            title="Captions - generate, style and burn in captions"
+            onClick={() => {
+              if (captionsAnchor) {
+                setCaptionsAnchor(null);
+                return;
+              }
+              const rect = captionsButtonRef.current?.getBoundingClientRect();
+              if (rect) setCaptionsAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              captionsAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <MdClosedCaptionOff size={16} className={editStore.captions?.settings.enabled ? "text-blue-400" : undefined} />
+          </button>
           <ActionButton
             title={isPlacingImage ? "Choosing an image…" : "Add image overlay"}
             onClick={() => onToggleArmPlaceImage?.()}
@@ -3213,6 +3273,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             />
           );
         })()}
+
+      {captionsAnchor && (
+        <CaptionsPanel
+          anchor={captionsAnchor}
+          captions={editStore.captions}
+          lines={captionLines}
+          sourcePaths={captionSourcePaths}
+          primarySourcePath={file.path}
+          currentOutputTime={currentOutputTime}
+          onGenerated={editStore.setCaptionTranscripts}
+          onUpdateSettings={editStore.updateCaptionSettings}
+          onEditLine={editStore.editCaptionLine}
+          onClear={editStore.clearCaptions}
+          onSeekLine={(line) => onSeek(line.sourcePath, line.sourceStart)}
+          onClose={() => setCaptionsAnchor(null)}
+        />
+      )}
 
       {toolModeAnchor && <ToolModePopover mode={toolMode} anchor={toolModeAnchor} onSelect={setToolMode} onClose={() => setToolModeAnchor(null)} />}
 

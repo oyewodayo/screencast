@@ -10,6 +10,7 @@ import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { IoClose, IoSpeedometerOutline } from "react-icons/io5";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
+import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
 import Slider from "./Slider";
 import NumberStepper from "./NumberStepper";
 
@@ -35,15 +36,19 @@ interface SpeedPopoverProps {
 
 const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anchor, onUpdate, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
+  // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
+  const dockHost = useToolPanelHost();
 
   useEffect(() => {
+    // A docked panel stays open until its X / toolbar button closes it.
+    if (dockHost) return;
     const close = (e: PointerEvent) => {
       if (e.target instanceof Element && e.target.closest("[data-speed-popover]")) return;
       onClose();
     };
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
-  }, [onClose]);
+  }, [onClose, dockHost]);
 
   const setSpeed = (next: number) => onUpdate(Math.abs(next - 1) < 0.001 ? undefined : Math.max(MIN_SPEED, Math.min(MAX_SPEED, next)));
   // Duration is just 1/speed scaled by sourceDuration - editing it directly sets speed to
@@ -61,8 +66,8 @@ const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anch
     <div
       ref={popoverRef}
       data-speed-popover
-      style={{ position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
-      className="w-64 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-2.5"
+      style={dockHost ? undefined : { position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
+      className={dockHost ? `${DOCKED_PANEL_CLASS} p-3 gap-2.5` : "w-64 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-2.5"}
     >
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs font-medium flex items-center gap-1.5">
@@ -110,7 +115,7 @@ const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anch
         </div>
       </div>
     </div>,
-    document.body
+    dockHost ?? document.body
   );
 };
 

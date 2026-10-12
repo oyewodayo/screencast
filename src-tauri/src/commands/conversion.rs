@@ -1539,12 +1539,141 @@ pub async fn generate_captions(
 
     // -of wants the output path WITHOUT its extension - whisper-cli appends ".vtt" itself.
     let output_stem = cache_path.with_extension("");
-    let transcription = run_whisper_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem, &lang).await;
+    let transcription = run_whisper_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem, &lang, &["-ovtt"]).await;
     let _ = std::fs::remove_file(&wav_path); // best-effort - a leftover scratch WAV is harmless either way
     transcription?;
 
     std::fs::read_to_string(&cache_path)
         .map_err(|e| format!("whisper-cli reported success but produced no readable output: {}", e))
+}
+
+// One spoken word with its own timing, in seconds of the SOURCE file - the video editor's
+// Captions tool (CaptionWord, videoEditTypes.ts) maps these through the timeline's clips itself,
+// so the transcript stays valid across any trim/cut/reorder/speed change made afterwards.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct CaptionWordOut {
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+// Word-timed transcript for the editor's burned-in captions - the same offline whisper.cpp pass
+// generate_captions runs, but asking for one word per segment (-ml 1 -sow) as JSON instead of
+// sentence-level VTT, which is what per-word emphasis and re-flowing lines need. Cached per
+// file+mtime+language exactly like generate_captions, as the parsed word list itself.
+#[tauri::command]
+pub async fn generate_caption_words(
+    app_handle: AppHandle,
+    input_path: String,
+    language: Option<String>,
+) -> Result<Vec<CaptionWordOut>, String> {
+    let input = PathBuf::from(&input_path);
+    let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
+    let namespace = format!("captions_words_v1_{}", lang);
+    let cache_path = preview_cache_path(&input, &namespace, "json")?;
+
+    if cache_path.exists() {
+        let cached = std::fs::read_to_string(&cache_path)
+            .map_err(|e| format!("Failed to read cached captions: {}", e))?;
+        if let Ok(words) = serde_json::from_str::<Vec<CaptionWordOut>>(&cached) {
+            return Ok(words);
+        }
+        // Unreadable cache - fall through and regenerate over it.
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create captions cache directory: {}", e))?;
+    }
+
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let whisper_path = crate::services::utility::get_whisper_cli_path(&app_handle)?;
+    if !whisper_path.exists() {
+        return Err(format!(
+            "whisper-cli not found at {} - see README's Getting Started for how to obtain it",
+            whisper_path.display()
+        ));
+    }
+    let model_handle = app_handle.clone();
+    let model_path = tauri::async_runtime::spawn_blocking(move || crate::services::whisper_model::ensure_model(&model_handle))
+        .await
+        .map_err(|e| format!("Speech model lookup failed: {}", e))??;
+
+    let wav_path = cache_path.with_extension("wav");
+    let extraction = extract_audio_for_whisper(&ffmpeg_path, &input, &wav_path).await;
+    if let Err(err) = extraction {
+        let _ = std::fs::remove_file(&wav_path);
+        return Err(err);
+    }
+
+    // whisper-cli appends ".json" to -of itself - a stem distinct from cache_path's own so its raw
+    // output never lands on (and gets mistaken for) the parsed cache file.
+    let raw_stem = cache_path.with_extension("whisper");
+    let raw_path = cache_path.with_extension("whisper.json");
+    let transcription = run_whisper_cli(
+        &app_handle,
+        &whisper_path,
+        &model_path,
+        &wav_path,
+        &raw_stem,
+        &lang,
+        &["-oj", "-ml", "1", "-sow"],
+    )
+    .await;
+    let _ = std::fs::remove_file(&wav_path);
+    transcription?;
+
+    let raw = std::fs::read_to_string(&raw_path)
+        .map_err(|e| format!("whisper-cli reported success but produced no readable output: {}", e))?;
+    let _ = std::fs::remove_file(&raw_path);
+    let words = parse_whisper_word_json(&raw)?;
+
+    if let Ok(json) = serde_json::to_string(&words) {
+        let _ = std::fs::write(&cache_path, json); // best-effort - a missing cache just regenerates
+    }
+    Ok(words)
+}
+
+// whisper-cli's `-oj -ml 1 -sow` output: { "transcription": [ { "offsets": { "from": ms, "to": ms },
+// "text": " word" }, ... ] }. A leading space marks a new word; an entry WITHOUT one is a fragment
+// of the previous word (whisper occasionally still splits one there) and gets merged back into
+// it. Empty entries and non-speech markers ("[BLANK_AUDIO]", "(music)", "[Music]") are dropped.
+fn parse_whisper_word_json(raw: &str) -> Result<Vec<CaptionWordOut>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("Couldn't read the transcription output: {}", e))?;
+    let entries = value
+        .get("transcription")
+        .and_then(|t| t.as_array())
+        .ok_or("Transcription output had no word list")?;
+
+    let mut words: Vec<CaptionWordOut> = Vec::new();
+    for entry in entries {
+        let text = entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        let offsets = entry.get("offsets");
+        let from = offsets.and_then(|o| o.get("from")).and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        let to = offsets.and_then(|o| o.get("to")).and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_marker = (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            || (trimmed.starts_with('(') && trimmed.ends_with(')'));
+        if is_marker {
+            continue;
+        }
+        match words.last_mut() {
+            Some(last) if !text.starts_with(' ') => {
+                last.text.push_str(trimmed);
+                last.end = last.end.max(to);
+            }
+            _ => words.push(CaptionWordOut {
+                start: from,
+                end: to.max(from),
+                text: trimmed.to_string(),
+            }),
+        }
+    }
+    Ok(words)
 }
 
 #[derive(serde::Serialize)]
@@ -1853,8 +1982,12 @@ async fn run_whisper_cli(
     wav_path: &PathBuf,
     output_stem: &PathBuf,
     language: &str,
+    // Output-format flags - ["-ovtt"] for segment captions (generate_captions), or JSON at one word
+    // per segment for the editor's word-timed captions (generate_caption_words).
+    format_args: &[&str],
 ) -> Result<(), String> {
     let app_handle = app_handle.clone();
+    let format_args: Vec<String> = format_args.iter().map(|a| a.to_string()).collect();
     let whisper_path = whisper_path.clone();
     let model_path = model_path.clone();
     let wav_path = wav_path.clone();
@@ -1875,7 +2008,8 @@ async fn run_whisper_cli(
         hide_console_window(&mut cmd);
         cmd.arg("-m").arg(path_to_str(&model_path)?);
         cmd.arg("-f").arg(path_to_str(&wav_path)?);
-        cmd.args(["-ovtt", "-np", "-pp", "-t", &threads.to_string(), "-l", &language]);
+        cmd.args(&format_args);
+        cmd.args(["-np", "-pp", "-t", &threads.to_string(), "-l", &language]);
         cmd.arg("-of").arg(path_to_str(&output_stem)?);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
@@ -3172,6 +3306,10 @@ pub async fn export_trimmed_video(
     // unique_output_path (run_conversion) the same as the default location does, so a second export
     // to the exact same custom path doesn't clobber the first.
     output_path: Option<String>,
+    // A complete ASS subtitle script (the editor's Captions tool - buildCaptionsAss, captions.ts),
+    // already timed to the OUTPUT timeline and laid out at the video's own pixel size. Burned in
+    // with libass as the very last video stage, above every overlay. None/omitted = no captions.
+    captions_ass: Option<String>,
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
@@ -3300,6 +3438,22 @@ pub async fn export_trimmed_video(
         inputs.push(InputSpec::plain(pip.source_path.clone()));
     }
 
+    // Written next to the overlay PNGs (and cleaned up by the same loop once the export finishes).
+    let captions_ass_path: Option<PathBuf> = match captions_ass.as_deref().filter(|a| !a.trim().is_empty()) {
+        Some(ass) => {
+            let path = std::env::temp_dir().join(format!("briefcast_captions_{}.ass", std::process::id()));
+            if let Err(e) = std::fs::write(&path, ass) {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(format!("Failed to write captions file: {}", e));
+            }
+            temp_overlay_paths.push(path.clone());
+            Some(path)
+        }
+        None => None,
+    };
+
     let has_video_overlays = !overlays.is_empty();
     let has_blur_overlays = !blur_overlays.is_empty();
     let has_audio_overlays = !audio_overlays.is_empty();
@@ -3319,6 +3473,7 @@ pub async fn export_trimmed_video(
         && !has_audio_overlays
         && !has_pip_overlays
         && !has_clip_effects
+        && captions_ass_path.is_none()
     {
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
@@ -3695,6 +3850,16 @@ pub async fn export_trimmed_video(
         // layers" with one check, rather than the single `!has_video_overlays` special case this
         // used to be before blur/pip support existed (back when [base] was the only possible
         // "nothing chained" label).
+        // Captions last, so they sit above every image/text/blur/PiP layer.
+        if let Some(ass_path) = &captions_ass_path {
+            filter.push_str(&format!(
+                "[{}]ass=filename='{}'[capv];",
+                current_label,
+                escape_filter_path(ass_path)
+            ));
+            current_label = "capv".to_string();
+        }
+
         if current_label != "outv" {
             filter.push_str(&format!("[{}]copy[outv];", current_label));
         }

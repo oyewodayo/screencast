@@ -618,7 +618,10 @@ const BottomDocker = ({
             showRecordingPanelButtons={showRecordingPanelButtons}
         />
 
-      {showDocker && (<div className="docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
+      {/* Hidden rather than unmounted when minimized, so the video editor's open tool panel
+          (docked in the sidebar - see ToolPanelHost.tsx) and timeline state survive collapsing
+          the docker. VideoTimelineDocker ignores its keyboard shortcuts while hidden. */}
+      {(<div className={`docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800 ${showDocker ? "" : "hidden"}`}>
         {dockerMode === "file-tools" && activeFile ? (
           <FileToolsDocker
             file={activeFile}

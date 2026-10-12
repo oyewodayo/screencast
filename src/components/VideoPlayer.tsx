@@ -173,6 +173,9 @@ interface VideoPlayerProps {
   // without re-measuring it independently. Keeps VideoPlayer itself fully generic - it has no
   // idea what's actually being rendered inside (text overlays, or anything else later).
   overlay?: (frameRect: FrameRect) => React.ReactNode;
+  // Pinned to the left end of the control bar, showing/hiding with it - Dashboard's "Back to …"
+  // button, which used to be its own row above the player and cost the picture that height.
+  controlsLeading?: React.ReactNode;
   // The primary video's own persisted/exported audio level (useVideoEditStore's
   // videoAudioMuted/videoAudioVolume) - distinct from this component's own volume slider/mute
   // button just below, which is pure local listening convenience that never leaves this session.
@@ -272,7 +275,7 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange, onPrevious, onNext }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -2095,7 +2098,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		onMouseLeave={hide}
 		onTouchStart={show}
 		onTouchMove={show}
-		className="flex flex-row relative w-full h-screen">
+		// h-full of the pane it's given (not h-screen) with the bottom --docker-height reserved:
+		// BottomDocker is a fixed overlay, so the player sizes itself to just the strip visible
+		// above it - the <video> letterboxes into that and the controls sit at its bottom edge,
+		// never under the docker or past the window (a full-window box below the "Back" row
+		// overflowed the pane and scrolled the whole page).
+		className="flex flex-row relative w-full h-full pb-[var(--docker-height,64px)]">
 
 		{showAlert && (
 			<Alert
@@ -2153,13 +2161,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		)}
       
     	<div
-        	className={`w-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
+        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
 			ref={videoContainerRef}
-			style={{ opacity: videoOpacity }}
+			// --player-h (live container height, from the ResizeObserver below) caps the control bar's
+			// flyout menus in player.css so a short player scrolls them instead of clipping their top.
+			style={{ opacity: videoOpacity, ...(containerSize ? { '--player-h': `${containerSize.height}px` } : {}) } as React.CSSProperties}
 			data-volume-level={volumeLevel}>
 			{(mediaType === 'video' || mediaType === 'audio') && (
 				<div>
-					<div className="video-controls-container py-2 place-items-center">
+					<div className="video-controls-container pt-1 pb-1 place-items-center">
 					<div
 						className="timeline-container"
 						id="timelineContainer"
@@ -2197,7 +2207,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 					</div>
 					
-					<div className="controls flex flex-row justify-between mt-2">
+					{/* [leading | centred cluster | spacer]: the two flex-1 sides keep the playback cluster
+					    centred, and the leading side (Dashboard's "Back to …") can only ever take the
+					    space beside it, never overlap it. player.css's @container player rules shrink
+					    and then thin out the cluster as the player itself narrows. */}
+					<div className="controls flex flex-row items-center">
+						<div className="ctl-side ctl-leading">{controlsLeading}</div>
+						<div className="ctl-cluster">
 						<div className='flex gap-5'>
 						{onPrevious && (
 							<button className="w-7" onClick={onPrevious} data-tip={`Previous ${mediaType === 'audio' ? 'track' : 'video'}`} data-tip-kbd="Shift+P" aria-label="Previous">
@@ -2240,7 +2256,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 						</div>
 						
-						<div className="flex flex-col place-items-center items-center">
+						<div className="ctl-skip flex flex-col place-items-center items-center">
 						<div ref={skipControlsRef} className='relative flex gap-4'>
 							<button
 							className='flex justify-center place-items-center'
@@ -2512,6 +2528,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							{isFullscreen ? <BsFullscreenExit className='text-2xl' /> : <BsFullscreen className='text-2xl' />}
 						</button>
 						</div>
+						</div>
+						<div className="ctl-side" />
 					</div>
 					</div>
 				</div>

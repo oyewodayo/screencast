@@ -429,6 +429,7 @@ fn main() {
             commands::conversion::set_video_thumbnail,
             commands::conversion::get_video_scrub_sprite,
             commands::conversion::generate_captions,
+            commands::conversion::generate_caption_words,
             commands::conversion::audio_cleanup_waveform,
             commands::conversion::decode_audio_range,
             commands::conversion::transcribe_doc_audio,

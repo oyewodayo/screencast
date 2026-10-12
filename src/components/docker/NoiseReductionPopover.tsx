@@ -21,6 +21,7 @@ import { createPortal } from "react-dom";
 import { IoClose, IoSyncOutline, IoEarOutline, IoCopyOutline, IoSparkles, IoPlay, IoPause } from "react-icons/io5";
 import { MdOutlineNoiseControlOff } from "react-icons/md";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
+import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
 import { AudioCleanup } from "../../utils/videoEditTypes";
 import Slider from "./Slider";
 import NumberStepper from "./NumberStepper";
@@ -115,6 +116,8 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
   onTogglePlay,
 }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
+  // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
+  const dockHost = useToolPanelHost();
   const [comparing, setComparing] = useState(false);
   const [appliedToAll, setAppliedToAll] = useState(false);
   const mode = cleanup?.mode ?? "reduce";
@@ -122,13 +125,15 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
   const samplingEnabled = mode === "reduce" && strength > 0;
 
   useEffect(() => {
+    // A docked panel stays open until its X / toolbar button closes it.
+    if (dockHost) return;
     const close = (e: PointerEvent) => {
       if (e.target instanceof Element && e.target.closest("[data-noise-reduction-popover]")) return;
       onClose();
     };
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
-  }, [onClose]);
+  }, [onClose, dockHost]);
 
   // Never leave the player stuck on the original if the popover closes mid-compare. Via a ref so
   // a new callback identity on re-render doesn't fire the cleanup mid-hold.
@@ -168,8 +173,8 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
     <div
       ref={popoverRef}
       data-noise-reduction-popover
-      style={{ position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
-      className="w-80 max-h-[calc(100vh-16px)] overflow-y-auto overscroll-contain rounded-xl bg-neutral-900/95 backdrop-blur-md shadow-2xl ring-1 ring-white/10 text-white/90 flex flex-col"
+      style={dockHost ? undefined : { position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
+      className={dockHost ? `${DOCKED_PANEL_CLASS}` : "w-80 max-h-[calc(100vh-16px)] overflow-y-auto overscroll-contain rounded-xl bg-neutral-900/95 backdrop-blur-md shadow-2xl ring-1 ring-white/10 text-white/90 flex flex-col"}
     >
       {/* Header */}
       <div className="flex items-center justify-between gap-2 px-3 pt-3 pb-2">
@@ -364,7 +369,7 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
         </p>
       </div>
     </div>,
-    document.body
+    dockHost ?? document.body
   );
 };
 
