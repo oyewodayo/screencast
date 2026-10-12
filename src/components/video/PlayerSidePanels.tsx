@@ -4,7 +4,7 @@
 // ToolPanelHost.tsx): viewing captions - styled with the same presets/controls as the editor's
 // burned-in captions but only ever shown over the player, never saved into the video - and
 // chapters. Presentational; VideoPlayer owns the state.
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { IoAddCircleOutline, IoBookmarkOutline, IoClose, IoDocumentAttachOutline, IoMicOutline, IoSparklesOutline, IoTrashOutline } from "react-icons/io5";
 import { MdClosedCaptionOff } from "react-icons/md";
 import { DOCKED_PANEL_CLASS } from "../docker/ToolPanelHost";
@@ -166,8 +166,27 @@ export const PlayerChaptersPanel: React.FC<{
   onDelete: (id: string) => void;
   onAdd: () => void;
   onDetect: () => void;
+  onClearAll: () => void;
   onClose: () => void;
-}> = (props) => (
+}> = (props) => {
+  // Follows playback: the current chapter is kept in view as the video plays (good for studying
+  // along), pausing for a few seconds after the user scrolls the list or while a name is typed.
+  const listRef = useRef<HTMLDivElement>(null);
+  const lastUserScrollRef = useRef(0);
+  const activeIndex = props.chapters.findIndex((c) => c.id === props.activeChapterId);
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list || activeIndex < 0) return;
+    if (list.contains(document.activeElement)) return;
+    if (Date.now() - lastUserScrollRef.current < 3000) return;
+    const row = list.children[activeIndex] as HTMLElement | undefined;
+    if (!row) return;
+    const top = row.offsetTop;
+    if (top >= list.scrollTop && top + row.offsetHeight <= list.scrollTop + list.clientHeight) return;
+    list.scrollTo({ top: Math.max(0, top - list.clientHeight / 3), behavior: "smooth" });
+  }, [activeIndex]);
+
+  return (
   <PanelShell
     icon={<IoBookmarkOutline size={14} />}
     title="Chapters"
@@ -199,7 +218,12 @@ export const PlayerChaptersPanel: React.FC<{
     {props.chapters.length === 0 ? (
       <p className="text-[11px] leading-relaxed text-white/50">No chapters yet. Mark moments to jump between them - they also show as ticks on the player's timeline.</p>
     ) : (
-      <div className="flex flex-col gap-0.5 max-h-[calc(100vh-280px)] overflow-y-auto overscroll-contain -mx-1.5">
+      <div
+        ref={listRef}
+        onWheel={() => (lastUserScrollRef.current = Date.now())}
+        onPointerDown={() => (lastUserScrollRef.current = Date.now())}
+        className="relative flex flex-col gap-0.5 max-h-[calc(100vh-300px)] overflow-y-auto overscroll-contain -mx-1.5"
+      >
         {props.chapters.map((chapter, i) => {
           const active = chapter.id === props.activeChapterId;
           const untitled = chapter.label === formatCaptionTime(chapter.time);
@@ -236,5 +260,20 @@ export const PlayerChaptersPanel: React.FC<{
         })}
       </div>
     )}
+    {props.chapters.length > 0 && (
+      <div className="flex justify-end pt-2 border-t border-white/10">
+        <button
+          type="button"
+          onClick={() => {
+            if (window.confirm(`Remove all ${props.chapters.length} chapters from this video?`)) props.onClearAll();
+          }}
+          className="flex items-center gap-1 px-2 py-1 rounded text-[11px] text-white/50 hover:text-red-400 hover:bg-white/10"
+        >
+          <IoTrashOutline size={12} />
+          Clear all
+        </button>
+      </div>
+    )}
   </PanelShell>
-);
+  );
+};

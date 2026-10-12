@@ -51,6 +51,9 @@ export interface AppSettings {
   // it can be hidden right before presenting/recording a screen that includes this app's own
   // window, without those controls ending up baked into the video.
   showRecordingPanelButtons: boolean;
+  // The bottom docker's last row - date/time, CPU RAM, OS and the "Request feature / Report a bug"
+  // link. Purely informational, so it can be hidden to give the player that extra strip of height.
+  showDockerStatusBar: boolean;
   // The "Recording started - saved to <path>" toast (plus its shortcut hints). Off by default: the
   // overlay and the bottom-bar timer already say a recording is running, and the path is shown by
   // the completion window when it's actually there to open.
@@ -112,6 +115,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // primary way to start a recording now; the full panel is an opt-in for anyone who wants it.
   showRecordingDocker: false,
   showRecordingPanelButtons: true,
+  showDockerStatusBar: true,
   notifyOnRecordingStart: false,
   recordingCountdownEnabled: false,
   recordingCountdownSeconds: 3,

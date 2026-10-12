@@ -75,6 +75,26 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
   }, [onClose, dockHost]);
 
   const missingSources = sourcePaths.filter((p) => !captions?.transcripts[p]);
+
+  // An interrupted generation (app closed mid-way) keeps its finished pieces - generate_caption_words
+  // resumes from them. Shown on the button so "Generate" doesn't look like starting over.
+  const [resumable, setResumable] = useState<{ done: number; total: number } | null>(null);
+  useEffect(() => {
+    if (captions || generating) return;
+    let cancelled = false;
+    Promise.all(
+      sourcePaths.map((p) =>
+        invoke<{ done: number; total: number } | null>("caption_job_progress", { inputPath: p, language, words: true }).catch(() => null)
+      )
+    ).then((jobs) => {
+      if (cancelled) return;
+      const found = jobs.filter((j): j is { done: number; total: number } => !!j);
+      setResumable(found.length > 0 ? { done: found.reduce((a, j) => a + j.done, 0), total: found.reduce((a, j) => a + j.total, 0) } : null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [captions, generating, sourcePaths, language]);
   const [importTarget, setImportTarget] = useState<string>(primarySourcePath);
 
   // An existing .srt/.vtt, in place of (or replacing) a generated transcript for one source file.
@@ -240,7 +260,7 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
               disabled={sourcePaths.length === 0}
               className="px-3 py-1.5 rounded-md text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-40"
             >
-              Generate captions
+              {resumable ? `Resume generating${resumable.total > 0 ? ` (${resumable.done} of ${resumable.total} parts done)` : ""}` : "Generate captions"}
             </button>
           )}
           <div className="flex items-center gap-2 text-[10px] uppercase tracking-wide text-white/30">

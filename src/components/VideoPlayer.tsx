@@ -570,6 +570,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // LATEST url is without needing it in that effect's own deps.
   const [captionsUrl, setCaptionsUrl] = useState<string | null>(null);
   const captionsUrlRef = useRef<string | null>(null);
+  // Where to resume, as of when this file was opened - see onLoadedMetadata.
+  const initialTimeRef = useRef(initialTime);
   captionsUrlRef.current = captionsUrl;
   // Shown when the CC button is clicked with nothing loaded yet - lets the user pick between a
   // file of their own and offline generation, rather than the button jumping straight to one.
@@ -1073,6 +1075,28 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     [playerCues, playerCaptionSettings]
   );
 
+  // Caption generation is resumable (generate_captions works in saved pieces, conversion.rs) - if a
+  // job for this file was interrupted (app closed, file switched), pick it up again on open rather
+  // than making the user start it over. Waits a moment first so an auto-detected sibling caption
+  // file, if there is one, wins instead.
+  useEffect(() => {
+    if (!filePath || mediaType !== 'video') return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      invoke<{ done: number; total: number } | null>('caption_job_progress', { inputPath: filePath, language: captionsLanguage, words: false })
+        .then((job) => {
+          if (cancelled || !job || captionsUrlRef.current) return;
+          void generateCaptionsFromAudio(captionsLanguage);
+        })
+        .catch(() => {});
+    }, 1500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filePath, mediaType]);
+
   // The player's sidebar panels (PlayerSidePanels.tsx), portaled into the parent's Tools tab.
   const toolPanelHost = useToolPanelHost();
   const [sidebarPanel, setSidebarPanel] = useState<null | 'captions' | 'chapters'>(null);
@@ -1268,6 +1292,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     });
   };
 
+  const clearChapters = (): void => {
+    setChapters([]);
+    persistChapters([]);
+  };
+
   const seekToChapter = (time: number): void => {
     const video = videoRef.current;
     if (!video) return;
@@ -1327,16 +1356,23 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         noiseDb: null,
         minDuration: null,
       });
-      const MERGE_TOLERANCE_SEC = 3;
+      // Every pause in a long talk is a silence range - thousands on a multi-hour video. Chapters
+      // come from the LONGEST pauses only, at least minGap apart, and at most maxChapters of
+      // them: both scale with the video's length (about one per 4 minutes, 3-40 in total).
       const END_MARGIN_SEC = 2; // skip a suggestion this close to the very end - nothing left to chapter
-      const candidates = ranges
-        .map((r) => r.end)
-        .filter((t) => !Number.isFinite(duration) || t < (duration as number) - END_MARGIN_SEC);
+      const total = Number.isFinite(duration) ? (duration as number) : Math.max(0, ...ranges.map((r) => r.end));
+      const maxChapters = Math.max(3, Math.min(40, Math.round(total / 240)));
+      const minGap = Math.max(30, total / (maxChapters * 1.5));
+      const byLength = ranges
+        .filter((r) => r.end > 1 && r.end < total - END_MARGIN_SEC)
+        .sort((a, b) => b.end - b.start - (a.end - a.start));
 
       setChapters((prev) => {
         const additions: Chapter[] = [];
-        for (const time of candidates) {
-          const tooClose = [...prev, ...additions].some((c) => Math.abs(c.time - time) < MERGE_TOLERANCE_SEC);
+        for (const r of byLength) {
+          if (additions.length >= maxChapters) break;
+          const time = r.end;
+          const tooClose = [...prev, ...additions].some((c) => Math.abs(c.time - time) < minGap);
           if (!tooClose) additions.push({ id: crypto.randomUUID(), time, label: formatChapterTime(time) });
         }
         const next = [...prev, ...additions].sort((a, b) => a.time - b.time);
@@ -2088,19 +2124,29 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Reports playback position as it advances, and once more on unmount/file-change — the latter
   // is what lets a caller (Dashboard, for audio) capture "wherever this track was" the moment the
   // user navigates away, even if they navigated mid-scrub between two timeupdate ticks.
+  //
+  // Through a ref, not as an effect dependency: callers pass a fresh inline function every render,
+  // which used to re-run this effect on each one - and its cleanup's "report where we are" fired
+  // with currentTime 0 while a file was still loading, which the resume store reads as "went back
+  // to the start" and deletes the saved position before the player ever seeked to it. The unmount
+  // report is also skipped until metadata has loaded, for the same reason.
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  onTimeUpdateRef.current = onTimeUpdate;
   useEffect(() => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
-    if (!video || !onTimeUpdate) return;
+    if (!video) return;
 
-    const handleTimeUpdate = (): void => onTimeUpdate(video.currentTime);
+    const handleTimeUpdate = (): void => {
+      if (video.readyState >= 1) onTimeUpdateRef.current?.(video.currentTime);
+    };
     video.addEventListener('timeupdate', handleTimeUpdate);
 
     return () => {
       video.removeEventListener('timeupdate', handleTimeUpdate);
-      onTimeUpdate(video.currentTime);
+      if (video.readyState >= 1) onTimeUpdateRef.current?.(video.currentTime);
     };
-  }, [mediaType, onTimeUpdate]);
+  }, [mediaType]);
 
   // Icons components (could be moved to separate file)
   const MiniPlayerIcon: React.FC = () => (
@@ -2273,14 +2319,18 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 									: `${formatChapterTime(hoveredChapter.time)} — ${hoveredChapter.label}`}
 							</div>
 						)}
-						{videoRef.current && Number.isFinite(videoRef.current.duration) && chapters.map((chapter) => (
-							<div
-								key={chapter.id}
-								className="chapter-tick"
-								style={{ left: `${(chapter.time / videoRef.current!.duration) * 100}%` }}
-								title={chapter.label}
-							/>
-						))}
+						{videoRef.current && Number.isFinite(videoRef.current.duration) && (() => {
+							// At most one tick per 0.75% of the bar - closer ones would merge into a
+							// solid white strip over the progress.
+							const duration = videoRef.current!.duration;
+							let lastPct = -Infinity;
+							return chapters.map((chapter) => {
+								const pct = (chapter.time / duration) * 100;
+								if (pct - lastPct < 0.75) return null;
+								lastPct = pct;
+								return <div key={chapter.id} className="chapter-tick" style={{ left: `${pct}%` }} title={chapter.label} />;
+							});
+						})()}
 						</div>
 					</div>
 					
@@ -2635,8 +2685,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						onLoadedMetadata={() => {
 							if (videoRef.current) {
 							setTotalTimeElement(formatDuration(videoRef.current.duration));
-							if (initialTime && Number.isFinite(initialTime) && initialTime > 0 && initialTime < videoRef.current.duration) {
-								videoRef.current.currentTime = initialTime;
+							// The position as it was when this file opened (initialTimeRef), not whatever a
+							// later render's prop says - those can already reflect early timeupdate ticks.
+							const resumeAt = initialTimeRef.current;
+							if (resumeAt && Number.isFinite(resumeAt) && resumeAt > 0 && resumeAt < videoRef.current.duration) {
+								videoRef.current.currentTime = resumeAt;
 							}
 							setVideoIntrinsicSize({ width: videoRef.current.videoWidth, height: videoRef.current.videoHeight });
 							}
@@ -2709,6 +2762,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								onDelete={deleteChapter}
 								onAdd={addChapterAtCurrentTime}
 								onDetect={() => void detectChaptersFromSilence()}
+								onClearAll={clearChapters}
 								onClose={() => setSidebarPanel(null)}
 							/>,
 							toolPanelHost

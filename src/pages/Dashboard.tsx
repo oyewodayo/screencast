@@ -297,6 +297,7 @@ const Dashboard = () => {
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [showRecordingDocker, setShowRecordingDocker] = useState<boolean>(() => loadSettings().showRecordingDocker);
   const [showRecordingPanelButtons, setShowRecordingPanelButtons] = useState<boolean>(() => loadSettings().showRecordingPanelButtons);
+  const [showDockerStatusBar, setShowDockerStatusBar] = useState<boolean>(() => loadSettings().showDockerStatusBar);
 
   // The main window is created hidden (tauri.conf.json's "visible": false on the main window
   // entry) specifically so this can show it only once there's real, already-painted UI behind it
@@ -1808,6 +1809,7 @@ const setScreen = () => {
 		setHomeBackgroundStyle(settings.homeBackgroundStyle);
 		setShowRecordingDocker(settings.showRecordingDocker);
 		setShowRecordingPanelButtons(settings.showRecordingPanelButtons);
+		setShowDockerStatusBar(settings.showDockerStatusBar);
 		setIncludeSystemAudio(settings.defaultIncludeSystemAudio);
 		setResolutionWidth(settings.defaultResolutionWidth);
 		setFramerate(settings.defaultFramerate);
@@ -4534,6 +4536,7 @@ const setScreen = () => {
         setAudioDevice={setAudioDevice}
         showRecordingDocker={showRecordingDocker}
         showRecordingPanelButtons={showRecordingPanelButtons}
+        showDockerStatusBar={showDockerStatusBar}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
         isHome={selectedFile === null && boardScreen === null && docsScreen === null && whiteboardScreen === null && mindmapScreen === null && videoEditorScreen === null}

@@ -3,6 +3,8 @@ import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import ActiveRecordingState, { RecordSource, SOURCE_FLAGS } from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
@@ -12,6 +14,34 @@ import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import { loadSettings } from "../utils/appSettings";
 import { startSnip } from "../services/snip";
+
+const FEEDBACK_EMAIL = "withbriefs@gmail.com";
+
+// Opens the user's mail client with a pre-filled feedback email. Version + OS go in the body so
+// bug reports arrive with the basics without the user having to look them up.
+async function openFeedbackEmail() {
+  const version = await getVersion().catch(() => "unknown");
+  const subject = `Briefcast ${version}: Feature request / Bug report`;
+  const body = [
+    "Type: Feature request / Bug report (delete one)",
+    "",
+    "What happened / what would you like?",
+    "",
+    "",
+    "Steps to reproduce (for bugs):",
+    "1. ",
+    "",
+    "---",
+    `Briefcast version: ${version}`,
+    `Platform: ${navigator.userAgent}`,
+  ].join("\n");
+  const url = `mailto:${FEEDBACK_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  try {
+    await openExternal(url);
+  } catch (err) {
+    console.error("Failed to open mail client:", err);
+  }
+}
 
 // First entry of each is the fallback when Settings' default format is of another kind.
 const VIDEO_EXTS = ["mp4", "mkv", "mov", "webm", "avi"];
@@ -182,6 +212,9 @@ interface Props {
   // bottom-right buttons, distinct from RecordingDocker above) is visible - see
   // appSettings.ts's showRecordingPanelButtons doc comment for why this exists.
   showRecordingPanelButtons: boolean;
+  // Whether the last row (date/time, CPU RAM, OS, feedback link) is shown - see appSettings.ts's
+  // showDockerStatusBar doc comment.
+  showDockerStatusBar: boolean;
 }
 
 type ConnectedDevice = string[];
@@ -291,7 +324,8 @@ const BottomDocker = ({
   showRecordingDocker,
   onOpenPhoneCamera,
   isPhoneCameraConnected,
-  showRecordingPanelButtons
+  showRecordingPanelButtons,
+  showDockerStatusBar
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -621,7 +655,9 @@ const BottomDocker = ({
       {/* Hidden rather than unmounted when minimized, so the video editor's open tool panel
           (docked in the sidebar - see ToolPanelHost.tsx) and timeline state survive collapsing
           the docker. VideoTimelineDocker ignores its keyboard shortcuts while hidden. */}
-      {(<div className={`docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800 ${showDocker ? "" : "hidden"}`}>
+      {/* Also hidden when nothing inside would render (no file tools, recording panel and status
+          bar both off) - otherwise its padding/border leave an empty strip under the toolbar. */}
+      {(<div className={`docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800 ${showDocker && ((dockerMode === "file-tools" && activeFile) || showRecordingDocker || showDockerStatusBar) ? "" : "hidden"}`}>
         {dockerMode === "file-tools" && activeFile ? (
           <FileToolsDocker
             file={activeFile}
@@ -699,6 +735,7 @@ const BottomDocker = ({
           />
         ) : null}
 
+        {showDockerStatusBar && (
         <div className="w-full grid grid-cols-1 grid-flow-col text-xs">
           <div>
           <span>{Date()}</span>
@@ -723,8 +760,14 @@ const BottomDocker = ({
           </span>
           <OsInfo />
           </div>
-          <div className="right-0"><span> <a href="https://x.com/oyewodayo" target="blank" className="text-blue-600 dark:text-blue-400">Request feature / Report a bug</a></span></div>
+          <div className="right-0"><span> <a
+            href={`mailto:${FEEDBACK_EMAIL}`}
+            onClick={(e) => { e.preventDefault(); void openFeedbackEmail(); }}
+            title={`Email ${FEEDBACK_EMAIL}`}
+            className="text-blue-600 dark:text-blue-400"
+          >Request feature / Report a bug</a></span></div>
         </div>
+        )}
       </div>)}
     </div>
     </>

@@ -1501,21 +1501,70 @@ pub async fn generate_captions(
 ) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
     let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
-    let namespace = format!("captions_generated_v1_{}", lang);
-    let cache_path = preview_cache_path(&input, &namespace, "vtt")?;
+    let cache_path = preview_cache_path(&input, &format!("captions_generated_v1_{}", lang), "vtt")?;
 
     if cache_path.exists() {
         return std::fs::read_to_string(&cache_path)
             .map_err(|e| format!("Failed to read cached captions: {}", e));
     }
 
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create captions cache directory: {}", e))?;
+    let chunks = transcribe_in_chunks(&app_handle, &input, &cache_path, &lang, false).await?;
+
+    // Stitch the per-chunk VTTs into one, each cue's times shifted by its chunk's start.
+    let mut vtt = String::from("WEBVTT\n\n");
+    for (offset, file) in &chunks {
+        let text = std::fs::read_to_string(file).map_err(|e| format!("Failed to read a transcribed part: {}", e))?;
+        for block in text.replace("\r\n", "\n").split("\n\n") {
+            let mut lines = block.lines();
+            let Some(timing) = lines.find(|l| l.contains("-->")) else { continue };
+            let Some(shifted) = shift_vtt_timing(timing, *offset) else { continue };
+            let body: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
+            if body.is_empty() {
+                continue;
+            }
+            vtt.push_str(&shifted);
+            vtt.push('\n');
+            vtt.push_str(&body.join("\n"));
+            vtt.push_str("\n\n");
+        }
     }
 
-    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
-    let whisper_path = crate::services::utility::get_whisper_cli_path(&app_handle)?;
+    std::fs::write(&cache_path, &vtt).map_err(|e| format!("Failed to cache captions: {}", e))?;
+    finish_chunked_transcription(&cache_path);
+    Ok(vtt)
+}
+
+// One whisper run's worth of audio. Long recordings are transcribed in pieces this size so the
+// work survives the app closing: each finished piece is kept, and a later run (same file, same
+// language) only transcribes what's still missing - see transcribe_in_chunks. Short enough that
+// little is lost to an interruption, long enough that whisper's per-run model load stays a small
+// share of the time.
+const CAPTION_CHUNK_SECS: f64 = 300.0;
+
+// Bytes per second of the 16kHz mono s16le WAV extract_audio_for_whisper writes.
+const WHISPER_WAV_BYTES_PER_SEC: f64 = 32_000.0;
+
+fn chunk_parts_dir(cache_path: &PathBuf) -> PathBuf {
+    cache_path.with_extension("parts")
+}
+
+// Transcribes `input` piece by piece into `<cache>.parts/`, resuming from whatever an earlier,
+// interrupted run already finished (a piece counts as done once its `.ok` marker exists - written
+// only after whisper succeeded, so a half-written output is never trusted). Returns every piece's
+// start offset (seconds) and output file, in order. Emits "captions-progress" across the whole job,
+// so a resumed run starts its bar at the share already done.
+async fn transcribe_in_chunks(
+    app_handle: &AppHandle,
+    input: &PathBuf,
+    cache_path: &PathBuf,
+    lang: &str,
+    words: bool,
+) -> Result<Vec<(f64, PathBuf)>, String> {
+    let parts = chunk_parts_dir(cache_path);
+    std::fs::create_dir_all(&parts).map_err(|e| format!("Failed to create captions work folder: {}", e))?;
+
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let whisper_path = crate::services::utility::get_whisper_cli_path(app_handle)?;
     if !whisper_path.exists() {
         return Err(format!(
             "whisper-cli not found at {} - see README's Getting Started for how to obtain it",
@@ -1527,24 +1576,151 @@ pub async fn generate_captions(
         .await
         .map_err(|e| format!("Speech model lookup failed: {}", e))??;
 
-    // whisper.cpp needs a plain mono 16kHz WAV, not whatever the source video's own audio track
-    // happens to be encoded as - extracted into the same cache directory as a scratch file,
-    // removed once transcription finishes (success or failure) since it's never needed again.
-    let wav_path = cache_path.with_extension("wav");
-    let extraction = extract_audio_for_whisper(&ffmpeg_path, &input, &wav_path).await;
-    if let Err(err) = extraction {
-        let _ = std::fs::remove_file(&wav_path);
-        return Err(err);
+    // The whole audio track, extracted once and kept with the pieces until the job completes.
+    // Written under a temporary name first so an interrupted extraction is never mistaken for a
+    // finished one (ffmpeg picks the format from the extension, so it stays .wav).
+    let wav = parts.join("audio.wav");
+    if !wav.exists() {
+        let partial = parts.join("audio.partial.wav");
+        let extraction = extract_audio_for_whisper(&ffmpeg_path, input, &partial).await;
+        if let Err(err) = extraction {
+            let _ = std::fs::remove_file(&partial);
+            return Err(err);
+        }
+        std::fs::rename(&partial, &wav).map_err(|e| format!("Failed to keep extracted audio: {}", e))?;
     }
+    let wav_len = std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0);
+    let duration = (wav_len.saturating_sub(44) as f64) / WHISPER_WAV_BYTES_PER_SEC;
+    let total = ((duration / CAPTION_CHUNK_SECS).ceil() as usize).max(1);
 
-    // -of wants the output path WITHOUT its extension - whisper-cli appends ".vtt" itself.
-    let output_stem = cache_path.with_extension("");
-    let transcription = run_whisper_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem, &lang, &["-ovtt"]).await;
-    let _ = std::fs::remove_file(&wav_path); // best-effort - a leftover scratch WAV is harmless either way
-    transcription?;
+    let ext = if words { "json" } else { "vtt" };
+    let mut outputs = Vec::with_capacity(total);
+    for i in 0..total {
+        let offset = i as f64 * CAPTION_CHUNK_SECS;
+        let stem = parts.join(format!("chunk_{:04}", i));
+        let out_file = stem.with_extension(ext);
+        let ok_marker = stem.with_extension("ok");
+        let span = (i as f64 / total as f64 * 100.0, (i + 1) as f64 / total as f64 * 100.0);
 
-    std::fs::read_to_string(&cache_path)
-        .map_err(|e| format!("whisper-cli reported success but produced no readable output: {}", e))
+        if ok_marker.exists() && out_file.exists() {
+            let _ = app_handle.emit("captions-progress", span.1);
+            outputs.push((offset, out_file));
+            continue;
+        }
+
+        let chunk_wav = stem.with_extension("wav");
+        cut_wav_chunk(&ffmpeg_path, &wav, &chunk_wav, offset, CAPTION_CHUNK_SECS).await?;
+        let format_args: &[&str] = if words { &["-oj", "-ml", "1", "-sow"] } else { &["-ovtt"] };
+        let result = run_whisper_cli(app_handle, &whisper_path, &model_path, &chunk_wav, &stem, lang, format_args, span).await;
+        let _ = std::fs::remove_file(&chunk_wav);
+        result?;
+        std::fs::write(&ok_marker, b"").map_err(|e| format!("Failed to record transcription progress: {}", e))?;
+        outputs.push((offset, out_file));
+    }
+    Ok(outputs)
+}
+
+// The job is done and its final result cached - the pieces and extracted audio can go.
+fn finish_chunked_transcription(cache_path: &PathBuf) {
+    let _ = std::fs::remove_dir_all(chunk_parts_dir(cache_path));
+}
+
+async fn cut_wav_chunk(ffmpeg_path: &PathBuf, wav: &PathBuf, output: &PathBuf, start: f64, length: f64) -> Result<(), String> {
+    let ffmpeg_path = ffmpeg_path.clone();
+    let wav = wav.clone();
+    let output = output.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-y");
+        cmd.args(["-ss", &format!("{:.3}", start), "-t", &format!("{:.3}", length)]);
+        cmd.arg("-i").arg(path_to_str(&wav)?);
+        cmd.args(["-c:a", "pcm_s16le"]);
+        cmd.arg(path_to_str(&output)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() || !output.exists() {
+            return Err("Failed to cut the audio into pieces for transcription".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Audio split task failed: {}", e))?
+}
+
+// "00:01:02.345 --> 00:01:04.000 <settings>" with both times moved later by `offset` seconds.
+fn shift_vtt_timing(line: &str, offset: f64) -> Option<String> {
+    let (left, right) = line.split_once("-->")?;
+    let mut right_parts = right.trim().splitn(2, char::is_whitespace);
+    let end_raw = right_parts.next()?;
+    let settings = right_parts.next().unwrap_or("");
+    let start = parse_vtt_time(left.trim())? + offset;
+    let end = parse_vtt_time(end_raw)? + offset;
+    let mut out = format!("{} --> {}", format_vtt_time(start), format_vtt_time(end));
+    if !settings.is_empty() {
+        out.push(' ');
+        out.push_str(settings);
+    }
+    Some(out)
+}
+
+fn parse_vtt_time(s: &str) -> Option<f64> {
+    let s = s.replace(',', ".");
+    let parts: Vec<&str> = s.split(':').collect();
+    let (h, m, sec) = match parts.as_slice() {
+        [h, m, sec] => (h.parse::<f64>().ok()?, m.parse::<f64>().ok()?, sec.parse::<f64>().ok()?),
+        [m, sec] => (0.0, m.parse::<f64>().ok()?, sec.parse::<f64>().ok()?),
+        _ => return None,
+    };
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+fn format_vtt_time(t: f64) -> String {
+    let ms_total = (t.max(0.0) * 1000.0).round() as u64;
+    let h = ms_total / 3_600_000;
+    let m = (ms_total % 3_600_000) / 60_000;
+    let s = (ms_total % 60_000) / 1000;
+    let ms = ms_total % 1000;
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
+#[derive(serde::Serialize)]
+pub struct CaptionJobProgress {
+    done: usize,
+    // 0 when the audio hasn't been extracted yet (nothing to measure the total from).
+    total: usize,
+}
+
+// Whether an interrupted caption job exists for this file+language (and how far it got) - lets
+// the player resume it automatically on open, and the editor's Captions panel offer "Resume"
+// instead of "Generate". None once the job is complete (or was never started).
+#[tauri::command]
+pub fn caption_job_progress(input_path: String, language: Option<String>, words: bool) -> Result<Option<CaptionJobProgress>, String> {
+    let input = PathBuf::from(&input_path);
+    let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
+    let (namespace, ext) = if words {
+        (format!("captions_words_v1_{}", lang), "json")
+    } else {
+        (format!("captions_generated_v1_{}", lang), "vtt")
+    };
+    let cache_path = preview_cache_path(&input, &namespace, ext)?;
+    if cache_path.exists() {
+        return Ok(None);
+    }
+    let parts = chunk_parts_dir(&cache_path);
+    if !parts.exists() {
+        return Ok(None);
+    }
+    let done = std::fs::read_dir(&parts)
+        .map(|entries| entries.filter_map(Result::ok).filter(|e| e.path().extension().map_or(false, |x| x == "ok")).count())
+        .unwrap_or(0);
+    let total = std::fs::metadata(parts.join("audio.wav"))
+        .map(|m| ((m.len().saturating_sub(44) as f64 / WHISPER_WAV_BYTES_PER_SEC / CAPTION_CHUNK_SECS).ceil() as usize).max(1))
+        .unwrap_or(0);
+    Ok(Some(CaptionJobProgress { done, total }))
 }
 
 // One spoken word with its own timing, in seconds of the SOURCE file - the video editor's
@@ -1569,8 +1745,7 @@ pub async fn generate_caption_words(
 ) -> Result<Vec<CaptionWordOut>, String> {
     let input = PathBuf::from(&input_path);
     let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
-    let namespace = format!("captions_words_v1_{}", lang);
-    let cache_path = preview_cache_path(&input, &namespace, "json")?;
+    let cache_path = preview_cache_path(&input, &format!("captions_words_v1_{}", lang), "json")?;
 
     if cache_path.exists() {
         let cached = std::fs::read_to_string(&cache_path)
@@ -1580,57 +1755,27 @@ pub async fn generate_caption_words(
         }
         // Unreadable cache - fall through and regenerate over it.
     }
-
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create captions cache directory: {}", e))?;
     }
 
-    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
-    let whisper_path = crate::services::utility::get_whisper_cli_path(&app_handle)?;
-    if !whisper_path.exists() {
-        return Err(format!(
-            "whisper-cli not found at {} - see README's Getting Started for how to obtain it",
-            whisper_path.display()
-        ));
+    // Word-per-segment JSON, transcribed (and resumable) piece by piece - see transcribe_in_chunks.
+    let chunks = transcribe_in_chunks(&app_handle, &input, &cache_path, &lang, true).await?;
+    let mut words: Vec<CaptionWordOut> = Vec::new();
+    for (offset, file) in &chunks {
+        let raw = std::fs::read_to_string(file).map_err(|e| format!("Failed to read a transcribed part: {}", e))?;
+        for mut w in parse_whisper_word_json(&raw)? {
+            w.start += offset;
+            w.end += offset;
+            words.push(w);
+        }
     }
-    let model_handle = app_handle.clone();
-    let model_path = tauri::async_runtime::spawn_blocking(move || crate::services::whisper_model::ensure_model(&model_handle))
-        .await
-        .map_err(|e| format!("Speech model lookup failed: {}", e))??;
-
-    let wav_path = cache_path.with_extension("wav");
-    let extraction = extract_audio_for_whisper(&ffmpeg_path, &input, &wav_path).await;
-    if let Err(err) = extraction {
-        let _ = std::fs::remove_file(&wav_path);
-        return Err(err);
-    }
-
-    // whisper-cli appends ".json" to -of itself - a stem distinct from cache_path's own so its raw
-    // output never lands on (and gets mistaken for) the parsed cache file.
-    let raw_stem = cache_path.with_extension("whisper");
-    let raw_path = cache_path.with_extension("whisper.json");
-    let transcription = run_whisper_cli(
-        &app_handle,
-        &whisper_path,
-        &model_path,
-        &wav_path,
-        &raw_stem,
-        &lang,
-        &["-oj", "-ml", "1", "-sow"],
-    )
-    .await;
-    let _ = std::fs::remove_file(&wav_path);
-    transcription?;
-
-    let raw = std::fs::read_to_string(&raw_path)
-        .map_err(|e| format!("whisper-cli reported success but produced no readable output: {}", e))?;
-    let _ = std::fs::remove_file(&raw_path);
-    let words = parse_whisper_word_json(&raw)?;
 
     if let Ok(json) = serde_json::to_string(&words) {
         let _ = std::fs::write(&cache_path, json); // best-effort - a missing cache just regenerates
     }
+    finish_chunked_transcription(&cache_path);
     Ok(words)
 }
 
@@ -1985,8 +2130,12 @@ async fn run_whisper_cli(
     // Output-format flags - ["-ovtt"] for segment captions (generate_captions), or JSON at one word
     // per segment for the editor's word-timed captions (generate_caption_words).
     format_args: &[&str],
+    // This run's share of the overall job's 0-100 progress (transcribe_in_chunks runs one per piece).
+    progress_span: (f64, f64),
 ) -> Result<(), String> {
     let app_handle = app_handle.clone();
+    let (span_start, span_end) = progress_span;
+    let _ = app_handle.emit("captions-progress", span_start);
     let format_args: Vec<String> = format_args.iter().map(|a| a.to_string()).collect();
     let whisper_path = whisper_path.clone();
     let model_path = model_path.clone();
@@ -2047,7 +2196,7 @@ async fn run_whisper_cli(
 
                 if let Some(caps) = progress_re.captures(&line) {
                     if let Ok(pct) = caps[1].parse::<f64>() {
-                        let _ = app_handle_for_stderr.emit("captions-progress", pct);
+                        let _ = app_handle_for_stderr.emit("captions-progress", span_start + pct / 100.0 * (span_end - span_start));
                     }
                 }
             }
@@ -2074,7 +2223,7 @@ async fn run_whisper_cli(
                 if reason.is_empty() { "unknown error".to_string() } else { reason }
             ));
         }
-        let _ = app_handle.emit("captions-progress", 100.0);
+        let _ = app_handle.emit("captions-progress", span_end);
         Ok(())
     })
     .await

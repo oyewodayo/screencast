@@ -449,6 +449,18 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     ))}
                   </div>
                 </div>
+
+                <Field label="Show status bar">
+                  <input
+                    type="checkbox"
+                    checked={settings.showDockerStatusBar}
+                    onChange={(e) => update("showDockerStatusBar", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  The last row of the bottom bar - date/time, CPU RAM, OS and the "Request feature / Report a bug" link.
+                </p>
               </Section>
             )}
 
