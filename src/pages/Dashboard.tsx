@@ -37,6 +37,8 @@ import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
+import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
+import { VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -710,6 +712,58 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     return url;
   }, []);
 
+  // The open timeline's frame size - a project's own (its file's header), or the open video's
+  // native resolution. Image clips preview letterboxed into exactly this frame (see
+  // get_image_clip_proxy), which is what keeps their crop/Ken Burns/overlay positions identical in
+  // preview and export. null if it couldn't be read; cached per primary file for the session.
+  const timelineFrameCacheRef = useRef<Map<string, Promise<VideoProjectFrame | null>>>(new Map());
+  const resolveTimelineFrame = useCallback((primaryPath: string): Promise<VideoProjectFrame | null> => {
+    let pending = timelineFrameCacheRef.current.get(primaryPath);
+    if (!pending) {
+      pending = (
+        isVideoProjectPath(primaryPath)
+          ? invoke<VideoProjectFrame>("read_video_project", { projectPath: primaryPath })
+          : invoke<Record<string, string>>("get_conversion_info", { inputPath: primaryPath }).then((info) => {
+              const match = info.resolution?.match(/^(\d+)x(\d+)$/);
+              return match ? { width: Number(match[1]), height: Number(match[2]) } : null;
+            })
+      ).catch((error) => {
+        console.error("Failed to read timeline frame size for", primaryPath, error);
+        timelineFrameCacheRef.current.delete(primaryPath);
+        return null;
+      });
+      timelineFrameCacheRef.current.set(primaryPath, pending);
+    }
+    return pending;
+  }, []);
+
+  // An image clip's preview source - a cached still-video proxy of that image (see
+  // get_image_clip_proxy for why images preview as video), fitted to the timeline's frame. Cached
+  // as a promise per image+frame so the prefetch effect below and an actual seek share one encode.
+  const imageClipProxyUrlCacheRef = useRef<Map<string, Promise<string>>>(new Map());
+  const resolveImageClipProxyUrl = useCallback(async (imagePath: string, primaryPath: string): Promise<string> => {
+    const frame = (await resolveTimelineFrame(primaryPath)) ?? { width: 1920, height: 1080 };
+    const key = `${imagePath}|${frame.width}x${frame.height}`;
+    let pending = imageClipProxyUrlCacheRef.current.get(key);
+    if (!pending) {
+      pending = invoke<string>("get_image_clip_proxy", { imagePath, frameWidth: frame.width, frameHeight: frame.height }).then((proxyPath) =>
+        resolvePreviewAssetUrl(proxyPath)
+      );
+      pending.catch(() => imageClipProxyUrlCacheRef.current.delete(key)); // let the next seek retry
+      imageClipProxyUrlCacheRef.current.set(key, pending);
+    }
+    return pending;
+  }, [resolveTimelineFrame, resolvePreviewAssetUrl]);
+
+  // What a video project plays as its primary file - a black canvas at the project's frame size
+  // (see get_video_canvas_proxy) - since the project file itself is only a small JSON header.
+  const resolveProjectCanvasUrl = useCallback(async (projectPath: string): Promise<string> => {
+    const frame = await resolveTimelineFrame(projectPath);
+    if (!frame) throw new Error("This video project couldn't be read");
+    const canvasPath = await invoke<string>("get_video_canvas_proxy", { width: frame.width, height: frame.height });
+    return resolvePreviewAssetUrl(canvasPath);
+  }, [resolveTimelineFrame, resolvePreviewAssetUrl]);
+
   // Full-resolution display URL for an image file - the single-image viewer's resolver (also used
   // by the gallery's "Copy image" action, which should copy full quality, not a thumbnail). Same
   // as resolvePreviewAssetUrl above except HEIC/HEIF (WebView2 has no decoder for it at all) first
@@ -745,10 +799,19 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // content-addressed cache on the Rust side (a single ffmpeg frame extraction, ~1s into the
   // clip). Routed through the same shared thumbnailLimiter as every other gallery/sidebar
   // thumbnail request by the callers of this function, not here - this just resolves one URL.
+  // A video project has no frames of its own, so its tile shows its first clip instead.
   const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }, bypassCache = false): Promise<string> => {
-    const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: file.path });
+    let videoPath = file.path;
+    if (isVideoProjectPath(file.path)) {
+      const json = await invoke<string | null>("load_video_edit_state", { videoPath: file.path });
+      const firstClipPath: unknown = json ? JSON.parse(json)?.clips?.[0]?.sourcePath : undefined;
+      if (typeof firstClipPath !== "string") throw new Error("Empty video project - nothing to thumbnail");
+      if (isImageClipPath(firstClipPath)) return resolveImageThumbnailUrl({ name: firstClipPath, path: firstClipPath });
+      videoPath = firstClipPath;
+    }
+    const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: videoPath });
     return resolvePreviewAssetUrl(thumbPath, bypassCache);
-  }, [resolvePreviewAssetUrl]);
+  }, [resolvePreviewAssetUrl, resolveImageThumbnailUrl]);
 
   // VideoPlayer.tsx's "set current frame as thumbnail" overwrites get_video_thumbnail's cached jpg
   // in place, at the SAME path it always had - so this listens for its completion and clears the
@@ -785,7 +848,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       videoPlayerRef.current?.loadSource(selectedFile.path, time);
       return;
     }
-    resolvePreviewAssetUrl(sourcePath)
+    (isImageClipPath(sourcePath) && selectedFile ? resolveImageClipProxyUrl(sourcePath, selectedFile.sourcePath) : resolvePreviewAssetUrl(sourcePath))
       .then((url) => {
         // Dropped if the player has moved on while the URL resolved - opening a different file
         // resets previewSourcePathRef (effect above), and a late load here would otherwise swap
@@ -795,6 +858,26 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       })
       .catch((error) => console.error("Failed to load preview source for", sourcePath, error));
   };
+  // Prepares every image clip's preview proxy ahead of the playhead, one at a time, so playback
+  // crossing into an image doesn't stall on its first encode. Re-runs on every edit, but anything
+  // already prepared is a cached promise - only newly added images do any work.
+  useEffect(() => {
+    const primaryPath = selectedFile?.sourcePath;
+    if (!primaryPath || getFileCategory(selectedFile.name) !== "video") return;
+    const imagePaths = Array.from(new Set(editStore.clips.map((clip) => clip.sourcePath).filter(isImageClipPath)));
+    let cancelled = false;
+    (async () => {
+      for (const imagePath of imagePaths) {
+        if (cancelled) return;
+        // eslint-disable-next-line no-await-in-loop
+        await resolveImageClipProxyUrl(imagePath, primaryPath).catch((error) => console.error("Failed to prepare image clip preview", imagePath, error));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFile?.sourcePath, editStore.clips, resolveImageClipProxyUrl]);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -1783,7 +1866,7 @@ const setScreen = () => {
 			});
 			if (!selected || Array.isArray(selected)) return; // cancelled
 
-			const name = selected.split(/[\/]/).pop() ?? selected;
+			const name = selected.split(/[\\/]/).pop() ?? selected;
 			if (getFileCategory(name) !== "video") {
 				await showMessageDialog(`"${name}" isn't a video file the editor can open.`, {
 					title: 'Unsupported file',
@@ -2077,6 +2160,22 @@ const setScreen = () => {
 
   // Shared by the sidebar (files already in the Briefcast library) and the "open file from
   // anywhere" picker below — both just need a raw filesystem path turned into a playable URL.
+	// The Video Editor's "Create video" - a new project (services/video_edits.rs) in the library,
+	// seeded with one clip per picked image (or none, for a blank timeline), opened straight into
+	// the editor. Errors are thrown back to NewVideoProjectDialog so it can show them in place.
+	const [isNewVideoProjectOpen, setIsNewVideoProjectOpen] = useState(false);
+	const handleCreateVideoProject = async (request: NewVideoProjectRequest): Promise<void> => {
+		const state = createProjectState(request.imagePaths, request.options);
+		const projectPath = await invoke<string>("create_video_project", {
+			name: request.name,
+			width: request.frame.width,
+			height: request.frame.height,
+			editStateJson: JSON.stringify(state),
+		});
+		setIsNewVideoProjectOpen(false);
+		void handleDirectoryFiles();
+		await handleOpenVideoInEditor({ path: projectPath, name: projectPath.split(/[\\/]/).pop() ?? projectPath });
+	};
 	const loadFileForPlayback = async (filePath: string, fileName: string) => {
 	// Document files (.docx/.md/.txt) open in Briefcast Docs - converted into a Briefcast document,
 	// or the one already made from the same unchanged file - rather than in another app.
@@ -2101,7 +2200,9 @@ const setScreen = () => {
 		// convertFileSrc round-trip.
 		const fileUrl = getFileCategory(fileName) === "image"
 			? await resolveImageDisplayUrl({ name: fileName, path: filePath })
-			: convertFileSrc(await invoke<string>("convert_file_path_to_url", { filepath: filePath }));
+			: isVideoProjectPath(filePath)
+				? await resolveProjectCanvasUrl(filePath)
+				: convertFileSrc(await invoke<string>("convert_file_path_to_url", { filepath: filePath }));
 
 		console.log('Converted file URL:', fileUrl);
 
@@ -4001,6 +4102,14 @@ const setScreen = () => {
           )}
 
           <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center">
+          {isNewVideoProjectOpen && (
+            <NewVideoProjectDialog
+              libraryImages={allLibraryFiles.filter((file) => isImageClipPath(file.path))}
+              resolveThumbnailUrl={resolveImageThumbnailUrl}
+              onCreate={handleCreateVideoProject}
+              onClose={() => setIsNewVideoProjectOpen(false)}
+            />
+          )}
           {videoEditorScreen?.mode === "home" ? (
             <VideoEditorHome
               videos={allLibraryFiles.filter((file) => getFileCategory(file.name) === "video")}
@@ -4008,6 +4117,7 @@ const setScreen = () => {
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
               onOpenVideo={(file) => void handleOpenVideoInEditor(file)}
               onOpenExternalVideo={() => void handleOpenExternalVideoForEditing()}
+              onCreateVideo={() => setIsNewVideoProjectOpen(true)}
             />
           ) : mindmapScreen ? (
             <ErrorBoundary

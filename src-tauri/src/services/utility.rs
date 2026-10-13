@@ -855,6 +855,8 @@ fn is_media_file(ext: &str) -> bool {
         "jpg" | "jpeg" | "png" | "gif"  | "bmp" | "tiff" | "heic" | "heif" |
         "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" |
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv" |
+        // Video projects (services/video_edits.rs) - an image-built timeline, listed with videos.
+        "briefvideo" |
         "pdf" |
         // docx/md/txt: what Docs' export feature (services/docs.rs's export_doc/
         // export_doc_binary) writes into briefcast_dir() - without these here they'd be filtered

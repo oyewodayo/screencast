@@ -5,7 +5,7 @@ import { CaptionLine, buildCaptionLines, buildCaptionsAss, defaultCaptionSetting
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, EditableFields, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, EditableFields, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
@@ -59,6 +59,8 @@ interface ConversionProgressPayload {
 // so a bad drag-in degrades to "can't resize this clip's end past what shows on-screen right now"
 // instead of crashing the whole editor.
 async function fetchDuration(path: string): Promise<number | null> {
+  // A still has no length of its own - an image clip can be stretched up to its preview proxy's.
+  if (isImageClipPath(path)) return IMAGE_CLIP_MAX_SECONDS;
   try {
     const info = await invoke<Record<string, string>>("get_conversion_info", { inputPath: path });
     const match = info.duration?.match(/[\d.]+/);
@@ -472,6 +474,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   const setDuration = useCallback(
     (duration: number) => {
       if (sourcePath) registerSourceDuration(sourcePath, duration);
+      // A project's "duration" is only its black preview canvas's - its timeline always comes from
+      // the sidecar written when it was created, never a clip spanning the canvas itself.
+      if (sourcePath && isVideoProjectPath(sourcePath)) return;
       setState((prev) => (prev ? prev : sourcePath ? createEmptyState(sourcePath, duration) : prev));
     },
     [sourcePath, registerSourceDuration]
@@ -1107,7 +1112,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       if (sourcePathRef.current !== requestedForSourcePath) return; // switched files mid-lookup
       const latest = stateRef.current;
       if (!latest) return;
-      const newClip: Clip = { id: crypto.randomUUID(), sourcePath: newClipSourcePath, start: 0, end: duration };
+      // An image clip starts at a slideshow-friendly length rather than its (very long) maximum.
+      const end = isImageClipPath(newClipSourcePath) ? Math.min(duration, DEFAULT_IMAGE_CLIP_SECONDS) : duration;
+      const newClip: Clip = { id: crypto.randomUUID(), sourcePath: newClipSourcePath, start: 0, end };
       const clips = insertClipHandler(latest.clips, atIndex, newClip);
       pushCommand(snapshot(latest, {}), snapshot(latest, { clips }), "insert");
     },

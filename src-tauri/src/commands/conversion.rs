@@ -483,6 +483,119 @@ pub async fn get_playable_preview(
     .await
 }
 
+// How long an image clip's preview proxy runs - and so the longest an image clip can be stretched
+// on the timeline (its "source duration", see IMAGE_CLIP_MAX_SECONDS in videoEditTypes.ts).
+const IMAGE_CLIP_PROXY_SECONDS: u32 = 600;
+// Preview proxies never need more than this on their long edge - the player shows them at window
+// size, and every pixel here is encode time spent before the clip can preview at all.
+const PROXY_MAX_EDGE: u32 = 1920;
+
+// Scales frame_width x frame_height down (aspect kept) to fit PROXY_MAX_EDGE, even dimensions.
+fn proxy_size(frame_width: u32, frame_height: u32) -> (u32, u32) {
+    let (w, h) = (frame_width.max(2) as f64, frame_height.max(2) as f64);
+    let scale = (PROXY_MAX_EDGE as f64 / w.max(h)).min(1.0);
+    let even = |v: f64| ((v * scale / 2.0).round() as u32 * 2).max(2);
+    (even(w), even(h))
+}
+
+// Runs one short-lived ffmpeg encode for the proxies below (no progress events, no shared
+// ConversionState - these are background preview assets, not a user-visible conversion), writing
+// to a temp file first so an interrupted encode can never leave a truncated file at the cache path.
+async fn encode_preview_proxy(ffmpeg_path: PathBuf, args: Vec<String>, cache_path: PathBuf) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
+        }
+        let tmp = cache_path.with_extension("partial.mp4");
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-y").args(&args).arg(path_to_str(&tmp)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() {
+            let _ = std::fs::remove_file(&tmp);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("unknown error").to_string();
+            return Err(format!("Couldn't prepare preview: {}", reason));
+        }
+        std::fs::rename(&tmp, &cache_path).map_err(|e| format!("Failed to store preview: {}", e))?;
+        path_to_str(&cache_path).map(|s| s.to_string())
+    })
+    .await
+    .map_err(|e| format!("Preview task panicked: {e}"))?
+}
+
+// The live preview of an image clip. The editor's player follows the timeline by seeking one
+// <video> element from clip to clip (VideoTimelineDocker's live-preview effect), so rather than
+// teaching it a second, image-shaped playback mode, an image clip previews as a cached
+// low-frame-rate "still video" of that image - every existing preview effect (crop, Ken Burns, color grade,
+// flip) then just works on it. Already letterboxed into the timeline's own frame by the same
+// scale+pad export applies (frame_fit_chain), so positions line up with the real render exactly.
+// Export never reads this file - it loops the original image at full quality instead.
+#[tauri::command]
+pub async fn get_image_clip_proxy(
+    app_handle: AppHandle,
+    image_path: String,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<String, String> {
+    let input = PathBuf::from(&image_path);
+    let (w, h) = proxy_size(frame_width, frame_height);
+    let cache_path = preview_cache_path(&input, &format!("image_clip_v1_{}x{}", w, h), "mp4")?;
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let args: Vec<String> = vec![
+        "-loop".into(), "1".into(),
+        // One frame every 10s: every frame is the same picture, and encode time scales with frame
+        // count (measured: 600 frames took ~15s at 1080p, 60 frames ~2.4s, for the same file).
+        "-framerate".into(), "0.1".into(),
+        "-i".into(), image_path.clone(),
+        "-t".into(), IMAGE_CLIP_PROXY_SECONDS.to_string(),
+        "-vf".into(), frame_fit_chain(w as i64, h as i64, true)[1..].to_string(),
+        "-c:v".into(), "libx264".into(),
+        "-preset".into(), "ultrafast".into(),
+        "-tune".into(), "stillimage".into(),
+        // A single keyframe - the rest are near-empty repeats, so seeking anywhere decodes only a
+        // few dozen trivial frames, and the whole proxy stays a few hundred KB.
+        "-g".into(), "60".into(),
+        "-an".into(),
+        "-movflags".into(), "+faststart".into(),
+    ];
+    encode_preview_proxy(ffmpeg_path, args, cache_path).await
+}
+
+// The "primary file" a video project plays while no clip is under the playhead (an empty
+// timeline, or before the first clip has loaded) - a short black video at the project's own frame
+// size. The timeline reads the project's frame size off this (its videoPixelSize), the same way it
+// reads a real video's, so overlay burn-in and export resolution need no project-specific path.
+#[tauri::command]
+pub async fn get_video_canvas_proxy(app_handle: AppHandle, width: u32, height: u32) -> Result<String, String> {
+    let (w, h) = ((width.max(2) / 2) * 2, (height.max(2) / 2) * 2);
+    let cache_path = std::env::temp_dir()
+        .join("briefcast_preview_cache")
+        .join("video_canvas_v1")
+        .join(format!("{}x{}.mp4", w, h));
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let args: Vec<String> = vec![
+        "-f".into(), "lavfi".into(),
+        "-i".into(), format!("color=c=black:s={}x{}:r=1:d=10", w, h),
+        "-c:v".into(), "libx264".into(),
+        "-preset".into(), "ultrafast".into(),
+        "-pix_fmt".into(), "yuv420p".into(),
+        "-an".into(),
+        "-movflags".into(), "+faststart".into(),
+    ];
+    encode_preview_proxy(ffmpeg_path, args, cache_path).await
+}
+
 // Convert a still image (screenshot) between png/jpeg/webp/bmp. No audio/video codec args
 // apply here - ffmpeg's image2 muxer picks a sane default encoder from the output extension,
 // and run_conversion's duration-based progress just never populates (there's no "Duration:"
@@ -3044,8 +3157,39 @@ fn escape_filter_path(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/").replace(':', "\\:").replace('\'', "")
 }
 
+// Still images a timeline clip can be built from (the editor's image clips - see Clip's own doc
+// comment, videoEditTypes.ts). Mirrors IMAGE_CLIP_EXTENSIONS there; HEIC/HEIF are left out since
+// the bundled ffmpeg can't reliably decode them (see get_heic_preview).
+fn is_still_image_path(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "gif")
+}
+
+// Frame rate every image segment is looped at (`-loop 1 -framerate`) - there's no source rate to
+// inherit from a still, and 30 matches probe_frame_rate's own fallback.
+const IMAGE_SEGMENT_FPS: f64 = 30.0;
+
+// Fits a segment's frames into the shared out_w:out_h output frame (letterboxed, never stretched)
+// before any of its own effects run - needed whenever segments can differ in size, since concat/
+// xfade both reject inputs of different dimensions. Image clips always need it (a photo is almost
+// never exactly the output size); same-size video segments pass through scale untouched. The
+// preview's own image proxy (get_image_clip_proxy) applies this exact scale+pad, which is what
+// keeps crop/Ken Burns/overlay positions on an image clip identical between preview and export.
+fn frame_fit_chain(out_w: i64, out_h: i64, is_image: bool) -> String {
+    format!(
+        ",scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1{fmt}",
+        w = out_w,
+        h = out_h,
+        fmt = if is_image { ",format=yuv420p" } else { "" }
+    )
+}
+
 fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
-    seg.color_filter
+    is_still_image_path(&seg.source_path) || seg.color_filter
         .as_ref()
         .map_or(false, |cf| cf.preset != "none")
         || seg.ken_burns.is_some()
@@ -3081,8 +3225,11 @@ fn atempo_chain(speed: f64) -> String {
         .join(",")
 }
 
-fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>) -> String {
+fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>, fit_frame: bool) -> String {
     let mut extra = String::new();
+    if let (true, Some(w), Some(h)) = (fit_frame, out_w, out_h) {
+        extra.push_str(&frame_fit_chain(w, h, is_still_image_path(&seg.source_path)));
+    }
     if seg.flip_horizontal.unwrap_or(false) {
         extra.push_str(",hflip");
     }
@@ -3487,13 +3634,37 @@ pub async fn export_trimmed_video(
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "mp4".to_string());
             let parent = base.parent().map(PathBuf::from).unwrap_or_default();
-            parent.join(format!("{} (edited).{}", stem, ext))
+            if ext.eq_ignore_ascii_case(crate::services::video_edits::VIDEO_PROJECT_EXTENSION) {
+                // A video project (made from images - see video_edits.rs) isn't itself a video, so
+                // its render is "<project name>.mp4", not "<name> (edited).briefvideo".
+                parent.join(format!("{}.mp4", stem))
+            } else {
+                parent.join(format!("{} (edited).{}", stem, ext))
+            }
         }
     };
 
+    // An image segment is a single still looped into a constant-rate stream long enough to cover
+    // its own [start,end) window - trim= below then cuts it exactly like a video segment.
     let mut inputs: Vec<InputSpec> = segments
         .iter()
-        .map(|s| InputSpec::plain(s.source_path.clone()))
+        .map(|s| {
+            if is_still_image_path(&s.source_path) {
+                InputSpec {
+                    path: s.source_path.clone(),
+                    pre_args: vec![
+                        "-loop".into(),
+                        "1".into(),
+                        "-framerate".into(),
+                        format!("{}", IMAGE_SEGMENT_FPS),
+                        "-t".into(),
+                        format!("{:.3}", s.end + 0.5),
+                    ],
+                }
+            } else {
+                InputSpec::plain(s.source_path.clone())
+            }
+        })
         .collect();
 
     // Written to temp files up front (ffmpeg needs real file paths, not data URLs) and cleaned up
@@ -3679,6 +3850,7 @@ pub async fn export_trimmed_video(
         };
         let audio_probe_handles: Vec<_> = unique_source_paths
             .iter()
+            .filter(|path| !is_still_image_path(path))
             .map(|path| {
                 let ffprobe_path = ffprobe_path.clone();
                 let path = path.clone();
@@ -3692,9 +3864,17 @@ pub async fn export_trimmed_video(
         let dimensions_probe_handle =
             if (video_width.is_none() || video_height.is_none()) && has_clip_effects {
                 let ffprobe_path = ffprobe_path.clone();
-                let first_source = segments[0].source_path.clone();
+                // A real video's size beats a photo's as the output frame - photos come in any
+                // size/orientation, and an odd dimension would also break yuv420p encoding.
+                let first_source = segments
+                    .iter()
+                    .find(|s| !is_still_image_path(&s.source_path))
+                    .unwrap_or(&segments[0])
+                    .source_path
+                    .clone();
                 Some(tauri::async_runtime::spawn_blocking(move || {
                     probe_video_dimensions(&ffprobe_path, &first_source)
+                        .map(|(w, h)| ((w / 2 * 2).max(2), (h / 2 * 2).max(2)))
                 }))
             } else {
                 None
@@ -3711,7 +3891,7 @@ pub async fn export_trimmed_video(
         }
         let segment_has_audio: Vec<bool> = segments
             .iter()
-            .map(|s| *has_audio_by_path.get(&s.source_path).unwrap_or(&true))
+            .map(|s| !is_still_image_path(&s.source_path) && *has_audio_by_path.get(&s.source_path).unwrap_or(&true))
             .collect();
 
         let (video_width, video_height): (Option<i64>, Option<i64>) = match dimensions_probe_handle
@@ -3722,12 +3902,24 @@ pub async fn export_trimmed_video(
             },
             None => (video_width, video_height),
         };
+        let has_image_segments = segments.iter().any(|s| is_still_image_path(&s.source_path));
+        // Image segments can't be concatenated without a concrete output frame to fit them into,
+        // so a timeline with images always has one - 1080p only if nothing else could say.
+        let (video_width, video_height) = match (video_width, video_height) {
+            (Some(w), Some(h)) => (Some(w), Some(h)),
+            _ if has_image_segments => (Some(1920), Some(1080)),
+            other => other,
+        };
+        // Every segment gets fitted to the output frame once sources can differ in size - an
+        // image anywhere, or clips from more than one file. A single-file timeline keeps its
+        // exact pre-existing filter graph.
+        let fit_frame = has_image_segments || unique_source_paths.len() > 1;
 
         // Base video (trim, or trim+concat) always lands in a [base] node so the overlay chain
         // below has one consistent label to start from regardless of how many segments there were.
         if segments.len() == 1 {
             let seg = &segments[0];
-            let extra = segment_effect_chain(seg, video_width, video_height);
+            let extra = segment_effect_chain(seg, video_width, video_height, fit_frame);
             let speed = segment_speed(seg);
             filter.push_str(&format!(
                 "[0:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{2:.4}{3}[base];",
@@ -3750,7 +3942,7 @@ pub async fn export_trimmed_video(
             // timeline with no transitions takes this exact path regardless of color/Ken Burns.
             let mut concat_inputs = String::new();
             for (i, seg) in segments.iter().enumerate() {
-                let extra = segment_effect_chain(seg, video_width, video_height);
+                let extra = segment_effect_chain(seg, video_width, video_height, fit_frame);
                 let speed = segment_speed(seg);
                 filter.push_str(&format!(
                     "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{4:.4}{3}[v{2}];",
@@ -3784,10 +3976,15 @@ pub async fn export_trimmed_video(
             // so every segment gets an explicit `fps=` up front, using the first segment's own
             // source file's frame rate as the shared target (screen recordings from this app are
             // effectively always one consistent rate throughout a session either way).
-            let target_fps = {
-                let ffprobe_path = ffprobe_path.clone();
-                let source_path = segments[0].source_path.clone();
-                blocking(move || probe_frame_rate(&ffprobe_path, &source_path)).await?
+            // The first VIDEO segment's rate - an image has no rate of its own to offer (ffprobe
+            // reports image2's arbitrary 25), so an all-image timeline uses IMAGE_SEGMENT_FPS.
+            let target_fps = match segments.iter().find(|s| !is_still_image_path(&s.source_path)) {
+                Some(seg) => {
+                    let ffprobe_path = ffprobe_path.clone();
+                    let source_path = seg.source_path.clone();
+                    blocking(move || probe_frame_rate(&ffprobe_path, &source_path)).await?
+                }
+                None => IMAGE_SEGMENT_FPS,
             };
 
             // `settb=AVTB` too: xfade also demands both inputs share one timebase, but a plain
@@ -3796,7 +3993,7 @@ pub async fn export_trimmed_video(
             // failed with "First input link main timebase ... do not match" (reproduced against
             // the bundled ffmpeg). Pinning every segment to AVTB makes all fold steps agree.
             for (i, seg) in segments.iter().enumerate() {
-                let extra = segment_effect_chain(seg, video_width, video_height);
+                let extra = segment_effect_chain(seg, video_width, video_height, fit_frame);
                 let speed = segment_speed(seg);
                 filter.push_str(&format!(
                     "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{5:.4}{3},fps={4:.3},settb=AVTB[v{2}];",
@@ -5101,7 +5298,7 @@ mod tests {
             width: 1.0,
             height: 1.0,
         });
-        let chain = segment_effect_chain(&seg, Some(1920), Some(1080));
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false);
         let hflip_pos = chain.find("hflip").expect("hflip missing");
         let color_pos = chain.find("eq=saturation").expect("color filter missing");
         let crop_pos = chain.find("crop=").expect("crop missing");
@@ -5126,7 +5323,7 @@ mod tests {
             target_x: None,
             target_y: None,
         });
-        let chain = segment_effect_chain(&seg, Some(1920), Some(1080));
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false);
         // Exactly one scale=1920:1080 (Ken Burns' own trailing one), not two.
         assert_eq!(chain.matches("scale=1920:1080").count(), 1);
     }
@@ -5134,7 +5331,7 @@ mod tests {
     #[test]
     fn segment_effect_chain_with_no_effects_is_empty() {
         assert_eq!(
-            segment_effect_chain(&base_segment(), Some(1920), Some(1080)),
+            segment_effect_chain(&base_segment(), Some(1920), Some(1080), false),
             ""
         );
     }
@@ -5416,5 +5613,51 @@ mod tests {
         assert_eq!(decoded.dimensions(), (16, 16));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- image clips -----------------------------------------------------------------------------
+
+    #[test]
+    fn still_image_paths_are_recognized_case_insensitively() {
+        assert!(is_still_image_path("C:/photos/IMG_0001.JPG"));
+        assert!(is_still_image_path("shot.png"));
+        assert!(is_still_image_path("scan.webp"));
+        assert!(!is_still_image_path("clip.mp4"));
+        assert!(!is_still_image_path("photo.heic"));
+        assert!(!is_still_image_path("My video.briefvideo"));
+    }
+
+    #[test]
+    fn image_segments_always_need_the_filter_graph() {
+        let seg = KeepSegment { source_path: "photo.jpg".to_string(), end: 5.0, ..base_segment() };
+        assert!(segment_needs_filter_graph(&seg));
+        assert!(!segment_needs_filter_graph(&base_segment()));
+    }
+
+    #[test]
+    fn frame_fit_letterboxes_before_any_clip_effect() {
+        let seg = KeepSegment { source_path: "photo.jpg".to_string(), flip_horizontal: Some(true), ..base_segment() };
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), true);
+        let fit = chain.find("pad=1920:1080").expect("pads to the output frame");
+        let flip = chain.find("hflip").expect("still applies the clip's own effects");
+        assert!(fit < flip, "fit must come first so effects see the output-sized frame: {chain}");
+        assert!(chain.contains("force_original_aspect_ratio=decrease"), "never stretches: {chain}");
+        assert!(chain.contains("format=yuv420p"), "images get converted to the encode format: {chain}");
+    }
+
+    #[test]
+    fn frame_fit_is_skipped_unless_requested() {
+        let seg = KeepSegment { source_path: "photo.jpg".to_string(), ..base_segment() };
+        assert_eq!(segment_effect_chain(&seg, Some(1920), Some(1080), false), "");
+        assert!(!frame_fit_chain(1280, 720, false).contains("format="), "videos keep their own pixel format");
+    }
+
+    #[test]
+    fn proxy_size_caps_the_long_edge_and_stays_even() {
+        assert_eq!(proxy_size(1920, 1080), (1920, 1080));
+        assert_eq!(proxy_size(3840, 2160), (1920, 1080));
+        assert_eq!(proxy_size(1080, 1920), (1080, 1920));
+        let (w, h) = proxy_size(4001, 3001);
+        assert!(w <= PROXY_MAX_EDGE && h <= PROXY_MAX_EDGE && w % 2 == 0 && h % 2 == 0);
     }
 }

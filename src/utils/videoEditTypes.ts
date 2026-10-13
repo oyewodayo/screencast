@@ -554,3 +554,66 @@ export function isVideoEditState(value: unknown): value is VideoEditState {
   const v = value as Record<string, unknown>;
   return typeof v.duration === "number" && Array.isArray(v.clips) && v.clips.every(isClip);
 }
+
+// ---- Image clips & video projects ----------------------------------------------------------
+//
+// A clip's sourcePath can also be a still image - the clip then shows that image for (end-start)
+// seconds. There's no "source length" to run out of, so an image clip's start is always 0 and its
+// end is however long it's been stretched, capped at IMAGE_CLIP_MAX_SECONDS (the length of the
+// preview proxy it plays through - see get_image_clip_proxy in conversion.rs). Every clip effect
+// still applies: Ken Burns, crop, flip, color grade and transitions are what turn a set of photos
+// into a slideshow. Mirrors is_still_image_path (conversion.rs); HEIC/HEIF are left out because
+// the bundled ffmpeg can't decode them reliably.
+export const IMAGE_CLIP_EXTENSIONS = ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif"];
+export const IMAGE_CLIP_MAX_SECONDS = 600;
+export const DEFAULT_IMAGE_CLIP_SECONDS = 5;
+
+export const isImageClipPath = (path: string): boolean =>
+  IMAGE_CLIP_EXTENSIONS.includes(path.split(".").pop()?.toLowerCase() ?? "");
+
+// A video project (services/video_edits.rs) - a timeline not attached to any one recording, made
+// from images or started empty. The file itself only records the frame size; its timeline is the
+// usual .edits.json sidecar next to it.
+export const VIDEO_PROJECT_EXTENSION = "briefvideo";
+export const isVideoProjectPath = (path: string): boolean => path.toLowerCase().endsWith(`.${VIDEO_PROJECT_EXTENSION}`);
+
+export interface VideoProjectFrame {
+  width: number;
+  height: number;
+}
+
+export interface NewProjectOptions {
+  // Seconds each image is shown for.
+  imageDuration: number;
+  // Ken Burns on every image clip, alternating zoom in/out so a slideshow doesn't feel mechanical.
+  kenBurns: boolean;
+  // Crossfade into every image after the first.
+  transition: TransitionType | null;
+}
+
+// Initial timeline for a new project - one clip per image, in the order given.
+export function createProjectState(imagePaths: string[], options: NewProjectOptions): VideoEditState {
+  const kenBurnsCycle: KenBurnsPreset[] = ["zoom-in", "zoom-out", "pan-right", "pan-left"];
+  const duration = Math.min(IMAGE_CLIP_MAX_SECONDS, Math.max(0.5, options.imageDuration));
+  return {
+    // A project has no primary media of its own (only the black canvas it previews on).
+    duration: 0,
+    clips: imagePaths.map((sourcePath, i) => ({
+      id: crypto.randomUUID(),
+      sourcePath,
+      start: 0,
+      end: duration,
+      ...(options.kenBurns ? { kenBurns: { preset: kenBurnsCycle[i % kenBurnsCycle.length], intensity: 0.5 } } : {}),
+      ...(options.transition && i > 0 ? { transitionIn: { type: options.transition, duration: Math.min(1, duration / 3) } } : {}),
+    })),
+    textOverlays: [],
+    imageOverlays: [],
+    blurOverlays: [],
+    audioOverlays: [],
+    pipOverlays: [],
+    videoAudioMuted: false,
+    videoAudioVolume: 1,
+    captions: null,
+    updatedAt: new Date().toISOString(),
+  };
+}
