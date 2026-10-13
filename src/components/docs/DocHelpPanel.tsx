@@ -1,12 +1,13 @@
 // components/docs/DocHelpPanel.tsx
 //
-// The "?" guide beside the document: how to write a two-column paper from scratch (the same
-// docs/two-column-papers.md the website shows), with a contents strip to jump between sections
-// and buttons that do the first steps for you.
+// The "?" guide beside the document: how to write a two-column paper from scratch, with a contents
+// strip to jump between sections and buttons that do the first steps for you. The text is the app's
+// own copy (guides/two-column-papers.md) - the same guide the website shows, kept in sync by hand;
+// docs/ itself isn't published with the source.
 import React, { useMemo, useRef } from "react";
 import { IoClose } from "react-icons/io5";
 import { TbColumns2, TbTypography } from "react-icons/tb";
-import guide from "../../../docs/two-column-papers.md?raw";
+import guide from "./guides/two-column-papers.md?raw";
 import DocHelpMarkdown, { parseBlocks, slugify } from "./DocHelpMarkdown";
 import "./docHelp.css";
 

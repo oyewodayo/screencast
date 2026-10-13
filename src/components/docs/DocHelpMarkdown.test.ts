@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import { parseBlocks, slugify } from "./DocHelpMarkdown";
 
-const guide = fs.readFileSync(path.resolve(__dirname, "../../../docs/two-column-papers.md"), "utf-8");
+const guide = fs.readFileSync(path.resolve(__dirname, "guides/two-column-papers.md"), "utf-8");
 
 describe("in-app guide", () => {
   const blocks = parseBlocks(guide);
