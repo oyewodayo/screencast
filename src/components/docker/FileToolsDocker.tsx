@@ -1,5 +1,6 @@
 // components/docker/FileToolsDocker.tsx
 import React, { useEffect, useState } from "react";
+import type { ReframePreview } from "../video/ReframePreviewLayer";
 import { invoke } from "@tauri-apps/api/core";
 import {
   IoFolderOpenOutline,
@@ -72,6 +73,7 @@ interface FileToolsDockerProps {
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  onReframePreviewChange?: (preview: ReframePreview | null) => void;
   // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
   // through to VideoTimelineDocker - see its own prop doc comment.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
@@ -128,6 +130,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onTimelineInsertHandled,
   onOutputTimeChange,
   onActiveClipChange,
+  onReframePreviewChange,
   noiseReductionStatus,
   onPreviewNoiseOriginal,
   selectedOverlayId,
@@ -172,6 +175,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onTimelineInsertHandled={onTimelineInsertHandled}
         onOutputTimeChange={onOutputTimeChange}
         onActiveClipChange={onActiveClipChange}
+        onReframePreviewChange={onReframePreviewChange}
         noiseReductionStatus={noiseReductionStatus}
         onPreviewNoiseOriginal={onPreviewNoiseOriginal}
         selectedOverlayId={selectedOverlayId}

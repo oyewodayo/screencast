@@ -5,6 +5,7 @@
 // script for export_trimmed_video to burn in with libass (conversion.rs). The live preview
 // (CaptionOverlayLayer.tsx) renders the very same lines with CSS built from the same preset
 // numbers, so what's shown over the video is what lands in the exported file.
+import { clipOutputDuration, sourceToOutputOffset } from "./clipTiming";
 import type { CSSProperties } from "react";
 import { CaptionSettings, CaptionStylePreset, CaptionTrack, CaptionWord, Clip } from "./videoEditTypes";
 
@@ -315,14 +316,14 @@ export function buildCaptionLines(clips: Clip[], track: CaptionTrack | null): Ca
   const lines: CaptionLine[] = [];
   let offset = 0;
   for (const clip of clips) {
-    const speed = clip.speed ?? 1;
     const words = track.transcripts[clip.sourcePath] ?? [];
     let current: CaptionLine | null = null;
     for (let i = 0; i < words.length; i++) {
       const w = words[i];
       if (w.end <= clip.start || w.start >= clip.end) continue;
-      const start = offset + (Math.max(w.start, clip.start) - clip.start) / speed;
-      const end = offset + (Math.min(w.end, clip.end) - clip.start) / speed;
+      // Through clipTiming so a speed-ramped clip's words land where the ramp puts them.
+      const start = offset + sourceToOutputOffset(clip, Math.max(w.start, clip.start));
+      const end = offset + sourceToOutputOffset(clip, Math.min(w.end, clip.end));
       const prev: CaptionLineWord | undefined = current?.words[current.words.length - 1];
       const breakBefore =
         !current ||
@@ -348,7 +349,7 @@ export function buildCaptionLines(clips: Clip[], track: CaptionTrack | null): Ca
       current!.lastWordIndex = i;
     }
     if (current) lines.push(current);
-    offset += Math.max(0, (clip.end - clip.start) / speed);
+    offset += clipOutputDuration(clip);
   }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];

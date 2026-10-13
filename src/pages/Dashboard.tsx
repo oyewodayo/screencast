@@ -38,10 +38,14 @@ import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
 import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
-import { VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
+import { Clip, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
 import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
+import { useGradeLut } from "../utils/gradeLuts";
+import { clipOutputDuration, sourceToOutputOffset } from "../utils/clipTiming";
+import { OverlayKeyframe, keyframeAt, keyframeStateAt, upsertKeyframe } from "../utils/keyframes";
 import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
+import ReframePreviewLayer, { type ReframePreview } from "../components/video/ReframePreviewLayer";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -554,7 +558,7 @@ const Dashboard = () => {
   // range spans. Fed to VideoOverlayLayer/PipOverlayLayer below so a freshly-placed overlay's own
   // default end time clamps against the timeline's REAL length instead of a stale, too-long value
   // that ignores every sped-up clip already on it.
-  const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + Math.max(0, (c.end - c.start) / (c.speed ?? 1)), 0);
+  const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + clipOutputDuration(c), 0);
   // Burned-in captions preview (CaptionOverlayLayer) - the same lines Save exports.
   const captionLines = useMemo(() => buildCaptionLines(editStore.clips, editStore.captions), [editStore.clips, editStore.captions]);
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
@@ -577,6 +581,27 @@ const Dashboard = () => {
   // in Dashboard state, passed to both the timeline docker and the sibling player" shape as
   // currentOutputTime just above.
   const [activeClipEffects, setActiveClipEffects] = useState<ActiveClipEffects | null>(null);
+  // The on-screen clip's color grade, baked for the player's WebGL layer (gradeLuts.ts).
+  const activeGradeLut = useGradeLut(activeClipEffects?.grade);
+  // Export's Fill window, shown on the player while the export options are open.
+  const [reframePreview, setReframePreview] = useState<ReframePreview | null>(null);
+
+  // Moving a keyframed overlay sets its keyframe at the playhead rather than its base x/y (which
+  // the keyframes have replaced): the move is added to where the keyframes put it there.
+  const keyframeAwarePatch = <P extends { x?: number; y?: number; keyframes?: OverlayKeyframe[] }>(
+    overlay: { x: number; y: number; startTime: number; endTime: number; keyframes?: OverlayKeyframe[] } | undefined,
+    patch: P
+  ): P => {
+    if (!overlay?.keyframes?.length || patch.keyframes !== undefined) return patch;
+    const dx = patch.x !== undefined ? patch.x - overlay.x : 0;
+    const dy = patch.y !== undefined ? patch.y - overlay.y : 0;
+    if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return patch;
+    const local = Math.max(0, Math.min(overlay.endTime - overlay.startTime, currentOutputTime - overlay.startTime));
+    const state = keyframeStateAt(overlay.keyframes, local)!;
+    const here = keyframeAt(overlay.keyframes, local);
+    const { x: _x, y: _y, ...rest } = patch;
+    return { ...rest, keyframes: upsertKeyframe(overlay.keyframes, { time: here?.time ?? local, easing: here?.easing ?? "ease", ...state, x: state.x + dx, y: state.y + dy }) } as P;
+  };
   // Live status of VideoPlayer's own noise-reduction Web Audio graph (see its
   // onNoiseReductionStatusChange prop) - relayed straight through to VideoTimelineDocker
   // (noiseReductionStatus) so NoiseReductionPopover can show it, same round-trip shape as
@@ -750,6 +775,22 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   );
   // Stable (TransitionPreviewLayer's animation loop restarts whenever it changes).
   const getPlayerPlaybackState = useCallback(() => videoPlayerRef.current?.getPlaybackState() ?? null, []);
+
+  // The exact output time right now - the on-screen clip's output start plus how far the player is
+  // into it, read from the <video> itself. For per-frame preview (keyframed overlays); the
+  // timeline's own currentOutputTime only updates a few times a second.
+  const outputTimingRef = useRef<{ clips: Clip[]; activeId: string | null }>({ clips: [], activeId: null });
+  outputTimingRef.current = { clips: editStore.clips, activeId: activeClipEffects?.id ?? null };
+  const getExactOutputTime = useCallback((): number | null => {
+    const playback = videoPlayerRef.current?.getPlaybackState();
+    const { clips, activeId } = outputTimingRef.current;
+    const index = clips.findIndex((c) => c.id === activeId);
+    if (!playback || index < 0) return null;
+    let start = 0;
+    for (let i = 0; i < index; i++) start += clipOutputDuration(clips[i]);
+    const clip = clips[index];
+    return start + sourceToOutputOffset(clip, Math.max(clip.start, Math.min(clip.end, playback.time)));
+  }, []);
   // Any clip's preview source as the player loads it - the primary file's already-resolved URL,
   // an image's proxy, or another video's asset URL (TransitionPreviewLayer compares this against
   // what the player actually has loaded).
@@ -4276,6 +4317,7 @@ const setScreen = () => {
                             getPlaybackState={getPlayerPlaybackState}
                             resolveClipUrl={resolveTimelineClipUrl}
                           />
+                          {reframePreview && <ReframePreviewLayer preview={reframePreview} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />}
                           <VideoOverlayLayer
                           frameRect={frameRect}
                           overlays={editStore.textOverlays}
@@ -4288,7 +4330,8 @@ const setScreen = () => {
                           isPlacingText={isPlacingText}
                           onPlacementConsumed={() => setIsPlacingText(false)}
                           onAddTextOverlay={editStore.addTextOverlay}
-                          onUpdateTextOverlayContent={editStore.updateTextOverlayContent}
+                          onUpdateTextOverlayContent={(id, patch) => editStore.updateTextOverlayContent(id, keyframeAwarePatch(editStore.textOverlays.find((o) => o.id === id), patch))}
+                          getOutputTime={getExactOutputTime}
                           onDeleteTextOverlay={editStore.deleteTextOverlay}
                           onDuplicateTextOverlay={(id) => setSelectedOverlayId(editStore.duplicateTextOverlay(id))}
                           onBringTextOverlayToFront={editStore.bringTextOverlayToFront}
@@ -4296,7 +4339,7 @@ const setScreen = () => {
                           isPlacingImage={isPlacingImage}
                           onPlacementImageConsumed={() => setIsPlacingImage(false)}
                           onAddImageOverlay={editStore.addImageOverlay}
-                          onUpdateImageOverlayContent={editStore.updateImageOverlayContent}
+                          onUpdateImageOverlayContent={(id, patch) => editStore.updateImageOverlayContent(id, keyframeAwarePatch(editStore.imageOverlays.find((o) => o.id === id), patch))}
                           onDeleteImageOverlay={editStore.deleteImageOverlay}
                           onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
                           onBringImageOverlayToFront={editStore.bringImageOverlayToFront}
@@ -4369,6 +4412,7 @@ const setScreen = () => {
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted}
                 activeClipEffects={activeClipEffects}
+                gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}
               />
             )
@@ -4631,6 +4675,7 @@ const setScreen = () => {
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         onOutputTimeChange={setCurrentOutputTime}
         onActiveClipChange={setActiveClipEffects}
+        onReframePreviewChange={setReframePreview}
         noiseReductionStatus={noiseReductionStatus}
         onPreviewNoiseOriginal={(bypass) => videoPlayerRef.current?.setNoisePreviewBypass(bypass)}
         selectedOverlayId={selectedOverlayId}

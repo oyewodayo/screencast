@@ -16,14 +16,15 @@
 // delete row) was pushed past the window and effectively invisible/unreachable. See
 // useClampedPopoverPosition for the fix - it measures the popover's real rendered size and nudges
 // it back on-screen after layout.
-import React, { useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import React, { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
 import { AudioOverlay } from "../../utils/videoEditTypes";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
 
-export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted">>;
+export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "bpm" | "beats">>;
 
 interface AudioOverlayPopoverProps {
   overlay: AudioOverlay;
@@ -31,10 +32,23 @@ interface AudioOverlayPopoverProps {
   onUpdate: (patch: AudioOverlayContentPatch) => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  // Beat sync - fit every image clip to this (and any other) track's beats.
+  hasImageClips: boolean;
+  onCutImagesOnBeat: (everyBeats: number) => void;
   onClose: () => void;
 }
 
-const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onDelete, onClose }) => {
+const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onDelete, hasImageClips, onCutImagesOnBeat, onClose }) => {
+  const [beatState, setBeatState] = useState<{ busy: boolean; error?: string }>({ busy: false });
+  const findBeats = () => {
+    setBeatState({ busy: true });
+    invoke<{ bpm: number; beats: number[] }>("detect_beats", { sourcePath: overlay.src })
+      .then((r) => {
+        onUpdate({ bpm: r.bpm, beats: r.beats });
+        setBeatState({ busy: false });
+      })
+      .catch((err) => setBeatState({ busy: false, error: String(err) }));
+  };
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
@@ -112,6 +126,51 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
         />
         <span className="text-white/60">sec</span>
       </label>
+
+      <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] uppercase tracking-wide text-white/40">Beats</span>
+          {overlay.beats ? (
+            <span className="text-[10px] tabular-nums text-amber-300/90">
+              {overlay.bpm} BPM · {overlay.beats.length} beats
+            </span>
+          ) : null}
+        </div>
+        {!overlay.beats ? (
+          <button
+            type="button"
+            disabled={beatState.busy}
+            onClick={findBeats}
+            title="Find the tempo and every beat - they show on the timeline, and dragging snaps to them"
+            className="self-start px-2 py-1 rounded text-[11px] text-white/80 bg-white/5 hover:bg-white/10 disabled:opacity-50"
+          >
+            {beatState.busy ? "Listening for the beat…" : "Find beats"}
+          </button>
+        ) : (
+          <div className="flex flex-col gap-1">
+            {hasImageClips && (
+              <div className="flex items-center gap-1 text-[11px]">
+                <span className="text-white/60 mr-1">Cut images on the beat:</span>
+                {[1, 2, 4].map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    onClick={() => onCutImagesOnBeat(n)}
+                    title={`Every image ends exactly ${n} beat${n === 1 ? "" : "s"} after it starts`}
+                    className="px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/15 text-white/80 tabular-nums"
+                  >
+                    {n === 1 ? "every beat" : `every ${n}`}
+                  </button>
+                ))}
+              </div>
+            )}
+            <button type="button" onClick={() => onUpdate({ beats: undefined, bpm: undefined })} className="self-start text-[10px] text-white/45 hover:text-white/80">
+              Hide beats
+            </button>
+          </div>
+        )}
+        {beatState.error && <p className="text-[10px] leading-snug text-red-300">{beatState.error}</p>}
+      </div>
 
       <div className="flex items-center justify-between pt-1 border-t border-white/10">
         <button

@@ -9,7 +9,6 @@
 import React, { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { IoClose, IoDocumentAttachOutline, IoRefresh, IoTrashOutline } from "react-icons/io5";
 import { MdClosedCaptionOff } from "react-icons/md";
@@ -19,6 +18,7 @@ import { CaptionSettings, CaptionTrack, CaptionWord } from "../../utils/videoEdi
 import { CaptionLine, cuesToCaptionWords, parseSubtitleFile } from "../../utils/captions";
 import { CAPTIONS_LANGUAGE_OPTIONS } from "../../utils/videoUtils";
 import { trackEvent } from "../../utils/telemetry";
+import { GenerationProgressBar, useTranscriptGeneration } from "../captions/useTranscriptGeneration";
 import { CaptionStyleControls, CaptionTranscript, Toggle, TranscriptOnlyButton, useTranscriptOnly } from "../captions/CaptionControls";
 
 interface CaptionsPanelProps {
@@ -59,8 +59,6 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
   const [language, setLanguage] = useState<string>(captions?.language ?? "auto");
-  const [generating, setGenerating] = useState<{ index: number; total: number; progress: number; downloadingModel: boolean } | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [transcriptOnly, setTranscriptOnly] = useTranscriptOnly();
 
   useEffect(() => {
@@ -76,25 +74,13 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
 
   const missingSources = sourcePaths.filter((p) => !captions?.transcripts[p]);
 
-  // An interrupted generation (app closed mid-way) keeps its finished pieces - generate_caption_words
-  // resumes from them. Shown on the button so "Generate" doesn't look like starting over.
-  const [resumable, setResumable] = useState<{ done: number; total: number } | null>(null);
-  useEffect(() => {
-    if (captions || generating) return;
-    let cancelled = false;
-    Promise.all(
-      sourcePaths.map((p) =>
-        invoke<{ done: number; total: number } | null>("caption_job_progress", { inputPath: p, language, words: true }).catch(() => null)
-      )
-    ).then((jobs) => {
-      if (cancelled) return;
-      const found = jobs.filter((j): j is { done: number; total: number } => !!j);
-      setResumable(found.length > 0 ? { done: found.reduce((a, j) => a + j.done, 0), total: found.reduce((a, j) => a + j.total, 0) } : null);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [captions, generating, sourcePaths, language]);
+  const { generate, generating, error, setError, resumable } = useTranscriptGeneration({
+    sourcePaths,
+    language,
+    hasTranscripts: !!captions,
+    onGenerated,
+    telemetryEvent: "editor_captions_generated",
+  });
   const [importTarget, setImportTarget] = useState<string>(primarySourcePath);
 
   // An existing .srt/.vtt, in place of (or replacing) a generated transcript for one source file.
@@ -116,38 +102,6 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
     } catch (err) {
       console.error("Caption import failed:", err);
       setError(`Couldn't import captions: ${err}`);
-    }
-  };
-
-  // Transcribes each file in turn (whisper already uses every core but one, so in parallel would
-  // only make each slower) and hands the whole batch to the store as one undoable step.
-  const generate = async (paths: string[], lang: string) => {
-    if (paths.length === 0 || generating) return;
-    setError(null);
-    setGenerating({ index: 0, total: paths.length, progress: 0, downloadingModel: false });
-    const unlisten = await listen<number>("captions-progress", (event) => {
-      setGenerating((g) => (g ? { ...g, progress: event.payload, downloadingModel: false } : g));
-    });
-    const unlistenModel = await listen<{ downloaded: number; total: number }>("whisper-model-download", (event) => {
-      const { downloaded, total } = event.payload;
-      setGenerating((g) => (g ? { ...g, downloadingModel: downloaded < total, progress: downloaded < total ? (downloaded / total) * 100 : 0 } : g));
-    });
-    try {
-      const transcripts: Record<string, CaptionWord[]> = {};
-      for (let i = 0; i < paths.length; i++) {
-        setGenerating((g) => (g ? { ...g, index: i, progress: 0 } : g));
-        // eslint-disable-next-line no-await-in-loop
-        transcripts[paths[i]] = await invoke<CaptionWord[]>("generate_caption_words", { inputPath: paths[i], language: lang });
-      }
-      onGenerated(lang, transcripts);
-      trackEvent("editor_captions_generated", { language: lang, files: paths.length });
-    } catch (err) {
-      console.error("Caption generation failed:", err);
-      setError(String(err));
-    } finally {
-      unlisten();
-      unlistenModel();
-      setGenerating(null);
     }
   };
 
@@ -198,23 +152,7 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
     </div>
   );
 
-  const progressBlock = generating && (
-    <div className="flex flex-col gap-1">
-      <div className="flex justify-between text-[10px] text-white/60">
-        <span>
-          {generating.downloadingModel
-            ? "Downloading speech model (one time)…"
-            : generating.total > 1
-              ? `Transcribing file ${generating.index + 1} of ${generating.total}…`
-              : "Transcribing…"}
-        </span>
-        <span className="tabular-nums">{Math.round(generating.progress)}%</span>
-      </div>
-      <div className="h-1 rounded-full bg-white/10 overflow-hidden">
-        <div className="h-full bg-blue-500 transition-[width]" style={{ width: `${generating.progress}%` }} />
-      </div>
-    </div>
-  );
+  const progressBlock = generating && <GenerationProgressBar generating={generating} />;
 
   const showTranscriptOnly = transcriptOnly && !!settings && lines.length > 0;
 

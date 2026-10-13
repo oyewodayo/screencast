@@ -23,6 +23,7 @@ import { IoChevronDown, IoChevronUp, IoClose, IoImageOutline, IoText } from "rea
 import { MdBlurOn } from "react-icons/md";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { OverlayKeyframe, keyframeStateAt } from "../../utils/keyframes";
 import { FrameRect } from "../../utils/videoFrameRect";
 import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
@@ -87,11 +88,13 @@ type TextOverlayContentPatch = Partial<
     | "height"
     | "fontSize"
     | "padding"
+    | "keyframes"
   >
 >;
 type ImageOverlayContentPatch = Partial<
   Pick<
     ImageOverlay,
+    | "keyframes"
     | "x"
     | "y"
     | "width"
@@ -246,6 +249,9 @@ interface EditingOverlayState {
 
 interface VideoOverlayLayerProps {
   frameRect: FrameRect;
+  // The exact output time right now, read from the player every animation frame - keyframed
+  // overlays move with it smoothly (currentOutputTime alone only updates a few times a second).
+  getOutputTime?: () => number | null;
   overlays: TextOverlay[];
   imageOverlays: ImageOverlay[];
   currentOutputTime: number;
@@ -660,6 +666,7 @@ const ToolbarOverflowMenu: React.FC<{ children: React.ReactNode }> = ({ children
 
 const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   frameRect,
+  getOutputTime,
   overlays,
   imageOverlays,
   currentOutputTime,
@@ -1399,6 +1406,42 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     }
   }, [editingOverlay, editingSession, commitEditingOverlay]);
 
+  // Keyframed motion, every animation frame: each keyframed overlay's box gets the offset, scale
+  // and fade its keyframes give at the player's exact current time (keyframes.ts - the same curve
+  // export builds). Uses the CSS `translate`/`scale` properties, separate from `transform`, so it
+  // composes with rotation and the entry animations without touching them. Kept on while dragging,
+  // so a keyframed box moves from where it's shown; the drop is then turned into a keyframe at the
+  // playhead (Dashboard's keyframeAwarePatch adds the drag's movement to the keyframed state).
+  const keyframedRef = useRef<{ id: string; x: number; y: number; startTime: number; keyframes: OverlayKeyframe[] }[]>([]);
+  keyframedRef.current = [...overlays, ...imageOverlays]
+    .filter((o) => o.keyframes && o.keyframes.length > 0)
+    .map((o) => ({ id: o.id, x: o.x, y: o.y, startTime: o.startTime, keyframes: o.keyframes! }));
+  const frameSizeRef = useRef({ w: frameRect.width, h: frameRect.height });
+  frameSizeRef.current = { w: frameRect.width, h: frameRect.height };
+  const currentOutputTimeRef = useRef(currentOutputTime);
+  currentOutputTimeRef.current = currentOutputTime;
+  const hasKeyframed = keyframedRef.current.length > 0;
+  useEffect(() => {
+    if (!hasKeyframed) return;
+    let raf = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const now = getOutputTime?.() ?? currentOutputTimeRef.current;
+      const { w, h } = frameSizeRef.current;
+      for (const o of keyframedRef.current) {
+        const el = document.querySelector<HTMLElement>(`[data-kf-overlay="${o.id}"]`);
+        if (!el) continue;
+        const state = keyframeStateAt(o.keyframes, now - o.startTime);
+        if (!state) continue;
+        el.style.translate = `${(state.x - o.x) * w}px ${(state.y - o.y) * h}px`;
+        el.style.scale = String(state.scale);
+        el.style.setProperty("--kf-opacity", String(state.opacity));
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [hasKeyframed, getOutputTime]);
+
   const activeImageOverlays = overlaysActiveAt(imageOverlays, currentOutputTime).map((o) => {
     if (imageDrag && o.id === imageDrag.id) return { ...o, x: imageDrag.liveX, y: imageDrag.liveY };
     if (imageResizeDrag && o.id === imageResizeDrag.id && frameRect.width > 0 && frameRect.height > 0) {
@@ -1642,13 +1685,15 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             onPointerCancel={endImageDrag}
             onContextMenu={openContextMenu("image", o.id)}
             title="Drag to move"
+            data-kf-overlay={o.keyframes?.length ? o.id : undefined}
             className={`absolute cursor-move outline outline-2 transition-colors ${isSelected ? "outline-dashed outline-white" : "outline-transparent hover:outline-white/40"}`}
             style={{
               left: o.x * frameRect.width,
               top: o.y * frameRect.height,
               width: o.width * frameRect.width,
               height: o.height * frameRect.height,
-              opacity: o.opacity * anim.opacity,
+              // --kf-opacity: keyframed fade, written every frame by the keyframe loop below.
+              opacity: o.keyframes?.length ? `calc(${o.opacity * anim.opacity} * var(--kf-opacity, 1))` : o.opacity * anim.opacity,
               borderRadius: radiusPx,
               // translate (slide animation) is listed before rotate so it applies in screen-space,
               // outside the image's own local rotation - see overlayAnimationStyle's own comment on
@@ -1761,6 +1806,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               key={o.id}
               onClick={() => selectTextOverlayExclusive(o.id)}
               onContextMenu={openContextMenu("text", o.id)}
+              data-kf-overlay={o.keyframes?.length ? o.id : undefined}
               className="absolute whitespace-pre-wrap break-words cursor-text outline outline-2 outline-transparent hover:outline-white/40 transition-colors"
               style={{
                 left: o.x * frameRect.width,
@@ -1771,7 +1817,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 padding: paddingPx,
                 textAlign: o.textAlign ?? "left",
                 pointerEvents: placingAnything ? "none" : "auto",
-                opacity: anim.opacity,
+                opacity: o.keyframes?.length ? `calc(${anim.opacity} * var(--kf-opacity, 1))` : anim.opacity,
                 transform:
                   [anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null, anim.scale !== 1 ? `scale(${anim.scale})` : null]
                     .filter(Boolean)
@@ -1908,6 +1954,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 endTime={editingOverlayData.endTime}
                 playhead={currentOutputTime}
                 onPlace={(x, y) => setEditingOverlay((prev) => (prev ? { ...prev, x, y } : prev))}
+                keyframes={editingOverlayData.keyframes}
+                onKeyframes={(keyframes) => onUpdateTextOverlayContent(editingOverlayData.id, { keyframes })}
                 onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("text", editingOverlayData.id, edge, time) : undefined}
                 onDuplicate={() => onDuplicateTextOverlay(editingOverlayData.id)}
                 onFront={() => onBringTextOverlayToFront(editingOverlayData.id)}
@@ -2102,6 +2150,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 endTime={o.endTime}
                 playhead={currentOutputTime}
                 onPlace={(x, y) => onUpdateImageOverlayContent(o.id, { x, y })}
+                keyframes={o.keyframes}
+                onKeyframes={(keyframes) => onUpdateImageOverlayContent(o.id, { keyframes })}
                 onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("image", o.id, edge, time) : undefined}
                 onDuplicate={() => onDuplicateImageOverlay(o.id)}
                 onFront={() => onBringImageOverlayToFront(o.id)}

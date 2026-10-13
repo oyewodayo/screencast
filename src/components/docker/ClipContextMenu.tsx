@@ -23,11 +23,14 @@ import {
   IoCheckmark,
   IoColorPaletteOutline,
   IoScanOutline,
+  IoPauseCircleOutline,
+  IoPlayBackOutline,
 } from "react-icons/io5";
 import { MdFlip } from "react-icons/md";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType } from "../../utils/videoEditTypes";
 import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
+import { clipOutputDuration } from "../../utils/clipTiming";
 
 export type ClipMoveTarget = "earlier" | "later" | "start" | "end";
 
@@ -45,6 +48,8 @@ interface ClipContextMenuProps {
   onSaveAs: () => void;
   onSplit: () => void;
   onDuplicate: () => void;
+  onFreezeFrame: () => void;
+  onToggleReverse: () => void;
   onMove: (target: ClipMoveTarget) => void;
   onSetTransition: (type: TransitionType | null) => void;
   onSetMotion: (preset: KenBurnsPreset | null) => void;
@@ -152,7 +157,7 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
   const transitionLabel = clip.transitionIn ? TRANSITION_PRESETS.find((p) => p.value === clip.transitionIn?.type)?.label ?? "On" : null;
   const motionLabel = clip.kenBurns ? KEN_BURNS_PRESETS.find((p) => p.value === clip.kenBurns?.preset)?.label ?? "On" : null;
   const colorLabel = clip.colorFilter && clip.colorFilter.preset !== "none" ? COLOR_FILTER_PRESETS.find((p) => p.value === clip.colorFilter?.preset)?.label ?? null : null;
-  const lengthSec = (clip.end - clip.start) / (clip.speed ?? 1);
+  const lengthSec = clipOutputDuration(clip);
 
   const renderSubmenu = () => {
     switch (openSubmenu) {
@@ -208,6 +213,24 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
       <button type="button" onClick={act(props.onDuplicate)} className={itemClass}>
         <IoCopyOutline size={14} /> Duplicate
       </button>
+      {!isImage && (
+        <>
+          <button
+            type="button"
+            disabled={!canSplit}
+            onClick={act(props.onFreezeFrame)}
+            className={itemClass}
+            title={canSplit ? "Hold the frame at the playhead for 2 seconds" : "Move the playhead inside this clip to freeze a frame there"}
+          >
+            <IoPauseCircleOutline size={14} /> Freeze frame at playhead
+          </button>
+          <button type="button" onClick={act(props.onToggleReverse)} className={itemClass} title="Play this clip backwards, picture and sound">
+            <IoPlayBackOutline size={14} />
+            <span className="flex-1">Reverse</span>
+            {clip.reversedFrom && <IoCheckmark size={12} className="text-teal-400" />}
+          </button>
+        </>
+      )}
       {submenuItem("move", <IoMoveOutline size={14} />, "Move", null, clipCount < 2)}
       <div className="my-1 border-t border-white/10" />
       {submenuItem("transition", <IoSwapHorizontalOutline size={14} />, "Transition in", index === 0 ? null : transitionLabel, index === 0)}

@@ -13,6 +13,7 @@ import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition
 import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
 import Slider from "./Slider";
 import NumberStepper from "./NumberStepper";
+import { ClipSpeedRamp, SPEED_RAMP_PRESETS, clipOutputDuration, clipSpeedSteps } from "../../utils/clipTiming";
 
 // Same range export_trimmed_video's own atempo_chain (conversion.rs) is built to handle cleanly -
 // see that function's own doc comment for why arbitrarily large factors aren't offered here.
@@ -31,10 +32,31 @@ interface SpeedPopoverProps {
   sourceDuration: number;
   anchor: { left: number; top: number };
   onUpdate: (speed: number | undefined) => void;
+  // Speed ramp - a curve on top of `speed` (clipTiming.ts).
+  ramp?: ClipSpeedRamp;
+  onRampChange: (ramp: ClipSpeedRamp | undefined) => void;
   onClose: () => void;
 }
 
-const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anchor, onUpdate, onClose }) => {
+const DEFAULT_RAMP_AMOUNT = 0.6;
+
+// The ramp's actual steps as a small bar graph (speed per step, 1x marked) - what plays, exactly.
+const RampGraph: React.FC<{ speed: number; ramp: ClipSpeedRamp }> = ({ speed, ramp }) => {
+  const steps = clipSpeedSteps({ start: 0, end: 1, speed, speedRamp: ramp });
+  const max = Math.max(1.5, ...steps.map((s) => s.speed));
+  const h = 36;
+  const y = (v: number) => h - (Math.log2(v / 0.25) / Math.log2(max / 0.25)) * (h - 2);
+  return (
+    <svg viewBox={`0 0 ${steps.length} ${h}`} preserveAspectRatio="none" className="w-full h-9 rounded bg-black/40" aria-hidden>
+      <line x1={0} x2={steps.length} y1={y(1)} y2={y(1)} stroke="rgba(255,255,255,0.25)" strokeWidth={0.6} vectorEffect="non-scaling-stroke" />
+      {steps.map((s, i) => (
+        <rect key={i} x={i + 0.1} width={0.8} y={y(s.speed)} height={h - y(s.speed)} fill={s.speed < 1 ? "rgba(96,165,250,0.8)" : "rgba(45,212,191,0.8)"} />
+      ))}
+    </svg>
+  );
+};
+
+const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anchor, onUpdate, ramp, onRampChange, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
@@ -113,6 +135,51 @@ const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anch
             onChange={setDuration}
           />
         </div>
+      </div>
+
+      <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
+        <span className="text-[10px] uppercase tracking-wide text-white/40">Speed ramp</span>
+        <div className="flex flex-wrap gap-1">
+          <button
+            type="button"
+            onClick={() => onRampChange(undefined)}
+            className={`px-2 py-1 rounded text-[11px] ${!ramp ? "text-blue-400 bg-blue-500/10 ring-1 ring-blue-400/40" : "text-white/70 hover:text-white hover:bg-white/10"}`}
+          >
+            None
+          </button>
+          {SPEED_RAMP_PRESETS.map((p) => (
+            <button
+              key={p.value}
+              type="button"
+              title={p.hint}
+              onClick={() => onRampChange({ preset: p.value, amount: ramp?.amount ?? DEFAULT_RAMP_AMOUNT })}
+              className={`px-2 py-1 rounded text-[11px] ${ramp?.preset === p.value ? "text-blue-400 bg-blue-500/10 ring-1 ring-blue-400/40" : "text-white/70 hover:text-white hover:bg-white/10"}`}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        {ramp && (
+          <>
+            <RampGraph speed={speed} ramp={ramp} />
+            <label className="flex items-center gap-2 text-[11px]">
+              <span className="w-12 shrink-0 text-white/60">Amount</span>
+              <input
+                type="range"
+                min={0.1}
+                max={1}
+                step={0.01}
+                value={ramp.amount}
+                onChange={(e) => onRampChange({ ...ramp, amount: Number(e.target.value) })}
+                className="flex-1 accent-blue-400"
+              />
+              <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(ramp.amount * 100)}%</span>
+            </label>
+            <p className="text-[10px] leading-snug text-white/45">
+              Now {clipOutputDuration({ start: 0, end: sourceDuration, speed, speedRamp: ramp }).toFixed(1)}s long. Plays live, exactly as it exports.
+            </p>
+          </>
+        )}
       </div>
     </div>,
     dockHost ?? document.body

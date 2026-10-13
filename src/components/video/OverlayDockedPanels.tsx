@@ -10,6 +10,7 @@
 // the text panel only exists while TextNoteEditor is open, and that editor commits and closes the
 // moment its textarea loses focus. The blur panel's X/Y/W/H fields are the one exception (real
 // inputs), safe there since a blur region has no editing session to end.
+import { KEYFRAME_EASINGS, KEYFRAME_SNAP_SEC, KeyframeEasing, OverlayKeyframe, keyframeAt, keyframeStateAt, removeKeyframeAt, upsertKeyframe } from "../../utils/keyframes";
 import React from "react";
 import {
   IoArrowDown,
@@ -310,7 +311,104 @@ interface CommonProps {
   onSetTime?: (edge: "start" | "end", time: number) => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  // Keyframed motion (keyframes.ts) - omitted where the overlay type doesn't support it.
+  keyframes?: OverlayKeyframe[];
+  onKeyframes?: (keyframes: OverlayKeyframe[] | undefined) => void;
 }
+
+// Position pad - for a keyframed overlay it shows and sets the keyframe at the playhead (its
+// position there), not the base x/y the keyframes have replaced.
+const KeyframeAwarePosition: React.FC<CommonProps> = (props) => {
+  const { keyframes, onKeyframes } = props;
+  if (!keyframes || keyframes.length === 0 || !onKeyframes) {
+    return <PositionSection x={props.x} y={props.y} width={props.width} height={props.height} onPlace={props.onPlace} />;
+  }
+  const local = Math.max(0, Math.min(props.endTime - props.startTime, props.playhead - props.startTime));
+  const state = keyframeStateAt(keyframes, local)!;
+  const here = keyframeAt(keyframes, local);
+  return (
+    <PositionSection
+      x={state.x}
+      y={state.y}
+      width={props.width}
+      height={props.height}
+      onPlace={(x, y) => onKeyframes(upsertKeyframe(keyframes, { time: here?.time ?? local, easing: here?.easing ?? "ease", ...state, x, y }))}
+    />
+  );
+};
+
+// Motion: keyframes for position, scale and opacity. "Add keyframe" captures the overlay as it is
+// at the playhead; once it has keyframes, moving it (drag or the position pad) - or the scale and
+// opacity sliders here - sets the keyframe at the playhead, creating one if there isn't one.
+const MotionSection: React.FC<CommonProps> = (props) => {
+  const { keyframes, onKeyframes } = props;
+  if (!onKeyframes) return null;
+  const local = Math.max(0, Math.min(props.endTime - props.startTime, props.playhead - props.startTime));
+  const inRange = props.playhead >= props.startTime && props.playhead <= props.endTime;
+  const state = keyframeStateAt(keyframes, local) ?? { x: props.x, y: props.y, scale: 1, opacity: 1 };
+  const here = keyframeAt(keyframes, local);
+  const setHere = (patch: Partial<OverlayKeyframe>) =>
+    onKeyframes(upsertKeyframe(keyframes, { time: local, easing: here?.easing ?? "ease", ...state, ...patch } as OverlayKeyframe));
+  const sorted = [...(keyframes ?? [])].sort((a, b) => a.time - b.time);
+  return (
+    <Section title="Motion">
+      {!keyframes || keyframes.length === 0 ? (
+        <div className="flex flex-col gap-1.5">
+          <p className="text-[11px] leading-snug text-white/50">
+            Animate position, size and fade: add a keyframe, move the playhead, then move or resize the overlay - it glides between them.
+          </p>
+          <button
+            type="button"
+            disabled={!inRange}
+            onClick={() => setHere({})}
+            title={inRange ? "Keyframe the overlay as it is right now" : "Move the playhead inside the overlay's time first"}
+            className="self-start px-2 py-1 rounded text-[11px] text-white/80 bg-white/5 hover:bg-white/10 disabled:opacity-40"
+          >
+            Add keyframe at playhead
+          </button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          <SliderRow label="Scale" value={Math.round(state.scale * 100)} min={10} max={400} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && setHere({ scale: v / 100 })} />
+          <SliderRow label="Opacity" value={Math.round(state.opacity * 100)} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && setHere({ opacity: v / 100 })} />
+          <div className="flex flex-col gap-0.5">
+            {sorted.map((k) => (
+              <div key={k.time} className={`flex items-center gap-1.5 text-[11px] px-1 rounded ${Math.abs(k.time - local) <= KEYFRAME_SNAP_SEC ? "bg-amber-500/15" : ""}`}>
+                <span className="text-amber-300">◆</span>
+                <span className="w-12 tabular-nums text-white/70">{k.time.toFixed(2)}s</span>
+                <select
+                  value={k.easing}
+                  onChange={(e) => onKeyframes(upsertKeyframe(keyframes, { ...k, easing: e.target.value as KeyframeEasing }))}
+                  title="How it moves from here to the next keyframe"
+                  className="flex-1 min-w-0 bg-white/10 rounded px-1 py-0.5 text-white outline-none"
+                >
+                  {KEYFRAME_EASINGS.map((e) => (
+                    <option key={e.value} value={e.value} className="bg-neutral-900">
+                      {e.label}
+                    </option>
+                  ))}
+                </select>
+                <button type="button" onClick={() => onKeyframes(removeKeyframeAt(keyframes, k.time))} title="Remove keyframe" className="px-1 text-white/40 hover:text-red-400">
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            {!here && inRange && (
+              <button type="button" onClick={() => setHere({})} className="px-2 py-1 rounded text-[11px] text-white/80 bg-white/5 hover:bg-white/10">
+                Add keyframe here
+              </button>
+            )}
+            <button type="button" onClick={() => onKeyframes(undefined)} className="ml-auto text-[10px] text-white/40 hover:text-white/80">
+              Remove motion
+            </button>
+          </div>
+        </div>
+      )}
+    </Section>
+  );
+};
 
 // ---------- text ----------
 
@@ -512,7 +610,8 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
       </Section>
 
       <AnimationSection value={props.animation} onChange={props.onAnimation} />
-      <PositionSection x={props.x} y={props.y} width={props.width} height={props.height} onPlace={props.onPlace} />
+      <MotionSection {...props} />
+      <KeyframeAwarePosition {...props} />
       <TimingSection start={props.startTime} end={props.endTime} playhead={props.playhead} onSet={props.onSetTime} />
       <ActionBar onDuplicate={props.onDuplicate} onFront={props.onFront} onBack={props.onBack} onDelete={props.onDelete} />
     </>
@@ -597,7 +696,8 @@ export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
     </Section>
 
     <AnimationSection value={props.animation} onChange={props.onAnimation} />
-    <PositionSection x={props.x} y={props.y} width={props.width} height={props.height} onPlace={props.onPlace} />
+    <MotionSection {...props} />
+    <KeyframeAwarePosition {...props} />
     <TimingSection start={props.startTime} end={props.endTime} playhead={props.playhead} onSet={props.onSetTime} />
     <ActionBar onDuplicate={props.onDuplicate} onFront={props.onFront} onBack={props.onBack} onDelete={props.onDelete} />
   </>

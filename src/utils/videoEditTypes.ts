@@ -10,6 +10,8 @@
 // deleting removes a clip from the array outright.
 
 import { TextAlign, TextColorRun, TextRange } from "./pdfAnnotationTypes";
+import type { ClipSpeedRamp } from "./clipTiming";
+import type { OverlayKeyframe } from "./keyframes";
 
 // A per-clip color grade, applied to that clip's own trimmed segment (both live preview -
 // VideoPlayer's CSS `filter`, see cssFilterForColorPreset in videoColorFilters.ts - and export
@@ -21,6 +23,22 @@ export type ColorFilterPreset = "none" | "vibrant" | "cinematic" | "bw" | "warm"
 export interface ClipColorFilter {
   preset: ColorFilterPreset;
   intensity: number; // 0..1, scales the preset's own strength from identity (0) to full (1)
+}
+
+// Manual color grading for one clip, plus an optional imported 3D LUT - all baked into a single
+// lookup table (colorGrade.ts) that both the preview's WebGL layer and export's ffmpeg `lut3d`
+// apply, so the two match exactly. Every slider is -1..1 except exposure (stops, -2..2); missing
+// or 0 means untouched. Applied on top of the clip's color preset (colorFilter), if it has one.
+export interface ClipGrade {
+  exposure?: number;
+  contrast?: number;
+  saturation?: number;
+  temperature?: number; // + warmer, - cooler
+  tint?: number; // + magenta, - green
+  highlights?: number;
+  shadows?: number;
+  // A .cube file from disk (camera log conversions, film looks), applied first, mixed by intensity.
+  lut?: { path: string; name: string; intensity: number };
 }
 
 // A simple, non-keyframed motion effect animated across THIS clip's own [start,end) source
@@ -36,10 +54,13 @@ export interface ClipKenBurns {
   // undefined means the frame's own center (0.5, 0.5), the pre-existing look. Ignored by
   // "pan-left"/"pan-right", which have their own fixed direction. Lets the "auto zoom on click"
   // tool (applyAutoZoomAtClicks, videoEditHandlers.ts) center a punch-in on where a click actually
-  // landed instead of the frame's middle - both preview (kenBurnsTransform, videoColorFilters.ts)
+  // landed instead of the frame's middle - both preview (kenBurnsWindow, videoColorFilters.ts)
   // and export (ken_burns_chain, conversion.rs) read this the same way a plain zoom does.
   targetX?: number;
   targetY?: number;
+  // The part of the move (0..1) this clip plays - a piece split out of a Ken Burns clip continues
+  // the move rather than restarting it. undefined = all of it.
+  span?: [number, number];
 }
 
 // A free-form crop window into this clip's own frame - independent x/y/width/height (fractions of
@@ -47,7 +68,7 @@ export interface ClipKenBurns {
 // strip off just the top (full width, shorter height) is representable. Since the cropped region's
 // own aspect generally won't match the export's fixed output resolution, both preview and export
 // STRETCH it to fill that resolution rather than letterboxing/padding - preview via a non-uniform
-// CSS scale+translate on the <video> element (see cropStaticTransform in videoColorFilters.ts),
+// CSS scale+translate on the <video> element (see clipFrameAffine in videoColorFilters.ts),
 // export via crop_chain's own trailing `scale=out_w:out_h` (conversion.rs), which stretches by
 // design (no force_original_aspect_ratio). All four undefined means uncropped (equivalent to
 // {x:0,y:0,width:1,height:1}).
@@ -96,6 +117,17 @@ export interface Clip {
   start: number;
   end: number;
   colorFilter?: ClipColorFilter;
+  grade?: ClipGrade;
+  // Camera-shake removal (two-pass vidstab at export, see stabilization_transforms in
+  // conversion.rs). Previewed by the clip viewer's "Preview stabilized" render, not live - it needs
+  // the whole clip analysed first. strength 0..1.
+  stabilize?: { strength: number };
+  // Set while the clip plays backwards: sourcePath/start/end then point at the reversed render
+  // (render_reversed_clip, conversion.rs) and this remembers the original range, for un-reversing.
+  reversedFrom?: { sourcePath: string; start: number; end: number };
+  // A speed curve across the clip, on top of `speed` - see clipTiming.ts, which every duration and
+  // time mapping goes through so preview, timeline, captions and export agree.
+  speedRamp?: ClipSpeedRamp;
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
   crop?: ClipCrop;
@@ -183,6 +215,9 @@ export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | 
 // top of it by VideoOverlayLayer, not by TextNoteEditor itself.
 export interface TextOverlay {
   id: string;
+  // Keyframed motion - position/scale/opacity over the overlay's life (keyframes.ts); when set,
+  // these drive where it is instead of x/y alone.
+  keyframes?: OverlayKeyframe[];
   text: string;
   color: string;
   backgroundColor?: string;
@@ -233,6 +268,9 @@ export interface TextOverlay {
 // point back at, so a data URL is their only option).
 export interface ImageOverlay {
   id: string;
+  // Keyframed motion - position/scale/opacity over the overlay's life (keyframes.ts); when set,
+  // these drive where it is instead of x/y alone.
+  keyframes?: OverlayKeyframe[];
   src: string;
   x: number;
   y: number;
@@ -321,6 +359,10 @@ export interface AudioOverlay {
   // replaces all of these rather than stacking a second copy on top - which would otherwise keep
   // playing the old Music/Voice underneath the new ones, hidden in lower lane rows.
   detached?: boolean;
+  // Beat sync: the track's tempo and beats (its own file's seconds), from detect_beats - drawn on
+  // the timeline, snapped to, and what "cut images on the beat" fits to (beatSync.ts).
+  bpm?: number;
+  beats?: number[];
   createdAt: number;
   updatedAt: number;
 }
@@ -433,6 +475,12 @@ export interface KeepSegment {
   speed?: number;
   noiseReduction?: number;
   audioCleanup?: AudioCleanup;
+  // The clip's grade baked to .cube text (gradeCubeForClip) - applied with ffmpeg's lut3d.
+  lutCube?: string;
+  stabilize?: { strength: number };
+  // A speed ramp's constant-speed steps (clipSpeedSteps); export renders them as one continuous
+  // time map (speed_steps, conversion.rs). When set, `speed` is ignored.
+  speedSteps?: { sourceStart: number; sourceEnd: number; speed: number }[];
 }
 
 export interface VideoEditState {
@@ -508,7 +556,8 @@ export interface VideoEditCommand {
     | "view-switch-cut"
     | "edit-track-audio"
     | "detach-audio"
-    | "edit-captions";
+    | "edit-captions"
+    | "edit-transcript";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {

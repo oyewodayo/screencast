@@ -5,7 +5,7 @@ import { CaptionLine, buildCaptionLines, buildCaptionsAss, defaultCaptionSetting
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, EditableFields, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
@@ -15,6 +15,10 @@ import {
   ViewSwitchEvent,
   bringOverlayToFront,
   deleteClipAt as deleteClipAtHandler,
+  cutClipRanges as cutClipRangesHandler,
+  insertFreezeFrame as insertFreezeFrameHandler,
+  reverseClip as reverseClipHandler,
+  unreverseClip as unreverseClipHandler,
   deleteOverlay,
   duplicateOverlay,
   duplicateTimedOverlay,
@@ -40,6 +44,19 @@ import {
   updateClip as updateClipHandler,
   updateOverlay,
 } from "../handlers/videoEditHandlers";
+import { gradeCubeForClip } from "../utils/gradeLuts";
+import { clipOutputDuration } from "../utils/clipTiming";
+import type { OverlayKeyframe } from "../utils/keyframes";
+
+interface ExportKeyframe {
+  time: number;
+  x: number;
+  y: number;
+  scale: number;
+  opacity: number;
+  easing: string;
+}
+import { beatOutputTimes, fitImageClipsToBeats } from "../utils/beatSync";
 import { blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderTextOverlayToPng } from "../utils/videoOverlayRender";
 const appWindow = getCurrentWebviewWindow()
 
@@ -50,6 +67,13 @@ interface ConversionProgressPayload {
   progress: number;
   status: "starting" | "processing" | "completed" | "failed";
   message: string;
+}
+
+// Each graded clip's baked LUT as .cube text, attached to its export segment - the same table the
+// preview's WebGL layer draws with (gradeLuts.ts), so the export grades exactly as previewed.
+async function withGradeLuts(segments: KeepSegment[], clips: Clip[]): Promise<KeepSegment[]> {
+  const cubes = await Promise.all(clips.map((clip) => gradeCubeForClip(clip.grade)));
+  return segments.map((segment, i) => (cubes[i] ? { ...segment, lutCube: cubes[i]! } : segment));
 }
 
 // ffprobe-backed duration lookup for a file that isn't the one this edit session belongs to (a
@@ -80,6 +104,13 @@ export type ExportQuality = "standard" | "high" | "small";
 export interface ExportOptions {
   quality?: ExportQuality;
   outputPath?: string;
+  // A platform format (Shorts/Reels, square...) and how the picture fits it - see OutputFrame in
+  // conversion.rs. Overlays and captions are drawn at this size when it's set.
+  // track: Fill following the subject - the crop window's centre over output time as
+  // [seconds, x, y] knots (reframeTrack.ts); replaces the anchor.
+  outputFrame?: { width: number; height: number; mode: "fit-blur" | "fit" | "fill"; anchorX?: number; anchorY?: number; track?: [number, number, number][] } | null;
+  // Loudness target in LUFS (-14 YouTube/Spotify, -16 podcasts); null/undefined = as mixed.
+  loudnessLufs?: number | null;
 }
 
 // export_trimmed_video's OverlayImage.animation accepts everything OverlayAnimation does except
@@ -94,15 +125,15 @@ function exportOverlayAnimation(animation: OverlayAnimation | undefined): string
 }
 
 type TextOverlayContentPatch = Partial<
-  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize">
+  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes">
 >;
 type ImageOverlayContentPatch = Partial<
-  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src">
+  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes">
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
-type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src">>;
+type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src" | "bpm" | "beats">>;
 type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -165,6 +196,7 @@ export interface UseVideoEditStoreResult {
   audioOverlays: AudioOverlay[];
   addAudioOverlay: (src: string, sourceDuration: number, startTime: number, endTime: number) => string;
   updateAudioOverlayContent: (id: string, patch: AudioOverlayContentPatch) => void;
+  cutImagesOnBeat: (everyBeats: number) => void;
   // Trims into the source (see resizeAudioOverlayTime in videoEditHandlers.ts) rather than just
   // retiming an empty box - the one meaningful behavioral difference from resizeTextOverlayTime/
   // resizeImageOverlayTime.
@@ -205,7 +237,8 @@ export interface UseVideoEditStoreResult {
   captions: CaptionTrack | null;
   // Adds/replaces word transcripts (keyed by source path), creating the track with default
   // settings the first time.
-  setCaptionTranscripts: (language: string, transcripts: Record<string, CaptionWord[]>) => void;
+  setCaptionTranscripts: (language: string, transcripts: Record<string, CaptionWord[]>, options?: { captionsEnabled?: boolean }) => void;
+  cutClipRanges: (cuts: { clipId: string; start: number; end: number }[]) => void;
   updateCaptionSettings: (patch: Partial<CaptionSettings>) => void;
   editCaptionLine: (line: CaptionLine, text: string) => void;
   clearCaptions: () => void;
@@ -221,6 +254,9 @@ export interface UseVideoEditStoreResult {
   deleteClipAt: (index: number) => void;
   reorderClip: (fromIndex: number, toIndex: number) => void;
   duplicateClip: (id: string) => void;
+  freezeFrame: (clipId: string, sourceTime: number, stillPath: string, seconds: number) => void;
+  // A reversed render's path to reverse the clip, or null to un-reverse it.
+  setClipReversed: (clipId: string, reversedPath: string | null) => void;
   resizeClipEdge: (id: string, edge: "start" | "end", time: number) => void;
   // Color grade / Ken Burns / crossfade-in, all three on one patch entry point - same "one
   // generic patch fn" shape as updateTextOverlayContent, just for a clip's own non-geometric
@@ -546,6 +582,33 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand, sourcePath]
   );
 
+  // Freeze frame / reverse (clip menu): the media they need is rendered by the caller first
+  // (extract_frame_still / render_reversed_clip), then applied here as one undo step each.
+  const freezeFrame = useCallback(
+    (clipId: string, sourceTime: number, stillPath: string, seconds: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = insertFreezeFrameHandler(current.clips, clipId, sourceTime, stillPath, seconds);
+      if (clips === current.clips) return;
+      registerSourceDuration(stillPath, IMAGE_CLIP_MAX_SECONDS);
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "insert");
+    },
+    [pushCommand, registerSourceDuration]
+  );
+  const setClipReversed = useCallback(
+    (clipId: string, reversedPath: string | null) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = reversedPath ? reverseClipHandler(current.clips, clipId, reversedPath) : unreverseClipHandler(current.clips, clipId);
+      if (reversedPath) {
+        const clip = current.clips.find((c) => c.id === clipId);
+        if (clip) registerSourceDuration(reversedPath, clip.end - clip.start);
+      }
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "edit-clip-effects");
+    },
+    [pushCommand, registerSourceDuration]
+  );
+
   // A copy of one clip, effects and all, placed right after it.
   const duplicateClip = useCallback(
     (id: string) => {
@@ -648,7 +711,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // comment, videoEditTypes.ts) - a sped-up clip plays back in LESS output time than its source
   // range spans, so summing raw source ranges here would over-clamp every overlay's own end time
   // against a timeline length longer than the real one.
-  const totalOutputDuration = (clips: Clip[]): number => clips.reduce((sum, c) => sum + Math.max(0, (c.end - c.start) / (c.speed ?? 1)), 0);
+  const totalOutputDuration = (clips: Clip[]): number => clips.reduce((sum, c) => sum + clipOutputDuration(c), 0);
 
   const addTextOverlay = useCallback(
     (x: number, y: number, width: number, fontSize: number, startTime: number, endTime: number): string => {
@@ -930,6 +993,19 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  // Beat sync: every image clip fitted to end `everyBeats` beats after it starts (beatSync.ts),
+  // against all music tracks' beats - one undo step.
+  const cutImagesOnBeat = useCallback(
+    (everyBeats: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = fitImageClipsToBeats(current.clips, beatOutputTimes(current.audioOverlays), everyBeats);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "trim");
+    },
+    [pushCommand]
+  );
+
   const resizeAudioOverlayTimeCb = useCallback(
     (id: string, edge: "start" | "end", time: number) => {
       const current = stateRef.current;
@@ -1073,16 +1149,33 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   );
 
   const setCaptionTranscripts = useCallback(
-    (language: string, transcripts: Record<string, CaptionWord[]>) => {
+    (language: string, transcripts: Record<string, CaptionWord[]>, options?: { captionsEnabled?: boolean }) => {
       const current = stateRef.current;
       if (!current) return;
       const existing = current.captions;
+      // A first transcript made just to edit by (the Transcript panel) leaves burned-in captions
+      // off until the user turns them on; an existing track keeps whatever it was set to.
+      const settings = existing?.settings ?? { ...defaultCaptionSettings(), enabled: options?.captionsEnabled ?? true };
       const captions: CaptionTrack = {
         language,
         transcripts: { ...(existing?.transcripts ?? {}), ...transcripts },
-        settings: existing?.settings ?? defaultCaptionSettings(),
+        settings,
       };
       pushCommand(snapshot(current, {}), snapshot(current, { captions }), "edit-captions");
+    },
+    [pushCommand]
+  );
+
+  // Edit by transcript (TranscriptEditorPanel): removes source ranges from specific clips as one
+  // undo step - see cutClipRanges (videoEditHandlers.ts) and transcriptEdit.ts for how word
+  // selections and pause tightening become these ranges.
+  const cutClipRanges = useCallback(
+    (cuts: { clipId: string; start: number; end: number }[]) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = cutClipRangesHandler(current.clips, cuts);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "edit-transcript");
     },
     [pushCommand]
   );
@@ -1197,25 +1290,41 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // decode) are just skipped rather than failing the whole export.
   const exportEdited = useCallback(
     async (
-      videoPixelSize: { width: number; height: number } | null,
+      timelinePixelSize: { width: number; height: number } | null,
       options?: ExportOptions
     ): Promise<{ path: string; name: string } | null> => {
       const current = stateRef.current;
       if (!sourcePath || !current || current.clips.length === 0) return null;
       setIsExporting(true);
       setExportError(null);
+      // Overlays, blur regions, picture-in-picture and captions are laid out on the FINAL frame -
+      // the platform format's when one is chosen (export fits the video into it first).
+      const videoPixelSize = options?.outputFrame ? { width: options.outputFrame.width, height: options.outputFrame.height } : timelinePixelSize;
       try {
-        const overlays: { dataBase64: string; x: number; y: number; startTime: number; endTime: number; animation: string }[] = [];
+        const overlays: { dataBase64: string; x: number; y: number; startTime: number; endTime: number; animation: string; keyframes?: ExportKeyframe[] }[] = [];
         if (videoPixelSize) {
           const { width: pxW, height: pxH } = videoPixelSize;
+          // Keyframes in the export's terms: absolute output seconds, and the rendered PNG's own
+          // top-left in pixels (offset from the overlay's x/y by however the renderer padded it).
+          const exportKeyframes = (o: { x: number; y: number; startTime: number; keyframes?: OverlayKeyframe[] }, xPx: number, yPx: number) =>
+            o.keyframes && o.keyframes.length > 0
+              ? o.keyframes.map((k) => ({
+                  time: o.startTime + k.time,
+                  x: xPx + (k.x - o.x) * pxW,
+                  y: yPx + (k.y - o.y) * pxH,
+                  scale: k.scale,
+                  opacity: k.opacity,
+                  easing: k.easing,
+                }))
+              : undefined;
           for (const o of current.textOverlays) {
             const rendered = renderTextOverlayToPng(o, pxW, pxH);
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation) });
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx) });
           }
           for (const o of current.imageOverlays) {
             // eslint-disable-next-line no-await-in-loop
             const rendered = await renderImageOverlayToPng(o, pxW, pxH);
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation) });
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx) });
           }
         }
 
@@ -1297,18 +1406,20 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
 
         const resultPath = await invoke<string>("export_trimmed_video", {
           outputBasePath: sourcePath,
-          segments: toKeepSegments(current.clips),
+          segments: await withGradeLuts(toKeepSegments(current.clips), current.clips),
           overlays,
           blurOverlays,
           audioOverlays,
           pipOverlays,
           audioMuted: current.videoAudioMuted,
           audioVolume: current.videoAudioVolume,
-          videoWidth: videoPixelSize?.width ?? null,
-          videoHeight: videoPixelSize?.height ?? null,
+          videoWidth: timelinePixelSize?.width ?? null,
+          videoHeight: timelinePixelSize?.height ?? null,
           quality: options?.quality ?? null,
           outputPath: options?.outputPath ?? null,
           captionsAss,
+          outputFrame: options?.outputFrame ?? null,
+          loudnessLufs: options?.loudnessLufs ?? null,
         });
         const name = resultPath.split(/[\\/]/).pop() ?? resultPath;
         return { path: resultPath, name };
@@ -1334,7 +1445,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         const resultPath = await invoke<string>("export_trimmed_video", {
           outputBasePath: sourcePath,
           // Alone, there's nothing for it to transition in from.
-          segments: toKeepSegments([{ ...clip, transitionIn: undefined }]),
+          segments: await withGradeLuts(toKeepSegments([{ ...clip, transitionIn: undefined }]), [clip]),
           overlays: [],
           blurOverlays: [],
           audioOverlays: [],
@@ -1346,6 +1457,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           quality: null,
           outputPath,
           captionsAss: null,
+          outputFrame: null,
+          loudnessLufs: null,
         });
         return { path: resultPath, name: resultPath.split(/[\\/]/).pop() ?? resultPath };
       } catch (err) {
@@ -1362,7 +1475,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   return {
     loading,
     exportClip,
+    cutImagesOnBeat,
     duplicateClip,
+    freezeFrame,
+    setClipReversed,
     clips: state?.clips ?? [],
     textOverlays: state?.textOverlays ?? [],
     imageOverlays: state?.imageOverlays ?? [],
@@ -1412,6 +1528,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     setVideoAudioVolume,
     captions: state?.captions ?? null,
     setCaptionTranscripts,
+    cutClipRanges,
     updateCaptionSettings,
     editCaptionLine,
     clearCaptions,

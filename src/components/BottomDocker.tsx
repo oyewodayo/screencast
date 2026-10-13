@@ -1,4 +1,5 @@
 import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
+import type { ReframePreview } from "./video/ReframePreviewLayer";
 import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
@@ -87,6 +88,7 @@ interface Props {
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  onReframePreviewChange?: (preview: ReframePreview | null) => void;
   // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
   // through to FileToolsDocker/VideoTimelineDocker - same shape as onActiveClipChange above, just
   // travelling player-to-timeline-docker instead of the other way.
@@ -236,6 +238,7 @@ const BottomDocker = ({
   onTimelineInsertHandled,
   onOutputTimeChange,
   onActiveClipChange,
+  onReframePreviewChange,
   noiseReductionStatus,
   onPreviewNoiseOriginal,
   selectedOverlayId,
@@ -676,6 +679,7 @@ const BottomDocker = ({
             onTimelineInsertHandled={onTimelineInsertHandled}
             onOutputTimeChange={onOutputTimeChange}
             onActiveClipChange={onActiveClipChange}
+            onReframePreviewChange={onReframePreviewChange}
             noiseReductionStatus={noiseReductionStatus}
             onPreviewNoiseOriginal={onPreviewNoiseOriginal}
             selectedOverlayId={selectedOverlayId}

@@ -5,12 +5,14 @@
 // main preview shows it. Loads the same preview source the player would (clipPreviewSource.ts),
 // so an image clip plays its letterboxed proxy rather than a bare picture. Leaves the timeline
 // and the main player alone - closing it puts you right back where you were.
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { clipOutputDuration, outputOffsetToSource, sourceToOutputOffset, speedAtSource } from "../../utils/clipTiming";
 import { createPortal } from "react-dom";
 import { IoClose, IoPause, IoPlay, IoRepeat } from "react-icons/io5";
 import { Clip, VideoProjectFrame, isImageClipPath } from "../../utils/videoEditTypes";
 import { clipFrameStyle } from "../../utils/videoColorFilters";
-import { FALLBACK_PREVIEW_FRAME, resolveClipPreviewUrl } from "../../utils/clipPreviewSource";
+import { FALLBACK_PREVIEW_FRAME, resolveAssetUrl, resolveClipPreviewUrl } from "../../utils/clipPreviewSource";
+import { invoke } from "@tauri-apps/api/core";
 
 interface ClipViewerModalProps {
   clip: Clip;
@@ -31,11 +33,20 @@ const ClipViewerModal: React.FC<ClipViewerModalProps> = ({ clip, index, clipCoun
   const videoRef = useRef<HTMLVideoElement>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // "Preview stabilized" - plays a stabilized render of just this clip's range instead of its
+  // source (stabilization can't preview live; see stabilized_clip_preview, conversion.rs). That
+  // render starts at 0, so the playable range shifts with it.
+  const [stabilized, setStabilized] = useState(false);
+  const [preparing, setPreparing] = useState(false);
+  const rangeStart = stabilized ? 0 : clip.start;
+  const rangeEnd = stabilized ? clip.end - clip.start : clip.end;
+  // The clip's timing in whichever file is playing (the stabilized render starts at 0).
+  const timing = useMemo(() => ({ start: rangeStart, end: rangeEnd, speed: clip.speed, speedRamp: clip.speedRamp }), [rangeStart, rangeEnd, clip.speed, clip.speedRamp]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [loop, setLoop] = useState(true);
   const [elapsed, setElapsed] = useState(0); // output seconds into the clip
   const speed = clip.speed ?? 1;
-  const duration = (clip.end - clip.start) / speed;
+  const duration = clipOutputDuration(clip);
   const stage = frame ?? FALLBACK_PREVIEW_FRAME;
   const name = clip.sourcePath.split(/[\\/]/).pop() ?? clip.sourcePath;
   const loopRef = useRef(loop);
@@ -43,13 +54,20 @@ const ClipViewerModal: React.FC<ClipViewerModalProps> = ({ clip, index, clipCoun
 
   useEffect(() => {
     let cancelled = false;
-    resolveClipPreviewUrl(clip.sourcePath, frame)
+    setUrl(null);
+    setError(null);
+    const load = stabilized && clip.stabilize
+      ? (setPreparing(true),
+        invoke<string>("stabilized_clip_preview", { sourcePath: clip.sourcePath, start: clip.start, end: clip.end, strength: clip.stabilize.strength }).then(resolveAssetUrl))
+      : resolveClipPreviewUrl(clip.sourcePath, frame);
+    load
       .then((resolved) => !cancelled && setUrl(resolved))
-      .catch((err) => !cancelled && setError(`Couldn't load this clip: ${err}`));
+      .catch((err) => !cancelled && setError(`Couldn't load this clip: ${err}`))
+      .finally(() => !cancelled && setPreparing(false));
     return () => {
       cancelled = true;
     };
-  }, [clip.sourcePath, frame]);
+  }, [clip.sourcePath, clip.start, clip.end, clip.stabilize?.strength, frame, stabilized]);
 
   // Keeps playback inside [start, end) and the clip's look in sync, every animation frame.
   useEffect(() => {
@@ -57,20 +75,22 @@ const ClipViewerModal: React.FC<ClipViewerModalProps> = ({ clip, index, clipCoun
     if (!video || !url) return;
     let raf = 0;
     const tick = () => {
-      if (video.currentTime >= clip.end || video.currentTime < clip.start - 0.05) {
-        video.currentTime = clip.start;
+      if (video.currentTime >= rangeEnd || video.currentTime < rangeStart - 0.05) {
+        video.currentTime = rangeStart;
         if (!loopRef.current) video.pause();
       }
-      const progress = (video.currentTime - clip.start) / Math.max(0.01, clip.end - clip.start);
+      const progress = (video.currentTime - rangeStart) / Math.max(0.01, rangeEnd - rangeStart);
       const look = clipFrameStyle(clip, progress);
       video.style.transform = look.transform;
       video.style.filter = look.filter;
-      setElapsed(Math.max(0, (video.currentTime - clip.start) / speed));
+      const rate = speedAtSource(timing, video.currentTime);
+      if (Math.abs(video.playbackRate - rate) > 1e-3) video.playbackRate = rate;
+      setElapsed(sourceToOutputOffset(timing, video.currentTime));
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [url, clip, speed]);
+  }, [url, clip, timing, rangeStart, rangeEnd]);
 
   const togglePlay = () => {
     const video = videoRef.current;
@@ -119,7 +139,7 @@ const ClipViewerModal: React.FC<ClipViewerModalProps> = ({ clip, index, clipCoun
                 autoPlay
                 playsInline
                 onLoadedMetadata={(e) => {
-                  e.currentTarget.currentTime = clip.start;
+                  e.currentTarget.currentTime = rangeStart;
                   e.currentTarget.playbackRate = speed;
                 }}
                 onPlay={() => setIsPlaying(true)}
@@ -128,7 +148,11 @@ const ClipViewerModal: React.FC<ClipViewerModalProps> = ({ clip, index, clipCoun
                 className="absolute inset-0 w-full h-full object-contain cursor-pointer"
               />
             )}
-            {!url && !error && <div className="absolute inset-0 flex items-center justify-center text-xs text-neutral-500">Loading…</div>}
+            {!url && !error && (
+              <div className="absolute inset-0 flex items-center justify-center text-xs text-neutral-500">
+                {preparing ? "Stabilizing this clip… (the first time takes about as long as the clip)" : "Loading…"}
+              </div>
+            )}
             {error && <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-xs text-red-300">{error}</div>}
           </div>
         </div>
@@ -145,7 +169,7 @@ const ClipViewerModal: React.FC<ClipViewerModalProps> = ({ clip, index, clipCoun
             value={Math.min(elapsed, duration)}
             onChange={(e) => {
               const video = videoRef.current;
-              if (video) video.currentTime = clip.start + Number(e.target.value) * speed;
+              if (video) video.currentTime = outputOffsetToSource(timing, Number(e.target.value));
             }}
             className="flex-1 accent-teal-400"
             aria-label="Position in clip"
@@ -153,6 +177,17 @@ const ClipViewerModal: React.FC<ClipViewerModalProps> = ({ clip, index, clipCoun
           <span className="text-[11px] tabular-nums text-neutral-400 w-[92px] text-right">
             {formatTime(elapsed)} / {formatTime(duration)}
           </span>
+          {clip.stabilize && (
+            <button
+              type="button"
+              onClick={() => setStabilized((v) => !v)}
+              aria-pressed={stabilized}
+              title={stabilized ? "Showing the stabilized version - click for the original" : "Preview the clip stabilized, as it will export"}
+              className={`px-2 py-1 rounded text-[11px] hover:bg-white/10 ${stabilized ? "text-teal-300 bg-teal-500/10" : "text-neutral-400"}`}
+            >
+              {stabilized ? "Stabilized" : "Preview stabilized"}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setLoop((v) => !v)}

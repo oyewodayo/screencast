@@ -14,12 +14,15 @@
 import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
-import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType } from "../../utils/videoEditTypes";
+import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
 import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
+import ColorGradeControls from "./ColorGradeControls";
 
-export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "flipHorizontal">>;
+export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "flipHorizontal">>;
+
+export const DEFAULT_STABILIZE_STRENGTH = 0.5;
 
 export const DEFAULT_COLOR_INTENSITY = 0.7;
 export const DEFAULT_KEN_BURNS_INTENSITY = 0.5;
@@ -28,6 +31,8 @@ export const DEFAULT_TRANSITION_DURATION = 0.5;
 interface ClipEffectsPopoverProps {
   clip: Clip;
   hasPrecedingClip: boolean;
+  // Whether this clip is the one in the preview right now (the grade's histogram reads the screen).
+  isOnScreen: boolean;
   anchor: { left: number; top: number };
   onUpdate: (patch: ClipEffectsPatch) => void;
   onClose: () => void;
@@ -47,7 +52,7 @@ const PresetButton: React.FC<{ active: boolean; onClick: () => void; children: R
   </button>
 );
 
-const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, anchor, onUpdate, onClose }) => {
+const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, isOnScreen, anchor, onUpdate, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
@@ -76,7 +81,8 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
   const kenBurnsPreset = clip.kenBurns?.preset ?? null;
   const kenBurnsIntensity = clip.kenBurns?.intensity ?? DEFAULT_KEN_BURNS_INTENSITY;
   const setKenBurnsPreset = (preset: KenBurnsPreset | null) => {
-    onUpdate({ kenBurns: preset ? { preset, intensity: kenBurnsIntensity } : undefined });
+    // A new move for this clip - keeps an auto-zoom's target, starts the move from its beginning.
+    onUpdate({ kenBurns: preset ? { preset, intensity: kenBurnsIntensity, targetX: clip.kenBurns?.targetX, targetY: clip.kenBurns?.targetY } : undefined });
   };
 
   const transitionType = clip.transitionIn?.type ?? null;
@@ -125,6 +131,44 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
         )}
       </div>
 
+      <div className="pt-1 border-t border-white/10">
+        <ColorGradeControls grade={clip.grade} onChange={(grade) => onUpdate({ grade })} isOnScreen={isOnScreen} />
+      </div>
+
+      {!isImageClipPath(clip.sourcePath) && (
+        <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
+          <span className="text-[10px] uppercase tracking-wide text-white/40">Stabilize</span>
+          <PresetRow>
+            <PresetButton active={!clip.stabilize} onClick={() => onUpdate({ stabilize: undefined })}>
+              Off
+            </PresetButton>
+            <PresetButton active={!!clip.stabilize} onClick={() => onUpdate({ stabilize: { strength: clip.stabilize?.strength ?? DEFAULT_STABILIZE_STRENGTH } })}>
+              Remove camera shake
+            </PresetButton>
+          </PresetRow>
+          {clip.stabilize && (
+            <>
+              <label className="flex items-center gap-2 text-[11px] pt-0.5">
+                <span className="w-12 shrink-0 text-white/60">Strength</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={clip.stabilize.strength}
+                  onChange={(e) => onUpdate({ stabilize: { strength: Number(e.target.value) } })}
+                  className="flex-1 accent-blue-400"
+                />
+                <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(clip.stabilize.strength * 100)}%</span>
+              </label>
+              <p className="text-[10px] leading-snug text-white/45">
+                Applied when you save. Stronger is steadier but crops in a little more. Right-click the clip and choose View clip to preview it stabilized.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
       <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
         <span className="text-[10px] uppercase tracking-wide text-white/40">Ken Burns</span>
         <PresetRow>
@@ -146,7 +190,7 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
               max={1}
               step={0.01}
               value={kenBurnsIntensity}
-              onChange={(e) => onUpdate({ kenBurns: { preset: kenBurnsPreset, intensity: Number(e.target.value) } })}
+              onChange={(e) => onUpdate({ kenBurns: { ...clip.kenBurns, preset: kenBurnsPreset, intensity: Number(e.target.value) } })}
               className="flex-1 accent-blue-400"
             />
             <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(kenBurnsIntensity * 100)}%</span>

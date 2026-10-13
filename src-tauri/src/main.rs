@@ -21,6 +21,8 @@ mod commands {
 }
 mod services {
     pub mod asset_download;
+    pub mod beat_detect;
+    pub mod subject_track;
     pub mod boards;
     pub mod citations;
     pub mod docs;
@@ -418,6 +420,11 @@ fn main() {
             commands::conversion::get_playable_preview,
             commands::conversion::get_image_clip_proxy,
             commands::conversion::get_video_canvas_proxy,
+            commands::conversion::stabilized_clip_preview,
+            commands::conversion::extract_frame_still,
+            commands::conversion::render_reversed_clip,
+            commands::conversion::detect_beats,
+            commands::conversion::analyze_subject_track,
             commands::conversion::batch_convert_to_mp4,
             commands::conversion::cancel_conversion,
             commands::conversion::get_conversion_info,

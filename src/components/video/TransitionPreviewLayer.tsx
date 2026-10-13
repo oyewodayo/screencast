@@ -22,6 +22,9 @@ import React, { useEffect, useRef, useState } from "react";
 import { FrameRect } from "../../utils/videoFrameRect";
 import { Clip, TransitionType } from "../../utils/videoEditTypes";
 import { clipFrameStyle } from "../../utils/videoColorFilters";
+import { hasGrade, sampleLut } from "../../utils/colorGrade";
+import { clipOutputDuration, sourceToOutputOffset } from "../../utils/clipTiming";
+import { bakedLutForGrade } from "../../utils/gradeLuts";
 
 interface TransitionPreviewLayerProps {
   frameRect: FrameRect;
@@ -36,7 +39,7 @@ interface TransitionPreviewLayerProps {
 
 // Same clamp as transition_fold_step: at most 90% of the clip it plays over.
 export function transitionDuration(clip: Clip): number {
-  const own = (clip.end - clip.start) / (clip.speed ?? 1);
+  const own = clipOutputDuration(clip);
   return Math.max(0.05, Math.min(clip.transitionIn?.duration ?? 0, own * 0.9));
 }
 
@@ -90,6 +93,40 @@ function captureFrame(url: string, time: number): Promise<HTMLCanvasElement> {
   return pending;
 }
 
+// The outgoing clip's last frame with its color grade applied - the frozen frame stands in for what
+// the player was showing, which (for a graded clip) was GradeCanvas's graded picture. Same baked
+// LUT, applied per pixel once per capture.
+const gradedFrameCache = new Map<string, Promise<HTMLCanvasElement>>();
+function gradedFrame(url: string, time: number, grade: Clip["grade"]): Promise<HTMLCanvasElement> {
+  if (!hasGrade(grade)) return captureFrame(url, time);
+  const key = `${url}|${time.toFixed(3)}|${JSON.stringify(grade)}`;
+  let pending = gradedFrameCache.get(key);
+  if (!pending) {
+    pending = Promise.all([captureFrame(url, time), bakedLutForGrade(grade)]).then(([raw, lut]) => {
+      if (!lut) return raw;
+      const canvas = document.createElement("canvas");
+      canvas.width = raw.width;
+      canvas.height = raw.height;
+      const ctx = canvas.getContext("2d")!;
+      ctx.drawImage(raw, 0, 0);
+      const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const px = image.data;
+      for (let i = 0; i < px.length; i += 4) {
+        const [r, g, b] = sampleLut(lut, px[i] / 255, px[i + 1] / 255, px[i + 2] / 255);
+        px[i] = r * 255;
+        px[i + 1] = g * 255;
+        px[i + 2] = b * 255;
+      }
+      ctx.putImageData(image, 0, 0);
+      return canvas;
+    });
+    pending.catch(() => gradedFrameCache.delete(key));
+    gradedFrameCache.set(key, pending);
+    if (gradedFrameCache.size > FRAME_CACHE_MAX) gradedFrameCache.delete(gradedFrameCache.keys().next().value!);
+  }
+  return pending;
+}
+
 // One frame before the outgoing clip's own end, in its source time.
 const lastFrameTime = (clip: Clip): number => Math.max(clip.start, clip.end - 1 / 30);
 
@@ -102,14 +139,14 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
 
   const [frame, setFrame] = useState<{ key: string; canvas: HTMLCanvasElement } | null>(null);
   const [incomingUrl, setIncomingUrl] = useState<{ clipId: string; url: string } | null>(null);
-  const frameKey = outgoing && incoming ? `${incoming.id}|${outgoing.sourcePath}|${lastFrameTime(outgoing)}` : null;
+  const frameKey = outgoing && incoming ? `${incoming.id}|${outgoing.sourcePath}|${lastFrameTime(outgoing)}|${JSON.stringify(outgoing.grade ?? null)}` : null;
 
   // Capture (or reuse) the frozen frame for the transition on screen now, and warm the one after.
   useEffect(() => {
     let cancelled = false;
     if (outgoing && incoming && frameKey) {
       resolveClipUrl(outgoing.sourcePath)
-        .then((url) => captureFrame(url, lastFrameTime(outgoing)))
+        .then((url) => gradedFrame(url, lastFrameTime(outgoing), outgoing.grade))
         .then((canvas) => !cancelled && setFrame({ key: frameKey, canvas }))
         .catch((err) => console.error("Transition preview: couldn't capture the outgoing frame", err));
       resolveClipUrl(incoming.sourcePath)
@@ -119,7 +156,7 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
     const current = activeIndex >= 0 ? clips[activeIndex] : undefined;
     if (current && hasTransition(clips[activeIndex + 1])) {
       resolveClipUrl(current.sourcePath)
-        .then((url) => captureFrame(url, lastFrameTime(current)))
+        .then((url) => gradedFrame(url, lastFrameTime(current), current.grade))
         .catch(() => {});
     }
     return () => {
@@ -157,7 +194,6 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
     if (!incoming || !readyCanvas || !root || !mover || !black) return;
     const type: TransitionType = incoming.transitionIn!.type;
     const duration = transitionDuration(incoming);
-    const speed = incoming.speed ?? 1;
     const expectedUrl = incomingUrl?.clipId === incoming.id ? incomingUrl.url : null;
     const { left: L, top: T, width: W, height: H } = frameRect;
     const R = containerW - L - W;
@@ -248,7 +284,7 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
       if (state) {
         // Not swapped to the incoming clip yet (or no frame decoded) - hold the frozen frame.
         if (!expectedUrl || state.src !== expectedUrl || !state.hasFrame) progress = 0;
-        else progress = (state.time - incoming.start) / speed / duration;
+        else progress = sourceToOutputOffset(incoming, state.time) / duration;
       }
       if (progress === null || progress >= 1 || progress < -0.05) show(false);
       else {
@@ -262,8 +298,9 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
   }, [incoming, readyCanvas, incomingUrl, frameRect.left, frameRect.top, frameRect.width, frameRect.height, containerW, containerH, getPlaybackState]);
 
   if (!incoming || !outgoing || !readyCanvas) return null;
-  const look = clipFrameStyle(outgoing, 1);
   const { left: L, top: T, width: W, height: H } = frameRect;
+  // The transformed box is the whole <video> box, centred on the frame - offsets in frame px.
+  const look = clipFrameStyle(outgoing, 1, { width: W, height: H });
   return (
     <div
       ref={rootRef}

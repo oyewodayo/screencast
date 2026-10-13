@@ -31,11 +31,14 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
-import { ActiveClipEffects, cropStaticTransform, cssFilterForColorPreset, kenBurnsTransform } from '../utils/videoColorFilters';
+import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, playerFraming } from '../utils/videoColorFilters';
 import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
 import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile } from '../utils/captions';
 import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
 import CaptionOverlayLayer from './video/CaptionOverlayLayer';
+import GradeCanvas from './video/GradeCanvas';
+import { speedAtSource } from '../utils/clipTiming';
+import type { Lut3D } from '../utils/colorGrade';
 import { PlayerCaptionsPanel, PlayerChaptersPanel } from './video/PlayerSidePanels';
 import { useToolPanelHost } from './docker/ToolPanelHost';
 import { loadRnnoise, RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
@@ -200,6 +203,9 @@ interface VideoPlayerProps {
   // unaware otherwise, just applying whatever small descriptor it's handed straight to the
   // <video> element's own CSS.
   activeClipEffects?: ActiveClipEffects | null;
+  // The active clip's color grade, baked to a 3D LUT (colorGrade.ts) - shown through GradeCanvas's
+  // WebGL layer. null/undefined = no grade, the video shows directly.
+  gradeLut?: Lut3D | null;
   // Live status of the noise-reduction Web Audio graph below - "calibrating" while the worklet
   // module is loading and/or its noise profile is being learned, "active" once real subtraction
   // is running, "idle" whenever activeClipEffects?.noiseReduction is unset/0 (including before
@@ -290,7 +296,7 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -447,23 +453,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const effects = activeClipEffectsRef.current;
     const crop = liveCropOverrideRef.current ?? effects?.crop;
     const kb = effects?.kenBurns;
-    // Mirrors the raw frame first (rightmost/innermost - see cropStaticTransform's own comment on
-    // CSS transform composition order), matching conversion.rs's segment_effect_chain, which runs
-    // `hflip` before crop/Ken Burns so crop/pan coordinates describe the already-mirrored frame the
-    // same way in both preview and export.
-    const flipTransform = effects?.flipHorizontal ? 'scaleX(-1)' : '';
-    if (!crop && !kb) {
-      video.style.transform = flipTransform;
-      return;
-    }
-    const cropTransform = crop ? cropStaticTransform(crop) : '';
-    if (!kb) {
-      video.style.transform = `${cropTransform} ${flipTransform}`.trim();
-      return;
-    }
-    const duration = Math.max(0.01, effects!.sourceEnd - effects!.sourceStart);
-    const progress = Math.max(0, Math.min(1, (video.currentTime - effects!.sourceStart) / duration));
-    video.style.transform = `${cropTransform} ${kenBurnsTransform(kb, progress)} ${flipTransform}`.trim();
+    const progress = kb && effects
+      ? (video.currentTime - effects.sourceStart) / Math.max(0.01, effects.sourceEnd - effects.sourceStart)
+      : 0;
+    // Export's exact framing: fitted into the project frame, then flip -> crop -> Ken Burns
+    // (clipFrameAffine), clipped to the frame (playerFraming).
+    const m = clipFrameAffine({ crop, kenBurns: kb, flipHorizontal: effects?.flipHorizontal }, progress);
+    const framing = playerFraming(
+      m,
+      { width: video.clientWidth, height: video.clientHeight },
+      { width: video.videoWidth, height: video.videoHeight },
+      effects?.frame ?? null
+    );
+    video.style.transformOrigin = framing.transform ? '0 0' : '';
+    video.style.transform = framing.transform;
+    video.style.clipPath = framing.clipPath;
   };
 
   useImperativeHandle(ref, () => ({
@@ -1159,12 +1163,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => observer.disconnect();
   }, []);
 
+  // The project frame when editing (every clip is fitted into it, as export does), else the file's.
+  const frameSize = activeClipEffects?.frame ?? videoIntrinsicSize;
   const frameRect = useMemo(
     () =>
-      containerSize && videoIntrinsicSize
-        ? computeLetterboxRect(containerSize.width, containerSize.height, videoIntrinsicSize.width, videoIntrinsicSize.height)
+      containerSize && frameSize
+        ? computeLetterboxRect(containerSize.width, containerSize.height, frameSize.width, frameSize.height)
         : null,
-    [containerSize, videoIntrinsicSize]
+    [containerSize, frameSize?.width, frameSize?.height]
   );
 
   // Some containers/codecs this app can record (most notably .avi - WebView2's <video> element
@@ -1580,8 +1586,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    video.playbackRate = activeClipEffects?.speed ?? 1;
-  }, [activeClipEffects?.speed]);
+    const fx = activeClipEffects;
+    video.playbackRate = fx?.speed ?? 1;
+    if (!fx?.speedRamp) return;
+    // A speed ramp: follow its constant-speed steps (clipTiming.ts) - the same steps export renders
+    // - switching rate as playback crosses each step's start.
+    const clip = { start: fx.sourceStart, end: fx.sourceEnd, speed: fx.speed, speedRamp: fx.speedRamp };
+    let raf = 0;
+    const tick = () => {
+      const rate = speedAtSource(clip, video.currentTime);
+      if (Math.abs(video.playbackRate - rate) > 1e-3) video.playbackRate = rate;
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [activeClipEffects?.speed, activeClipEffects?.speedRamp, activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd]);
 
   // Live audio-cleanup preview - wires this <video> element's audio through the graph described at
   // noiseGraphRef the first time any clip turns any cleanup on, then just retunes it for whichever
@@ -1762,36 +1781,35 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioEffects?.id, audioEffects?.noiseReduction, audioEffects?.sourcePath, audioCleanupKey]);
 
-  // Live-preview crop + Ken Burns, combined into the one thing that's ever allowed to write
-  // video.style.transform (two separate effects each writing it independently would race and
-  // clobber each other) - applyCropAndKenBurns above does the actual writing, reusable here AND
-  // from previewCropLive's own drag-move hot path. Crop is a static "zoom window"
-  // (cropStaticTransform) composed BEFORE Ken Burns' own scale/translate - same order crop_chain
-  // runs before ken_burns_chain on the export side (conversion.rs), so Ken Burns zooms/pans within
-  // the already-cropped window rather than the original uncropped frame. Ken Burns still needs its
-  // own rAF loop reading video.currentTime directly (the 'timeupdate' event fires far too coarsely,
-  // ~4x/sec, for a smooth zoom/pan) - a crop with no Ken Burns is static and just gets written
-  // once, no rAF needed. Safe to transform the <video> element itself: it fills its container at
-  // 100%/100% with object-fit:contain handling the letterboxing, so scaling/translating the element
-  // scales/pans/zooms the picture uniformly around its own center exactly like these effects should.
+  // Live-preview framing (flip, crop, Ken Burns) - applyCropAndKenBurns is the one thing that ever
+  // writes video.style.transform/clipPath. Static framing is rewritten whenever the element or the
+  // picture changes size (its offsets are in px); Ken Burns also needs every animation frame, read
+  // off video.currentTime ('timeupdate' is ~4x/sec - far too coarse for a smooth move).
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     applyCropAndKenBurns();
-    const kb = activeClipEffects?.kenBurns;
-    if (!kb) return;
-    let raf: number;
-    const tick = () => {
-      applyCropAndKenBurns();
+    const resize = new ResizeObserver(() => applyCropAndKenBurns());
+    resize.observe(video);
+    video.addEventListener('loadedmetadata', applyCropAndKenBurns);
+    let raf = 0;
+    if (activeClipEffects?.kenBurns) {
+      const tick = () => {
+        applyCropAndKenBurns();
+        raf = requestAnimationFrame(tick);
+      };
       raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
+    }
     return () => {
       cancelAnimationFrame(raf);
+      resize.disconnect();
+      video.removeEventListener('loadedmetadata', applyCropAndKenBurns);
       video.style.transform = '';
+      video.style.transformOrigin = '';
+      video.style.clipPath = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal]);
+  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal, activeClipEffects?.frame?.width, activeClipEffects?.frame?.height]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);
@@ -2714,6 +2732,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							/>
 						)}
 					</video>
+					{/* WebGL color-grade layer - only present while the clip on screen has a grade. */}
+					<GradeCanvas videoRef={videoRef} lut={gradeLut} />
 					{captionsVisible && playerCaptionLines.length > 0 && frameRect ? (
 						<div
 							className="absolute pointer-events-none"

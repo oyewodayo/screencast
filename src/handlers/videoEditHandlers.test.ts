@@ -5,6 +5,9 @@
 // unchanged; if one of these breaks, the app's actual editing behavior changed, not just plumbing.
 import { describe, expect, it } from "vitest";
 import {
+  insertFreezeFrame,
+  reverseClip,
+  unreverseClip,
   isDetachedAudioOverlay,
   packAudioRows,
   applyAutoZoomAtClicks,
@@ -607,5 +610,41 @@ describe("isDetachedAudioOverlay", () => {
 
   it("leaves user-added music alone", () => {
     expect(isDetachedAudioOverlay(base)).toBe(false);
+  });
+});
+
+describe("freeze frame and reverse", () => {
+  const base = (): Clip[] => [{ id: "a", sourcePath: "v.mp4", start: 2, end: 10, speed: 1.5, transitionIn: { type: "fade", duration: 1 } }];
+
+  it("splits the clip at the frame and puts the still between the halves", () => {
+    const clips = insertFreezeFrame(base(), "a", 5, "still.png", 2);
+    expect(clips.map((c) => [c.sourcePath, c.start, c.end])).toEqual([
+      ["v.mp4", 2, 5],
+      ["still.png", 0, 2],
+      ["v.mp4", 5, 10],
+    ]);
+    expect(clips[0].transitionIn).toBeDefined();
+    expect(clips[2].transitionIn).toBeUndefined();
+    expect(clips[2].speed).toBe(1.5);
+  });
+
+  it("puts the still before or after the clip at its very edges", () => {
+    expect(insertFreezeFrame(base(), "a", 2, "s.png", 2).map((c) => c.sourcePath)).toEqual(["s.png", "v.mp4"]);
+    expect(insertFreezeFrame(base(), "a", 10, "s.png", 2).map((c) => c.sourcePath)).toEqual(["v.mp4", "s.png"]);
+  });
+
+  it("reverses to the rendered file and back, keeping the clip's settings", () => {
+    const reversed = reverseClip(base(), "a", "rev.mp4");
+    expect(reversed[0]).toMatchObject({ sourcePath: "rev.mp4", start: 0, end: 8, speed: 1.5, reversedFrom: { sourcePath: "v.mp4", start: 2, end: 10 } });
+    const restored = unreverseClip(reversed, "a");
+    expect(restored[0]).toMatchObject({ sourcePath: "v.mp4", start: 2, end: 10, speed: 1.5 });
+    expect(restored[0].reversedFrom).toBeUndefined();
+  });
+
+  it("un-reverses just the part of the render a trimmed or split piece covers", () => {
+    const reversed = reverseClip(base(), "a", "rev.mp4");
+    // Render times 0..3 are the LAST three seconds of the original (7..10).
+    const piece = [{ ...reversed[0], start: 0, end: 3 }];
+    expect(unreverseClip(piece, "a")[0]).toMatchObject({ sourcePath: "v.mp4", start: 7, end: 10 });
   });
 });
