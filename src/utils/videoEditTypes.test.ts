@@ -4,10 +4,10 @@ import { describe, expect, it } from "vitest";
 import { IMAGE_CLIP_MAX_SECONDS, createProjectState, isImageClipPath, isVideoEditState, isVideoProjectPath } from "./videoEditTypes";
 
 describe("isImageClipPath / isVideoProjectPath", () => {
-  it("recognizes still images case-insensitively, but not HEIC or video", () => {
+  it("recognizes still images case-insensitively (HEIC included), but not video", () => {
     expect(isImageClipPath("C:\\photos\\IMG_1.JPG")).toBe(true);
     expect(isImageClipPath("scan.webp")).toBe(true);
-    expect(isImageClipPath("photo.heic")).toBe(false);
+    expect(isImageClipPath("IMG_0042.HEIC")).toBe(true);
     expect(isImageClipPath("clip.mp4")).toBe(false);
   });
 

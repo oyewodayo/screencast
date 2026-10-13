@@ -49,7 +49,10 @@ import { buildViewSwitchOverlays, overlaysActiveAt, packAudioRows, resizeAudioOv
 import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import AudioOverlayPopover from "./AudioOverlayPopover";
-import ClipEffectsPopover from "./ClipEffectsPopover";
+import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION } from "./ClipEffectsPopover";
+import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
+import ClipViewerModal from "./ClipViewerModal";
+import { transitionDuration } from "../video/TransitionPreviewLayer";
 import SpeedPopover from "./SpeedPopover";
 import NoiseReductionPopover from "./NoiseReductionPopover";
 import ExtractAudioPopover, { DetachMode, SeparationEngineStatus } from "./ExtractAudioPopover";
@@ -218,6 +221,19 @@ const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heig
 };
 
 const IMAGE_CLIP_TOOL_HINT = "Not available for image clips";
+
+// A fixed-position menu kept fully inside the window - the track's "..." menu opens from a button
+// near the bottom of the screen, where opening straight down used to cut most of it off.
+const ViewportClampedMenu: React.FC<{ anchor: PopoverAnchor; className: string; children: React.ReactNode }> = ({ anchor, className, children }) => {
+  const { ref, position } = useClampedPopoverPosition(anchor);
+  return (
+    <div ref={ref} className={`fixed ${className}`} style={{ top: position.top, left: position.left }}>
+      {children}
+    </div>
+  );
+};
+// Space kept past the last clip for the "+" add button (36px wide, 10px from the clip).
+const ADD_BUTTON_ROOM_PX = 56;
 
 // An image clip's filmstrip - the same picture on every tile, from the gallery's own cached
 // thumbnail (get_image_thumbnail) rather than a full-resolution photo decode per tile. The primary
@@ -1480,6 +1496,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
 
   const handleScrubPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return; // right-click opens menus, it doesn't move the playhead
     e.currentTarget.setPointerCapture(e.pointerId);
     setSelectedClipId(null);
     seekToOutputTime(outputTimeFromClientX(e.clientX));
@@ -1578,6 +1595,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
 
   const handleClipPointerDown = (clip: Clip, index: number) => (e: React.PointerEvent) => {
+    // Right button: the clip menu (onContextMenu) - not a drag, a razor cut or a scrub.
+    if (e.button === 2) {
+      e.stopPropagation();
+      return;
+    }
     if (toolMode === "razor") {
       handleRazorClipPointerDown(e);
       return;
@@ -2089,6 +2111,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // this panel and force-seeked an already-playing video back to the start each time.
   useEffect(() => {
     const first = baseClips[0];
+    // A project emptied of every clip goes back to its blank canvas (its primary file) rather
+    // than leaving the deleted clip's picture on screen - and forgets the old first clip, so
+    // bringing it back (undo) plays from it again.
+    if (!first && isProject && !editStore.loading) {
+      bootstrappedClipIdByFile.delete(file.path);
+      activeClipIndexRef.current = 0;
+      onSeek(file.path, 0);
+      return;
+    }
     if (!first || first.id === "__pending__" || bootstrappedClipIdByFile.get(file.path) === first.id) return;
     bootstrappedClipIdByFile.set(file.path, first.id);
     activeClipIndexRef.current = 0;
@@ -2167,6 +2198,42 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       insertIndex += 1;
     }
   };
+
+  // ---- Clip menu (right-click a clip) & clip viewer ------------------------------------------
+  const [clipMenu, setClipMenu] = useState<{ clipId: string; anchor: { left: number; top: number } } | null>(null);
+  const [viewerClipId, setViewerClipId] = useState<string | null>(null);
+  // Selects the clip too (without moving the playhead, so "Split at playhead" still means the
+  // playhead's spot), which is what "All effects…" then opens against.
+  const openClipMenu = (clip: Clip) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setSelectedClipId(clip.id);
+    setClipMenu({ clipId: clip.id, anchor: { left: e.clientX, top: e.clientY } });
+  };
+  const menuClipIndex = clipMenu ? editStore.clips.findIndex((c) => c.id === clipMenu.clipId) : -1;
+  const menuClip = menuClipIndex >= 0 ? editStore.clips[menuClipIndex] : null;
+  // The playhead's source time, if it's inside `clip` right now.
+  const playheadInClip = (clip: Clip): number | null => {
+    const active = baseClips[activeClipIndexRef.current];
+    return active?.id === clip.id && currentTime > clip.start && currentTime < clip.end ? currentTime : null;
+  };
+  const moveClip = (index: number, target: ClipMoveTarget) => {
+    const last = editStore.clips.length - 1;
+    const to = target === "earlier" ? index - 1 : target === "later" ? index + 1 : target === "start" ? 0 : last;
+    editStore.reorderClip(index, Math.max(0, Math.min(last, to)));
+  };
+  const handleSaveClipAs = async (clip: Clip, index: number) => {
+    const stem = clip.sourcePath.replace(/\.[^./\\]+$/, "").split(/[\\/]/).pop() ?? "clip";
+    const chosen = await saveFileDialog({ defaultPath: `${stem} - clip ${index + 1}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
+    if (!chosen) return;
+    const result = await editStore.exportClip(clip.id, videoPixelSize, chosen);
+    if (result) onExported(result.path, result.name);
+  };
+  const handleViewClip = (clip: Clip) => {
+    if (isPlaying) onTogglePlay(); // one thing playing at a time
+    setViewerClipId(clip.id);
+  };
+  const viewerIndex = viewerClipId ? editStore.clips.findIndex((c) => c.id === viewerClipId) : -1;
 
   // Playhead position on the (output/assembled) ruler - maps currentTime (a raw source
   // timestamp) via whichever clip is currently tracked as active (activeClipIndexRef, clamped
@@ -2263,7 +2330,61 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [currentOutputTime, isPlaying, editStore.audioOverlays]);
 
   return (
-    <div ref={rootRef} className="w-full flex flex-col gap-2">
+    // The webview's native menu (Save image as / Copy image / Inspect) means nothing on a timeline -
+    // clips get their own menu (openClipMenu), everything else simply gets none.
+    <div ref={rootRef} className="w-full flex flex-col gap-2" onContextMenu={(e) => e.preventDefault()}>
+      {clipMenu && menuClip && (
+        <ClipContextMenu
+          anchor={clipMenu.anchor}
+          clip={menuClip}
+          index={menuClipIndex}
+          clipCount={editStore.clips.length}
+          isImage={isImageClipPath(menuClip.sourcePath)}
+          canSplit={playheadInClip(menuClip) !== null}
+          canDelete={isProject || editStore.clips.length > 1}
+          onClose={() => setClipMenu(null)}
+          onView={() => handleViewClip(menuClip)}
+          onSaveAs={() => void handleSaveClipAs(menuClip, menuClipIndex)}
+          onSplit={() => {
+            const at = playheadInClip(menuClip);
+            if (at !== null) editStore.splitAt(menuClipIndex, at);
+          }}
+          onDuplicate={() => editStore.duplicateClip(menuClip.id)}
+          onMove={(target) => moveClip(menuClipIndex, target)}
+          onSetTransition={(type) =>
+            editStore.updateClipEffects(menuClip.id, {
+              transitionIn: type ? { type, duration: menuClip.transitionIn?.duration ?? DEFAULT_TRANSITION_DURATION } : undefined,
+            })
+          }
+          onSetMotion={(preset) =>
+            editStore.updateClipEffects(menuClip.id, {
+              kenBurns: preset ? { ...menuClip.kenBurns, preset, intensity: menuClip.kenBurns?.intensity ?? DEFAULT_KEN_BURNS_INTENSITY } : undefined,
+            })
+          }
+          onSetColor={(preset) =>
+            editStore.updateClipEffects(menuClip.id, {
+              colorFilter: preset === "none" ? undefined : { preset, intensity: menuClip.colorFilter?.intensity ?? DEFAULT_COLOR_INTENSITY },
+            })
+          }
+          onSetLength={(seconds) => editStore.resizeClipEdge(menuClip.id, "end", menuClip.start + seconds * (menuClip.speed ?? 1))}
+          onToggleMirror={() => editStore.updateClipEffects(menuClip.id, { flipHorizontal: !menuClip.flipHorizontal })}
+          onOpenEffects={() => setEffectsPopoverAnchor({ left: clipMenu.anchor.left, top: clipMenu.anchor.top })}
+          onReveal={() => invoke("open_file_from_directory", { filepath: menuClip.sourcePath }).catch((error) => console.error("Failed to reveal file:", error))}
+          onDelete={() => {
+            editStore.deleteClipAt(menuClipIndex);
+            setSelectedClipId(null);
+          }}
+        />
+      )}
+      {viewerIndex >= 0 && (
+        <ClipViewerModal
+          clip={editStore.clips[viewerIndex]}
+          index={viewerIndex}
+          clipCount={editStore.clips.length}
+          frame={videoPixelSize}
+          onClose={() => setViewerClipId(null)}
+        />
+      )}
       {/* Hidden capture rig - never shown, just decodes frames for the filmstrip/cover. */}
       {/* crossOrigin="anonymous" is required here, not optional - without it, drawing this asset://-
           sourced video onto captureCanvasRef taints the canvas, and toDataURL() throws
@@ -2709,9 +2830,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       a portal) - document.body, where this now renders, is outside the Timeline
                       panel's own text-neutral-200 ancestor, so without this the menu items fell
                       back to the page's default (invisible-on-dark) text color. */}
-                  <div
-                    className="fixed w-44 bg-neutral-800 border border-neutral-700 rounded-md shadow-lg z-50 text-sm text-neutral-200"
-                    style={{ top: moreMenuPosition.top, left: moreMenuPosition.left }}
+                  <ViewportClampedMenu
+                    anchor={moreMenuPosition}
+                    className="w-56 bg-neutral-800 border border-neutral-700 rounded-md shadow-lg z-50 text-sm text-neutral-200 whitespace-nowrap"
                   >
                     <button
                       type="button"
@@ -2763,7 +2884,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     >
                       <IoTrashOutline size={13} /> Delete
                     </button>
-                  </div>
+                  </ViewportClampedMenu>
                 </>,
                 document.body
               )}
@@ -2783,7 +2904,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             above), and past ~4 lanes the stack scrolls vertically here instead of growing the
             panel up over the video preview. The ruler stays pinned while scrolling. */}
         <div ref={trackAreaRef} className="flex-1 max-h-[236px] overflow-x-auto overflow-y-auto relative select-none">
-          <div ref={trackContentRef} style={{ width: totalWidth }} className="relative">
+          {/* An empty project's track fills the panel (its drop zone/"Add media" needs the room);
+              otherwise the clips' own width plus space for the "+" after the last clip. */}
+          <div
+            ref={trackContentRef}
+            style={isProject && baseClips.length === 0 ? { width: "100%", minWidth: 320 } : { width: totalWidth + ADD_BUTTON_ROOM_PX }}
+            className="relative"
+          >
             {/* Ruler - represents the *assembled* (playback-order) timeline, not raw source time */}
             <div
               className="sticky top-0 z-30 bg-neutral-950 h-6 border-b border-neutral-800 cursor-pointer"
@@ -2869,6 +2996,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   <div
                     key={clip.id}
                     onPointerDown={isPending ? undefined : handleClipPointerDown(baseClips[i], i)}
+                    onContextMenu={isPending ? undefined : openClipMenu(baseClips[i])}
                     onPointerMove={toolMode === "razor" ? undefined : handleClipDragMove}
                     onPointerUp={toolMode === "razor" ? undefined : endClipDrag}
                     onPointerCancel={toolMode === "razor" ? undefined : endClipDrag}
@@ -2924,24 +3052,39 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 </button>
               )}
 
-              {/* Transition markers - purely decorative (not interactive; edit the transition
-                  itself via the selected clip's Effects popover), at each boundary where the clip
-                  on the RIGHT has transitionIn set. Communicates the documented preview-vs-export
-                  gap (see ClipTransitionIn's own doc comment): live preview shows a hard cut here
-                  regardless of which transition style is picked - the real transition only
-                  renders in the exported file. */}
+              {/* Transitions - at each boundary where the clip on the RIGHT has transitionIn set: a band
+                  over the stretch of that clip the transition plays across (its first `d` seconds -
+                  see transition_fold_step), the boundary marker, and the transition's name in small
+                  type under the cut. The name opens that clip's menu, to change or remove it. */}
               {renderClips.map((clip, i) => {
                 if (i === 0 || clip.id === "__pending__" || !clip.transitionIn) return null;
                 const left = outputStarts[i] * pxPerSec;
+                const label = TRANSITION_PRESETS.find((p) => p.value === clip.transitionIn?.type)?.label ?? "Transition";
+                const seconds = transitionDuration(clip);
                 return (
-                  <div
-                    key={`transition-${clip.id}`}
-                    title={`${TRANSITION_PRESETS.find((p) => p.value === clip.transitionIn?.type)?.label ?? "Transition"} (preview shows a hard cut; export renders the real transition)`}
-                    className="absolute inset-y-1 w-4 -ml-2 flex items-center justify-center rounded bg-blue-500/80 z-10 pointer-events-none"
-                    style={{ left }}
-                  >
-                    <IoSwapHorizontalOutline size={10} className="text-white" />
-                  </div>
+                  <React.Fragment key={`transition-${clip.id}`}>
+                    <div
+                      className="absolute inset-y-1 rounded-r pointer-events-none z-[5] bg-gradient-to-r from-blue-400/45 to-blue-400/0"
+                      style={{ left, width: seconds * pxPerSec }}
+                    />
+                    <div
+                      title={`${label} · ${seconds.toFixed(1)}s`}
+                      className="absolute inset-y-1 w-4 -ml-2 flex items-center justify-center rounded bg-blue-500/80 z-10 pointer-events-none"
+                      style={{ left }}
+                    >
+                      <IoSwapHorizontalOutline size={10} className="text-white" />
+                    </div>
+                    <button
+                      type="button"
+                      title={`${label} · ${seconds.toFixed(1)}s - click to change`}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => openClipMenu(baseClips[i])(e)}
+                      className="absolute z-20 -translate-x-1/2 px-1 rounded-sm bg-blue-600 text-[9px] leading-[13px] font-medium text-white whitespace-nowrap shadow ring-1 ring-black/40 hover:bg-blue-500"
+                      style={{ left, bottom: -6 }}
+                    >
+                      {label}
+                    </button>
+                  </React.Fragment>
                 );
               })}
 

@@ -220,6 +220,7 @@ export interface UseVideoEditStoreResult {
   splitAt: (index: number, sourceTime: number) => void;
   deleteClipAt: (index: number) => void;
   reorderClip: (fromIndex: number, toIndex: number) => void;
+  duplicateClip: (id: string) => void;
   resizeClipEdge: (id: string, edge: "start" | "end", time: number) => void;
   // Color grade / Ken Burns / crossfade-in, all three on one patch entry point - same "one
   // generic patch fn" shape as updateTextOverlayContent, just for a clip's own non-geometric
@@ -262,6 +263,9 @@ export interface UseVideoEditStoreResult {
     videoPixelSize: { width: number; height: number } | null,
     options?: ExportOptions
   ) => Promise<{ path: string; name: string } | null>;
+  // Renders just one clip, with its own effects, to `outputPath` - the clip menu's "Save clip as".
+  // No overlays/captions/music: those live on the whole timeline, not on any one clip.
+  exportClip: (clipId: string, videoPixelSize: { width: number; height: number } | null, outputPath: string) => Promise<{ path: string; name: string } | null>;
 }
 
 // Non-destructive edit state (an ordered, reorderable, multi-source-capable list of clips) for
@@ -484,14 +488,21 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
 
   const pushCommand = useCallback(
     (before: EditableFields, after: EditableFields, label: VideoEditCommand["label"]) => {
-      if (after.clips.length === 0) return; // never leave nothing to preview/export
+      // A recording never ends up with nothing to preview/export; a project may be emptied (it's
+      // just an empty timeline waiting for media).
+      if (after.clips.length === 0 && !(sourcePath && isVideoProjectPath(sourcePath))) return;
       const command: VideoEditCommand = { before, after, label };
+      // Kept in step right away, not only once React re-renders (the effect mirroring `state`):
+      // every operation builds its `after` from stateRef.current, so back-to-back edits in one
+      // go - inserting several picked/dropped files in a row - would otherwise each start from
+      // the same stale timeline and overwrite one another, leaving only the last one standing.
+      if (stateRef.current) stateRef.current = { ...stateRef.current, ...applyCommand(command) };
       setState((prev) => (prev ? { ...prev, ...applyCommand(command), updatedAt: new Date().toISOString() } : prev));
       setUndoStack((prev) => [...prev, command]);
       setRedoStack([]);
       scheduleAutosave();
     },
-    [scheduleAutosave]
+    [scheduleAutosave, sourcePath]
   );
 
   // Snapshot helper - every pushCommand call needs the *other* two overlay arrays passed through
@@ -525,10 +536,24 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   const deleteClipAt = useCallback(
     (index: number) => {
       const current = stateRef.current;
-      if (!current || current.clips.length <= 1) return; // never delete down to nothing left
+      // A recording never deletes down to nothing left (there'd be nothing to fall back on) - a
+      // project may, since an empty project is just an empty timeline waiting for media.
+      if (!current || (current.clips.length <= 1 && !(sourcePath && isVideoProjectPath(sourcePath)))) return;
       const clips = deleteClipAtHandler(current.clips, index);
       if (clips === current.clips) return;
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "delete");
+    },
+    [pushCommand, sourcePath]
+  );
+
+  // A copy of one clip, effects and all, placed right after it.
+  const duplicateClip = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      const index = current?.clips.findIndex((c) => c.id === id) ?? -1;
+      if (!current || index < 0) return;
+      const clips = insertClipHandler(current.clips, index + 1, { ...current.clips[index], id: crypto.randomUUID() });
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "insert");
     },
     [pushCommand]
   );
@@ -1298,8 +1323,46 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [sourcePath]
   );
 
+  const exportClip = useCallback(
+    async (clipId: string, videoPixelSize: { width: number; height: number } | null, outputPath: string): Promise<{ path: string; name: string } | null> => {
+      const clip = stateRef.current?.clips.find((c) => c.id === clipId);
+      if (!sourcePath || !clip || !stateRef.current) return null;
+      const current = stateRef.current;
+      setIsExporting(true);
+      setExportError(null);
+      try {
+        const resultPath = await invoke<string>("export_trimmed_video", {
+          outputBasePath: sourcePath,
+          // Alone, there's nothing for it to transition in from.
+          segments: toKeepSegments([{ ...clip, transitionIn: undefined }]),
+          overlays: [],
+          blurOverlays: [],
+          audioOverlays: [],
+          pipOverlays: [],
+          audioMuted: current.videoAudioMuted,
+          audioVolume: current.videoAudioVolume,
+          videoWidth: videoPixelSize?.width ?? null,
+          videoHeight: videoPixelSize?.height ?? null,
+          quality: null,
+          outputPath,
+          captionsAss: null,
+        });
+        return { path: resultPath, name: resultPath.split(/[\\/]/).pop() ?? resultPath };
+      } catch (err) {
+        setExportError(err instanceof Error ? err.message : String(err));
+        return null;
+      } finally {
+        setIsExporting(false);
+        setExportProgress(null);
+      }
+    },
+    [sourcePath]
+  );
+
   return {
     loading,
+    exportClip,
+    duplicateClip,
     clips: state?.clips ?? [],
     textOverlays: state?.textOverlays ?? [],
     imageOverlays: state?.imageOverlays ?? [],

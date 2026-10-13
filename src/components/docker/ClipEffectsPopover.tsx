@@ -21,9 +21,9 @@ import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
 
 export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "flipHorizontal">>;
 
-const DEFAULT_COLOR_INTENSITY = 0.7;
-const DEFAULT_KEN_BURNS_INTENSITY = 0.5;
-const DEFAULT_TRANSITION_DURATION = 0.5;
+export const DEFAULT_COLOR_INTENSITY = 0.7;
+export const DEFAULT_KEN_BURNS_INTENSITY = 0.5;
+export const DEFAULT_TRANSITION_DURATION = 0.5;
 
 interface ClipEffectsPopoverProps {
   clip: Clip;
@@ -155,7 +155,7 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
       </div>
 
       {hasPrecedingClip && (
-        <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10" title="Preview shows a hard cut here - the real transition only renders in the exported video">
+        <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10" title="Plays over the start of this clip, from the previous clip's last frame - in the preview and the export alike">
           <span className="text-[10px] uppercase tracking-wide text-white/40">Transition (with previous clip)</span>
           <PresetRow>
             <PresetButton active={transitionType === null} onClick={() => setTransitionType(null)}>

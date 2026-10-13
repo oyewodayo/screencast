@@ -6,7 +6,7 @@
 // byte-identical output (a CSS `filter` and an ffmpeg pixel filter are never going to match
 // exactly). If one side's formula is retuned, retune the other so preview and export don't
 // silently drift apart - see the cross-reference comment on color_filter_chain itself.
-import { AudioCleanup, ClipColorFilter, ClipCrop, ClipKenBurns, ColorFilterPreset, KenBurnsPreset, TransitionType } from "./videoEditTypes";
+import { AudioCleanup, Clip, ClipColorFilter, ClipCrop, ClipKenBurns, ColorFilterPreset, KenBurnsPreset, TransitionType } from "./videoEditTypes";
 
 export const COLOR_FILTER_PRESETS: { value: ColorFilterPreset; label: string }[] = [
   { value: "none", label: "None" },
@@ -129,6 +129,25 @@ export function cropStaticTransform(crop: ClipCrop): string {
   const dxPct = (0.5 - centerX) * 100;
   const dyPct = (0.5 - centerY) * 100;
   return `scale(${1 / width}, ${1 / height}) translate(${dxPct}%, ${dyPct}%)`;
+}
+
+// A clip's whole on-screen look at `progress` (0..1 through it) as CSS - the same composition
+// VideoPlayer's applyCropAndKenBurns writes onto its <video> (crop, then Ken Burns, then mirror,
+// rightmost acting first) plus the color grade filter. For elements standing in for a clip's
+// frame elsewhere: the transition preview's frozen outgoing frame and the clip viewer popup.
+export function clipFrameStyle(
+  clip: Pick<Clip, "crop" | "kenBurns" | "flipHorizontal" | "colorFilter">,
+  progress: number
+): { transform: string; filter: string } {
+  const transform = [
+    clip.crop ? cropStaticTransform(clip.crop) : "",
+    clip.kenBurns ? kenBurnsTransform(clip.kenBurns, progress) : "",
+    clip.flipHorizontal ? "scaleX(-1)" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const filter = clip.colorFilter && clip.colorFilter.preset !== "none" ? cssFilterForColorPreset(clip.colorFilter) : "";
+  return { transform, filter };
 }
 
 // What VideoTimelineDocker reports upward (onActiveClipChange) and VideoPlayer consumes

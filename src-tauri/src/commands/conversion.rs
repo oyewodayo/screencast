@@ -538,23 +538,28 @@ async fn encode_preview_proxy(ffmpeg_path: PathBuf, args: Vec<String>, cache_pat
 #[tauri::command]
 pub async fn get_image_clip_proxy(
     app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
     image_path: String,
     frame_width: u32,
     frame_height: u32,
 ) -> Result<String, String> {
     let input = PathBuf::from(&image_path);
     let (w, h) = proxy_size(frame_width, frame_height);
-    let cache_path = preview_cache_path(&input, &format!("image_clip_v1_{}x{}", w, h), "mp4")?;
+    // Frame size goes in the file name, not the namespace, so every proxy shares one cache entry in
+    // Settings' storage list regardless of how many frame sizes have been used.
+    let cache_path = preview_cache_path(&input, "image_clip_v1", &format!("{}x{}.mp4", w, h))?;
     if cache_path.exists() {
         return path_to_str(&cache_path).map(|s| s.to_string());
     }
+    let source = still_image_source(&app_handle, &window, &state, &image_path).await?;
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
     let args: Vec<String> = vec![
         "-loop".into(), "1".into(),
         // One frame every 10s: every frame is the same picture, and encode time scales with frame
         // count (measured: 600 frames took ~15s at 1080p, 60 frames ~2.4s, for the same file).
         "-framerate".into(), "0.1".into(),
-        "-i".into(), image_path.clone(),
+        "-i".into(), source,
         "-t".into(), IMAGE_CLIP_PROXY_SECONDS.to_string(),
         "-vf".into(), frame_fit_chain(w as i64, h as i64, true)[1..].to_string(),
         "-c:v".into(), "libx264".into(),
@@ -1046,7 +1051,9 @@ pub async fn get_image_thumbnail(
     // side instead of in here.
     log::debug!("get_image_thumbnail: {}", input_path);
     let input = PathBuf::from(&input_path);
-    let cache_path = preview_cache_path(&input, "thumb_v1", "jpg")?;
+    // v2: thumbnails now honor EXIF orientation (see generate_plain_thumbnail) - the bump is what
+    // retires every sideways phone-photo thumbnail cached under v1.
+    let cache_path = preview_cache_path(&input, "thumb_v2", "jpg")?;
 
     if cache_path.exists() {
         return path_to_str(&cache_path).map(|s| s.to_string());
@@ -1113,7 +1120,19 @@ pub async fn get_image_thumbnail(
 }
 
 fn generate_plain_thumbnail(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
-    let img = image::open(input).map_err(|e| format!("Failed to open image: {e}"))?;
+    use image::ImageDecoder;
+    // Decoded through the format's own decoder (not image::open) so the EXIF orientation a phone
+    // camera writes instead of rotating the pixels can be applied - image::open ignores it, which
+    // left every portrait phone photo's thumbnail lying on its side. ffmpeg (image clip previews
+    // and export) already honors the same tag, so thumbnails now match what renders.
+    let mut decoder = image::ImageReader::open(input)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(|e| format!("Failed to open image: {e}"))?
+        .into_decoder()
+        .map_err(|e| format!("Failed to open image: {e}"))?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| format!("Failed to decode image: {e}"))?;
+    img.apply_orientation(orientation);
     img.thumbnail(
         GALLERY_THUMBNAIL_MAX_DIMENSION,
         GALLERY_THUMBNAIL_MAX_DIMENSION,
@@ -3157,16 +3176,38 @@ fn escape_filter_path(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/").replace(':', "\\:").replace('\'', "")
 }
 
-// Still images a timeline clip can be built from (the editor's image clips - see Clip's own doc
-// comment, videoEditTypes.ts). Mirrors IMAGE_CLIP_EXTENSIONS there; HEIC/HEIF are left out since
-// the bundled ffmpeg can't reliably decode them (see get_heic_preview).
-fn is_still_image_path(path: &str) -> bool {
-    let ext = std::path::Path::new(path)
+fn lowercase_extension(path: &str) -> String {
+    std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
-        .unwrap_or_default();
-    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "gif")
+        .unwrap_or_default()
+}
+
+// Still images a timeline clip can be built from (the editor's image clips - see Clip's own doc
+// comment, videoEditTypes.ts). Mirrors IMAGE_CLIP_EXTENSIONS there. EXIF orientation needs no
+// handling of its own: ffmpeg auto-rotates image inputs by it, in -vf and -filter_complex alike.
+fn is_still_image_path(path: &str) -> bool {
+    matches!(
+        lowercase_extension(path).as_str(),
+        "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "gif" | "heic" | "heif"
+    )
+}
+
+// HEIC/HEIF stills (iPhone's default) - the bundled ffmpeg's HEIF tile-grid decoding is unreliable
+// (see get_heic_preview), so these never reach ffmpeg directly: still_image_source swaps in the
+// same cached, correctly decoded PNG the image viewer already shows.
+fn is_heic_path(path: &str) -> bool {
+    matches!(lowercase_extension(path).as_str(), "heic" | "heif")
+}
+
+// The file ffmpeg should actually read for an image clip - the image itself, or for HEIC/HEIF its
+// decoded PNG (generated once, then a cache hit).
+async fn still_image_source(app_handle: &AppHandle, window: &Window, state: &State<'_, ConversionState>, path: &str) -> Result<String, String> {
+    if !is_heic_path(path) {
+        return Ok(path.to_string());
+    }
+    get_heic_preview(app_handle.clone(), window.clone(), state.clone(), path.to_string()).await
 }
 
 // Frame rate every image segment is looped at (`-loop 1 -framerate`) - there's no source rate to
@@ -3260,6 +3301,41 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         ));
     }
     extra
+}
+
+// One left-to-right fold step joining segment `i` ([v{i}]/[a{i}]) onto everything folded so far
+// ([cur_v]/[cur_a], `accumulated` seconds long). Returns the filter text and the new labels.
+//
+// A transition plays over the START of the incoming clip, from the outgoing clip's frozen last
+// frame - [cur_v] is held on its last frame (`tpad` clone) for the transition's length, and the
+// xfade begins exactly where the outgoing content ends. So a transition never eats into either
+// clip and the output is exactly the sum of the clips' own lengths - the same timeline the editor
+// shows, which is what keeps text/image overlays and captions (all timed on that timeline) in
+// sync after a transition, and what the live preview (TransitionPreviewLayer) reproduces: the
+// outgoing clip's last frame over the incoming clip as it starts. Audio simply cuts (concat):
+// with nothing overlapping there's nothing to crossfade, and no clip's sound gets shortened.
+fn transition_fold_step(
+    cur_v: &str,
+    cur_a: &str,
+    i: usize,
+    accumulated: f64,
+    seg_dur: f64,
+    transition: Option<(&str, f64)>,
+) -> (String, String, String) {
+    let next_v = format!("fold{}v", i);
+    let next_a = format!("fold{}a", i);
+    let step = match transition {
+        Some((name, duration)) => {
+            // At most 90% of the incoming clip - it plays entirely over that clip's own start.
+            let d = duration.min(seg_dur * 0.9).max(0.05);
+            format!(
+                "[{cur_v}]tpad=stop_mode=clone:stop_duration={d:.3}[hold{i}];[hold{i}][v{i}]xfade=transition={name}:duration={d:.3}:offset={offset:.3}[{next_v}];[{cur_a}][a{i}]concat=n=2:v=0:a=1[{next_a}];",
+                offset = accumulated.max(0.0)
+            )
+        }
+        None => format!("[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"),
+    };
+    (step, next_v, next_a)
 }
 
 // Frame rate of a source file's first video stream, as a plain f64 (e.g. 30.0, 59.94) - only ever
@@ -3609,6 +3685,14 @@ pub async fn export_trimmed_video(
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
+    }
+    // HEIC/HEIF image clips render from their decoded PNG (see still_image_source) - swapped in
+    // before anything below reads a segment's path, so every later step just sees a plain image.
+    let mut segments = segments;
+    for seg in segments.iter_mut() {
+        if is_heic_path(&seg.source_path) {
+            seg.source_path = still_image_source(&app_handle, &window, &state, &seg.source_path).await?;
+        }
     }
     let (quality_preset, quality_crf) = resolve_export_quality(quality.as_deref());
 
@@ -4023,38 +4107,14 @@ pub async fn export_trimmed_video(
             for i in 1..segments.len() {
                 let seg = &segments[i];
                 let seg_dur = (seg.end - seg.start) / segment_speed(seg);
-                let next_v = format!("fold{}v", i);
-                let next_a = format!("fold{}a", i);
-                let use_transition = seg
+                let transition = seg
                     .transition_in
                     .as_ref()
-                    .map_or(false, |tr| tr.duration > 0.0);
-                if use_transition {
-                    let tr = seg.transition_in.as_ref().unwrap();
-                    let transition_name = sanitize_transition_name(&tr.transition_type);
-                    // Clamped so the transition can never exceed 90% of either flanking segment's
-                    // own duration - an unclamped duration could push `offset` negative (transition
-                    // longer than everything accumulated so far) or overlap more of the next
-                    // segment than actually exists.
-                    let d = tr
-                        .duration
-                        .min(accumulated * 0.9)
-                        .min(seg_dur * 0.9)
-                        .max(0.05);
-                    let offset = (accumulated - d).max(0.0);
-                    // acrossfade has no equivalent "transition style" concept of its own (audio has
-                    // no visual wipe/circle/pixelize shape to speak of) - every visual transition
-                    // style shares the exact same linear audio crossfade underneath.
-                    filter.push_str(&format!(
-                        "[{cur_v}][v{i}]xfade=transition={transition_name}:duration={d:.3}:offset={offset:.3}[{next_v}];[{cur_a}][a{i}]acrossfade=d={d:.3}[{next_a}];"
-                    ));
-                    accumulated += seg_dur - d;
-                } else {
-                    filter.push_str(&format!(
-                        "[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"
-                    ));
-                    accumulated += seg_dur;
-                }
+                    .filter(|tr| tr.duration > 0.0)
+                    .map(|tr| (sanitize_transition_name(&tr.transition_type), tr.duration));
+                let (step, next_v, next_a) = transition_fold_step(&cur_v, &cur_a, i, accumulated, seg_dur, transition);
+                filter.push_str(&step);
+                accumulated += seg_dur;
                 cur_v = next_v;
                 cur_a = next_a;
             }
@@ -5623,7 +5683,8 @@ mod tests {
         assert!(is_still_image_path("shot.png"));
         assert!(is_still_image_path("scan.webp"));
         assert!(!is_still_image_path("clip.mp4"));
-        assert!(!is_still_image_path("photo.heic"));
+        assert!(is_still_image_path("photo.HEIC"));
+        assert!(is_heic_path("photo.heif") && !is_heic_path("photo.jpg"));
         assert!(!is_still_image_path("My video.briefvideo"));
     }
 
@@ -5659,5 +5720,29 @@ mod tests {
         assert_eq!(proxy_size(1080, 1920), (1080, 1920));
         let (w, h) = proxy_size(4001, 3001);
         assert!(w <= PROXY_MAX_EDGE && h <= PROXY_MAX_EDGE && w % 2 == 0 && h % 2 == 0);
+    }
+
+    // ---- transition_fold_step ------------------------------------------------------------------
+
+    #[test]
+    fn transition_holds_the_outgoing_frame_and_starts_where_it_ends() {
+        let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fade", 1.0)));
+        assert_eq!((v.as_str(), a.as_str()), ("fold1v", "fold1a"));
+        assert!(step.contains("[v0]tpad=stop_mode=clone:stop_duration=1.000[hold1]"), "{step}");
+        assert!(step.contains("xfade=transition=fade:duration=1.000:offset=5.000"), "{step}");
+        assert!(step.contains("[a0][a1]concat=n=2:v=0:a=1[fold1a]"), "audio just cuts: {step}");
+    }
+
+    #[test]
+    fn transition_is_capped_by_the_incoming_clip_only() {
+        // A tiny first clip no longer limits the transition - it plays over the incoming clip.
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 0.5, 2.0, Some(("wipeleft", 3.0)));
+        assert!(step.contains("duration=1.800:offset=0.500"), "{step}");
+    }
+
+    #[test]
+    fn no_transition_is_a_plain_concat() {
+        let (step, _, _) = transition_fold_step("fold1v", "fold1a", 2, 9.0, 4.0, None);
+        assert_eq!(step, "[fold1v][fold1a][v2][a2]concat=n=2:v=1:a=1[fold2v][fold2a];");
     }
 }

@@ -62,10 +62,10 @@ export interface ClipCrop {
 // order - deliberately not "transitionOut" on the earlier clip, so reordering clips naturally
 // keeps "the transition" attached to whichever pairing is now adjacent, with no extra
 // bookkeeping. Meaningless (ignored) on the very first clip - there's nothing to transition
-// from. Preview-only shows a hard cut at the boundary regardless of which transition is picked
-// (see the transition marker in VideoTimelineDocker) - the real transition only renders in the
-// export, same "one side documented as behind" precedent TextOverlay/ImageOverlay's own "slide"
-// animation already set.
+// from. It plays over the START of this clip - the previous clip's frozen last frame giving way
+// to this one over `duration` seconds - so it never shortens either clip, and the timeline's
+// length is exactly the export's (overlays and captions stay in sync). Export: transition_fold_step
+// (conversion.rs); live preview: TransitionPreviewLayer, drawing the same thing over the player.
 // Names ffmpeg's own `xfade` filter transition names directly (see conversion.rs's
 // TRANSITION_ALLOWLIST) rather than inventing a separate friendly-name-to-xfade-name mapping
 // layer - one flat vocabulary shared by the UI, the sidecar JSON, and the export filter string,
@@ -562,9 +562,10 @@ export function isVideoEditState(value: unknown): value is VideoEditState {
 // end is however long it's been stretched, capped at IMAGE_CLIP_MAX_SECONDS (the length of the
 // preview proxy it plays through - see get_image_clip_proxy in conversion.rs). Every clip effect
 // still applies: Ken Burns, crop, flip, color grade and transitions are what turn a set of photos
-// into a slideshow. Mirrors is_still_image_path (conversion.rs); HEIC/HEIF are left out because
-// the bundled ffmpeg can't decode them reliably.
-export const IMAGE_CLIP_EXTENSIONS = ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif"];
+// into a slideshow. Mirrors is_still_image_path (conversion.rs). HEIC/HEIF (iPhone photos) work
+// too - the backend decodes them once to a cached PNG before ffmpeg ever reads them - and a phone
+// photo's EXIF rotation is honored everywhere (ffmpeg auto-rotates; thumbnails apply it).
+export const IMAGE_CLIP_EXTENSIONS = ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", "heic", "heif"];
 export const IMAGE_CLIP_MAX_SECONDS = 600;
 export const DEFAULT_IMAGE_CLIP_SECONDS = 5;
 

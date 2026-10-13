@@ -242,6 +242,11 @@ export interface VideoPlayerHandle {
   // A/B compare: true routes the untouched original audio to the speakers instead of the cleaned
   // signal (NoiseReductionPopover's "Hold to hear original"), false switches back.
   setNoisePreviewBypass: (bypass: boolean) => void;
+  // What's actually on screen right now, read straight off the <video> - for per-frame preview
+  // layers (TransitionPreviewLayer) that need the exact current time and need to know whether a
+  // source swap (loadSource) has finished: `src` is the URL last assigned, and `hasFrame` is false
+  // until that source has decoded a frame to show.
+  getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean } | null;
 }
 
 // Decoded noise samples (mono 48kHz PCM from decode_audio_range), keyed by file+range. A handful
@@ -494,6 +499,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       const t = graph.ctx.currentTime;
       graph.originalGain.gain.setTargetAtTime(bypass ? 1 : 0, t, 0.015);
       graph.processedGain.gain.setTargetAtTime(bypass ? 0 : 1, t, 0.015);
+    },
+    getPlaybackState: () => {
+      const video = videoRef.current;
+      if (!video) return null;
+      return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2 };
     },
   }), []);
 

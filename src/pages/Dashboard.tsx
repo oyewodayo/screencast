@@ -39,6 +39,9 @@ import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWo
 import VideoEditorHome from "../components/video/VideoEditorHome";
 import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
 import { VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
+import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
+import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
+import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -737,23 +740,27 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     return pending;
   }, []);
 
-  // An image clip's preview source - a cached still-video proxy of that image (see
-  // get_image_clip_proxy for why images preview as video), fitted to the timeline's frame. Cached
-  // as a promise per image+frame so the prefetch effect below and an actual seek share one encode.
-  const imageClipProxyUrlCacheRef = useRef<Map<string, Promise<string>>>(new Map());
-  const resolveImageClipProxyUrl = useCallback(async (imagePath: string, primaryPath: string): Promise<string> => {
-    const frame = (await resolveTimelineFrame(primaryPath)) ?? { width: 1920, height: 1080 };
-    const key = `${imagePath}|${frame.width}x${frame.height}`;
-    let pending = imageClipProxyUrlCacheRef.current.get(key);
-    if (!pending) {
-      pending = invoke<string>("get_image_clip_proxy", { imagePath, frameWidth: frame.width, frameHeight: frame.height }).then((proxyPath) =>
-        resolvePreviewAssetUrl(proxyPath)
-      );
-      pending.catch(() => imageClipProxyUrlCacheRef.current.delete(key)); // let the next seek retry
-      imageClipProxyUrlCacheRef.current.set(key, pending);
-    }
-    return pending;
-  }, [resolveTimelineFrame, resolvePreviewAssetUrl]);
+  // An image clip's preview source - a cached still-video proxy of that image, fitted to the
+  // timeline's frame (see clipPreviewSource.ts, shared with the transition preview and the clip
+  // viewer so all three show the same picture). The prefetch effect below and an actual seek share
+  // one encode through that module's cache.
+  const resolveImageClipProxyUrl = useCallback(
+    async (imagePath: string, primaryPath: string): Promise<string> => resolveClipPreviewUrl(imagePath, await resolveTimelineFrame(primaryPath)),
+    [resolveTimelineFrame]
+  );
+  // Stable (TransitionPreviewLayer's animation loop restarts whenever it changes).
+  const getPlayerPlaybackState = useCallback(() => videoPlayerRef.current?.getPlaybackState() ?? null, []);
+  // Any clip's preview source as the player loads it - the primary file's already-resolved URL,
+  // an image's proxy, or another video's asset URL (TransitionPreviewLayer compares this against
+  // what the player actually has loaded).
+  const resolveTimelineClipUrl = useCallback(
+    (sourcePath: string): Promise<string> => {
+      const open = selectedFileRef.current;
+      if (open && sourcePath === open.sourcePath) return Promise.resolve(open.path);
+      return open && isImageClipPath(sourcePath) ? resolveImageClipProxyUrl(sourcePath, open.sourcePath) : resolvePreviewAssetUrl(sourcePath);
+    },
+    [resolveImageClipProxyUrl, resolvePreviewAssetUrl]
+  );
 
   // What a video project plays as its primary file - a black canvas at the project's frame size
   // (see get_video_canvas_proxy) - since the project file itself is only a small JSON header.
@@ -848,7 +855,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       videoPlayerRef.current?.loadSource(selectedFile.path, time);
       return;
     }
-    (isImageClipPath(sourcePath) && selectedFile ? resolveImageClipProxyUrl(sourcePath, selectedFile.sourcePath) : resolvePreviewAssetUrl(sourcePath))
+    resolveTimelineClipUrl(sourcePath)
       .then((url) => {
         // Dropped if the player has moved on while the URL resolved - opening a different file
         // resets previewSourcePathRef (effect above), and a late load here would otherwise swap
@@ -2176,6 +2183,48 @@ const setScreen = () => {
 		void handleDirectoryFiles();
 		await handleOpenVideoInEditor({ path: projectPath, name: projectPath.split(/[\\/]/).pop() ?? projectPath });
 	};
+	// Back to where the user was after a reload (sleep/wake, a recovered WebView, Ctrl+R) rather
+	// than the home screen - see sessionRestore.ts. Restored once on mount; saving only starts
+	// after that attempt, so the empty first render can't overwrite what's about to be restored.
+	const workspaceRestoredRef = useRef(false);
+	useEffect(() => {
+		const saved = loadWorkspace();
+		if (!saved) {
+			workspaceRestoredRef.current = true;
+			return;
+		}
+		(async () => {
+			try {
+				if (saved.file) {
+					await loadFileForPlayback(saved.file.path, saved.file.name);
+					// loadFileForPlayback leaves the Video Editor unless it was already open.
+					setVideoEditorScreen(saved.videoEditor);
+				} else if (saved.videoEditor) setVideoEditorScreen(saved.videoEditor);
+				else if (saved.docs) setDocsScreen(saved.docs);
+				else if (saved.whiteboard) setWhiteboardScreen(saved.whiteboard);
+				else if (saved.mindmap) setMindmapScreen(saved.mindmap);
+				else if (saved.board) setBoardScreen(saved.board);
+				setDockerMode(saved.dockerMode);
+			} catch (error) {
+				console.error("Couldn't restore the previous workspace:", error);
+			} finally {
+				workspaceRestoredRef.current = true;
+			}
+		})();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, []);
+	useEffect(() => {
+		if (!workspaceRestoredRef.current) return;
+		saveWorkspace({
+			file: selectedFile ? { path: selectedFile.sourcePath, name: selectedFile.name } : null,
+			videoEditor: videoEditorScreen,
+			docs: docsScreen,
+			whiteboard: whiteboardScreen,
+			mindmap: mindmapScreen,
+			board: boardScreen,
+			dockerMode,
+		});
+	}, [selectedFile, videoEditorScreen, docsScreen, whiteboardScreen, mindmapScreen, boardScreen, dockerMode]);
 	const loadFileForPlayback = async (filePath: string, fileName: string) => {
 	// Document files (.docx/.md/.txt) open in Briefcast Docs - converted into a Briefcast document,
 	// or the one already made from the same unchanged file - rather than in another app.
@@ -4218,6 +4267,15 @@ const setScreen = () => {
                   getFileCategory(selectedFile.name) === "video"
                     ? (frameRect) => (
                         <>
+                          {/* First, so it sits under every overlay - export composites the
+                              transition into the base video before any overlay too. */}
+                          <TransitionPreviewLayer
+                            frameRect={frameRect}
+                            clips={editStore.clips}
+                            activeClipId={activeClipEffects?.id ?? null}
+                            getPlaybackState={getPlayerPlaybackState}
+                            resolveClipUrl={resolveTimelineClipUrl}
+                          />
                           <VideoOverlayLayer
                           frameRect={frameRect}
                           overlays={editStore.textOverlays}

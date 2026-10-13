@@ -164,7 +164,12 @@ interface CacheCategoryInfo {
 // namespace (a future cache this list hasn't been updated for) still renders fine via the
 // fallback in the render code below, just without a friendly description.
 const CACHE_CATEGORY_INFO: Record<string, { label: string; description: string }> = {
-  thumb_v1: { label: "Image thumbnails", description: "Gallery-grid preview images for photos." },
+  // thumb_v1 predates EXIF-orientation support (see generate_plain_thumbnail) - still listed so
+  // its leftovers can be cleared.
+  thumb_v1: { label: "Image thumbnails (old)", description: "Earlier gallery-grid previews, before photo rotation was honored." },
+  thumb_v2: { label: "Image thumbnails", description: "Gallery-grid preview images for photos." },
+  image_clip_v1: { label: "Image clip previews", description: "Still-video previews of photos used as clips in the video editor." },
+  video_canvas_v1: { label: "Video project canvases", description: "Blank frames video projects preview on." },
   video_thumb_v1: { label: "Video poster frames", description: "Gallery-grid preview frames for videos." },
   scrub_sprite_v1: { label: "Video scrub-bar previews", description: "Hover-preview thumbnails shown while dragging a video's timeline." },
   heic_v2: { label: "HEIC/HEIF photo previews", description: "Decoded previews for iPhone-style photos." },
