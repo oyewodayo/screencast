@@ -30,7 +30,8 @@
 .doc-page-gap-start {
   position: relative;
   margin: 0 3px;
-  background: #ffffff;
+  /* The page's own paper (docLayout.css) - white, the dark-mode page, or the document's colour. */
+  background: var(--doc-paper, #ffffff);
   border-left: 1px solid #e5e5e5;
   border-right: 1px solid #e5e5e5;
 }
@@ -47,15 +48,15 @@
 
 .dark .doc-page-gap-end,
 .dark .doc-page-gap-start {
-  background: #171717;
   border-color: #262626;
   box-shadow: none;
 }
 
-/* Print frame (DocsEditor.tsx): on screen the table is just transparent blocks; in print its
-   thead/tfoot spacer rows repeat on every page, giving each page its 1in top/bottom margin while
-   @page itself has margin 0 - and a zero page margin is what leaves Chromium no room to stamp its
-   own date/title/URL header and footer. */
+/* Print frame (DocsEditor.tsx): the table is plain blocks on screen and in print. Its thead/tfoot
+   spacer rows once gave each printed page its top/bottom margin under a zero @page margin (so
+   Chromium had nowhere to stamp its own header/footer); real @page margins do that now, with the
+   document's header, footer and page numbers in their margin boxes (docPageChrome.ts), so the
+   spacers stay hidden. */
 .doc-print-frame,
 .doc-print-frame > tbody,
 .doc-print-frame > tbody > tr,
@@ -83,7 +84,7 @@
   }
   /* ...and everything beside that chain (sidebars, panels - laid out next to the doc by flex on
      screen, so with the chain flattened to blocks they'd stack above it as blank pages). The
-     repeating header/footer text opts back in with .doc-print-keep. */
+     anything marked .doc-print-keep opts back in. */
   *:has(.doc-print-frame) > *:not(:has(.doc-print-frame)):not(.doc-print-frame):not(.doc-print-keep) {
     display: none !important;
   }
@@ -94,28 +95,27 @@
   .doc-print-frame ::selection {
     background: transparent;
   }
-  .doc-print-frame {
-    display: table;
-    width: 100%;
-    border-collapse: collapse;
-  }
-  .doc-print-frame > thead {
-    display: table-header-group;
-  }
-  .doc-print-frame > tfoot {
-    display: table-footer-group;
-  }
-  .doc-print-frame > tbody {
-    display: table-row-group;
-  }
-  .doc-print-frame > tbody > tr {
-    display: table-row;
-  }
+  /* Plain blocks: with the spacers gone there is nothing left for table layout to do. */
+  .doc-print-frame,
+  .doc-print-frame > tbody,
+  .doc-print-frame > tbody > tr,
   .doc-print-frame > tbody > tr > td {
-    display: table-cell;
+    display: block !important;
+    width: 100%;
     padding: 0;
   }
-  .doc-print-spacer {
-    height: 1in;
+  .doc-print-frame > thead,
+  .doc-print-frame > tfoot {
+    display: none !important;
+  }
+}
+
+/* Print breaks pages exactly where the live preview does: each page-gap widget (hidden in print,
+   but still in the DOM) marks the block that starts the next page. Without this the print engine
+   paginates on its own, line by line, and drifts from the preview - so the table of contents'
+   page numbers (DocTocView.tsx, read from these same gaps) would no longer match the PDF. */
+@media print {
+  .ProseMirror > .doc-page-gap + * {
+    break-before: page;
   }
 }

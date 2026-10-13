@@ -13,7 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import * as Y from "yjs";
-import { DocComment, DocMargins, DocPageSetupPatch, DocPageSize, DocVersionSummary } from "../utils/docTypes";
+import { DocComment, DocMargins, DocOrientation, DocPageSetupPatch, DocPageSize, DocVersionSummary } from "../utils/docTypes";
 import { extractPlainText } from "../utils/docYjsText";
 const appWindow = getCurrentWebviewWindow()
 
@@ -35,6 +35,8 @@ interface LoadedDoc {
   header_text: string | null;
   footer_text: string | null;
   margins: DocMargins | null;
+  orientation: DocOrientation | null;
+  page_color: string | null;
 }
 
 interface DocPageSetupResult {
@@ -42,6 +44,23 @@ interface DocPageSetupResult {
   header_text: string | null;
   footer_text: string | null;
   margins: DocMargins | null;
+  orientation: DocOrientation | null;
+  page_color: string | null;
+}
+
+type PageSetupState = Required<DocPageSetupPatch>;
+
+const EMPTY_PAGE_SETUP: PageSetupState = { pageSize: null, headerText: null, footerText: null, margins: null, orientation: null, pageColor: null };
+
+function pageSetupFromResult(r: DocPageSetupResult): PageSetupState {
+  return {
+    pageSize: r.page_size,
+    headerText: r.header_text,
+    footerText: r.footer_text,
+    margins: r.margins ?? null,
+    orientation: r.orientation ?? null,
+    pageColor: r.page_color ?? null,
+  };
 }
 
 interface DocSummaryResult {
@@ -84,6 +103,10 @@ export interface UseDocsEditStoreResult {
   headerText: string | null;
   footerText: string | null;
   margins: DocMargins | null;
+  // null = portrait.
+  orientation: DocOrientation | null;
+  // "#rrggbb" paper colour; null = white.
+  pageColor: string | null;
   // Merges the patch over the current setup; applied locally at once (the ruler's margin drags
   // need to feel instant) and then persisted.
   setPageSetup: (patch: DocPageSetupPatch) => Promise<void>;
@@ -103,12 +126,9 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
   const [headerText, setHeaderTextState] = useState<string | null>(null);
   const [footerText, setFooterTextState] = useState<string | null>(null);
   const [margins, setMarginsState] = useState<DocMargins | null>(null);
-  const pageSetupRef = useRef<{ pageSize: DocPageSize | null; headerText: string | null; footerText: string | null; margins: DocMargins | null }>({
-    pageSize: null,
-    headerText: null,
-    footerText: null,
-    margins: null,
-  });
+  const [orientation, setOrientationState] = useState<DocOrientation | null>(null);
+  const [pageColor, setPageColorState] = useState<string | null>(null);
+  const pageSetupRef = useRef<PageSetupState>(EMPTY_PAGE_SETUP);
 
   const ydocRef = useRef<Y.Doc | null>(null);
   const titleRef = useRef<string>("");
@@ -245,7 +265,9 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
       setHeaderTextState(result.header_text);
       setFooterTextState(result.footer_text);
       setMarginsState(result.margins ?? null);
-      pageSetupRef.current = { pageSize: result.page_size, headerText: result.header_text, footerText: result.footer_text, margins: result.margins ?? null };
+      setOrientationState(result.orientation ?? null);
+      setPageColorState(result.page_color ?? null);
+      pageSetupRef.current = pageSetupFromResult(result);
       setYdoc(doc);
       refreshComments(id);
 
@@ -413,6 +435,8 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
     setHeaderTextState(next.headerText);
     setFooterTextState(next.footerText);
     setMarginsState(next.margins);
+    setOrientationState(next.orientation);
+    setPageColorState(next.pageColor);
     try {
       const result = await invoke<DocPageSetupResult>("set_doc_page_setup", {
         id,
@@ -420,12 +444,16 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
         headerText: next.headerText,
         footerText: next.footerText,
         margins: next.margins,
+        orientation: next.orientation === "landscape" ? "landscape" : null,
+        pageColor: next.pageColor,
       });
       // The backend clamps margins; adopt what it stored unless a newer edit already landed.
       if (pageSetupRef.current === next) {
-        const stored = { pageSize: result.page_size, headerText: result.header_text, footerText: result.footer_text, margins: result.margins ?? null };
+        const stored = pageSetupFromResult(result);
         pageSetupRef.current = stored;
         setMarginsState(stored.margins);
+        setOrientationState(stored.orientation);
+        setPageColorState(stored.pageColor);
       }
     } catch (err) {
       console.error("Failed to update page setup:", err);
@@ -468,6 +496,8 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
     headerText,
     footerText,
     margins,
+    orientation,
+    pageColor,
     setPageSetup,
   };
 }

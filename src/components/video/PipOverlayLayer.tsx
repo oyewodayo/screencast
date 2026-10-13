@@ -28,7 +28,7 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { ClipCrop, PipOverlay } from "../../utils/videoEditTypes";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { FrameRect, computeLetterboxRect } from "../../utils/videoFrameRect";
-import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
+import { MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
 import PipOverlayPopover, { PipOverlayPatch } from "./PipOverlayPopover";
 import ClipCropOverlay from "./ClipCropOverlay";
 
@@ -533,7 +533,7 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
     let cancelled = false;
     (async () => {
       try {
-        const selected = await openFileDialog({ multiple: false, filters: [{ name: "Video", extensions: FILE_CATEGORY_EXTENSIONS.video }] });
+        const selected = await openFileDialog({ multiple: false, filters: [{ name: "Video", extensions: [...MEDIA_VIDEO_EXTENSIONS] }] });
         if (cancelled || !selected || Array.isArray(selected)) return; // cancelled
 
         const src = convertFileSrc(selected);
@@ -553,9 +553,9 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
         const aspect = metadata.height > 0 ? metadata.width / metadata.height : 1;
         const height = frameRect.height > 0 ? (width * frameRect.width) / aspect / frameRect.height : width;
         const x = Math.max(0, 1 - width - DEFAULT_PIP_MARGIN_FRACTION);
-        // Bottom-right of the part of the frame actually visible - VideoPlayer is full window height
-        // and BottomDocker (publishing its height as --docker-height) is drawn over its lower edge,
-        // so the frame's true bottom corner is often hidden behind the timeline, where the new pip
+        // Bottom-right of the part of the frame actually visible - VideoPlayer now reserves
+        // --docker-height so this is normally the frame's own corner, but this stays as a guard
+        // for any frame BottomDocker still overlaps, where a new pip hidden behind the timeline
         // could be neither seen nor grabbed.
         const y = Math.max(0, visibleFrameBottomFraction(originRef.current, frameRect) - height - DEFAULT_PIP_MARGIN_FRACTION);
         const startTime = currentOutputTime;

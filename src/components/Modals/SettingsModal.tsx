@@ -164,7 +164,12 @@ interface CacheCategoryInfo {
 // namespace (a future cache this list hasn't been updated for) still renders fine via the
 // fallback in the render code below, just without a friendly description.
 const CACHE_CATEGORY_INFO: Record<string, { label: string; description: string }> = {
-  thumb_v1: { label: "Image thumbnails", description: "Gallery-grid preview images for photos." },
+  // thumb_v1 predates EXIF-orientation support (see generate_plain_thumbnail) - still listed so
+  // its leftovers can be cleared.
+  thumb_v1: { label: "Image thumbnails (old)", description: "Earlier gallery-grid previews, before photo rotation was honored." },
+  thumb_v2: { label: "Image thumbnails", description: "Gallery-grid preview images for photos." },
+  image_clip_v1: { label: "Image clip previews", description: "Still-video previews of photos used as clips in the video editor." },
+  video_canvas_v1: { label: "Video project canvases", description: "Blank frames video projects preview on." },
   video_thumb_v1: { label: "Video poster frames", description: "Gallery-grid preview frames for videos." },
   scrub_sprite_v1: { label: "Video scrub-bar previews", description: "Hover-preview thumbnails shown while dragging a video's timeline." },
   heic_v2: { label: "HEIC/HEIF photo previews", description: "Decoded previews for iPhone-style photos." },
@@ -449,6 +454,18 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     ))}
                   </div>
                 </div>
+
+                <Field label="Show status bar">
+                  <input
+                    type="checkbox"
+                    checked={settings.showDockerStatusBar}
+                    onChange={(e) => update("showDockerStatusBar", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  The last row of the bottom bar - date/time, CPU RAM, OS and the "Request feature / Report a bug" link.
+                </p>
               </Section>
             )}
 

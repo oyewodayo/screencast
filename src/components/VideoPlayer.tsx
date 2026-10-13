@@ -4,6 +4,7 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { trackEvent } from '../utils/telemetry';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { createPortal } from 'react-dom';
 import { IoPause, IoPlay, IoPlaySkipBack, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
@@ -30,8 +31,16 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
-import { ActiveClipEffects, cropStaticTransform, cssFilterForColorPreset, kenBurnsTransform } from '../utils/videoColorFilters';
-import { ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
+import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, playerFraming } from '../utils/videoColorFilters';
+import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
+import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile } from '../utils/captions';
+import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
+import CaptionOverlayLayer from './video/CaptionOverlayLayer';
+import GradeCanvas from './video/GradeCanvas';
+import { speedAtSource } from '../utils/clipTiming';
+import type { Lut3D } from '../utils/colorGrade';
+import { PlayerCaptionsPanel, PlayerChaptersPanel } from './video/PlayerSidePanels';
+import { useToolPanelHost } from './docker/ToolPanelHost';
 import { loadRnnoise, RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 import rnnoiseWorkletPath from '@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url';
 import rnnoiseWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise.wasm?url';
@@ -173,6 +182,13 @@ interface VideoPlayerProps {
   // without re-measuring it independently. Keeps VideoPlayer itself fully generic - it has no
   // idea what's actually being rendered inside (text overlays, or anything else later).
   overlay?: (frameRect: FrameRect) => React.ReactNode;
+  // Pinned to the left end of the control bar, showing/hiding with it - Dashboard's "Back to …"
+  // button, which used to be its own row above the player and cost the picture that height.
+  controlsLeading?: React.ReactNode;
+  // Opens/closes the player's own sidebar panels (viewing captions, chapters). When set, the
+  // parent shows its Tools tab for them (and provides ToolPanelHost); when absent, chapters keep
+  // their popup menu and captions have no sidebar option.
+  onSidebarPanelChange?: (open: boolean) => void;
   // The primary video's own persisted/exported audio level (useVideoEditStore's
   // videoAudioMuted/videoAudioVolume) - distinct from this component's own volume slider/mute
   // button just below, which is pure local listening convenience that never leaves this session.
@@ -187,6 +203,9 @@ interface VideoPlayerProps {
   // unaware otherwise, just applying whatever small descriptor it's handed straight to the
   // <video> element's own CSS.
   activeClipEffects?: ActiveClipEffects | null;
+  // The active clip's color grade, baked to a 3D LUT (colorGrade.ts) - shown through GradeCanvas's
+  // WebGL layer. null/undefined = no grade, the video shows directly.
+  gradeLut?: Lut3D | null;
   // Live status of the noise-reduction Web Audio graph below - "calibrating" while the worklet
   // module is loading and/or its noise profile is being learned, "active" once real subtraction
   // is running, "idle" whenever activeClipEffects?.noiseReduction is unset/0 (including before
@@ -229,6 +248,11 @@ export interface VideoPlayerHandle {
   // A/B compare: true routes the untouched original audio to the speakers instead of the cleaned
   // signal (NoiseReductionPopover's "Hold to hear original"), false switches back.
   setNoisePreviewBypass: (bypass: boolean) => void;
+  // What's actually on screen right now, read straight off the <video> - for per-frame preview
+  // layers (TransitionPreviewLayer) that need the exact current time and need to know whether a
+  // source swap (loadSource) has finished: `src` is the URL last assigned, and `hasFrame` is false
+  // until that source has decoded a frame to show.
+  getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean } | null;
 }
 
 // Decoded noise samples (mono 48kHz PCM from decode_audio_range), keyed by file+range. A handful
@@ -272,7 +296,7 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, onNoiseReductionStatusChange, onPrevious, onNext }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -429,23 +453,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const effects = activeClipEffectsRef.current;
     const crop = liveCropOverrideRef.current ?? effects?.crop;
     const kb = effects?.kenBurns;
-    // Mirrors the raw frame first (rightmost/innermost - see cropStaticTransform's own comment on
-    // CSS transform composition order), matching conversion.rs's segment_effect_chain, which runs
-    // `hflip` before crop/Ken Burns so crop/pan coordinates describe the already-mirrored frame the
-    // same way in both preview and export.
-    const flipTransform = effects?.flipHorizontal ? 'scaleX(-1)' : '';
-    if (!crop && !kb) {
-      video.style.transform = flipTransform;
-      return;
-    }
-    const cropTransform = crop ? cropStaticTransform(crop) : '';
-    if (!kb) {
-      video.style.transform = `${cropTransform} ${flipTransform}`.trim();
-      return;
-    }
-    const duration = Math.max(0.01, effects!.sourceEnd - effects!.sourceStart);
-    const progress = Math.max(0, Math.min(1, (video.currentTime - effects!.sourceStart) / duration));
-    video.style.transform = `${cropTransform} ${kenBurnsTransform(kb, progress)} ${flipTransform}`.trim();
+    const progress = kb && effects
+      ? (video.currentTime - effects.sourceStart) / Math.max(0.01, effects.sourceEnd - effects.sourceStart)
+      : 0;
+    // Export's exact framing: fitted into the project frame, then flip -> crop -> Ken Burns
+    // (clipFrameAffine), clipped to the frame (playerFraming).
+    const m = clipFrameAffine({ crop, kenBurns: kb, flipHorizontal: effects?.flipHorizontal }, progress);
+    const framing = playerFraming(
+      m,
+      { width: video.clientWidth, height: video.clientHeight },
+      { width: video.videoWidth, height: video.videoHeight },
+      effects?.frame ?? null
+    );
+    video.style.transformOrigin = framing.transform ? '0 0' : '';
+    video.style.transform = framing.transform;
+    video.style.clipPath = framing.clipPath;
   };
 
   useImperativeHandle(ref, () => ({
@@ -481,6 +503,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       const t = graph.ctx.currentTime;
       graph.originalGain.gain.setTargetAtTime(bypass ? 1 : 0, t, 0.015);
       graph.processedGain.gain.setTargetAtTime(bypass ? 0 : 1, t, 0.015);
+    },
+    getPlaybackState: () => {
+      const video = videoRef.current;
+      if (!video) return null;
+      return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2 };
     },
   }), []);
 
@@ -557,6 +584,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // LATEST url is without needing it in that effect's own deps.
   const [captionsUrl, setCaptionsUrl] = useState<string | null>(null);
   const captionsUrlRef = useRef<string | null>(null);
+  // Where to resume, as of when this file was opened - see onLoadedMetadata.
+  const initialTimeRef = useRef(initialTime);
   captionsUrlRef.current = captionsUrl;
   // Shown when the CC button is clicked with nothing loaded yet - lets the user pick between a
   // file of their own and offline generation, rather than the button jumping straight to one.
@@ -1020,6 +1049,95 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => track.removeEventListener('cuechange', syncCue);
   }, [captionsUrl]);
 
+  // Viewing captions drawn with the caption presets (CaptionOverlayLayer, the same renderer as the
+  // editor's burned-in captions) instead of the plain cue box: the whole cue list is read from the
+  // caption Blob once, and lines/words are timed off it (word timing estimated within each cue,
+  // since a subtitle file only times whole cues). Style is a viewer preference, never saved into a
+  // file - see playerCaptionSettings.ts. The plain cue box below remains the fallback.
+  const [playerCaptionSettings, setPlayerCaptionSettings] = useState<CaptionSettings>(loadPlayerCaptionSettings);
+  const updatePlayerCaptionSettings = (patch: Partial<CaptionSettings>): void => {
+    setPlayerCaptionSettings((prev) => {
+      const next = { ...prev, ...patch };
+      savePlayerCaptionSettings(next);
+      return next;
+    });
+  };
+  const [playerCues, setPlayerCues] = useState<SubtitleCue[]>([]);
+  useEffect(() => {
+    if (!captionsUrl) {
+      setPlayerCues([]);
+      return;
+    }
+    let cancelled = false;
+    fetch(captionsUrl)
+      .then((r) => r.text())
+      .then((text) => !cancelled && setPlayerCues(parseSubtitleFile(text)))
+      .catch(() => !cancelled && setPlayerCues([]));
+    return () => {
+      cancelled = true;
+    };
+  }, [captionsUrl]);
+  const playerCaptionLines = useMemo(
+    () =>
+      playerCues.length === 0
+        ? []
+        : buildCaptionLines([{ id: 'player', sourcePath: 'player', start: 0, end: Number.MAX_SAFE_INTEGER }], {
+            language: '',
+            transcripts: { player: cuesToCaptionWords(playerCues) },
+            settings: playerCaptionSettings,
+          }),
+    [playerCues, playerCaptionSettings]
+  );
+
+  // Caption generation is resumable (generate_captions works in saved pieces, conversion.rs) - if a
+  // job for this file was interrupted (app closed, file switched), pick it up again on open rather
+  // than making the user start it over. Waits a moment first so an auto-detected sibling caption
+  // file, if there is one, wins instead.
+  useEffect(() => {
+    if (!filePath || mediaType !== 'video') return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      invoke<{ done: number; total: number } | null>('caption_job_progress', { inputPath: filePath, language: captionsLanguage, words: false })
+        .then((job) => {
+          if (cancelled || !job || captionsUrlRef.current) return;
+          void generateCaptionsFromAudio(captionsLanguage);
+        })
+        .catch(() => {});
+    }, 1500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filePath, mediaType]);
+
+  // The player's sidebar panels (PlayerSidePanels.tsx), portaled into the parent's Tools tab.
+  const toolPanelHost = useToolPanelHost();
+  const [sidebarPanel, setSidebarPanel] = useState<null | 'captions' | 'chapters'>(null);
+  const onSidebarPanelChangeRef = useRef(onSidebarPanelChange);
+  onSidebarPanelChangeRef.current = onSidebarPanelChange;
+  useEffect(() => {
+    onSidebarPanelChangeRef.current?.(sidebarPanel !== null);
+  }, [sidebarPanel]);
+  useEffect(() => () => onSidebarPanelChangeRef.current?.(false), []);
+
+  // Numeric playback time for the caption renderer and the panels (timeupdate, ~4Hz - the caption
+  // layer interpolates between ticks itself). Only listened to while something needs it.
+  const [playbackClock, setPlaybackClock] = useState(0);
+  const needsPlaybackClock = (captionsVisible && playerCaptionLines.length > 0) || sidebarPanel !== null;
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !needsPlaybackClock) return;
+    const tick = () => setPlaybackClock(video.currentTime);
+    tick();
+    video.addEventListener('timeupdate', tick);
+    video.addEventListener('seeked', tick);
+    return () => {
+      video.removeEventListener('timeupdate', tick);
+      video.removeEventListener('seeked', tick);
+    };
+  }, [needsPlaybackClock]);
+
   // Revokes whatever caption Blob URL is current when this player unmounts entirely (a file
   // switch already revokes the previous one itself, in the effect above) - reads captionsUrlRef
   // rather than closing over captionsUrl so this always sees the latest value regardless of which
@@ -1045,12 +1163,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => observer.disconnect();
   }, []);
 
+  // The project frame when editing (every clip is fitted into it, as export does), else the file's.
+  const frameSize = activeClipEffects?.frame ?? videoIntrinsicSize;
   const frameRect = useMemo(
     () =>
-      containerSize && videoIntrinsicSize
-        ? computeLetterboxRect(containerSize.width, containerSize.height, videoIntrinsicSize.width, videoIntrinsicSize.height)
+      containerSize && frameSize
+        ? computeLetterboxRect(containerSize.width, containerSize.height, frameSize.width, frameSize.height)
         : null,
-    [containerSize, videoIntrinsicSize]
+    [containerSize, frameSize?.width, frameSize?.height]
   );
 
   // Some containers/codecs this app can record (most notably .avi - WebView2's <video> element
@@ -1188,6 +1308,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     });
   };
 
+  const clearChapters = (): void => {
+    setChapters([]);
+    persistChapters([]);
+  };
+
   const seekToChapter = (time: number): void => {
     const video = videoRef.current;
     if (!video) return;
@@ -1247,16 +1372,23 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         noiseDb: null,
         minDuration: null,
       });
-      const MERGE_TOLERANCE_SEC = 3;
+      // Every pause in a long talk is a silence range - thousands on a multi-hour video. Chapters
+      // come from the LONGEST pauses only, at least minGap apart, and at most maxChapters of
+      // them: both scale with the video's length (about one per 4 minutes, 3-40 in total).
       const END_MARGIN_SEC = 2; // skip a suggestion this close to the very end - nothing left to chapter
-      const candidates = ranges
-        .map((r) => r.end)
-        .filter((t) => !Number.isFinite(duration) || t < (duration as number) - END_MARGIN_SEC);
+      const total = Number.isFinite(duration) ? (duration as number) : Math.max(0, ...ranges.map((r) => r.end));
+      const maxChapters = Math.max(3, Math.min(40, Math.round(total / 240)));
+      const minGap = Math.max(30, total / (maxChapters * 1.5));
+      const byLength = ranges
+        .filter((r) => r.end > 1 && r.end < total - END_MARGIN_SEC)
+        .sort((a, b) => b.end - b.start - (a.end - a.start));
 
       setChapters((prev) => {
         const additions: Chapter[] = [];
-        for (const time of candidates) {
-          const tooClose = [...prev, ...additions].some((c) => Math.abs(c.time - time) < MERGE_TOLERANCE_SEC);
+        for (const r of byLength) {
+          if (additions.length >= maxChapters) break;
+          const time = r.end;
+          const tooClose = [...prev, ...additions].some((c) => Math.abs(c.time - time) < minGap);
           if (!tooClose) additions.push({ id: crypto.randomUUID(), time, label: formatChapterTime(time) });
         }
         const next = [...prev, ...additions].sort((a, b) => a.time - b.time);
@@ -1454,8 +1586,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    video.playbackRate = activeClipEffects?.speed ?? 1;
-  }, [activeClipEffects?.speed]);
+    const fx = activeClipEffects;
+    video.playbackRate = fx?.speed ?? 1;
+    if (!fx?.speedRamp) return;
+    // A speed ramp: follow its constant-speed steps (clipTiming.ts) - the same steps export renders
+    // - switching rate as playback crosses each step's start.
+    const clip = { start: fx.sourceStart, end: fx.sourceEnd, speed: fx.speed, speedRamp: fx.speedRamp };
+    let raf = 0;
+    const tick = () => {
+      const rate = speedAtSource(clip, video.currentTime);
+      if (Math.abs(video.playbackRate - rate) > 1e-3) video.playbackRate = rate;
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [activeClipEffects?.speed, activeClipEffects?.speedRamp, activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd]);
 
   // Live audio-cleanup preview - wires this <video> element's audio through the graph described at
   // noiseGraphRef the first time any clip turns any cleanup on, then just retunes it for whichever
@@ -1636,36 +1781,35 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioEffects?.id, audioEffects?.noiseReduction, audioEffects?.sourcePath, audioCleanupKey]);
 
-  // Live-preview crop + Ken Burns, combined into the one thing that's ever allowed to write
-  // video.style.transform (two separate effects each writing it independently would race and
-  // clobber each other) - applyCropAndKenBurns above does the actual writing, reusable here AND
-  // from previewCropLive's own drag-move hot path. Crop is a static "zoom window"
-  // (cropStaticTransform) composed BEFORE Ken Burns' own scale/translate - same order crop_chain
-  // runs before ken_burns_chain on the export side (conversion.rs), so Ken Burns zooms/pans within
-  // the already-cropped window rather than the original uncropped frame. Ken Burns still needs its
-  // own rAF loop reading video.currentTime directly (the 'timeupdate' event fires far too coarsely,
-  // ~4x/sec, for a smooth zoom/pan) - a crop with no Ken Burns is static and just gets written
-  // once, no rAF needed. Safe to transform the <video> element itself: it fills its container at
-  // 100%/100% with object-fit:contain handling the letterboxing, so scaling/translating the element
-  // scales/pans/zooms the picture uniformly around its own center exactly like these effects should.
+  // Live-preview framing (flip, crop, Ken Burns) - applyCropAndKenBurns is the one thing that ever
+  // writes video.style.transform/clipPath. Static framing is rewritten whenever the element or the
+  // picture changes size (its offsets are in px); Ken Burns also needs every animation frame, read
+  // off video.currentTime ('timeupdate' is ~4x/sec - far too coarse for a smooth move).
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     applyCropAndKenBurns();
-    const kb = activeClipEffects?.kenBurns;
-    if (!kb) return;
-    let raf: number;
-    const tick = () => {
-      applyCropAndKenBurns();
+    const resize = new ResizeObserver(() => applyCropAndKenBurns());
+    resize.observe(video);
+    video.addEventListener('loadedmetadata', applyCropAndKenBurns);
+    let raf = 0;
+    if (activeClipEffects?.kenBurns) {
+      const tick = () => {
+        applyCropAndKenBurns();
+        raf = requestAnimationFrame(tick);
+      };
       raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
+    }
     return () => {
       cancelAnimationFrame(raf);
+      resize.disconnect();
+      video.removeEventListener('loadedmetadata', applyCropAndKenBurns);
       video.style.transform = '';
+      video.style.transformOrigin = '';
+      video.style.clipPath = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal]);
+  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal, activeClipEffects?.frame?.width, activeClipEffects?.frame?.height]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);
@@ -2008,19 +2152,29 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Reports playback position as it advances, and once more on unmount/file-change — the latter
   // is what lets a caller (Dashboard, for audio) capture "wherever this track was" the moment the
   // user navigates away, even if they navigated mid-scrub between two timeupdate ticks.
+  //
+  // Through a ref, not as an effect dependency: callers pass a fresh inline function every render,
+  // which used to re-run this effect on each one - and its cleanup's "report where we are" fired
+  // with currentTime 0 while a file was still loading, which the resume store reads as "went back
+  // to the start" and deletes the saved position before the player ever seeked to it. The unmount
+  // report is also skipped until metadata has loaded, for the same reason.
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  onTimeUpdateRef.current = onTimeUpdate;
   useEffect(() => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
     const video = videoRef.current;
-    if (!video || !onTimeUpdate) return;
+    if (!video) return;
 
-    const handleTimeUpdate = (): void => onTimeUpdate(video.currentTime);
+    const handleTimeUpdate = (): void => {
+      if (video.readyState >= 1) onTimeUpdateRef.current?.(video.currentTime);
+    };
     video.addEventListener('timeupdate', handleTimeUpdate);
 
     return () => {
       video.removeEventListener('timeupdate', handleTimeUpdate);
-      onTimeUpdate(video.currentTime);
+      if (video.readyState >= 1) onTimeUpdateRef.current?.(video.currentTime);
     };
-  }, [mediaType, onTimeUpdate]);
+  }, [mediaType]);
 
   // Icons components (could be moved to separate file)
   const MiniPlayerIcon: React.FC = () => (
@@ -2095,7 +2249,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		onMouseLeave={hide}
 		onTouchStart={show}
 		onTouchMove={show}
-		className="flex flex-row relative w-full h-screen">
+		// h-full of the pane it's given (not h-screen) with the bottom --docker-height reserved:
+		// BottomDocker is a fixed overlay, so the player sizes itself to just the strip visible
+		// above it - the <video> letterboxes into that and the controls sit at its bottom edge,
+		// never under the docker or past the window (a full-window box below the "Back" row
+		// overflowed the pane and scrolled the whole page).
+		className="flex flex-row relative w-full h-full pb-[var(--docker-height,64px)]">
 
 		{showAlert && (
 			<Alert
@@ -2153,13 +2312,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		)}
       
     	<div
-        	className={`w-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
+        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
 			ref={videoContainerRef}
-			style={{ opacity: videoOpacity }}
+			// --player-h (live container height, from the ResizeObserver below) caps the control bar's
+			// flyout menus in player.css so a short player scrolls them instead of clipping their top.
+			style={{ opacity: videoOpacity, ...(containerSize ? { '--player-h': `${containerSize.height}px` } : {}) } as React.CSSProperties}
 			data-volume-level={volumeLevel}>
 			{(mediaType === 'video' || mediaType === 'audio') && (
 				<div>
-					<div className="video-controls-container py-2 place-items-center">
+					<div className="video-controls-container pt-1 pb-1 place-items-center">
 					<div
 						className="timeline-container"
 						id="timelineContainer"
@@ -2186,18 +2347,28 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 									: `${formatChapterTime(hoveredChapter.time)} — ${hoveredChapter.label}`}
 							</div>
 						)}
-						{videoRef.current && Number.isFinite(videoRef.current.duration) && chapters.map((chapter) => (
-							<div
-								key={chapter.id}
-								className="chapter-tick"
-								style={{ left: `${(chapter.time / videoRef.current!.duration) * 100}%` }}
-								title={chapter.label}
-							/>
-						))}
+						{videoRef.current && Number.isFinite(videoRef.current.duration) && (() => {
+							// At most one tick per 0.75% of the bar - closer ones would merge into a
+							// solid white strip over the progress.
+							const duration = videoRef.current!.duration;
+							let lastPct = -Infinity;
+							return chapters.map((chapter) => {
+								const pct = (chapter.time / duration) * 100;
+								if (pct - lastPct < 0.75) return null;
+								lastPct = pct;
+								return <div key={chapter.id} className="chapter-tick" style={{ left: `${pct}%` }} title={chapter.label} />;
+							});
+						})()}
 						</div>
 					</div>
 					
-					<div className="controls flex flex-row justify-between mt-2">
+					{/* [leading | centred cluster | spacer]: the two flex-1 sides keep the playback cluster
+					    centred, and the leading side (Dashboard's "Back to …") can only ever take the
+					    space beside it, never overlap it. player.css's @container player rules shrink
+					    and then thin out the cluster as the player itself narrows. */}
+					<div className="controls flex flex-row items-center">
+						<div className="ctl-side ctl-leading">{controlsLeading}</div>
+						<div className="ctl-cluster">
 						<div className='flex gap-5'>
 						{onPrevious && (
 							<button className="w-7" onClick={onPrevious} data-tip={`Previous ${mediaType === 'audio' ? 'track' : 'video'}`} data-tip-kbd="Shift+P" aria-label="Previous">
@@ -2240,7 +2411,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 						</div>
 						
-						<div className="flex flex-col place-items-center items-center">
+						<div className="ctl-skip flex flex-col place-items-center items-center">
 						<div ref={skipControlsRef} className='relative flex gap-4'>
 							<button
 							className='flex justify-center place-items-center'
@@ -2312,7 +2483,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							<button
 								ref={chaptersBtnRef}
 								className="chapters-btn w-7"
-								onClick={() => setShowChaptersMenu((prev) => !prev)}
+								onClick={() =>
+									onSidebarPanelChange
+										? setSidebarPanel((prev) => (prev === 'chapters' ? null : 'chapters'))
+										: setShowChaptersMenu((prev) => !prev)
+								}
 								title={chapters.length > 0 ? `${chapters.length} chapter${chapters.length === 1 ? '' : 's'}` : 'Chapters'}
 							>
 								{chapters.length > 0
@@ -2487,6 +2662,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							hasCaptions={!!captionsUrl}
 							captionsVisible={captionsVisible}
 							onCaptionsVisibleChange={() => setCaptionsVisible((prev) => !prev)}
+							onShowCaptionsInSidebar={
+								onSidebarPanelChange
+									? () => {
+											setShowSettings(false);
+											setSidebarPanel('captions');
+										}
+									: undefined
+							}
 							generatedCaptionsLanguage={generatedCaptionsLanguage}
 							onLoadCaptionsFile={() => { setShowSettings(false); void pickCaptionsFile(); }}
 							onGenerateCaptions={() => { setShowSettings(false); void generateCaptionsFromAudio(); }}
@@ -2512,6 +2695,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							{isFullscreen ? <BsFullscreenExit className='text-2xl' /> : <BsFullscreen className='text-2xl' />}
 						</button>
 						</div>
+						</div>
+						<div className="ctl-side" />
 					</div>
 					</div>
 				</div>
@@ -2528,8 +2713,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						onLoadedMetadata={() => {
 							if (videoRef.current) {
 							setTotalTimeElement(formatDuration(videoRef.current.duration));
-							if (initialTime && Number.isFinite(initialTime) && initialTime > 0 && initialTime < videoRef.current.duration) {
-								videoRef.current.currentTime = initialTime;
+							// The position as it was when this file opened (initialTimeRef), not whatever a
+							// later render's prop says - those can already reflect early timeupdate ticks.
+							const resumeAt = initialTimeRef.current;
+							if (resumeAt && Number.isFinite(resumeAt) && resumeAt > 0 && resumeAt < videoRef.current.duration) {
+								videoRef.current.currentTime = resumeAt;
 							}
 							setVideoIntrinsicSize({ width: videoRef.current.videoWidth, height: videoRef.current.videoHeight });
 							}
@@ -2544,11 +2732,71 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							/>
 						)}
 					</video>
-					{captionsVisible && activeCaptionText && (
-						<div className="caption-overlay" aria-live="polite">
-							<span className="caption-text">{activeCaptionText}</span>
+					{/* WebGL color-grade layer - only present while the clip on screen has a grade. */}
+					<GradeCanvas videoRef={videoRef} lut={gradeLut} />
+					{captionsVisible && playerCaptionLines.length > 0 && frameRect ? (
+						<div
+							className="absolute pointer-events-none"
+							style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height, zIndex: 90 }}
+							aria-live="polite"
+						>
+							<CaptionOverlayLayer
+								frameRect={frameRect}
+								lines={playerCaptionLines}
+								settings={{ ...playerCaptionSettings, enabled: true }}
+								currentOutputTime={playbackClock}
+								isPlaying={isPlaying}
+								clipSpeed={1}
+							/>
 						</div>
+					) : (
+						captionsVisible &&
+						activeCaptionText && (
+							<div className="caption-overlay" aria-live="polite">
+								<span className="caption-text">{activeCaptionText}</span>
+							</div>
+						)
 					)}
+					{toolPanelHost &&
+						sidebarPanel === 'captions' &&
+						createPortal(
+							<PlayerCaptionsPanel
+								hasCaptions={!!captionsUrl}
+								visible={captionsVisible}
+								onVisibleChange={setCaptionsVisible}
+								settings={playerCaptionSettings}
+								onUpdateSettings={updatePlayerCaptionSettings}
+								lines={playerCaptionLines}
+								currentTime={playbackClock}
+								onSeek={(t) => {
+									if (videoRef.current) videoRef.current.currentTime = t;
+								}}
+								exportBaseName={(filePath?.split(/[\\/]/).pop() ?? 'video').replace(/\.[^.]+$/, '')}
+								onLoadFile={() => void pickCaptionsFile()}
+								onGenerate={() => void generateCaptionsFromAudio()}
+								generating={isGeneratingCaptions ? { progress: captionsGenerationProgress ?? 0, downloadingModel: isDownloadingSpeechModel } : null}
+								onClose={() => setSidebarPanel(null)}
+							/>,
+							toolPanelHost
+						)}
+					{toolPanelHost &&
+						sidebarPanel === 'chapters' &&
+						createPortal(
+							<PlayerChaptersPanel
+								chapters={chapters}
+								activeChapterId={[...chapters].reverse().find((c) => c.time <= playbackClock + 0.05)?.id}
+								currentTime={playbackClock}
+								isDetecting={isDetectingChapters}
+								onSeek={seekToChapter}
+								onRename={renameChapter}
+								onDelete={deleteChapter}
+								onAdd={addChapterAtCurrentTime}
+								onDetect={() => void detectChaptersFromSilence()}
+								onClearAll={clearChapters}
+								onClose={() => setSidebarPanel(null)}
+							/>,
+							toolPanelHost
+						)}
 					{mediaType === 'audio' && (
 						<canvas ref={visualizerCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
 					)}

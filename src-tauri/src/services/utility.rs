@@ -599,6 +599,18 @@ pub fn reset_briefcast_dir(app_handle: AppHandle) -> Result<String, String> {
     path_to_str(&new_root).map(|s| s.to_string())
 }
 
+// Media the video editor makes from your clips - a reversed copy of a clip's range, a frozen frame
+// as a still - kept inside the library (not the disposable preview cache) because edits point at
+// them: a project or edit that uses one keeps working after a cache clear or on another machine
+// the library is moved to. Hidden from the file list like the other app-managed folders.
+pub const DERIVED_MEDIA_DIR_NAME: &str = ".briefcast-media";
+
+pub fn derived_media_dir() -> Result<PathBuf, String> {
+    let dir = briefcast_dir()?.join(DERIVED_MEDIA_DIR_NAME);
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create the editor's media folder: {}", e))?;
+    Ok(dir)
+}
+
 #[command(async)]
 // Read-only, so deliberately not behind responsiveness::serial(): it walks the whole library, and
 // holding the app-wide write lock for that meant every whiteboard, mindmap, doc and board command
@@ -677,6 +689,7 @@ fn scan_directory(root: &Path, dir: &Path, result: &mut HashMap<String, Vec<File
                 || dir_name == Some(super::docs::DOCS_DIR_NAME)
                 || dir_name == Some(super::whiteboards::WHITEBOARDS_DIR_NAME)
                 || dir_name == Some(super::mindmaps::MINDMAPS_DIR_NAME)
+                || dir_name == Some(DERIVED_MEDIA_DIR_NAME)
             {
                 continue;
             }
@@ -855,6 +868,8 @@ fn is_media_file(ext: &str) -> bool {
         "jpg" | "jpeg" | "png" | "gif"  | "bmp" | "tiff" | "heic" | "heif" |
         "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" |
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv" |
+        // Video projects (services/video_edits.rs) - an image-built timeline, listed with videos.
+        "briefvideo" |
         "pdf" |
         // docx/md/txt: what Docs' export feature (services/docs.rs's export_doc/
         // export_doc_binary) writes into briefcast_dir() - without these here they'd be filtered

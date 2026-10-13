@@ -483,6 +483,124 @@ pub async fn get_playable_preview(
     .await
 }
 
+// How long an image clip's preview proxy runs - and so the longest an image clip can be stretched
+// on the timeline (its "source duration", see IMAGE_CLIP_MAX_SECONDS in videoEditTypes.ts).
+const IMAGE_CLIP_PROXY_SECONDS: u32 = 600;
+// Preview proxies never need more than this on their long edge - the player shows them at window
+// size, and every pixel here is encode time spent before the clip can preview at all.
+const PROXY_MAX_EDGE: u32 = 1920;
+
+// Scales frame_width x frame_height down (aspect kept) to fit PROXY_MAX_EDGE, even dimensions.
+fn proxy_size(frame_width: u32, frame_height: u32) -> (u32, u32) {
+    let (w, h) = (frame_width.max(2) as f64, frame_height.max(2) as f64);
+    let scale = (PROXY_MAX_EDGE as f64 / w.max(h)).min(1.0);
+    let even = |v: f64| ((v * scale / 2.0).round() as u32 * 2).max(2);
+    (even(w), even(h))
+}
+
+// Runs one short-lived ffmpeg encode for the proxies below (no progress events, no shared
+// ConversionState - these are background preview assets, not a user-visible conversion), writing
+// to a temp file first so an interrupted encode can never leave a truncated file at the cache path.
+async fn encode_preview_proxy(ffmpeg_path: PathBuf, args: Vec<String>, cache_path: PathBuf) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
+        }
+        let tmp = cache_path.with_extension("partial.mp4");
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-y").args(&args).arg(path_to_str(&tmp)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() {
+            let _ = std::fs::remove_file(&tmp);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("unknown error").to_string();
+            return Err(format!("Couldn't prepare preview: {}", reason));
+        }
+        std::fs::rename(&tmp, &cache_path).map_err(|e| format!("Failed to store preview: {}", e))?;
+        path_to_str(&cache_path).map(|s| s.to_string())
+    })
+    .await
+    .map_err(|e| format!("Preview task panicked: {e}"))?
+}
+
+// The live preview of an image clip. The editor's player follows the timeline by seeking one
+// <video> element from clip to clip (VideoTimelineDocker's live-preview effect), so rather than
+// teaching it a second, image-shaped playback mode, an image clip previews as a cached
+// low-frame-rate "still video" of that image - every existing preview effect (crop, Ken Burns, color grade,
+// flip) then just works on it. Already letterboxed into the timeline's own frame by the same
+// scale+pad export applies (frame_fit_chain), so positions line up with the real render exactly.
+// Export never reads this file - it loops the original image at full quality instead.
+#[tauri::command]
+pub async fn get_image_clip_proxy(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    image_path: String,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<String, String> {
+    let input = PathBuf::from(&image_path);
+    let (w, h) = proxy_size(frame_width, frame_height);
+    // Frame size goes in the file name, not the namespace, so every proxy shares one cache entry in
+    // Settings' storage list regardless of how many frame sizes have been used.
+    let cache_path = preview_cache_path(&input, "image_clip_v1", &format!("{}x{}.mp4", w, h))?;
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    let source = still_image_source(&app_handle, &window, &state, &image_path).await?;
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let args: Vec<String> = vec![
+        "-loop".into(), "1".into(),
+        // One frame every 10s: every frame is the same picture, and encode time scales with frame
+        // count (measured: 600 frames took ~15s at 1080p, 60 frames ~2.4s, for the same file).
+        "-framerate".into(), "0.1".into(),
+        "-i".into(), source,
+        "-t".into(), IMAGE_CLIP_PROXY_SECONDS.to_string(),
+        "-vf".into(), frame_fit_chain(w as i64, h as i64, true)[1..].to_string(),
+        "-c:v".into(), "libx264".into(),
+        "-preset".into(), "ultrafast".into(),
+        "-tune".into(), "stillimage".into(),
+        // A single keyframe - the rest are near-empty repeats, so seeking anywhere decodes only a
+        // few dozen trivial frames, and the whole proxy stays a few hundred KB.
+        "-g".into(), "60".into(),
+        "-an".into(),
+        "-movflags".into(), "+faststart".into(),
+    ];
+    encode_preview_proxy(ffmpeg_path, args, cache_path).await
+}
+
+// The "primary file" a video project plays while no clip is under the playhead (an empty
+// timeline, or before the first clip has loaded) - a short black video at the project's own frame
+// size. The timeline reads the project's frame size off this (its videoPixelSize), the same way it
+// reads a real video's, so overlay burn-in and export resolution need no project-specific path.
+#[tauri::command]
+pub async fn get_video_canvas_proxy(app_handle: AppHandle, width: u32, height: u32) -> Result<String, String> {
+    let (w, h) = ((width.max(2) / 2) * 2, (height.max(2) / 2) * 2);
+    let cache_path = std::env::temp_dir()
+        .join("briefcast_preview_cache")
+        .join("video_canvas_v1")
+        .join(format!("{}x{}.mp4", w, h));
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let args: Vec<String> = vec![
+        "-f".into(), "lavfi".into(),
+        "-i".into(), format!("color=c=black:s={}x{}:r=1:d=10", w, h),
+        "-c:v".into(), "libx264".into(),
+        "-preset".into(), "ultrafast".into(),
+        "-pix_fmt".into(), "yuv420p".into(),
+        "-an".into(),
+        "-movflags".into(), "+faststart".into(),
+    ];
+    encode_preview_proxy(ffmpeg_path, args, cache_path).await
+}
+
 // Convert a still image (screenshot) between png/jpeg/webp/bmp. No audio/video codec args
 // apply here - ffmpeg's image2 muxer picks a sane default encoder from the output extension,
 // and run_conversion's duration-based progress just never populates (there's no "Duration:"
@@ -933,7 +1051,9 @@ pub async fn get_image_thumbnail(
     // side instead of in here.
     log::debug!("get_image_thumbnail: {}", input_path);
     let input = PathBuf::from(&input_path);
-    let cache_path = preview_cache_path(&input, "thumb_v1", "jpg")?;
+    // v2: thumbnails now honor EXIF orientation (see generate_plain_thumbnail) - the bump is what
+    // retires every sideways phone-photo thumbnail cached under v1.
+    let cache_path = preview_cache_path(&input, "thumb_v2", "jpg")?;
 
     if cache_path.exists() {
         return path_to_str(&cache_path).map(|s| s.to_string());
@@ -1000,7 +1120,19 @@ pub async fn get_image_thumbnail(
 }
 
 fn generate_plain_thumbnail(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
-    let img = image::open(input).map_err(|e| format!("Failed to open image: {e}"))?;
+    use image::ImageDecoder;
+    // Decoded through the format's own decoder (not image::open) so the EXIF orientation a phone
+    // camera writes instead of rotating the pixels can be applied - image::open ignores it, which
+    // left every portrait phone photo's thumbnail lying on its side. ffmpeg (image clip previews
+    // and export) already honors the same tag, so thumbnails now match what renders.
+    let mut decoder = image::ImageReader::open(input)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(|e| format!("Failed to open image: {e}"))?
+        .into_decoder()
+        .map_err(|e| format!("Failed to open image: {e}"))?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| format!("Failed to decode image: {e}"))?;
+    img.apply_orientation(orientation);
     img.thumbnail(
         GALLERY_THUMBNAIL_MAX_DIMENSION,
         GALLERY_THUMBNAIL_MAX_DIMENSION,
@@ -1501,21 +1633,70 @@ pub async fn generate_captions(
 ) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
     let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
-    let namespace = format!("captions_generated_v1_{}", lang);
-    let cache_path = preview_cache_path(&input, &namespace, "vtt")?;
+    let cache_path = preview_cache_path(&input, &format!("captions_generated_v1_{}", lang), "vtt")?;
 
     if cache_path.exists() {
         return std::fs::read_to_string(&cache_path)
             .map_err(|e| format!("Failed to read cached captions: {}", e));
     }
 
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create captions cache directory: {}", e))?;
+    let chunks = transcribe_in_chunks(&app_handle, &input, &cache_path, &lang, false).await?;
+
+    // Stitch the per-chunk VTTs into one, each cue's times shifted by its chunk's start.
+    let mut vtt = String::from("WEBVTT\n\n");
+    for (offset, file) in &chunks {
+        let text = std::fs::read_to_string(file).map_err(|e| format!("Failed to read a transcribed part: {}", e))?;
+        for block in text.replace("\r\n", "\n").split("\n\n") {
+            let mut lines = block.lines();
+            let Some(timing) = lines.find(|l| l.contains("-->")) else { continue };
+            let Some(shifted) = shift_vtt_timing(timing, *offset) else { continue };
+            let body: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
+            if body.is_empty() {
+                continue;
+            }
+            vtt.push_str(&shifted);
+            vtt.push('\n');
+            vtt.push_str(&body.join("\n"));
+            vtt.push_str("\n\n");
+        }
     }
 
-    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
-    let whisper_path = crate::services::utility::get_whisper_cli_path(&app_handle)?;
+    std::fs::write(&cache_path, &vtt).map_err(|e| format!("Failed to cache captions: {}", e))?;
+    finish_chunked_transcription(&cache_path);
+    Ok(vtt)
+}
+
+// One whisper run's worth of audio. Long recordings are transcribed in pieces this size so the
+// work survives the app closing: each finished piece is kept, and a later run (same file, same
+// language) only transcribes what's still missing - see transcribe_in_chunks. Short enough that
+// little is lost to an interruption, long enough that whisper's per-run model load stays a small
+// share of the time.
+const CAPTION_CHUNK_SECS: f64 = 300.0;
+
+// Bytes per second of the 16kHz mono s16le WAV extract_audio_for_whisper writes.
+const WHISPER_WAV_BYTES_PER_SEC: f64 = 32_000.0;
+
+fn chunk_parts_dir(cache_path: &PathBuf) -> PathBuf {
+    cache_path.with_extension("parts")
+}
+
+// Transcribes `input` piece by piece into `<cache>.parts/`, resuming from whatever an earlier,
+// interrupted run already finished (a piece counts as done once its `.ok` marker exists - written
+// only after whisper succeeded, so a half-written output is never trusted). Returns every piece's
+// start offset (seconds) and output file, in order. Emits "captions-progress" across the whole job,
+// so a resumed run starts its bar at the share already done.
+async fn transcribe_in_chunks(
+    app_handle: &AppHandle,
+    input: &PathBuf,
+    cache_path: &PathBuf,
+    lang: &str,
+    words: bool,
+) -> Result<Vec<(f64, PathBuf)>, String> {
+    let parts = chunk_parts_dir(cache_path);
+    std::fs::create_dir_all(&parts).map_err(|e| format!("Failed to create captions work folder: {}", e))?;
+
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let whisper_path = crate::services::utility::get_whisper_cli_path(app_handle)?;
     if !whisper_path.exists() {
         return Err(format!(
             "whisper-cli not found at {} - see README's Getting Started for how to obtain it",
@@ -1527,24 +1708,281 @@ pub async fn generate_captions(
         .await
         .map_err(|e| format!("Speech model lookup failed: {}", e))??;
 
-    // whisper.cpp needs a plain mono 16kHz WAV, not whatever the source video's own audio track
-    // happens to be encoded as - extracted into the same cache directory as a scratch file,
-    // removed once transcription finishes (success or failure) since it's never needed again.
-    let wav_path = cache_path.with_extension("wav");
-    let extraction = extract_audio_for_whisper(&ffmpeg_path, &input, &wav_path).await;
-    if let Err(err) = extraction {
-        let _ = std::fs::remove_file(&wav_path);
-        return Err(err);
+    // The whole audio track, extracted once and kept with the pieces until the job completes.
+    // Written under a temporary name first so an interrupted extraction is never mistaken for a
+    // finished one (ffmpeg picks the format from the extension, so it stays .wav).
+    let wav = parts.join("audio.wav");
+    if !wav.exists() {
+        let partial = parts.join("audio.partial.wav");
+        let extraction = extract_audio_for_whisper(&ffmpeg_path, input, &partial).await;
+        if let Err(err) = extraction {
+            let _ = std::fs::remove_file(&partial);
+            return Err(err);
+        }
+        std::fs::rename(&partial, &wav).map_err(|e| format!("Failed to keep extracted audio: {}", e))?;
+    }
+    let wav_len = std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0);
+    let duration = (wav_len.saturating_sub(44) as f64) / WHISPER_WAV_BYTES_PER_SEC;
+    let total = ((duration / CAPTION_CHUNK_SECS).ceil() as usize).max(1);
+
+    // Word mode only: voice-activity detection for accurate word timings (see ensure_vad_model).
+    // Optional - if it can't be had, transcription goes ahead without it.
+    let vad_model: Option<String> = if words {
+        let handle = app_handle.clone();
+        match tauri::async_runtime::spawn_blocking(move || crate::services::whisper_model::ensure_vad_model(&handle)).await {
+            Ok(Ok(path)) => path_to_str(&path).ok().map(|s| s.to_string()),
+            Ok(Err(err)) => {
+                log::warn!("Transcribing without voice detection: {}", err);
+                None
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let ext = if words { "json" } else { "vtt" };
+    let mut outputs = Vec::with_capacity(total);
+    for i in 0..total {
+        let offset = i as f64 * CAPTION_CHUNK_SECS;
+        let stem = parts.join(format!("chunk_{:04}", i));
+        let out_file = stem.with_extension(ext);
+        let ok_marker = stem.with_extension("ok");
+        let span = (i as f64 / total as f64 * 100.0, (i + 1) as f64 / total as f64 * 100.0);
+
+        if ok_marker.exists() && out_file.exists() {
+            let _ = app_handle.emit("captions-progress", span.1);
+            outputs.push((offset, out_file));
+            continue;
+        }
+
+        let chunk_wav = stem.with_extension("wav");
+        cut_wav_chunk(&ffmpeg_path, &wav, &chunk_wav, offset, CAPTION_CHUNK_SECS).await?;
+        // Word mode feeds edit-by-transcript as well as captions, and there the hesitations are the
+        // point: Whisper normally tidies speech up, silently dropping "um"/"uh" and stutters, so
+        // "remove filler words" would have nothing to find. A disfluent prompt (the known trick
+        // for keeping them) makes it transcribe what was actually said. English-only text, so
+        // it's only given when the speech is English or being auto-detected.
+        let keep_disfluencies = words && (lang == "en" || lang == "auto");
+        let mut format_args: Vec<&str> = if words { vec!["-oj", "-ml", "1", "-sow"] } else { vec!["-ovtt"] };
+        if keep_disfluencies {
+            format_args.extend(["--prompt", WHISPER_DISFLUENCY_PROMPT]);
+        }
+        if let Some(vad) = vad_model.as_deref() {
+            format_args.extend(["--vad", "-vm", vad]);
+        }
+        let result = run_whisper_cli(app_handle, &whisper_path, &model_path, &chunk_wav, &stem, lang, &format_args, span).await;
+        let _ = std::fs::remove_file(&chunk_wav);
+        result?;
+        std::fs::write(&ok_marker, b"").map_err(|e| format!("Failed to record transcription progress: {}", e))?;
+        outputs.push((offset, out_file));
+    }
+    Ok(outputs)
+}
+
+const WHISPER_DISFLUENCY_PROMPT: &str = "Umm, let me think like, hmm... Okay, uh, so here's what I'm, like, thinking, I- I mean the the plan.";
+
+// The job is done and its final result cached - the pieces and extracted audio can go.
+fn finish_chunked_transcription(cache_path: &PathBuf) {
+    let _ = std::fs::remove_dir_all(chunk_parts_dir(cache_path));
+}
+
+async fn cut_wav_chunk(ffmpeg_path: &PathBuf, wav: &PathBuf, output: &PathBuf, start: f64, length: f64) -> Result<(), String> {
+    let ffmpeg_path = ffmpeg_path.clone();
+    let wav = wav.clone();
+    let output = output.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-y");
+        cmd.args(["-ss", &format!("{:.3}", start), "-t", &format!("{:.3}", length)]);
+        cmd.arg("-i").arg(path_to_str(&wav)?);
+        cmd.args(["-c:a", "pcm_s16le"]);
+        cmd.arg(path_to_str(&output)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() || !output.exists() {
+            return Err("Failed to cut the audio into pieces for transcription".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Audio split task failed: {}", e))?
+}
+
+// "00:01:02.345 --> 00:01:04.000 <settings>" with both times moved later by `offset` seconds.
+fn shift_vtt_timing(line: &str, offset: f64) -> Option<String> {
+    let (left, right) = line.split_once("-->")?;
+    let mut right_parts = right.trim().splitn(2, char::is_whitespace);
+    let end_raw = right_parts.next()?;
+    let settings = right_parts.next().unwrap_or("");
+    let start = parse_vtt_time(left.trim())? + offset;
+    let end = parse_vtt_time(end_raw)? + offset;
+    let mut out = format!("{} --> {}", format_vtt_time(start), format_vtt_time(end));
+    if !settings.is_empty() {
+        out.push(' ');
+        out.push_str(settings);
+    }
+    Some(out)
+}
+
+fn parse_vtt_time(s: &str) -> Option<f64> {
+    let s = s.replace(',', ".");
+    let parts: Vec<&str> = s.split(':').collect();
+    let (h, m, sec) = match parts.as_slice() {
+        [h, m, sec] => (h.parse::<f64>().ok()?, m.parse::<f64>().ok()?, sec.parse::<f64>().ok()?),
+        [m, sec] => (0.0, m.parse::<f64>().ok()?, sec.parse::<f64>().ok()?),
+        _ => return None,
+    };
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+fn format_vtt_time(t: f64) -> String {
+    let ms_total = (t.max(0.0) * 1000.0).round() as u64;
+    let h = ms_total / 3_600_000;
+    let m = (ms_total % 3_600_000) / 60_000;
+    let s = (ms_total % 60_000) / 1000;
+    let ms = ms_total % 1000;
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
+#[derive(serde::Serialize)]
+pub struct CaptionJobProgress {
+    done: usize,
+    // 0 when the audio hasn't been extracted yet (nothing to measure the total from).
+    total: usize,
+}
+
+// Whether an interrupted caption job exists for this file+language (and how far it got) - lets
+// the player resume it automatically on open, and the editor's Captions panel offer "Resume"
+// instead of "Generate". None once the job is complete (or was never started).
+#[tauri::command]
+pub async fn caption_job_progress(input_path: String, language: Option<String>, words: bool) -> Result<Option<CaptionJobProgress>, String> {
+    let input = PathBuf::from(&input_path);
+    let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
+    let (namespace, ext) = if words {
+        (format!("captions_words_v3_{}", lang), "json")
+    } else {
+        (format!("captions_generated_v1_{}", lang), "vtt")
+    };
+    let cache_path = preview_cache_path(&input, &namespace, ext)?;
+    if cache_path.exists() {
+        return Ok(None);
+    }
+    let parts = chunk_parts_dir(&cache_path);
+    if !parts.exists() {
+        return Ok(None);
+    }
+    let done = std::fs::read_dir(&parts)
+        .map(|entries| entries.filter_map(Result::ok).filter(|e| e.path().extension().map_or(false, |x| x == "ok")).count())
+        .unwrap_or(0);
+    let total = std::fs::metadata(parts.join("audio.wav"))
+        .map(|m| ((m.len().saturating_sub(44) as f64 / WHISPER_WAV_BYTES_PER_SEC / CAPTION_CHUNK_SECS).ceil() as usize).max(1))
+        .unwrap_or(0);
+    Ok(Some(CaptionJobProgress { done, total }))
+}
+
+// One spoken word with its own timing, in seconds of the SOURCE file - the video editor's
+// Captions tool (CaptionWord, videoEditTypes.ts) maps these through the timeline's clips itself,
+// so the transcript stays valid across any trim/cut/reorder/speed change made afterwards.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct CaptionWordOut {
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+// Word-timed transcript for the editor's burned-in captions - the same offline whisper.cpp pass
+// generate_captions runs, but asking for one word per segment (-ml 1 -sow) as JSON instead of
+// sentence-level VTT, which is what per-word emphasis and re-flowing lines need. Cached per
+// file+mtime+language exactly like generate_captions, as the parsed word list itself.
+#[tauri::command]
+pub async fn generate_caption_words(
+    app_handle: AppHandle,
+    input_path: String,
+    language: Option<String>,
+) -> Result<Vec<CaptionWordOut>, String> {
+    let input = PathBuf::from(&input_path);
+    let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
+    // v3: fillers and stutters kept (WHISPER_DISFLUENCY_PROMPT) and words timed with voice
+    // detection (ensure_vad_model) - the bump retires older transcripts that had neither.
+    let cache_path = preview_cache_path(&input, &format!("captions_words_v3_{}", lang), "json")?;
+
+    if cache_path.exists() {
+        let cached = std::fs::read_to_string(&cache_path)
+            .map_err(|e| format!("Failed to read cached captions: {}", e))?;
+        if let Ok(words) = serde_json::from_str::<Vec<CaptionWordOut>>(&cached) {
+            return Ok(words);
+        }
+        // Unreadable cache - fall through and regenerate over it.
+    }
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create captions cache directory: {}", e))?;
     }
 
-    // -of wants the output path WITHOUT its extension - whisper-cli appends ".vtt" itself.
-    let output_stem = cache_path.with_extension("");
-    let transcription = run_whisper_cli(&app_handle, &whisper_path, &model_path, &wav_path, &output_stem, &lang).await;
-    let _ = std::fs::remove_file(&wav_path); // best-effort - a leftover scratch WAV is harmless either way
-    transcription?;
+    // Word-per-segment JSON, transcribed (and resumable) piece by piece - see transcribe_in_chunks.
+    let chunks = transcribe_in_chunks(&app_handle, &input, &cache_path, &lang, true).await?;
+    let mut words: Vec<CaptionWordOut> = Vec::new();
+    for (offset, file) in &chunks {
+        let raw = std::fs::read_to_string(file).map_err(|e| format!("Failed to read a transcribed part: {}", e))?;
+        for mut w in parse_whisper_word_json(&raw)? {
+            w.start += offset;
+            w.end += offset;
+            words.push(w);
+        }
+    }
 
-    std::fs::read_to_string(&cache_path)
-        .map_err(|e| format!("whisper-cli reported success but produced no readable output: {}", e))
+    if let Ok(json) = serde_json::to_string(&words) {
+        let _ = std::fs::write(&cache_path, json); // best-effort - a missing cache just regenerates
+    }
+    finish_chunked_transcription(&cache_path);
+    Ok(words)
+}
+
+// whisper-cli's `-oj -ml 1 -sow` output: { "transcription": [ { "offsets": { "from": ms, "to": ms },
+// "text": " word" }, ... ] }. A leading space marks a new word; an entry WITHOUT one is a fragment
+// of the previous word (whisper occasionally still splits one there) and gets merged back into
+// it. Empty entries and non-speech markers ("[BLANK_AUDIO]", "(music)", "[Music]") are dropped.
+fn parse_whisper_word_json(raw: &str) -> Result<Vec<CaptionWordOut>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("Couldn't read the transcription output: {}", e))?;
+    let entries = value
+        .get("transcription")
+        .and_then(|t| t.as_array())
+        .ok_or("Transcription output had no word list")?;
+
+    let mut words: Vec<CaptionWordOut> = Vec::new();
+    for entry in entries {
+        let text = entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        let offsets = entry.get("offsets");
+        let from = offsets.and_then(|o| o.get("from")).and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        let to = offsets.and_then(|o| o.get("to")).and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_marker = (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            || (trimmed.starts_with('(') && trimmed.ends_with(')'));
+        if is_marker {
+            continue;
+        }
+        match words.last_mut() {
+            Some(last) if !text.starts_with(' ') => {
+                last.text.push_str(trimmed);
+                last.end = last.end.max(to);
+            }
+            _ => words.push(CaptionWordOut {
+                start: from,
+                end: to.max(from),
+                text: trimmed.to_string(),
+            }),
+        }
+    }
+    Ok(words)
 }
 
 #[derive(serde::Serialize)]
@@ -1853,8 +2291,16 @@ async fn run_whisper_cli(
     wav_path: &PathBuf,
     output_stem: &PathBuf,
     language: &str,
+    // Output-format flags - ["-ovtt"] for segment captions (generate_captions), or JSON at one word
+    // per segment for the editor's word-timed captions (generate_caption_words).
+    format_args: &[&str],
+    // This run's share of the overall job's 0-100 progress (transcribe_in_chunks runs one per piece).
+    progress_span: (f64, f64),
 ) -> Result<(), String> {
     let app_handle = app_handle.clone();
+    let (span_start, span_end) = progress_span;
+    let _ = app_handle.emit("captions-progress", span_start);
+    let format_args: Vec<String> = format_args.iter().map(|a| a.to_string()).collect();
     let whisper_path = whisper_path.clone();
     let model_path = model_path.clone();
     let wav_path = wav_path.clone();
@@ -1875,7 +2321,8 @@ async fn run_whisper_cli(
         hide_console_window(&mut cmd);
         cmd.arg("-m").arg(path_to_str(&model_path)?);
         cmd.arg("-f").arg(path_to_str(&wav_path)?);
-        cmd.args(["-ovtt", "-np", "-pp", "-t", &threads.to_string(), "-l", &language]);
+        cmd.args(&format_args);
+        cmd.args(["-np", "-pp", "-t", &threads.to_string(), "-l", &language]);
         cmd.arg("-of").arg(path_to_str(&output_stem)?);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
@@ -1913,7 +2360,7 @@ async fn run_whisper_cli(
 
                 if let Some(caps) = progress_re.captures(&line) {
                     if let Ok(pct) = caps[1].parse::<f64>() {
-                        let _ = app_handle_for_stderr.emit("captions-progress", pct);
+                        let _ = app_handle_for_stderr.emit("captions-progress", span_start + pct / 100.0 * (span_end - span_start));
                     }
                 }
             }
@@ -1940,7 +2387,7 @@ async fn run_whisper_cli(
                 if reason.is_empty() { "unknown error".to_string() } else { reason }
             ));
         }
-        let _ = app_handle.emit("captions-progress", 100.0);
+        let _ = app_handle.emit("captions-progress", span_end);
         Ok(())
     })
     .await
@@ -2141,6 +2588,9 @@ pub struct ClipKenBurns {
     // auto-zoom punch-in on a recorded click position instead of the frame's middle).
     pub target_x: Option<f64>,
     pub target_y: Option<f64>,
+    // The part of the move (0..1) this clip plays - a piece split out of a Ken Burns clip
+    // continues the move (kenBurnsWindow, videoColorFilters.ts). None = all of it.
+    pub span: Option<[f64; 2]>,
 }
 
 // A free-form crop window into this segment's own frame - see crop_chain. NOT locked to the
@@ -2193,6 +2643,475 @@ pub struct KeepSegment {
     pub noise_reduction: Option<f64>,
     // How noise_reduction is applied plus the extra cleanup stages around it - see AudioCleanup.
     pub audio_cleanup: Option<AudioCleanup>,
+    // The clip's color grade baked to .cube text by the frontend (colorGrade.ts) - the exact table
+    // its WebGL preview draws with, applied here with lut3d so the export matches it.
+    pub lut_cube: Option<String>,
+    // Camera-shake removal (vidstab, two passes) - see stabilization_transforms.
+    pub stabilize: Option<StabilizeSettings>,
+    // A speed ramp: the clip's range as consecutive constant-speed steps (clipTiming.ts - the same
+    // steps the preview plays). Rendered as ONE segment - a single piecewise setpts for the picture
+    // and per-step atempo for the sound - so the ramp's length is exact (joining the steps as
+    // separate segments rounded every join to a whole frame: 0.17s drift over 16 steps). When set,
+    // `speed` is ignored.
+    pub speed_steps: Option<Vec<SpeedStep>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedStep {
+    pub source_start: f64,
+    pub source_end: f64,
+    pub speed: f64,
+}
+
+fn clamp_speed(speed: f64) -> f64 {
+    speed.max(0.25).min(4.0)
+}
+
+// The segment's steps relative to its own start: (from, to, speed) in source seconds. A plain
+// segment is one step.
+fn segment_steps(seg: &KeepSegment) -> Vec<(f64, f64, f64)> {
+    match &seg.speed_steps {
+        Some(steps) if !steps.is_empty() => steps
+            .iter()
+            .map(|st| ((st.source_start - seg.start).max(0.0), (st.source_end - seg.start).min(seg.end - seg.start), clamp_speed(st.speed)))
+            .filter(|(a, b, _)| b > a)
+            .collect(),
+        _ => vec![(0.0, seg.end - seg.start, segment_speed(seg))],
+    }
+}
+
+// How long the segment plays for in the OUTPUT - what every transition offset and silent-audio
+// length is measured in.
+fn segment_output_duration(seg: &KeepSegment) -> f64 {
+    segment_steps(seg).iter().map(|(a, b, sp)| (b - a) / sp).sum::<f64>().max(0.0)
+}
+
+// The picture's speed change, applied after the clip's effects (so Ken Burns and friends run on
+// the clip's own source time, exactly as the preview computes them): one setpts - a plain divide
+// for constant speed, a continuous piecewise map for a ramp.
+fn segment_speed_filter(seg: &KeepSegment) -> String {
+    let steps = segment_steps(seg);
+    if steps.len() <= 1 {
+        let speed = steps.first().map(|s| s.2).unwrap_or(1.0);
+        return format!("setpts=PTS/{:.4}", speed);
+    }
+    let mut out_before = Vec::with_capacity(steps.len());
+    let mut acc = 0.0;
+    for (a, b, sp) in &steps {
+        out_before.push(acc);
+        acc += (b - a) / sp;
+    }
+    let last = steps.len() - 1;
+    let mut expr = format!("({:.6}+(T-{:.6})/{:.6})", out_before[last], steps[last].0, steps[last].2);
+    for i in (0..last).rev() {
+        expr = format!(
+            "if(lt(T,{:.6}),({:.6}+(T-{:.6})/{:.6}),{})",
+            steps[i + 1].0, out_before[i], steps[i].0, steps[i].2, expr
+        );
+    }
+    format!("setpts='({})/TB'", expr)
+}
+
+// The video branch of one segment: trim to its range, effects, then its speed.
+fn segment_video_chain(input: &str, seg: &KeepSegment, extra: &str) -> String {
+    format!(
+        "{input}trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS{extra},{}",
+        seg.start,
+        seg.end,
+        segment_speed_filter(seg)
+    )
+}
+
+const RAMP_AUDIO_LOOKAHEAD: f64 = 0.25;
+
+// The audio branch of one segment. A ramp gets its cleanup on the source timeline first (where a
+// noise sample's times mean what they say), then each step's tempo, joined sample-accurately.
+fn segment_audio_chain(
+    has_audio: bool,
+    input_index: usize,
+    seg: &KeepSegment,
+    cleanup: &(Vec<String>, Option<(f64, f64)>),
+    out_label: &str,
+) -> String {
+    let steps = segment_steps(seg);
+    if steps.len() <= 1 || !has_audio {
+        if !has_audio {
+            return format!(
+                "anullsrc=channel_layout=stereo:sample_rate=44100:duration={:.3}[{}];",
+                segment_output_duration(seg).max(0.01),
+                out_label
+            );
+        }
+        return audio_trim_chain(true, input_index, seg.start, seg.end, steps[0].2, cleanup, out_label);
+    }
+    let clean = format!("{}_src", out_label);
+    let mut graph = audio_branch(&format!("[{}:a]", input_index), seg.start, seg.end, 1.0, &cleanup.0, cleanup.1, &clean);
+    let split: String = (0..steps.len()).map(|i| format!("[{}_p{}]", out_label, i)).collect();
+    graph.push_str(&format!("[{clean}]asplit={}{split};", steps.len()));
+    let mut joined = String::new();
+    // Each atempo drops its last partial window (~17ms) when its input ends - 0.27s lost over 16
+    // steps. So each step reads a little past its end (silence past the clip's own end) and is then
+    // trimmed to exactly its output length.
+    for (i, (a, b, sp)) in steps.iter().enumerate() {
+        graph.push_str(&format!(
+            "[{out}_p{i}]atrim=start={a:.6}:end={lookahead:.6},asetpts=PTS-STARTPTS,apad=pad_dur={RAMP_AUDIO_LOOKAHEAD},{tempo},atrim=end={len:.6}[{out}_q{i}];",
+            out = out_label,
+            lookahead = b + RAMP_AUDIO_LOOKAHEAD,
+            tempo = atempo_chain(*sp),
+            len = (b - a) / sp
+        ));
+        joined.push_str(&format!("[{}_q{}]", out_label, i));
+    }
+    graph.push_str(&format!("{joined}concat=n={}:v=0:a=1[{out_label}];", steps.len()));
+    graph
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StabilizeSettings {
+    // 0..1 - how much camera movement is smoothed away (more = steadier, but crops in further).
+    pub strength: f64,
+}
+
+// vidstabtransform's smoothing window (frames each side) for a 0..1 strength: 0.5 -> 25 frames,
+// close to tripod-like steadiness for handheld footage without looking floaty.
+fn stabilize_smoothing(strength: f64) -> u32 {
+    (5.0 + strength.clamp(0.0, 1.0) * 40.0).round() as u32
+}
+
+// Pass 1 of stabilization: vidstabdetect over exactly the frames this clip uses (the same
+// trim+setpts the export applies, so frame numbers line up with pass 2), cached per source file +
+// range so it runs once however often the clip is exported or previewed.
+async fn stabilization_transforms(app_handle: &AppHandle, source_path: &str, start: f64, end: f64) -> Result<PathBuf, String> {
+    let input = PathBuf::from(source_path);
+    let cache_path = preview_cache_path(&input, "stabilize_v1", &format!("{:.3}_{:.3}.trf", start, end))?;
+    if cache_path.exists() {
+        return Ok(cache_path);
+    }
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create stabilization cache: {}", e))?;
+    }
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let partial = cache_path.with_extension("partial.trf");
+    let filter = format!(
+        "trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS,vidstabdetect=shakiness=6:accuracy=12:result='{}'",
+        start,
+        end,
+        escape_filter_path(&partial)
+    );
+    let source = source_path.to_string();
+    let partial_for_task = partial.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.args(["-y", "-i", &source, "-an", "-vf", &filter, "-f", "null", "-"]);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() || !partial_for_task.exists() {
+            let _ = std::fs::remove_file(&partial_for_task);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("unknown error").to_string();
+            return Err(format!("Couldn't analyse the clip for stabilization: {}", reason));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Stabilization task panicked: {e}"))??;
+    std::fs::rename(&partial, &cache_path).map_err(|e| format!("Failed to keep stabilization data: {}", e))?;
+    Ok(cache_path)
+}
+
+// A name for a file the editor derives from a clip, unique to its source, range and kind - so asking
+// again for the same thing finds the file already made instead of rendering it twice.
+fn derived_media_path(source_path: &str, kind: &str, key: &str, ext: &str) -> Result<PathBuf, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    source_path.hash(&mut hasher);
+    key.hash(&mut hasher);
+    let stem = std::path::Path::new(source_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "clip".to_string());
+    Ok(crate::services::utility::derived_media_dir()?.join(format!("{} {} {:08x}.{}", stem, kind, hasher.finish() as u32, ext)))
+}
+
+fn run_ffmpeg_quiet(ffmpeg_path: &PathBuf, args: &[String]) -> Result<(), String> {
+    let mut cmd = Command::new(ffmpeg_path);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    cmd.arg("-y").args(args);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("unknown error").to_string();
+        return Err(reason);
+    }
+    Ok(())
+}
+
+// Freeze frame: the frame at `time` (source seconds) as a full-resolution PNG, which the editor
+// then uses as an ordinary image clip. Returns the PNG's path.
+#[tauri::command]
+pub async fn extract_frame_still(app_handle: AppHandle, source_path: String, time: f64) -> Result<String, String> {
+    let out = derived_media_path(&source_path, "frame", &format!("{:.3}", time), "png")?;
+    if out.exists() {
+        return path_to_str(&out).map(|s| s.to_string());
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let partial = out.with_extension("partial.png");
+    let args: Vec<String> = vec![
+        "-ss".into(), format!("{:.3}", time.max(0.0)), "-i".into(), source_path.clone(),
+        "-frames:v".into(), "1".into(), "-update".into(), "1".into(), path_to_str(&partial)?.to_string(),
+    ];
+    let task_partial = partial.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_ffmpeg_quiet(&ffmpeg_path, &args).and_then(|_| {
+            if task_partial.exists() { Ok(()) } else { Err("no frame at that time".to_string()) }
+        })
+    })
+    .await
+    .map_err(|e| format!("Freeze frame task panicked: {e}"))?
+    .map_err(|e| format!("Couldn't grab that frame: {}", e))?;
+    std::fs::rename(&partial, &out).map_err(|e| format!("Failed to save the frame: {}", e))?;
+    path_to_str(&out).map(|s| s.to_string())
+}
+
+// How much of a clip is reversed at a time. ffmpeg's `reverse` holds every frame of its input in
+// memory, so reversing a long clip in one go can take gigabytes; reversing it in short pieces and
+// joining them last-to-first gives the identical result in bounded memory.
+const REVERSE_CHUNK_SECS: f64 = 5.0;
+
+// Reverse: the clip's [start,end) range played backwards, picture and sound, as a new file the
+// clip then points at (its original range is remembered so it can be un-reversed). Returns the
+// file's path.
+#[tauri::command]
+pub async fn render_reversed_clip(app_handle: AppHandle, source_path: String, start: f64, end: f64) -> Result<String, String> {
+    if end - start <= 0.05 {
+        return Err("The clip is too short to reverse".to_string());
+    }
+    // v2 in the key: the first version lost frames (see `fps` below), so its files aren't reused.
+    let out = derived_media_path(&source_path, "reversed", &format!("v3 {:.3}-{:.3}", start, end), "mp4")?;
+    if out.exists() {
+        return path_to_str(&out).map(|s| s.to_string());
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let has_audio = {
+        let ffprobe_path = get_ffprobe_path(&app_handle)?;
+        let path = source_path.clone();
+        tauri::async_runtime::spawn_blocking(move || probe_has_audio(&ffprobe_path, &path)).await.unwrap_or(false)
+    };
+    // `reverse` drops the stream's frame rate, and ffmpeg then falls back to 25fps and silently
+    // discards frames from a 30/60fps source - so every piece is re-timed at the source's own rate
+    // (measured on a 30fps clip: 442 frames in, 372 out, before this).
+    let fps = {
+        let ffprobe_path = get_ffprobe_path(&app_handle)?;
+        let path = source_path.clone();
+        tauri::async_runtime::spawn_blocking(move || probe_frame_rate(&ffprobe_path, &path)).await.unwrap_or(30.0)
+    };
+    let work = std::env::temp_dir().join(format!("briefcast_reverse_{}_{:x}", std::process::id(), (start * 1000.0) as u64));
+    std::fs::create_dir_all(&work).map_err(|e| format!("Failed to create a work folder: {}", e))?;
+    let _cleanup = TempDir(work.clone());
+    let source = source_path.clone();
+    let out_for_task = out.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // Pieces cut by FRAME number (not time), so they tile the range exactly - cutting by time let
+        // each boundary round to an extra frame. Rendered reversed, listed last piece first; audio
+        // is cut at the same frame boundaries' times.
+        let mut list = String::new();
+        let first_frame = (start * fps).round() as i64;
+        let last_frame = ((end * fps).round() as i64).max(first_frame + 1);
+        let chunk = ((REVERSE_CHUNK_SECS * fps).round() as i64).max(1);
+        let mut pieces: Vec<(i64, i64)> = Vec::new();
+        let mut f = first_frame;
+        while f < last_frame {
+            let next = (f + chunk).min(last_frame);
+            pieces.push((f, next));
+            f = next;
+        }
+        for (i, (fa, fb)) in pieces.iter().enumerate().rev() {
+            let piece = work.join(format!("piece_{:04}.mp4", i));
+            let (a, b) = (*fa as f64 / fps, *fb as f64 / fps);
+            let mut args: Vec<String> = vec!["-i".into(), source.clone(), "-filter_complex".into()];
+            let video = format!("[0:v]trim=start_frame={fa}:end_frame={fb},setpts=PTS-STARTPTS,reverse,setpts=N/({fps:.3}*TB)[v]");
+            if has_audio {
+                args.push(format!("{video};[0:a]atrim=start={a:.4}:end={b:.4},asetpts=PTS-STARTPTS,areverse[a]"));
+                args.extend(["-map".into(), "[v]".into(), "-map".into(), "[a]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
+            } else {
+                args.push(video);
+                args.extend(["-map".into(), "[v]".into()]);
+            }
+            args.extend(["-r".into(), format!("{:.3}", fps), "-c:v".into(), "libx264".into(), "-preset".into(), "veryfast".into(), "-crf".into(), "18".into(), "-pix_fmt".into(), "yuv420p".into()]);
+            args.push(path_to_str(&piece)?.to_string());
+            run_ffmpeg_quiet(&ffmpeg_path, &args).map_err(|e| format!("Couldn't reverse the clip: {}", e))?;
+            list.push_str(&format!("file '{}'\n", path_to_str(&piece)?.replace('\\', "/").replace('\'', "'\\''")));
+        }
+        let list_path = work.join("pieces.txt");
+        std::fs::write(&list_path, list).map_err(|e| format!("Failed to write the piece list: {}", e))?;
+        let partial = out_for_task.with_extension("partial.mp4");
+        let args: Vec<String> = vec![
+            "-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), path_to_str(&list_path)?.to_string(),
+            "-c".into(), "copy".into(), "-movflags".into(), "+faststart".into(), path_to_str(&partial)?.to_string(),
+        ];
+        run_ffmpeg_quiet(&ffmpeg_path, &args).map_err(|e| format!("Couldn't join the reversed clip: {}", e))?;
+        std::fs::rename(&partial, &out_for_task).map_err(|e| format!("Failed to save the reversed clip: {}", e))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Reverse task panicked: {e}"))??;
+    path_to_str(&out).map(|s| s.to_string())
+}
+
+// A work folder removed when dropped, whatever happens in between.
+struct TempDir(PathBuf);
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// Pass 2, as a filter-chain fragment for segment_effect_chain. `optzoom=1` crops in just enough to
+// hide the moving edges; the light unsharp makes up for the resampling softness.
+fn stabilize_chain(trf_path: &str, strength: f64) -> String {
+    format!(
+        ",vidstabtransform=input='{}':smoothing={}:optzoom=1:interpol=bicubic,unsharp=5:5:0.6:3:3:0.3",
+        trf_path,
+        stabilize_smoothing(strength)
+    )
+}
+
+// A stabilized render of one clip's range (no other effects), for "Preview stabilized" in the clip
+// viewer - stabilization needs the whole clip analysed first, so it can't preview live in the
+// player. Cached per source + range + strength; 720p ultrafast, so it's quick to make.
+#[tauri::command]
+pub async fn stabilized_clip_preview(app_handle: AppHandle, source_path: String, start: f64, end: f64, strength: f64) -> Result<String, String> {
+    let input = PathBuf::from(&source_path);
+    let cache_path = preview_cache_path(&input, "stabilize_v1", &format!("{:.3}_{:.3}_{:.2}.mp4", start, end, strength))?;
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    let trf = stabilization_transforms(&app_handle, &source_path, start, end).await?;
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let video = format!(
+        "[0:v]trim=start={s:.3}:end={e:.3},setpts=PTS-STARTPTS{stab},scale=-2:'min(720,ih)'[v]",
+        s = start,
+        e = end,
+        stab = stabilize_chain(&escape_filter_path(&trf), strength)
+    );
+    let has_audio = {
+        let ffprobe_path = get_ffprobe_path(&app_handle)?;
+        let path = source_path.clone();
+        tauri::async_runtime::spawn_blocking(move || probe_has_audio(&ffprobe_path, &path))
+            .await
+            .unwrap_or(false)
+    };
+    let mut args: Vec<String> = vec!["-i".into(), source_path.clone(), "-filter_complex".into()];
+    if has_audio {
+        args.push(format!("{video};[0:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS[a]"));
+        args.extend(["-map".into(), "[v]".into(), "-map".into(), "[a]".into(), "-c:a".into(), "aac".into()]);
+    } else {
+        args.push(video);
+        args.extend(["-map".into(), "[v]".into()]);
+    }
+    args.extend([
+        "-c:v".into(), "libx264".into(), "-preset".into(), "ultrafast".into(), "-crf".into(), "23".into(),
+        "-pix_fmt".into(), "yuv420p".into(), "-movflags".into(), "+faststart".into(),
+    ]);
+    encode_preview_proxy(ffmpeg_path, args, cache_path).await
+}
+
+// A platform format for the export (Shorts/Reels 9:16, square, 4:5...) and how the picture is
+// fitted into it. Applied to the assembled video before overlays and captions, which are then
+// drawn at this size - so captions sit properly in a vertical frame instead of being cropped off.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputFrame {
+    pub width: i64,
+    pub height: i64,
+    // "fit-blur" (whole picture over a blurred, zoomed copy of itself), "fit" (black bars), or
+    // "fill" (cropped to fill).
+    pub mode: String,
+    // Fill only: where the crop window sits, 0..1 across the spare width/height (0.5 = centred).
+    pub anchor_x: Option<f64>,
+    pub anchor_y: Option<f64>,
+    // Fill only, auto-reframe: the crop window's centre over the output timeline as knots
+    // (seconds, x, y - fractions of the frame), eased between (reframeTrack.ts). Replaces the anchor.
+    pub track: Option<Vec<[f64; 3]>>,
+}
+
+// A value through `knots` (time, value) over `tvar`: held before the first and after the last,
+// smoothstep-eased between each pair, constant where a pair is equal (a hold). Built as a balanced
+// tree of if()s - depth log2(n), so an hour of camera moves stays cheap per frame.
+fn eased_knots_expr(knots: &[(f64, f64)], tvar: &str) -> String {
+    fn segment(a: (f64, f64), b: (f64, f64), tvar: &str) -> String {
+        if (b.1 - a.1).abs() < 1e-6 {
+            return format!("{:.5}", a.1);
+        }
+        let p = format!("clip(({tvar}-{:.4})/{:.4},0,1)", a.0, (b.0 - a.0).max(1e-3));
+        format!("({:.5}+({:.5})*{p}*{p}*(3-2*{p}))", a.1, b.1 - a.1)
+    }
+    fn build(knots: &[(f64, f64)], lo: usize, hi: usize, tvar: &str) -> String {
+        if lo == hi {
+            return segment(knots[lo], knots[lo + 1], tvar);
+        }
+        let mid = (lo + hi) / 2;
+        format!("if(lt({tvar},{:.4}),{},{})", knots[mid + 1].0, build(knots, lo, mid, tvar), build(knots, mid + 1, hi, tvar))
+    }
+    match knots.len() {
+        0 => "0.5".into(),
+        1 => format!("{:.5}", knots[0].1),
+        n => build(knots, 0, n - 2, tvar),
+    }
+}
+
+fn reframe_chain(input: &str, output: &str, frame: &OutputFrame) -> String {
+    let w = (frame.width.max(16) / 2) * 2;
+    let h = (frame.height.max(16) / 2) * 2;
+    match frame.mode.as_str() {
+        "fill" if frame.track.as_ref().map_or(false, |t| !t.is_empty()) => {
+            let track = frame.track.as_ref().unwrap();
+            let mut sorted: Vec<[f64; 3]> = track.iter().filter(|k| k.iter().all(|v| v.is_finite())).cloned().collect();
+            sorted.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+            let x = eased_knots_expr(&sorted.iter().map(|k| (k[0], k[1].clamp(0.0, 1.0))).collect::<Vec<_>>(), "t");
+            let y = eased_knots_expr(&sorted.iter().map(|k| (k[0], k[2].clamp(0.0, 1.0))).collect::<Vec<_>>(), "t");
+            // The window centred on the track, kept inside the frame.
+            format!("[{input}]scale={w}:{h}:force_original_aspect_ratio=increase,crop=w={w}:h={h}:x='clip(({x})*iw-ow/2,0,iw-ow)':y='clip(({y})*ih-oh/2,0,ih-oh)',setsar=1[{output}];")
+        }
+        "fill" => {
+            let ax = frame.anchor_x.unwrap_or(0.5).clamp(0.0, 1.0);
+            let ay = frame.anchor_y.unwrap_or(0.5).clamp(0.0, 1.0);
+            if (ax - 0.5).abs() < 1e-6 && (ay - 0.5).abs() < 1e-6 {
+                format!("[{input}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1[{output}];")
+            } else {
+                format!("[{input}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}:(iw-ow)*{ax:.4}:(ih-oh)*{ay:.4},setsar=1[{output}];")
+            }
+        }
+        "fit" => format!("[{input}]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[{output}];"),
+        _ => format!(
+            "[{input}]split=2[rf_bg_in][rf_fg_in];\
+             [rf_bg_in]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=luma_radius=40:luma_power=2,eq=brightness=-0.06[rf_bg];\
+             [rf_fg_in]scale={w}:{h}:force_original_aspect_ratio=decrease[rf_fg];\
+             [rf_bg][rf_fg]overlay=(W-w)/2:(H-h)/2,setsar=1[{output}];"
+        ),
+    }
+}
+
+// Files an export writes for ffmpeg to read (graded clips' LUTs), deleted when the export is done
+// however it ends - success, failure or an early error return.
+struct TempFiles(Vec<PathBuf>);
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 // Mirrors AudioCleanup (videoEditTypes.ts). None/default fields keep the original behaviour:
@@ -2247,6 +3166,54 @@ pub struct OverlayImage {
     // ALLOWED_OVERLAY_ANIMATIONS the same way transition_type already is (sanitize_transition_name)
     // - interpolated directly into the filter_complex string, so this is a real security boundary.
     pub animation: String,
+    // Keyframed motion (keyframes.ts): position/scale/opacity over time, replacing `animation`'s
+    // slide when present. Already in output-video pixels and absolute output seconds.
+    #[serde(default)]
+    pub keyframes: Option<Vec<OverlayKeyframe>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayKeyframe {
+    pub time: f64,
+    pub x: f64,
+    pub y: f64,
+    pub scale: f64,
+    pub opacity: f64,
+    // How the motion eases from this keyframe to the next: "linear", "ease", "ease-in",
+    // "ease-out" or "hold" (stays put, then jumps). Matches easeKeyframe (keyframes.ts).
+    pub easing: String,
+}
+
+// Overlay PNG inputs run at this rate so a keyframed scale (which, in this ffmpeg, can only follow
+// time through the frame number `n`) maps frames to seconds exactly.
+const OVERLAY_INPUT_FPS: f64 = 30.0;
+
+fn easing_expr(easing: &str, p: &str) -> String {
+    match easing {
+        "ease" => format!("({p})*({p})*(3-2*({p}))"),
+        "ease-in" => format!("({p})*({p})"),
+        "ease-out" => format!("(1-(1-({p}))*(1-({p})))"),
+        "hold" => "0".to_string(),
+        _ => p.to_string(),
+    }
+}
+
+// One keyframed value over time as an ffmpeg expression in `tvar`: held at the first keyframe's
+// value before it, eased between each pair, held at the last after it - the same piecewise curve
+// keyframeStateAt (keyframes.ts) draws in the preview.
+fn keyframe_expr(kfs: &[OverlayKeyframe], tvar: &str, value: impl Fn(&OverlayKeyframe) -> f64) -> String {
+    let mut sorted: Vec<&OverlayKeyframe> = kfs.iter().collect();
+    sorted.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+    let last = sorted[sorted.len() - 1];
+    let mut expr = format!("{:.4}", value(last));
+    for i in (0..sorted.len().saturating_sub(1)).rev() {
+        let (a, b) = (sorted[i], sorted[i + 1]);
+        let p = format!("clip(({tvar}-{:.4})/{:.4},0,1)", a.time, (b.time - a.time).max(1e-3));
+        let segment = format!("({:.4}+({:.4})*{})", value(a), value(b) - value(a), easing_expr(&a.easing, &p));
+        expr = format!("if(lt({tvar},{:.4}),{segment},{expr})", b.time);
+    }
+    expr
 }
 
 // A blurred region burned into the output video for its own [start_time,end_time) window - unlike
@@ -2486,13 +3453,20 @@ fn color_filter_chain(cf: &ClipColorFilter) -> String {
 fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64) -> String {
     let amount = kb.intensity.unwrap_or(0.5).max(0.0).min(1.0);
     let d = duration.max(0.01);
+    let progress = match kb.span {
+        Some([a, b]) if (a, b) != (0.0, 1.0) => {
+            let (a, b) = (a.max(0.0).min(1.0), b.max(0.0).min(1.0));
+            format!("({a:.6}+{:.6}*min(t/{d:.3},1))", b - a)
+        }
+        _ => format!("min(t/{d:.3},1)"),
+    };
     match kb.preset.as_str() {
         "zoom-in" | "zoom-out" => {
             let z = 1.0 + 0.30 * amount;
             let p = if kb.preset == "zoom-in" {
-                format!("(1+({z:.4}-1)*min(t/{d:.3},1))")
+                format!("(1+({z:.4}-1)*{progress})")
             } else {
-                format!("({z:.4}-({z:.4}-1)*min(t/{d:.3},1))")
+                format!("({z:.4}-({z:.4}-1)*{progress})")
             };
             // clip(...) rather than the plain "(iw-ow)/2" center every zoom used before targetX/
             // targetY existed - ow/oh are themselves time-varying here (they're `iw/p`/`ih/p`
@@ -2507,9 +3481,9 @@ fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64) -> 
         "pan-left" | "pan-right" => {
             let z = 1.0 + 0.15 * amount;
             let dir = if kb.preset == "pan-right" {
-                format!("min(t/{d:.3},1)")
+                progress.clone()
             } else {
-                format!("1-min(t/{d:.3},1)")
+                format!("1-{progress}")
             };
             format!(",crop=w='iw/{z:.4}':h='ih/{z:.4}':x='(iw-ow)*({dir})':y='(ih-oh)/2',scale={out_w}:{out_h}")
         }
@@ -2761,8 +3735,61 @@ fn escape_filter_path(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/").replace(':', "\\:").replace('\'', "")
 }
 
+fn lowercase_extension(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default()
+}
+
+// Still images a timeline clip can be built from (the editor's image clips - see Clip's own doc
+// comment, videoEditTypes.ts). Mirrors IMAGE_CLIP_EXTENSIONS there. EXIF orientation needs no
+// handling of its own: ffmpeg auto-rotates image inputs by it, in -vf and -filter_complex alike.
+fn is_still_image_path(path: &str) -> bool {
+    matches!(
+        lowercase_extension(path).as_str(),
+        "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "gif" | "heic" | "heif"
+    )
+}
+
+// HEIC/HEIF stills (iPhone's default) - the bundled ffmpeg's HEIF tile-grid decoding is unreliable
+// (see get_heic_preview), so these never reach ffmpeg directly: still_image_source swaps in the
+// same cached, correctly decoded PNG the image viewer already shows.
+fn is_heic_path(path: &str) -> bool {
+    matches!(lowercase_extension(path).as_str(), "heic" | "heif")
+}
+
+// The file ffmpeg should actually read for an image clip - the image itself, or for HEIC/HEIF its
+// decoded PNG (generated once, then a cache hit).
+async fn still_image_source(app_handle: &AppHandle, window: &Window, state: &State<'_, ConversionState>, path: &str) -> Result<String, String> {
+    if !is_heic_path(path) {
+        return Ok(path.to_string());
+    }
+    get_heic_preview(app_handle.clone(), window.clone(), state.clone(), path.to_string()).await
+}
+
+// Frame rate every image segment is looped at (`-loop 1 -framerate`) - there's no source rate to
+// inherit from a still, and 30 matches probe_frame_rate's own fallback.
+const IMAGE_SEGMENT_FPS: f64 = 30.0;
+
+// Fits a segment's frames into the shared out_w:out_h output frame (letterboxed, never stretched)
+// before any of its own effects run - needed whenever segments can differ in size, since concat/
+// xfade both reject inputs of different dimensions. Image clips always need it (a photo is almost
+// never exactly the output size); same-size video segments pass through scale untouched. The
+// preview's own image proxy (get_image_clip_proxy) applies this exact scale+pad, which is what
+// keeps crop/Ken Burns/overlay positions on an image clip identical between preview and export.
+fn frame_fit_chain(out_w: i64, out_h: i64, is_image: bool) -> String {
+    format!(
+        ",scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1{fmt}",
+        w = out_w,
+        h = out_h,
+        fmt = if is_image { ",format=yuv420p" } else { "" }
+    )
+}
+
 fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
-    seg.color_filter
+    is_still_image_path(&seg.source_path) || seg.lut_cube.is_some() || seg.stabilize.is_some() || seg.color_filter
         .as_ref()
         .map_or(false, |cf| cf.preset != "none")
         || seg.ken_burns.is_some()
@@ -2770,6 +3797,7 @@ fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
         || seg.crop.is_some()
         || seg.flip_horizontal.unwrap_or(false)
         || (segment_speed(seg) - 1.0).abs() > 0.001
+        || seg.speed_steps.as_ref().map_or(false, |s| !s.is_empty())
         || segment_noise_reduction_db(seg).is_some()
         || !segment_audio_cleanup_filters(seg, None).is_empty()
 }
@@ -2798,8 +3826,15 @@ fn atempo_chain(speed: f64) -> String {
         .join(",")
 }
 
-fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>) -> String {
+fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>, fit_frame: bool, lut_path: Option<&str>, stab_path: Option<&str>) -> String {
     let mut extra = String::new();
+    // Stabilization first, on the clip's own frames exactly as pass 1 analysed them.
+    if let (Some(path), Some(stab)) = (stab_path, &seg.stabilize) {
+        extra.push_str(&stabilize_chain(path, stab.strength));
+    }
+    if let (true, Some(w), Some(h)) = (fit_frame, out_w, out_h) {
+        extra.push_str(&frame_fit_chain(w, h, is_still_image_path(&seg.source_path)));
+    }
     if seg.flip_horizontal.unwrap_or(false) {
         extra.push_str(",hflip");
     }
@@ -2808,6 +3843,11 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
             extra.push_str(&color_filter_chain(cf));
         }
     }
+    // The grade, right after the preset - the same order the preview's WebGL layer draws them in
+    // (CSS preset filter on top of the graded frame is equivalent: both are per-pixel color maps).
+    if let Some(path) = lut_path {
+        extra.push_str(&format!(",lut3d=file='{}':interp=trilinear", path));
+    }
     if let (Some(crop), Some(w), Some(h)) = (&seg.crop, out_w, out_h) {
         extra.push_str(&crop_chain(crop));
         if seg.ken_burns.is_none() {
@@ -2815,21 +3855,48 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         }
     }
     if let (Some(kb), Some(w), Some(h)) = (&seg.ken_burns, out_w, out_h) {
-        // Divided by speed: Ken Burns' own crop expression reads `t` from the SAME filter chain
-        // this is appended to, which by the time this runs has already had the segment's own
-        // setpts=(PTS-STARTPTS)/speed applied (see the three trim-step call sites) - `t` there is
-        // already OUTPUT time, not source time, so the progress fraction t/duration needs an
-        // OUTPUT duration to reach exactly 1.0 at the segment's own end regardless of speed. The
-        // live preview needs no equivalent adjustment - its own progress calc (VideoPlayer.tsx) is
-        // a source-time ratio that's already speed-invariant by construction, see its own comment.
-        extra.push_str(&ken_burns_chain(
-            kb,
-            (seg.end - seg.start) / segment_speed(seg),
-            w,
-            h,
-        ));
+        // Over the clip's SOURCE duration: this chain runs before the segment's speed change
+        // (segment_video_chain), so `t` here is source time - the same progress the preview uses
+        // (source-time fraction, VideoPlayer.tsx), and the same for a speed ramp as for a constant
+        // speed.
+        extra.push_str(&ken_burns_chain(kb, seg.end - seg.start, w, h));
     }
     extra
+}
+
+// One left-to-right fold step joining segment `i` ([v{i}]/[a{i}]) onto everything folded so far
+// ([cur_v]/[cur_a], `accumulated` seconds long). Returns the filter text and the new labels.
+//
+// A transition plays over the START of the incoming clip, from the outgoing clip's frozen last
+// frame - [cur_v] is held on its last frame (`tpad` clone) for the transition's length, and the
+// xfade begins exactly where the outgoing content ends. So a transition never eats into either
+// clip and the output is exactly the sum of the clips' own lengths - the same timeline the editor
+// shows, which is what keeps text/image overlays and captions (all timed on that timeline) in
+// sync after a transition, and what the live preview (TransitionPreviewLayer) reproduces: the
+// outgoing clip's last frame over the incoming clip as it starts. Audio simply cuts (concat):
+// with nothing overlapping there's nothing to crossfade, and no clip's sound gets shortened.
+fn transition_fold_step(
+    cur_v: &str,
+    cur_a: &str,
+    i: usize,
+    accumulated: f64,
+    seg_dur: f64,
+    transition: Option<(&str, f64)>,
+) -> (String, String, String) {
+    let next_v = format!("fold{}v", i);
+    let next_a = format!("fold{}a", i);
+    let step = match transition {
+        Some((name, duration)) => {
+            // At most 90% of the incoming clip - it plays entirely over that clip's own start.
+            let d = duration.min(seg_dur * 0.9).max(0.05);
+            format!(
+                "[{cur_v}]tpad=stop_mode=clone:stop_duration={d:.3}[hold{i}];[hold{i}][v{i}]xfade=transition={name}:duration={d:.3}:offset={offset:.3}[{next_v}];[{cur_a}][a{i}]concat=n=2:v=0:a=1[{next_a}];",
+                offset = accumulated.max(0.0)
+            )
+        }
+        None => format!("[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"),
+    };
+    (step, next_v, next_a)
 }
 
 // Frame rate of a source file's first video stream, as a plain f64 (e.g. 30.0, 59.94) - only ever
@@ -3172,9 +4239,25 @@ pub async fn export_trimmed_video(
     // unique_output_path (run_conversion) the same as the default location does, so a second export
     // to the exact same custom path doesn't clobber the first.
     output_path: Option<String>,
+    // A complete ASS subtitle script (the editor's Captions tool - buildCaptionsAss, captions.ts),
+    // already timed to the OUTPUT timeline and laid out at the video's own pixel size. Burned in
+    // with libass as the very last video stage, above every overlay. None/omitted = no captions.
+    captions_ass: Option<String>,
+    // A platform format to export in (see OutputFrame); None keeps the timeline's own frame.
+    output_frame: Option<OutputFrame>,
+    // Loudness target in LUFS (e.g. -14 for YouTube/Spotify, -16 for podcasts); None = as mixed.
+    loudness_lufs: Option<f64>,
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
+    }
+    // HEIC/HEIF image clips render from their decoded PNG (see still_image_source) - swapped in
+    // before anything below reads a segment's path, so every later step just sees a plain image.
+    let mut segments = segments;
+    for seg in segments.iter_mut() {
+        if is_heic_path(&seg.source_path) {
+            seg.source_path = still_image_source(&app_handle, &window, &state, &seg.source_path).await?;
+        }
     }
     let (quality_preset, quality_crf) = resolve_export_quality(quality.as_deref());
 
@@ -3200,18 +4283,42 @@ pub async fn export_trimmed_video(
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "mp4".to_string());
             let parent = base.parent().map(PathBuf::from).unwrap_or_default();
-            parent.join(format!("{} (edited).{}", stem, ext))
+            if ext.eq_ignore_ascii_case(crate::services::video_edits::VIDEO_PROJECT_EXTENSION) {
+                // A video project (made from images - see video_edits.rs) isn't itself a video, so
+                // its render is "<project name>.mp4", not "<name> (edited).briefvideo".
+                parent.join(format!("{}.mp4", stem))
+            } else {
+                parent.join(format!("{} (edited).{}", stem, ext))
+            }
         }
     };
 
+    // An image segment is a single still looped into a constant-rate stream long enough to cover
+    // its own [start,end) window - trim= below then cuts it exactly like a video segment.
     let mut inputs: Vec<InputSpec> = segments
         .iter()
-        .map(|s| InputSpec::plain(s.source_path.clone()))
+        .map(|s| {
+            if is_still_image_path(&s.source_path) {
+                InputSpec {
+                    path: s.source_path.clone(),
+                    pre_args: vec![
+                        "-loop".into(),
+                        "1".into(),
+                        "-framerate".into(),
+                        format!("{}", IMAGE_SEGMENT_FPS),
+                        "-t".into(),
+                        format!("{:.3}", s.end + 0.5),
+                    ],
+                }
+            } else {
+                InputSpec::plain(s.source_path.clone())
+            }
+        })
         .collect();
 
     // Written to temp files up front (ffmpeg needs real file paths, not data URLs) and cleaned up
     // unconditionally once the export attempt finishes below, success or failure.
-    let total_duration: f64 = segments.iter().map(|s| s.end - s.start).sum();
+    let total_duration: f64 = segments.iter().map(segment_output_duration).sum();
     let mut temp_overlay_paths: Vec<PathBuf> = Vec::new();
     for (i, ov) in overlays.iter().enumerate() {
         // Deliberately not `?` here - that would return before the cleanup loop further down ever
@@ -3237,6 +4344,8 @@ pub async fn export_trimmed_video(
             pre_args: vec![
                 "-loop".into(),
                 "1".into(),
+                "-framerate".into(),
+                format!("{}", OVERLAY_INPUT_FPS),
                 "-t".into(),
                 format!("{:.3}", total_duration.max(0.01)),
             ],
@@ -3300,12 +4409,53 @@ pub async fn export_trimmed_video(
         inputs.push(InputSpec::plain(pip.source_path.clone()));
     }
 
+    // Written next to the overlay PNGs (and cleaned up by the same loop once the export finishes).
+    let captions_ass_path: Option<PathBuf> = match captions_ass.as_deref().filter(|a| !a.trim().is_empty()) {
+        Some(ass) => {
+            let path = std::env::temp_dir().join(format!("briefcast_captions_{}.ass", std::process::id()));
+            if let Err(e) = std::fs::write(&path, ass) {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(format!("Failed to write captions file: {}", e));
+            }
+            temp_overlay_paths.push(path.clone());
+            Some(path)
+        }
+        None => None,
+    };
+
     let has_video_overlays = !overlays.is_empty();
     let has_blur_overlays = !blur_overlays.is_empty();
     let has_audio_overlays = !audio_overlays.is_empty();
     let has_pip_overlays = !pip_overlays.is_empty();
     // Any clip-level effect also needs the full filter graph - the fast -ss/-to path below has no
     // filter graph at all, so a color grade/Ken Burns/transition would have nowhere to be applied.
+    // Graded clips' LUTs, written where ffmpeg can read them (lut3d needs a file) and deleted again
+    // when this function returns, by TempFiles' Drop.
+    let mut lut_files = TempFiles(Vec::new());
+    let mut lut_paths: Vec<Option<String>> = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        match &seg.lut_cube {
+            Some(cube) => {
+                let path = std::env::temp_dir().join(format!("briefcast_grade_{}_{}.cube", std::process::id(), i));
+                std::fs::write(&path, cube).map_err(|e| format!("Failed to write a clip's color grade: {}", e))?;
+                lut_paths.push(Some(escape_filter_path(&path)));
+                lut_files.0.push(path);
+            }
+            None => lut_paths.push(None),
+        }
+    }
+    // Stabilized clips' pass-1 analysis (cached after the first time), escaped for the filter.
+    let mut stab_paths: Vec<Option<String>> = Vec::with_capacity(segments.len());
+    for seg in &segments {
+        stab_paths.push(match &seg.stabilize {
+            Some(_) if !is_still_image_path(&seg.source_path) => {
+                Some(escape_filter_path(&stabilization_transforms(&app_handle, &seg.source_path, seg.start, seg.end).await?))
+            }
+            _ => None,
+        });
+    }
     let has_clip_effects = segments.iter().any(segment_needs_filter_graph);
     // Any segment beyond the first requesting a transition - gates the pairwise xfade/acrossfade
     // fold below instead of the plain all-at-once `concat=n=N` the multi-segment branch has always
@@ -3319,6 +4469,9 @@ pub async fn export_trimmed_video(
         && !has_audio_overlays
         && !has_pip_overlays
         && !has_clip_effects
+        && captions_ass_path.is_none()
+        && output_frame.is_none()
+        && loudness_lufs.is_none()
     {
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
@@ -3375,6 +4528,7 @@ pub async fn export_trimmed_video(
         };
         let audio_probe_handles: Vec<_> = unique_source_paths
             .iter()
+            .filter(|path| !is_still_image_path(path))
             .map(|path| {
                 let ffprobe_path = ffprobe_path.clone();
                 let path = path.clone();
@@ -3388,9 +4542,17 @@ pub async fn export_trimmed_video(
         let dimensions_probe_handle =
             if (video_width.is_none() || video_height.is_none()) && has_clip_effects {
                 let ffprobe_path = ffprobe_path.clone();
-                let first_source = segments[0].source_path.clone();
+                // A real video's size beats a photo's as the output frame - photos come in any
+                // size/orientation, and an odd dimension would also break yuv420p encoding.
+                let first_source = segments
+                    .iter()
+                    .find(|s| !is_still_image_path(&s.source_path))
+                    .unwrap_or(&segments[0])
+                    .source_path
+                    .clone();
                 Some(tauri::async_runtime::spawn_blocking(move || {
                     probe_video_dimensions(&ffprobe_path, &first_source)
+                        .map(|(w, h)| ((w / 2 * 2).max(2), (h / 2 * 2).max(2)))
                 }))
             } else {
                 None
@@ -3407,7 +4569,7 @@ pub async fn export_trimmed_video(
         }
         let segment_has_audio: Vec<bool> = segments
             .iter()
-            .map(|s| *has_audio_by_path.get(&s.source_path).unwrap_or(&true))
+            .map(|s| !is_still_image_path(&s.source_path) && *has_audio_by_path.get(&s.source_path).unwrap_or(&true))
             .collect();
 
         let (video_width, video_height): (Option<i64>, Option<i64>) = match dimensions_probe_handle
@@ -3418,23 +4580,29 @@ pub async fn export_trimmed_video(
             },
             None => (video_width, video_height),
         };
+        let has_image_segments = segments.iter().any(|s| is_still_image_path(&s.source_path));
+        // Image segments can't be concatenated without a concrete output frame to fit them into,
+        // so a timeline with images always has one - 1080p only if nothing else could say.
+        let (video_width, video_height) = match (video_width, video_height) {
+            (Some(w), Some(h)) => (Some(w), Some(h)),
+            _ if has_image_segments => (Some(1920), Some(1080)),
+            other => other,
+        };
+        // Every segment gets fitted to the output frame once sources can differ in size - an
+        // image anywhere, or clips from more than one file. A single-file timeline keeps its
+        // exact pre-existing filter graph.
+        let fit_frame = has_image_segments || unique_source_paths.len() > 1;
 
         // Base video (trim, or trim+concat) always lands in a [base] node so the overlay chain
         // below has one consistent label to start from regardless of how many segments there were.
         if segments.len() == 1 {
             let seg = &segments[0];
-            let extra = segment_effect_chain(seg, video_width, video_height);
-            let speed = segment_speed(seg);
-            filter.push_str(&format!(
-                "[0:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{2:.4}{3}[base];",
-                seg.start, seg.end, speed, extra
-            ));
-            filter.push_str(&audio_trim_chain(
+            let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[0].as_deref(), stab_paths[0].as_deref());
+            filter.push_str(&format!("{}[base];", segment_video_chain("[0:v]", seg, &extra)));
+            filter.push_str(&segment_audio_chain(
                 segment_has_audio[0],
                 0,
-                seg.start,
-                seg.end,
-                speed,
+                seg,
                 &segment_cleanup(seg, rnnoise_model.as_deref()),
                 "outa",
             ));
@@ -3446,18 +4614,12 @@ pub async fn export_trimmed_video(
             // timeline with no transitions takes this exact path regardless of color/Ken Burns.
             let mut concat_inputs = String::new();
             for (i, seg) in segments.iter().enumerate() {
-                let extra = segment_effect_chain(seg, video_width, video_height);
-                let speed = segment_speed(seg);
-                filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{4:.4}{3}[v{2}];",
-                    seg.start, seg.end, i, extra, speed
-                ));
-                filter.push_str(&audio_trim_chain(
+                let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref());
+                filter.push_str(&format!("{}[v{i}];", segment_video_chain(&format!("[{i}:v]"), seg, &extra)));
+                filter.push_str(&segment_audio_chain(
                     segment_has_audio[i],
                     i,
-                    seg.start,
-                    seg.end,
-                    speed,
+                    seg,
                     &segment_cleanup(seg, rnnoise_model.as_deref()),
                     &format!("a{}", i),
                 ));
@@ -3480,10 +4642,15 @@ pub async fn export_trimmed_video(
             // so every segment gets an explicit `fps=` up front, using the first segment's own
             // source file's frame rate as the shared target (screen recordings from this app are
             // effectively always one consistent rate throughout a session either way).
-            let target_fps = {
-                let ffprobe_path = ffprobe_path.clone();
-                let source_path = segments[0].source_path.clone();
-                blocking(move || probe_frame_rate(&ffprobe_path, &source_path)).await?
+            // The first VIDEO segment's rate - an image has no rate of its own to offer (ffprobe
+            // reports image2's arbitrary 25), so an all-image timeline uses IMAGE_SEGMENT_FPS.
+            let target_fps = match segments.iter().find(|s| !is_still_image_path(&s.source_path)) {
+                Some(seg) => {
+                    let ffprobe_path = ffprobe_path.clone();
+                    let source_path = seg.source_path.clone();
+                    blocking(move || probe_frame_rate(&ffprobe_path, &source_path)).await?
+                }
+                None => IMAGE_SEGMENT_FPS,
             };
 
             // `settb=AVTB` too: xfade also demands both inputs share one timebase, but a plain
@@ -3492,18 +4659,16 @@ pub async fn export_trimmed_video(
             // failed with "First input link main timebase ... do not match" (reproduced against
             // the bundled ffmpeg). Pinning every segment to AVTB makes all fold steps agree.
             for (i, seg) in segments.iter().enumerate() {
-                let extra = segment_effect_chain(seg, video_width, video_height);
-                let speed = segment_speed(seg);
+                let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref());
                 filter.push_str(&format!(
-                    "[{2}:v]trim=start={0:.3}:end={1:.3},setpts=(PTS-STARTPTS)/{5:.4}{3},fps={4:.3},settb=AVTB[v{2}];",
-                    seg.start, seg.end, i, extra, target_fps, speed
+                    "{},fps={:.3},settb=AVTB[v{i}];",
+                    segment_video_chain(&format!("[{i}:v]"), seg, &extra),
+                    target_fps
                 ));
-                filter.push_str(&audio_trim_chain(
+                filter.push_str(&segment_audio_chain(
                     segment_has_audio[i],
                     i,
-                    seg.start,
-                    seg.end,
-                    speed,
+                    seg,
                     &segment_cleanup(seg, rnnoise_model.as_deref()),
                     &format!("a{}", i),
                 ));
@@ -3517,43 +4682,18 @@ pub async fn export_trimmed_video(
             // needs to be in that same OUTPUT-time space, not raw source seconds.
             let mut cur_v = "v0".to_string();
             let mut cur_a = "a0".to_string();
-            let mut accumulated =
-                (segments[0].end - segments[0].start) / segment_speed(&segments[0]);
+            let mut accumulated = segment_output_duration(&segments[0]);
             for i in 1..segments.len() {
                 let seg = &segments[i];
-                let seg_dur = (seg.end - seg.start) / segment_speed(seg);
-                let next_v = format!("fold{}v", i);
-                let next_a = format!("fold{}a", i);
-                let use_transition = seg
+                let seg_dur = segment_output_duration(seg);
+                let transition = seg
                     .transition_in
                     .as_ref()
-                    .map_or(false, |tr| tr.duration > 0.0);
-                if use_transition {
-                    let tr = seg.transition_in.as_ref().unwrap();
-                    let transition_name = sanitize_transition_name(&tr.transition_type);
-                    // Clamped so the transition can never exceed 90% of either flanking segment's
-                    // own duration - an unclamped duration could push `offset` negative (transition
-                    // longer than everything accumulated so far) or overlap more of the next
-                    // segment than actually exists.
-                    let d = tr
-                        .duration
-                        .min(accumulated * 0.9)
-                        .min(seg_dur * 0.9)
-                        .max(0.05);
-                    let offset = (accumulated - d).max(0.0);
-                    // acrossfade has no equivalent "transition style" concept of its own (audio has
-                    // no visual wipe/circle/pixelize shape to speak of) - every visual transition
-                    // style shares the exact same linear audio crossfade underneath.
-                    filter.push_str(&format!(
-                        "[{cur_v}][v{i}]xfade=transition={transition_name}:duration={d:.3}:offset={offset:.3}[{next_v}];[{cur_a}][a{i}]acrossfade=d={d:.3}[{next_a}];"
-                    ));
-                    accumulated += seg_dur - d;
-                } else {
-                    filter.push_str(&format!(
-                        "[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"
-                    ));
-                    accumulated += seg_dur;
-                }
+                    .filter(|tr| tr.duration > 0.0)
+                    .map(|tr| (sanitize_transition_name(&tr.transition_type), tr.duration));
+                let (step, next_v, next_a) = transition_fold_step(&cur_v, &cur_a, i, accumulated, seg_dur, transition);
+                filter.push_str(&step);
+                accumulated += seg_dur;
                 cur_v = next_v;
                 cur_a = next_a;
             }
@@ -3571,6 +4711,12 @@ pub async fn export_trimmed_video(
         // "blur only part of a frame" (blurring the whole frame and overlaying a crop of the
         // ORIGINAL on top would do it backwards).
         let mut current_label = "base".to_string();
+        // Platform format: the assembled video fitted into it first, so every overlay below (and
+        // the captions, laid out by the frontend at this same size) lands on the final frame.
+        if let Some(frame) = &output_frame {
+            filter.push_str(&reframe_chain("base", "framed", frame));
+            current_label = "framed".to_string();
+        }
         for (i, bv) in blur_overlays.iter().enumerate() {
             // Scaled off the region's own height (not a fixed px count) so a small region doesn't
             // get an absurdly large radius relative to itself and vice versa; clamped both for
@@ -3651,7 +4797,40 @@ pub async fn export_trimmed_video(
             } else {
                 source_label
             };
-            let (x_expr, y_expr) = overlay_position_expr(ov, animation);
+            let (mut x_expr, mut y_expr) = overlay_position_expr(ov, animation);
+            let mut composited_label = composited_label;
+            if let Some(kfs) = ov.keyframes.as_ref().filter(|k| !k.is_empty()) {
+                // Keyframed motion: scale (per frame, by frame number), opacity (per pixel, by
+                // time) and position - scaling about the box's centre, as the preview does.
+                let scales = kfs.iter().any(|k| (k.scale - 1.0).abs() > 1e-3);
+                let fades = kfs.iter().any(|k| (k.opacity - 1.0).abs() > 1e-3);
+                if scales {
+                    let s = keyframe_expr(kfs, &format!("(n/{})", OVERLAY_INPUT_FPS), |k| k.scale.max(0.01));
+                    let scaled = format!("ovkfs{}", i);
+                    filter.push_str(&format!(
+                        "[{composited_label}]scale=w='max(2,trunc(iw*({s})/2)*2)':h='max(2,trunc(ih*({s})/2)*2)':eval=frame[{scaled}];"
+                    ));
+                    composited_label = scaled;
+                }
+                if fades {
+                    let o = keyframe_expr(kfs, "T", |k| k.opacity.clamp(0.0, 1.0));
+                    let faded = format!("ovkfa{}", i);
+                    filter.push_str(&format!(
+                        "[{composited_label}]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({o})'[{faded}];"
+                    ));
+                    composited_label = faded;
+                }
+                let x = keyframe_expr(kfs, "t", |k| k.x);
+                let y = keyframe_expr(kfs, "t", |k| k.y);
+                if scales {
+                    let s = keyframe_expr(kfs, "t", |k| k.scale.max(0.01));
+                    x_expr = format!("({x})+overlay_w*(1/({s})-1)/2");
+                    y_expr = format!("({y})+overlay_h*(1/({s})-1)/2");
+                } else {
+                    x_expr = x;
+                    y_expr = y;
+                }
+            }
             let next_label = if i + 1 == overlays.len() {
                 "outv".to_string()
             } else {
@@ -3695,6 +4874,16 @@ pub async fn export_trimmed_video(
         // layers" with one check, rather than the single `!has_video_overlays` special case this
         // used to be before blur/pip support existed (back when [base] was the only possible
         // "nothing chained" label).
+        // Captions last, so they sit above every image/text/blur/PiP layer.
+        if let Some(ass_path) = &captions_ass_path {
+            filter.push_str(&format!(
+                "[{}]ass=filename='{}'[capv];",
+                current_label,
+                escape_filter_path(ass_path)
+            ));
+            current_label = "capv".to_string();
+        }
+
         if current_label != "outv" {
             filter.push_str(&format!("[{}]copy[outv];", current_label));
         }
@@ -3813,6 +5002,7 @@ pub async fn export_trimmed_video(
         } else {
             base_audio_label.to_string()
         };
+        // (A loudness target is applied after the render - see normalize_loudness.)
 
         // Trailing `;` is harmless to ffmpeg either way, but trimmed for consistency with how the
         // original concat-only filter string here was always built without one.
@@ -3856,7 +5046,159 @@ pub async fn export_trimmed_video(
         let _ = std::fs::remove_file(temp_path);
     }
 
-    result
+    match (result, loudness_lufs) {
+        (Ok(path), Some(target)) => {
+            normalize_loudness(&app_handle, &path, target).await?;
+            Ok(path)
+        }
+        (result, _) => result,
+    }
+}
+
+// Integrated loudness (LUFS) of a file's audio, measured with ffmpeg's EBU R128 scanner.
+fn measure_loudness(ffmpeg_path: &PathBuf, path: &str) -> Result<f64, String> {
+    let mut cmd = Command::new(ffmpeg_path);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    cmd.args(["-hide_banner", "-nostats", "-i", path, "-vn", "-af", "ebur128=framelog=quiet", "-f", "null", "-"]);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    let out = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+    let log = String::from_utf8_lossy(&out.stderr);
+    // The summary's "I: -17.4 LUFS" line (the last one - the per-frame log is off).
+    log.lines()
+        .filter_map(|l| l.trim().strip_prefix("I:"))
+        .filter_map(|v| v.trim().trim_end_matches("LUFS").trim().parse::<f64>().ok())
+        .last()
+        .ok_or_else(|| "Couldn't measure the export's loudness".to_string())
+}
+
+// Loudness target: the finished export's audio is re-rendered with the gain that lands it on
+// `target` LUFS (EBU R128 integrated); the picture is copied untouched.
+//
+// - The chain (loudness_chain) is the gain, then a lookahead peak limiter holding peaks near
+//   -2 dBFS (room for AAC's overshoot). A short release shaves the peaks inside each syllable rather
+//   than ducking whole words: on dense speech (every syllable within a few dB of the loudest) a
+//   40ms release took back 11 of 15 dB of gain on the way to -14 LUFS, 8ms takes back ~5. No
+//   compressor: the loudness then rises smoothly and monotonically with the gain, which is what
+//   makes the search exact.
+// - The gain is searched with measure-only passes (decode -> chain -> R128 scanner, nothing
+//   written): secant steps, safeguarded by bisection once the target is bracketed. Limited,
+//   high-crest audio bends the curve well below 1:1, which is what the secant follows.
+// - Then the audio alone is encoded once and checked (AAC moves the result by a few hundredths),
+//   with one correction if needed, and muxed back next to the copied video.
+const LOUDNESS_TOLERANCE_LU: f64 = 0.1;
+const LOUDNESS_MAX_SEARCH_PASSES: usize = 10;
+const LOUDNESS_MAX_GAIN_DB: f64 = 30.0;
+
+fn loudness_chain(gain: f64) -> String {
+    // latency=1: the 2ms lookahead is compensated, so the sound stays in sync with the picture.
+    format!("volume={gain:.3}dB,alimiter=limit=0.79:attack=2:release=8:level=false:latency=1")
+}
+
+// Integrated loudness of `path`'s audio after `chain`, without writing anything.
+fn measure_loudness_through(ffmpeg_path: &PathBuf, path: &str, chain: &str) -> Result<f64, String> {
+    let mut cmd = Command::new(ffmpeg_path);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let af = format!("{chain},ebur128=framelog=quiet");
+    cmd.args(["-hide_banner", "-nostats", "-i", path, "-vn", "-af", &af, "-f", "null", "-"]);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    let out = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+    let log = String::from_utf8_lossy(&out.stderr);
+    log.lines()
+        .filter_map(|l| l.trim().strip_prefix("I:"))
+        .filter_map(|v| v.trim().trim_end_matches("LUFS").trim().parse::<f64>().ok())
+        .last()
+        .ok_or_else(|| "Couldn't measure the export's loudness".to_string())
+}
+
+// The gain search on a monotone gain -> loudness curve `f`: secant steps from `first_gain`, kept
+// inside the bracket once the target is crossed (bisecting when a step would leave it). Returns the
+// gain whose result was closest, and that result.
+fn search_loudness_gain(target: f64, first_gain: f64, mut f: impl FnMut(f64) -> Result<f64, String>) -> Result<(f64, f64), String> {
+    let clamp_gain = |g: f64| g.clamp(-LOUDNESS_MAX_GAIN_DB, LOUDNESS_MAX_GAIN_DB);
+    let mut gain = clamp_gain(first_gain);
+    let mut best: Option<(f64, f64)> = None; // (gain, result)
+    let mut previous: Option<(f64, f64)> = None;
+    let mut below: Option<f64> = None; // a gain known to land under the target
+    let mut above: Option<f64> = None; // ... and over it
+    for _ in 0..LOUDNESS_MAX_SEARCH_PASSES {
+        let result = f(gain)?;
+        if best.map_or(true, |(_, r)| (target - result).abs() < (target - r).abs()) {
+            best = Some((gain, result));
+        }
+        if (target - result).abs() <= LOUDNESS_TOLERANCE_LU {
+            break;
+        }
+        if result < target {
+            below = Some(below.map_or(gain, |b: f64| b.max(gain)));
+        } else {
+            above = Some(above.map_or(gain, |a: f64| a.min(gain)));
+        }
+        let slope = match previous {
+            Some((g0, r0)) if (gain - g0).abs() > 1e-6 && (result - r0).abs() > 1e-3 => ((result - r0) / (gain - g0)).clamp(0.02, 1.5),
+            _ => 1.0,
+        };
+        previous = Some((gain, result));
+        let mut next = clamp_gain(gain + (target - result) / slope);
+        if let (Some(lo), Some(hi)) = (below, above) {
+            if !(next > lo.min(hi) && next < lo.max(hi)) {
+                next = (lo + hi) / 2.0;
+            }
+        }
+        if (next - gain).abs() < 1e-3 {
+            break; // pinned at the gain limit, or the curve has flattened out (limiter wall)
+        }
+        gain = next;
+    }
+    best.ok_or_else(|| "Couldn't measure the export's loudness".to_string())
+}
+
+async fn normalize_loudness(app_handle: &AppHandle, path: &str, target: f64) -> Result<(), String> {
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let target = target.clamp(-30.0, -5.0);
+    let file = path.to_string();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let measured = measure_loudness(&ffmpeg_path, &file)?;
+        if !measured.is_finite() || measured < -70.0 || (target - measured).abs() < LOUDNESS_TOLERANCE_LU {
+            return Ok(()); // silent, or already on target
+        }
+        let (mut gain, searched) =
+            search_loudness_gain(target, target - measured, |g| measure_loudness_through(&ffmpeg_path, &file, &loudness_chain(g)))?;
+
+        let source = PathBuf::from(&file);
+        let temps = TempFiles(vec![source.with_extension("loudness.m4a"), source.with_extension("loudness.mp4")]);
+        let (audio, muxed) = (&temps.0[0], &temps.0[1]);
+        let encode = |g: f64| -> Result<f64, String> {
+            let args: Vec<String> = vec![
+                "-i".into(), file.clone(), "-vn".into(), "-af".into(), loudness_chain(g),
+                "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), path_to_str(audio)?.to_string(),
+            ];
+            run_ffmpeg_quiet(&ffmpeg_path, &args).map_err(|e| format!("Couldn't adjust the export's loudness: {}", e))?;
+            measure_loudness(&ffmpeg_path, path_to_str(audio)?)
+        };
+        let mut result = encode(gain)?;
+        // AAC shifts it by a few hundredths at most; one correction if that crossed the tolerance.
+        if (target - result).abs() > LOUDNESS_TOLERANCE_LU && (target - searched).abs() <= LOUDNESS_TOLERANCE_LU {
+            gain += target - result;
+            result = encode(gain)?;
+        }
+        let args: Vec<String> = vec![
+            "-i".into(), file.clone(), "-i".into(), path_to_str(audio)?.to_string(),
+            "-map".into(), "0".into(), "-map".into(), "-0:a".into(), "-map".into(), "1:a".into(),
+            "-c".into(), "copy".into(), "-movflags".into(), "+faststart".into(), path_to_str(muxed)?.to_string(),
+        ];
+        run_ffmpeg_quiet(&ffmpeg_path, &args).map_err(|e| format!("Couldn't save the loudness-adjusted export: {}", e))?;
+        std::fs::rename(muxed, &source).map_err(|e| format!("Failed to save the loudness-adjusted export: {}", e))?;
+        log::info!("[export] loudness {:.2} LUFS -> {:.2} (target {:.1}, gain {:+.2} dB)", measured, result, target, gain);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Loudness task panicked: {e}"))?
 }
 
 // Extracts one timeline clip's own audio to a standalone file - the audio-only counterpart of
@@ -4499,6 +5841,109 @@ pub async fn decode_audio_range(
     Ok(tauri::ipc::Response::new(run_ffmpeg_capture(ffmpeg_path, args).await?))
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeatsResult {
+    pub bpm: f64,
+    pub beats: Vec<f64>,
+}
+
+// Beat sync (video editor): the tempo and every beat of a music file, in that file's own seconds.
+// Decoded to mono 22.05kHz and analysed by services/beat_detect.rs; cached per file, since
+// analysing a long track takes a few seconds and the answer never changes.
+#[tauri::command]
+pub async fn detect_beats(app_handle: AppHandle, source_path: String) -> Result<BeatsResult, String> {
+    let input = PathBuf::from(&source_path);
+    let cache_path = preview_cache_path(&input, "beats_v1", "json")?;
+    if let Ok(text) = std::fs::read_to_string(&cache_path) {
+        if let Ok(cached) = serde_json::from_str::<BeatsResult>(&text) {
+            return Ok(cached);
+        }
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let args: Vec<String> = vec![
+        "-v".into(), "error".into(), "-i".into(), source_path,
+        "-vn".into(), "-ac".into(), "1".into(), "-ar".into(), "22050".into(),
+        "-f".into(), "f32le".into(), "pipe:1".into(),
+    ];
+    let bytes = run_ffmpeg_capture(ffmpeg_path, args).await?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let samples: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        crate::services::beat_detect::track_beats(&samples, 22050.0)
+    })
+    .await
+    .map_err(|e| format!("Beat detection task panicked: {e}"))?
+    .ok_or("No steady beat found - the track may be too short, or have no clear rhythm")?;
+    let out = BeatsResult { bpm: (result.bpm * 10.0).round() / 10.0, beats: result.beats };
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&cache_path, serde_json::to_string(&out).unwrap_or_default());
+    Ok(out)
+}
+
+// Auto-reframe analysis: where the action is in [start, end] of a clip's source, once per frame at
+// ANALYSIS_FPS, for a crop window `crop_w` x `crop_h` (fractions of the source frame). The
+// saliency profiles are cached per range (the slow part - decoding), so asking again for another
+// output shape is instant. Times are source seconds.
+#[tauri::command]
+pub async fn analyze_subject_track(
+    app_handle: AppHandle,
+    source_path: String,
+    start: f64,
+    end: f64,
+    crop_w: f64,
+    crop_h: f64,
+) -> Result<SubjectTrack, String> {
+    use crate::services::subject_track::{profiles_from_gray, subject_samples, FrameProfile, ANALYSIS_FPS, ANALYSIS_SIZE};
+    let input = PathBuf::from(&source_path);
+    // The source's own size - the frontend fits it into the project frame, as export does.
+    let ffprobe_path = get_ffprobe_path(&app_handle)?;
+    let probe_path = source_path.clone();
+    let (width, height) = tauri::async_runtime::spawn_blocking(move || probe_video_dimensions(&ffprobe_path, &probe_path))
+        .await
+        .map_err(|e| format!("Probe task panicked: {e}"))?
+        .unwrap_or((0, 0));
+    if !(end > start) {
+        return Ok(SubjectTrack { width, height, samples: Vec::new() });
+    }
+    let cache_path = preview_cache_path(&input, &format!("subject_v1_{:.3}_{:.3}", start, end), "json")?;
+    let cached = std::fs::read_to_string(&cache_path).ok().and_then(|text| serde_json::from_str::<Vec<FrameProfile>>(&text).ok());
+    let profiles = match cached {
+        Some(profiles) => profiles,
+        None => {
+            let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+            let args: Vec<String> = vec![
+                "-v".into(), "error".into(), "-ss".into(), format!("{:.3}", start), "-i".into(), source_path,
+                "-t".into(), format!("{:.3}", end - start), "-an".into(), "-sn".into(),
+                "-vf".into(), format!("fps={ANALYSIS_FPS},scale={ANALYSIS_SIZE}:{ANALYSIS_SIZE}:flags=area,format=gray"),
+                "-f".into(), "rawvideo".into(), "pipe:1".into(),
+            ];
+            let bytes = run_ffmpeg_capture(ffmpeg_path, args).await?;
+            let profiles = tauri::async_runtime::spawn_blocking(move || profiles_from_gray(&bytes, ANALYSIS_SIZE, ANALYSIS_FPS))
+                .await
+                .map_err(|e| format!("Subject analysis task panicked: {e}"))?;
+            if let Some(parent) = cache_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&cache_path, serde_json::to_string(&profiles).unwrap_or_default());
+            profiles
+        }
+    };
+    let mut samples = subject_samples(&profiles, crop_w.clamp(0.01, 1.0), crop_h.clamp(0.01, 1.0));
+    for sample in &mut samples {
+        sample.t += start;
+    }
+    Ok(SubjectTrack { width, height, samples })
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubjectTrack {
+    pub width: i64,
+    pub height: i64,
+    pub samples: Vec<crate::services::subject_track::SubjectSample>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4519,6 +5964,9 @@ mod tests {
             speed: None,
             noise_reduction: None,
             audio_cleanup: None,
+            lut_cube: None,
+            stabilize: None,
+            speed_steps: None,
         }
     }
 
@@ -4748,6 +6196,7 @@ mod tests {
             intensity: None,
             target_x: None,
             target_y: None,
+            span: None,
         };
         assert_eq!(ken_burns_chain(&kb, 5.0, 1920, 1080), "");
     }
@@ -4759,6 +6208,7 @@ mod tests {
             intensity: Some(1.0),
             target_x: None,
             target_y: None,
+            span: None,
         };
         let chain = ken_burns_chain(&kb, 5.0, 1920, 1080);
         assert!(
@@ -4769,6 +6219,45 @@ mod tests {
             chain.ends_with(",scale=1920:1080"),
             "expected a trailing scale to output resolution, got: {chain}"
         );
+    }
+
+    #[test]
+    fn ken_burns_chain_continues_a_split_move_over_its_span() {
+        let kb = ClipKenBurns {
+            preset: "zoom-in".to_string(),
+            intensity: Some(1.0),
+            target_x: None,
+            target_y: None,
+            span: Some([0.5, 1.0]),
+        };
+        let chain = ken_burns_chain(&kb, 4.0, 1920, 1080);
+        assert!(chain.contains("(0.500000+0.500000*min(t/4.000,1))"), "{chain}");
+    }
+
+    #[test]
+    fn loudness_search_lands_on_a_limited_curve() {
+        // A limiter wall: 1:1 up to -16 LUFS, then only 0.15 LU per dB.
+        let curve = |g: f64| {
+            let raw = -30.0 + g;
+            if raw < -16.0 { raw } else { -16.0 + 0.15 * (raw + 16.0) }
+        };
+        let mut evals = 0;
+        let (gain, result) = search_loudness_gain(-14.0, 16.0, |g| { evals += 1; Ok(curve(g)) }).unwrap();
+        assert!((result + 14.0).abs() <= LOUDNESS_TOLERANCE_LU, "result {result} gain {gain} after {evals}");
+        assert!(evals <= LOUDNESS_MAX_SEARCH_PASSES);
+    }
+
+    #[test]
+    fn loudness_search_stops_at_the_gain_limit_when_unreachable() {
+        let (gain, result) = search_loudness_gain(-5.0, 20.0, |g| Ok(-40.0 + 0.2 * g)).unwrap();
+        assert!((gain - LOUDNESS_MAX_GAIN_DB).abs() < 1e-9);
+        assert!((result - (-40.0 + 0.2 * LOUDNESS_MAX_GAIN_DB)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loudness_chain_is_one_shape_for_every_gain() {
+        assert_eq!(loudness_chain(-1.0), "volume=-1.000dB,alimiter=limit=0.79:attack=2:release=8:level=false:latency=1");
+        assert!(loudness_chain(12.0).starts_with("volume=12.000dB,alimiter"));
     }
 
     // ---- segment_effect_chain - ordering matters (mirrored in VideoPlayer.tsx's own preview) -----
@@ -4787,7 +6276,7 @@ mod tests {
             width: 1.0,
             height: 1.0,
         });
-        let chain = segment_effect_chain(&seg, Some(1920), Some(1080));
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None);
         let hflip_pos = chain.find("hflip").expect("hflip missing");
         let color_pos = chain.find("eq=saturation").expect("color filter missing");
         let crop_pos = chain.find("crop=").expect("crop missing");
@@ -4811,8 +6300,9 @@ mod tests {
             intensity: Some(0.5),
             target_x: None,
             target_y: None,
+            span: None,
         });
-        let chain = segment_effect_chain(&seg, Some(1920), Some(1080));
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None);
         // Exactly one scale=1920:1080 (Ken Burns' own trailing one), not two.
         assert_eq!(chain.matches("scale=1920:1080").count(), 1);
     }
@@ -4820,7 +6310,7 @@ mod tests {
     #[test]
     fn segment_effect_chain_with_no_effects_is_empty() {
         assert_eq!(
-            segment_effect_chain(&base_segment(), Some(1920), Some(1080)),
+            segment_effect_chain(&base_segment(), Some(1920), Some(1080), false, None, None),
             ""
         );
     }
@@ -4943,6 +6433,7 @@ mod tests {
             start_time: 0.0,
             end_time: 5.0,
             animation: "none".to_string(),
+            keyframes: None,
         };
         assert_eq!(
             overlay_position_expr(&ov, "none"),
@@ -4963,6 +6454,7 @@ mod tests {
             start_time: 0.0,
             end_time: 5.0,
             animation: "slide-left".to_string(),
+            keyframes: None,
         };
         let (x, y) = overlay_position_expr(&ov, "slide-left");
         assert_eq!(y, "200"); // y untouched
@@ -5102,5 +6594,168 @@ mod tests {
         assert_eq!(decoded.dimensions(), (16, 16));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- image clips -----------------------------------------------------------------------------
+
+    #[test]
+    fn still_image_paths_are_recognized_case_insensitively() {
+        assert!(is_still_image_path("C:/photos/IMG_0001.JPG"));
+        assert!(is_still_image_path("shot.png"));
+        assert!(is_still_image_path("scan.webp"));
+        assert!(!is_still_image_path("clip.mp4"));
+        assert!(is_still_image_path("photo.HEIC"));
+        assert!(is_heic_path("photo.heif") && !is_heic_path("photo.jpg"));
+        assert!(!is_still_image_path("My video.briefvideo"));
+    }
+
+    #[test]
+    fn image_segments_always_need_the_filter_graph() {
+        let seg = KeepSegment { source_path: "photo.jpg".to_string(), end: 5.0, ..base_segment() };
+        assert!(segment_needs_filter_graph(&seg));
+        assert!(!segment_needs_filter_graph(&base_segment()));
+    }
+
+    #[test]
+    fn frame_fit_letterboxes_before_any_clip_effect() {
+        let seg = KeepSegment { source_path: "photo.jpg".to_string(), flip_horizontal: Some(true), ..base_segment() };
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), true, None, None);
+        let fit = chain.find("pad=1920:1080").expect("pads to the output frame");
+        let flip = chain.find("hflip").expect("still applies the clip's own effects");
+        assert!(fit < flip, "fit must come first so effects see the output-sized frame: {chain}");
+        assert!(chain.contains("force_original_aspect_ratio=decrease"), "never stretches: {chain}");
+        assert!(chain.contains("format=yuv420p"), "images get converted to the encode format: {chain}");
+    }
+
+    #[test]
+    fn frame_fit_is_skipped_unless_requested() {
+        let seg = KeepSegment { source_path: "photo.jpg".to_string(), ..base_segment() };
+        assert_eq!(segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None), "");
+        assert!(!frame_fit_chain(1280, 720, false).contains("format="), "videos keep their own pixel format");
+    }
+
+    #[test]
+    fn proxy_size_caps_the_long_edge_and_stays_even() {
+        assert_eq!(proxy_size(1920, 1080), (1920, 1080));
+        assert_eq!(proxy_size(3840, 2160), (1920, 1080));
+        assert_eq!(proxy_size(1080, 1920), (1080, 1920));
+        let (w, h) = proxy_size(4001, 3001);
+        assert!(w <= PROXY_MAX_EDGE && h <= PROXY_MAX_EDGE && w % 2 == 0 && h % 2 == 0);
+    }
+
+    // ---- transition_fold_step ------------------------------------------------------------------
+
+    #[test]
+    fn transition_holds_the_outgoing_frame_and_starts_where_it_ends() {
+        let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fade", 1.0)));
+        assert_eq!((v.as_str(), a.as_str()), ("fold1v", "fold1a"));
+        assert!(step.contains("[v0]tpad=stop_mode=clone:stop_duration=1.000[hold1]"), "{step}");
+        assert!(step.contains("xfade=transition=fade:duration=1.000:offset=5.000"), "{step}");
+        assert!(step.contains("[a0][a1]concat=n=2:v=0:a=1[fold1a]"), "audio just cuts: {step}");
+    }
+
+    #[test]
+    fn transition_is_capped_by_the_incoming_clip_only() {
+        // A tiny first clip no longer limits the transition - it plays over the incoming clip.
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 0.5, 2.0, Some(("wipeleft", 3.0)));
+        assert!(step.contains("duration=1.800:offset=0.500"), "{step}");
+    }
+
+    #[test]
+    fn no_transition_is_a_plain_concat() {
+        let (step, _, _) = transition_fold_step("fold1v", "fold1a", 2, 9.0, 4.0, None);
+        assert_eq!(step, "[fold1v][fold1a][v2][a2]concat=n=2:v=1:a=1[fold2v][fold2a];");
+    }
+
+    #[test]
+    fn graded_segments_get_lut3d_after_their_color_preset() {
+        let seg = KeepSegment {
+            color_filter: Some(ClipColorFilter { preset: "warm".to_string(), intensity: 0.5 }),
+            lut_cube: Some("LUT_3D_SIZE 2".to_string()),
+            ..base_segment()
+        };
+        assert!(segment_needs_filter_graph(&seg));
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, Some(r"C\:/tmp/g.cube"), None);
+        let lut = chain.find(r"lut3d=file='C\:/tmp/g.cube':interp=trilinear").expect("lut3d step");
+        assert!(chain.find("colorbalance").or(chain.find("eq=")).unwrap() < lut, "{chain}");
+    }
+
+    #[test]
+    fn a_ramp_is_one_segment_with_a_continuous_time_map_and_stepped_audio() {
+        let seg = KeepSegment {
+            start: 10.0,
+            end: 14.0,
+            speed_steps: Some(vec![
+                SpeedStep { source_start: 10.0, source_end: 12.0, speed: 1.0 },
+                SpeedStep { source_start: 12.0, source_end: 14.0, speed: 0.5 },
+            ]),
+            ..base_segment()
+        };
+        assert!(segment_needs_filter_graph(&seg));
+        assert!((segment_output_duration(&seg) - 6.0).abs() < 1e-9); // 2s + 2s at half speed
+        assert_eq!(
+            segment_speed_filter(&seg),
+            "setpts='(if(lt(T,2.000000),(0.000000+(T-0.000000)/1.000000),(2.000000+(T-2.000000)/0.500000)))/TB'"
+        );
+        let audio = segment_audio_chain(true, 3, &seg, &(vec![], None), "a3");
+        assert!(audio.contains("[a3_src]asplit=2[a3_p0][a3_p1];"), "{audio}");
+        assert!(audio.contains("[a3_p1]atrim=start=2.000000:end=4.250000,asetpts=PTS-STARTPTS,apad=pad_dur=0.25,atempo=0.5000,atrim=end=4.000000[a3_q1];"), "{audio}");
+        assert!(audio.ends_with("[a3_q0][a3_q1]concat=n=2:v=0:a=1[a3];"), "{audio}");
+        // Silent clip: silence as long as the ramped output.
+        assert!(segment_audio_chain(false, 3, &seg, &(vec![], None), "a3").contains("duration=6.000"));
+    }
+
+    #[test]
+    fn constant_speed_keeps_its_plain_chain() {
+        let seg = KeepSegment { speed: Some(2.0), ..base_segment() };
+        assert_eq!(segment_video_chain("[0:v]", &seg, ",hflip"), "[0:v]trim=start=0.000:end=10.000,setpts=PTS-STARTPTS,hflip,setpts=PTS/2.0000");
+        assert!((segment_output_duration(&seg) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reframe_modes_produce_the_output_size() {
+        let frame = |mode: &str| OutputFrame { width: 1080, height: 1920, mode: mode.to_string(), anchor_x: None, anchor_y: None , track: None};
+        assert_eq!(
+            reframe_chain("base", "framed", &frame("fill")),
+            "[base]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[framed];"
+        );
+        assert!(reframe_chain("base", "framed", &frame("fit")).contains("pad=1080:1920"));
+        let blur = reframe_chain("base", "framed", &frame("fit-blur"));
+        assert!(blur.starts_with("[base]split=2") && blur.contains("boxblur") && blur.ends_with("[framed];"), "{blur}");
+    }
+
+    #[test]
+    fn eased_knots_build_a_balanced_tree_that_holds_and_eases() {
+        assert_eq!(eased_knots_expr(&[(0.0, 0.3)], "t"), "0.30000");
+        let two = eased_knots_expr(&[(1.0, 0.2), (2.0, 0.2)], "t");
+        assert_eq!(two, "0.20000"); // a hold is a constant
+        let k: Vec<(f64, f64)> = (0..64).map(|i| (i as f64, (i % 2) as f64)).collect();
+        let e = eased_knots_expr(&k, "t");
+        // 63 segments -> nesting depth ~6, not 63.
+        let mut depth = 0i32;
+        let mut max_depth = 0;
+        for c in e.chars() {
+            if c == '(' { depth += 1; max_depth = max_depth.max(depth); }
+            if c == ')' { depth -= 1; }
+        }
+        assert!(max_depth < 20, "depth {max_depth}");
+        assert_eq!(e.matches("if(").count(), 62);
+    }
+
+    #[test]
+    fn a_tracked_fill_crops_on_the_track() {
+        let frame = OutputFrame { width: 1080, height: 1920, mode: "fill".into(), anchor_x: None, anchor_y: None, track: Some(vec![[0.0, 0.3, 0.5], [2.0, 0.7, 0.5]]) };
+        let chain = reframe_chain("base", "framed", &frame);
+        assert!(chain.contains("x='clip(((0.30000+(0.40000)*"), "{chain}");
+        assert!(chain.contains(":y='clip((0.50000)*ih-oh/2,0,ih-oh)'"), "{chain}");
+    }
+
+    #[test]
+    fn keyframe_expressions_hold_ease_and_hold_again() {
+        let kf = |time: f64, x: f64, easing: &str| OverlayKeyframe { time, x, y: 0.0, scale: 1.0, opacity: 1.0, easing: easing.to_string() };
+        assert_eq!(keyframe_expr(&[kf(1.0, 50.0, "linear")], "t", |k| k.x), "50.0000");
+        let e = keyframe_expr(&[kf(2.0, 100.0, "linear"), kf(1.0, 0.0, "ease")], "t", |k| k.x);
+        assert_eq!(e, "if(lt(t,2.0000),(0.0000+(100.0000)*(clip((t-1.0000)/1.0000,0,1))*(clip((t-1.0000)/1.0000,0,1))*(3-2*(clip((t-1.0000)/1.0000,0,1)))),100.0000)");
+        assert!(keyframe_expr(&[kf(0.0, 0.0, "hold"), kf(1.0, 10.0, "linear")], "t", |k| k.x).contains("(0.0000+(10.0000)*0)"));
     }
 }

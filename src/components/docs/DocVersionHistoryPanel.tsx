@@ -15,6 +15,8 @@ import { yDocToProsemirrorJSON } from "y-prosemirror";
 import { IoClose, IoTimeOutline } from "react-icons/io5";
 import { DocVersionSummary } from "../../utils/docTypes";
 import { getDocContentExtensions, docProseClassName } from "../../utils/docSchemaExtensions";
+import { snapshotBibliography, type BibliographySource } from "../../utils/docBibliography";
+import { createDocStructureExtension } from "../../utils/docStructure";
 
 interface DocVersionHistoryPanelProps {
   docId: string;
@@ -47,7 +49,7 @@ const DocVersionHistoryPanel: React.FC<DocVersionHistoryPanelProps> = ({ docId, 
   // Newest first is already how useDocsEditStore.ts's `versions` comes back from list_doc_versions
   // (docs.rs sorts descending), so no re-sort needed here.
   const [selectedId, setSelectedId] = useState<string | null>(versions[0]?.id ?? null);
-  const [previewDoc, setPreviewDoc] = useState<{ versionId: string; json: JSONContent } | null>(null);
+  const [previewDoc, setPreviewDoc] = useState<{ versionId: string; json: JSONContent; bibliography: BibliographySource } | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [confirmRestore, setConfirmRestore] = useState(false);
@@ -71,7 +73,8 @@ const DocVersionHistoryPanel: React.FC<DocVersionHistoryPanelProps> = ({ docId, 
         try {
           Y.applyUpdate(tempDoc, new Uint8Array(bytes));
           const json = yDocToProsemirrorJSON(tempDoc, "default") as JSONContent;
-          setPreviewDoc({ versionId: selectedId, json });
+          // The version's own reference library, so its citations and reference list read as they did.
+          setPreviewDoc({ versionId: selectedId, json, bibliography: snapshotBibliography(tempDoc) });
         } finally {
           tempDoc.destroy();
         }
@@ -89,7 +92,8 @@ const DocVersionHistoryPanel: React.FC<DocVersionHistoryPanelProps> = ({ docId, 
     };
   }, [docId, selectedId]);
 
-  const extensions = useMemo(() => getDocContentExtensions(), []);
+  // The structure plugin numbers figures/equations and formats citations in the preview too.
+  const extensions = useMemo(() => [...getDocContentExtensions(), createDocStructureExtension(previewDoc?.bibliography ?? null)], [previewDoc]);
   const previewEditor = useEditor(
     {
       extensions,

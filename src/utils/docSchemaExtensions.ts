@@ -14,8 +14,8 @@ import Underline from "@tiptap/extension-underline";
 import Image, { ImageOptions } from "@tiptap/extension-image";
 import Table from "@tiptap/extension-table";
 import TableRow from "@tiptap/extension-table-row";
-import TableHeader from "@tiptap/extension-table-header";
-import TableCell from "@tiptap/extension-table-cell";
+import TaskList from "@tiptap/extension-task-list";
+import TaskItem from "@tiptap/extension-task-item";
 import TextAlign from "@tiptap/extension-text-align";
 import TextStyle from "@tiptap/extension-text-style";
 import Color from "@tiptap/extension-color";
@@ -29,9 +29,15 @@ import DocImageView from "../components/docs/DocImageView";
 import FontSize from "./docFontSizeExtension";
 import LineSpacing from "./docLineSpacingExtension";
 import DocIndent from "./docIndentExtension";
+import DocBlockFormat from "./docBlockFormat";
+import DocPdfPage from "./docPdfPage";
+import DocTextOverrides from "./docTextOverrides";
 import CommentMark from "./docCommentMark";
 import DocPageBreak from "./docPageBreakExtension";
 import DocLink from "./docLinkExtension";
+import { MathBlock, MathInline } from "./docMathExtension";
+import { Bibliography, Caption, Citation, CrossRef, TableOfContents } from "./docStructureNodes";
+import { ShadedTableCell, ShadedTableHeader } from "./docTableCellShading";
 
 // `common` (not `all`) - covers every mainstream language (JS/TS, Python, Rust, Go, JSON, etc.)
 // without bundling lowlight's full ~190-grammar set, which this doc editor has no need for.
@@ -107,22 +113,42 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     DocImage.configure({ inline: true, docId: docId ?? null }),
     Table.configure({ resizable: true, lastColumnResizable: false, allowTableNodeSelection: true }),
     TableRow,
-    TableHeader,
-    TableCell,
-    TextAlign.configure({ types: ["heading", "paragraph", "tableCell", "tableHeader"] }),
+    // Plain header/cell plus a `background` (cell shading) attribute - see docTableCellShading.ts.
+    ShadedTableHeader,
+    ShadedTableCell,
+    // Checklists (action items, procedures). nested: sub-tasks indent under a task like list items.
+    TaskList,
+    TaskItem.configure({ nested: true }),
+    TextAlign.configure({ types: ["heading", "paragraph", "caption", "tableCell", "tableHeader"] }),
     TextStyle,
     Color,
     FontFamily,
     FontSize,
+    // "Not bold" / "not italic" direct formatting over a style that is (a heading, a caption).
+    DocTextOverrides,
     // multicolor: true - without it, Highlight has no `color` attribute at all (a single fixed
     // highlight color, not a picker) - see @tiptap/extension-highlight's own addAttributes().
     Highlight.configure({ multicolor: true }),
     LineSpacing,
     DocIndent,
+    // Column spanning, block spacing, first-line indent control, table rule styles.
+    DocBlockFormat,
     Subscript,
     Superscript,
     CommentMark,
     DocPageBreak,
+    MathInline,
+    MathBlock,
+    // Captions, cross-references, citations, reference list, table of contents - numbered by
+    // docStructure.ts's plugin (added by the editors themselves, since it needs the document's
+    // reference library).
+    Caption,
+    CrossRef,
+    Citation,
+    Bibliography,
+    TableOfContents,
+    // A PDF page kept exactly as printed (PDF import, "Exact pages").
+    DocPdfPage,
   ];
 }
 

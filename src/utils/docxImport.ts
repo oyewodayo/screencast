@@ -91,7 +91,9 @@ async function saveEmbeddedImage(docId: string, image: { contentType: string; re
   return { src: convertFileSrc(path) };
 }
 
-export async function importDocxFile(path: string, fileName: string): Promise<ImportedDoc> {
+// `preread` - the file's bytes when the caller already has them (docFileImport.ts reads them to
+// fingerprint the file first), so the file isn't read twice.
+export async function importDocxFile(path: string, fileName: string, preread?: ArrayBuffer): Promise<ImportedDoc> {
   const id = crypto.randomUUID();
   const title = fileName.replace(/\.docx$/i, "");
 
@@ -102,7 +104,7 @@ export async function importDocxFile(path: string, fileName: string): Promise<Im
 
   try {
     // read_file_bytes answers with raw bytes (an ArrayBuffer), not a JSON number array.
-    const arrayBuffer = await invoke<ArrayBuffer>("read_file_bytes", { path });
+    const arrayBuffer = preread ?? (await invoke<ArrayBuffer>("read_file_bytes", { path }));
 
     const result = await mammoth.convertToHtml(
       { arrayBuffer },

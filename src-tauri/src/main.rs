@@ -21,7 +21,10 @@ mod commands {
 }
 mod services {
     pub mod asset_download;
+    pub mod beat_detect;
+    pub mod subject_track;
     pub mod boards;
+    pub mod citations;
     pub mod docs;
     pub mod docs_search;
     pub mod file_watcher;
@@ -41,6 +44,7 @@ mod services {
     // Keeps the window from ever going "Not responding" - see the module's own comment for the
     // threading rules every command follows and the test that enforces them.
     pub mod responsiveness;
+    pub mod share;
     // Opt-out analytics + crash reports, compiled in only for release builds with keys.
     pub mod telemetry;
     pub mod trash;
@@ -255,10 +259,13 @@ fn main() {
     // terminal never blocks - see NonBlockingStdout for why.
     let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = Vec::new();
     if let Some(log_file) = log_file {
-        // Everything while developing; INFO and up for users, which still keeps every warning,
-        // error, watchdog stall and recording milestone without per-frame noise.
+        // DEBUG while developing; INFO and up for users, which still keeps every warning,
+        // error, watchdog stall and recording milestone without per-frame noise. Not TRACE even
+        // in development: wasapi alone logs every 10ms audio packet at it, which rotated the
+        // 10MB log in eight minutes - taking the start of any longer recording with it, along
+        // with whatever went wrong there.
         loggers.push(WriteLogger::new(
-            if cfg!(debug_assertions) { LevelFilter::Trace } else { LevelFilter::Info },
+            if cfg!(debug_assertions) { LevelFilter::Debug } else { LevelFilter::Info },
             config.clone(),
             log_file,
         ));
@@ -411,6 +418,13 @@ fn main() {
             commands::window_capture::activate_and_open_window,
             commands::conversion::convert_to_mp4,
             commands::conversion::get_playable_preview,
+            commands::conversion::get_image_clip_proxy,
+            commands::conversion::get_video_canvas_proxy,
+            commands::conversion::stabilized_clip_preview,
+            commands::conversion::extract_frame_still,
+            commands::conversion::render_reversed_clip,
+            commands::conversion::detect_beats,
+            commands::conversion::analyze_subject_track,
             commands::conversion::batch_convert_to_mp4,
             commands::conversion::cancel_conversion,
             commands::conversion::get_conversion_info,
@@ -424,6 +438,8 @@ fn main() {
             commands::conversion::set_video_thumbnail,
             commands::conversion::get_video_scrub_sprite,
             commands::conversion::generate_captions,
+            commands::conversion::generate_caption_words,
+            commands::conversion::caption_job_progress,
             commands::conversion::audio_cleanup_waveform,
             commands::conversion::decode_audio_range,
             commands::conversion::transcribe_doc_audio,
@@ -519,6 +535,12 @@ fn main() {
             services::docs::export_doc,
             services::docs::export_doc_binary,
             services::docs::export_doc_pdf,
+            services::share::share_staging_path,
+            services::share::share_capabilities,
+            services::share::open_share_url,
+            services::share::copy_file_to_clipboard,
+            services::share::share_file_native,
+            services::share::email_file,
             services::docs::save_doc_image,
             services::docs::list_trashed_docs,
             services::docs::restore_doc,
@@ -539,12 +561,15 @@ fn main() {
             services::docs::reopen_doc_comment,
             services::docs::delete_doc_comment,
             services::docs::set_doc_page_setup,
+            services::citations::lookup_doi,
             services::docs_search::index_doc_content,
             services::docs_search::remove_doc_from_index,
             services::docs_search::list_indexed_doc_ids,
             services::docs_search::search_docs,
             services::video_edits::save_video_edit_state,
             services::video_edits::load_video_edit_state,
+            services::video_edits::create_video_project,
+            services::video_edits::read_video_project,
             services::video_edits::save_video_chapters,
             services::video_edits::load_video_chapters,
             services::trash::move_to_trash,
@@ -557,6 +582,18 @@ fn main() {
         .build(context)
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // Closing the main window quits Briefcast. Tauri only exits once EVERY window is gone,
+            // and the overlay windows (recording bar, screenshot picker, annotation, countdown,
+            // live display, completion popup) are pre-built and merely hidden - so the process used
+            // to stay alive invisibly after the user closed the app, and the single-instance guard
+            // then turned every relaunch into "focus a main window that no longer exists": nothing
+            // happened at all. Destroyed, not CloseRequested, so the editors' own save-on-quit
+            // handlers (which delay the close until they've flushed) always finish first.
+            if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } = &event {
+                if label == "main" {
+                    app_handle.exit(0);
+                }
+            }
             if let tauri::RunEvent::Exit = event {
                 commands::window_capture::cleanup_stale_window_screenshots();
                 commands::native_playback::cleanup_all_sessions(

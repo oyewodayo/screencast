@@ -21,8 +21,11 @@ import {
   MdHorizontalRule,
   MdShortText,
   MdInsertPageBreak,
+  MdChecklist,
+  MdInfoOutline,
 } from "react-icons/md";
-import { TbTable } from "react-icons/tb";
+import { TbListDetails, TbMath, TbMathFunction, TbQuote, TbTable, TbBooks, TbCornerDownRight, TbPhoto } from "react-icons/tb";
+import { OPEN_PICKER_EVENT, type OpenPickerDetail } from "./docStructureNodes";
 import SlashCommandMenu, { SlashCommandItem } from "../components/docs/SlashCommandMenu";
 import { uploadImageFromPath } from "./docImagePaste";
 
@@ -65,6 +68,29 @@ function buildItems(docId: string): SlashCommandItem[] {
       run: (editor, range) => editor.chain().focus().deleteRange(range).toggleOrderedList().run(),
     },
     {
+      title: "Checklist",
+      keywords: ["checklist", "todo", "task", "checkbox", "action"],
+      icon: MdChecklist,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).toggleTaskList().run(),
+    },
+    {
+      // A one-cell, borderless, shaded table - reads as a tinted panel, and exports to Word as one.
+      title: "Callout box",
+      keywords: ["callout", "note", "box", "highlight", "panel", "info", "tip"],
+      icon: MdInfoOutline,
+      run: (editor, range) =>
+        editor
+          .chain()
+          .focus()
+          .deleteRange(range)
+          .insertContent({
+            type: "table",
+            attrs: { rules: "none" },
+            content: [{ type: "tableRow", content: [{ type: "tableCell", attrs: { background: "#dbeafe" }, content: [{ type: "paragraph" }] }] }],
+          })
+          .run(),
+    },
+    {
       title: "Blockquote",
       keywords: ["quote", "blockquote"],
       icon: MdFormatQuote,
@@ -82,6 +108,60 @@ function buildItems(docId: string): SlashCommandItem[] {
       icon: TbTable,
       run: (editor, range) =>
         editor.chain().focus().deleteRange(range).insertTable({ rows: 3, cols: 4, withHeaderRow: true }).run(),
+    },
+    {
+      title: "Equation",
+      keywords: ["equation", "math", "latex", "formula", "katex", "display"],
+      icon: TbMathFunction,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertMathBlock().run(),
+    },
+    {
+      title: "Inline equation",
+      keywords: ["inline", "equation", "math", "latex", "formula", "katex"],
+      icon: TbMath,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertMathInline().run(),
+    },
+    {
+      title: "Citation",
+      keywords: ["cite", "citation", "reference", "doi", "bibtex", "arxiv"],
+      icon: TbQuote,
+      run: (editor, range) => {
+        editor.chain().focus().deleteRange(range).run();
+        openPicker(editor, "cite");
+      },
+    },
+    {
+      title: "Cross-reference",
+      keywords: ["cross", "reference", "xref", "ref", "figure", "table", "equation", "see"],
+      icon: TbCornerDownRight,
+      run: (editor, range) => {
+        editor.chain().focus().deleteRange(range).run();
+        openPicker(editor, "xref");
+      },
+    },
+    {
+      title: "Figure caption",
+      keywords: ["caption", "figure", "fig", "image"],
+      icon: TbPhoto,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertCaption("figure").run(),
+    },
+    {
+      title: "Table caption",
+      keywords: ["caption", "table"],
+      icon: TbTable,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertCaption("table").run(),
+    },
+    {
+      title: "Reference list",
+      keywords: ["bibliography", "references", "reference", "list", "works cited"],
+      icon: TbBooks,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertBibliography().run(),
+    },
+    {
+      title: "Table of contents",
+      keywords: ["toc", "contents", "table of contents", "outline"],
+      icon: TbListDetails,
+      run: (editor, range) => editor.chain().focus().deleteRange(range).insertTableOfContents().run(),
     },
     {
       title: "Divider",
@@ -115,6 +195,16 @@ function buildItems(docId: string): SlashCommandItem[] {
       },
     },
   ];
+}
+
+// The citation and cross-reference pickers open anchored at the cursor (DocsEditor.tsx hosts them).
+function openPicker(editor: import("@tiptap/core").Editor, kind: OpenPickerDetail["kind"]): void {
+  editor.commands.scrollIntoView();
+  requestAnimationFrame(() => {
+    const { from } = editor.state.selection;
+    const c = editor.view.coordsAtPos(from);
+    editor.view.dom.dispatchEvent(new CustomEvent<OpenPickerDetail>(OPEN_PICKER_EVENT, { detail: { kind, rect: new DOMRect(c.left, c.top, 1, c.bottom - c.top) } }));
+  });
 }
 
 function filterItems(items: SlashCommandItem[], query: string): SlashCommandItem[] {

@@ -9,7 +9,9 @@
 export type FileCategory = "video" | "audio" | "image" | "pdf" | "document";
 
 export const FILE_CATEGORY_EXTENSIONS: Record<FileCategory, string[]> = {
-  video: ["mp4", "mov", "avi", "mkv", "webm", "wmv"],
+  // briefvideo: a Video Editor project built from images (services/video_edits.rs) - opens in the
+  // editor like a video, though only Save turns it into real media.
+  video: ["mp4", "mov", "avi", "mkv", "webm", "wmv", "briefvideo"],
   audio: ["mp3", "wav", "aac", "flac", "ogg", "m4a"],
   // heic/heif are iPhone's default photo format - Chromium (WebView2) has no built-in decoder for
   // them, so Dashboard.tsx special-cases these two extensions to show a "Convert to view" prompt
@@ -38,3 +40,8 @@ export const CONVERTIBLE_CATEGORIES: readonly FileCategory[] = ["video", "audio"
 
 export const isConvertibleCategory = (category: FileCategory | null): category is "video" | "audio" | "image" =>
   category !== null && (CONVERTIBLE_CATEGORIES as readonly FileCategory[]).includes(category);
+
+// Video extensions that are real media files - everything in the video category except Video
+// Editor projects (.briefvideo), which only the editor itself can open. What a "pick a video to
+// use as a clip/PiP source" dialog should offer.
+export const MEDIA_VIDEO_EXTENSIONS: readonly string[] = FILE_CATEGORY_EXTENSIONS.video.filter((ext) => ext !== "briefvideo");

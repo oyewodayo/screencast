@@ -10,6 +10,8 @@
 // deleting removes a clip from the array outright.
 
 import { TextAlign, TextColorRun, TextRange } from "./pdfAnnotationTypes";
+import type { ClipSpeedRamp } from "./clipTiming";
+import type { OverlayKeyframe } from "./keyframes";
 
 // A per-clip color grade, applied to that clip's own trimmed segment (both live preview -
 // VideoPlayer's CSS `filter`, see cssFilterForColorPreset in videoColorFilters.ts - and export
@@ -21,6 +23,22 @@ export type ColorFilterPreset = "none" | "vibrant" | "cinematic" | "bw" | "warm"
 export interface ClipColorFilter {
   preset: ColorFilterPreset;
   intensity: number; // 0..1, scales the preset's own strength from identity (0) to full (1)
+}
+
+// Manual color grading for one clip, plus an optional imported 3D LUT - all baked into a single
+// lookup table (colorGrade.ts) that both the preview's WebGL layer and export's ffmpeg `lut3d`
+// apply, so the two match exactly. Every slider is -1..1 except exposure (stops, -2..2); missing
+// or 0 means untouched. Applied on top of the clip's color preset (colorFilter), if it has one.
+export interface ClipGrade {
+  exposure?: number;
+  contrast?: number;
+  saturation?: number;
+  temperature?: number; // + warmer, - cooler
+  tint?: number; // + magenta, - green
+  highlights?: number;
+  shadows?: number;
+  // A .cube file from disk (camera log conversions, film looks), applied first, mixed by intensity.
+  lut?: { path: string; name: string; intensity: number };
 }
 
 // A simple, non-keyframed motion effect animated across THIS clip's own [start,end) source
@@ -36,10 +54,13 @@ export interface ClipKenBurns {
   // undefined means the frame's own center (0.5, 0.5), the pre-existing look. Ignored by
   // "pan-left"/"pan-right", which have their own fixed direction. Lets the "auto zoom on click"
   // tool (applyAutoZoomAtClicks, videoEditHandlers.ts) center a punch-in on where a click actually
-  // landed instead of the frame's middle - both preview (kenBurnsTransform, videoColorFilters.ts)
+  // landed instead of the frame's middle - both preview (kenBurnsWindow, videoColorFilters.ts)
   // and export (ken_burns_chain, conversion.rs) read this the same way a plain zoom does.
   targetX?: number;
   targetY?: number;
+  // The part of the move (0..1) this clip plays - a piece split out of a Ken Burns clip continues
+  // the move rather than restarting it. undefined = all of it.
+  span?: [number, number];
 }
 
 // A free-form crop window into this clip's own frame - independent x/y/width/height (fractions of
@@ -47,7 +68,7 @@ export interface ClipKenBurns {
 // strip off just the top (full width, shorter height) is representable. Since the cropped region's
 // own aspect generally won't match the export's fixed output resolution, both preview and export
 // STRETCH it to fill that resolution rather than letterboxing/padding - preview via a non-uniform
-// CSS scale+translate on the <video> element (see cropStaticTransform in videoColorFilters.ts),
+// CSS scale+translate on the <video> element (see clipFrameAffine in videoColorFilters.ts),
 // export via crop_chain's own trailing `scale=out_w:out_h` (conversion.rs), which stretches by
 // design (no force_original_aspect_ratio). All four undefined means uncropped (equivalent to
 // {x:0,y:0,width:1,height:1}).
@@ -62,10 +83,10 @@ export interface ClipCrop {
 // order - deliberately not "transitionOut" on the earlier clip, so reordering clips naturally
 // keeps "the transition" attached to whichever pairing is now adjacent, with no extra
 // bookkeeping. Meaningless (ignored) on the very first clip - there's nothing to transition
-// from. Preview-only shows a hard cut at the boundary regardless of which transition is picked
-// (see the transition marker in VideoTimelineDocker) - the real transition only renders in the
-// export, same "one side documented as behind" precedent TextOverlay/ImageOverlay's own "slide"
-// animation already set.
+// from. It plays over the START of this clip - the previous clip's frozen last frame giving way
+// to this one over `duration` seconds - so it never shortens either clip, and the timeline's
+// length is exactly the export's (overlays and captions stay in sync). Export: transition_fold_step
+// (conversion.rs); live preview: TransitionPreviewLayer, drawing the same thing over the player.
 // Names ffmpeg's own `xfade` filter transition names directly (see conversion.rs's
 // TRANSITION_ALLOWLIST) rather than inventing a separate friendly-name-to-xfade-name mapping
 // layer - one flat vocabulary shared by the UI, the sidecar JSON, and the export filter string,
@@ -96,6 +117,17 @@ export interface Clip {
   start: number;
   end: number;
   colorFilter?: ClipColorFilter;
+  grade?: ClipGrade;
+  // Camera-shake removal (two-pass vidstab at export, see stabilization_transforms in
+  // conversion.rs). Previewed by the clip viewer's "Preview stabilized" render, not live - it needs
+  // the whole clip analysed first. strength 0..1.
+  stabilize?: { strength: number };
+  // Set while the clip plays backwards: sourcePath/start/end then point at the reversed render
+  // (render_reversed_clip, conversion.rs) and this remembers the original range, for un-reversing.
+  reversedFrom?: { sourcePath: string; start: number; end: number };
+  // A speed curve across the clip, on top of `speed` - see clipTiming.ts, which every duration and
+  // time mapping goes through so preview, timeline, captions and export agree.
+  speedRamp?: ClipSpeedRamp;
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
   crop?: ClipCrop;
@@ -183,6 +215,9 @@ export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | 
 // top of it by VideoOverlayLayer, not by TextNoteEditor itself.
 export interface TextOverlay {
   id: string;
+  // Keyframed motion - position/scale/opacity over the overlay's life (keyframes.ts); when set,
+  // these drive where it is instead of x/y alone.
+  keyframes?: OverlayKeyframe[];
   text: string;
   color: string;
   backgroundColor?: string;
@@ -233,6 +268,9 @@ export interface TextOverlay {
 // point back at, so a data URL is their only option).
 export interface ImageOverlay {
   id: string;
+  // Keyframed motion - position/scale/opacity over the overlay's life (keyframes.ts); when set,
+  // these drive where it is instead of x/y alone.
+  keyframes?: OverlayKeyframe[];
   src: string;
   x: number;
   y: number;
@@ -321,6 +359,10 @@ export interface AudioOverlay {
   // replaces all of these rather than stacking a second copy on top - which would otherwise keep
   // playing the old Music/Voice underneath the new ones, hidden in lower lane rows.
   detached?: boolean;
+  // Beat sync: the track's tempo and beats (its own file's seconds), from detect_beats - drawn on
+  // the timeline, snapped to, and what "cut images on the beat" fits to (beatSync.ts).
+  bpm?: number;
+  beats?: number[];
   createdAt: number;
   updatedAt: number;
 }
@@ -367,6 +409,57 @@ export interface PipOverlay {
 }
 
 // What export_trimmed_video (Rust) actually consumes - plain, ordered [start,end) ranges, each
+// Burned-in captions (the editor's Captions tool) - one word-timed transcript per SOURCE file, in
+// that file's own seconds, rather than a list of output-timed caption cues. The visible lines are
+// derived from these through the current clips at preview/export time (buildCaptionLines,
+// captions.ts), so captions stay in sync through every trim/cut/reorder/speed change made after
+// they were generated, with nothing to re-time by hand.
+export interface CaptionWord {
+  start: number;
+  end: number;
+  text: string;
+  // Forces a new caption line at this word - set on each imported subtitle cue's first word, so
+  // an .srt/.vtt keeps its own line breaks instead of being regrouped.
+  lineStart?: boolean;
+}
+export type CaptionStylePreset =
+  | "highlight"
+  | "outline"
+  | "clean"
+  | "card"
+  | "classic"
+  | "pop"
+  | "neon"
+  | "bubble"
+  | "typewriter"
+  | "comic"
+  | "tv"
+  | "headline"
+  | "button"
+  | "spotlight"
+  | "chip";
+export type CaptionPosition = "top" | "middle" | "bottom";
+export interface CaptionSettings {
+  enabled: boolean;
+  preset: CaptionStylePreset;
+  // Highlights the word being spoken (karaoke-style) in emphasisColor; off shows plain lines.
+  emphasis: boolean;
+  emphasisColor: string;
+  position: CaptionPosition;
+  // Gap from the anchored edge as a fraction of frame height (ignored for "middle").
+  offset: number;
+  // Multiplier on the preset's base text size (frame height based).
+  size: number;
+  maxWordsPerLine: number;
+  uppercase: boolean;
+}
+export interface CaptionTrack {
+  language: string;
+  // Keyed by Clip.sourcePath.
+  transcripts: Record<string, CaptionWord[]>;
+  settings: CaptionSettings;
+}
+
 // naming its own source file. Kept as a separate type from Clip (rather than reusing Clip
 // directly) so call sites are explicit about which shape they need; the id is UI-only and never
 // crosses the invoke boundary.
@@ -382,6 +475,12 @@ export interface KeepSegment {
   speed?: number;
   noiseReduction?: number;
   audioCleanup?: AudioCleanup;
+  // The clip's grade baked to .cube text (gradeCubeForClip) - applied with ffmpeg's lut3d.
+  lutCube?: string;
+  stabilize?: { strength: number };
+  // A speed ramp's constant-speed steps (clipSpeedSteps); export renders them as one continuous
+  // time map (speed_steps, conversion.rs). When set, `speed` is ignored.
+  speedSteps?: { sourceStart: number; sourceEnd: number; speed: number }[];
 }
 
 export interface VideoEditState {
@@ -402,6 +501,8 @@ export interface VideoEditState {
   // - there's only ever one of these per edit session, never a list.
   videoAudioMuted: boolean;
   videoAudioVolume: number; // 0..1, defaults to 1
+  // null until captions are first generated - see CaptionTrack.
+  captions: CaptionTrack | null;
   updatedAt: string;
 }
 
@@ -417,6 +518,7 @@ export interface EditableFields {
   pipOverlays: PipOverlay[];
   videoAudioMuted: boolean;
   videoAudioVolume: number;
+  captions: CaptionTrack | null;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -453,7 +555,9 @@ export interface VideoEditCommand {
     | "delete-pip"
     | "view-switch-cut"
     | "edit-track-audio"
-    | "detach-audio";
+    | "detach-audio"
+    | "edit-captions"
+    | "edit-transcript";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {
@@ -467,6 +571,7 @@ export function createEmptyState(sourcePath: string, duration: number): VideoEdi
     pipOverlays: [],
     videoAudioMuted: false,
     videoAudioVolume: 1,
+    captions: null,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -497,4 +602,68 @@ export function isVideoEditState(value: unknown): value is VideoEditState {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return typeof v.duration === "number" && Array.isArray(v.clips) && v.clips.every(isClip);
+}
+
+// ---- Image clips & video projects ----------------------------------------------------------
+//
+// A clip's sourcePath can also be a still image - the clip then shows that image for (end-start)
+// seconds. There's no "source length" to run out of, so an image clip's start is always 0 and its
+// end is however long it's been stretched, capped at IMAGE_CLIP_MAX_SECONDS (the length of the
+// preview proxy it plays through - see get_image_clip_proxy in conversion.rs). Every clip effect
+// still applies: Ken Burns, crop, flip, color grade and transitions are what turn a set of photos
+// into a slideshow. Mirrors is_still_image_path (conversion.rs). HEIC/HEIF (iPhone photos) work
+// too - the backend decodes them once to a cached PNG before ffmpeg ever reads them - and a phone
+// photo's EXIF rotation is honored everywhere (ffmpeg auto-rotates; thumbnails apply it).
+export const IMAGE_CLIP_EXTENSIONS = ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", "heic", "heif"];
+export const IMAGE_CLIP_MAX_SECONDS = 600;
+export const DEFAULT_IMAGE_CLIP_SECONDS = 5;
+
+export const isImageClipPath = (path: string): boolean =>
+  IMAGE_CLIP_EXTENSIONS.includes(path.split(".").pop()?.toLowerCase() ?? "");
+
+// A video project (services/video_edits.rs) - a timeline not attached to any one recording, made
+// from images or started empty. The file itself only records the frame size; its timeline is the
+// usual .edits.json sidecar next to it.
+export const VIDEO_PROJECT_EXTENSION = "briefvideo";
+export const isVideoProjectPath = (path: string): boolean => path.toLowerCase().endsWith(`.${VIDEO_PROJECT_EXTENSION}`);
+
+export interface VideoProjectFrame {
+  width: number;
+  height: number;
+}
+
+export interface NewProjectOptions {
+  // Seconds each image is shown for.
+  imageDuration: number;
+  // Ken Burns on every image clip, alternating zoom in/out so a slideshow doesn't feel mechanical.
+  kenBurns: boolean;
+  // Crossfade into every image after the first.
+  transition: TransitionType | null;
+}
+
+// Initial timeline for a new project - one clip per image, in the order given.
+export function createProjectState(imagePaths: string[], options: NewProjectOptions): VideoEditState {
+  const kenBurnsCycle: KenBurnsPreset[] = ["zoom-in", "zoom-out", "pan-right", "pan-left"];
+  const duration = Math.min(IMAGE_CLIP_MAX_SECONDS, Math.max(0.5, options.imageDuration));
+  return {
+    // A project has no primary media of its own (only the black canvas it previews on).
+    duration: 0,
+    clips: imagePaths.map((sourcePath, i) => ({
+      id: crypto.randomUUID(),
+      sourcePath,
+      start: 0,
+      end: duration,
+      ...(options.kenBurns ? { kenBurns: { preset: kenBurnsCycle[i % kenBurnsCycle.length], intensity: 0.5 } } : {}),
+      ...(options.transition && i > 0 ? { transitionIn: { type: options.transition, duration: Math.min(1, duration / 3) } } : {}),
+    })),
+    textOverlays: [],
+    imageOverlays: [],
+    blurOverlays: [],
+    audioOverlays: [],
+    pipOverlays: [],
+    videoAudioMuted: false,
+    videoAudioVolume: 1,
+    captions: null,
+    updatedAt: new Date().toISOString(),
+  };
 }

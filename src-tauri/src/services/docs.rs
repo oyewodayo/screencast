@@ -74,22 +74,55 @@ pub struct DocMargins {
 }
 
 impl DocMargins {
-    // Each side 0-4in, and at least 1in of page left between opposite margins (on the smallest
-    // supported page, 8.27in wide) - guards against a hand-edited meta.json or a bad drag.
-    fn sanitized(self) -> Self {
+    // Each side 0-4in, and at least 1in of page left between opposite margins on the actual page
+    // (its size and orientation) - guards against a hand-edited meta.json or a bad drag.
+    fn sanitized(self, page_width_in: f64, page_height_in: f64) -> Self {
         let clamp = |v: f64| if v.is_finite() { v.clamp(0.0, 4.0) } else { 1.0 };
         let (mut top, mut right, mut bottom, mut left) = (clamp(self.top), clamp(self.right), clamp(self.bottom), clamp(self.left));
-        if left + right > 7.27 {
-            let k = 7.27 / (left + right);
+        let max_horizontal = page_width_in - 1.0;
+        let max_vertical = page_height_in - 1.0;
+        if left + right > max_horizontal {
+            let k = max_horizontal / (left + right);
             left *= k;
             right *= k;
         }
-        if top + bottom > 10.0 {
-            let k = 10.0 / (top + bottom);
+        if top + bottom > max_vertical {
+            let k = max_vertical / (top + bottom);
             top *= k;
             bottom *= k;
         }
         Self { top, right, bottom, left }
+    }
+}
+
+// Paper size in inches, as laid out on screen and printed - (width, height), swapped for
+// landscape. Mirrors docPageGeometry.ts's PAGE_DIMENSIONS_IN; unknown/absent sizes are Letter.
+fn page_dimensions_in(page_size: Option<&str>, orientation: Option<&str>) -> (f64, f64) {
+    let (w, h) = match page_size {
+        Some("a4") => (8.27, 11.69),
+        Some("legal") => (8.5, 14.0),
+        _ => (8.5, 11.0),
+    };
+    if orientation == Some("landscape") {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+// Only "landscape" is stored - portrait is the default, kept as None like every other default.
+fn sanitize_orientation(orientation: Option<String>) -> Option<String> {
+    orientation.filter(|o| o == "landscape")
+}
+
+// A page colour is a "#rrggbb" hex string; white (the default) and anything malformed are None.
+fn sanitize_page_color(color: Option<String>) -> Option<String> {
+    let c = color?.trim().to_ascii_lowercase();
+    let valid = c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|ch| ch.is_ascii_hexdigit());
+    if valid && c != "#ffffff" {
+        Some(c)
+    } else {
+        None
     }
 }
 
@@ -134,6 +167,12 @@ struct DocMeta {
     // None = the default 1in on every side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     margins: Option<DocMargins>,
+    // "landscape", or None for portrait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    orientation: Option<String>,
+    // "#rrggbb" paper colour, or None for white.
+    #[serde(rename = "pageColor", default, skip_serializing_if = "Option::is_none")]
+    page_color: Option<String>,
 }
 
 // Unlike DocMeta (an internal, camelCase-keyed storage format never returned to the frontend
@@ -364,6 +403,8 @@ pub struct LoadedDoc {
     header_text: Option<String>,
     footer_text: Option<String>,
     margins: Option<DocMargins>,
+    orientation: Option<String>,
+    page_color: Option<String>,
 }
 
 fn read_meta(dir: &PathBuf) -> Option<DocMeta> {
@@ -456,6 +497,8 @@ pub fn create_doc(
         header_text: None,
         footer_text: None,
         margins: None,
+        orientation: None,
+        page_color: None,
     };
     write_meta(&dir, &meta)?;
 
@@ -504,6 +547,8 @@ pub fn save_doc(id: String, bytes: Vec<u8>, title: String) -> Result<(), String>
             header_text: None,
             footer_text: None,
             margins: None,
+            orientation: None,
+            page_color: None,
         },
     };
     write_meta(&dir, &meta)
@@ -528,6 +573,8 @@ pub fn load_doc(id: String) -> Result<LoadedDoc, String> {
         header_text: meta.header_text,
         footer_text: meta.footer_text,
         margins: meta.margins,
+        orientation: meta.orientation,
+        page_color: meta.page_color,
     })
 }
 
@@ -539,8 +586,12 @@ pub struct DocPageSetup {
     header_text: Option<String>,
     footer_text: Option<String>,
     margins: Option<DocMargins>,
+    orientation: Option<String>,
+    page_color: Option<String>,
 }
 
+// The whole page setup is replaced on every call (absent = default), which is how the editor
+// applies it: it always sends its complete current setup.
 #[command(async)]
 pub fn set_doc_page_setup(
     id: String,
@@ -548,20 +599,31 @@ pub fn set_doc_page_setup(
     header_text: Option<String>,
     footer_text: Option<String>,
     margins: Option<DocMargins>,
+    orientation: Option<String>,
+    page_color: Option<String>,
 ) -> Result<DocPageSetup, String> {
     let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
+    let orientation = sanitize_orientation(orientation);
+    let (page_width_in, page_height_in) = page_dimensions_in(page_size.as_deref(), orientation.as_deref());
     meta.page_size = page_size;
     meta.header_text = header_text;
     meta.footer_text = footer_text;
-    meta.margins = margins.map(DocMargins::sanitized);
+    meta.margins = margins.map(|m| m.sanitized(page_width_in, page_height_in));
+    meta.orientation = orientation;
+    meta.page_color = sanitize_page_color(page_color);
+    // Changing the page is an edit: the doc's "Edited" date moves, and DocsHome's card preview -
+    // cached by updated_at - redraws with the new orientation or colour.
+    meta.updated_at = chrono::Local::now().to_rfc3339();
     write_meta(&dir, &meta)?;
     Ok(DocPageSetup {
         page_size: meta.page_size,
         header_text: meta.header_text,
         footer_text: meta.footer_text,
         margins: meta.margins,
+        orientation: meta.orientation,
+        page_color: meta.page_color,
     })
 }
 
@@ -839,21 +901,23 @@ pub fn export_doc_binary(
 // engine as window.print(), so the @media print CSS in DocsEditor.tsx lays the pages out, but with
 // no dialog and with Chromium's date/title/URL/page-number header and footer switched off (the
 // print dialog defaults them on, which is what stamped "10/2/26, 11:53 PM" and the doc title across
-// the top of every exported page). Margins are zero here because the page frame in DocsEditor.tsx's
-// print CSS supplies the 1in margins itself, identically for this path and for Print.
+// the top of every exported page). The margins are the document's own, the same as the CSS @page
+// margin - the document's header, footer and page numbers are drawn in those margins.
 #[command]
 pub async fn export_doc_pdf(
     webview: tauri::Webview,
     doc_title: String,
     page_size: Option<String>,
+    orientation: Option<String>,
+    margins: Option<DocMargins>,
     output_path: Option<String>,
 ) -> Result<String, String> {
     let output = resolve_export_path(output_path, &doc_title, "pdf")?;
-    let (width_in, height_in) = match page_size.as_deref() {
-        Some("a4") => (8.27, 11.69),
-        Some("legal") => (8.5, 14.0),
-        _ => (8.5, 11.0),
-    };
+    // Landscape is expressed through the page dimensions themselves (width > height) with the
+    // print orientation left at portrait - setting both would rotate the page twice.
+    let (width_in, height_in) = page_dimensions_in(page_size.as_deref(), orientation.as_deref());
+    let m = margins.map(|m| m.sanitized(width_in, height_in));
+    let (m_top, m_right, m_bottom, m_left) = m.map(|m| (m.top, m.right, m.bottom, m.left)).unwrap_or((1.0, 1.0, 1.0, 1.0));
 
     #[cfg(windows)]
     {
@@ -877,10 +941,10 @@ pub async fn export_doc_pdf(
                         settings.SetOrientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT)?;
                         settings.SetPageWidth(width_in)?;
                         settings.SetPageHeight(height_in)?;
-                        settings.SetMarginTop(0.0)?;
-                        settings.SetMarginBottom(0.0)?;
-                        settings.SetMarginLeft(0.0)?;
-                        settings.SetMarginRight(0.0)?;
+                        settings.SetMarginTop(m_top)?;
+                        settings.SetMarginBottom(m_bottom)?;
+                        settings.SetMarginLeft(m_left)?;
+                        settings.SetMarginRight(m_right)?;
                         settings.SetShouldPrintBackgrounds(true)?;
                         settings.SetShouldPrintHeaderAndFooter(false)?;
                         let handler = PrintToPdfCompletedHandler::create(Box::new(move |result, ok| {
@@ -910,7 +974,7 @@ pub async fn export_doc_pdf(
 
     #[cfg(not(windows))]
     {
-        let _ = (webview, width_in, height_in, output);
+        let _ = (webview, width_in, height_in, output, m_top, m_right, m_bottom, m_left);
         Err("Download as PDF is only available on Windows - use Print and choose Save as PDF".to_string())
     }
 }
@@ -928,10 +992,11 @@ pub fn save_doc_image(
 ) -> Result<String, String> {
     let _serial = crate::services::responsiveness::serial();
     // extension comes from a clipboard MIME type, not a real file extension - whitelist rather
-    // than trust it verbatim.
-    const ALLOWED: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+    // than trust it verbatim. Besides images, a document can keep the fonts it uses (uploaded, or
+    // embedded in an imported PDF) and the original PDF behind an "exact pages" import.
+    const ALLOWED: [&str; 10] = ["png", "jpg", "jpeg", "gif", "webp", "otf", "ttf", "woff", "woff2", "pdf"];
     if !ALLOWED.contains(&extension.as_str()) {
-        return Err(format!("Unsupported image extension: {}", extension));
+        return Err(format!("Unsupported asset extension: {}", extension));
     }
 
     let dir = doc_dir(&id)?;
@@ -1209,4 +1274,38 @@ pub fn delete_doc_comment(id: String, comment_id: String) -> Result<(), String> 
     let mut comments = read_comments(&id)?;
     comments.retain(|c| c.id != comment_id);
     write_comments(&id, &comments)
+}
+
+#[cfg(test)]
+mod page_setup_tests {
+    use super::*;
+
+    #[test]
+    fn landscape_swaps_page_dimensions() {
+        assert_eq!(page_dimensions_in(Some("a4"), None), (8.27, 11.69));
+        assert_eq!(page_dimensions_in(Some("a4"), Some("landscape")), (11.69, 8.27));
+        assert_eq!(page_dimensions_in(None, Some("landscape")), (11.0, 8.5));
+    }
+
+    #[test]
+    fn margins_are_clamped_against_the_oriented_page() {
+        // Landscape Letter is only 8.5in tall: 5in + 5in top/bottom must shrink to 7.5in total.
+        let m = DocMargins { top: 4.0, right: 1.0, bottom: 4.0, left: 1.0 }.sanitized(11.0, 8.5);
+        assert!((m.top + m.bottom - 7.5).abs() < 1e-9);
+        // ...while 4in + 4in left/right fits easily on its 11in width.
+        let m = DocMargins { top: 1.0, right: 4.0, bottom: 1.0, left: 4.0 }.sanitized(11.0, 8.5);
+        assert_eq!((m.left, m.right), (4.0, 4.0));
+    }
+
+    #[test]
+    fn orientation_and_color_are_validated() {
+        assert_eq!(sanitize_orientation(Some("landscape".into())), Some("landscape".into()));
+        assert_eq!(sanitize_orientation(Some("portrait".into())), None);
+        assert_eq!(sanitize_orientation(Some("sideways".into())), None);
+        assert_eq!(sanitize_page_color(Some("#FFF8E1".into())), Some("#fff8e1".into()));
+        assert_eq!(sanitize_page_color(Some("#ffffff".into())), None);
+        assert_eq!(sanitize_page_color(Some("red".into())), None);
+        assert_eq!(sanitize_page_color(Some("#12345".into())), None);
+        assert_eq!(sanitize_page_color(None), None);
+    }
 }

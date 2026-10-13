@@ -71,6 +71,9 @@ const RecordingOverlayWindow = () => {
     // they watch the finished file back.
     const [captureFps, setCaptureFps] = useState<number | null>(null);
     const [droppedFrames, setDroppedFrames] = useState<number>(0);
+    // The screen capture died and is being restarted ('lost'), or just was ('recovered') - see
+    // capture_watchdog.rs. The audio carries on throughout.
+    const [captureStatus, setCaptureStatus] = useState<'lost' | 'recovered' | null>(null);
     // Live screen<->camera view switching - only meaningful for "sva" recordings with
     // separate_webcam_capture on (see FormData's own doc comment, recording.rs), which is the one
     // combination that actually produces a second (camera) file to switch to. canSwitchView comes
@@ -197,9 +200,14 @@ const RecordingOverlayWindow = () => {
                 setDroppedFrames(event.payload.dropFrames ?? 0);
             });
 
+            const unlistenCapture = await listen<'lost' | 'recovered'>('recording-capture-status', (event) => {
+                setCaptureStatus(event.payload);
+            });
+
             return () => {
                 unlistenRecordingState();
                 unlistenProgress();
+                unlistenCapture();
             };
         };
 
@@ -219,8 +227,16 @@ const RecordingOverlayWindow = () => {
         if (!isRecording) {
             setCaptureFps(null);
             setDroppedFrames(0);
+            setCaptureStatus(null);
         }
     }, [isRecording]);
+
+    // "recovered" is news for a few seconds, not a lasting state.
+    useEffect(() => {
+        if (captureStatus !== 'recovered') return;
+        const timer = setTimeout(() => setCaptureStatus(null), 6000);
+        return () => clearTimeout(timer);
+    }, [captureStatus]);
 
     // Every new recording starts on "screen" by construction (that's what recording_with_output_sva
     // actually captures as the main file's baked-in frame) - reset local UI state so a previous
@@ -324,6 +340,14 @@ const RecordingOverlayWindow = () => {
                     <span data-tauri-drag-region className="pl-[18px] font-mono text-[10px] leading-tight text-white/45 select-none">
                         {isPaused ? (
                             <span className="text-amber-300/80">paused</span>
+                        ) : captureStatus === 'lost' ? (
+                            <span className="text-amber-300/90" title="The screen capture stopped and is being restarted - your audio is still recording">
+                                reconnecting
+                            </span>
+                        ) : captureStatus === 'recovered' ? (
+                            <span className="text-emerald-300/90" title="The screen capture was restarted - nothing recorded was lost">
+                                recovered
+                            </span>
                         ) : droppedFrames > 0 ? (
                             <span className="text-amber-300/90" title="Frames dropped during capture - the encoder may be falling behind">
                                 {droppedFrames} dropped

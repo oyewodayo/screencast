@@ -1,8 +1,11 @@
 // Dashboard.tsx
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { ToolPanelHostContext } from "../components/docker/ToolPanelHost";
+import CaptionOverlayLayer from "../components/video/CaptionOverlayLayer";
+import { buildCaptionLines } from "../utils/captions";
 import * as Y from "yjs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
+import { ask, open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import BottomDocker from "../components/BottomDocker";
 import { listen, emit } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
@@ -34,6 +37,15 @@ import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
+import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
+import { Clip, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
+import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
+import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
+import { useGradeLut } from "../utils/gradeLuts";
+import { clipOutputDuration, sourceToOutputOffset } from "../utils/clipTiming";
+import { OverlayKeyframe, keyframeAt, keyframeStateAt, upsertKeyframe } from "../utils/keyframes";
+import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
+import ReframePreviewLayer, { type ReframePreview } from "../components/video/ReframePreviewLayer";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -64,7 +76,6 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
 import {
-  MAX_HOME_SCREEN_FILES,
   getPinnedPaths,
   getRecentPaths,
   togglePin,
@@ -72,6 +83,11 @@ import {
   repathFile,
   forgetFile,
 } from "../utils/homeScreenFiles";
+import { getOpenedAt, recordItemOpened } from "../utils/homeScreenFiles";
+import { buildHomeItems, homeItemKey, relativeTime, type HomeItem } from "../utils/homeLibraryItems";
+import { isOpenableDocument, openDocumentFile } from "../utils/docFileImport";
+import type { WhiteboardSummary } from "../utils/whiteboardTypes";
+import type { MindmapSummary } from "../utils/mindmapTypes";
 import {
   getResumeTime,
   recordPlaybackPosition,
@@ -98,6 +114,7 @@ import {
   IoFolderOutline,
   IoAddCircleOutline,
   IoBuildOutline,
+  IoOptionsOutline,
   IoPin,
   IoPinOutline,
   IoCreateOutline,
@@ -110,6 +127,12 @@ import {
   IoEyeOffOutline,
   IoEyeOutline,
   IoInformationCircleOutline,
+  IoCutOutline,
+  IoDocumentTextOutline,
+  IoGitNetworkOutline,
+  IoMapOutline,
+  IoImagesOutline,
+  IoFolderOpenOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -255,38 +278,6 @@ interface FileMap {
 // second carries no payload of its own.
 type VideoEditorScreen = { mode: "home" } | { mode: "editing" };
 
-// True while the cursor has moved (or a key/click/wheel happened) within the last `idleMs`, the
-// same "controls fade out while you're just watching" behaviour as the player's own control bar.
-// Only flips state on an actual active<->idle transition, so mousemove doesn't re-render per event.
-function useCursorActive(enabled: boolean, idleMs = 2500): boolean {
-  const [active, setActive] = useState(true);
-  const activeRef = useRef(true);
-  useEffect(() => {
-    if (!enabled) {
-      activeRef.current = true;
-      setActive(true);
-      return;
-    }
-    let timer: ReturnType<typeof setTimeout>;
-    const arm = () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => { activeRef.current = false; setActive(false); }, idleMs);
-    };
-    const wake = () => {
-      if (!activeRef.current) { activeRef.current = true; setActive(true); }
-      arm();
-    };
-    const events = ["mousemove", "mousedown", "keydown", "wheel", "touchstart"] as const;
-    events.forEach((e) => window.addEventListener(e, wake, { passive: true }));
-    arm();
-    return () => {
-      clearTimeout(timer);
-      events.forEach((e) => window.removeEventListener(e, wake));
-    };
-  }, [enabled, idleMs]);
-  return active;
-}
-
 const Dashboard = () => {
   const [message, setMessage] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
@@ -315,6 +306,7 @@ const Dashboard = () => {
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [showRecordingDocker, setShowRecordingDocker] = useState<boolean>(() => loadSettings().showRecordingDocker);
   const [showRecordingPanelButtons, setShowRecordingPanelButtons] = useState<boolean>(() => loadSettings().showRecordingPanelButtons);
+  const [showDockerStatusBar, setShowDockerStatusBar] = useState<boolean>(() => loadSettings().showDockerStatusBar);
 
   // The main window is created hidden (tauri.conf.json's "visible": false on the main window
   // entry) specifically so this can show it only once there's real, already-painted UI behind it
@@ -433,6 +425,11 @@ const Dashboard = () => {
   // pattern as boardScreen/docsScreen. See handleOpenWhiteboard.
   const [whiteboardScreen, setWhiteboardScreen] = useState<WhiteboardScreen | null>(null);
   const [mindmapScreen, setMindmapScreen] = useState<MindmapScreen | null>(null);
+  // Whiteboards and mind maps for the home screen's "From your library" list (documents come from
+  // docsIndex below), and when each library item was last opened - see utils/homeLibraryItems.ts.
+  const [whiteboardIndex, setWhiteboardIndex] = useState<WhiteboardSummary[]>([]);
+  const [mindmapIndex, setMindmapIndex] = useState<MindmapSummary[]>([]);
+  const [openedAt, setOpenedAt] = useState<Record<string, number>>(() => getOpenedAt());
   // Which Video Editor screen (if any) is active - same null-means-off pattern as the tool
   // screens above, but with one deliberate difference: "editing" renders nothing of its own. The
   // video editor has always been "an open video in VideoPlayer + FileToolsDocker's video tools",
@@ -561,18 +558,16 @@ const Dashboard = () => {
   // range spans. Fed to VideoOverlayLayer/PipOverlayLayer below so a freshly-placed overlay's own
   // default end time clamps against the timeline's REAL length instead of a stale, too-long value
   // that ignores every sped-up clip already on it.
-  const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + Math.max(0, (c.end - c.start) / (c.speed ?? 1)), 0);
+  const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + clipOutputDuration(c), 0);
+  // Burned-in captions preview (CaptionOverlayLayer) - the same lines Save exports.
+  const captionLines = useMemo(() => buildCaptionLines(editStore.clips, editStore.captions), [editStore.clips, editStore.captions]);
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
   // load_image_edit_state invoke. HEIC/HEIF included - selectedFile.path is already a decoded
   // PNG for them by the time this reads it (see resolveImageDisplayUrl/loadFileForPlayback), so
   // there's nothing left to fail decoding.
   const isImageFileSelected = !!selectedFile && getFileCategory(selectedFile.name) === "image";
-  // While a video/audio file is playing, the floating "Back to …" button fades out once the cursor
-  // goes idle (like the player's own controls) so it isn't sitting on top of the picture.
   const selectedCategory = selectedFile ? getFileCategory(selectedFile.name) : null;
   const isMediaFileSelected = selectedCategory === "video" || selectedCategory === "audio";
-  const cursorActive = useCursorActive(isMediaFileSelected);
-  const backButtonFade = `transition-opacity duration-300 ${cursorActive ? "opacity-100" : "opacity-0 [&>button]:pointer-events-none"}`;
   const imageEditStore = useImageEditStore(
     isImageFileSelected ? selectedFile!.sourcePath : undefined,
     isImageFileSelected ? selectedFile!.path : undefined
@@ -586,6 +581,27 @@ const Dashboard = () => {
   // in Dashboard state, passed to both the timeline docker and the sibling player" shape as
   // currentOutputTime just above.
   const [activeClipEffects, setActiveClipEffects] = useState<ActiveClipEffects | null>(null);
+  // The on-screen clip's color grade, baked for the player's WebGL layer (gradeLuts.ts).
+  const activeGradeLut = useGradeLut(activeClipEffects?.grade);
+  // Export's Fill window, shown on the player while the export options are open.
+  const [reframePreview, setReframePreview] = useState<ReframePreview | null>(null);
+
+  // Moving a keyframed overlay sets its keyframe at the playhead rather than its base x/y (which
+  // the keyframes have replaced): the move is added to where the keyframes put it there.
+  const keyframeAwarePatch = <P extends { x?: number; y?: number; keyframes?: OverlayKeyframe[] }>(
+    overlay: { x: number; y: number; startTime: number; endTime: number; keyframes?: OverlayKeyframe[] } | undefined,
+    patch: P
+  ): P => {
+    if (!overlay?.keyframes?.length || patch.keyframes !== undefined) return patch;
+    const dx = patch.x !== undefined ? patch.x - overlay.x : 0;
+    const dy = patch.y !== undefined ? patch.y - overlay.y : 0;
+    if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return patch;
+    const local = Math.max(0, Math.min(overlay.endTime - overlay.startTime, currentOutputTime - overlay.startTime));
+    const state = keyframeStateAt(overlay.keyframes, local)!;
+    const here = keyframeAt(overlay.keyframes, local);
+    const { x: _x, y: _y, ...rest } = patch;
+    return { ...rest, keyframes: upsertKeyframe(overlay.keyframes, { time: here?.time ?? local, easing: here?.easing ?? "ease", ...state, x: state.x + dx, y: state.y + dy }) } as P;
+  };
   // Live status of VideoPlayer's own noise-reduction Web Audio graph (see its
   // onNoiseReductionStatusChange prop) - relayed straight through to VideoTimelineDocker
   // (noiseReductionStatus) so NoiseReductionPopover can show it, same round-trip shape as
@@ -600,6 +616,22 @@ const Dashboard = () => {
   const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
   const [selectedPipOverlayId, setSelectedPipOverlayId] = useState<string | null>(null);
   const [isPlacingPip, setIsPlacingPip] = useState<boolean>(false);
+  // Esc disarms whichever placement tool is armed (and with it the "Click anywhere on the video
+  // to place …" banner), the same as clicking its toolbar button again.
+  const isPlacingAny = isPlacingText || isPlacingImage || isPlacingBlur || isPlacingPip;
+  useEffect(() => {
+    if (!isPlacingAny) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      setIsPlacingText(false);
+      setIsPlacingImage(false);
+      setIsPlacingBlur(false);
+      setIsPlacingPip(false);
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [isPlacingAny]);
   // Arms the on-canvas crop tool (ClipCropOverlay, mounted as a sibling to VideoOverlayLayer just
   // below) - unlike the placement tools above, there's no "consumed" step, it just shows/hides a
   // drag window over whichever clip activeClipEffects currently points at. Deliberately NOT reset
@@ -621,6 +653,31 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // Toggled from the sidebar header's tools icon (next to "new folder"); falls back to "record"
   // whenever there's no open file to show tools for, so it never gets stuck on an empty panel.
   const [dockerMode, setDockerMode] = useState<"record" | "file-tools">("record");
+  // While a video is being edited, the sidebar swaps between the timeline tools' docked settings
+  // panels ("tools" - see components/docker/ToolPanelHost.tsx) and the usual file list ("media",
+  // still needed there to drag clips onto the timeline). toolPanelHostEl is the Tools tab's panel
+  // container, held in state (callback ref) so the context re-renders the popovers once it mounts.
+  const [videoSidebarTab, setVideoSidebarTab] = useState<"tools" | "media">("tools");
+  const [toolPanelHostEl, setToolPanelHostEl] = useState<HTMLDivElement | null>(null);
+  // The player's own sidebar panels (viewing captions, chapters) are open - shows the Tools tab
+  // for them even when no video is being edited. See VideoPlayer's onSidebarPanelChange.
+  const [playerSidebarOpen, setPlayerSidebarOpen] = useState<boolean>(false);
+  const handlePlayerSidebarPanelChange = useCallback((open: boolean) => {
+    setPlayerSidebarOpen(open);
+    if (open) {
+      setShowFileList(true);
+      setVideoSidebarTab("tools");
+    }
+  }, []);
+  // Opening a tool from the timeline while the Media tab is showing brings its panel into view.
+  useEffect(() => {
+    if (!toolPanelHostEl) return;
+    const observer = new MutationObserver((records) => {
+      if (records.some((r) => r.addedNodes.length > 0)) setVideoSidebarTab("tools");
+    });
+    observer.observe(toolPanelHostEl, { childList: true });
+    return () => observer.disconnect();
+  }, [toolPanelHostEl]);
   useEffect(() => {
     if (!selectedFile) setDockerMode("record");
   }, [selectedFile]);
@@ -683,6 +740,78 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     return url;
   }, []);
 
+  // The open timeline's frame size - a project's own (its file's header), or the open video's
+  // native resolution. Image clips preview letterboxed into exactly this frame (see
+  // get_image_clip_proxy), which is what keeps their crop/Ken Burns/overlay positions identical in
+  // preview and export. null if it couldn't be read; cached per primary file for the session.
+  const timelineFrameCacheRef = useRef<Map<string, Promise<VideoProjectFrame | null>>>(new Map());
+  const resolveTimelineFrame = useCallback((primaryPath: string): Promise<VideoProjectFrame | null> => {
+    let pending = timelineFrameCacheRef.current.get(primaryPath);
+    if (!pending) {
+      pending = (
+        isVideoProjectPath(primaryPath)
+          ? invoke<VideoProjectFrame>("read_video_project", { projectPath: primaryPath })
+          : invoke<Record<string, string>>("get_conversion_info", { inputPath: primaryPath }).then((info) => {
+              const match = info.resolution?.match(/^(\d+)x(\d+)$/);
+              return match ? { width: Number(match[1]), height: Number(match[2]) } : null;
+            })
+      ).catch((error) => {
+        console.error("Failed to read timeline frame size for", primaryPath, error);
+        timelineFrameCacheRef.current.delete(primaryPath);
+        return null;
+      });
+      timelineFrameCacheRef.current.set(primaryPath, pending);
+    }
+    return pending;
+  }, []);
+
+  // An image clip's preview source - a cached still-video proxy of that image, fitted to the
+  // timeline's frame (see clipPreviewSource.ts, shared with the transition preview and the clip
+  // viewer so all three show the same picture). The prefetch effect below and an actual seek share
+  // one encode through that module's cache.
+  const resolveImageClipProxyUrl = useCallback(
+    async (imagePath: string, primaryPath: string): Promise<string> => resolveClipPreviewUrl(imagePath, await resolveTimelineFrame(primaryPath)),
+    [resolveTimelineFrame]
+  );
+  // Stable (TransitionPreviewLayer's animation loop restarts whenever it changes).
+  const getPlayerPlaybackState = useCallback(() => videoPlayerRef.current?.getPlaybackState() ?? null, []);
+
+  // The exact output time right now - the on-screen clip's output start plus how far the player is
+  // into it, read from the <video> itself. For per-frame preview (keyframed overlays); the
+  // timeline's own currentOutputTime only updates a few times a second.
+  const outputTimingRef = useRef<{ clips: Clip[]; activeId: string | null }>({ clips: [], activeId: null });
+  outputTimingRef.current = { clips: editStore.clips, activeId: activeClipEffects?.id ?? null };
+  const getExactOutputTime = useCallback((): number | null => {
+    const playback = videoPlayerRef.current?.getPlaybackState();
+    const { clips, activeId } = outputTimingRef.current;
+    const index = clips.findIndex((c) => c.id === activeId);
+    if (!playback || index < 0) return null;
+    let start = 0;
+    for (let i = 0; i < index; i++) start += clipOutputDuration(clips[i]);
+    const clip = clips[index];
+    return start + sourceToOutputOffset(clip, Math.max(clip.start, Math.min(clip.end, playback.time)));
+  }, []);
+  // Any clip's preview source as the player loads it - the primary file's already-resolved URL,
+  // an image's proxy, or another video's asset URL (TransitionPreviewLayer compares this against
+  // what the player actually has loaded).
+  const resolveTimelineClipUrl = useCallback(
+    (sourcePath: string): Promise<string> => {
+      const open = selectedFileRef.current;
+      if (open && sourcePath === open.sourcePath) return Promise.resolve(open.path);
+      return open && isImageClipPath(sourcePath) ? resolveImageClipProxyUrl(sourcePath, open.sourcePath) : resolvePreviewAssetUrl(sourcePath);
+    },
+    [resolveImageClipProxyUrl, resolvePreviewAssetUrl]
+  );
+
+  // What a video project plays as its primary file - a black canvas at the project's frame size
+  // (see get_video_canvas_proxy) - since the project file itself is only a small JSON header.
+  const resolveProjectCanvasUrl = useCallback(async (projectPath: string): Promise<string> => {
+    const frame = await resolveTimelineFrame(projectPath);
+    if (!frame) throw new Error("This video project couldn't be read");
+    const canvasPath = await invoke<string>("get_video_canvas_proxy", { width: frame.width, height: frame.height });
+    return resolvePreviewAssetUrl(canvasPath);
+  }, [resolveTimelineFrame, resolvePreviewAssetUrl]);
+
   // Full-resolution display URL for an image file - the single-image viewer's resolver (also used
   // by the gallery's "Copy image" action, which should copy full quality, not a thumbnail). Same
   // as resolvePreviewAssetUrl above except HEIC/HEIF (WebView2 has no decoder for it at all) first
@@ -718,10 +847,19 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // content-addressed cache on the Rust side (a single ffmpeg frame extraction, ~1s into the
   // clip). Routed through the same shared thumbnailLimiter as every other gallery/sidebar
   // thumbnail request by the callers of this function, not here - this just resolves one URL.
+  // A video project has no frames of its own, so its tile shows its first clip instead.
   const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }, bypassCache = false): Promise<string> => {
-    const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: file.path });
+    let videoPath = file.path;
+    if (isVideoProjectPath(file.path)) {
+      const json = await invoke<string | null>("load_video_edit_state", { videoPath: file.path });
+      const firstClipPath: unknown = json ? JSON.parse(json)?.clips?.[0]?.sourcePath : undefined;
+      if (typeof firstClipPath !== "string") throw new Error("Empty video project - nothing to thumbnail");
+      if (isImageClipPath(firstClipPath)) return resolveImageThumbnailUrl({ name: firstClipPath, path: firstClipPath });
+      videoPath = firstClipPath;
+    }
+    const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: videoPath });
     return resolvePreviewAssetUrl(thumbPath, bypassCache);
-  }, [resolvePreviewAssetUrl]);
+  }, [resolvePreviewAssetUrl, resolveImageThumbnailUrl]);
 
   // VideoPlayer.tsx's "set current frame as thumbnail" overwrites get_video_thumbnail's cached jpg
   // in place, at the SAME path it always had - so this listens for its completion and clears the
@@ -758,10 +896,36 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       videoPlayerRef.current?.loadSource(selectedFile.path, time);
       return;
     }
-    resolvePreviewAssetUrl(sourcePath)
-      .then((url) => videoPlayerRef.current?.loadSource(url, time))
+    resolveTimelineClipUrl(sourcePath)
+      .then((url) => {
+        // Dropped if the player has moved on while the URL resolved - opening a different file
+        // resets previewSourcePathRef (effect above), and a late load here would otherwise swap
+        // the newly opened video back out for this one.
+        if (previewSourcePathRef.current !== sourcePath) return;
+        videoPlayerRef.current?.loadSource(url, time);
+      })
       .catch((error) => console.error("Failed to load preview source for", sourcePath, error));
   };
+  // Prepares every image clip's preview proxy ahead of the playhead, one at a time, so playback
+  // crossing into an image doesn't stall on its first encode. Re-runs on every edit, but anything
+  // already prepared is a cached promise - only newly added images do any work.
+  useEffect(() => {
+    const primaryPath = selectedFile?.sourcePath;
+    if (!primaryPath || getFileCategory(selectedFile.name) !== "video") return;
+    const imagePaths = Array.from(new Set(editStore.clips.map((clip) => clip.sourcePath).filter(isImageClipPath)));
+    let cancelled = false;
+    (async () => {
+      for (const imagePath of imagePaths) {
+        if (cancelled) return;
+        // eslint-disable-next-line no-await-in-loop
+        await resolveImageClipProxyUrl(imagePath, primaryPath).catch((error) => console.error("Failed to prepare image clip preview", imagePath, error));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFile?.sourcePath, editStore.clips, resolveImageClipProxyUrl]);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -1487,6 +1651,35 @@ const setScreen = () => {
 			.catch((error) => console.error("Error checking for a recording in progress:", error));
 	}, []);
 
+	// Closing the main window quits Briefcast (main.rs), which would end a recording in progress
+	// abruptly - its parts never assembled into a file. So while recording, closing asks first, and
+	// "Stop and quit" saves the recording properly before letting the close through.
+	useEffect(() => {
+		if (!isRecording) return;
+		let ownClose = false;
+		const unlistenPromise = appWindow.onCloseRequested(async (event) => {
+			if (ownClose) return;
+			event.preventDefault();
+			const stopAndQuit = await ask("A recording is in progress. Stop and save it, then quit Briefcast?", {
+				title: "Recording in progress",
+				kind: "warning",
+				okLabel: "Stop and quit",
+				cancelLabel: "Keep recording",
+			});
+			if (!stopAndQuit) return;
+			try {
+				await invoke("stop_recording");
+			} catch (error) {
+				console.error("Error stopping recording before quitting:", error);
+			}
+			ownClose = true;
+			await appWindow.close();
+		});
+		return () => {
+			unlistenPromise.then((unlisten) => unlisten());
+		};
+	}, [isRecording]);
+
 	// One update check per launch, delayed so it never competes with startup work (device probes,
 	// file list, thumbnails). Shown as a dismissible card - see UpdateBanner.
 	const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
@@ -1522,6 +1715,41 @@ const setScreen = () => {
 	useEffect(() => {
 		refreshDocsIndex();
 	}, [refreshDocsIndex]);
+
+	// Opening a document, whiteboard or mind map counts as "recent" for the home screen even if
+	// nothing in it changes.
+	const openedDocId = docsScreen?.mode === "editor" ? docsScreen.docId : null;
+	const openedWhiteboardId = whiteboardScreen?.mode === "editor" ? whiteboardScreen.whiteboardId : null;
+	const openedMindmapId = mindmapScreen?.mode === "editor" ? mindmapScreen.mindmapId : null;
+	useEffect(() => {
+		if (openedDocId) setOpenedAt(recordItemOpened(homeItemKey("doc", openedDocId)));
+	}, [openedDocId]);
+	useEffect(() => {
+		if (openedWhiteboardId) setOpenedAt(recordItemOpened(homeItemKey("whiteboard", openedWhiteboardId)));
+	}, [openedWhiteboardId]);
+	useEffect(() => {
+		if (openedMindmapId) setOpenedAt(recordItemOpened(homeItemKey("mindmap", openedMindmapId)));
+	}, [openedMindmapId]);
+
+	// The home screen is whatever shows when no tool and no file is open. Its library list is
+	// refreshed every time it comes back into view, so a document just written or a whiteboard just
+	// drawn is there straight away.
+	const onHomeScreen = videoEditorScreen?.mode !== "home" && !mindmapScreen && !whiteboardScreen && !boardScreen && !docsScreen && !selectedFile;
+	useEffect(() => {
+		if (!onHomeScreen) return;
+		let live = true;
+		void refreshDocsIndex();
+		setOpenedAt(getOpenedAt());
+		invoke<WhiteboardSummary[]>("list_whiteboards")
+			.then((list) => live && setWhiteboardIndex(list))
+			.catch((error) => console.error("Failed to load whiteboards for the home screen:", error));
+		invoke<MindmapSummary[]>("list_mindmaps")
+			.then((list) => live && setMindmapIndex(list))
+			.catch((error) => console.error("Failed to load mind maps for the home screen:", error));
+		return () => {
+			live = false;
+		};
+	}, [onHomeScreen, refreshDocsIndex]);
 
 	// file.path -> every doc linked to it, derived once per docsIndex change rather than filtered
 	// per row on every render.
@@ -1686,7 +1914,7 @@ const setScreen = () => {
 			});
 			if (!selected || Array.isArray(selected)) return; // cancelled
 
-			const name = selected.split(/[\/]/).pop() ?? selected;
+			const name = selected.split(/[\\/]/).pop() ?? selected;
 			if (getFileCategory(name) !== "video") {
 				await showMessageDialog(`"${name}" isn't a video file the editor can open.`, {
 					title: 'Unsupported file',
@@ -1712,6 +1940,7 @@ const setScreen = () => {
 		setHomeBackgroundStyle(settings.homeBackgroundStyle);
 		setShowRecordingDocker(settings.showRecordingDocker);
 		setShowRecordingPanelButtons(settings.showRecordingPanelButtons);
+		setShowDockerStatusBar(settings.showDockerStatusBar);
 		setIncludeSystemAudio(settings.defaultIncludeSystemAudio);
 		setResolutionWidth(settings.defaultResolutionWidth);
 		setFramerate(settings.defaultFramerate);
@@ -1979,14 +2208,91 @@ const setScreen = () => {
 
   // Shared by the sidebar (files already in the Briefcast library) and the "open file from
   // anywhere" picker below — both just need a raw filesystem path turned into a playable URL.
+	// The Video Editor's "Create video" - a new project (services/video_edits.rs) in the library,
+	// seeded with one clip per picked image (or none, for a blank timeline), opened straight into
+	// the editor. Errors are thrown back to NewVideoProjectDialog so it can show them in place.
+	const [isNewVideoProjectOpen, setIsNewVideoProjectOpen] = useState(false);
+	const handleCreateVideoProject = async (request: NewVideoProjectRequest): Promise<void> => {
+		const state = createProjectState(request.imagePaths, request.options);
+		const projectPath = await invoke<string>("create_video_project", {
+			name: request.name,
+			width: request.frame.width,
+			height: request.frame.height,
+			editStateJson: JSON.stringify(state),
+		});
+		setIsNewVideoProjectOpen(false);
+		void handleDirectoryFiles();
+		await handleOpenVideoInEditor({ path: projectPath, name: projectPath.split(/[\\/]/).pop() ?? projectPath });
+	};
+	// Back to where the user was after a reload (sleep/wake, a recovered WebView, Ctrl+R) rather
+	// than the home screen - see sessionRestore.ts. Restored once on mount; saving only starts
+	// after that attempt, so the empty first render can't overwrite what's about to be restored.
+	const workspaceRestoredRef = useRef(false);
+	useEffect(() => {
+		const saved = loadWorkspace();
+		if (!saved) {
+			workspaceRestoredRef.current = true;
+			return;
+		}
+		(async () => {
+			try {
+				if (saved.file) {
+					await loadFileForPlayback(saved.file.path, saved.file.name);
+					// loadFileForPlayback leaves the Video Editor unless it was already open.
+					setVideoEditorScreen(saved.videoEditor);
+				} else if (saved.videoEditor) setVideoEditorScreen(saved.videoEditor);
+				else if (saved.docs) setDocsScreen(saved.docs);
+				else if (saved.whiteboard) setWhiteboardScreen(saved.whiteboard);
+				else if (saved.mindmap) setMindmapScreen(saved.mindmap);
+				else if (saved.board) setBoardScreen(saved.board);
+				setDockerMode(saved.dockerMode);
+			} catch (error) {
+				console.error("Couldn't restore the previous workspace:", error);
+			} finally {
+				workspaceRestoredRef.current = true;
+			}
+		})();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, []);
+	useEffect(() => {
+		if (!workspaceRestoredRef.current) return;
+		saveWorkspace({
+			file: selectedFile ? { path: selectedFile.sourcePath, name: selectedFile.name } : null,
+			videoEditor: videoEditorScreen,
+			docs: docsScreen,
+			whiteboard: whiteboardScreen,
+			mindmap: mindmapScreen,
+			board: boardScreen,
+			dockerMode,
+		});
+	}, [selectedFile, videoEditorScreen, docsScreen, whiteboardScreen, mindmapScreen, boardScreen, dockerMode]);
 	const loadFileForPlayback = async (filePath: string, fileName: string) => {
+	// Document files (.docx/.md/.txt) open in Briefcast Docs - converted into a Briefcast document,
+	// or the one already made from the same unchanged file - rather than in another app.
+	if (isOpenableDocument(fileName)) {
+		setMessage(`Opening ${fileName}…`);
+		try {
+			const { docId } = await openDocumentFile(filePath, fileName);
+			handleOpenDocs();
+			setDocsScreen({ mode: "editor", docId });
+			setMessage("");
+			void refreshDocsIndex();
+		} catch (error) {
+			console.error("Error opening document:", error);
+			setMessage("");
+			setError(`Couldn't open ${fileName}: ${error instanceof Error ? error.message : error}`);
+		}
+		return;
+	}
 	try {
 		// Images (including HEIC/HEIF, auto-decoded to a cached PNG - see resolveImageDisplayUrl)
 		// resolve through their own path; everything else is the plain convert_file_path_to_url +
 		// convertFileSrc round-trip.
 		const fileUrl = getFileCategory(fileName) === "image"
 			? await resolveImageDisplayUrl({ name: fileName, path: filePath })
-			: convertFileSrc(await invoke<string>("convert_file_path_to_url", { filepath: filePath }));
+			: isVideoProjectPath(filePath)
+				? await resolveProjectCanvasUrl(filePath)
+				: convertFileSrc(await invoke<string>("convert_file_path_to_url", { filepath: filePath }));
 
 		console.log('Converted file URL:', fileUrl);
 
@@ -2059,28 +2365,46 @@ const setScreen = () => {
 	const categoryIconColorClassName = (category: FileCategory | null): string =>
 		category ? CATEGORY_ICON_COLOR[category] : "text-neutral-400 dark:text-neutral-500";
 
-	// What to surface on the empty home screen so it isn't just a blank void. Pinned files (in pin
-	// order — see utils/homeScreenFiles.ts's newest-pin-first toggling) always come first, but they
-	// only ever ADD to the top of the list — they never wholesale replace what's already showing
-	// below. The rest of the slots fill in with recently opened/edited/viewed files (or, absent any
-	// open history, just a taste of the library), skipping anything already pinned so nothing shows
-	// twice.
+	// What to surface on the empty home screen so it isn't just a blank void: library files and
+	// Briefcast's own documents, whiteboards and mind maps in one most-recent-first list, with
+	// pinned files (in pin order - see utils/homeScreenFiles.ts) always on top. See
+	// utils/homeLibraryItems.ts for the ranking.
 	const allLibraryFiles = Object.values(files).flat();
 	const libraryFilesByPath = new Map(allLibraryFiles.map((file) => [file.path, file]));
-	const pinnedLibraryFiles = pinnedPaths
-		.map((path) => libraryFilesByPath.get(path))
-		.filter((file): file is FileEntry => !!file);
-	const recentLibraryFiles = recentPaths
-		.map((path) => libraryFilesByPath.get(path))
-		.filter((file): file is FileEntry => !!file);
-	const fillerFiles = (recentLibraryFiles.length > 0 ? recentLibraryFiles : allLibraryFiles).filter(
-		(file) => !pinnedPaths.includes(file.path)
-	);
-	const libraryPreviewFiles = [...pinnedLibraryFiles, ...fillerFiles].slice(0, MAX_HOME_SCREEN_FILES);
+	const homeItems = buildHomeItems({
+		files: allLibraryFiles,
+		pinnedPaths,
+		recentPaths,
+		openedAt,
+		docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
+		whiteboards: whiteboardIndex,
+		mindmaps: mindmapIndex,
+	});
+	const homeFiles = homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : []));
+	const openHomeItem = (item: HomeItem) => {
+		if (item.kind === "file") {
+			const file = libraryFilesByPath.get(item.id);
+			if (file) handleFileClick(file);
+		} else if (item.kind === "doc") {
+			handleOpenDocs();
+			setDocsScreen({ mode: "editor", docId: item.id });
+		} else if (item.kind === "whiteboard") {
+			handleOpenWhiteboard();
+			setWhiteboardScreen({ mode: "editor", whiteboardId: item.id });
+		} else {
+			handleOpenMindmap();
+			setMindmapScreen({ mode: "editor", mindmapId: item.id });
+		}
+	};
+	const HOME_KIND: Record<Exclude<HomeItem["kind"], "file">, { label: string; icon: React.ReactNode; color: string }> = {
+		doc: { label: "Document", icon: <IoDocumentTextOutline size={18} />, color: "text-blue-500 dark:text-blue-400" },
+		whiteboard: { label: "Whiteboard", icon: <IoGitNetworkOutline size={18} />, color: "text-amber-500 dark:text-amber-400" },
+		mindmap: { label: "Mind map", icon: <IoMapOutline size={18} />, color: "text-teal-500 dark:text-teal-400" },
+	};
 	// Length shown next to each audio/video row's size - probed only for those (at most
-	// MAX_HOME_SCREEN_FILES) rows, never the whole library.
+	// HOME_LIST_SIZE) rows, never the whole library.
 	const libraryPreviewDurations = useMediaDurations(
-		libraryPreviewFiles.filter((file) => {
+		homeFiles.filter((file) => {
 			const category = getFileCategory(file.name);
 			return category === "video" || category === "audio";
 		})
@@ -2854,7 +3178,41 @@ const setScreen = () => {
 		(selectedMediaCategory === "audio" || selectedMediaCategory === "video") &&
 		getFlatFilesForCategory(selectedMediaCategory).length > 1;
 
+  // The timeline (VideoTimelineDocker) is showing for the open video - see BottomDocker.
+  const isEditingVideo =
+    dockerMode === "file-tools" &&
+    !!selectedFile &&
+    getFileCategory(selectedFile.name) === "video" &&
+    !boardScreen &&
+    !docsScreen &&
+    !whiteboardScreen &&
+    !mindmapScreen &&
+    videoEditorScreen?.mode !== "home";
+  // Tools/Media tabs (and a docking host) whenever something wants the sidebar's Tools tab.
+  const showToolsSidebar = isEditingVideo || playerSidebarOpen;
+
+  // The "Back to …" button for whatever VideoPlayer is showing - rendered at the left end of its
+  // control bar (fading with it) rather than as a row above the picture.
+  const playerBackButtonClass =
+    "flex items-center gap-1 min-w-0 max-w-full px-2 py-1 rounded-md bg-white/10 hover:bg-white/20 text-xs font-medium text-white whitespace-nowrap transition-colors";
+  // Just "Back" - the title says where to (video editor / which folder) on hover. Drops to the
+  // bare chevron once the player is very narrow (VideoPlayer's `player` size container).
+  const playerBackLabelClass = "@max-[520px]/player:hidden";
+  const playerBackButton =
+    videoEditorScreen?.mode === "editing" ? (
+      <button type="button" title="Back to video editor" className={playerBackButtonClass} onClick={() => { setSelectedFile(null); setVideoEditorScreen({ mode: "home" }); }}>
+        <IoChevronBack size={12} className="shrink-0" />
+        <span className={playerBackLabelClass}>Back</span>
+      </button>
+    ) : selectedFolder !== null ? (
+      <button type="button" title={`Back to ${folderDisplayName(selectedFolder)}`} className={playerBackButtonClass} onClick={() => setSelectedFile(null)}>
+        <IoChevronBack size={12} className="shrink-0" />
+        <span className={playerBackLabelClass}>Back</span>
+      </button>
+    ) : undefined;
+
   return (
+    <ToolPanelHostContext.Provider value={showToolsSidebar ? toolPanelHostEl : null}>
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
       {/* flex-1 min-h-0 here (and h-full min-h-0 on the row below) is load-bearing, not
           cosmetic: without a real height bound propagated all the way down, the main content
@@ -2877,6 +3235,48 @@ const setScreen = () => {
           >
             {showFileList && !isPdfFullscreen && (
               <div className="flex flex-col h-full">
+                {showToolsSidebar && (
+                  <div className="flex items-center gap-1 p-2 border-b border-gray-300 dark:border-neutral-700 shrink-0">
+                    {([
+                      { tab: "tools", label: "Tools", icon: <IoOptionsOutline size={15} /> },
+                      { tab: "media", label: "Media", icon: <IoFolderOpenOutline size={15} /> },
+                    ] as const).map(({ tab, label, icon }) => (
+                      <button
+                        key={tab}
+                        type="button"
+                        onClick={() => setVideoSidebarTab(tab)}
+                        className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                          videoSidebarTab === tab
+                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        }`}
+                      >
+                        {icon}
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {/* Tools tab - the timeline's settings popovers portal into the host div below
+                    (ToolPanelHost.tsx). Kept mounted (just hidden) on the Media tab so an open
+                    panel isn't torn down, and so a panel opening there can flip back to it. */}
+                {showToolsSidebar && (
+                  <div
+                    className={`flex-1 min-h-0 overflow-y-auto overscroll-contain p-3 pb-[var(--docker-height,64px)] ${
+                      videoSidebarTab === "tools" ? "" : "hidden"
+                    }`}
+                  >
+                    <div ref={setToolPanelHostEl} className="peer flex flex-col gap-3" />
+                    <div className="hidden peer-empty:flex flex-col items-center text-center gap-2 px-4 pt-10 text-neutral-500 dark:text-neutral-400">
+                      <IoOptionsOutline size={28} className="text-neutral-300 dark:text-neutral-600" />
+                      <p className="text-sm font-medium text-neutral-700 dark:text-neutral-300">No tool selected</p>
+                      <p className="text-xs leading-relaxed">
+                        Select a clip on the timeline, then choose Effects, Speed or Reduce noise from the toolbar - or click an audio clip - to adjust it here.
+                      </p>
+                    </div>
+                  </div>
+                )}
+                <div className={`flex flex-col flex-1 min-h-0 ${showToolsSidebar && videoSidebarTab === "tools" ? "hidden" : ""}`}>
                 {/* File type tabs */}
                 <div className="flex items-center justify-around border-b border-gray-300 dark:border-neutral-700 py-2 shrink-0">
                   {FILE_CATEGORY_TABS.map(({ category, label, icon }) => (
@@ -3684,6 +4084,7 @@ const setScreen = () => {
                   ))
                 )}
                 </div>
+                </div>
               </div>
             )}
           </div>
@@ -3774,29 +4175,15 @@ const setScreen = () => {
               directly: only the filename's tail end still peeked out past this button's right
               edge). Stacking it as its own shrink-0 row instead means every viewer's own header,
               image/pdf included, renders in the space actually left for it. */}
-          {/* relative z-20 + the pointer-events dance: VideoPlayer's own wrapper is h-screen inside
-              a shorter, items-center pane below this row, so it overflows *upward* and paints over
-              this strip - without a stacking context of its own the button here renders behind the
-              <video> and can't be clicked at all (elementFromPoint over it returns VIDEO). The row
-              is full-width, so only the button itself takes pointer events back; the rest of the
-              strip stays click-through to the player underneath. */}
-          {videoEditorScreen?.mode === "editing" && selectedFile ? (
-            <div className={`shrink-0 px-3 pt-3 relative z-20 pointer-events-none ${backButtonFade}`}>
-              <button
-                type="button"
-                onClick={() => { setSelectedFile(null); setVideoEditorScreen({ mode: "home" }); }}
-                className="pointer-events-auto flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
-              >
-                <IoChevronBack size={14} />
-                Back to video editor
-              </button>
-            </div>
-          ) : selectedFolder !== null && selectedFile && !boardScreen && !docsScreen && (
-            <div className={`shrink-0 px-3 pt-3 relative z-20 pointer-events-none ${backButtonFade}`}>
+          {/* Video/audio files (VideoPlayer) carry their "Back to …" button inside the player's own
+              control bar instead (playerBackButton below), so the picture gets this row's height
+              back - this row is only for the image/pdf/document viewers. */}
+          {selectedFolder !== null && selectedFile && !isMediaFileSelected && !boardScreen && !docsScreen && (
+            <div className="shrink-0 px-3 pt-3">
               <button
                 type="button"
                 onClick={() => setSelectedFile(null)}
-                className="pointer-events-auto flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
+                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-sm text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm"
               >
                 <IoChevronBack size={14} />
                 Back to {folderDisplayName(selectedFolder)}
@@ -3805,6 +4192,14 @@ const setScreen = () => {
           )}
 
           <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center">
+          {isNewVideoProjectOpen && (
+            <NewVideoProjectDialog
+              libraryImages={allLibraryFiles.filter((file) => isImageClipPath(file.path))}
+              resolveThumbnailUrl={resolveImageThumbnailUrl}
+              onCreate={handleCreateVideoProject}
+              onClose={() => setIsNewVideoProjectOpen(false)}
+            />
+          )}
           {videoEditorScreen?.mode === "home" ? (
             <VideoEditorHome
               videos={allLibraryFiles.filter((file) => getFileCategory(file.name) === "video")}
@@ -3812,6 +4207,7 @@ const setScreen = () => {
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
               onOpenVideo={(file) => void handleOpenVideoInEditor(file)}
               onOpenExternalVideo={() => void handleOpenExternalVideoForEditing()}
+              onCreateVideo={() => setIsNewVideoProjectOpen(true)}
             />
           ) : mindmapScreen ? (
             <ErrorBoundary
@@ -3912,6 +4308,16 @@ const setScreen = () => {
                   getFileCategory(selectedFile.name) === "video"
                     ? (frameRect) => (
                         <>
+                          {/* First, so it sits under every overlay - export composites the
+                              transition into the base video before any overlay too. */}
+                          <TransitionPreviewLayer
+                            frameRect={frameRect}
+                            clips={editStore.clips}
+                            activeClipId={activeClipEffects?.id ?? null}
+                            getPlaybackState={getPlayerPlaybackState}
+                            resolveClipUrl={resolveTimelineClipUrl}
+                          />
+                          {reframePreview && <ReframePreviewLayer preview={reframePreview} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />}
                           <VideoOverlayLayer
                           frameRect={frameRect}
                           overlays={editStore.textOverlays}
@@ -3924,7 +4330,8 @@ const setScreen = () => {
                           isPlacingText={isPlacingText}
                           onPlacementConsumed={() => setIsPlacingText(false)}
                           onAddTextOverlay={editStore.addTextOverlay}
-                          onUpdateTextOverlayContent={editStore.updateTextOverlayContent}
+                          onUpdateTextOverlayContent={(id, patch) => editStore.updateTextOverlayContent(id, keyframeAwarePatch(editStore.textOverlays.find((o) => o.id === id), patch))}
+                          getOutputTime={getExactOutputTime}
                           onDeleteTextOverlay={editStore.deleteTextOverlay}
                           onDuplicateTextOverlay={(id) => setSelectedOverlayId(editStore.duplicateTextOverlay(id))}
                           onBringTextOverlayToFront={editStore.bringTextOverlayToFront}
@@ -3932,7 +4339,7 @@ const setScreen = () => {
                           isPlacingImage={isPlacingImage}
                           onPlacementImageConsumed={() => setIsPlacingImage(false)}
                           onAddImageOverlay={editStore.addImageOverlay}
-                          onUpdateImageOverlayContent={editStore.updateImageOverlayContent}
+                          onUpdateImageOverlayContent={(id, patch) => editStore.updateImageOverlayContent(id, keyframeAwarePatch(editStore.imageOverlays.find((o) => o.id === id), patch))}
                           onDeleteImageOverlay={editStore.deleteImageOverlay}
                           onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
                           onBringImageOverlayToFront={editStore.bringImageOverlayToFront}
@@ -3946,6 +4353,12 @@ const setScreen = () => {
                           onUpdateBlurOverlayContent={editStore.updateBlurOverlayContent}
                           onDeleteBlurOverlay={editStore.deleteBlurOverlay}
                           onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
+                          onSetOverlayTime={(kind, id, edge, time) => {
+                            const clamped = Math.max(0, Math.min(totalOutputDuration, time));
+                            if (kind === "text") editStore.resizeTextOverlayTime(id, edge, clamped);
+                            else if (kind === "image") editStore.resizeImageOverlayTime(id, edge, clamped);
+                            else editStore.resizeBlurOverlayTime(id, edge, clamped);
+                          }}
                           totalOutputDuration={totalOutputDuration}
                         />
                         <PipOverlayLayer
@@ -3962,6 +4375,18 @@ const setScreen = () => {
                           onUpdatePipOverlayContent={editStore.updatePipOverlayContent}
                           onDeletePipOverlay={editStore.deletePipOverlay}
                         />
+                        {/* Above PiP and every other overlay - same stacking as the export, where the
+                            captions are the last video stage (export_trimmed_video). */}
+                        {editStore.captions?.settings.enabled && captionLines.length > 0 && (
+                          <CaptionOverlayLayer
+                            frameRect={frameRect}
+                            lines={captionLines}
+                            settings={editStore.captions.settings}
+                            currentOutputTime={currentOutputTime}
+                            isPlaying={playerIsPlaying}
+                            clipSpeed={activeClipEffects?.speed ?? 1}
+                          />
+                        )}
                         {isCroppingClip && activeClipEffects && (
                           // Keyed on the active clip's own id so a clip change mid-drag (playback
                           // crossing a cut while the user is still holding a handle down - rare,
@@ -3982,9 +4407,12 @@ const setScreen = () => {
                       )
                     : undefined
                 }
+                controlsLeading={playerBackButton}
+                onSidebarPanelChange={handlePlayerSidebarPanelChange}
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted}
                 activeClipEffects={activeClipEffects}
+                gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}
               />
             )
@@ -4128,57 +4556,89 @@ const setScreen = () => {
               {isRecording && CAMERA_ONLY_RECORD_TYPES.includes(recordType) ? (
                 <LiveCameraRecordingView videoDevices={videoDevices} isPaused={isPaused} />
               ) : (
-              <div className="relative flex flex-col items-center gap-3 text-center">
-                <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
-                  <IoVideocam size={28} />
-                </div>
+              <div className="relative flex flex-col items-center gap-5 text-center w-full max-w-3xl">
                 <div>
-                  <p className="text-gray-700 dark:text-neutral-200 font-medium">Nothing playing yet</p>
+                  <p className="text-xl text-gray-800 dark:text-neutral-100 font-semibold">
+                    What would you like to create today?
+                  </p>
                   <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
-                    Pick a file from the sidebar, or open one from your computer.
+                    Jump into a tool, open a file from your computer, or pick up something from your library.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleOpenExternalFile}
-                  className="mt-1 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity"
-                >
-                  Open a file
-                </button>
+                {/* Same tools (and icons) as the bottom dock's tool row, surfaced here with labels
+                    so a first-time user can see what the app does without hovering icons. */}
+                <div className="flex flex-wrap justify-center gap-2">
+                  {[
+                    { label: "Edit a video", icon: <IoCutOutline size={22} />, onClick: handleOpenVideoEditor },
+                    { label: "Write a document", icon: <IoDocumentTextOutline size={22} />, onClick: handleOpenDocs },
+                    { label: "Whiteboard", icon: <IoGitNetworkOutline size={22} />, onClick: handleOpenWhiteboard },
+                    { label: "Mind map", icon: <IoMapOutline size={22} />, onClick: handleOpenMindmap },
+                    { label: "Board", icon: <IoImagesOutline size={22} />, onClick: handleOpenBoard },
+                    { label: "Open a file", icon: <IoFolderOpenOutline size={22} />, onClick: handleOpenExternalFile },
+                  ].map((action) => (
+                    <button
+                      key={action.label}
+                      type="button"
+                      onClick={action.onClick}
+                      className="flex flex-col items-center justify-center gap-2 w-28 h-24 rounded-lg bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-gray-600 dark:text-neutral-300 hover:border-blue-400 dark:hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+                    >
+                      {action.icon}
+                      <span className="text-xs font-medium">{action.label}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
               )}
 
-              {libraryPreviewFiles.length > 0 && (
+              {homeItems.length > 0 && (
                 <div className="relative w-full max-w-md">
                   <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
                     From your library
                   </p>
                   <div className="flex flex-col gap-1">
-                    {libraryPreviewFiles.map((file) => (
-                      <button
-                        key={file.path}
-                        type="button"
-                        onClick={() => handleFileClick(file)}
-                        className="flex items-center gap-3 px-3 py-2 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
-                      >
-                        <span className="text-gray-400 dark:text-neutral-500 shrink-0">
-                          {categoryIcon(getFileCategory(file.name))}
-                        </span>
-                        <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
-                          {truncateFileName(file.name)}
-                        </span>
-                        <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
-                          {libraryPreviewDurations.has(file.path) && (
-                            <>
-                              <span>{formatMediaDuration(libraryPreviewDurations.get(file.path)!)}</span>
-                              <span aria-hidden>·</span>
-                            </>
-                          )}
-                          <span>{formatFileSize(file.size)}</span>
-                          {pinnedPaths.includes(file.path) && <IoPin size={13} />}
-                        </span>
-                      </button>
-                    ))}
+                    {homeItems.map((item) => {
+                      const file = item.kind === "file" ? libraryFilesByPath.get(item.id) : undefined;
+                      const kind = item.kind === "file" ? null : HOME_KIND[item.kind];
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          onClick={() => openHomeItem(item)}
+                          className="flex items-center gap-3 px-3 py-2 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
+                        >
+                          <span className={`shrink-0 ${kind ? kind.color : "text-gray-400 dark:text-neutral-500"}`}>
+                            {kind ? kind.icon : categoryIcon(getFileCategory(item.name))}
+                          </span>
+                          <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
+                            {file ? truncateFileName(file.name) : item.name}
+                          </span>
+                          <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
+                            {file ? (
+                              <>
+                                {libraryPreviewDurations.has(file.path) && (
+                                  <>
+                                    <span>{formatMediaDuration(libraryPreviewDurations.get(file.path)!)}</span>
+                                    <span aria-hidden>·</span>
+                                  </>
+                                )}
+                                <span>{formatFileSize(file.size)}</span>
+                              </>
+                            ) : (
+                              <>
+                                <span>{kind!.label}</span>
+                                {item.time > 0 && (
+                                  <>
+                                    <span aria-hidden>·</span>
+                                    <span>{relativeTime(item.time)}</span>
+                                  </>
+                                )}
+                              </>
+                            )}
+                            {item.pinned && <IoPin size={13} />}
+                          </span>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -4215,6 +4675,7 @@ const setScreen = () => {
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         onOutputTimeChange={setCurrentOutputTime}
         onActiveClipChange={setActiveClipEffects}
+        onReframePreviewChange={setReframePreview}
         noiseReductionStatus={noiseReductionStatus}
         onPreviewNoiseOriginal={(bypass) => videoPlayerRef.current?.setNoisePreviewBypass(bypass)}
         selectedOverlayId={selectedOverlayId}
@@ -4288,6 +4749,7 @@ const setScreen = () => {
         setAudioDevice={setAudioDevice}
         showRecordingDocker={showRecordingDocker}
         showRecordingPanelButtons={showRecordingPanelButtons}
+        showDockerStatusBar={showDockerStatusBar}
         handleFolderSettings={toggleFileList}
         handleGoHome={handleGoHome}
         isHome={selectedFile === null && boardScreen === null && docsScreen === null && whiteboardScreen === null && mindmapScreen === null && videoEditorScreen === null}
@@ -4330,6 +4792,7 @@ const setScreen = () => {
         <TelemetryNotice />
       </div>
     </div>
+    </ToolPanelHostContext.Provider>
   );
 };
 

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { MdClosedCaption, MdOutlineOpacity, MdSpeed, MdOutlineNoiseControlOff } from 'react-icons/md';
-import { IoPlayCircleOutline, IoChevronForward, IoCheckmark, IoImageOutline, IoEyeOutline, IoScanOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline, IoSparkles } from 'react-icons/io5';
+import { IoBrowsersOutline, IoPlayCircleOutline, IoChevronForward, IoCheckmark, IoImageOutline, IoEyeOutline, IoScanOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline, IoSparkles } from 'react-icons/io5';
 import { CAPTIONS_LANGUAGE_OPTIONS } from '../../utils/videoUtils';
 import type { PlayerNoise } from '../VideoPlayer';
 
@@ -27,6 +27,8 @@ interface PlaytimeSettingsProps {
   hasCaptions: boolean;
   captionsVisible: boolean;
   onCaptionsVisibleChange: () => void;
+  // Opens the captions panel (styles + caption list) in the sidebar - absent where unsupported.
+  onShowCaptionsInSidebar?: () => void;
   // Language the on-screen captions were generated in (null = loaded from a file / none) - so the
   // generate row can say "Regenerate" and the language row can flag a pending mismatch.
   generatedCaptionsLanguage: string | null;
@@ -67,6 +69,7 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   hasCaptions,
   captionsVisible,
   onCaptionsVisibleChange,
+  onShowCaptionsInSidebar,
   generatedCaptionsLanguage,
   onLoadCaptionsFile,
   onGenerateCaptions,
@@ -285,6 +288,15 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
 
       {showCaptionsOptions && (
         <div className="settings-submenu">
+          {onShowCaptionsInSidebar && (
+            <button className="settings-row settings-submenu-item" onClick={onShowCaptionsInSidebar}>
+              <span className="settings-row-label">
+                <IoBrowsersOutline />
+                Style &amp; captions list
+              </span>
+              <span className="settings-row-value">Sidebar</span>
+            </button>
+          )}
           {hasCaptions && (
             <button className="settings-row settings-submenu-item" onClick={onCaptionsVisibleChange}>
               <span className="settings-row-label">

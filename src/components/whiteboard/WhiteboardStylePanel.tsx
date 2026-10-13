@@ -1252,10 +1252,10 @@ function TransformBlock({ nodes, onCommit }: { nodes: WhiteboardNode[]; onCommit
     <div className="flex flex-col gap-2">
       {nodes.length === 1 && (
         <div className="grid grid-cols-2 gap-2">
-          <PrefixedNumber prefix="X" title="Horizontal position" resetKey={`${ids}-x-${Math.round(node.x)}`} value={node.x} min={-100000} max={100000} onCommit={(x) => onCommit({ x })} />
-          <PrefixedNumber prefix="Y" title="Vertical position" resetKey={`${ids}-y-${Math.round(node.y)}`} value={node.y} min={-100000} max={100000} onCommit={(y) => onCommit({ y })} />
-          <PrefixedNumber prefix="W" title="Width" resetKey={`${ids}-w-${Math.round(node.width)}`} value={node.width} min={1} max={100000} onCommit={(width) => onCommit({ width })} />
-          <PrefixedNumber prefix="H" title="Height" resetKey={`${ids}-h-${Math.round(node.height)}`} value={node.height} min={1} max={100000} onCommit={(height) => onCommit({ height })} />
+          <PrefixedNumber prefix="X" title="Horizontal position" resetKey={`${ids}-x`} value={node.x} min={-100000} max={100000} onCommit={(x) => onCommit({ x })} />
+          <PrefixedNumber prefix="Y" title="Vertical position" resetKey={`${ids}-y`} value={node.y} min={-100000} max={100000} onCommit={(y) => onCommit({ y })} />
+          <PrefixedNumber prefix="W" title="Width" resetKey={`${ids}-w`} value={node.width} min={1} max={100000} onCommit={(width) => onCommit({ width })} />
+          <PrefixedNumber prefix="H" title="Height" resetKey={`${ids}-h`} value={node.height} min={1} max={100000} onCommit={(height) => onCommit({ height })} />
         </div>
       )}
       <div className="grid grid-cols-2 gap-2">
@@ -1263,7 +1263,7 @@ function TransformBlock({ nodes, onCommit }: { nodes: WhiteboardNode[]; onCommit
           prefix={<TbRotateClockwise size={13} />}
           title="Rotation in degrees"
           suffix="°"
-          resetKey={`${ids}-r-${node.rotation ?? 0}`}
+          resetKey={`${ids}-r`}
           value={node.rotation ?? 0}
           min={0}
           max={360}
