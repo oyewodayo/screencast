@@ -4,6 +4,7 @@
 // everything they need explicitly. useVideoEditStore is the only caller.
 
 import { clipSpeedSteps, subSpan } from "../utils/clipTiming";
+import type { OverlayAsset } from "../utils/videoAssets";
 import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, PipOverlay, TextOverlay, VideoEditCommand, isImageClipPath } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
@@ -361,9 +362,9 @@ export function makeTextOverlay(x: number, y: number, width: number, fontSize: n
   };
 }
 
-export function makeImageOverlay(src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number): ImageOverlay {
+export function makeImageOverlay(src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number, asset?: OverlayAsset): ImageOverlay {
   const now = Date.now();
-  return { id: crypto.randomUUID(), src, x, y, width, height, opacity: 1, startTime, endTime, createdAt: now, updatedAt: now };
+  return { id: crypto.randomUUID(), src, ...(asset ? { asset } : {}), x, y, width, height, opacity: 1, startTime, endTime, createdAt: now, updatedAt: now };
 }
 
 export function makeBlurOverlay(x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number): BlurOverlay {

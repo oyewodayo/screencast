@@ -52,6 +52,8 @@ import {
 import { gradeCubeForClip } from "../utils/gradeLuts";
 import { clipOutputDuration } from "../utils/clipTiming";
 import type { OverlayKeyframe } from "../utils/keyframes";
+import type { OverlayAsset } from "../utils/videoAssets";
+import { renderAssetFrames } from "../utils/videoAssets";
 
 interface ExportKeyframe {
   time: number;
@@ -135,7 +137,7 @@ type TextOverlayContentPatch = Partial<
   Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes">
 >;
 type ImageOverlayContentPatch = Partial<
-  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes">
+  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset">
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src" | "bpm" | "beats">>;
@@ -177,7 +179,8 @@ export interface UseVideoEditStoreResult {
   // Same shape as the text-overlay methods above, minus a "content-only, no id yet" add step -
   // an image overlay's identity (the file it points at) is only known once a file's been picked,
   // so it's created with its full src/geometry in one call rather than an empty placeholder.
-  addImageOverlay: (src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number) => string;
+  // `asset` makes it a shape/animated element (videoAssets.ts) rather than a picture.
+  addImageOverlay: (src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number, asset?: OverlayAsset) => string;
   updateImageOverlayContent: (id: string, patch: ImageOverlayContentPatch) => void;
   resizeImageOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
   moveImageOverlayTime: (id: string, newStartTime: number) => void;
@@ -859,10 +862,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   );
 
   const addImageOverlay = useCallback(
-    (src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number): string => {
+    (src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number, asset?: OverlayAsset): string => {
       const current = stateRef.current;
       if (!current) return "";
-      const overlay = makeImageOverlay(src, x, y, width, height, startTime, endTime);
+      const overlay = makeImageOverlay(src, x, y, width, height, startTime, endTime, asset);
       const imageOverlays = addOverlay(current.imageOverlays, overlay);
       pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "add-image");
       return overlay.id;
@@ -1403,7 +1406,16 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       // the platform format's when one is chosen (export fits the video into it first).
       const videoPixelSize = options?.outputFrame ? { width: options.outputFrame.width, height: options.outputFrame.height } : timelinePixelSize;
       try {
-        const overlays: { dataBase64: string; x: number; y: number; startTime: number; endTime: number; animation: string; keyframes?: ExportKeyframe[] }[] = [];
+        const overlays: {
+          dataBase64: string;
+          x: number;
+          y: number;
+          startTime: number;
+          endTime: number;
+          animation: string;
+          keyframes?: ExportKeyframe[];
+          frames?: { unique: string[]; sequence: number[] };
+        }[] = [];
         if (videoPixelSize) {
           const { width: pxW, height: pxH } = videoPixelSize;
           // Keyframes in the export's terms: absolute output seconds, and the rendered PNG's own
@@ -1424,6 +1436,24 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx) });
           }
           for (const o of current.imageOverlays) {
+            if (o.asset) {
+              // A shape/animated element burns in as a frame sequence of its own animation -
+              // drawn by the same function as the preview (videoAssets.ts).
+              // eslint-disable-next-line no-await-in-loop
+              const seq = await renderAssetFrames(o, pxW, pxH);
+              if (seq)
+                overlays.push({
+                  dataBase64: "",
+                  x: seq.xPx,
+                  y: seq.yPx,
+                  startTime: o.startTime,
+                  endTime: o.endTime,
+                  animation: exportOverlayAnimation(o.animation),
+                  keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
+                  frames: { unique: seq.unique, sequence: seq.sequence },
+                });
+              continue;
+            }
             // eslint-disable-next-line no-await-in-loop
             const rendered = await renderImageOverlayToPng(o, pxW, pxH);
             if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx) });

@@ -19,10 +19,13 @@
 // instead of it never having existed.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoChevronDown, IoChevronUp, IoClose, IoImageOutline, IoText } from "react-icons/io5";
+import { IoChevronDown, IoChevronUp, IoClose, IoImageOutline, IoShapesOutline, IoText } from "react-icons/io5";
 import { MdBlurOn } from "react-icons/md";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import AssetCanvas from "./AssetCanvas";
+import AssetFloatingControls from "./AssetFloatingControls";
+import { assetEntry } from "../../utils/videoAssets";
 import { OverlayKeyframe, keyframeStateAt } from "../../utils/keyframes";
 import { FrameRect } from "../../utils/videoFrameRect";
 import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
@@ -112,6 +115,7 @@ type ImageOverlayContentPatch = Partial<
     | "cropY"
     | "cropWidth"
     | "cropHeight"
+    | "asset"
   >
 >;
 // "rounded" is a flat px amount (converted to a frameRect.height fraction at click time) rather
@@ -1694,7 +1698,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               height: o.height * frameRect.height,
               // --kf-opacity: keyframed fade, written every frame by the keyframe loop below.
               opacity: o.keyframes?.length ? `calc(${o.opacity * anim.opacity} * var(--kf-opacity, 1))` : o.opacity * anim.opacity,
-              borderRadius: radiusPx,
+              borderRadius: o.asset ? undefined : radiusPx,
               // translate (slide animation) is listed before rotate so it applies in screen-space,
               // outside the image's own local rotation - see overlayAnimationStyle's own comment on
               // why "peek and retreat" rather than a conveyor, and CSS's own transform-composition
@@ -1718,11 +1722,25 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               // doesn't show" bug: it was rendering, just permanently hidden under the picture). An
               // outer ring instead grows 3px past the box's own edge, into space the <img> doesn't
               // reach, so nothing paints over it.
-              boxShadow: [o.borderColor ? `0 0 0 3px ${o.borderColor}` : null, o.shadow ? "0 6px 16px rgba(0,0,0,0.45)" : null].filter(Boolean).join(", ") || undefined,
+              // A shape draws its own shadow (following its outline, not this box) - see AssetCanvas.
+              boxShadow: o.asset
+                ? undefined
+                : [o.borderColor ? `0 0 0 3px ${o.borderColor}` : null, o.shadow ? "0 6px 16px rgba(0,0,0,0.45)" : null].filter(Boolean).join(", ") || undefined,
               pointerEvents: placingAnything ? "none" : "auto",
             }}
           >
-            {hasActiveCrop(o) ? (
+            {o.asset ? (
+              <AssetCanvas
+                asset={o.asset}
+                widthPx={o.width * frameRect.width}
+                heightPx={o.height * frameRect.height}
+                duration={o.endTime - o.startTime}
+                getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime}
+                flipHorizontal={o.flipHorizontal}
+                flipVertical={o.flipVertical}
+                shadow={o.shadow}
+              />
+            ) : hasActiveCrop(o) ? (
               // object-fit can only ever show the *whole* picture (letterboxed or covering) - it
               // has no way to show a sub-rectangle of it, so a crop needs a different technique
               // entirely: an oversized background-image, scaled/positioned so only the cropped
@@ -2095,8 +2113,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
 
       {selectedImageOverlayData && (
         <OverlaySettingsPanel
-          title="Image"
-          icon={<IoImageOutline size={14} />}
+          title={selectedImageOverlayData.asset ? assetEntry(selectedImageOverlayData.asset.kind).label : "Image"}
+          icon={selectedImageOverlayData.asset ? <IoShapesOutline size={14} /> : <IoImageOutline size={14} />}
           onClose={() => onSelectImageOverlay(null)}
           docked={(() => {
             const o = selectedImageOverlayData;
@@ -2142,6 +2160,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 onAnimation={(animation) => onUpdateImageOverlayContent(o.id, { animation })}
                 onReplace={() => void handleReplaceImage(o.id)}
                 onCrop={() => setCroppingOverlayId(o.id)}
+                asset={o.asset}
+                onAsset={(patch) => o.asset && onUpdateImageOverlayContent(o.id, { asset: { ...o.asset, ...patch } })}
                 x={o.x}
                 y={o.y}
                 width={o.width}
@@ -2187,7 +2207,13 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             className="w-16 accent-amber-400"
           />
           <div className="w-px h-4 bg-white/15" />
-          {(["square", "rounded", "round"] as const).map((corner) => {
+          {selectedImageOverlayData.asset && (
+            <AssetFloatingControls
+              asset={selectedImageOverlayData.asset}
+              onAsset={(patch) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { asset: { ...selectedImageOverlayData.asset!, ...patch } })}
+            />
+          )}
+          {!selectedImageOverlayData.asset && (["square", "rounded", "round"] as const).map((corner) => {
             const radiusFraction =
               corner === "square"
                 ? 0
@@ -2210,27 +2236,31 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               </button>
             );
           })}
-          <div className="w-px h-4 bg-white/15" />
-          <div onMouseDown={(e) => e.preventDefault()} title="Border color">
-            <ColorSwatchPicker
-              color={selectedImageOverlayData.borderColor ?? "#ffffff"}
-              onChange={(c) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { borderColor: c })}
-              size="sm"
-            />
-          </div>
-          <button
-            type="button"
-            title={selectedImageOverlayData.borderColor ? "Remove border" : "Add border"}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() =>
-              onUpdateImageOverlayContent(selectedImageOverlayData.id, { borderColor: selectedImageOverlayData.borderColor ? undefined : "#ffffff" })
-            }
-            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-              selectedImageOverlayData.borderColor ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-            }`}
-          >
-            Border
-          </button>
+          {!selectedImageOverlayData.asset && (
+            <>
+              <div className="w-px h-4 bg-white/15" />
+              <div onMouseDown={(e) => e.preventDefault()} title="Border color">
+                <ColorSwatchPicker
+                  color={selectedImageOverlayData.borderColor ?? "#ffffff"}
+                  onChange={(c) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { borderColor: c })}
+                  size="sm"
+                />
+              </div>
+              <button
+                type="button"
+                title={selectedImageOverlayData.borderColor ? "Remove border" : "Add border"}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() =>
+                  onUpdateImageOverlayContent(selectedImageOverlayData.id, { borderColor: selectedImageOverlayData.borderColor ? undefined : "#ffffff" })
+                }
+                className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+                  selectedImageOverlayData.borderColor ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                Border
+              </button>
+            </>
+          )}
           <div className="w-px h-4 bg-white/15" />
           {/* Everything past this point is reached for less often than opacity/corners/border
               above - tucked behind a caret instead of growing this row every time a new image
@@ -2316,24 +2346,28 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 onChange={(next) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { animation: next })}
               />
             </div>
-            <button
-              type="button"
-              title="Replace the picture, keeping position/size/style"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => void handleReplaceImage(selectedImageOverlayData.id)}
-              className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-            >
-              Replace
-            </button>
-            <button
-              type="button"
-              title="Crop to a sub-region of the picture"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => setCroppingOverlayId(selectedImageOverlayData.id)}
-              className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-            >
-              Crop
-            </button>
+            {!selectedImageOverlayData.asset && (
+              <>
+                <button
+                  type="button"
+                  title="Replace the picture, keeping position/size/style"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => void handleReplaceImage(selectedImageOverlayData.id)}
+                  className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+                >
+                  Replace
+                </button>
+                <button
+                  type="button"
+                  title="Crop to a sub-region of the picture"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setCroppingOverlayId(selectedImageOverlayData.id)}
+                  className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+                >
+                  Crop
+                </button>
+              </>
+            )}
             <button
               type="button"
               title="Duplicate this image overlay"

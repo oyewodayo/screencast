@@ -29,6 +29,7 @@ import NumberStepper from "../docker/NumberStepper";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 import { BlurShape, OverlayAnimation, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { TextAlign } from "../../utils/pdfAnnotationTypes";
+import { ASSET_ENTRANCES, ASSET_LOOPS, AssetEntrance, AssetLoop, OverlayAsset, assetEntry, assetSupportsOutline, assetUsesColor2, countdownPlan } from "../../utils/videoAssets";
 
 const keepFocus = (e: React.MouseEvent) => e.preventDefault();
 
@@ -618,6 +619,181 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
   );
 };
 
+// ---------- shapes & elements ----------
+
+function ChipGrid<T extends string>({ options, value, onChange }: { options: { value: T; label: string }[]; value: T; onChange: (next: T) => void }) {
+  return (
+    <div className="grid grid-cols-4 gap-1">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          onMouseDown={keepFocus}
+          onClick={() => onChange(o.value)}
+          className={`h-7 rounded-md text-[11px] transition-colors ${
+            value === o.value ? "bg-blue-500/25 text-blue-200 ring-1 ring-blue-400/50" : "bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10"
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// A text input that commits on Enter or blur - one undo step per edit, not per keystroke.
+const DraftTextField: React.FC<{ value: string; placeholder?: string; onCommit: (v: string) => void }> = ({ value, placeholder, onCommit }) => {
+  const [draft, setDraft] = React.useState<string | null>(null);
+  return (
+    <input
+      type="text"
+      value={draft ?? value}
+      placeholder={placeholder}
+      onFocus={() => setDraft(value)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        if (draft !== null && draft !== value) onCommit(draft);
+        setDraft(null);
+      }}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") e.currentTarget.blur();
+        else if (e.key === "Escape") {
+          setDraft(null);
+          setTimeout(() => (e.target as HTMLInputElement).blur());
+        }
+      }}
+      className="flex-1 min-w-0 h-7 px-2 rounded-md bg-black/40 ring-1 ring-white/10 text-[11px] text-white outline-none focus:ring-blue-400"
+    />
+  );
+};
+
+// Countdown numbers (from/to, pace) and the timer's starting time.
+const CounterSection: React.FC<{
+  asset: OverlayAsset;
+  onAsset: (patch: Partial<OverlayAsset>) => void;
+  startTime: number;
+  endTime: number;
+  onSetTime?: (edge: "start" | "end", time: number) => void;
+}> = ({ asset, onAsset, startTime, endTime, onSetTime }) => {
+  if (asset.kind === "timer") {
+    return (
+      <Section title="Timer">
+        <LabeledRow label="Start at">
+          <NumberStepper value={asset.countFrom ?? 0} min={0} max={359999} step={1} decimals={0} suffix=" s" onChange={(v) => onAsset({ countFrom: Math.round(v) })} />
+          <span className="text-white/40">counts up</span>
+        </LabeledRow>
+      </Section>
+    );
+  }
+  const plan = countdownPlan(asset, endTime - startTime);
+  const pace = asset.countPace ?? "second";
+  const fitsLength = Math.abs(endTime - startTime - plan.steps) < 0.05;
+  return (
+    <Section title="Count">
+      <LabeledRow label="From">
+        <NumberStepper value={plan.from} min={-9999} max={9999} step={1} decimals={0} suffix="" onChange={(v) => onAsset({ countFrom: Math.round(v) })} />
+        <span className="text-white/40">to</span>
+        <NumberStepper value={plan.to} min={-9999} max={9999} step={1} decimals={0} suffix="" onChange={(v) => onAsset({ countTo: Math.round(v) })} />
+      </LabeledRow>
+      <LabeledRow label="Pace">
+        <div className="flex-1">
+          <Segmented
+            value={pace}
+            onChange={(countPace) => onAsset({ countPace })}
+            options={[
+              { value: "second", title: "One number per second, then hold the last", label: "1 per second" },
+              { value: "fit", title: "Spread the numbers over the element's whole length", label: "Fit length" },
+            ]}
+          />
+        </div>
+      </LabeledRow>
+      {pace === "second" && onSetTime && !fitsLength && (
+        <button
+          type="button"
+          onMouseDown={keepFocus}
+          onClick={() => onSetTime("end", startTime + plan.steps)}
+          className="h-7 rounded-md bg-white/[0.06] text-[11px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+        >
+          Make it {plan.steps}s long to match the count
+        </button>
+      )}
+    </Section>
+  );
+};
+
+// Colours, style and the element's own built-in effects (videoAssets.ts) - separate from the
+// box-level Animation/Motion sections below, which still apply on top.
+export const AssetSettingsSections: React.FC<{
+  asset: OverlayAsset;
+  onAsset: (patch: Partial<OverlayAsset>) => void;
+  startTime: number;
+  endTime: number;
+  onSetTime?: (edge: "start" | "end", time: number) => void;
+}> = ({ asset, onAsset, startTime, endTime, onSetTime }) => (
+  <>
+    {(asset.kind === "countdown" || asset.kind === "timer") && (
+      <CounterSection asset={asset} onAsset={onAsset} startTime={startTime} endTime={endTime} onSetTime={onSetTime} />
+    )}
+    {assetEntry(asset.kind).text && (
+      <Section title="Text">
+        <LabeledRow label={assetEntry(asset.kind).text![0]}>
+          <DraftTextField value={asset.text ?? ""} onCommit={(text) => onAsset({ text })} />
+        </LabeledRow>
+        {assetEntry(asset.kind).text![1] && (
+          <LabeledRow label={assetEntry(asset.kind).text![1]!}>
+            <DraftTextField value={asset.subtext ?? ""} onCommit={(subtext) => onAsset({ subtext })} />
+          </LabeledRow>
+        )}
+      </Section>
+    )}
+    <Section title="Element">
+      <LabeledRow label="Colour">
+        <div onMouseDown={keepFocus} title="Main colour">
+          <ColorSwatchPicker color={asset.color} onChange={(c) => onAsset({ color: c })} size="sm" />
+        </div>
+        {assetUsesColor2(asset.kind) && (
+          <>
+            <Switch on={!!asset.color2} label={asset.color2 ? "Use a single colour" : "Add a second colour (gradient / accent)"} onChange={(on) => onAsset({ color2: on ? "#8b5cf6" : undefined })} />
+            {asset.color2 && (
+              <div onMouseDown={keepFocus} title="Second colour">
+                <ColorSwatchPicker color={asset.color2} onChange={(c) => onAsset({ color2: c })} size="sm" />
+              </div>
+            )}
+          </>
+        )}
+      </LabeledRow>
+      {assetSupportsOutline(asset.kind) && (
+        <LabeledRow label="Style">
+          <div className="flex-1">
+            <Segmented
+              value={asset.outline ? "outline" : "fill"}
+              onChange={(v) => onAsset({ outline: v === "outline" })}
+              options={[
+                { value: "fill", title: "Filled", label: <span className="w-3 h-3 rounded-sm bg-current" /> },
+                { value: "outline", title: "Outline only", label: <span className="w-3 h-3 rounded-sm border-[1.5px] border-current" /> },
+              ]}
+            />
+          </div>
+        </LabeledRow>
+      )}
+      <LabeledRow label="Glow">
+        <Switch on={!!asset.glow} label="Neon glow" onChange={(glow) => onAsset({ glow })} />
+      </LabeledRow>
+    </Section>
+    <Section title="Entrance">
+      <ChipGrid<AssetEntrance> options={ASSET_ENTRANCES} value={asset.entrance} onChange={(entrance) => onAsset({ entrance })} />
+      <LabeledRow label="Exit">
+        <Switch on={asset.exit} label="Play the entrance backwards on the way out" onChange={(exit) => onAsset({ exit })} />
+        <span className="text-white/40">reverse entrance</span>
+      </LabeledRow>
+    </Section>
+    <Section title="Loop">
+      <ChipGrid<AssetLoop> options={ASSET_LOOPS} value={asset.loop} onChange={(loop) => onAsset({ loop })} />
+    </Section>
+  </>
+);
+
 // ---------- image ----------
 
 export type ImageCorner = "square" | "rounded" | "round";
@@ -644,33 +820,43 @@ export interface ImageDockedPanelProps extends CommonProps {
   onCrop: () => void;
   onFront: () => void;
   onBack: () => void;
+  // Set for a shape/animated element instead of a picture.
+  asset?: OverlayAsset;
+  onAsset?: (patch: Partial<OverlayAsset>) => void;
 }
 
 export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
   <>
+    {props.asset && props.onAsset && (
+      <AssetSettingsSections asset={props.asset} onAsset={props.onAsset} startTime={props.startTime} endTime={props.endTime} onSetTime={props.onSetTime} />
+    )}
     <Section title="Appearance">
       <SliderRow label="Opacity" value={Math.round(props.opacity * 100)} min={10} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => props.onOpacity(v / 100)} />
-      <LabeledRow label="Corners">
-        <div className="flex-1">
-          <Segmented
-            value={props.corner ?? ("custom" as ImageCorner)}
-            onChange={props.onCorner}
-            options={[
-              { value: "square", title: "Square corners", label: <span className="w-3 h-3 border-[1.5px] border-current" /> },
-              { value: "rounded", title: "Rounded corners", label: <span className="w-3 h-3 border-[1.5px] border-current rounded-[3px]" /> },
-              { value: "round", title: "Round", label: <span className="w-3 h-3 border-[1.5px] border-current rounded-full" /> },
-            ]}
-          />
-        </div>
-      </LabeledRow>
-      <LabeledRow label="Border">
-        <Switch on={!!props.borderColor} label={props.borderColor ? "Remove border" : "Add border"} onChange={(on) => props.onBorderColor(on ? "#ffffff" : undefined)} />
-        {props.borderColor && (
-          <div onMouseDown={keepFocus} title="Border colour">
-            <ColorSwatchPicker color={props.borderColor} onChange={(c) => props.onBorderColor(c)} size="sm" />
+      {!props.asset && (
+        <LabeledRow label="Corners">
+          <div className="flex-1">
+            <Segmented
+              value={props.corner ?? ("custom" as ImageCorner)}
+              onChange={props.onCorner}
+              options={[
+                { value: "square", title: "Square corners", label: <span className="w-3 h-3 border-[1.5px] border-current" /> },
+                { value: "rounded", title: "Rounded corners", label: <span className="w-3 h-3 border-[1.5px] border-current rounded-[3px]" /> },
+                { value: "round", title: "Round", label: <span className="w-3 h-3 border-[1.5px] border-current rounded-full" /> },
+              ]}
+            />
           </div>
-        )}
-      </LabeledRow>
+        </LabeledRow>
+      )}
+      {!props.asset && (
+        <LabeledRow label="Border">
+          <Switch on={!!props.borderColor} label={props.borderColor ? "Remove border" : "Add border"} onChange={(on) => props.onBorderColor(on ? "#ffffff" : undefined)} />
+          {props.borderColor && (
+            <div onMouseDown={keepFocus} title="Border colour">
+              <ColorSwatchPicker color={props.borderColor} onChange={(c) => props.onBorderColor(c)} size="sm" />
+            </div>
+          )}
+        </LabeledRow>
+      )}
       <LabeledRow label="Shadow">
         <Switch on={props.shadow} label="Drop shadow" onChange={props.onShadow} />
       </LabeledRow>
@@ -686,12 +872,16 @@ export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
         <IconButton title="Flip vertically" onClick={props.onFlipVertical} active={props.flipVertical}>
           <IoSwapVerticalOutline size={15} />
         </IconButton>
-        <IconButton title="Crop the picture" onClick={props.onCrop}>
-          <IoCropOutline size={15} />
-        </IconButton>
-        <IconButton title="Replace the picture (keeps position, size and style)" onClick={props.onReplace}>
-          <IoRefreshOutline size={15} />
-        </IconButton>
+        {!props.asset && (
+          <>
+            <IconButton title="Crop the picture" onClick={props.onCrop}>
+              <IoCropOutline size={15} />
+            </IconButton>
+            <IconButton title="Replace the picture (keeps position, size and style)" onClick={props.onReplace}>
+              <IoRefreshOutline size={15} />
+            </IconButton>
+          </>
+        )}
       </div>
     </Section>
 

@@ -3201,6 +3201,19 @@ pub struct OverlayImage {
     // slide when present. Already in output-video pixels and absolute output seconds.
     #[serde(default)]
     pub keyframes: Option<Vec<OverlayKeyframe>>,
+    // An animated overlay (a shape/element - videoAssets.ts) as a PNG frame sequence instead of
+    // one still: frame k shows at start_time + k/OVERLAY_INPUT_FPS. Frames repeat a lot (a looping
+    // pulse, a held shape), so only the distinct images travel - `sequence[k]` indexes `unique`.
+    // `data_base64` is unused when this is set.
+    #[serde(default)]
+    pub frames: Option<OverlayFrames>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayFrames {
+    pub unique: Vec<String>,
+    pub sequence: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4219,6 +4232,42 @@ fn write_temp_overlay_png(data_base64: &str, index: usize) -> Result<PathBuf, St
     Ok(path)
 }
 
+// Writes an animated overlay's frames as a numbered PNG sequence ffmpeg's image2 demuxer can read
+// (`..._f%06d.png`). Each distinct frame is written once and every repeat is a hard link to it
+// (a copy where linking isn't possible), so a long looping element costs little disk or time.
+// Every file created is pushed onto `created` - including on failure - for the caller's cleanup.
+// Returns the sequence's printf-style pattern.
+fn write_temp_overlay_sequence(frames: &OverlayFrames, index: usize, created: &mut Vec<PathBuf>) -> Result<String, String> {
+    if frames.unique.is_empty() || frames.sequence.is_empty() {
+        return Err("Animated overlay has no frames".to_string());
+    }
+    let prefix = format!("briefcast_ovseq_{}_{}", std::process::id(), index);
+    let dir = std::env::temp_dir();
+    let mut unique_paths: Vec<PathBuf> = Vec::with_capacity(frames.unique.len());
+    for (j, data) in frames.unique.iter().enumerate() {
+        let payload = data.rsplit(',').next().unwrap_or(data);
+        let bytes = BASE64
+            .decode(payload)
+            .map_err(|e| format!("Failed to decode overlay frame: {}", e))?;
+        let path = dir.join(format!("{}_u{}.png", prefix, j));
+        std::fs::write(&path, &bytes).map_err(|e| format!("Failed to write overlay frame: {}", e))?;
+        created.push(path.clone());
+        unique_paths.push(path);
+    }
+    for (k, &u) in frames.sequence.iter().enumerate() {
+        let src = unique_paths
+            .get(u as usize)
+            .ok_or_else(|| "Animated overlay frame index out of range".to_string())?;
+        let path = dir.join(format!("{}_f{:06}.png", prefix, k));
+        let _ = std::fs::remove_file(&path);
+        if std::fs::hard_link(src, &path).is_err() {
+            std::fs::copy(src, &path).map_err(|e| format!("Failed to write overlay frame: {}", e))?;
+        }
+        created.push(path);
+    }
+    Ok(dir.join(format!("{}_f%06d.png", prefix)).to_string_lossy().to_string())
+}
+
 // Renders the edited (trimmed/split/reordered) video described by `segments` - an ordered list
 // of the *kept* time ranges, each independently naming which source file it comes from, produced
 // by VideoTimelineDocker's trim handles, split+delete tool, and drag-to-reorder/drag-in - to a
@@ -4352,6 +4401,28 @@ pub async fn export_trimmed_video(
     let total_duration: f64 = segments.iter().map(segment_output_duration).sum();
     let mut temp_overlay_paths: Vec<PathBuf> = Vec::new();
     for (i, ov) in overlays.iter().enumerate() {
+        // An animated overlay reads its own frame sequence at the overlay rate - it starts at
+        // timestamp 0 and is shifted to start_time in the filter graph (see the overlay loop).
+        if let Some(frames) = &ov.frames {
+            match write_temp_overlay_sequence(frames, i, &mut temp_overlay_paths) {
+                Ok(pattern) => inputs.push(InputSpec {
+                    path: pattern,
+                    pre_args: vec![
+                        "-framerate".into(),
+                        format!("{}", OVERLAY_INPUT_FPS),
+                        "-start_number".into(),
+                        "0".into(),
+                    ],
+                }),
+                Err(e) => {
+                    for temp_path in &temp_overlay_paths {
+                        let _ = std::fs::remove_file(temp_path);
+                    }
+                    return Err(e);
+                }
+            }
+            continue;
+        }
         // Deliberately not `?` here - that would return before the cleanup loop further down ever
         // runs, permanently leaking every overlay PNG already written earlier in this same loop
         // (e.g. overlay 0 succeeds, overlay 1 fails to decode - overlay 0's temp file would
@@ -4815,7 +4886,19 @@ pub async fn export_trimmed_video(
         // [start,end) window on the output timeline either way.
         let overlay_input_base = segments.len();
         for (i, ov) in overlays.iter().enumerate() {
-            let source_label = format!("{}:v", overlay_input_base + i);
+            let mut source_label = format!("{}:v", overlay_input_base + i);
+            // A frame sequence starts at timestamp 0 - shifted to start at the overlay's own
+            // start_time, so everything below (fade st=, opacity's T, the enable window) reads the
+            // same absolute output times it does for a looped still.
+            let is_sequence = ov.frames.is_some();
+            if is_sequence {
+                let shifted = format!("ovseq{}", i);
+                filter.push_str(&format!(
+                    "[{}]format=rgba,setpts=PTS-STARTPTS+{:.4}/TB[{}];",
+                    source_label, ov.start_time, shifted
+                ));
+                source_label = shifted;
+            }
             let animation = sanitize_overlay_animation(&ov.animation);
             let composited_label = if animation == "fade" {
                 let faded_label = format!("ovfade{}", i);
@@ -4836,7 +4919,14 @@ pub async fn export_trimmed_video(
                 let scales = kfs.iter().any(|k| (k.scale - 1.0).abs() > 1e-3);
                 let fades = kfs.iter().any(|k| (k.opacity - 1.0).abs() > 1e-3);
                 if scales {
-                    let s = keyframe_expr(kfs, &format!("(n/{})", OVERLAY_INPUT_FPS), |k| k.scale.max(0.01));
+                    // `n` counts this input's frames: from output time 0 for a looped still, from
+                    // start_time for a (shifted) frame sequence.
+                    let frame_time = if is_sequence {
+                        format!("({:.4}+n/{})", ov.start_time, OVERLAY_INPUT_FPS)
+                    } else {
+                        format!("(n/{})", OVERLAY_INPUT_FPS)
+                    };
+                    let s = keyframe_expr(kfs, &frame_time, |k| k.scale.max(0.01));
                     let scaled = format!("ovkfs{}", i);
                     filter.push_str(&format!(
                         "[{composited_label}]scale=w='max(2,trunc(iw*({s})/2)*2)':h='max(2,trunc(ih*({s})/2)*2)':eval=frame[{scaled}];"
@@ -6465,6 +6555,7 @@ mod tests {
             end_time: 5.0,
             animation: "none".to_string(),
             keyframes: None,
+            frames: None,
         };
         assert_eq!(
             overlay_position_expr(&ov, "none"),
@@ -6486,6 +6577,7 @@ mod tests {
             end_time: 5.0,
             animation: "slide-left".to_string(),
             keyframes: None,
+            frames: None,
         };
         let (x, y) = overlay_position_expr(&ov, "slide-left");
         assert_eq!(y, "200"); // y untouched

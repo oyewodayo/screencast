@@ -184,6 +184,55 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
             </div>
           </div>
 
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div>
+              <label htmlFor="new-video-project-duration" className={labelClass}>
+                Each image
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="new-video-project-duration"
+                  type="number"
+                  min={0.5}
+                  max={60}
+                  step={0.5}
+                  value={imageDuration}
+                  onChange={(e) => {
+                    const value = Number(e.target.value);
+                    if (Number.isFinite(value)) setImageDuration(Math.min(60, Math.max(0.5, value)));
+                  }}
+                  className="w-20 px-3 py-2 rounded-md text-sm bg-white dark:bg-neutral-950 border border-gray-200 dark:border-neutral-800 text-gray-800 dark:text-neutral-100 focus:border-blue-400 dark:focus:border-blue-500 outline-none tabular-nums"
+                />
+                <span className="text-sm text-neutral-500 dark:text-neutral-400">seconds</span>
+              </div>
+            </div>
+            {[
+              { id: "kenburns", label: "Slow zoom & pan", hint: "Ken Burns motion on every image", value: kenBurns, set: setKenBurns },
+              { id: "crossfade", label: "Crossfade", hint: "Fade from each image into the next", value: crossfade, set: setCrossfade },
+            ].map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                role="checkbox"
+                aria-checked={option.value}
+                onClick={() => option.set(!option.value)}
+                className="flex items-start gap-2.5 text-left outline-none sm:pt-6"
+              >
+                <span
+                  className={`mt-0.5 w-4 h-4 shrink-0 rounded border flex items-center justify-center ${
+                    option.value ? "bg-blue-600 border-blue-600 text-white" : "border-gray-300 dark:border-neutral-600"
+                  }`}
+                >
+                  {option.value && <IoCheckmark size={12} />}
+                </span>
+                <span>
+                  <span className="block text-sm text-gray-800 dark:text-neutral-100">{option.label}</span>
+                  <span className="block text-xs text-neutral-500 dark:text-neutral-400">{option.hint}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+
           <div>
             <div className="flex items-center justify-between mb-2">
               <span className={`${labelClass} mb-0`}>
@@ -261,55 +310,6 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
               </div>
             </div>
           )}
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div>
-              <label htmlFor="new-video-project-duration" className={labelClass}>
-                Each image
-              </label>
-              <div className="flex items-center gap-2">
-                <input
-                  id="new-video-project-duration"
-                  type="number"
-                  min={0.5}
-                  max={60}
-                  step={0.5}
-                  value={imageDuration}
-                  onChange={(e) => {
-                    const value = Number(e.target.value);
-                    if (Number.isFinite(value)) setImageDuration(Math.min(60, Math.max(0.5, value)));
-                  }}
-                  className="w-20 px-3 py-2 rounded-md text-sm bg-white dark:bg-neutral-950 border border-gray-200 dark:border-neutral-800 text-gray-800 dark:text-neutral-100 focus:border-blue-400 dark:focus:border-blue-500 outline-none tabular-nums"
-                />
-                <span className="text-sm text-neutral-500 dark:text-neutral-400">seconds</span>
-              </div>
-            </div>
-            {[
-              { id: "kenburns", label: "Slow zoom & pan", hint: "Ken Burns motion on every image", value: kenBurns, set: setKenBurns },
-              { id: "crossfade", label: "Crossfade", hint: "Fade from each image into the next", value: crossfade, set: setCrossfade },
-            ].map((option) => (
-              <button
-                key={option.id}
-                type="button"
-                role="checkbox"
-                aria-checked={option.value}
-                onClick={() => option.set(!option.value)}
-                className="flex items-start gap-2.5 text-left outline-none sm:pt-6"
-              >
-                <span
-                  className={`mt-0.5 w-4 h-4 shrink-0 rounded border flex items-center justify-center ${
-                    option.value ? "bg-blue-600 border-blue-600 text-white" : "border-gray-300 dark:border-neutral-600"
-                  }`}
-                >
-                  {option.value && <IoCheckmark size={12} />}
-                </span>
-                <span>
-                  <span className="block text-sm text-gray-800 dark:text-neutral-100">{option.label}</span>
-                  <span className="block text-xs text-neutral-500 dark:text-neutral-400">{option.hint}</span>
-                </span>
-              </button>
-            ))}
-          </div>
 
           {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
         </div>

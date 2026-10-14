@@ -38,6 +38,7 @@ import {
   IoPause,
   IoAddCircleOutline,
   IoImageOutline,
+  IoShapesOutline,
   IoLocateOutline,
   IoSpeedometerOutline,
   IoSyncOutline,
@@ -52,6 +53,8 @@ import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform
 import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
 import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
+import ElementsGallery from "../video/ElementsGallery";
+import { assetEntry, makeAsset } from "../../utils/videoAssets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION } from "./ClipEffectsPopover";
 import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
@@ -863,6 +866,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // Captions tool (CaptionsPanel) - whole-timeline, so unlike Effects/Speed it needs no selected
   // clip and isn't closed by selection changes.
   const [captionsAnchor, setCaptionsAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Elements gallery (shapes and animated elements - videoAssets.ts).
+  const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
   const captionsButtonRef = useRef<HTMLButtonElement>(null);
   // Edit by transcript (TranscriptEditorPanel) - whole-timeline like Captions, sharing its transcripts.
   const [transcriptAnchor, setTranscriptAnchor] = useState<{ left: number; top: number } | null>(null);
@@ -2964,6 +2969,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoImageOutline size={15} className={isPlacingImage ? "text-amber-400" : undefined} />
           </ActionButton>
+          <button
+            type="button"
+            data-elements-trigger
+            title="Add shapes and animated elements"
+            onClick={(e) => {
+              if (elementsAnchor) {
+                setElementsAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setElementsAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              elementsAnchor ? "bg-neutral-700 text-amber-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoShapesOutline size={15} />
+          </button>
           <ActionButton
             title={isPlacingBlur ? "Click the video preview to place a blur region" : "Add blur region"}
             onClick={() => onToggleArmPlaceBlur?.()}
@@ -3549,7 +3572,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 const left = overlay.startTime * pxPerSec;
                 const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
                 const isSelected = selectedImageOverlayId === overlay.id;
-                const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
+                const fileName = overlay.asset ? assetEntry(overlay.asset.kind).label : overlay.src.split(/[\\/]/).pop() ?? overlay.src;
                 return (
                   <div
                     key={overlay.id}
@@ -3563,7 +3586,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     }`}
                     style={{ left, width }}
                   >
-                    <IoImageOutline size={11} className="shrink-0" />
+                    {overlay.asset ? <IoShapesOutline size={11} className="shrink-0" /> : <IoImageOutline size={11} className="shrink-0" />}
                     {fileName}
                   </div>
                 );
@@ -3912,6 +3935,35 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             />
           );
         })()}
+
+      {elementsAnchor && (
+        <ElementsGallery
+          anchor={elementsAnchor}
+          onClose={() => setElementsAnchor(null)}
+          onPick={(kind) => {
+            const entry = assetEntry(kind);
+            const frameAspect = videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9;
+            // Wide elements (underlines, bars) by width; everything else about a third of the frame tall.
+            let height = entry.aspect >= 3 ? 0.5 / entry.aspect * frameAspect : 0.32;
+            let width = (height * entry.aspect) / frameAspect;
+            if (width > 0.6) {
+              width = 0.6;
+              height = (width * frameAspect) / entry.aspect;
+            }
+            if (entry.fullFrame) {
+              width = 1;
+              height = 1;
+            }
+            const length = kind === "countdown" ? 3 : kind === "progress" ? 5 : entry.fullFrame ? 6 : 4;
+            const total = totalOutputDuration > 0 ? totalOutputDuration : length;
+            const startTime = Math.max(0, Math.min(currentOutputTime, total - Math.min(length, total)));
+            const endTime = Math.min(total, startTime + length);
+            const id = editStore.addImageOverlay("", 0.5 - width / 2, 0.5 - height / 2, width, height, startTime, endTime, makeAsset(kind));
+            onSelectImageOverlay?.(id);
+            setElementsAnchor(null);
+          }}
+        />
+      )}
 
       {captionsAnchor && (
         <CaptionsPanel

@@ -12,6 +12,7 @@
 import { TextAlign, TextColorRun, TextRange } from "./pdfAnnotationTypes";
 import type { ClipSpeedRamp } from "./clipTiming";
 import type { OverlayKeyframe } from "./keyframes";
+import type { OverlayAsset } from "./videoAssets";
 
 // A per-clip color grade, applied to that clip's own trimmed segment (both live preview -
 // VideoPlayer's CSS `filter`, see cssFilterForColorPreset in videoColorFilters.ts - and export
@@ -272,6 +273,10 @@ export interface ImageOverlay {
   // these drive where it is instead of x/y alone.
   keyframes?: OverlayKeyframe[];
   src: string;
+  // A shape or animated element (videoAssets.ts) drawn in place of a picture - `src` is "" then.
+  // Everything else (box, rotation, opacity, flip, shadow, animation, keyframes, timing) applies
+  // the same; corners, border and crop are picture-only.
+  asset?: OverlayAsset;
   x: number;
   y: number;
   width: number;
