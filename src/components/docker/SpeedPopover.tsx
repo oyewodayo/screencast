@@ -18,7 +18,10 @@ import { ClipSpeedRamp, SPEED_RAMP_PRESETS, clipOutputDuration, clipSpeedSteps }
 // Same range export_trimmed_video's own atempo_chain (conversion.rs) is built to handle cleanly -
 // see that function's own doc comment for why arbitrarily large factors aren't offered here.
 const MIN_SPEED = 0.25;
-const MAX_SPEED = 4;
+// Up to 16x (the browser's own playback limit) for very short, punchy cuts; the slider itself stops
+// at 4x so it stays fine-grained where most edits live - the field and Duration go the rest of the way.
+const MAX_SPEED = 16;
+const SLIDER_MAX_SPEED = 4;
 const SPEED_PRESETS = [0.5, 1, 1.5, 2] as const;
 const SPEED_STEP = 0.05;
 const DURATION_STEP = 0.1;
@@ -117,7 +120,7 @@ const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anch
       </div>
       <div className="flex items-center gap-2 text-[11px]">
         <span className="w-12 shrink-0 text-white/60">Speed</span>
-        <Slider value={speed} min={MIN_SPEED} max={MAX_SPEED} step={SPEED_STEP} marks={SPEED_PRESETS} onChange={setSpeed} />
+        <Slider value={Math.min(speed, SLIDER_MAX_SPEED)} min={MIN_SPEED} max={SLIDER_MAX_SPEED} step={SPEED_STEP} marks={SPEED_PRESETS} onChange={setSpeed} />
         <NumberStepper value={speed} min={MIN_SPEED} max={MAX_SPEED} step={SPEED_STEP} decimals={2} suffix="x" onChange={setSpeed} />
       </div>
 

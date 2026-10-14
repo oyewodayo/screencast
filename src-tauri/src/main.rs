@@ -423,6 +423,8 @@ fn main() {
             commands::conversion::stabilized_clip_preview,
             commands::conversion::extract_frame_still,
             commands::conversion::render_reversed_clip,
+            commands::conversion::merged_clip_output_path,
+            commands::conversion::discard_merged_clip,
             commands::conversion::detect_beats,
             commands::conversion::analyze_subject_track,
             commands::conversion::batch_convert_to_mp4,

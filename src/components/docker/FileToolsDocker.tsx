@@ -49,7 +49,8 @@ interface FileToolsDockerProps {
   // present) for every non-video category.
   editStore: UseVideoEditStoreResult;
   currentTime: number;
-  onSeek: (sourcePath: string, time: number) => void;
+  // `resume`: keep playing after the seek (playback crossing into the next clip).
+  onSeek: (sourcePath: string, time: number, resume?: boolean) => void;
   // Video-only: lets the timeline's own transport button show accurate state and drive real
   // playback, same round-trip idea as currentTime/onSeek.
   isPlaying: boolean;
@@ -70,6 +71,9 @@ interface FileToolsDockerProps {
   // Video-only: reports the timeline's current output-timeline position upward, threaded
   // straight through to VideoTimelineDocker - see its own prop doc comment.
   onOutputTimeChange?: (outputTime: number) => void;
+  // The exact output time right now, read off the player itself (Dashboard's getExactOutputTime) -
+  // for keeping audio overlays in sync, where the ~4Hz currentTime is too stale to measure against.
+  getExactOutputTime?: () => number | null;
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
@@ -129,6 +133,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  getExactOutputTime,
   onActiveClipChange,
   onReframePreviewChange,
   noiseReductionStatus,
@@ -174,6 +179,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         pendingTimelineInsert={pendingTimelineInsert}
         onTimelineInsertHandled={onTimelineInsertHandled}
         onOutputTimeChange={onOutputTimeChange}
+        getExactOutputTime={getExactOutputTime}
         onActiveClipChange={onActiveClipChange}
         onReframePreviewChange={onReframePreviewChange}
         noiseReductionStatus={noiseReductionStatus}

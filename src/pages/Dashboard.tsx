@@ -699,6 +699,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     // left the player pointed at some *other* file's asset URL - opening a genuinely different
     // file here always starts fresh, so the "what's actually loaded" tracker needs to reset too.
     previewSourcePathRef.current = selectedFile?.sourcePath ?? null;
+    previewSwitchPendingRef.current = false;
     // Closing/replacing the open file is exactly the moment where the position updates still
     // sitting in playbackResume's write-behind buffer matter most (leaving for Docs/home unmounts
     // the player, so no further ticks are coming), so force them out instead of waiting for the
@@ -715,6 +716,8 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // selectedFile.sourcePath, but a cross-clip preview seek (see handleSeekActiveFile below) can
   // point it at a different file entirely without touching selectedFile itself.
   const previewSourcePathRef = useRef<string | null>(null);
+  // True while handleSeekActiveFile is still resolving a different file's URL - see there.
+  const previewSwitchPendingRef = useRef(false);
 
   // useCallback'd (stable identity across renders, not just a stable cache Map) because these
   // three resolvers are passed as props into ImageFolderGallery, whose own thumbnail-resolving
@@ -885,17 +888,25 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // the player's actual source (via the imperative loadSource, not the `src` prop/selectedFile -
   // see VideoPlayerHandle's own comment for why) only when the target differs from what's already
   // loaded, so scrubbing within the same clip stays a plain, cheap seek.
-  const handleSeekActiveFile = (sourcePath: string, time: number) => {
+  // `resume` (playback running from one clip into the next): keep playing even if the previous
+  // clip ran to the very end of its file, which leaves the <video> paused in "ended".
+  const handleSeekActiveFile = (sourcePath: string, time: number, resume = false) => {
     if (previewSourcePathRef.current === sourcePath) {
       videoPlayerRef.current?.seek(time);
+      if (resume) videoPlayerRef.current?.play();
       return;
     }
     previewSourcePathRef.current = sourcePath;
     if (sourcePath === selectedFile?.sourcePath) {
       // Back to the primary file - its asset URL is already resolved (selectedFile.path).
+      previewSwitchPendingRef.current = false;
       videoPlayerRef.current?.loadSource(selectedFile.path, time);
       return;
     }
+    // Until the new source is in, the old one keeps playing (past its clip's end) and reporting
+    // its own time - which the timeline would read as having already left the clip it just moved
+    // to, and skip straight past it. Hold position reports until the swap happens.
+    previewSwitchPendingRef.current = true;
     resolveTimelineClipUrl(sourcePath)
       .then((url) => {
         // Dropped if the player has moved on while the URL resolved - opening a different file
@@ -904,7 +915,10 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
         if (previewSourcePathRef.current !== sourcePath) return;
         videoPlayerRef.current?.loadSource(url, time);
       })
-      .catch((error) => console.error("Failed to load preview source for", sourcePath, error));
+      .catch((error) => console.error("Failed to load preview source for", sourcePath, error))
+      .finally(() => {
+        if (previewSourcePathRef.current === sourcePath) previewSwitchPendingRef.current = false;
+      });
   };
   // Prepares every image clip's preview proxy ahead of the playhead, one at a time, so playback
   // crossing into an image doesn't stall on its first encode. Re-runs on every edit, but anything
@@ -4294,7 +4308,7 @@ const setScreen = () => {
                 loop={isAudioSelected && audioRepeatMode === "one"}
                 onTimeUpdate={(time) => {
                   handleMediaTimeUpdate(time);
-                  setPlayerCurrentTime(time);
+                  if (!previewSwitchPendingRef.current) setPlayerCurrentTime(time);
                 }}
                 onPlayStateChange={setPlayerIsPlaying}
                 onEnded={handleMediaEnded}
@@ -4674,6 +4688,7 @@ const setScreen = () => {
         pendingTimelineInsert={pendingTimelineInsert}
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         onOutputTimeChange={setCurrentOutputTime}
+        getExactOutputTime={getExactOutputTime}
         onActiveClipChange={setActiveClipEffects}
         onReframePreviewChange={setReframePreview}
         noiseReductionStatus={noiseReductionStatus}

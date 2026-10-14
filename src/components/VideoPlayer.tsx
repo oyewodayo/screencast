@@ -236,6 +236,8 @@ interface VideoPlayerProps {
 export interface VideoPlayerHandle {
   seek: (time: number) => void;
   togglePlay: () => void;
+  // Starts playback if paused (no-op if already playing) - unlike togglePlay, safe to call blind.
+  play: () => void;
   loadSource: (src: string, seekTime: number) => void;
   // Imperatively overrides the crop transform for as long as a crop drag is in progress (pass
   // null once it ends) - ClipCropOverlay (Dashboard) calls this on every pointer move so the
@@ -481,6 +483,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     // actually runs (via useImperativeHandle's internal effect) after the whole render body -
     // including that declaration - has executed, so the forward reference is safe.
     togglePlay: () => togglePauseAndPlay(),
+    play: () => {
+      if (videoRef.current?.paused) togglePauseAndPlay();
+    },
     loadSource: (src: string, seekTime: number) => {
       const video = videoRef.current;
       if (!video) return;

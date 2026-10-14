@@ -68,7 +68,7 @@ interface Props {
   activeFileCurrentTime: number;
   // sourcePath names which file's timeline `time` belongs to - a timeline clip dragged in from
   // elsewhere means "seek to this time" is ambiguous without also saying which file.
-  onSeekActiveFile: (sourcePath: string, time: number) => void;
+  onSeekActiveFile: (sourcePath: string, time: number, resume?: boolean) => void;
   // Same round-trip as activeFileCurrentTime/onSeekActiveFile, for play/pause - lets the video-
   // tools timeline show an accurate transport button and drive real playback from it.
   activeFileIsPlaying: boolean;
@@ -85,6 +85,9 @@ interface Props {
   // Video-only: reports the timeline's current output-timeline position upward, threaded
   // straight through to FileToolsDocker/VideoTimelineDocker.
   onOutputTimeChange?: (outputTime: number) => void;
+  // The exact output time right now, read off the player itself (Dashboard's getExactOutputTime) -
+  // for keeping audio overlays in sync, where the ~4Hz currentTime is too stale to measure against.
+  getExactOutputTime?: () => number | null;
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
@@ -237,6 +240,7 @@ const BottomDocker = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  getExactOutputTime,
   onActiveClipChange,
   onReframePreviewChange,
   noiseReductionStatus,
@@ -678,6 +682,7 @@ const BottomDocker = ({
             pendingTimelineInsert={pendingTimelineInsert}
             onTimelineInsertHandled={onTimelineInsertHandled}
             onOutputTimeChange={onOutputTimeChange}
+            getExactOutputTime={getExactOutputTime}
             onActiveClipChange={onActiveClipChange}
             onReframePreviewChange={onReframePreviewChange}
             noiseReductionStatus={noiseReductionStatus}

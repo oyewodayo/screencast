@@ -36,7 +36,7 @@ export const SPEED_RAMP_PRESETS: { value: SpeedRampPreset; label: string; hint: 
 export const RAMP_STEPS = 16;
 // The range every step's speed is held to - the same 0.25..4 the export's segment_speed allows.
 const MIN_SPEED = 0.25;
-const MAX_SPEED = 4;
+const MAX_SPEED = 16; // SpeedPopover's MAX_SPEED - see there
 
 export interface SpeedStep {
   sourceStart: number;

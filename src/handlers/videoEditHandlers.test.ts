@@ -15,6 +15,8 @@ import {
   bringOverlayToFront,
   clipIndexAt,
   deleteClipAt,
+  deleteClips,
+  duplicateClips,
   deleteOverlay,
   deletePipOverlayAndCloseGap,
   duplicateOverlay,
@@ -29,6 +31,9 @@ import {
   resizeOverlayTime,
   sendOverlayToBack,
   splitClipAt,
+  splitAudioOverlayAt,
+  setImageClipLengths,
+  mergeClipsInPlace,
   splitPipOverlayAt,
   toKeepSegments,
   updateClip,
@@ -646,5 +651,77 @@ describe("freeze frame and reverse", () => {
     // Render times 0..3 are the LAST three seconds of the original (7..10).
     const piece = [{ ...reversed[0], start: 0, end: 3 }];
     expect(unreverseClip(piece, "a")[0]).toMatchObject({ sourcePath: "v.mp4", start: 7, end: 10 });
+  });
+});
+
+describe("deleteClips / duplicateClips (multi-select)", () => {
+  const clips = [makeClip({ id: "a" }), makeClip({ id: "b" }), makeClip({ id: "c" })];
+
+  it("deletes every selected clip and keeps the rest in order", () => {
+    expect(deleteClips(clips, ["a", "c"]).map((c) => c.id)).toEqual(["b"]);
+  });
+
+  it("returns the same array when nothing selected is present", () => {
+    expect(deleteClips(clips, ["zzz"])).toBe(clips);
+    expect(duplicateClips(clips, [], () => "x")).toBe(clips);
+  });
+
+  it("puts each copy right after its own original", () => {
+    let n = 0;
+    const result = duplicateClips(clips, ["a", "c"], () => `copy${++n}`);
+    expect(result.map((c) => c.id)).toEqual(["a", "copy1", "b", "c", "copy2"]);
+    expect(result[1]).toMatchObject({ sourcePath: "video.mp4", start: 0, end: 10 });
+  });
+});
+
+describe("splitAudioOverlayAt", () => {
+  const song = makeAudioOverlay({ id: "song", sourceDuration: 180, startTime: 2, endTime: 62, trimStart: 10, fadeInSec: 1, fadeOutSec: 3 });
+
+  it("cuts into two back-to-back pieces that pick up where the other left off in the song", () => {
+    const [a, b] = splitAudioOverlayAt([song], song.id, 12);
+    expect(a).toMatchObject({ id: song.id, startTime: 2, endTime: 12, trimStart: 10, fadeInSec: 1, fadeOutSec: undefined });
+    expect(b).toMatchObject({ startTime: 12, endTime: 62, trimStart: 20, fadeInSec: undefined, fadeOutSec: 3 });
+    expect(b.id).not.toBe(song.id);
+  });
+
+  it("refuses a cut too close to either edge", () => {
+    const overlays = [song];
+    expect(splitAudioOverlayAt(overlays, song.id, 2.01)).toBe(overlays);
+    expect(splitAudioOverlayAt(overlays, song.id, 61.99)).toBe(overlays);
+  });
+});
+
+describe("setImageClipLengths", () => {
+  it("sets every image clip to the length (speed respected) and leaves videos alone", () => {
+    const clips = [
+      makeClip({ id: "img", sourcePath: "a.jpg", start: 0, end: 5 }),
+      makeClip({ id: "vid", sourcePath: "b.mp4", start: 1, end: 9 }),
+      makeClip({ id: "fast", sourcePath: "c.png", start: 0, end: 5, speed: 2 }),
+    ];
+    const result = setImageClipLengths(clips, 0.2);
+    expect(result[0].end).toBeCloseTo(0.2);
+    expect(result[1]).toBe(clips[1]);
+    expect(result[2].end).toBeCloseTo(0.4);
+  });
+});
+
+describe("mergeClipsInPlace", () => {
+  const a = makeClip({ id: "a", start: 0, end: 4 });
+  const b = makeClip({ id: "b", start: 4, end: 7 });
+  const c = makeClip({ id: "c", start: 7, end: 10 });
+
+  it("joins back-to-back split pieces into one clip spanning them, in the first one's place", () => {
+    const result = mergeClipsInPlace([a, b, c], ["c", "b"]);
+    expect(result?.map((x) => [x.id, x.start, x.end])).toEqual([["a", 0, 4], ["b", 4, 10]]);
+  });
+
+  it("refuses (null) when something was cut out between them", () => {
+    expect(mergeClipsInPlace([a, c], ["a", "c"])).toBeNull();
+  });
+
+  it("refuses when they aren't side by side on the timeline, differ in settings or source", () => {
+    expect(mergeClipsInPlace([a, c, b], ["a", "b"])).toBeNull();
+    expect(mergeClipsInPlace([a, { ...b, speed: 2 }], ["a", "b"])).toBeNull();
+    expect(mergeClipsInPlace([a, { ...b, sourcePath: "other.mp4" }], ["a", "b"])).toBeNull();
   });
 });

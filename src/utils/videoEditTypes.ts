@@ -537,6 +537,8 @@ export interface VideoEditCommand {
     | "delete"
     | "reorder"
     | "insert"
+    | "replace-clip"
+    | "merge-clips"
     | "edit-clip-effects"
     | "add-text"
     | "edit-text"

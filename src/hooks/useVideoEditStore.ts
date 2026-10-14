@@ -15,6 +15,10 @@ import {
   ViewSwitchEvent,
   bringOverlayToFront,
   deleteClipAt as deleteClipAtHandler,
+  deleteClips as deleteClipsHandler,
+  duplicateClips as duplicateClipsHandler,
+  setImageClipLengths as setImageClipLengthsHandler,
+  mergeClipsInPlace,
   cutClipRanges as cutClipRangesHandler,
   insertFreezeFrame as insertFreezeFrameHandler,
   reverseClip as reverseClipHandler,
@@ -37,6 +41,7 @@ import {
   resizeOverlayTime,
   resizePipOverlayTime,
   splitPipOverlayAt,
+  splitAudioOverlayAt,
   deletePipOverlayAndCloseGap,
   sendOverlayToBack,
   splitClipAt,
@@ -61,6 +66,8 @@ import { blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderText
 const appWindow = getCurrentWebviewWindow()
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
+// An audio overlay can hang past the video's end, but must start at least this far before it.
+export const MIN_AUDIO_START_ROOM_SEC = 0.5;
 
 interface ConversionProgressPayload {
   input_path: string;
@@ -224,6 +231,8 @@ export interface UseVideoEditStoreResult {
   // Cuts one PiP at an output-timeline time; returns the new second piece's id ("" if the cut was
   // refused - too close to either edge).
   splitPipOverlay: (id: string, outputTime: number) => string;
+  // Cuts an audio overlay at the playhead - returns the second piece's id ("" if refused).
+  splitAudioOverlay: (id: string, outputTime: number) => string;
   duplicatePipOverlay: (id: string) => string;
   // The primary video's OWN audio level - see VideoEditState.videoAudioMuted's own doc comment for
   // why this is distinct from any AudioOverlay's own volume/muted. Read by VideoPlayer.tsx (stacked
@@ -254,6 +263,17 @@ export interface UseVideoEditStoreResult {
   deleteClipAt: (index: number) => void;
   reorderClip: (fromIndex: number, toIndex: number) => void;
   duplicateClip: (id: string) => void;
+  // Ctrl/Shift multi-selection: one undo step for the whole selection.
+  deleteClips: (ids: string[]) => void;
+  duplicateClips: (ids: string[]) => void;
+  // Every image clip to one length (a fast photo montage) - one undo step.
+  setImageClipLengths: (seconds: number) => void;
+  // Selected clips -> one clip (clip menu > Merge). Back-to-back split pieces just join (instant,
+  // still editable); anything else is rendered into one new file with its effects baked in. Resolves
+  // to the merged clip's id, or null if it couldn't be done.
+  mergeClips: (ids: string[], frame: { width: number; height: number } | null) => Promise<string | null>;
+  // Stops a merge that's still rendering - the timeline is left exactly as it was.
+  cancelMerge: () => void;
   freezeFrame: (clipId: string, sourceTime: number, stillPath: string, seconds: number) => void;
   // A reversed render's path to reverse the clip, or null to un-reverse it.
   setClipReversed: (clipId: string, reversedPath: string | null) => void;
@@ -285,6 +305,8 @@ export interface UseVideoEditStoreResult {
   // timeline - at `atIndex`, fetching its duration first if not already known. Resolves once the
   // clip has actually been added (or been skipped, if the duration lookup failed).
   insertClipAt: (sourcePath: string, atIndex: number) => Promise<void>;
+  // Swaps the media a clip plays (right-click > Replace) - keeps its place, length and effects.
+  replaceClipSource: (id: string, newSourcePath: string) => Promise<void>;
   undo: () => void;
   redo: () => void;
   canUndo: boolean;
@@ -617,6 +639,38 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       if (!current || index < 0) return;
       const clips = insertClipHandler(current.clips, index + 1, { ...current.clips[index], id: crypto.randomUUID() });
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "insert");
+    },
+    [pushCommand]
+  );
+
+  const deleteClips = useCallback(
+    (ids: string[]) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = deleteClipsHandler(current.clips, ids);
+      if (clips === current.clips) return;
+      // pushCommand refuses emptying a recording, same rule as deleteClipAt.
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "delete");
+    },
+    [pushCommand]
+  );
+
+  const duplicateClips = useCallback(
+    (ids: string[]) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = duplicateClipsHandler(current.clips, ids, () => crypto.randomUUID());
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "insert");
+    },
+    [pushCommand]
+  );
+
+  const setImageClipLengths = useCallback(
+    (seconds: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips: setImageClipLengthsHandler(current.clips, seconds) }), "trim");
     },
     [pushCommand]
   );
@@ -1010,7 +1064,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string, edge: "start" | "end", time: number) => {
       const current = stateRef.current;
       if (!current) return;
-      const audioOverlays = resizeAudioOverlayTime(current.audioOverlays, id, edge, totalOutputDuration(current.clips), time);
+      // Only the file's own length bounds an audio overlay's end - it may run past the video's end
+      // (shown dimmed on the lane; export's amix stops at the video's own length).
+      const audioOverlays = resizeAudioOverlayTime(current.audioOverlays, id, edge, Number.POSITIVE_INFINITY, time);
       pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "edit-audio");
     },
     [pushCommand]
@@ -1020,7 +1076,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string, newStartTime: number) => {
       const current = stateRef.current;
       if (!current) return;
-      const audioOverlays = moveOverlayTime(current.audioOverlays, id, newStartTime, totalOutputDuration(current.clips));
+      // Free to hang past the video's end (see resizeAudioOverlayTimeCb), but it has to start inside it.
+      const latestStart = Math.max(0, totalOutputDuration(current.clips) - MIN_AUDIO_START_ROOM_SEC);
+      const audioOverlays = moveOverlayTime(current.audioOverlays, id, Math.min(newStartTime, latestStart), Number.POSITIVE_INFINITY);
       pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "edit-audio");
     },
     [pushCommand]
@@ -1098,6 +1156,19 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       if (!current) return;
       const pipOverlays = deletePipOverlayAndCloseGap(current.pipOverlays, id);
       pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "delete-pip");
+    },
+    [pushCommand]
+  );
+
+  const splitAudioOverlay = useCallback(
+    (id: string, outputTime: number): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const audioOverlays = splitAudioOverlayAt(current.audioOverlays, id, outputTime);
+      if (audioOverlays === current.audioOverlays) return "";
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "edit-audio");
+      const index = audioOverlays.findIndex((o) => o.id === id);
+      return audioOverlays[index + 1]?.id ?? "";
     },
     [pushCommand]
   );
@@ -1235,6 +1306,37 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const newClip: Clip = { id: crypto.randomUUID(), sourcePath: newClipSourcePath, start: 0, end };
       const clips = insertClipHandler(latest.clips, atIndex, newClip);
       pushCommand(snapshot(latest, {}), snapshot(latest, { clips }), "insert");
+    },
+    [pushCommand, getSourceDuration, registerSourceDuration, sourcePath]
+  );
+
+  // The new media plays from its start for as long as the old clip ran (or all of it, if it's
+  // shorter), so the rest of the timeline doesn't shift. Look and motion carry over; what only
+  // made sense for the old file's own content - a reversed render, a noise sample - doesn't.
+  const replaceClipSource = useCallback(
+    async (id: string, newSourcePath: string) => {
+      const requestedForSourcePath = sourcePath; // same mid-lookup file-switch guard as insertClipAt
+      let duration = getSourceDuration(newSourcePath);
+      if (duration == null) {
+        duration = await fetchDuration(newSourcePath);
+        if (duration == null || sourcePathRef.current !== requestedForSourcePath) return;
+        registerSourceDuration(newSourcePath, duration);
+      }
+      if (sourcePathRef.current !== requestedForSourcePath) return;
+      const latest = stateRef.current;
+      const old = latest?.clips.find((c) => c.id === id);
+      if (!latest || !old) return;
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { reversedFrom, ...kept } = old;
+      if (kept.audioCleanup?.noiseSample) {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { noiseSample, ...cleanup } = kept.audioCleanup;
+        kept.audioCleanup = cleanup;
+      }
+      const sourceLength = old.end - old.start;
+      const replaced: Clip = { ...kept, sourcePath: newSourcePath, start: 0, end: Math.min(duration, sourceLength) };
+      const clips = latest.clips.map((c) => (c.id === id ? replaced : c));
+      pushCommand(snapshot(latest, {}), snapshot(latest, { clips }), "replace-clip");
     },
     [pushCommand, getSourceDuration, registerSourceDuration, sourcePath]
   );
@@ -1434,6 +1536,78 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [sourcePath]
   );
 
+  const mergeCancelledRef = useRef(false);
+  const cancelMerge = useCallback(() => {
+    mergeCancelledRef.current = true;
+    void invoke("cancel_conversion").catch((err) => console.error("Failed to cancel the merge:", err));
+  }, []);
+
+  const mergeClips = useCallback(
+    async (ids: string[], frame: { width: number; height: number } | null): Promise<string | null> => {
+      const current = stateRef.current;
+      if (!current || !sourcePath) return null;
+      const inPlace = mergeClipsInPlace(current.clips, ids);
+      if (inPlace) {
+        pushCommand(snapshot(current, {}), snapshot(current, { clips: inPlace }), "merge-clips");
+        return inPlace.find((c) => ids.includes(c.id))?.id ?? null;
+      }
+      const selected = current.clips.filter((c) => ids.includes(c.id));
+      if (selected.length < 2) return null;
+      const first = selected[0];
+      const requestedForSourcePath = sourcePath;
+      mergeCancelledRef.current = false;
+      const outputPath = await invoke<string>("merged_clip_output_path", { sourcePath: first.sourcePath });
+      // Cancelled (cancelMerge kills the render, so the invoke below rejects): no timeline change,
+      // and the half-written file goes.
+      const discardIfCancelled = () => {
+        if (!mergeCancelledRef.current) return false;
+        void invoke("discard_merged_clip", { path: outputPath }).catch((err) => console.error(err));
+        return true;
+      };
+      // Same render "Save clip as" uses, over the whole selection in timeline order - so the
+      // transitions between the selected clips are kept, while the first one's own transition in
+      // stays a live setting on the merged clip.
+      let resultPath: string;
+      try {
+        resultPath = await invoke<string>("export_trimmed_video", {
+          outputBasePath: sourcePath,
+          segments: await withGradeLuts(toKeepSegments([{ ...first, transitionIn: undefined }, ...selected.slice(1)]), selected),
+          overlays: [],
+          blurOverlays: [],
+          audioOverlays: [],
+          pipOverlays: [],
+          audioMuted: false,
+          audioVolume: 1,
+          videoWidth: frame?.width ?? null,
+          videoHeight: frame?.height ?? null,
+          quality: null,
+          outputPath,
+          captionsAss: null,
+          outputFrame: null,
+          loudnessLufs: null,
+        });
+      } catch (err) {
+        if (discardIfCancelled()) return null;
+        throw err;
+      }
+      if (discardIfCancelled()) return null;
+      const duration = await fetchDuration(resultPath);
+      if (duration == null || sourcePathRef.current !== requestedForSourcePath) return null;
+      registerSourceDuration(resultPath, duration);
+      const latest = stateRef.current;
+      if (!latest) return null;
+      const merged: Clip = { id: crypto.randomUUID(), sourcePath: resultPath, start: 0, end: duration, ...(first.transitionIn ? { transitionIn: first.transitionIn } : {}) };
+      const at = latest.clips.findIndex((c) => c.id === first.id);
+      if (at < 0) return null; // the first clip was removed while this rendered
+      const rest = latest.clips.filter((c) => !ids.includes(c.id));
+      const restIndex = latest.clips.slice(0, at).filter((c) => !ids.includes(c.id)).length;
+      const clips = [...rest.slice(0, restIndex), merged, ...rest.slice(restIndex)];
+      pushCommand(snapshot(latest, {}), snapshot(latest, { clips }), "merge-clips");
+      return merged.id;
+    },
+    [pushCommand, registerSourceDuration, sourcePath]
+  );
+
   const exportClip = useCallback(
     async (clipId: string, videoPixelSize: { width: number; height: number } | null, outputPath: string): Promise<{ path: string; name: string } | null> => {
       const clip = stateRef.current?.clips.find((c) => c.id === clipId);
@@ -1520,6 +1694,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     movePipOverlayTime,
     deletePipOverlay,
     splitPipOverlay,
+    splitAudioOverlay,
     duplicatePipOverlay,
     applyViewSwitchOverlays,
     videoAudioMuted: state?.videoAudioMuted ?? false,
@@ -1543,6 +1718,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     trimSilenceForClip,
     applyAutoZoomAtClicks,
     insertClipAt,
+    deleteClips,
+    duplicateClips,
+    setImageClipLengths,
+    mergeClips,
+    cancelMerge,
+    replaceClipSource,
     undo,
     redo,
     canUndo: undoStack.length > 0,

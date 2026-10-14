@@ -33,9 +33,9 @@ describe("clipTiming", () => {
     expect(sourceToOutputOffset(ramped, 12)).toBeCloseTo(clipOutputDuration(ramped), 6);
   });
 
-  it("keeps every step within the export's 0.25x-4x range", () => {
-    const extreme: Clip = { ...plain, speed: 4, speedRamp: { preset: "speed-up", amount: 1 } };
-    expect(clipSpeedSteps(extreme).every((s) => s.speed <= 4 && s.speed >= 0.25)).toBe(true);
+  it("keeps every step within the export's 0.25x-16x range", () => {
+    const extreme: Clip = { ...plain, speed: 16, speedRamp: { preset: "speed-up", amount: 1 } };
+    expect(clipSpeedSteps(extreme).every((s) => s.speed <= 16 && s.speed >= 0.25)).toBe(true);
   });
 });
 

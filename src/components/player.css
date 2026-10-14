@@ -517,16 +517,6 @@ video {
     box-sizing: border-box;
 }
 
-/* Loading animation for playing indicator */
-@keyframes pulse {
-    0%, 100% {
-        height: 16px;
-    }
-    50% {
-        height: 8px;
-    }
-}
-
 /* Responsive improvements */
 @media (max-width: 768px) {
     .video-controls-container .controls {

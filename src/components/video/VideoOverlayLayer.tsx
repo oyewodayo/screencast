@@ -2531,6 +2531,19 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             >
               Duplicate
             </button>
+            {contextMenu.kind === "image" && (
+              <button
+                type="button"
+                className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
+                onClick={() => {
+                  const id = contextMenu.id;
+                  setContextMenu(null);
+                  void handleReplaceImage(id);
+                }}
+              >
+                Replace…
+              </button>
+            )}
             {/* No z-order for a blur region (see BlurOverlay's own doc comment) - nothing for it
                 to stack against except the video itself, which is always behind by construction. */}
             {contextMenu.kind !== "blur" && (

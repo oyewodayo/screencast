@@ -2665,7 +2665,7 @@ pub struct SpeedStep {
 }
 
 fn clamp_speed(speed: f64) -> f64 {
-    speed.max(0.25).min(4.0)
+    speed.max(0.25).min(16.0)
 }
 
 // The segment's steps relative to its own start: (from, to, speed) in source seconds. A plain
@@ -2882,6 +2882,37 @@ pub async fn extract_frame_still(app_handle: AppHandle, source_path: String, tim
     .map_err(|e| format!("Couldn't grab that frame: {}", e))?;
     std::fs::rename(&partial, &out).map_err(|e| format!("Failed to save the frame: {}", e))?;
     path_to_str(&out).map(|s| s.to_string())
+}
+
+// Where a "Merge clips" render goes (the timeline's clip menu): a new file in the editor's media
+// folder next to reversed clips and frozen frames, named after the first clip's source. Each merge
+// is its own file - unlike those, there's no fixed range to find an earlier render by.
+#[tauri::command]
+pub fn merged_clip_output_path(source_path: String) -> Result<String, String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let out = derived_media_path(&source_path, "merged", &nonce.to_string(), "mp4")?;
+    path_to_str(&out).map(|s| s.to_string())
+}
+
+// Deletes what a cancelled merge left behind (ffmpeg killed mid-write). Only ever a merge render in
+// the editor's own media folder - anything else is refused, so this can't be pointed at user files.
+#[tauri::command]
+pub fn discard_merged_clip(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    let dir = crate::services::utility::derived_media_dir()?;
+    let in_media_dir = target.parent().map(|p| p == dir.as_path()).unwrap_or(false);
+    let is_merge = target.file_name().map(|n| n.to_string_lossy().contains(" merged ")).unwrap_or(false);
+    if !in_media_dir || !is_merge {
+        return Err("Not a merge render".to_string());
+    }
+    match std::fs::remove_file(&target) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Couldn't remove the cancelled merge: {}", e)),
+    }
 }
 
 // How much of a clip is reversed at a time. ffmpeg's `reverse` holds every frame of its input in
@@ -3522,12 +3553,12 @@ fn crop_chain(c: &ClipCrop) -> String {
 // actually rescales back to out_w:out_h - concat needs every segment at matching dimensions
 // regardless of which effects it has, so at least one of them always has to; see crop_chain's own
 // doc comment for why that's never both.
-// This segment's own playback-speed multiplier, clamped defensively to the same 0.25..4 range the
-// clip-effects UI itself offers (ClipEffectsPopover's MIN_SPEED/MAX_SPEED) - a value outside that
+// This segment's own playback-speed multiplier, clamped defensively to the same 0.25..16 range the
+// clip-effects UI itself offers (SpeedPopover's MIN_SPEED/MAX_SPEED) - a value outside that
 // couldn't have come from that slider, but clamping here (rather than trusting it) means a stale/
 // hand-edited sidecar can't push the setpts/atempo math into something degenerate.
 fn segment_speed(seg: &KeepSegment) -> f64 {
-    seg.speed.unwrap_or(1.0).max(0.25).min(4.0)
+    seg.speed.unwrap_or(1.0).max(0.25).min(16.0)
 }
 
 // This segment's own noise-reduction strength (0..1, clamped defensively same as segment_speed's
@@ -5234,7 +5265,7 @@ pub async fn extract_clip_audio(
     if end <= start {
         return Err("End must be after start".to_string());
     }
-    let speed = speed.max(0.25).min(4.0);
+    let speed = speed.max(0.25).min(16.0);
     // "Detach audio" writes into the app cache dir, which may not exist yet on a fresh install.
     if let Some(parent) = PathBuf::from(&output_path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create output folder: {}", e))?;
@@ -5978,10 +6009,10 @@ mod tests {
     }
 
     #[test]
-    fn segment_speed_clamps_to_0_25_4_range() {
+    fn segment_speed_clamps_to_0_25_16_range() {
         let mut seg = base_segment();
         seg.speed = Some(100.0);
-        assert_eq!(segment_speed(&seg), 4.0);
+        assert_eq!(segment_speed(&seg), 16.0);
         seg.speed = Some(0.001);
         assert_eq!(segment_speed(&seg), 0.25);
         seg.speed = Some(1.5);

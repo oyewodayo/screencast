@@ -25,6 +25,9 @@ import {
   IoScanOutline,
   IoPauseCircleOutline,
   IoPlayBackOutline,
+  IoRepeatOutline,
+  IoAddCircleOutline,
+  IoGitMergeOutline,
 } from "react-icons/io5";
 import { MdFlip } from "react-icons/md";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
@@ -44,10 +47,21 @@ interface ClipContextMenuProps {
   canSplit: boolean;
   // Delete is refused when it would leave a recording with no clips at all.
   canDelete: boolean;
+  // How many clips Duplicate/Delete act on - more than 1 when this clip is part of a Ctrl/Shift
+  // multi-selection.
+  selectionCount: number;
+  // Merge the multi-selection into one clip. `mergeIsInstant`: they're back-to-back split pieces
+  // that simply join; otherwise merging renders them into one new clip.
+  onMerge: () => void;
+  mergeIsInstant: boolean;
   onView: () => void;
   onSaveAs: () => void;
   onSplit: () => void;
   onDuplicate: () => void;
+  // Picks another image/video to play in this clip's place.
+  onReplace: () => void;
+  // Picks images/videos to add right before or after this clip.
+  onInsert: (where: "before" | "after") => void;
   onFreezeFrame: () => void;
   onToggleReverse: () => void;
   onMove: (target: ClipMoveTarget) => void;
@@ -55,6 +69,8 @@ interface ClipContextMenuProps {
   onSetMotion: (preset: KenBurnsPreset | null) => void;
   onSetColor: (preset: ColorFilterPreset) => void;
   onSetLength: (seconds: number) => void;
+  // Sets every image clip on the timeline to one length.
+  onSetAllImageLengths: (seconds: number) => void;
   onToggleMirror: () => void;
   onOpenEffects: () => void;
   onReveal: () => void;
@@ -62,15 +78,19 @@ interface ClipContextMenuProps {
   onClose: () => void;
 }
 
-const IMAGE_LENGTHS = [2, 3, 5, 8, 10, 15];
+// Down to a tenth of a second, for photo montages where each picture just flashes by.
+const IMAGE_LENGTHS = [0.1, 0.2, 0.3, 0.5, 1, 2, 3, 5, 8, 10, 15];
+const ALL_IMAGE_LENGTHS = [0.1, 0.2, 0.3, 0.5, 1, 2];
+const lengthLabel = (sec: number) => (sec < 1 ? `${sec}s` : `${sec} second${sec === 1 ? "" : "s"}`);
 
-type SubmenuId = "move" | "transition" | "motion" | "color" | "length";
+type SubmenuId = "insert" | "move" | "transition" | "motion" | "color" | "length";
 
 const itemClass =
   "w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-xs text-neutral-200 hover:bg-white/10 disabled:text-neutral-500 disabled:hover:bg-transparent disabled:cursor-default outline-none focus-visible:bg-white/10";
 
 const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
-  const { anchor, clip, index, clipCount, isImage, canSplit, canDelete, onClose } = props;
+  const { anchor, clip, index, clipCount, isImage, canSplit, canDelete, selectionCount, onClose } = props;
+  const many = selectionCount > 1;
   const { ref, position } = useClampedPopoverPosition(anchor);
   const [openSubmenu, setOpenSubmenu] = useState<SubmenuId | null>(null);
   const [submenuTop, setSubmenuTop] = useState(0);
@@ -161,6 +181,11 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
 
   const renderSubmenu = () => {
     switch (openSubmenu) {
+      case "insert":
+        return [
+          choice("before", "Before this clip…", false, () => props.onInsert("before")),
+          choice("after", "After this clip…", false, () => props.onInsert("after")),
+        ];
       case "move":
         return [
           choice("earlier", "Move earlier", false, () => props.onMove("earlier"), index === 0),
@@ -183,7 +208,13 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
           choice(p.value, p.label, (clip.colorFilter?.preset ?? "none") === p.value, () => props.onSetColor(p.value))
         );
       case "length":
-        return IMAGE_LENGTHS.map((sec) => choice(String(sec), `${sec} seconds`, Math.abs(lengthSec - sec) < 0.01, () => props.onSetLength(sec)));
+        return [
+          ...IMAGE_LENGTHS.map((sec) => choice(String(sec), lengthLabel(sec), Math.abs(lengthSec - sec) < 0.01, () => props.onSetLength(sec))),
+          <div key="all-label" className="mt-1 pt-1.5 px-3 pb-1 border-t border-white/10 text-[10px] uppercase tracking-wide text-neutral-500">
+            Every image
+          </div>,
+          ...ALL_IMAGE_LENGTHS.map((sec) => choice(`all-${sec}`, `All images ${lengthLabel(sec)}`, false, () => props.onSetAllImageLengths(sec))),
+        ];
       default:
         return null;
     }
@@ -211,8 +242,26 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
         <IoCutOutline size={14} /> Split at playhead
       </button>
       <button type="button" onClick={act(props.onDuplicate)} className={itemClass}>
-        <IoCopyOutline size={14} /> Duplicate
+        <IoCopyOutline size={14} /> {many ? `Duplicate ${selectionCount} clips` : "Duplicate"}
       </button>
+      <button type="button" onClick={act(props.onReplace)} className={itemClass} title="Swap in another image or video - keeps this clip's place, length and effects">
+        <IoRepeatOutline size={14} /> Replace…
+      </button>
+      {many && (
+        <button
+          type="button"
+          onClick={act(props.onMerge)}
+          className={itemClass}
+          title={
+            props.mergeIsInstant
+              ? "Join these back-to-back pieces into one clip"
+              : "Render these into one clip (in timeline order, where the first one is) - their effects and the transitions between them are baked in"
+          }
+        >
+          <IoGitMergeOutline size={14} /> Merge {selectionCount} clips{props.mergeIsInstant ? "" : "…"}
+        </button>
+      )}
+      {submenuItem("insert", <IoAddCircleOutline size={14} />, "Insert clip", null)}
       {!isImage && (
         <>
           <button
@@ -250,7 +299,7 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
         <IoFolderOpenOutline size={14} /> Show source in folder
       </button>
       <button type="button" disabled={!canDelete} onClick={act(props.onDelete)} className={`${itemClass} text-red-300`}>
-        <IoTrashOutline size={14} /> Delete clip
+        <IoTrashOutline size={14} /> {many ? `Delete ${selectionCount} clips` : "Delete clip"}
       </button>
 
       {openSubmenu && (

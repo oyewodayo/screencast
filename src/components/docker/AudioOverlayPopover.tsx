@@ -1,7 +1,7 @@
 // components/docker/AudioOverlayPopover.tsx
 //
-// The style/control surface for a selected audio overlay - volume, fade in/out, mute, duplicate,
-// delete. Portal-rendered and positioned from the timeline chip's own getBoundingClientRect()
+// The style/control surface for a selected audio overlay - which part of the song plays, volume,
+// fade in/out, cut, mute, duplicate, delete. Portal-rendered and positioned from the timeline chip's own getBoundingClientRect()
 // (computed by the caller, VideoTimelineDocker, at click time), the same technique AnimationPicker
 // in VideoOverlayLayer.tsx already uses for the identical "don't get clipped by a bounded/
 // scrolling ancestor" problem. Unlike that file's own panels, plain native <input type="range">/
@@ -16,15 +16,19 @@
 // delete row) was pushed past the window and effectively invisible/unreachable. See
 // useClampedPopoverPosition for the fix - it measures the popover's real rendered size and nudges
 // it back on-screen after layout.
-import { invoke } from "@tauri-apps/api/core";
-import React, { useState, useEffect } from "react";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import React, { useState, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
-import { IoClose } from "react-icons/io5";
+import { IoClose, IoPause, IoPlay } from "react-icons/io5";
 import { AudioOverlay } from "../../utils/videoEditTypes";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
 
-export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "bpm" | "beats">>;
+export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "bpm" | "beats" | "trimStart" | "endTime">>;
+
+const MIN_PART_SEC = 0.1;
+const FIT_FADE_OUT_SEC = 2;
+const formatSec = (sec: number) => `${Math.floor(sec / 60)}:${(sec % 60).toFixed(1).padStart(4, "0")}`;
 
 interface AudioOverlayPopoverProps {
   overlay: AudioOverlay;
@@ -32,13 +36,21 @@ interface AudioOverlayPopoverProps {
   onUpdate: (patch: AudioOverlayContentPatch) => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  // Where the video (and so the export) ends on the output timeline - audio past it isn't exported.
+  videoEnd: number;
+  // Cut this audio at the playhead; null when the playhead isn't inside it.
+  onSplitAtPlayhead: (() => void) | null;
+  // Called as the song preview starts, so the timeline isn't playing underneath it.
+  onPreviewStart?: () => void;
+  // Whether the timeline itself is playing - starting it stops the preview.
+  timelinePlaying?: boolean;
   // Beat sync - fit every image clip to this (and any other) track's beats.
   hasImageClips: boolean;
   onCutImagesOnBeat: (everyBeats: number) => void;
   onClose: () => void;
 }
 
-const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onDelete, hasImageClips, onCutImagesOnBeat, onClose }) => {
+const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onDelete, videoEnd, onSplitAtPlayhead, onPreviewStart, timelinePlaying, hasImageClips, onCutImagesOnBeat, onClose }) => {
   const [beatState, setBeatState] = useState<{ busy: boolean; error?: string }>({ busy: false });
   const findBeats = () => {
     setBeatState({ busy: true });
@@ -69,6 +81,52 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
 
   const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
 
+  // The part of the song that plays, in seconds into the file. It always plays at 1x, so its length
+  // on the timeline is (to - from) and only the end moves when either changes.
+  const partFrom = overlay.trimStart;
+  const partTo = overlay.trimStart + (overlay.endTime - overlay.startTime);
+  const setPart = (from: number, to: number) => {
+    const f = Math.max(0, Math.min(from, overlay.sourceDuration - MIN_PART_SEC));
+    const t = Math.max(f + MIN_PART_SEC, Math.min(to, overlay.sourceDuration));
+    onUpdate({ trimStart: f, endTime: overlay.startTime + (t - f) });
+  };
+  const pastVideoEnd = Math.max(0, overlay.endTime - Math.max(overlay.startTime, videoEnd));
+  // Ends it exactly where the video does (never longer than what's left of the song).
+  const fitToVideo = (fadeOut: boolean) => {
+    const t = Math.max(partFrom + MIN_PART_SEC, Math.min(partFrom + (videoEnd - overlay.startTime), overlay.sourceDuration));
+    onUpdate({ endTime: overlay.startTime + (t - partFrom), ...(fadeOut ? { fadeOutSec: FIT_FADE_OUT_SEC } : {}) });
+  };
+  // Preview: plays just this part of the song on its own (its own <audio>, not the timeline's), at
+  // the chip's volume, from where it was paused - back to the part's start once it reaches the end.
+  const previewRef = useRef<HTMLAudioElement>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewAt, setPreviewAt] = useState(partFrom);
+  const togglePreview = () => {
+    const audio = previewRef.current;
+    if (!audio) return;
+    if (!audio.paused) {
+      audio.pause();
+      return;
+    }
+    onPreviewStart?.();
+    if (audio.currentTime < partFrom || audio.currentTime >= partTo - 0.05) audio.currentTime = partFrom;
+    audio.volume = overlay.muted ? 0 : Math.max(0, Math.min(1, overlay.volume));
+    audio.play().catch((err) => console.error("Song preview failed to play:", overlay.src, err));
+  };
+  useEffect(() => {
+    const audio = previewRef.current;
+    if (audio) audio.volume = overlay.muted ? 0 : Math.max(0, Math.min(1, overlay.volume));
+  }, [overlay.volume, overlay.muted]);
+  useEffect(() => {
+    const audio = previewRef.current;
+    return () => audio?.pause(); // closing the panel stops the preview
+  }, []);
+  useEffect(() => {
+    if (timelinePlaying) previewRef.current?.pause();
+  }, [timelinePlaying]);
+
+  const partButtonClass = "px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/15 text-white/80 disabled:opacity-40 disabled:hover:bg-white/5";
+
   return createPortal(
     <div
       ref={popoverRef}
@@ -77,12 +135,94 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
       className={dockHost ? `${DOCKED_PANEL_CLASS} p-3 gap-2.5` : "w-64 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-2.5"}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium truncate" title={fileName}>
+        <button
+          type="button"
+          onClick={togglePreview}
+          title={previewing ? "Pause the song" : "Play this part of the song on its own"}
+          className="shrink-0 h-6 w-6 flex items-center justify-center rounded-full bg-teal-500 hover:bg-teal-400 text-white"
+        >
+          {previewing ? <IoPause size={12} /> : <IoPlay size={12} className="ml-px" />}
+        </button>
+        <span className="flex-1 min-w-0 text-xs font-medium truncate" title={fileName}>
           {fileName}
         </span>
+        <span className="shrink-0 text-[10px] tabular-nums text-white/45" title="Preview position in this part">
+          {formatSec(Math.max(0, Math.min(previewAt, partTo) - partFrom))}
+        </span>
+        <audio
+          ref={previewRef}
+          src={convertFileSrc(overlay.src)}
+          preload="metadata"
+          onPlay={() => setPreviewing(true)}
+          onPause={() => setPreviewing(false)}
+          onTimeUpdate={(e) => {
+            const audio = e.currentTarget;
+            setPreviewAt(audio.currentTime);
+            if (audio.currentTime >= partTo) {
+              audio.pause();
+              audio.currentTime = partFrom;
+            }
+          }}
+        />
         <button type="button" title="Close" onClick={onClose} className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white">
           <IoClose size={14} />
         </button>
+      </div>
+
+      <div className="flex flex-col gap-1.5 pb-1 border-b border-white/10">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] uppercase tracking-wide text-white/40">Part of the song</span>
+          <span className="text-[10px] tabular-nums text-white/45" title="Length used / whole file">
+            {formatSec(partTo - partFrom)} / {formatSec(overlay.sourceDuration)}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 text-[11px]">
+          <span className="w-12 shrink-0 text-white/60">From</span>
+          <input
+            type="number"
+            min={0}
+            max={overlay.sourceDuration}
+            step={0.1}
+            value={Number(partFrom.toFixed(1))}
+            onChange={(e) => setPart(Number(e.target.value) || 0, partTo)}
+            title="Where in the song this starts (seconds)"
+            className="w-16 px-1.5 py-0.5 rounded bg-white/10 text-white text-right outline-none focus:ring-1 focus:ring-teal-400"
+          />
+          <span className="text-white/60">to</span>
+          <input
+            type="number"
+            min={0}
+            max={overlay.sourceDuration}
+            step={0.1}
+            value={Number(partTo.toFixed(1))}
+            onChange={(e) => setPart(partFrom, Number(e.target.value) || 0)}
+            title="Where in the song this stops (seconds)"
+            className="w-16 px-1.5 py-0.5 rounded bg-white/10 text-white text-right outline-none focus:ring-1 focus:ring-teal-400"
+          />
+        </div>
+        {pastVideoEnd > 0.05 && (
+          <p className="text-[10px] leading-snug text-amber-300/90">{formatSec(pastVideoEnd)} runs past the end of the video and won't be exported.</p>
+        )}
+        <div className="flex flex-wrap items-center gap-1 text-[11px]">
+          <button type="button" onClick={() => fitToVideo(false)} title="End this audio exactly where the video ends" className={partButtonClass}>
+            Fit to video
+          </button>
+          <button type="button" onClick={() => fitToVideo(true)} title={`Fit to the video and fade out over its last ${FIT_FADE_OUT_SEC}s`} className={partButtonClass}>
+            Fit & fade out
+          </button>
+          <button type="button" onClick={() => setPart(partFrom, overlay.sourceDuration)} title="Play on to the end of the song" className={partButtonClass}>
+            Full song
+          </button>
+          <button
+            type="button"
+            disabled={!onSplitAtPlayhead}
+            onClick={() => onSplitAtPlayhead?.()}
+            title={onSplitAtPlayhead ? "Cut in two at the playhead - then delete the piece you don't want" : "Move the playhead inside this audio to cut it there"}
+            className={partButtonClass}
+          >
+            Cut at playhead
+          </button>
+        </div>
       </div>
 
       <label className="flex items-center gap-2 text-[11px]">

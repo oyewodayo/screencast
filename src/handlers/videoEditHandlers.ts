@@ -4,7 +4,7 @@
 // everything they need explicitly. useVideoEditStore is the only caller.
 
 import { clipSpeedSteps, subSpan } from "../utils/clipTiming";
-import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, PipOverlay, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, PipOverlay, TextOverlay, VideoEditCommand, isImageClipPath } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
 const MIN_OVERLAY_DURATION = 0.1;
@@ -239,6 +239,51 @@ export function applyAutoZoomAtClicks(clips: Clip[], clipId: string, clicks: Aut
 export function deleteClipAt(clips: Clip[], index: number): Clip[] {
   if (index < 0 || index >= clips.length) return clips;
   return clips.filter((_, i) => i !== index);
+}
+
+// Multi-selection versions of delete/duplicate (Ctrl/Shift-click on the timeline). Same array in,
+// same array out when none of `ids` is present, so callers can skip the undo step.
+export function deleteClips(clips: Clip[], ids: string[]): Clip[] {
+  const remove = new Set(ids);
+  const next = clips.filter((c) => !remove.has(c.id));
+  return next.length === clips.length ? clips : next;
+}
+
+// Every image clip shown for `seconds` (of output time - speed is respected) in one go: the quick way
+// to a fast photo montage where each picture flashes by. Video clips are left alone.
+export function setImageClipLengths(clips: Clip[], seconds: number): Clip[] {
+  return clips.map((c) => (isImageClipPath(c.sourcePath) ? { ...c, end: c.start + Math.max(MIN_CLIP_LENGTH, seconds * (c.speed ?? 1)) } : c));
+}
+
+// Merge (multi-selection, clip menu): when the selected clips are back-to-back pieces of the same
+// recording - what Split leaves behind - with nothing between them in the source and the same
+// settings, they're simply one longer clip again: no render, everything stays editable. Returns
+// null when that isn't the case (then the caller renders them into a single new file instead).
+const MERGE_GAP_EPSILON_SEC = 0.001;
+const sameSettings = (a: Clip, b: Clip): boolean =>
+  JSON.stringify([a.speed ?? 1, a.colorFilter, a.grade, a.crop, !!a.flipHorizontal, a.kenBurns, a.stabilize, a.noiseReduction, a.audioCleanup]) ===
+  JSON.stringify([b.speed ?? 1, b.colorFilter, b.grade, b.crop, !!b.flipHorizontal, b.kenBurns, b.stabilize, b.noiseReduction, b.audioCleanup]);
+export function mergeClipsInPlace(clips: Clip[], ids: string[]): Clip[] | null {
+  const indices = ids.map((id) => clips.findIndex((c) => c.id === id)).filter((i) => i >= 0).sort((a, b) => a - b);
+  if (indices.length < 2) return null;
+  const run = indices.map((i) => clips[i]);
+  for (let k = 1; k < run.length; k++) {
+    const prev = run[k - 1];
+    const cur = run[k];
+    if (indices[k] !== indices[k - 1] + 1) return null; // not side by side on the timeline
+    if (cur.sourcePath !== prev.sourcePath || isImageClipPath(cur.sourcePath)) return null;
+    if (Math.abs(cur.start - prev.end) > MERGE_GAP_EPSILON_SEC) return null; // something was cut out between
+    if (cur.transitionIn || cur.speedRamp || prev.speedRamp || cur.reversedFrom || prev.reversedFrom || !sameSettings(prev, cur)) return null;
+  }
+  const merged: Clip = { ...run[0], end: run[run.length - 1].end };
+  return [...clips.slice(0, indices[0]), merged, ...clips.slice(indices[indices.length - 1] + 1)];
+}
+
+// Each copy lands right after its own original - what a single Duplicate already does.
+export function duplicateClips(clips: Clip[], ids: string[], makeId: () => string): Clip[] {
+  const copy = new Set(ids);
+  if (!clips.some((c) => copy.has(c.id))) return clips;
+  return clips.flatMap((c) => (copy.has(c.id) ? [c, { ...c, id: makeId() }] : [c]));
 }
 
 // Moves the clip at `fromIndex` to sit at `toIndex` in the array - i.e. changes its playback
@@ -659,6 +704,29 @@ export function splitPipOverlayAt(overlays: PipOverlay[], id: string, outputTime
     id: crypto.randomUUID(),
     startTime: outputTime,
     trimStart: o.trimStart + (outputTime - o.startTime),
+    createdAt: now,
+    updatedAt: now,
+  };
+  return [...overlays.slice(0, index), first, second, ...overlays.slice(index + 1)];
+}
+
+// Cuts an audio overlay in two at `outputTime` (Split with an audio chip selected) - the way to
+// keep just the part of a song you want: cut, then delete the unwanted piece. Same shape as
+// splitPipOverlayAt; the fade-in stays on the first piece and the fade-out on the second, so the
+// song's own beginning and end still fade as they did.
+export function splitAudioOverlayAt(overlays: AudioOverlay[], id: string, outputTime: number): AudioOverlay[] {
+  const index = overlays.findIndex((o) => o.id === id);
+  if (index === -1) return overlays;
+  const o = overlays[index];
+  if (outputTime - o.startTime < MIN_OVERLAY_DURATION || o.endTime - outputTime < MIN_OVERLAY_DURATION) return overlays;
+  const now = Date.now();
+  const first: AudioOverlay = { ...o, endTime: outputTime, fadeOutSec: undefined, updatedAt: now };
+  const second: AudioOverlay = {
+    ...o,
+    id: crypto.randomUUID(),
+    startTime: outputTime,
+    trimStart: o.trimStart + (outputTime - o.startTime),
+    fadeInSec: undefined,
     createdAt: now,
     updatedAt: now,
   };
