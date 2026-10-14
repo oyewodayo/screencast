@@ -54,6 +54,7 @@ export type AssetKind =
   | "timer"
   // full-frame overlays
   | "viewfinder"
+  | "reveal"
   | "letterbox"
   | "vignette"
   | "bokeh"
@@ -177,6 +178,8 @@ export const ASSET_CATALOG: AssetCatalogEntry[] = [
     defaults: { color: "#ffffff", color2: "#ef4444", text: "4K · 60fps", ...fx("zoom") },
     idleKey: (_a, t) => (blinkOn(t) ? "on" : "off"),
   },
+  // Opens the picture out of a horizontal line - an intro from black (or a closing, with exit on).
+  { kind: "reveal", label: "Bar reveal", category: "Overlays", aspect: 16 / 9, motion: "static", fullFrame: true, defaults: { color: "#000000", ...fx("draw", "none", false) } },
   { kind: "letterbox", label: "Cinema bars", category: "Overlays", aspect: 16 / 9, motion: "static", fullFrame: true, defaults: { color: "#000000", ...fx("draw") } },
   { kind: "vignette", label: "Vignette", category: "Overlays", aspect: 16 / 9, motion: "static", fullFrame: true, defaults: { color: "#000000", ...fx("none") } },
   { kind: "bokeh", label: "Bokeh", category: "Overlays", aspect: 16 / 9, motion: "periodic", fullFrame: true, defaults: { color: "#fbbf24", color2: "#f472b6", ...fx("none") } },
@@ -196,7 +199,7 @@ export const assetSupportsOutline = (kind: AssetKind): boolean => POLY_SHAPES.ha
 // Elements made of a second colour (gradient end or accent) - the panel's second swatch.
 export const assetUsesColor2 = (kind: AssetKind): boolean =>
   !STROKE_SHAPES.has(kind) &&
-  !["highlight", "speech", "check", "cross", "ping", "subscribe", "pin", "cursor", "chevrons", "bell", "rec", "letterbox", "vignette", "snow"].includes(kind);
+  !["highlight", "speech", "check", "cross", "ping", "subscribe", "pin", "cursor", "chevrons", "bell", "rec", "reveal", "letterbox", "vignette", "snow"].includes(kind);
 
 export const ASSET_ENTRANCES: { value: AssetEntrance; label: string }[] = [
   { value: "none", label: "None" },
@@ -1178,6 +1181,14 @@ function drawElement(ctx: CanvasRenderingContext2D, asset: OverlayAsset, w: numb
       }
       return;
     }
+    case "reveal": {
+      // Two black curtains parting from the middle line.
+      const band = easeInOut(reveal) * (h / 2);
+      ctx.fillStyle = asset.color;
+      ctx.fillRect(-w / 2, -h / 2, w, h / 2 - band);
+      ctx.fillRect(-w / 2, band, w, h / 2 - band);
+      return;
+    }
     case "letterbox": {
       const bar = Math.max(h * 0.06, (h - w / 2.39) / 2) * easeInOut(reveal);
       ctx.fillStyle = asset.color;
@@ -1260,7 +1271,7 @@ function effectState(asset: OverlayAsset, w: number, h: number, t: number, durat
   if (asset.exit && e > 0) r = Math.min(r, clamp01((duration - t) / e));
 
   // Some elements build themselves even with no chosen entrance.
-  const selfDrawn = ["check", "cross", "lower-third", "equalizer", "pin", "chevrons", "letterbox"].includes(asset.kind) || STROKE_SHAPES.has(asset.kind);
+  const selfDrawn = ["check", "cross", "lower-third", "equalizer", "pin", "chevrons", "letterbox", "reveal"].includes(asset.kind) || STROKE_SHAPES.has(asset.kind);
 
   switch (asset.entrance) {
     case "pop":

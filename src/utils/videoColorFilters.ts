@@ -31,6 +31,10 @@ export const KEN_BURNS_PRESETS: { value: KenBurnsPreset; label: string }[] = [
 // ALLOWED_TRANSITIONS (conversion.rs) for the export-side allowlist this must stay in sync with.
 export const TRANSITION_PRESETS: { value: TransitionType; label: string }[] = [
   { value: "fade", label: "Crossfade" },
+  { value: "lightleak", label: "Light leak" },
+  { value: "fadewhite", label: "Flash" },
+  { value: "whip", label: "Whip" },
+  { value: "horzopen", label: "Bar open" },
   { value: "fadeblack", label: "Fade to black" },
   { value: "dissolve", label: "Dissolve" },
   { value: "wipeleft", label: "Wipe ←" },
@@ -246,6 +250,8 @@ export interface ActiveClipEffects {
   speedRamp?: ClipSpeedRamp;
   noiseReduction?: number;
   audioCleanup?: AudioCleanup;
+  // The clip's own sound is off (Clip.muted) - VideoPlayer silences the track while it plays.
+  muted?: boolean;
   // Which file this clip plays from - VideoPlayer decodes its noise sample from here.
   sourcePath?: string;
   // The project frame in px (the primary file's size - what export renders at). The player fits

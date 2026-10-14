@@ -12,6 +12,7 @@
 // of their own subfeatures to earn a dedicated surface instead of being one more section buried
 // inside "Clip effects".
 import React, { useEffect } from "react";
+import TransitionLookControls, { transitionHasLook } from "./TransitionLookControls";
 import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
 import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
@@ -20,7 +21,7 @@ import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition
 import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
 import ColorGradeControls from "./ColorGradeControls";
 
-export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "flipHorizontal">>;
+export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "flipHorizontal" | "muted">>;
 
 export const DEFAULT_STABILIZE_STRENGTH = 0.5;
 
@@ -87,8 +88,10 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
 
   const transitionType = clip.transitionIn?.type ?? null;
   const transitionDuration = clip.transitionIn?.duration ?? DEFAULT_TRANSITION_DURATION;
+  const transitionLook = clip.transitionIn?.look;
   const setTransitionType = (type: TransitionType | null) => {
-    onUpdate({ transitionIn: type ? { type, duration: transitionDuration } : undefined });
+    // The look carries over between transitions that understand it (a leak's colour to a flash...).
+    onUpdate({ transitionIn: type ? { type, duration: transitionDuration, ...(transitionLook ? { look: transitionLook } : {}) } : undefined });
   };
 
   return createPortal(
@@ -198,6 +201,18 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
         )}
       </div>
 
+      <div className="flex items-center justify-between gap-2 pt-1 border-t border-white/10 text-[11px]">
+        <span className="text-[10px] uppercase tracking-wide text-white/40">Clip sound</span>
+        <button
+          type="button"
+          title={clip.muted ? "This clip plays silently - click to hear it" : "Silence just this clip (e.g. under music)"}
+          onClick={() => onUpdate({ muted: clip.muted ? undefined : true })}
+          className={`px-2 h-6 rounded transition-colors ${clip.muted ? "text-red-300 bg-red-500/15" : "text-white/70 bg-white/[0.06] hover:bg-white/10"}`}
+        >
+          {clip.muted ? "Muted" : "On"}
+        </button>
+      </div>
+
       {hasPrecedingClip && (
         <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10" title="Plays over the start of this clip, from the previous clip's last frame - in the preview and the export alike">
           <span className="text-[10px] uppercase tracking-wide text-white/40">Transition (with previous clip)</span>
@@ -220,11 +235,18 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
                 max={1.5}
                 step={0.05}
                 value={transitionDuration}
-                onChange={(e) => onUpdate({ transitionIn: { type: transitionType, duration: Number(e.target.value) } })}
+                onChange={(e) => onUpdate({ transitionIn: { ...clip.transitionIn, type: transitionType, duration: Number(e.target.value) } })}
                 className="flex-1 accent-blue-400"
               />
               <span className="w-10 shrink-0 text-right tabular-nums text-white/60">{transitionDuration.toFixed(2)}s</span>
             </label>
+          )}
+          {transitionType !== null && transitionHasLook(transitionType) && (
+            <TransitionLookControls
+              type={transitionType}
+              look={transitionLook}
+              onChange={(look) => onUpdate({ transitionIn: { type: transitionType, duration: transitionDuration, look } })}
+            />
           )}
         </div>
       )}

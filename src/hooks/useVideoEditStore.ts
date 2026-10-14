@@ -5,7 +5,7 @@ import { CaptionLine, buildCaptionLines, buildCaptionsAss, defaultCaptionSetting
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS } from "../utils/videoEditTypes";
+import { AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS } from "../utils/videoEditTypes";
 import {
   applyCommand,
   addOverlay,
@@ -53,6 +53,21 @@ import { gradeCubeForClip } from "../utils/gradeLuts";
 import { clipOutputDuration } from "../utils/clipTiming";
 import type { OverlayKeyframe } from "../utils/keyframes";
 import type { OverlayAsset } from "../utils/videoAssets";
+
+// One cell of a split screen (addSplitScreen) - where it sits and which source it plays from where.
+export interface SplitScreenCell {
+  sourcePath: string;
+  sourceDuration: number;
+  // Seconds into the source the cell starts playing from.
+  trimStart: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  // Fraction of the cell's own height; 0 = square corners.
+  cornerRadius: number;
+  muted: boolean;
+}
 import { renderAssetFrames } from "../utils/videoAssets";
 
 interface ExportKeyframe {
@@ -64,7 +79,8 @@ interface ExportKeyframe {
   easing: string;
 }
 import { beatOutputTimes, fitImageClipsToBeats } from "../utils/beatSync";
-import { blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderTextOverlayToPng } from "../utils/videoOverlayRender";
+import { blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
+import { isTextReveal } from "../utils/textReveal";
 const appWindow = getCurrentWebviewWindow()
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
@@ -130,19 +146,21 @@ export interface ExportOptions {
 function exportOverlayAnimation(animation: OverlayAnimation | undefined): string {
   if (!animation || animation === "none") return "none";
   if (animation === "pop") return "fade";
+  // Title reveals are drawn into their own frames; an image never uses them.
+  if (isTextReveal(animation)) return "none";
   return animation;
 }
 
 type TextOverlayContentPatch = Partial<
-  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes">
+  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal">
 >;
 type ImageOverlayContentPatch = Partial<
-  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset">
+  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset" | "reveal">
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src" | "bpm" | "beats">>;
 type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -225,6 +243,14 @@ export interface UseVideoEditStoreResult {
   // doc comment (videoEditTypes.ts) for why this can't reuse ImageOverlay's PNG-based rendering.
   pipOverlays: PipOverlay[];
   addPipOverlay: (sourcePath: string, sourceDuration: number, x: number, y: number, width: number, height: number, startTime: number, endTime: number) => string;
+  // A whole split screen in one undo step: one PiP per cell, plus an optional full-frame colour
+  // backdrop behind them (so the gaps between cells show a colour, not the main video).
+  addSplitScreen: (cells: SplitScreenCell[], startTime: number, endTime: number, backdropColor: string | null) => string[];
+  // Puts a highlight intro (highlightIntro.ts) in front of the timeline as one undo step: every
+  // overlay moves along by the intro's length so it stays on the same shot - except music when
+  // `keepMusicInPlace` (a beat-synced intro was cut to the music where it already is) - and the
+  // first real shot gets `into` as its transition.
+  insertHighlightIntro: (introClips: Clip[], into: ClipTransitionIn | null, keepMusicInPlace: boolean) => void;
   updatePipOverlayContent: (id: string, patch: PipOverlayContentPatch) => void;
   resizePipOverlayTime: (id: string, edge: "start" | "end", time: number) => void;
   movePipOverlayTime: (id: string, newStartTime: number) => void;
@@ -1123,6 +1149,63 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const addSplitScreen = useCallback(
+    (cells: SplitScreenCell[], startTime: number, endTime: number, backdropColor: string | null): string[] => {
+      const current = stateRef.current;
+      if (!current || cells.length === 0) return [];
+      const pips = cells.map((c) => ({
+        ...makePipOverlay(c.sourcePath, c.sourceDuration, c.x, c.y, c.width, c.height, startTime, endTime),
+        shape: (c.cornerRadius > 0 ? "rounded" : "rectangle") as PipOverlay["shape"],
+        ...(c.cornerRadius > 0 ? { cornerRadius: c.cornerRadius } : {}),
+        // Never past the end of its own source.
+        trimStart: Math.max(0, Math.min(c.trimStart, c.sourceDuration - (endTime - startTime))),
+        muted: c.muted,
+      }));
+      const backdrop = backdropColor
+        ? [
+            makeImageOverlay("", 0, 0, 1, 1, startTime, endTime, {
+              kind: "rectangle",
+              color: backdropColor,
+              entrance: "none",
+              exit: false,
+              loop: "none",
+            }),
+          ]
+        : [];
+      pushCommand(
+        snapshot(current, {}),
+        snapshot(current, { pipOverlays: [...current.pipOverlays, ...pips], imageOverlays: [...current.imageOverlays, ...backdrop] }),
+        "add-pip"
+      );
+      return pips.map((p) => p.id);
+    },
+    [pushCommand]
+  );
+
+  const insertHighlightIntro = useCallback(
+    (introClips: Clip[], into: ClipTransitionIn | null, keepMusicInPlace: boolean) => {
+      const current = stateRef.current;
+      if (!current || introClips.length === 0) return;
+      const shift = introClips.reduce((sum, c) => sum + clipOutputDuration(c), 0);
+      const later = <T extends { startTime: number; endTime: number }>(o: T): T => ({ ...o, startTime: o.startTime + shift, endTime: o.endTime + shift });
+      const [first, ...rest] = current.clips;
+      const firstShot = first ? (into ? { ...first, transitionIn: into } : first) : undefined;
+      pushCommand(
+        snapshot(current, {}),
+        snapshot(current, {
+          clips: [...introClips, ...(firstShot ? [firstShot] : []), ...rest],
+          textOverlays: current.textOverlays.map(later),
+          imageOverlays: current.imageOverlays.map(later),
+          blurOverlays: current.blurOverlays.map(later),
+          pipOverlays: current.pipOverlays.map(later),
+          audioOverlays: keepMusicInPlace ? current.audioOverlays : current.audioOverlays.map(later),
+        }),
+        "insert"
+      );
+    },
+    [pushCommand]
+  );
+
   const updatePipOverlayContent = useCallback(
     (id: string, patch: PipOverlayContentPatch) => {
       const current = stateRef.current;
@@ -1432,6 +1515,23 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 }))
               : undefined;
           for (const o of current.textOverlays) {
+            if (isTextReveal(o.animation)) {
+              // Letter-by-letter titles burn in as a frame sequence (textReveal.ts).
+              // eslint-disable-next-line no-await-in-loop
+              const seq = await renderTextRevealFrames(o, pxW, pxH);
+              if (seq)
+                overlays.push({
+                  dataBase64: "",
+                  x: seq.xPx,
+                  y: seq.yPx,
+                  startTime: o.startTime,
+                  endTime: o.endTime,
+                  animation: "none",
+                  keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
+                  frames: { unique: seq.unique, sequence: seq.sequence },
+                });
+              continue;
+            }
             const rendered = renderTextOverlayToPng(o, pxW, pxH);
             if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx) });
           }
@@ -1441,6 +1541,23 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
               // drawn by the same function as the preview (videoAssets.ts).
               // eslint-disable-next-line no-await-in-loop
               const seq = await renderAssetFrames(o, pxW, pxH);
+              if (seq)
+                overlays.push({
+                  dataBase64: "",
+                  x: seq.xPx,
+                  y: seq.yPx,
+                  startTime: o.startTime,
+                  endTime: o.endTime,
+                  animation: exportOverlayAnimation(o.animation),
+                  keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
+                  frames: { unique: seq.unique, sequence: seq.sequence },
+                });
+              continue;
+            }
+            if (o.reveal) {
+              // A revealing picture burns in as a frame sequence of its reveal (imageReveal.ts).
+              // eslint-disable-next-line no-await-in-loop
+              const seq = await renderImageRevealFrames(o, pxW, pxH);
               if (seq)
                 overlays.push({
                   dataBase64: "",
@@ -1719,6 +1836,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     deleteAudioOverlay,
     duplicateAudioOverlay,
     addPipOverlay,
+    addSplitScreen,
+    insertHighlightIntro,
     updatePipOverlayContent,
     resizePipOverlayTime: resizePipOverlayTimeCb,
     movePipOverlayTime,

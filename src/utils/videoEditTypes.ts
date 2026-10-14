@@ -13,6 +13,8 @@ import { TextAlign, TextColorRun, TextRange } from "./pdfAnnotationTypes";
 import type { ClipSpeedRamp } from "./clipTiming";
 import type { OverlayKeyframe } from "./keyframes";
 import type { OverlayAsset } from "./videoAssets";
+import type { TextRevealSettings } from "./textReveal";
+import type { ImageRevealSettings } from "./imageReveal";
 
 // A per-clip color grade, applied to that clip's own trimmed segment (both live preview -
 // VideoPlayer's CSS `filter`, see cssFilterForColorPreset in videoColorFilters.ts - and export
@@ -104,9 +106,30 @@ export type TransitionType =
   | "zoomin"
   | "pixelize"
   | "radial"
-  | "dissolve";
+  | "dissolve"
+  | "fadewhite"
+  | "horzopen"
+  // Not ffmpeg names: a crossfade / horizontal blur plus a glow pass (transition_fold_step).
+  | "lightleak"
+  | "whip";
+// Where a light leak's hot spot travels.
+export type LeakDirection = "right" | "left" | "down" | "up" | "diagonal" | "center";
+// The look of transitions that have one (TransitionLookControls). All optional - undefined is the
+// default look. Export: transition_glow_filter (conversion.rs); preview: TransitionPreviewLayer.
+export interface TransitionLook {
+  // Light leak / flash colour, "#rrggbb".
+  color?: string;
+  // Glow strength, 0.1..1.5 (1 = default).
+  intensity?: number;
+  direction?: LeakDirection;
+  // Light leak hot-spot size, 0.3..2.5 (1 = default).
+  size?: number;
+  // Bar open: out of a horizontal line (default) or a vertical one.
+  orientation?: "horizontal" | "vertical";
+}
 export interface ClipTransitionIn {
   type: TransitionType;
+  look?: TransitionLook;
   duration: number; // seconds, e.g. 0.5 - clamped against both flanking clips' own durations
                      // server-side (see export_trimmed_video) so a too-long transition can't
                      // produce an invalid ffmpeg offset.
@@ -159,6 +182,9 @@ export interface Clip {
   // How noiseReduction is applied plus the extra cleanup stages around it - see AudioCleanup.
   // Undefined keeps the original behaviour (spectral "reduce" mode, no extra stages).
   audioCleanup?: AudioCleanup;
+  // The clip's own sound is silenced, in the preview and the export - e.g. the quick cuts of a
+  // highlight intro (highlightIntro.ts), which play over music.
+  muted?: boolean;
 }
 
 // Optional audio-cleanup stages for one clip, applied in this order in both the live preview
@@ -202,7 +228,9 @@ export type TextOverlayCornerStyle = "square" | "rounded" | "pill";
 // "pop" is preview-only, same as every "slide-*" variant already was before this comment existed
 // - see exportEdited's own comment (useVideoEditStore.ts) for why burning a scale-varying overlay
 // into the export is deferred rather than attempted here.
-export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down" | "pop";
+// "typewriter"/"words"/"rise" are text-only title reveals, letter by letter or word by word -
+// see textReveal.ts; they export exactly (as a frame sequence), unlike "pop".
+export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down" | "pop" | "typewriter" | "words" | "rise";
 
 // A caption/title composited over the video preview (v1 is preview-only - not yet burned into
 // exported files, see export_trimmed_video). Core text/formatting mirrors TextObject
@@ -236,6 +264,9 @@ export interface TextOverlay {
   strokeWidth?: number;
   cornerStyle?: TextOverlayCornerStyle; // undefined means "square", the pre-existing look
   animation?: OverlayAnimation; // undefined means "none", the pre-existing look
+  // Controls for a letter-by-letter title reveal (animation "typewriter"/"words"/"rise") - pace,
+  // delay, caret, exit, accent underline. See textReveal.ts.
+  reveal?: TextRevealSettings;
   // Breathing room around the text inside its box, most visible with backgroundColor/stroke set -
   // fraction of frameRect.height (same basis as fontSize, not width - padding is a vertical-scale
   // concept here). Undefined means the pre-existing fixed 2px look, both in the live preview
@@ -277,6 +308,8 @@ export interface ImageOverlay {
   // Everything else (box, rotation, opacity, flip, shadow, animation, keyframes, timing) applies
   // the same; corners, border and crop are picture-only.
   asset?: OverlayAsset;
+  // How the picture inside the box reveals itself - wipe, glare streak, focus pull (imageReveal.ts).
+  reveal?: ImageRevealSettings;
   x: number;
   y: number;
   width: number;
@@ -486,6 +519,7 @@ export interface KeepSegment {
   // A speed ramp's constant-speed steps (clipSpeedSteps); export renders them as one continuous
   // time map (speed_steps, conversion.rs). When set, `speed` is ignored.
   speedSteps?: { sourceStart: number; sourceEnd: number; speed: number }[];
+  muted?: boolean;
 }
 
 export interface VideoEditState {

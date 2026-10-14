@@ -29,6 +29,8 @@ import NumberStepper from "../docker/NumberStepper";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 import { BlurShape, OverlayAnimation, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { TextAlign } from "../../utils/pdfAnnotationTypes";
+import { ImageRevealDirection, ImageRevealSettings, ImageRevealStyle } from "../../utils/imageReveal";
+import { TEXT_REVEAL_SPEED_MAX, TEXT_REVEAL_SPEED_MIN, TextReveal, TextRevealSettings, isTextReveal, textRevealSeconds } from "../../utils/textReveal";
 import { ASSET_ENTRANCES, ASSET_LOOPS, AssetEntrance, AssetLoop, OverlayAsset, assetEntry, assetSupportsOutline, assetUsesColor2, countdownPlan } from "../../utils/videoAssets";
 
 const keepFocus = (e: React.MouseEvent) => e.preventDefault();
@@ -156,10 +158,17 @@ const ANIMATIONS: { value: OverlayAnimation; label: string; title: string }[] = 
   { value: "slide-down", label: "↓ Slide", title: "Slide down" },
 ];
 
-const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange: (next: OverlayAnimation) => void }> = ({ value, onChange }) => (
+// Letter-by-letter title reveals - text only (textReveal.ts).
+const TEXT_REVEALS: { value: OverlayAnimation; label: string; title: string }[] = [
+  { value: "typewriter", label: "Type", title: "Typewriter - letters type on with a caret" },
+  { value: "words", label: "Words", title: "Word by word - each word rises into place" },
+  { value: "rise", label: "Rise", title: "Letters bounce up one after another" },
+];
+
+const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange: (next: OverlayAnimation) => void; text?: boolean }> = ({ value, onChange, text }) => (
   <Section title="Animation">
     <div className="grid grid-cols-4 gap-1">
-      {ANIMATIONS.map((a) => (
+      {(text ? [...ANIMATIONS, ...TEXT_REVEALS] : ANIMATIONS).map((a) => (
         <button
           key={a.value}
           type="button"
@@ -436,6 +445,10 @@ export interface TextDockedPanelProps extends CommonProps {
   onCornerStyle: (corner: TextOverlayCornerStyle) => void;
   onStroke: (patch: { strokeColor?: string; strokeWidth?: number }) => void;
   onAnimation: (next: OverlayAnimation) => void;
+  // A title reveal's controls (textReveal.ts) - shown while the animation is one.
+  text?: string;
+  reveal?: TextRevealSettings;
+  onReveal?: (patch: Partial<TextRevealSettings>) => void;
   onFront: () => void;
   onBack: () => void;
   // Character formatting - applied by the in-place editor (VideoTextEditor) to the selected text,
@@ -459,6 +472,119 @@ const HIGHLIGHTS: { value: string | undefined; title: string }[] = [
   { value: "rgba(239,68,68,0.85)", title: "Red" },
 ];
 const OUTLINE_COLORS = ["#000000", "#ffffff", "#ef4444", "#facc15", "#3b82f6", "#a855f7"];
+const UNDERLINE_COLORS = ["#facc15", "#f97316", "#ef4444", "#ffffff", "#22d3ee", "#a855f7"];
+
+// Pace, timing, caret and exit for a typewriter / word-by-word / rise title.
+const RevealSection: React.FC<{
+  kind: TextReveal;
+  text: string;
+  duration: number;
+  settings: TextRevealSettings;
+  onChange: (patch: Partial<TextRevealSettings>) => void;
+}> = ({ kind, text, duration, settings, onChange }) => {
+  const typewriter = kind === "typewriter";
+  const caretOn = settings.caret !== false;
+  const revealSec = textRevealSeconds(text, kind, duration, settings);
+  return (
+    <Section title={typewriter ? "Typing" : "Reveal"}>
+      {typewriter && (
+        <LabeledRow label="Type by">
+          <div className="flex-1">
+            <Segmented
+              value={settings.unit ?? "letter"}
+              onChange={(unit) => onChange({ unit })}
+              options={[
+                { value: "letter", title: "One letter at a time", label: "Letter" },
+                { value: "word", title: "A whole word at a time", label: "Word" },
+              ]}
+            />
+          </div>
+        </LabeledRow>
+      )}
+      {!typewriter && (
+        <LabeledRow label="From">
+          <div className="flex-1">
+            <Segmented
+              value={settings.from ?? "below"}
+              onChange={(from) => onChange({ from })}
+              options={[
+                { value: "below", title: "Letters come up from below", label: "Below" },
+                { value: "above", title: "Letters drop in from above", label: "Above" },
+              ]}
+            />
+          </div>
+        </LabeledRow>
+      )}
+      <SliderRow
+        label="Speed"
+        value={settings.speed ?? 1}
+        min={TEXT_REVEAL_SPEED_MIN}
+        max={TEXT_REVEAL_SPEED_MAX}
+        step={0.05}
+        marks={[1]}
+        format={(v) => `${v.toFixed(v < 1 ? 2 : 1)}×`}
+        onChange={(speed) => onChange({ speed })}
+      />
+      <SliderRow
+        label="Delay"
+        value={settings.delay ?? 0}
+        min={0}
+        max={Math.max(0.5, Math.min(10, duration * 0.8))}
+        step={0.05}
+        format={(v) => `${v.toFixed(1)}s`}
+        onChange={(delay) => onChange({ delay })}
+      />
+      {typewriter && (
+        <>
+          <LabeledRow label="Caret">
+            <Switch on={caretOn} label="Typing caret" onChange={(caret) => onChange({ caret })} />
+            {caretOn && (
+              <div className="flex-1">
+                <Segmented
+                  value={settings.caretStyle ?? "bar"}
+                  onChange={(caretStyle) => onChange({ caretStyle })}
+                  options={[
+                    { value: "bar", title: "Thin bar", label: <span className="w-[2px] h-3 bg-current" /> },
+                    { value: "block", title: "Block", label: <span className="w-2 h-3 bg-current opacity-80" /> },
+                    { value: "underscore", title: "Underscore", label: <span className="w-2.5 h-[2px] mt-2.5 bg-current" /> },
+                  ]}
+                />
+              </div>
+            )}
+          </LabeledRow>
+          {caretOn && (
+            <LabeledRow label="Blink">
+              <Switch on={!!settings.caretHold} label="Keep the caret blinking after typing" onChange={(caretHold) => onChange({ caretHold })} />
+              <span className="text-white/40">after typing</span>
+            </LabeledRow>
+          )}
+          <LabeledRow label="Rhythm">
+            <Switch on={!!settings.humanize} label="Uneven, human typing rhythm" onChange={(humanize) => onChange({ humanize })} />
+            <span className="text-white/40">human</span>
+          </LabeledRow>
+        </>
+      )}
+      <LabeledRow label="Underline">
+        <Switch on={!!settings.underline} label="Accent line that draws in under the title" onChange={(on) => onChange({ underline: on ? UNDERLINE_COLORS[0] : undefined })} />
+        {settings.underline && <Swatches colors={UNDERLINE_COLORS} value={settings.underline} onPick={(c) => c && onChange({ underline: c })} />}
+      </LabeledRow>
+      <LabeledRow label="Exit">
+        <div className="flex-1">
+          <Segmented
+            value={settings.exit ?? "fade"}
+            onChange={(exit) => onChange({ exit })}
+            options={[
+              { value: "fade", title: "Fade out at the end", label: "Fade" },
+              { value: "reverse", title: typewriter ? "Delete the text, letter by letter" : "Play the reveal backwards", label: typewriter ? "Untype" : "Reverse" },
+              { value: "none", title: "Stay until the end, then cut", label: "None" },
+            ]}
+          />
+        </div>
+      </LabeledRow>
+      <span className="text-[10px] text-white/40 tabular-nums">Fully revealed after {(revealSec + Math.min(settings.delay ?? 0, duration * 0.9)).toFixed(1)}s</span>
+    </Section>
+  );
+};
 
 // A row of colour dots - inline (no popup), so it never opens off-screen or steals focus.
 const Swatches: React.FC<{ colors: (string | undefined)[]; value: string | undefined; onPick: (c: string | undefined) => void; titles?: string[] }> = ({
@@ -610,7 +736,16 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
         </LabeledRow>
       </Section>
 
-      <AnimationSection value={props.animation} onChange={props.onAnimation} />
+      <AnimationSection text value={props.animation} onChange={props.onAnimation} />
+      {isTextReveal(props.animation) && props.onReveal && (
+        <RevealSection
+          kind={props.animation}
+          text={props.text ?? ""}
+          duration={props.endTime - props.startTime}
+          settings={props.reveal ?? {}}
+          onChange={props.onReveal}
+        />
+      )}
       <MotionSection {...props} />
       <KeyframeAwarePosition {...props} />
       <TimingSection start={props.startTime} end={props.endTime} playhead={props.playhead} onSet={props.onSetTime} />
@@ -823,7 +958,77 @@ export interface ImageDockedPanelProps extends CommonProps {
   // Set for a shape/animated element instead of a picture.
   asset?: OverlayAsset;
   onAsset?: (patch: Partial<OverlayAsset>) => void;
+  // The picture's own reveal (imageReveal.ts); undefined = none.
+  reveal?: ImageRevealSettings;
+  onReveal?: (reveal: ImageRevealSettings | undefined) => void;
 }
+
+const SHINE_COLORS = ["#ffffff", "#fde68a", "#fbbf24", "#93c5fd", "#f9a8d4"];
+const WIPE_DIRECTIONS: { value: ImageRevealDirection; label: string; title: string }[] = [
+  { value: "right", label: "→", title: "Left to right" },
+  { value: "left", label: "←", title: "Right to left" },
+  { value: "down", label: "↓", title: "Top to bottom" },
+  { value: "up", label: "↑", title: "Bottom to top" },
+  { value: "diagonal", label: "↘", title: "Corner to corner" },
+];
+
+// Wipe / glare / focus / fade-in of the picture inside its box, with its direction, length,
+// repeating shine and exit.
+const ImageRevealSection: React.FC<{ reveal?: ImageRevealSettings; onChange: (reveal: ImageRevealSettings | undefined) => void }> = ({ reveal, onChange }) => {
+  const set = (patch: Partial<ImageRevealSettings>) => reveal && onChange({ ...reveal, ...patch });
+  const style = reveal?.style ?? "none";
+  const wipes = style === "wipe" || style === "glare";
+  return (
+    <Section title="Reveal">
+      <ChipGrid<ImageRevealStyle | "none">
+        options={[
+          { value: "none", label: "None" },
+          { value: "wipe", label: "Wipe" },
+          { value: "glare", label: "Glare" },
+          { value: "focus", label: "Focus" },
+          { value: "fade", label: "Fade" },
+        ]}
+        value={style}
+        onChange={(next) => onChange(next === "none" ? undefined : { ...(reveal ?? {}), style: next })}
+      />
+      {reveal && (
+        <>
+          {wipes && (
+            <LabeledRow label="Direction">
+              <div className="flex-1">
+                <Segmented value={reveal.direction ?? "right"} onChange={(direction) => set({ direction })} options={WIPE_DIRECTIONS} />
+              </div>
+            </LabeledRow>
+          )}
+          <SliderRow label="Length" value={reveal.seconds ?? 1.2} min={0.3} max={4} step={0.05} format={(v) => `${v.toFixed(1)}s`} onChange={(seconds) => set({ seconds })} />
+          <LabeledRow label="Shine">
+            <div className="flex-1">
+              <Segmented
+                value={String(reveal.shineEvery ?? 0)}
+                onChange={(v) => set({ shineEvery: Number(v) || undefined })}
+                options={[
+                  { value: "0", title: style === "glare" ? "Only the streak in the reveal" : "No shine", label: style === "glare" ? "Once" : "Off" },
+                  { value: "2", title: "A light streak every 2 seconds", label: "2s" },
+                  { value: "3", title: "A light streak every 3 seconds", label: "3s" },
+                  { value: "5", title: "A light streak every 5 seconds", label: "5s" },
+                ]}
+              />
+            </div>
+          </LabeledRow>
+          {(style === "glare" || (reveal.shineEvery ?? 0) > 0) && (
+            <LabeledRow label="Shine colour">
+              <Swatches colors={SHINE_COLORS} value={reveal.shineColor ?? "#ffffff"} onPick={(c) => c && set({ shineColor: c })} />
+            </LabeledRow>
+          )}
+          <LabeledRow label="Exit">
+            <Switch on={!!reveal.exit} label="Play the reveal backwards at the end" onChange={(exit) => set({ exit })} />
+            <span className="text-white/40">reverse at the end</span>
+          </LabeledRow>
+        </>
+      )}
+    </Section>
+  );
+};
 
 export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
   <>
@@ -885,6 +1090,7 @@ export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
       </div>
     </Section>
 
+    {!props.asset && props.onReveal && <ImageRevealSection reveal={props.reveal} onChange={props.onReveal} />}
     <AnimationSection value={props.animation} onChange={props.onAnimation} />
     <MotionSection {...props} />
     <KeyframeAwarePosition {...props} />

@@ -114,6 +114,17 @@ impl InputSpec {
             pre_args: Vec::new(),
         }
     }
+
+    // The file that has to be on disk for this input to open. An image-sequence input (an
+    // animated overlay's frames - write_temp_overlay_sequence) is a printf pattern, not a file:
+    // it's there when its first frame is.
+    fn existing_path(&self) -> PathBuf {
+        if self.pre_args.iter().any(|a| a == "-start_number") {
+            PathBuf::from(self.path.replace("%06d", "000000"))
+        } else {
+            PathBuf::from(&self.path)
+        }
+    }
 }
 
 // Shared conversion runner used by every command in this file, so every target format gets the
@@ -137,7 +148,7 @@ async fn run_conversion(
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
     for input in inputs {
-        if !PathBuf::from(&input.path).exists() {
+        if !input.existing_path().exists() {
             return Err(format!("Input file does not exist: {}", input.path));
         }
     }
@@ -2616,6 +2627,30 @@ pub struct ClipTransitionIn {
     #[serde(rename = "type")]
     pub transition_type: String, // "crossfade" - only variant in v1
     pub duration: f64, // seconds
+    // How a light leak / flash / bar open looks (TransitionLook, videoEditTypes.ts). Every field
+    // is sanitized before reaching the filter graph (transition_glow_filter).
+    #[serde(default)]
+    pub look: Option<TransitionLook>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionLook {
+    pub color: Option<String>,
+    pub intensity: Option<f64>,
+    pub direction: Option<String>,
+    pub size: Option<f64>,
+    pub orientation: Option<String>,
+}
+
+// "#rrggbb" -> (r, g, b); anything else -> None.
+fn parse_hex_color(color: &str) -> Option<(f64, f64, f64)> {
+    let hex = color.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let ch = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok().map(f64::from);
+    Some((ch(0)?, ch(2)?, ch(4)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2654,6 +2689,10 @@ pub struct KeepSegment {
     // separate segments rounded every join to a whole frame: 0.17s drift over 16 steps). When set,
     // `speed` is ignored.
     pub speed_steps: Option<Vec<SpeedStep>>,
+    // The clip's own sound is silenced (Clip.muted) - e.g. the quick cuts of a highlight intro,
+    // which play over music. Rendered as silence of the segment's exact length.
+    #[serde(default)]
+    pub muted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2735,6 +2774,7 @@ fn segment_audio_chain(
     out_label: &str,
 ) -> String {
     let steps = segment_steps(seg);
+    let has_audio = has_audio && !seg.muted.unwrap_or(false);
     if steps.len() <= 1 || !has_audio {
         if !has_audio {
             return format!(
@@ -3844,6 +3884,7 @@ fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
         || seg.speed_steps.as_ref().map_or(false, |s| !s.is_empty())
         || segment_noise_reduction_db(seg).is_some()
         || !segment_audio_cleanup_filters(seg, None).is_empty()
+        || seg.muted.unwrap_or(false)
 }
 
 // Decomposes an arbitrary speed factor into a chain of ffmpeg `atempo` filters, each within the
@@ -3926,6 +3967,7 @@ fn transition_fold_step(
     accumulated: f64,
     seg_dur: f64,
     transition: Option<(&str, f64)>,
+    look: Option<&TransitionLook>,
 ) -> (String, String, String) {
     let next_v = format!("fold{}v", i);
     let next_a = format!("fold{}a", i);
@@ -3933,14 +3975,88 @@ fn transition_fold_step(
         Some((name, duration)) => {
             // At most 90% of the incoming clip - it plays entirely over that clip's own start.
             let d = duration.min(seg_dur * 0.9).max(0.05);
-            format!(
-                "[{cur_v}]tpad=stop_mode=clone:stop_duration={d:.3}[hold{i}];[hold{i}][v{i}]xfade=transition={name}:duration={d:.3}:offset={offset:.3}[{next_v}];[{cur_a}][a{i}]concat=n=2:v=0:a=1[{next_a}];",
-                offset = accumulated.max(0.0)
-            )
+            let offset = accumulated.max(0.0);
+            // The app's own transitions are an ffmpeg xfade plus, for some, a glow pass over the
+            // transition window (transition_glow_filter).
+            let default_look = TransitionLook::default();
+            let look = look.unwrap_or(&default_look);
+            let (xfade_name, glow) = match name {
+                "lightleak" => ("fade", Some(transition_glow_filter(TransitionGlow::LightLeak, offset, d, look))),
+                "whip" => ("hblur", Some(transition_glow_filter(TransitionGlow::Flash, offset, d, look))),
+                // A white flash is ffmpeg's own; any other colour goes through the glow pass.
+                "fadewhite" if look.color.as_deref().and_then(parse_hex_color).is_some_and(|c| c != (255.0, 255.0, 255.0)) || look.intensity.is_some() => {
+                    ("fade", Some(transition_glow_filter(TransitionGlow::Flash, offset, d, look)))
+                }
+                "horzopen" if look.orientation.as_deref() == Some("vertical") => ("vertopen", None),
+                other => (other, None),
+            };
+            let xfade_out = if glow.is_some() { format!("xf{i}") } else { next_v.clone() };
+            let mut step = format!(
+                "[{cur_v}]tpad=stop_mode=clone:stop_duration={d:.3}[hold{i}];[hold{i}][v{i}]xfade=transition={xfade_name}:duration={d:.3}:offset={offset:.3}[{xfade_out}];"
+            );
+            if let Some(glow) = glow {
+                step.push_str(&format!("[{xfade_out}]{glow}[{next_v}];"));
+            }
+            step.push_str(&format!("[{cur_a}][a{i}]concat=n=2:v=0:a=1[{next_a}];"));
+            step
         }
         None => format!("[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"),
     };
     (step, next_v, next_a)
+}
+
+#[derive(Clone, Copy)]
+enum TransitionGlow {
+    // A warm orange burn sweeping across the frame, blowing out to near-white at its peak.
+    LightLeak,
+    // An even white flash at the midpoint.
+    Flash,
+}
+
+// The light-leak / flash pass laid over a transition's [offset, offset+d) window: pulls luma up
+// toward white (screen-like) and tints chroma, strongest at the transition's midpoint. The live
+// preview's TransitionPreviewLayer draws the same envelope with CSS gradients.
+//
+// `look` steers it: colour (the tint chroma heads toward), intensity (0.1..1.5 times the glow),
+// and for a light leak the direction its hot spot travels and the spot's size.
+fn transition_glow_filter(kind: TransitionGlow, offset: f64, d: f64, look: &TransitionLook) -> String {
+    let p = format!("clip((T-{offset:.3})/{d:.3},0,1)");
+    let s = format!("sin(PI*{p})");
+    let k = look.intensity.unwrap_or(1.0).clamp(0.1, 1.5);
+    let default_color = match kind {
+        TransitionGlow::LightLeak => (255.0, 122.0, 46.0),
+        TransitionGlow::Flash => (255.0, 255.0, 255.0),
+    };
+    let (r, g, b) = look.color.as_deref().and_then(parse_hex_color).unwrap_or(default_color);
+    // BT.601 chroma of the tint colour.
+    let cb_target = (128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b).clamp(16.0, 240.0);
+    let cr_target = (128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b).clamp(16.0, 240.0);
+    let (gain, tint) = match kind {
+        TransitionGlow::LightLeak => {
+            // Where the hot spot is at progress p (fractions of the frame).
+            let (cx, cy) = match look.direction.as_deref() {
+                Some("left") => (format!("(1.2-1.4*{p})"), "0.35".to_string()),
+                Some("down") => ("0.4".to_string(), format!("(-0.2+1.4*{p})")),
+                Some("up") => ("0.4".to_string(), format!("(1.2-1.4*{p})")),
+                Some("diagonal") => (format!("(-0.2+1.4*{p})"), format!("(-0.2+1.4*{p})")),
+                Some("center") => ("0.5".to_string(), "0.5".to_string()),
+                _ => (format!("(-0.2+1.4*{p})"), "0.35".to_string()),
+            };
+            let size = look.size.unwrap_or(1.0).clamp(0.3, 2.5);
+            let falloff = format!("clip(1.25-hypot(X/W-{cx},Y/H-{cy})*{:.3},0,1)", 1.5 / size);
+            (format!("min(1,{k:.3}*{s}*(0.3+0.9*{falloff}))"), format!("min(1,1.6*{s})*{:.3}", (0.85 * k).min(1.0)))
+        }
+        TransitionGlow::Flash => {
+            // White flashes go white; coloured ones wash the frame in their colour as they peak.
+            let tinted = (r, g, b) != (255.0, 255.0, 255.0);
+            (format!("min(1,{:.3}*{s}*{s})", 0.8 * k), if tinted { format!("min(1,{k:.3}*{s})") } else { "0".to_string() })
+        }
+    };
+    let (cb_target, cr_target) = (cb_target.round() as i64, cr_target.round() as i64);
+    format!(
+        "format=yuv420p,geq=lum='lum(X,Y)+(255-lum(X,Y))*{gain}':cb='cb(X,Y)+({cb_target}-cb(X,Y))*{tint}*(1-0.65*{gain})':cr='cr(X,Y)+({cr_target}-cr(X,Y))*{tint}*(1-0.65*{gain})':enable='between(t,{offset:.3},{end:.3})'",
+        end = offset + d
+    )
 }
 
 // Frame rate of a source file's first video stream, as a plain f64 (e.g. 30.0, 59.94) - only ever
@@ -3967,6 +4083,11 @@ const ALLOWED_TRANSITIONS: &[&str] = &[
     "pixelize",
     "radial",
     "dissolve",
+    "fadewhite",
+    "horzopen",
+    // Not ffmpeg names - xfade plus a glow pass (see transition_fold_step).
+    "lightleak",
+    "whip",
 ];
 
 fn sanitize_transition_name(name: &str) -> &str {
@@ -4793,7 +4914,8 @@ pub async fn export_trimmed_video(
                     .as_ref()
                     .filter(|tr| tr.duration > 0.0)
                     .map(|tr| (sanitize_transition_name(&tr.transition_type), tr.duration));
-                let (step, next_v, next_a) = transition_fold_step(&cur_v, &cur_a, i, accumulated, seg_dur, transition);
+                let look = seg.transition_in.as_ref().and_then(|tr| tr.look.as_ref());
+                let (step, next_v, next_a) = transition_fold_step(&cur_v, &cur_a, i, accumulated, seg_dur, transition, look);
                 filter.push_str(&step);
                 accumulated += seg_dur;
                 cur_v = next_v;
@@ -6088,7 +6210,29 @@ mod tests {
             lut_cube: None,
             stabilize: None,
             speed_steps: None,
+            muted: None,
         }
+    }
+
+    #[test]
+    fn an_overlay_frame_sequence_counts_as_present_when_its_first_frame_is() {
+        let frames = OverlayFrames { unique: vec![BASE64.encode([137u8, 80, 78, 71])], sequence: vec![0, 0, 0] };
+        let mut created = Vec::new();
+        let pattern = write_temp_overlay_sequence(&frames, 9_999, &mut created).expect("frames written");
+        let input = InputSpec { path: pattern.clone(), pre_args: vec!["-framerate".into(), "30".into(), "-start_number".into(), "0".into()] };
+        assert!(!PathBuf::from(&pattern).exists(), "the pattern itself is not a file");
+        assert!(input.existing_path().exists(), "{pattern}");
+        for path in &created {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn a_muted_clip_renders_silence_of_its_own_length() {
+        let seg = KeepSegment { muted: Some(true), end: 4.0, ..base_segment() };
+        assert!(segment_needs_filter_graph(&seg));
+        let audio = segment_audio_chain(true, 2, &seg, &(vec![], None), "a2");
+        assert!(audio.starts_with("anullsrc") && audio.contains("duration=4.000"), "{audio}");
     }
 
     // ---- segment_speed / segment_noise_reduction_db --------------------------------------------
@@ -6770,7 +6914,7 @@ mod tests {
 
     #[test]
     fn transition_holds_the_outgoing_frame_and_starts_where_it_ends() {
-        let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fade", 1.0)));
+        let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fade", 1.0)), None);
         assert_eq!((v.as_str(), a.as_str()), ("fold1v", "fold1a"));
         assert!(step.contains("[v0]tpad=stop_mode=clone:stop_duration=1.000[hold1]"), "{step}");
         assert!(step.contains("xfade=transition=fade:duration=1.000:offset=5.000"), "{step}");
@@ -6780,14 +6924,50 @@ mod tests {
     #[test]
     fn transition_is_capped_by_the_incoming_clip_only() {
         // A tiny first clip no longer limits the transition - it plays over the incoming clip.
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 0.5, 2.0, Some(("wipeleft", 3.0)));
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 0.5, 2.0, Some(("wipeleft", 3.0)), None);
         assert!(step.contains("duration=1.800:offset=0.500"), "{step}");
     }
 
     #[test]
     fn no_transition_is_a_plain_concat() {
-        let (step, _, _) = transition_fold_step("fold1v", "fold1a", 2, 9.0, 4.0, None);
+        let (step, _, _) = transition_fold_step("fold1v", "fold1a", 2, 9.0, 4.0, None, None);
         assert_eq!(step, "[fold1v][fold1a][v2][a2]concat=n=2:v=1:a=1[fold2v][fold2a];");
+    }
+
+    #[test]
+    fn light_leak_and_whip_add_a_glow_pass_over_the_transition_window() {
+        let (step, v, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("lightleak", 1.0)), None);
+        assert_eq!(v, "fold1v");
+        assert!(step.contains("xfade=transition=fade:duration=1.000:offset=5.000[xf1];"), "{step}");
+        assert!(step.contains("[xf1]format=yuv420p,geq="), "{step}");
+        assert!(step.contains("enable='between(t,5.000,6.000)'[fold1v];"), "{step}");
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("whip", 0.5)), None);
+        assert!(step.contains("xfade=transition=hblur"), "{step}");
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("horzopen", 0.5)), None);
+        assert!(step.contains("xfade=transition=horzopen") && !step.contains("geq"), "{step}");
+        assert_eq!(sanitize_transition_name("lightleak"), "lightleak");
+    }
+
+    #[test]
+    fn transition_looks_are_sanitized_into_the_glow() {
+        let look = TransitionLook {
+            color: Some("#3b82f6".to_string()),
+            intensity: Some(9.0),
+            direction: Some("'; drop".to_string()),
+            size: Some(1.0),
+            orientation: Some("vertical".to_string()),
+        };
+        let glow = transition_glow_filter(TransitionGlow::LightLeak, 1.0, 0.5, &look);
+        // Blue: chroma heads to high Cb / low Cr; intensity clamped to 1.5; bad direction ignored.
+        assert!(glow.contains("(198-cb(X,Y))") && glow.contains("(83-cr(X,Y))"), "{glow}");
+        assert!(glow.contains("min(1,1.500*") && !glow.contains("drop"), "{glow}");
+        assert!(parse_hex_color("red").is_none() && parse_hex_color("#12345g").is_none());
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("horzopen", 0.5)), Some(&look));
+        assert!(step.contains("xfade=transition=vertopen"), "{step}");
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fadewhite", 0.5)), Some(&look));
+        assert!(step.contains("xfade=transition=fade") && step.contains("geq="), "{step}");
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fadewhite", 0.5)), None);
+        assert!(step.contains("xfade=transition=fadewhite") && !step.contains("geq"), "{step}");
     }
 
     #[test]

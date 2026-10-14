@@ -4424,7 +4424,7 @@ const setScreen = () => {
                 controlsLeading={playerBackButton}
                 onSidebarPanelChange={handlePlayerSidebarPanelChange}
                 trackVolume={editStore.videoAudioVolume}
-                trackMuted={editStore.videoAudioMuted}
+                trackMuted={editStore.videoAudioMuted || !!activeClipEffects?.muted}
                 activeClipEffects={activeClipEffects}
                 gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}

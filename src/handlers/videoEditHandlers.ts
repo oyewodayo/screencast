@@ -53,6 +53,7 @@ export function toKeepSegments(clips: Clip[]): KeepSegment[] {
       noiseReduction,
       audioCleanup,
       speedSteps: clip.speedRamp ? clipSpeedSteps(clip) : undefined,
+      muted: clip.muted || undefined,
     };
   });
 }
@@ -262,8 +263,8 @@ export function setImageClipLengths(clips: Clip[], seconds: number): Clip[] {
 // null when that isn't the case (then the caller renders them into a single new file instead).
 const MERGE_GAP_EPSILON_SEC = 0.001;
 const sameSettings = (a: Clip, b: Clip): boolean =>
-  JSON.stringify([a.speed ?? 1, a.colorFilter, a.grade, a.crop, !!a.flipHorizontal, a.kenBurns, a.stabilize, a.noiseReduction, a.audioCleanup]) ===
-  JSON.stringify([b.speed ?? 1, b.colorFilter, b.grade, b.crop, !!b.flipHorizontal, b.kenBurns, b.stabilize, b.noiseReduction, b.audioCleanup]);
+  JSON.stringify([a.speed ?? 1, a.colorFilter, a.grade, a.crop, !!a.flipHorizontal, a.kenBurns, a.stabilize, a.noiseReduction, a.audioCleanup, !!a.muted]) ===
+  JSON.stringify([b.speed ?? 1, b.colorFilter, b.grade, b.crop, !!b.flipHorizontal, b.kenBurns, b.stabilize, b.noiseReduction, b.audioCleanup, !!b.muted]);
 export function mergeClipsInPlace(clips: Clip[], ids: string[]): Clip[] | null {
   const indices = ids.map((id) => clips.findIndex((c) => c.id === id)).filter((i) => i >= 0).sort((a, b) => a - b);
   if (indices.length < 2) return null;
@@ -330,7 +331,7 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
 // transition) - same "one function, Partial<T> patch" shape as updateOverlay, but standalone
 // since Clip (unlike every overlay type) has no updatedAt for anything to read back, so it can't
 // reuse updateOverlay<T extends {id,updatedAt}> as-is.
-export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup">>): Clip[] {
+export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted">>): Clip[] {
   return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
 

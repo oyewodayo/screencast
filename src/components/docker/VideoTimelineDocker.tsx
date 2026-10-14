@@ -9,7 +9,7 @@ import { appCacheDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt } from "react-icons/md";
+import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt, MdViewQuilt, MdFlashOn } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -54,6 +54,8 @@ import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudio
 import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import ElementsGallery from "../video/ElementsGallery";
+import SplitScreenPanel from "../video/SplitScreenPanel";
+import HighlightIntroPanel from "../video/HighlightIntroPanel";
 import { assetEntry, makeAsset } from "../../utils/videoAssets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION } from "./ClipEffectsPopover";
@@ -868,6 +870,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [captionsAnchor, setCaptionsAnchor] = useState<{ left: number; top: number } | null>(null);
   // Elements gallery (shapes and animated elements - videoAssets.ts).
   const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Split screen builder (SplitScreenPanel).
+  const [splitAnchor, setSplitAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Highlight intro builder (HighlightIntroPanel).
+  const [introAnchor, setIntroAnchor] = useState<{ left: number; top: number } | null>(null);
   const captionsButtonRef = useRef<HTMLButtonElement>(null);
   // Edit by transcript (TranscriptEditorPanel) - whole-timeline like Captions, sharing its transcripts.
   const [transcriptAnchor, setTranscriptAnchor] = useState<{ left: number; top: number } | null>(null);
@@ -2523,13 +2529,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             speedRamp: activeClip.speedRamp,
             noiseReduction: activeClip.noiseReduction,
             audioCleanup: activeClip.audioCleanup,
+            muted: activeClip.muted,
             sourcePath: activeClip.sourcePath,
             frame: videoPixelSize ?? undefined,
           }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videoPixelSize?.width, videoPixelSize?.height, activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.grade, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.speedRamp, activeClip?.noiseReduction, activeClip?.audioCleanup, activeClip?.sourcePath]);
+  }, [videoPixelSize?.width, videoPixelSize?.height, activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.grade, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.speedRamp, activeClip?.noiseReduction, activeClip?.audioCleanup, activeClip?.muted, activeClip?.sourcePath]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -2986,6 +2993,40 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             }`}
           >
             <IoShapesOutline size={15} />
+          </button>
+          <button
+            type="button"
+            title="Split screen - several shots at once"
+            onClick={(e) => {
+              if (splitAnchor) {
+                setSplitAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setSplitAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              splitAnchor ? "bg-neutral-700 text-fuchsia-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <MdViewQuilt size={16} />
+          </button>
+          <button
+            type="button"
+            title="Highlight intro - a burst of quick cuts before the video"
+            onClick={(e) => {
+              if (introAnchor) {
+                setIntroAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setIntroAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              introAnchor ? "bg-neutral-700 text-amber-300" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <MdFlashOn size={16} />
           </button>
           <ActionButton
             title={isPlacingBlur ? "Click the video preview to place a blur region" : "Add blur region"}
@@ -3936,6 +3977,36 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           );
         })()}
 
+      {introAnchor && (
+        <HighlightIntroPanel
+          anchor={introAnchor}
+          clips={editStore.clips}
+          selectedClipIds={selectedClipIds}
+          audioOverlays={editStore.audioOverlays}
+          onApply={(introClips, into, keepMusic) => {
+            editStore.insertHighlightIntro(introClips, into, keepMusic);
+            setIntroAnchor(null);
+          }}
+          onClose={() => setIntroAnchor(null)}
+        />
+      )}
+
+      {splitAnchor && (
+        <SplitScreenPanel
+          anchor={splitAnchor}
+          clips={editStore.clips}
+          selectedClipIds={selectedClipIds}
+          playhead={currentOutputTime}
+          totalDuration={totalOutputDuration}
+          frameAspect={videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9}
+          onApply={(cells, startTime, endTime, backdrop) => {
+            editStore.addSplitScreen(cells, startTime, endTime, backdrop);
+            setSplitAnchor(null);
+          }}
+          onClose={() => setSplitAnchor(null)}
+        />
+      )}
+
       {elementsAnchor && (
         <ElementsGallery
           anchor={elementsAnchor}
@@ -3954,7 +4025,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               width = 1;
               height = 1;
             }
-            const length = kind === "countdown" ? 3 : kind === "progress" ? 5 : entry.fullFrame ? 6 : 4;
+            const length = kind === "countdown" ? 3 : kind === "progress" ? 5 : kind === "reveal" ? 2.6 : entry.fullFrame ? 6 : 4;
             const total = totalOutputDuration > 0 ? totalOutputDuration : length;
             const startTime = Math.max(0, Math.min(currentOutputTime, total - Math.min(length, total)));
             const endTime = Math.min(total, startTime + length);
