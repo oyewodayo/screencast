@@ -5,11 +5,19 @@
 // small, non-sensitive UI preference data with no need for filesystem placement or the
 // asset-scope concerns that apply to actual recording/annotation files.
 
+import type { AnnotationFade, AnnotationStyle } from "./annotationStyles";
+
 export interface AppSettings {
   defaultRecordType: string;
   defaultFileExt: string;
   defaultFileNamePrefix: string;
   pdfDefaultZoom: number;
+  // On: a PDF opens fitted to the window (and stays fitted until zoomed by hand); off: it opens
+  // at pdfDefaultZoom.
+  pdfFitOnOpen: boolean;
+  // How a two-page spread changes: "flip" animates a book page turning, "instant" just swaps -
+  // the calmer choice for presenting.
+  pdfPageTurn: "flip" | "instant";
   pdfDefaultTool: "pen" | "highlighter" | "eraser" | "none";
   pdfDefaultPenColor: string;
   pdfDefaultHighlighterColor: string;
@@ -26,6 +34,17 @@ export interface AppSettings {
   // AnnotationOverlayWindow.tsx) — when false, Dashboard never creates the overlay window or
   // registers its hotkey at all.
   enableAnnotationTool: boolean;
+  // The overlay's ink (see utils/annotationStyles.ts) - re-read by the overlay every time draw mode
+  // turns on, so a change here applies from the next Ctrl+Shift+D without a restart. Colour and
+  // style can also be switched from the overlay's own toolbar mid-presentation; that's temporary.
+  annotationColor: string;
+  annotationWidth: number;
+  annotationStyle: AnnotationStyle;
+  annotationFade: AnnotationFade;
+  annotationShadow: boolean;
+  // Off hides the overlay's floating toolbar so drawing looks like it comes from nowhere while
+  // presenting - its keyboard shortcuts (Esc, Backspace, 1-8, P/M/N/L) still work.
+  annotationShowToolbar: boolean;
   // Whether the full recording setup panel (file name/type/recording options/audio+video
   // device pickers/Screenshot/Start Recording) still appears in the bottom docker. Its fields
   // now live here in Settings as defaults regardless of this - turning it off just also stops
@@ -38,6 +57,17 @@ export interface AppSettings {
   // it can be hidden right before presenting/recording a screen that includes this app's own
   // window, without those controls ending up baked into the video.
   showRecordingPanelButtons: boolean;
+  // The bottom docker's last row - date/time, CPU RAM, OS and the "Request feature / Report a bug"
+  // link. Purely informational, so it can be hidden to give the player that extra strip of height.
+  showDockerStatusBar: boolean;
+  // The "Recording started - saved to <path>" toast (plus its shortcut hints). Off by default: the
+  // overlay and the bottom-bar timer already say a recording is running, and the path is shown by
+  // the completion window when it's actually there to open.
+  notifyOnRecordingStart: boolean;
+  // A "3, 2, 1" shown in the middle of the screen between pressing Record and capture starting - time
+  // to switch to the window being recorded and get ready. See utils/recordingCountdown.ts.
+  recordingCountdownEnabled: boolean;
+  recordingCountdownSeconds: number;
   defaultAudioDevice: string;
   defaultVideoDevices: string[];
   defaultIncludeSystemAudio: boolean;
@@ -47,6 +77,14 @@ export interface AppSettings {
   // Same "untouched setting changes nothing" reasoning as every other default here.
   defaultResolutionWidth: number | null;
   defaultFramerate: number | null;
+  // Studio cleanup of every recording's audio once it stops - noise removal, levelling, ducking
+  // system audio under the voice, loudness to -16 LUFS (see src-tauri/src/services/
+  // audio_enhance.rs). On by default; off keeps the audio exactly as captured (still in sync).
+  autoEnhanceAudio: boolean;
+  // Webcam bubble border ("none" | "thin" | "medium" | "thick") and its "#rrggbb" colour, chosen
+  // in the Screen Options modal and remembered between recordings.
+  cameraBorder: string;
+  cameraBorderColor: string;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -61,6 +99,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultFileExt: "mp4",
   defaultFileNamePrefix: "Recording",
   pdfDefaultZoom: 1.25,
+  pdfFitOnOpen: true,
+  pdfPageTurn: "flip",
   pdfDefaultTool: "pen",
   pdfDefaultPenColor: "#1a1a1a",
   pdfDefaultHighlighterColor: "#ffd43b",
@@ -69,19 +109,32 @@ export const DEFAULT_SETTINGS: AppSettings = {
   homeBackgroundStyle: "graph",
   trashRetentionDays: 30,
   // The overlay this drives now stays hidden except for the brief, user-initiated span while
-  // draw mode is actually on (see ensure_annotation_overlay/toggleAnnotationDrawMode) - a hidden
+  // draw mode is actually on (see Dashboard.tsx's toggleAnnotationDrawMode) - a hidden
   // window can't block input no matter what, which is what makes it safe to default to on rather
   // than requiring an opt-in visit to Settings.
   enableAnnotationTool: true,
+  annotationColor: "#ef4444",
+  annotationWidth: 6,
+  annotationStyle: "pen",
+  annotationFade: "normal",
+  annotationShadow: false,
+  annotationShowToolbar: true,
   // Off by default - the bottom-right shortcut icons (see ActiveRecordingState.tsx) are the
   // primary way to start a recording now; the full panel is an opt-in for anyone who wants it.
   showRecordingDocker: false,
   showRecordingPanelButtons: true,
+  showDockerStatusBar: true,
+  notifyOnRecordingStart: false,
+  recordingCountdownEnabled: false,
+  recordingCountdownSeconds: 3,
   defaultAudioDevice: "",
   defaultVideoDevices: [],
   defaultIncludeSystemAudio: false,
   defaultResolutionWidth: null,
   defaultFramerate: null,
+  autoEnhanceAudio: true,
+  cameraBorder: "none",
+  cameraBorderColor: "#ffffff",
 };
 
 // One-time correction for installs whose settings were saved back when "avi" was still the coded

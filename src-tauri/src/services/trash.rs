@@ -35,7 +35,7 @@ pub struct TrashEntry {
     deleted_at: i64,
 }
 
-fn trash_dir() -> Result<PathBuf, String> {
+pub(crate) fn trash_dir() -> Result<PathBuf, String> {
     let dir = briefcast_dir()?.join(".trash");
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("Failed to create trash directory: {}", e))?;
@@ -64,7 +64,11 @@ fn write_manifest(records: &[TrashRecord]) -> Result<(), String> {
     let path = manifest_path()?;
     let json = serde_json::to_string_pretty(records)
         .map_err(|e| format!("Failed to serialize trash manifest: {}", e))?;
-    fs::write(&path, json).map_err(|e| format!("Failed to write trash manifest: {}", e))
+    // Written beside and renamed over, like every editor save: a crash mid-write must not leave a
+    // truncated manifest, which would make every trashed file unlistable and unrestorable.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| format!("Failed to write trash manifest: {}", e))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("Failed to save trash manifest: {}", e))
 }
 
 // Guards against two different trashed files colliding on the same on-disk name inside .trash
@@ -75,8 +79,9 @@ fn unique_trashed_name(original_name: &str) -> String {
     format!("{}_{}", Utc::now().timestamp_millis(), original_name)
 }
 
-#[command]
+#[command(async)]
 pub fn move_to_trash(path: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let source = PathBuf::from(&path);
     if !source.exists() {
         return Err("File does not exist".to_string());
@@ -89,6 +94,9 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
 
     let trashed_name = unique_trashed_name(&original_name);
     let destination = trash_dir()?.join(&trashed_name);
+    // Read before the move, so an unreadable manifest refuses the delete instead of moving the file
+    // somewhere nothing records.
+    let mut records = read_manifest()?;
 
     fs::rename(&source, &destination).map_err(|e| {
         // Windows ERROR_SHARING_VIOLATION (32) - another process (Word, Excel, a preview pane,
@@ -106,19 +114,24 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
         }
     })?;
 
-    let mut records = read_manifest()?;
     records.push(TrashRecord {
         trashed_name,
         original_path: path,
         deleted_at: Utc::now().timestamp(),
     });
-    write_manifest(&records)?;
+    if let Err(e) = write_manifest(&records) {
+        // Unrecorded, the file would sit in .trash invisible to the Trash view and never restorable
+        // - put it back where it was instead.
+        let _ = fs::rename(&destination, &source);
+        return Err(e);
+    }
 
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn list_trash() -> Result<Vec<TrashEntry>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut records = read_manifest()?;
     records.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
     Ok(records
@@ -167,8 +180,9 @@ fn free_restore_path(original_path: &Path) -> PathBuf {
     unreachable!()
 }
 
-#[command]
+#[command(async)]
 pub fn restore_from_trash(trashed_name: String) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut records = read_manifest()?;
     let index = records
         .iter()
@@ -196,8 +210,9 @@ pub fn restore_from_trash(trashed_name: String) -> Result<String, String> {
     path_to_str(&destination).map(|s| s.to_string())
 }
 
-#[command]
+#[command(async)]
 pub fn delete_trash_item(trashed_name: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut records = read_manifest()?;
     let index = records
         .iter()
@@ -214,8 +229,9 @@ pub fn delete_trash_item(trashed_name: String) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn empty_trash() -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let records = read_manifest()?;
     for record in &records {
         let path = trash_dir()?.join(&record.trashed_name);
@@ -229,8 +245,9 @@ pub fn empty_trash() -> Result<(), String> {
 // Deliberately not a background timer: this is a desktop app, "check whenever it's opened" is
 // the same policy every mainstream trash implementation (Gmail, Google Photos, ...) already uses
 // in practice, without needing a persistent scheduler for something this low-stakes.
-#[command]
+#[command(async)]
 pub fn purge_expired_trash(retention_days: i64) -> Result<u32, String> {
+    let _serial = crate::services::responsiveness::serial();
     if retention_days <= 0 {
         return Ok(0); // 0/negative means "never auto-purge"
     }

@@ -7,8 +7,9 @@
 // button has - a fresh whiteboard has nothing analogous to pick (no background/size presets yet).
 import React, { useCallback, useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { IoAdd, IoCopyOutline, IoEllipsisVertical, IoGitNetworkOutline, IoSearchOutline, IoTrashOutline } from "react-icons/io5";
+import { IoAdd, IoCopyOutline, IoEllipsisVertical, IoGitNetworkOutline, IoSearchOutline, IoTrashOutline, IoInformationCircleOutline } from "react-icons/io5";
 import { createEmptyWhiteboardDocument, WhiteboardSummary } from "../../utils/whiteboardTypes";
+import FileInfoModal from "../Modals/FileInfoModal";
 
 interface WhiteboardHomeProps {
   onOpenWhiteboard: (id: string) => void;
@@ -22,6 +23,8 @@ function formatUpdatedAt(iso: string): string {
 
 const WhiteboardHome: React.FC<WhiteboardHomeProps> = ({ onOpenWhiteboard }) => {
   const [whiteboards, setWhiteboards] = useState<WhiteboardSummary[] | null>(null);
+  // Item whose Info panel (FileInfoModal) is open.
+  const [infoItem, setInfoItem] = useState<{ id: string; name: string } | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Which card's 3-dot menu is open, if any - and, within that menu, whether "Delete" has already
@@ -212,6 +215,17 @@ const WhiteboardHome: React.FC<WhiteboardHomeProps> = ({ onOpenWhiteboard }) => 
                             <IoCopyOutline size={14} />
                             {duplicatingId === whiteboard.id ? "Duplicating…" : "Duplicate whiteboard"}
                           </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setInfoItem({ id: whiteboard.id, name: whiteboard.name || "Untitled whiteboard" });
+                              setOpenMenuId(null);
+                            }}
+                            className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                          >
+                            <IoInformationCircleOutline size={14} />
+                            Info
+                          </button>
                           <div className="border-t border-gray-100 dark:border-neutral-700/70" />
                           <button
                             type="button"
@@ -242,6 +256,9 @@ const WhiteboardHome: React.FC<WhiteboardHomeProps> = ({ onOpenWhiteboard }) => 
             );
           })()}
         </div>
+      )}
+      {infoItem && (
+        <FileInfoModal item={{ kind: "whiteboard", id: infoItem.id }} fileName={infoItem.name} onClose={() => setInfoItem(null)} />
       )}
     </div>
   );

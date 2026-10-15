@@ -1,5 +1,6 @@
 // components/docker/FileToolsDocker.tsx
 import React, { useEffect, useState } from "react";
+import type { ReframePreview } from "../video/ReframePreviewLayer";
 import { invoke } from "@tauri-apps/api/core";
 import {
   IoFolderOpenOutline,
@@ -48,7 +49,8 @@ interface FileToolsDockerProps {
   // present) for every non-video category.
   editStore: UseVideoEditStoreResult;
   currentTime: number;
-  onSeek: (sourcePath: string, time: number) => void;
+  // `resume`: keep playing after the seek (playback crossing into the next clip).
+  onSeek: (sourcePath: string, time: number, resume?: boolean) => void;
   // Video-only: lets the timeline's own transport button show accurate state and drive real
   // playback, same round-trip idea as currentTime/onSeek.
   isPlaying: boolean;
@@ -69,15 +71,18 @@ interface FileToolsDockerProps {
   // Video-only: reports the timeline's current output-timeline position upward, threaded
   // straight through to VideoTimelineDocker - see its own prop doc comment.
   onOutputTimeChange?: (outputTime: number) => void;
+  // The exact output time right now, read off the player itself (Dashboard's getExactOutputTime) -
+  // for keeping audio overlays in sync, where the ~4Hz currentTime is too stale to measure against.
+  getExactOutputTime?: () => number | null;
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  onReframePreviewChange?: (preview: ReframePreview | null) => void;
   // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
   // through to VideoTimelineDocker - see its own prop doc comment.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
-  // Video-only: forwards NoiseReductionPopover's "Recalibrate from current playback" click through
-  // to VideoTimelineDocker - see its own prop doc comment.
-  onRecalibrateNoise?: () => void;
+  // Video-only: NoiseReductionPopover's "Hold to compare", forwarded to VideoTimelineDocker.
+  onPreviewNoiseOriginal?: (bypass: boolean) => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // VideoTimelineDocker - see its own prop doc comments.
   selectedOverlayId?: string | null;
@@ -128,9 +133,11 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  getExactOutputTime,
   onActiveClipChange,
+  onReframePreviewChange,
   noiseReductionStatus,
-  onRecalibrateNoise,
+  onPreviewNoiseOriginal,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -172,9 +179,11 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         pendingTimelineInsert={pendingTimelineInsert}
         onTimelineInsertHandled={onTimelineInsertHandled}
         onOutputTimeChange={onOutputTimeChange}
+        getExactOutputTime={getExactOutputTime}
         onActiveClipChange={onActiveClipChange}
+        onReframePreviewChange={onReframePreviewChange}
         noiseReductionStatus={noiseReductionStatus}
-        onRecalibrateNoise={onRecalibrateNoise}
+        onPreviewNoiseOriginal={onPreviewNoiseOriginal}
         selectedOverlayId={selectedOverlayId}
         onSelectOverlay={onSelectOverlay}
         isPlacingText={isPlacingText}

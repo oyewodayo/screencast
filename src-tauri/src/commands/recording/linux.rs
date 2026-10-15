@@ -25,7 +25,7 @@ use std::process::Command;
 use tauri::{AppHandle, State};
 
 use super::{
-    build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error,
+    build_camera_overlay_filter_complex, codec_args_for_ext_hw, extract_ffmpeg_error,
     map_overlay_size, resolve_capture_target, spawn_recording, AppState, CaptureTarget, FormData,
     MAX_RECORDING_WIDTH,
 };
@@ -364,7 +364,7 @@ pub async fn recording_with_output_sva(
         plain_audio_args(&mut args, form_data, 1);
     }
 
-    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
@@ -410,16 +410,20 @@ pub async fn recording_with_output_v(
     let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
     let camera_path = require_v4l2_path(&video_device)?;
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(),
         "v4l2".to_string(),
         "-i".to_string(),
         camera_path,
-        "-c:v".to_string(),
-        "mpeg4".to_string(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    // Hardware encoding, and the container's own codec table, rather than the bare `-c:v mpeg4`
+    // this used to hardcode. That old default ignored the file type the user picked entirely and
+    // produced MPEG-4 Part 2 - a pre-H.264 codec with markedly worse quality per byte, and one
+    // most players treat as legacy - while the equivalent Windows path had been using the shared
+    // H.264 table all along. It also meant camera recordings carried no audio codec choice at all.
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }
@@ -460,7 +464,7 @@ pub async fn recording_with_output_va(
     // v4l2 and pulse can't be combined into one -i (unlike dshow/avfoundation) — two separate
     // inputs, one video-only stream and one audio-only stream, which ffmpeg's default stream
     // selection maps unambiguously since each type has exactly one candidate.
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(),
         "v4l2".to_string(),
         "-i".to_string(),
@@ -469,11 +473,13 @@ pub async fn recording_with_output_va(
         "pulse".to_string(),
         "-i".to_string(),
         form_data.audio_device.clone(),
-        "-c:v".to_string(),
-        "mpeg4".to_string(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    // Same change as recording_with_output_v above: the container's own codec table plus hardware
+    // encoding, instead of a hardcoded `-c:v mpeg4` that ignored the chosen file type and left the
+    // audio codec entirely to the muxer's default.
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
 
     spawn_recording(&state, output_path, &ffmpeg_path, args).await
 }

@@ -49,7 +49,7 @@ fn docs_trash_root() -> Result<PathBuf, String> {
 // Doc ids are frontend-generated UUIDs (crypto.randomUUID(), same convention as boards.rs), but
 // every command below is directly reachable, so this boundary is enforced here regardless of
 // caller - rejects anything that could escape docs_root() via a path separator or a "."/".." segment.
-fn doc_dir(id: &str) -> Result<PathBuf, String> {
+pub(crate) fn doc_dir(id: &str) -> Result<PathBuf, String> {
     if id.is_empty() || id.contains(['/', '\\']) || id == "." || id == ".." {
         return Err("Invalid document id".to_string());
     }
@@ -64,7 +64,69 @@ fn versions_dir(id: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+// Page margins in inches. Crosses the command boundary as-is (load_doc, set_doc_page_setup).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct DocMargins {
+    top: f64,
+    right: f64,
+    bottom: f64,
+    left: f64,
+}
+
+impl DocMargins {
+    // Each side 0-4in, and at least 1in of page left between opposite margins on the actual page
+    // (its size and orientation) - guards against a hand-edited meta.json or a bad drag.
+    fn sanitized(self, page_width_in: f64, page_height_in: f64) -> Self {
+        let clamp = |v: f64| if v.is_finite() { v.clamp(0.0, 4.0) } else { 1.0 };
+        let (mut top, mut right, mut bottom, mut left) = (clamp(self.top), clamp(self.right), clamp(self.bottom), clamp(self.left));
+        let max_horizontal = page_width_in - 1.0;
+        let max_vertical = page_height_in - 1.0;
+        if left + right > max_horizontal {
+            let k = max_horizontal / (left + right);
+            left *= k;
+            right *= k;
+        }
+        if top + bottom > max_vertical {
+            let k = max_vertical / (top + bottom);
+            top *= k;
+            bottom *= k;
+        }
+        Self { top, right, bottom, left }
+    }
+}
+
+// Paper size in inches, as laid out on screen and printed - (width, height), swapped for
+// landscape. Mirrors docPageGeometry.ts's PAGE_DIMENSIONS_IN; unknown/absent sizes are Letter.
+fn page_dimensions_in(page_size: Option<&str>, orientation: Option<&str>) -> (f64, f64) {
+    let (w, h) = match page_size {
+        Some("a4") => (8.27, 11.69),
+        Some("legal") => (8.5, 14.0),
+        _ => (8.5, 11.0),
+    };
+    if orientation == Some("landscape") {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+// Only "landscape" is stored - portrait is the default, kept as None like every other default.
+fn sanitize_orientation(orientation: Option<String>) -> Option<String> {
+    orientation.filter(|o| o == "landscape")
+}
+
+// A page colour is a "#rrggbb" hex string; white (the default) and anything malformed are None.
+fn sanitize_page_color(color: Option<String>) -> Option<String> {
+    let c = color?.trim().to_ascii_lowercase();
+    let valid = c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|ch| ch.is_ascii_hexdigit());
+    if valid && c != "#ffffff" {
+        Some(c)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DocMeta {
     title: String,
     #[serde(rename = "createdAt")]
@@ -102,6 +164,15 @@ struct DocMeta {
         skip_serializing_if = "Option::is_none"
     )]
     footer_text: Option<String>,
+    // None = the default 1in on every side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    margins: Option<DocMargins>,
+    // "landscape", or None for portrait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    orientation: Option<String>,
+    // "#rrggbb" paper colour, or None for white.
+    #[serde(rename = "pageColor", default, skip_serializing_if = "Option::is_none")]
+    page_color: Option<String>,
 }
 
 // Unlike DocMeta (an internal, camelCase-keyed storage format never returned to the frontend
@@ -155,19 +226,21 @@ fn is_ancestor_or_self(folders: &[DocFolder], candidate: &str, ancestor_of: &str
     false
 }
 
-#[command]
+#[command(async)]
 pub fn list_doc_folders() -> Result<Vec<DocFolder>, String> {
+    let _serial = crate::services::responsiveness::serial();
     read_folders()
 }
 
 // id is frontend-generated (crypto.randomUUID()), same convention as create_doc's own id param -
 // there's no existing UUID-generation dependency on the Rust side to reuse for one call site.
-#[command]
+#[command(async)]
 pub fn create_doc_folder(
     id: String,
     name: String,
     parent_id: Option<String>,
 ) -> Result<DocFolder, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut folders = read_folders()?;
     if folders.iter().any(|f| f.id == id) {
         return Err("A folder with that id already exists".to_string());
@@ -188,8 +261,9 @@ pub fn create_doc_folder(
     Ok(folder)
 }
 
-#[command]
+#[command(async)]
 pub fn rename_doc_folder(id: String, name: String) -> Result<DocFolder, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut folders = read_folders()?;
     let folder = folders
         .iter_mut()
@@ -201,8 +275,9 @@ pub fn rename_doc_folder(id: String, name: String) -> Result<DocFolder, String> 
     Ok(result)
 }
 
-#[command]
+#[command(async)]
 pub fn move_doc_folder(id: String, new_parent_id: Option<String>) -> Result<DocFolder, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut folders = read_folders()?;
     if let Some(ref pid) = new_parent_id {
         if !folders.iter().any(|f| &f.id == pid) {
@@ -228,8 +303,9 @@ pub fn move_doc_folder(id: String, new_parent_id: Option<String>) -> Result<DocF
 // filed under one of them - folders are organizational metadata, not containers, same reasoning
 // relink_doc_path uses to repair a stale reference rather than cascading a delete onto the doc
 // that holds it.
-#[command]
+#[command(async)]
 pub fn delete_doc_folder(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut folders = read_folders()?;
 
     let mut doomed: Vec<String> = vec![id];
@@ -279,8 +355,9 @@ pub fn delete_doc_folder(id: String) -> Result<(), String> {
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn set_doc_folder(id: String, folder_id: Option<String>) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     if let Some(ref fid) = folder_id {
         let folders = read_folders()?;
         if !folders.iter().any(|f| &f.id == fid) {
@@ -325,6 +402,9 @@ pub struct LoadedDoc {
     page_size: Option<String>,
     header_text: Option<String>,
     footer_text: Option<String>,
+    margins: Option<DocMargins>,
+    orientation: Option<String>,
+    page_color: Option<String>,
 }
 
 fn read_meta(dir: &PathBuf) -> Option<DocMeta> {
@@ -354,8 +434,9 @@ fn read_summary(dir: &PathBuf, id: &str) -> Option<DocSummary> {
     })
 }
 
-#[command]
+#[command(async)]
 pub fn list_docs() -> Result<Vec<DocSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = docs_root()?;
     let mut summaries: Vec<DocSummary> = Vec::new();
 
@@ -384,13 +465,14 @@ pub fn list_docs() -> Result<Vec<DocSummary>, String> {
     Ok(summaries)
 }
 
-#[command]
+#[command(async)]
 pub fn create_doc(
     id: String,
     title: String,
     bytes: Vec<u8>,
     folder_id: Option<String>,
 ) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     if dir.exists() {
         return Err("A document with that id already exists".to_string());
@@ -414,6 +496,9 @@ pub fn create_doc(
         page_size: None,
         header_text: None,
         footer_text: None,
+        margins: None,
+        orientation: None,
+        page_color: None,
     };
     write_meta(&dir, &meta)?;
 
@@ -433,8 +518,9 @@ pub fn create_doc(
     })
 }
 
-#[command]
+#[command(async)]
 pub fn save_doc(id: String, bytes: Vec<u8>, title: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create document folder: {}", e))?;
 
@@ -445,36 +531,32 @@ pub fn save_doc(id: String, bytes: Vec<u8>, title: String) -> Result<(), String>
 
     // Preserve every field this command doesn't itself own from any existing metadata - it only
     // ever changes content/title, never the doc's link/trash/folder state or its page setup.
+    // Copied wholesale rather than field by field so a new meta field can't be silently dropped on
+    // every autosave by forgetting to list it here.
     let now = chrono::Local::now().to_rfc3339();
-    let existing = read_meta(&dir);
-    let created_at = existing
-        .as_ref()
-        .map(|m| m.created_at.clone())
-        .unwrap_or_else(|| now.clone());
-    let linked_to = existing.as_ref().and_then(|m| m.linked_to.clone());
-    let deleted_at = existing.as_ref().and_then(|m| m.deleted_at.clone());
-    let folder_id = existing.as_ref().and_then(|m| m.folder_id.clone());
-    let page_size = existing.as_ref().and_then(|m| m.page_size.clone());
-    let header_text = existing.as_ref().and_then(|m| m.header_text.clone());
-    let footer_text = existing.and_then(|m| m.footer_text);
-    write_meta(
-        &dir,
-        &DocMeta {
+    let meta = match read_meta(&dir) {
+        Some(existing) => DocMeta { title, updated_at: now, ..existing },
+        None => DocMeta {
             title,
-            created_at,
+            created_at: now.clone(),
             updated_at: now,
-            linked_to,
-            deleted_at,
-            folder_id,
-            page_size,
-            header_text,
-            footer_text,
+            linked_to: None,
+            deleted_at: None,
+            folder_id: None,
+            page_size: None,
+            header_text: None,
+            footer_text: None,
+            margins: None,
+            orientation: None,
+            page_color: None,
         },
-    )
+    };
+    write_meta(&dir, &meta)
 }
 
-#[command]
+#[command(async)]
 pub fn load_doc(id: String) -> Result<LoadedDoc, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let bytes =
         fs::read(dir.join("doc.bin")).map_err(|e| format!("Failed to load document: {}", e))?;
@@ -490,6 +572,9 @@ pub fn load_doc(id: String) -> Result<LoadedDoc, String> {
         page_size: meta.page_size,
         header_text: meta.header_text,
         footer_text: meta.footer_text,
+        margins: meta.margins,
+        orientation: meta.orientation,
+        page_color: meta.page_color,
     })
 }
 
@@ -500,25 +585,45 @@ pub struct DocPageSetup {
     page_size: Option<String>,
     header_text: Option<String>,
     footer_text: Option<String>,
+    margins: Option<DocMargins>,
+    orientation: Option<String>,
+    page_color: Option<String>,
 }
 
-#[command]
+// The whole page setup is replaced on every call (absent = default), which is how the editor
+// applies it: it always sends its complete current setup.
+#[command(async)]
 pub fn set_doc_page_setup(
     id: String,
     page_size: Option<String>,
     header_text: Option<String>,
     footer_text: Option<String>,
+    margins: Option<DocMargins>,
+    orientation: Option<String>,
+    page_color: Option<String>,
 ) -> Result<DocPageSetup, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
+    let orientation = sanitize_orientation(orientation);
+    let (page_width_in, page_height_in) = page_dimensions_in(page_size.as_deref(), orientation.as_deref());
     meta.page_size = page_size;
     meta.header_text = header_text;
     meta.footer_text = footer_text;
+    meta.margins = margins.map(|m| m.sanitized(page_width_in, page_height_in));
+    meta.orientation = orientation;
+    meta.page_color = sanitize_page_color(page_color);
+    // Changing the page is an edit: the doc's "Edited" date moves, and DocsHome's card preview -
+    // cached by updated_at - redraws with the new orientation or colour.
+    meta.updated_at = chrono::Local::now().to_rfc3339();
     write_meta(&dir, &meta)?;
     Ok(DocPageSetup {
         page_size: meta.page_size,
         header_text: meta.header_text,
         footer_text: meta.footer_text,
+        margins: meta.margins,
+        orientation: meta.orientation,
+        page_color: meta.page_color,
     })
 }
 
@@ -526,8 +631,9 @@ pub fn set_doc_page_setup(
 // "an accidental click shouldn't be unrecoverable" reasoning as services/trash.rs's file-level
 // move_to_trash. list_docs already skips DOCS_TRASH_DIR_NAME, so a trashed doc immediately stops
 // appearing in the normal list without a real delete.
-#[command]
+#[command(async)]
 pub fn delete_doc(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.deleted_at = Some(chrono::Local::now().to_rfc3339());
@@ -537,8 +643,9 @@ pub fn delete_doc(id: String) -> Result<(), String> {
     fs::rename(&dir, &trash_dest).map_err(|e| format!("Failed to move document to trash: {}", e))
 }
 
-#[command]
+#[command(async)]
 pub fn list_trashed_docs() -> Result<Vec<DocSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = docs_trash_root()?;
     let mut summaries: Vec<DocSummary> = Vec::new();
 
@@ -569,8 +676,9 @@ pub fn list_trashed_docs() -> Result<Vec<DocSummary>, String> {
     Ok(summaries)
 }
 
-#[command]
+#[command(async)]
 pub fn restore_doc(id: String) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let trash_dir = docs_trash_root()?.join(&id);
     if !trash_dir.exists() {
         return Err("Document is not in the trash".to_string());
@@ -598,8 +706,9 @@ pub fn restore_doc(id: String) -> Result<DocSummary, String> {
 }
 
 // The real, unrecoverable delete - only ever called on a doc already sitting in the trash.
-#[command]
+#[command(async)]
 pub fn delete_doc_permanently(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let trash_dir = docs_trash_root()?.join(&id);
     fs::remove_dir_all(&trash_dir)
         .map_err(|e| format!("Failed to permanently delete document: {}", e))
@@ -608,8 +717,9 @@ pub fn delete_doc_permanently(id: String) -> Result<(), String> {
 // Points this doc at a recording/file elsewhere in the library ("notes for this screencast"). One
 // doc links to at most one file; a file can have several docs pointing at it (see
 // find_docs_linked_to) - a recording might accumulate more than one separate note over time.
-#[command]
+#[command(async)]
 pub fn link_doc_to_file(id: String, file_path: String) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.linked_to = Some(file_path);
@@ -625,8 +735,9 @@ pub fn link_doc_to_file(id: String, file_path: String) -> Result<DocSummary, Str
     })
 }
 
-#[command]
+#[command(async)]
 pub fn unlink_doc(id: String) -> Result<DocSummary, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let mut meta = read_meta(&dir).ok_or_else(|| "Failed to load document metadata".to_string())?;
     meta.linked_to = None;
@@ -645,8 +756,9 @@ pub fn unlink_doc(id: String) -> Result<DocSummary, String> {
 // Reverse lookup for a given file path - which doc(s) are "notes for" it. A full scan over every
 // doc's meta.json rather than a second sidecar-per-recording index: trivially cheap at
 // desktop/local doc-count scale, and avoids a second data structure that could drift out of sync.
-#[command]
+#[command(async)]
 pub fn find_docs_linked_to(file_path: String) -> Result<Vec<DocSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = docs_root()?;
     let mut summaries: Vec<DocSummary> = Vec::new();
 
@@ -676,8 +788,9 @@ pub fn find_docs_linked_to(file_path: String) -> Result<Vec<DocSummary>, String>
 // Called when a linked recording is renamed/moved, alongside the frontend's existing
 // repathFile()-style pin/recent repair, so a doc's link doesn't silently go stale. Returns how
 // many docs were updated (0 is a valid, expected result for a file nothing links to).
-#[command]
+#[command(async)]
 pub fn relink_doc_path(old_path: String, new_path: String) -> Result<u32, String> {
+    let _serial = crate::services::responsiveness::serial();
     let root = docs_root()?;
     let mut updated = 0u32;
 
@@ -727,13 +840,36 @@ fn build_export_path(doc_title: &str, extension: &str) -> Result<PathBuf, String
     Ok(root.join(format!("{} {}.{}", safe_name, stamp, extension)))
 }
 
-#[command]
-pub fn export_doc(doc_title: String, extension: String, content: String) -> Result<String, String> {
-    if extension != "md" && extension != "txt" {
+// `output_path` is where the user chose in the frontend's Save dialog; without one the file goes to
+// the Briefcast folder under a timestamped name (the original behaviour). The extension is forced
+// to the export type so a dialog filename typo can't produce "notes.docx" holding Markdown.
+fn resolve_export_path(output_path: Option<String>, doc_title: &str, extension: &str) -> Result<PathBuf, String> {
+    let Some(raw) = output_path.filter(|p| !p.trim().is_empty()) else {
+        return build_export_path(doc_title, extension);
+    };
+    let mut path = PathBuf::from(raw);
+    let matches = path
+        .extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case(extension))
+        .unwrap_or(false);
+    if !matches {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        path.set_file_name(format!("{}.{}", name, extension));
+    }
+    match path.parent() {
+        Some(parent) if parent.is_dir() => Ok(path),
+        _ => Err("The chosen folder doesn't exist".to_string()),
+    }
+}
+
+#[command(async)]
+pub fn export_doc(doc_title: String, extension: String, content: String, output_path: Option<String>) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
+    if extension != "md" && extension != "txt" && extension != "html" {
         return Err(format!("Unsupported export extension: {}", extension));
     }
 
-    let output = build_export_path(&doc_title, &extension)?;
+    let output = resolve_export_path(output_path, &doc_title, &extension)?;
     let tmp_file_name = format!("{}.tmp", output.file_name().unwrap().to_string_lossy());
     let tmp = output.with_file_name(tmp_file_name);
     fs::write(&tmp, content.as_bytes()).map_err(|e| format!("Failed to write export: {}", e))?;
@@ -741,17 +877,19 @@ pub fn export_doc(doc_title: String, extension: String, content: String) -> Resu
     Ok(output.to_string_lossy().to_string())
 }
 
-#[command]
+#[command(async)]
 pub fn export_doc_binary(
     doc_title: String,
     extension: String,
     bytes: Vec<u8>,
+    output_path: Option<String>,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     if extension != "docx" {
         return Err(format!("Unsupported export extension: {}", extension));
     }
 
-    let output = build_export_path(&doc_title, &extension)?;
+    let output = resolve_export_path(output_path, &doc_title, &extension)?;
     let tmp_file_name = format!("{}.tmp", output.file_name().unwrap().to_string_lossy());
     let tmp = output.with_file_name(tmp_file_name);
     fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write export: {}", e))?;
@@ -759,22 +897,106 @@ pub fn export_doc_binary(
     Ok(output.to_string_lossy().to_string())
 }
 
+// "Download PDF" straight to a file through WebView2's own PrintToPdf - the same Chromium print
+// engine as window.print(), so the @media print CSS in DocsEditor.tsx lays the pages out, but with
+// no dialog and with Chromium's date/title/URL/page-number header and footer switched off (the
+// print dialog defaults them on, which is what stamped "10/2/26, 11:53 PM" and the doc title across
+// the top of every exported page). The margins are the document's own, the same as the CSS @page
+// margin - the document's header, footer and page numbers are drawn in those margins.
+#[command]
+pub async fn export_doc_pdf(
+    webview: tauri::Webview,
+    doc_title: String,
+    page_size: Option<String>,
+    orientation: Option<String>,
+    margins: Option<DocMargins>,
+    output_path: Option<String>,
+) -> Result<String, String> {
+    let output = resolve_export_path(output_path, &doc_title, "pdf")?;
+    // Landscape is expressed through the page dimensions themselves (width > height) with the
+    // print orientation left at portrait - setting both would rotate the page twice.
+    let (width_in, height_in) = page_dimensions_in(page_size.as_deref(), orientation.as_deref());
+    let m = margins.map(|m| m.sanitized(width_in, height_in));
+    let (m_top, m_right, m_bottom, m_left) = m.map(|m| (m.top, m.right, m.bottom, m.left)).unwrap_or((1.0, 1.0, 1.0, 1.0));
+
+    #[cfg(windows)]
+    {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2Environment6, ICoreWebView2_7, COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT,
+        };
+        use webview2_com::PrintToPdfCompletedHandler;
+        use windows_core::{Interface, HSTRING};
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<bool, String>>();
+        let target = HSTRING::from(output.as_os_str());
+        webview
+            .with_webview(move |platform| {
+                let failed = tx.clone();
+                let started = (|| -> windows_core::Result<()> {
+                    unsafe {
+                        let core = platform.controller().CoreWebView2()?;
+                        let core7: ICoreWebView2_7 = core.cast()?;
+                        let env6: ICoreWebView2Environment6 = platform.environment().cast()?;
+                        let settings = env6.CreatePrintSettings()?;
+                        settings.SetOrientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT)?;
+                        settings.SetPageWidth(width_in)?;
+                        settings.SetPageHeight(height_in)?;
+                        settings.SetMarginTop(m_top)?;
+                        settings.SetMarginBottom(m_bottom)?;
+                        settings.SetMarginLeft(m_left)?;
+                        settings.SetMarginRight(m_right)?;
+                        settings.SetShouldPrintBackgrounds(true)?;
+                        settings.SetShouldPrintHeaderAndFooter(false)?;
+                        let handler = PrintToPdfCompletedHandler::create(Box::new(move |result, ok| {
+                            let _ = tx.send(result.map(|_| ok).map_err(|e| e.message().to_string()));
+                            Ok(())
+                        }));
+                        core7.PrintToPdf(&target, &settings, &handler)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = started {
+                    let _ = failed.send(Err(e.message().to_string()));
+                }
+            })
+            .map_err(|e| format!("Couldn't reach the document view: {}", e))?;
+
+        let outcome = tauri::async_runtime::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(120)))
+            .await
+            .map_err(|e| format!("PDF export task failed: {}", e))?
+            .map_err(|_| "PDF export timed out".to_string())?;
+        match outcome {
+            Ok(true) => Ok(output.to_string_lossy().to_string()),
+            Ok(false) => Err("WebView2 couldn't write the PDF (is the file open in another program?)".to_string()),
+            Err(e) => Err(format!("PDF export failed: {}", e)),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (webview, width_in, height_in, output, m_top, m_right, m_bottom, m_left);
+        Err("Download as PDF is only available on Windows - use Print and choose Save as PDF".to_string())
+    }
+}
+
 // Persists a pasted/dropped image's raw bytes into this doc's own assets/ folder, mirroring
 // boards.rs's import_board_image - except this takes bytes directly (clipboard data starts as an
 // in-memory File/Blob, not a path on disk) and returns the full absolute path rather than just a
 // filename, so the frontend doesn't need to duplicate docs_root()-equivalent path-joining in JS.
-#[command]
+#[command(async)]
 pub fn save_doc_image(
     id: String,
     asset_id: String,
     extension: String,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     // extension comes from a clipboard MIME type, not a real file extension - whitelist rather
-    // than trust it verbatim.
-    const ALLOWED: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+    // than trust it verbatim. Besides images, a document can keep the fonts it uses (uploaded, or
+    // embedded in an imported PDF) and the original PDF behind an "exact pages" import.
+    const ALLOWED: [&str; 10] = ["png", "jpg", "jpeg", "gif", "webp", "otf", "ttf", "woff", "woff2", "pdf"];
     if !ALLOWED.contains(&extension.as_str()) {
-        return Err(format!("Unsupported image extension: {}", extension));
+        return Err(format!("Unsupported asset extension: {}", extension));
     }
 
     let dir = doc_dir(&id)?;
@@ -881,13 +1103,15 @@ fn write_version(dir: &PathBuf, bytes: &[u8]) -> Result<Option<DocVersionSummary
     Ok(Some(version_summary_from_millis(millis)))
 }
 
-#[command]
+#[command(async)]
 pub fn create_doc_version(id: String, bytes: Vec<u8>) -> Result<Option<DocVersionSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     write_version(&versions_dir(&id)?, &bytes)
 }
 
-#[command]
+#[command(async)]
 pub fn list_doc_versions(id: String) -> Result<Vec<DocVersionSummary>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let versions = list_version_files(&versions_dir(&id)?)?;
     Ok(versions
         .into_iter()
@@ -905,8 +1129,9 @@ fn version_file_path(dir: &PathBuf, version_id: &str) -> Result<PathBuf, String>
     Ok(dir.join(format!("{}.bin", version_id)))
 }
 
-#[command]
+#[command(async)]
 pub fn load_doc_version(id: String, version_id: String) -> Result<Vec<u8>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let path = version_file_path(&versions_dir(&id)?, &version_id)?;
     fs::read(&path).map_err(|e| format!("Failed to load version: {}", e))
 }
@@ -915,8 +1140,9 @@ pub fn load_doc_version(id: String, version_id: String) -> Result<Vec<u8>, Strin
 // then overwrites doc.bin with the target version's bytes and bumps meta.json's updated_at - same
 // write-then-rename convention as save_doc. Returns the restored bytes so the frontend can apply
 // them to a fresh Y.Doc without a second round trip.
-#[command]
+#[command(async)]
 pub fn restore_doc_version(id: String, version_id: String) -> Result<Vec<u8>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let dir = doc_dir(&id)?;
     let versions = versions_dir(&id)?;
     let target_path = version_file_path(&versions, &version_id)?;
@@ -984,21 +1210,23 @@ fn write_comments(id: &str, comments: &[DocComment]) -> Result<(), String> {
     fs::rename(&tmp, &path).map_err(|e| format!("Failed to save comments: {}", e))
 }
 
-#[command]
+#[command(async)]
 pub fn list_doc_comments(id: String) -> Result<Vec<DocComment>, String> {
+    let _serial = crate::services::responsiveness::serial();
     read_comments(&id)
 }
 
 // id/mark_id are both frontend-generated (crypto.randomUUID()) - mark_id doubles as the comment
 // mark's own attribute value applied to the selection at the same moment this is called, so the
 // two ids start out equal, though only mark_id is ever looked up against the live document again.
-#[command]
+#[command(async)]
 pub fn add_doc_comment(
     id: String,
     comment_id: String,
     mark_id: String,
     text: String,
 ) -> Result<DocComment, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut comments = read_comments(&id)?;
     let comment = DocComment {
         id: comment_id,
@@ -1012,8 +1240,9 @@ pub fn add_doc_comment(
     Ok(comment)
 }
 
-#[command]
+#[command(async)]
 pub fn resolve_doc_comment(id: String, comment_id: String) -> Result<DocComment, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut comments = read_comments(&id)?;
     let comment = comments
         .iter_mut()
@@ -1025,8 +1254,9 @@ pub fn resolve_doc_comment(id: String, comment_id: String) -> Result<DocComment,
     Ok(result)
 }
 
-#[command]
+#[command(async)]
 pub fn reopen_doc_comment(id: String, comment_id: String) -> Result<DocComment, String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut comments = read_comments(&id)?;
     let comment = comments
         .iter_mut()
@@ -1038,9 +1268,44 @@ pub fn reopen_doc_comment(id: String, comment_id: String) -> Result<DocComment, 
     Ok(result)
 }
 
-#[command]
+#[command(async)]
 pub fn delete_doc_comment(id: String, comment_id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut comments = read_comments(&id)?;
     comments.retain(|c| c.id != comment_id);
     write_comments(&id, &comments)
+}
+
+#[cfg(test)]
+mod page_setup_tests {
+    use super::*;
+
+    #[test]
+    fn landscape_swaps_page_dimensions() {
+        assert_eq!(page_dimensions_in(Some("a4"), None), (8.27, 11.69));
+        assert_eq!(page_dimensions_in(Some("a4"), Some("landscape")), (11.69, 8.27));
+        assert_eq!(page_dimensions_in(None, Some("landscape")), (11.0, 8.5));
+    }
+
+    #[test]
+    fn margins_are_clamped_against_the_oriented_page() {
+        // Landscape Letter is only 8.5in tall: 5in + 5in top/bottom must shrink to 7.5in total.
+        let m = DocMargins { top: 4.0, right: 1.0, bottom: 4.0, left: 1.0 }.sanitized(11.0, 8.5);
+        assert!((m.top + m.bottom - 7.5).abs() < 1e-9);
+        // ...while 4in + 4in left/right fits easily on its 11in width.
+        let m = DocMargins { top: 1.0, right: 4.0, bottom: 1.0, left: 4.0 }.sanitized(11.0, 8.5);
+        assert_eq!((m.left, m.right), (4.0, 4.0));
+    }
+
+    #[test]
+    fn orientation_and_color_are_validated() {
+        assert_eq!(sanitize_orientation(Some("landscape".into())), Some("landscape".into()));
+        assert_eq!(sanitize_orientation(Some("portrait".into())), None);
+        assert_eq!(sanitize_orientation(Some("sideways".into())), None);
+        assert_eq!(sanitize_page_color(Some("#FFF8E1".into())), Some("#fff8e1".into()));
+        assert_eq!(sanitize_page_color(Some("#ffffff".into())), None);
+        assert_eq!(sanitize_page_color(Some("red".into())), None);
+        assert_eq!(sanitize_page_color(Some("#12345".into())), None);
+        assert_eq!(sanitize_page_color(None), None);
+    }
 }

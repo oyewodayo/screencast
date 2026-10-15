@@ -1,0 +1,68 @@
+/* Equations (docMathExtension.ts / DocMathView.tsx). Display equations marked numbered show
+   (1), (2), ... from docStructure.ts, which numbers them in document order - so inserting or
+   deleting one renumbers the rest, cross-references follow, and the exporters agree. */
+.doc-math-block {
+  position: relative;
+  margin: 0;
+  padding: 0.35em 3.5em;
+  text-align: center;
+  border-radius: 6px;
+  cursor: pointer;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.doc-math-block .katex-display {
+  margin: 0;
+}
+.doc-math-number {
+  position: absolute;
+  right: 0.25em;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.95em;
+  font-variant-numeric: tabular-nums;
+}
+
+.doc-math-inline {
+  display: inline-block;
+  /* An inline-block starts its own line box, which would inherit the paragraph's first-line indent
+     (text-indent) and push the formula right of where it sits. */
+  text-indent: 0;
+  padding: 0 1px;
+  border-radius: 3px;
+  cursor: pointer;
+  /* KaTeX's own line box can sit a hair taller than the text's; keep the line height steady. */
+  line-height: 1;
+}
+
+.doc-math-block:hover,
+.doc-math-inline:hover {
+  background: rgba(26, 115, 232, 0.06);
+}
+.doc-math-selected,
+.doc-math-selected:hover {
+  background: rgba(26, 115, 232, 0.1);
+  outline: 1.5px solid rgba(26, 115, 232, 0.6);
+}
+
+.doc-math-empty {
+  font-style: italic;
+  font-size: 0.9em;
+  color: #9ca3af;
+}
+
+@media print {
+  .doc-math-block,
+  .doc-math-inline {
+    cursor: default;
+  }
+  .doc-math-block:hover,
+  .doc-math-inline:hover,
+  .doc-math-selected {
+    background: none;
+    outline: none;
+  }
+  .doc-math-empty {
+    display: none;
+  }
+}

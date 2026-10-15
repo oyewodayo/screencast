@@ -8,6 +8,9 @@ interface ColorSwatchPickerProps {
   // "md" (default) is sized for the main annotation toolbar, among other 32px IconButtons; "sm"
   // is for tighter contexts like the text-note header strip, where "md" reads as oversized.
   size?: "sm" | "md";
+  // "below" (default): a horizontal palette under the trigger. "left": a vertical palette to the
+  // trigger's left, for vertical toolbars docked against the right edge.
+  placement?: "below" | "left";
 }
 
 // Black and white bookend the palette deliberately - they're the two most-reached-for colors for
@@ -36,7 +39,7 @@ const TRIGGER_SIZE_CLASSES: Record<"sm" | "md", string> = {
 // pill groups) — anchoring a popover to one of them risks it fighting for stacking order
 // against the PDF canvas underneath. Rendering at the document root with a very high
 // z-index sidesteps that entirely.
-const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, size = "md" }) => {
+const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, size = "md", placement = "below" }) => {
   const [open, setOpen] = useState(false);
   const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -44,7 +47,9 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
 
   const openPicker = (): void => {
     const rect = buttonRef.current?.getBoundingClientRect();
-    if (rect) setCoords({ top: rect.bottom + 8, left: rect.left + rect.width / 2 });
+    if (rect) {
+      setCoords(placement === "left" ? { top: rect.top + rect.height / 2, left: rect.left - 10 } : { top: rect.bottom + 8, left: rect.left + rect.width / 2 });
+    }
     setOpen(true);
   };
 
@@ -64,7 +69,8 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
       <button
         ref={buttonRef}
         type="button"
-        title="Color"
+        data-tip="Color"
+        aria-label="Color"
         // Callers can embed this next to a focused input (e.g. a text note's textarea) that
         // commits/closes itself on blur — suppressing the default mousedown focus-shift here
         // keeps that input focused instead of stealing it, so opening the picker doesn't trigger
@@ -79,8 +85,8 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
         createPortal(
           <div
             ref={popoverRef}
-            style={{ position: "fixed", top: coords.top, left: coords.left, transform: "translateX(-50%)" }}
-            className="flex items-center gap-2 px-2.5 py-2 rounded-2xl bg-white/90 dark:bg-neutral-800/95 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.18)] ring-1 ring-black/[0.06] dark:ring-white/[0.1] z-[9999]"
+            style={{ position: "fixed", top: coords.top, left: coords.left, transform: placement === "left" ? "translate(-100%, -50%)" : "translateX(-50%)" }}
+            className={`flex items-center ${placement === "left" ? "flex-col gap-1.5 px-1.5 py-2" : "gap-2 px-2.5 py-2"} rounded-2xl bg-white/90 dark:bg-neutral-800/95 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.18)] ring-1 ring-black/[0.06] dark:ring-white/[0.1] z-[9999]`}
           >
             {PALETTE.map((swatch) => (
               <button
@@ -92,7 +98,7 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
                   onChange(swatch);
                   setOpen(false);
                 }}
-                className={`w-6 h-6 rounded-full transition-transform duration-150 hover:scale-110 ${
+                className={`${placement === "left" ? "w-4 h-4" : "w-6 h-6"} rounded-full transition-transform duration-150 hover:scale-110 ${
                   swatch.toLowerCase() === color.toLowerCase()
                     ? "ring-2 ring-blue-500 ring-offset-2 ring-offset-white/90 dark:ring-offset-neutral-800"
                     // Stronger than before (was ring-black/[0.06], nearly invisible against the
@@ -103,14 +109,14 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
                 style={{ backgroundColor: swatch }}
               />
             ))}
-            <div className="w-px h-5 bg-black/[0.08] dark:bg-white/[0.12]" />
+            <div className={placement === "left" ? "w-4 h-px bg-black/[0.08] dark:bg-white/[0.12]" : "w-px h-5 bg-black/[0.08] dark:bg-white/[0.12]"} />
             <input
               type="color"
               title="Custom color"
               value={color}
               onMouseDown={(e) => e.preventDefault()}
               onChange={(e) => onChange(e.target.value)}
-              className="w-6 h-6 p-0 border-0 rounded-full cursor-pointer bg-transparent"
+              className={`${placement === "left" ? "w-4 h-4" : "w-6 h-6"} p-0 border-0 rounded-full cursor-pointer bg-transparent`}
             />
           </div>,
           document.body

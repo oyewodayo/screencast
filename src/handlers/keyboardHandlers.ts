@@ -23,6 +23,10 @@ interface KeyboardHandlers {
   // "?" for a shortcuts overlay is the same convention YouTube, Gmail, and most keyboard-driven
   // web apps share - shown here in the player rather than only buried in Settings > Help.
   toggleShortcutsOverlay?: () => void;
+  // Shift+P / Shift+N - YouTube's previous/next-video shortcut, for the player's own prev/next
+  // file buttons.
+  playPrevious?: () => void;
+  playNext?: () => void;
   onPlaybackRateChange?: (rate: number) => void;
   onVolumeChange?: (volume: number) => void;
 }
@@ -107,6 +111,16 @@ export const createKeyboardHandler = (
       case "?":
         e.preventDefault();
         handlers.toggleShortcutsOverlay?.();
+        break;
+      case "P":
+        if (!e.shiftKey || !handlers.playPrevious) break;
+        e.preventDefault();
+        handlers.playPrevious();
+        break;
+      case "N":
+        if (!e.shiftKey || !handlers.playNext) break;
+        e.preventDefault();
+        handlers.playNext();
         break;
       default:
         break;

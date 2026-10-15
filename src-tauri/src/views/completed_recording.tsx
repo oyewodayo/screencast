@@ -1,7 +1,7 @@
 // src/modal.js
 import React from 'react';
 import ReactDOM from "react-dom/client";
-import FileModal from "../../../src/components/Modals/FileModal";
+import FileModal, { type RecordingModalStatus } from "../../../src/components/Modals/FileModal";
 // This window has its own HTML entry point (completed_recording.html), separate from the
 // main app's index.html/main.tsx - without importing the compiled Tailwind stylesheet here
 // too, every Tailwind class used by FileModal has no matching CSS in this window at all,
@@ -19,10 +19,15 @@ initTheme();
 // (Rust side) rather than sent via an event - by the time any event listener registered here
 // could fire, the backend has already emitted it, so it would always be missed. Reading it
 // synchronously from the URL has no such timing dependency.
-const filePath = new URLSearchParams(window.location.search).get('path') ?? '';
+const params = new URLSearchParams(window.location.search);
+const filePath = params.get('path') ?? '';
+// "processing" while the backend is still finishing the file, then the window is reloaded as
+// "done" or "failed" (with `error`) - see stop_recording in commands/recording.rs.
+const status = (params.get('status') as RecordingModalStatus | null) ?? 'done';
+const error = params.get('error') ?? undefined;
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
-      <FileModal filePath={filePath} />
+      <FileModal filePath={filePath} status={status} error={error} />
     </React.StrictMode>,
   );

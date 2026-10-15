@@ -1,16 +1,53 @@
 import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
+import type { ReframePreview } from "./video/ReframePreviewLayer";
 import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
-import { message } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import ActiveRecordingState, { RecordSource, SOURCE_FLAGS } from "./ActiveRecordingState";
 import EnhancedScreenOptions from "./EnhancedScreenOptions";
 import RecordingDocker from "./docker/RecordingDocker";
+import { PHONE_CAMERA_DEVICE } from "../services/phoneCamera";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import { loadSettings } from "../utils/appSettings";
+import { startSnip } from "../services/snip";
+
+const FEEDBACK_EMAIL = "withbriefs@gmail.com";
+
+// Opens the user's mail client with a pre-filled feedback email. Version + OS go in the body so
+// bug reports arrive with the basics without the user having to look them up.
+async function openFeedbackEmail() {
+  const version = await getVersion().catch(() => "unknown");
+  const subject = `Briefcast ${version}: Feature request / Bug report`;
+  const body = [
+    "Type: Feature request / Bug report (delete one)",
+    "",
+    "What happened / what would you like?",
+    "",
+    "",
+    "Steps to reproduce (for bugs):",
+    "1. ",
+    "",
+    "---",
+    `Briefcast version: ${version}`,
+    `Platform: ${navigator.userAgent}`,
+  ].join("\n");
+  const url = `mailto:${FEEDBACK_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  try {
+    await openExternal(url);
+  } catch (err) {
+    console.error("Failed to open mail client:", err);
+  }
+}
+
+// First entry of each is the fallback when Settings' default format is of another kind.
+const VIDEO_EXTS = ["mp4", "mkv", "mov", "webm", "avi"];
+const AUDIO_EXTS = ["mp3", "wav", "aac", "wma"];
+const IMAGE_EXTS = ["png", "jpeg", "webp"];
 
 interface Props {
   // Which content the collapsible panel below ActiveRecordingState shows - the default
@@ -31,7 +68,7 @@ interface Props {
   activeFileCurrentTime: number;
   // sourcePath names which file's timeline `time` belongs to - a timeline clip dragged in from
   // elsewhere means "seek to this time" is ambiguous without also saying which file.
-  onSeekActiveFile: (sourcePath: string, time: number) => void;
+  onSeekActiveFile: (sourcePath: string, time: number, resume?: boolean) => void;
   // Same round-trip as activeFileCurrentTime/onSeekActiveFile, for play/pause - lets the video-
   // tools timeline show an accurate transport button and drive real playback from it.
   activeFileIsPlaying: boolean;
@@ -48,16 +85,19 @@ interface Props {
   // Video-only: reports the timeline's current output-timeline position upward, threaded
   // straight through to FileToolsDocker/VideoTimelineDocker.
   onOutputTimeChange?: (outputTime: number) => void;
+  // The exact output time right now, read off the player itself (Dashboard's getExactOutputTime) -
+  // for keeping audio overlays in sync, where the ~4Hz currentTime is too stale to measure against.
+  getExactOutputTime?: () => number | null;
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  onReframePreviewChange?: (preview: ReframePreview | null) => void;
   // Video-only: live status of VideoPlayer's noise-reduction Web Audio graph, threaded straight
   // through to FileToolsDocker/VideoTimelineDocker - same shape as onActiveClipChange above, just
   // travelling player-to-timeline-docker instead of the other way.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
-  // Video-only: forwards NoiseReductionPopover's "Recalibrate from current playback" click through
-  // to VideoPlayer, same threading direction as onActiveClipChange above.
-  onRecalibrateNoise?: () => void;
+  // Video-only: NoiseReductionPopover's "Hold to compare", forwarded to VideoTimelineDocker.
+  onPreviewNoiseOriginal?: (bypass: boolean) => void;
   // Video-only: text-overlay selection/placement state, threaded straight through to
   // FileToolsDocker/VideoTimelineDocker.
   selectedOverlayId?: string | null;
@@ -117,6 +157,10 @@ interface Props {
   setIncludeSystemAudio: React.Dispatch<React.SetStateAction<boolean>>;
   separateWebcamCapture: boolean;
   setSeparateWebcamCapture: React.Dispatch<React.SetStateAction<boolean>>;
+  // Live Screen <-> Camera cutting while recording - see Dashboard's switchView.
+  canSwitchView: boolean;
+  viewMode: 'screen' | 'camera';
+  onSwitchView: (mode: 'screen' | 'camera') => void;
   trackClicks: boolean;
   setTrackClicks: React.Dispatch<React.SetStateAction<boolean>>;
   resolutionWidth: number | null;
@@ -141,6 +185,10 @@ interface Props {
     track_clicks: boolean;
   }) => void;
   handleStopRecording: () => void;
+  // Opens the phone-camera pairing panel (PhoneCameraModal) - owned by Dashboard, which is where
+  // the modal is mounted, since BottomDocker has no modal layer of its own.
+  onOpenPhoneCamera: () => void;
+  isPhoneCameraConnected: boolean;
   isRecording: boolean;
   recordingStartTime: number | null;
   // Pause/resume timing model - see Dashboard.tsx's own doc comment on these three fields for the
@@ -169,6 +217,9 @@ interface Props {
   // bottom-right buttons, distinct from RecordingDocker above) is visible - see
   // appSettings.ts's showRecordingPanelButtons doc comment for why this exists.
   showRecordingPanelButtons: boolean;
+  // Whether the last row (date/time, CPU RAM, OS, feedback link) is shown - see appSettings.ts's
+  // showDockerStatusBar doc comment.
+  showDockerStatusBar: boolean;
 }
 
 type ConnectedDevice = string[];
@@ -189,9 +240,11 @@ const BottomDocker = ({
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  getExactOutputTime,
   onActiveClipChange,
+  onReframePreviewChange,
   noiseReductionStatus,
-  onRecalibrateNoise,
+  onPreviewNoiseOriginal,
   selectedOverlayId,
   onSelectOverlay,
   isPlacingText,
@@ -243,6 +296,9 @@ const BottomDocker = ({
   setIncludeSystemAudio,
   separateWebcamCapture,
   setSeparateWebcamCapture,
+  canSwitchView,
+  viewMode,
+  onSwitchView,
   trackClicks,
   setTrackClicks,
   resolutionWidth,
@@ -273,7 +329,10 @@ const BottomDocker = ({
   videoDevices,
   setVideoDevices,
   showRecordingDocker,
-  showRecordingPanelButtons
+  onOpenPhoneCamera,
+  isPhoneCameraConnected,
+  showRecordingPanelButtons,
+  showDockerStatusBar
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -364,7 +423,13 @@ const BottomDocker = ({
 
     invoke<ConnectedDevice>("get_connected_cameras")
       .then((devices) => {
-        setConnectedCameraDevices(devices);
+        // The phone is appended rather than detected: it can never appear in get_connected_cameras
+        // (that enumerates DirectShow devices, and a phone isn't one - see
+        // src-tauri/src/services/phone_camera.rs), so the entry has to be offered unconditionally
+        // and is paired on demand from the panel behind it.
+        setConnectedCameraDevices([...devices, PHONE_CAMERA_DEVICE]);
+        // Defaults are chosen from the REAL cameras only - auto-selecting the phone on a machine
+        // with no webcam would arm a source that isn't paired yet and record nothing.
         if (devices.length > 0) {
           const preferred = settings.defaultVideoDevices.filter((d) => devices.includes(d));
           setVideoDevices(preferred.length > 0 ? preferred : [devices[0]]); // Default to the first detected camera
@@ -377,41 +442,29 @@ const BottomDocker = ({
     loadDevices();
   }, []);
 
+  // Keeps the format valid for the record type: switching between video types keeps the user's
+  // choice; moving to a different kind (video/audio/screenshot) takes the Settings default when
+  // it's of that kind, otherwise MP4 / MP3 / PNG.
   useEffect(() => {
-    // Set default file extension based on recordType
-    switch (recordType) {
-      case "c":
-        setFileExt("png");
-        break;
-      case "a":
-        setFileExt("mp3");
-        break;
-      default:
-        setFileExt("Avi");
-        break;
-    }
+    const allowed = recordType === "c" ? IMAGE_EXTS : recordType === "a" ? AUDIO_EXTS : VIDEO_EXTS;
+    const preferred = loadSettings().defaultFileExt.toLowerCase();
+    setFileExt((prev) => {
+      const current = prev.toLowerCase();
+      if (allowed.includes(current)) return current;
+      return allowed.includes(preferred) ? preferred : allowed[0];
+    });
   }, [recordType]);
 
-  const handleRecordTypeChange = (
-    event: React.ChangeEvent<HTMLSelectElement>
-  ) => {
-    setRecordType(event.target.value);
-  };
-
-  const handleFileExtChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
-    console.log(event.target.value);
-
-    setFileExt(event.target.value);
+  // For the screen-selection modal's own "Change" control. Clearing previousRecordType matters:
+  // closeModalScreen restores it on close, so without this, deliberately switching type inside
+  // the modal during a screenshot flow would be silently undone the moment it closed.
+  const handleRecordTypeSelected = (value: string) => {
+    setPreviousRecordType(null);
+    setRecordType(value);
   };
 
   const handleFileNameChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     setFileName(event.target.value);
-  };
-
-  const handleAudioDeviceChange = (
-    event: React.ChangeEvent<HTMLSelectElement>
-  ) => {
-    setAudioDevice(event.target.value);
   };
 
   const toggleVideoDevice = (device: string) => {
@@ -507,14 +560,16 @@ const BottomDocker = ({
   // screen-selection modal and the backend both key off recordType === "c" to behave as a
   // screenshot flow. Switch to it just for this flow and restore the dropdown's value
   // (in closeModalScreen) once the modal closes.
-  const handleScreenshotClick = () => {
+  // The screen picker (services/snip.ts) where it's available; elsewhere, the screenshot modal.
+  const handleScreenshotClick = async () => {
+    try {
+      if (await startSnip()) return;
+    } catch (err) {
+      console.error("Screenshot picker failed:", err);
+    }
     setPreviousRecordType(recordType);
     setRecordType("c");
     openModalScreen();
-  }
-
-  const videoFormatInfo = async() =>{
-    return await message("Avi or Mkv format is highly rocommended to record video. However, you can remuxe or convert to other format when you are done recording.", { title: 'Video format', kind: 'info' });
   }
 
   return (
@@ -536,14 +591,41 @@ const BottomDocker = ({
       setOverlayShape={setOverlayShape}
       setOverlayPosition={setOverlayPosition}
       setOverlaySize={setOverlaySize}
+      separateWebcamCapture={separateWebcamCapture}
+      setSeparateWebcamCapture={setSeparateWebcamCapture}
+      fileName={fileName}
+      onFileNameChange={setFileName}
+      fileExt={fileExt}
+      onFileExtChange={setFileExt}
+      audioDevice={audioDevice}
+      onAudioDeviceChange={setAudioDevice}
+      connectedAudioDevices={connectedAudioDevices}
+      connectedCameraDevices={connectedCameraDevices}
+      onToggleVideoDevice={toggleVideoDevice}
+      onRefreshDevices={loadDevices}
+      onOpenPhoneCamera={onOpenPhoneCamera}
+      isPhoneCameraConnected={isPhoneCameraConnected}
+      includeSystemAudio={includeSystemAudio}
+      onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
+      trackClicks={trackClicks}
+      onToggleTrackClicks={() => setTrackClicks((prev) => !prev)}
+      isClickTrackingSupported={isClickTrackingSupported}
+      resolutionWidth={resolutionWidth}
+      onResolutionWidthChange={setResolutionWidth}
+      framerate={framerate}
+      onFramerateChange={setFramerate}
       isOpenScreen={modalOpenScreen} 
       onCloseScreen={closeModalScreen} 
       onStartRecording={onStartRecording} 
       setOpen={setModalOpenScreen}
+      onRecordTypeChange={handleRecordTypeSelected}
     />
     <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
      
         <ActiveRecordingState
+            canSwitchView={canSwitchView}
+            viewMode={viewMode}
+            onSwitchView={onSwitchView}
             isRecording={isRecording}
             recordingStartTime={recordingStartTime}
             recordType={recordType}
@@ -577,7 +659,12 @@ const BottomDocker = ({
             showRecordingPanelButtons={showRecordingPanelButtons}
         />
 
-      {showDocker && (<div className="docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800">
+      {/* Hidden rather than unmounted when minimized, so the video editor's open tool panel
+          (docked in the sidebar - see ToolPanelHost.tsx) and timeline state survive collapsing
+          the docker. VideoTimelineDocker ignores its keyboard shortcuts while hidden. */}
+      {/* Also hidden when nothing inside would render (no file tools, recording panel and status
+          bar both off) - otherwise its padding/border leave an empty strip under the toolbar. */}
+      {(<div className={`docker-container w-full flex flex-col gap-3 p-4 bg-neutral-50 dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 border-t border-neutral-200 dark:border-neutral-800 ${showDocker && ((dockerMode === "file-tools" && activeFile) || showRecordingDocker || showDockerStatusBar) ? "" : "hidden"}`}>
         {dockerMode === "file-tools" && activeFile ? (
           <FileToolsDocker
             file={activeFile}
@@ -595,9 +682,11 @@ const BottomDocker = ({
             pendingTimelineInsert={pendingTimelineInsert}
             onTimelineInsertHandled={onTimelineInsertHandled}
             onOutputTimeChange={onOutputTimeChange}
+            getExactOutputTime={getExactOutputTime}
             onActiveClipChange={onActiveClipChange}
+            onReframePreviewChange={onReframePreviewChange}
             noiseReductionStatus={noiseReductionStatus}
-            onRecalibrateNoise={onRecalibrateNoise}
+            onPreviewNoiseOriginal={onPreviewNoiseOriginal}
             selectedOverlayId={selectedOverlayId}
             onSelectOverlay={onSelectOverlay}
             isPlacingText={isPlacingText}
@@ -622,17 +711,18 @@ const BottomDocker = ({
             fileName={fileName}
             onFileNameChange={handleFileNameChange}
             fileExt={fileExt}
-            onFileExtChange={handleFileExtChange}
-            onShowVideoFormatInfo={videoFormatInfo}
+            onFileExtChange={setFileExt}
             recordType={recordType}
-            onRecordTypeChange={handleRecordTypeChange}
+            onRecordTypeChange={setRecordType}
             audioDevice={audioDevice}
-            onAudioDeviceChange={handleAudioDeviceChange}
+            onAudioDeviceChange={setAudioDevice}
             connectedAudioDevices={connectedAudioDevices}
             connectedCameraDevices={connectedCameraDevices}
             videoDevices={videoDevices}
             onToggleVideoDevice={toggleVideoDevice}
             onRefreshDevices={loadDevices}
+            onOpenPhoneCamera={onOpenPhoneCamera}
+            isPhoneCameraConnected={isPhoneCameraConnected}
             includeSystemAudio={includeSystemAudio}
             onToggleIncludeSystemAudio={() => setIncludeSystemAudio((prev) => !prev)}
             separateWebcamCapture={separateWebcamCapture}
@@ -654,6 +744,7 @@ const BottomDocker = ({
           />
         ) : null}
 
+        {showDockerStatusBar && (
         <div className="w-full grid grid-cols-1 grid-flow-col text-xs">
           <div>
           <span>{Date()}</span>
@@ -678,8 +769,14 @@ const BottomDocker = ({
           </span>
           <OsInfo />
           </div>
-          <div className="right-0"><span> <a href="https://x.com/oyewodayo" target="blank" className="text-blue-600 dark:text-blue-400">Request feature / Report a bug</a></span></div>
+          <div className="right-0"><span> <a
+            href={`mailto:${FEEDBACK_EMAIL}`}
+            onClick={(e) => { e.preventDefault(); void openFeedbackEmail(); }}
+            title={`Email ${FEEDBACK_EMAIL}`}
+            className="text-blue-600 dark:text-blue-400"
+          >Request feature / Report a bug</a></span></div>
         </div>
+        )}
       </div>)}
     </div>
     </>

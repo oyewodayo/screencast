@@ -3,7 +3,9 @@
 // Pure functions only, mirroring pdfAnnotationHandlers.ts's style: no React, callers pass in
 // everything they need explicitly. useVideoEditStore is the only caller.
 
-import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, PipOverlay, TextOverlay, VideoEditCommand } from "../utils/videoEditTypes";
+import { clipSpeedSteps, subSpan } from "../utils/clipTiming";
+import type { OverlayAsset } from "../utils/videoAssets";
+import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, PipOverlay, TextOverlay, VideoEditCommand, isImageClipPath } from "../utils/videoEditTypes";
 
 const MIN_CLIP_LENGTH = 0.05;
 const MIN_OVERLAY_DURATION = 0.1;
@@ -21,7 +23,7 @@ export function invertCommand(command: VideoEditCommand): VideoEditCommand {
 // (in-memory state from before a shape change, or an already-saved sidecar file written by that
 // older version), would otherwise fail JSON deserialization on invoke and hard-error the whole
 // export. Dropping it back to "uncropped" here is the same defensive fallback ClipCropOverlay's
-// own `committed`/cropStaticTransform already use for display - export just needs the same safety
+// own `committed`/clipFrameAffine already use for display - export just needs the same safety
 // net at its own boundary.
 function sanitizeCrop(crop: ClipCrop | undefined): ClipCrop | undefined {
   if (!crop || !Number.isFinite(crop.width) || !Number.isFinite(crop.height) || crop.width <= 0 || crop.height <= 0) return undefined;
@@ -31,19 +33,29 @@ function sanitizeCrop(crop: ClipCrop | undefined): ClipCrop | undefined {
 // The plain [start,end) ranges export_trimmed_video needs, each naming its own source file, in
 // the same order as `clips` - that order is exactly the desired playback/output order, so this is
 // a type-only projection, not a sort or a merge.
+// One segment per clip. A speed-ramped clip carries its constant-speed steps (clipSpeedSteps - the
+// same steps the preview plays at), which export renders as a single continuous time map, so its
+// length is exact.
 export function toKeepSegments(clips: Clip[]): KeepSegment[] {
-  return clips.map(({ sourcePath, start, end, colorFilter, kenBurns, transitionIn, crop, flipHorizontal, speed, noiseReduction }) => ({
-    sourcePath,
-    start,
-    end,
-    colorFilter,
-    kenBurns,
-    transitionIn,
-    crop: sanitizeCrop(crop),
-    flipHorizontal,
-    speed,
-    noiseReduction,
-  }));
+  return clips.map((clip) => {
+    const { sourcePath, start, end, speed, colorFilter, stabilize, kenBurns, transitionIn, crop, flipHorizontal, noiseReduction, audioCleanup } = clip;
+    return {
+      sourcePath,
+      start,
+      end,
+      speed,
+      colorFilter,
+      stabilize,
+      kenBurns,
+      transitionIn,
+      crop: sanitizeCrop(crop),
+      flipHorizontal,
+      noiseReduction,
+      audioCleanup,
+      speedSteps: clip.speedRamp ? clipSpeedSteps(clip) : undefined,
+      muted: clip.muted || undefined,
+    };
+  });
 }
 
 // Which clip (by array position) `sourceTime` falls into, restricted to `sourcePath` - without
@@ -57,6 +69,20 @@ export function clipIndexAt(clips: Clip[], sourcePath: string, sourceTime: numbe
   return clips.findIndex((c) => c.sourcePath === sourcePath && sourceTime >= c.start && sourceTime < c.end);
 }
 
+// A piece [start, end] cut out of `clip`: every setting carried over (look, grade, motion, speed,
+// audio, reverse...), its speed ramp and Ken Burns move narrowed to the part of them this piece
+// covers - so the pieces of a clip together play exactly as it did. Only the first piece keeps the
+// transition (the rest join their neighbour by a plain cut).
+export function clipPiece(clip: Clip, start: number, end: number, opts: { id?: string; first: boolean }): Clip {
+  const piece: Clip = { ...clip, id: opts.id ?? crypto.randomUUID(), start, end, transitionIn: opts.first ? clip.transitionIn : undefined };
+  if (clip.speedRamp) piece.speedRamp = { ...clip.speedRamp, span: subSpan(clip, clip.speedRamp.span, start, end) };
+  if (clip.kenBurns) piece.kenBurns = { ...clip.kenBurns, span: subSpan(clip, clip.kenBurns.span, start, end) };
+  if (!piece.speedRamp?.span) delete piece.speedRamp?.span;
+  if (!piece.kenBurns?.span) delete piece.kenBurns?.span;
+  if (!piece.transitionIn) delete piece.transitionIn;
+  return piece;
+}
+
 // Splits the clip at `index` into two adjacent clips (same sourcePath) in its old array slot,
 // preserving playback order. No-op (returns the same array reference) if `index` is out of range,
 // or `sourceTime` is too close to that clip's own edges to leave two meaningful pieces.
@@ -66,62 +92,84 @@ export function splitClipAt(clips: Clip[], index: number, sourceTime: number): C
   if (sourceTime - clip.start < MIN_CLIP_LENGTH || clip.end - sourceTime < MIN_CLIP_LENGTH) return clips;
   return [
     ...clips.slice(0, index),
-    // First half keeps transitionIn (still the same pairing with whatever precedes it) plus the
-    // look/motion effects - both halves keep colorFilter/kenBurns/crop/flipHorizontal/speed
-    // (splitting a graded/panned/cropped/mirrored/sped-up clip shouldn't silently reset its look),
-    // but only the first half is actually adjacent to the clip that used to precede the whole thing.
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: clip.start, end: sourceTime, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, transitionIn: clip.transitionIn, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed },
-    { id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: sourceTime, end: clip.end, colorFilter: clip.colorFilter, kenBurns: clip.kenBurns, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed },
+    clipPiece(clip, clip.start, sourceTime, { first: true }),
+    clipPiece(clip, sourceTime, clip.end, { first: false }),
     ...clips.slice(index + 1),
   ];
 }
 
-// Splits `clipId`'s own [start,end) into the pieces that remain once every range in
-// `silentRanges` is cut out - a batch version of splitClipAt+deleteClipAt for the "remove every
-// detected dead-air gap in this clip" gesture (see detect_silence, conversion.rs, and the Trim
-// Silence toolbar button), so N gaps removed at once lands as ONE undo command instead of up to
-// 2*N. Ranges are clamped/intersected against the clip's own [start,end) here (not just trusted
-// from the caller) since detect_silence analyzes the WHOLE source file, not just this clip's own
-// trim window. Every kept piece carries the original clip's own colorFilter/kenBurns/crop/
-// flipHorizontal forward (same reasoning as splitClipAt); only the FIRST piece keeps transitionIn,
-// for the same reason splitClipAt's own first half does. A piece shorter than MIN_CLIP_LENGTH
-// (silence detection landing a hair off a clip's own edge) is dropped rather than kept as a
-// sliver; a clip that ends up entirely silent is simply removed.
+// The "remove every detected dead-air gap in this clip" gesture (detect_silence, conversion.rs;
+// the Trim Silence button) as ONE undo command - cutClipRanges on this clip. Ranges are clamped to
+// the clip (detect_silence scans the WHOLE source file); a piece shorter than MIN_CLIP_LENGTH is
+// dropped rather than kept as a sliver; a clip that's silent throughout is removed.
 export function removeSilentRanges(clips: Clip[], clipId: string, silentRanges: { start: number; end: number }[]): Clip[] {
+  return cutClipRanges(clips, silentRanges.map((r) => ({ clipId, start: r.start, end: r.end })));
+}
+
+// Removes source ranges from specific clips (by id), splitting a clip into the pieces left
+// between its cuts - what edit-by-transcript's deletions and pause tightening apply
+// (transcriptEdit.ts) and silence removal. Pieces are clipPiece's (every setting kept, ramps and
+// Ken Burns continued). The first piece also keeps the clip's id, so anything keyed on it
+// (selection, transcript word keys) survives the cut.
+export function cutClipRanges(clips: Clip[], cuts: { clipId: string; start: number; end: number }[]): Clip[] {
+  if (cuts.length === 0) return clips;
+  let changed = false;
+  const next = clips.flatMap((clip) => {
+    const own = cuts
+      .filter((c) => c.clipId === clip.id)
+      .map((c) => ({ start: Math.max(clip.start, c.start), end: Math.min(clip.end, c.end) }))
+      .filter((c) => c.end > c.start)
+      .sort((a, b) => a.start - b.start);
+    if (own.length === 0) return [clip];
+    changed = true;
+    const kept: { start: number; end: number }[] = [];
+    let cursor = clip.start;
+    for (const range of own) {
+      if (range.start > cursor) kept.push({ start: cursor, end: range.start });
+      cursor = Math.max(cursor, range.end);
+    }
+    if (clip.end > cursor) kept.push({ start: cursor, end: clip.end });
+    return kept
+      .filter((k) => k.end - k.start >= MIN_CLIP_LENGTH)
+      .map((k, i) => clipPiece(clip, k.start, k.end, { id: i === 0 ? clip.id : undefined, first: i === 0 }));
+  });
+  return changed ? next : clips;
+}
+
+// Freeze frame: the clip split at `sourceTime` with a still of that frame (`stillPath`, an image
+// clip `seconds` long) between the two halves. At the clip's very start/end there's nothing to
+// split, so the still just goes before/after it. The still has no transition of its own; the
+// second half loses the clip's (it now follows the still by a plain cut).
+export function insertFreezeFrame(clips: Clip[], clipId: string, sourceTime: number, stillPath: string, seconds: number): Clip[] {
   const index = clips.findIndex((c) => c.id === clipId);
   if (index === -1) return clips;
   const clip = clips[index];
+  const still: Clip = { id: crypto.randomUUID(), sourcePath: stillPath, start: 0, end: seconds, colorFilter: clip.colorFilter, grade: clip.grade, crop: clip.crop, flipHorizontal: clip.flipHorizontal };
+  if (sourceTime - clip.start < MIN_CLIP_LENGTH) return [...clips.slice(0, index), still, ...clips.slice(index)];
+  if (clip.end - sourceTime < MIN_CLIP_LENGTH) return [...clips.slice(0, index + 1), still, ...clips.slice(index + 1)];
+  const first = clipPiece(clip, clip.start, sourceTime, { id: clip.id, first: true });
+  const second = clipPiece(clip, sourceTime, clip.end, { first: false });
+  return [...clips.slice(0, index), first, still, second, ...clips.slice(index + 1)];
+}
 
-  const sorted = silentRanges
-    .map((r) => ({ start: Math.max(clip.start, r.start), end: Math.min(clip.end, r.end) }))
-    .filter((r) => r.end - r.start > 0)
-    .sort((a, b) => a.start - b.start);
-  if (sorted.length === 0) return clips;
-
-  const kept: { start: number; end: number }[] = [];
-  let cursor = clip.start;
-  for (const range of sorted) {
-    if (range.start > cursor) kept.push({ start: cursor, end: range.start });
-    cursor = Math.max(cursor, range.end);
-  }
-  if (clip.end > cursor) kept.push({ start: cursor, end: clip.end });
-
-  const keptClips: Clip[] = kept
-    .filter((k) => k.end - k.start >= MIN_CLIP_LENGTH)
-    .map((k, i) => ({
-      id: crypto.randomUUID(),
-      sourcePath: clip.sourcePath,
-      start: k.start,
-      end: k.end,
-      colorFilter: clip.colorFilter,
-      kenBurns: clip.kenBurns,
-      crop: clip.crop,
-      flipHorizontal: clip.flipHorizontal,
-      speed: clip.speed,
-      transitionIn: i === 0 ? clip.transitionIn : undefined,
-    }));
-
-  return [...clips.slice(0, index), ...keptClips, ...clips.slice(index + 1)];
+// Reverse / un-reverse: a reversed clip points at the backwards render of its own range.
+// `reversedFrom` describes that render - which original range it covers - not the clip's current
+// trim, so splitting, trimming or freezing a frame in a reversed clip needs no bookkeeping: a
+// clip at [a,b] of the render (render time t = original end - t) un-reverses to
+// [original end - b, original end - a]. Every other setting is kept either way.
+export function reverseClip(clips: Clip[], clipId: string, reversedPath: string): Clip[] {
+  return clips.map((c) =>
+    c.id === clipId && !c.reversedFrom
+      ? { ...c, sourcePath: reversedPath, start: 0, end: c.end - c.start, reversedFrom: { sourcePath: c.sourcePath, start: c.start, end: c.end } }
+      : c
+  );
+}
+export function unreverseClip(clips: Clip[], clipId: string): Clip[] {
+  return clips.map((c) => {
+    if (c.id !== clipId || !c.reversedFrom) return c;
+    const { reversedFrom, ...rest } = c;
+    return { ...rest, sourcePath: reversedFrom.sourcePath, start: reversedFrom.end - c.end, end: reversedFrom.end - c.start };
+  });
 }
 
 // One recorded click, already resolved to this clip's own SOURCE-time coordinate space (same
@@ -167,40 +215,23 @@ export function applyAutoZoomAtClicks(clips: Clip[], clipId: string, clicks: Aut
     const zoomEnd = Math.min(clip.end, peak + AUTO_ZOOM_LEAD_OUT_SEC);
     if (zoomStart < cursor || peak - zoomStart < MIN_CLIP_LENGTH || zoomEnd - peak < MIN_CLIP_LENGTH) continue;
 
-    if (zoomStart > cursor) {
-      pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: zoomStart, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed });
-    }
-    pieces.push({
-      id: crypto.randomUUID(),
-      sourcePath: clip.sourcePath,
-      start: zoomStart,
-      end: peak,
-      colorFilter: clip.colorFilter,
-      crop: clip.crop,
-      flipHorizontal: clip.flipHorizontal,
-      speed: clip.speed,
-      kenBurns: { preset: "zoom-in", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y },
-    });
-    pieces.push({
-      id: crypto.randomUUID(),
-      sourcePath: clip.sourcePath,
-      start: peak,
-      end: zoomEnd,
-      colorFilter: clip.colorFilter,
-      crop: clip.crop,
-      flipHorizontal: clip.flipHorizontal,
-      speed: clip.speed,
-      kenBurns: { preset: "zoom-out", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y },
-    });
+    // Every setting kept (clipPiece); the zoom pieces get their own move in place of any the clip had.
+    const plain = (a: number, b: number) => {
+      const piece = clipPiece(clip, a, b, { first: pieces.length === 0 });
+      delete piece.kenBurns;
+      return piece;
+    };
+    if (zoomStart > cursor) pieces.push(plain(cursor, zoomStart));
+    pieces.push({ ...plain(zoomStart, peak), kenBurns: { preset: "zoom-in", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y } });
+    pieces.push({ ...plain(peak, zoomEnd), kenBurns: { preset: "zoom-out", intensity: AUTO_ZOOM_INTENSITY, targetX: click.x, targetY: click.y } });
     cursor = zoomEnd;
   }
-  if (clip.end > cursor) {
-    pieces.push({ id: crypto.randomUUID(), sourcePath: clip.sourcePath, start: cursor, end: clip.end, colorFilter: clip.colorFilter, crop: clip.crop, flipHorizontal: clip.flipHorizontal, speed: clip.speed });
-  }
   if (pieces.length === 0) return clips;
-  // First piece keeps the original clip's own transitionIn (still adjacent to whatever preceded
-  // the whole thing) - same reasoning splitClipAt/removeSilentRanges already established.
-  pieces[0].transitionIn = clip.transitionIn;
+  if (clip.end > cursor) {
+    const rest = clipPiece(clip, cursor, clip.end, { first: false });
+    delete rest.kenBurns;
+    pieces.push(rest);
+  }
 
   return [...clips.slice(0, index), ...pieces, ...clips.slice(index + 1)];
 }
@@ -210,6 +241,51 @@ export function applyAutoZoomAtClicks(clips: Clip[], clipId: string, clicks: Aut
 export function deleteClipAt(clips: Clip[], index: number): Clip[] {
   if (index < 0 || index >= clips.length) return clips;
   return clips.filter((_, i) => i !== index);
+}
+
+// Multi-selection versions of delete/duplicate (Ctrl/Shift-click on the timeline). Same array in,
+// same array out when none of `ids` is present, so callers can skip the undo step.
+export function deleteClips(clips: Clip[], ids: string[]): Clip[] {
+  const remove = new Set(ids);
+  const next = clips.filter((c) => !remove.has(c.id));
+  return next.length === clips.length ? clips : next;
+}
+
+// Every image clip shown for `seconds` (of output time - speed is respected) in one go: the quick way
+// to a fast photo montage where each picture flashes by. Video clips are left alone.
+export function setImageClipLengths(clips: Clip[], seconds: number): Clip[] {
+  return clips.map((c) => (isImageClipPath(c.sourcePath) ? { ...c, end: c.start + Math.max(MIN_CLIP_LENGTH, seconds * (c.speed ?? 1)) } : c));
+}
+
+// Merge (multi-selection, clip menu): when the selected clips are back-to-back pieces of the same
+// recording - what Split leaves behind - with nothing between them in the source and the same
+// settings, they're simply one longer clip again: no render, everything stays editable. Returns
+// null when that isn't the case (then the caller renders them into a single new file instead).
+const MERGE_GAP_EPSILON_SEC = 0.001;
+const sameSettings = (a: Clip, b: Clip): boolean =>
+  JSON.stringify([a.speed ?? 1, a.colorFilter, a.grade, a.crop, !!a.flipHorizontal, a.kenBurns, a.stabilize, a.noiseReduction, a.audioCleanup, !!a.muted]) ===
+  JSON.stringify([b.speed ?? 1, b.colorFilter, b.grade, b.crop, !!b.flipHorizontal, b.kenBurns, b.stabilize, b.noiseReduction, b.audioCleanup, !!b.muted]);
+export function mergeClipsInPlace(clips: Clip[], ids: string[]): Clip[] | null {
+  const indices = ids.map((id) => clips.findIndex((c) => c.id === id)).filter((i) => i >= 0).sort((a, b) => a - b);
+  if (indices.length < 2) return null;
+  const run = indices.map((i) => clips[i]);
+  for (let k = 1; k < run.length; k++) {
+    const prev = run[k - 1];
+    const cur = run[k];
+    if (indices[k] !== indices[k - 1] + 1) return null; // not side by side on the timeline
+    if (cur.sourcePath !== prev.sourcePath || isImageClipPath(cur.sourcePath)) return null;
+    if (Math.abs(cur.start - prev.end) > MERGE_GAP_EPSILON_SEC) return null; // something was cut out between
+    if (cur.transitionIn || cur.speedRamp || prev.speedRamp || cur.reversedFrom || prev.reversedFrom || !sameSettings(prev, cur)) return null;
+  }
+  const merged: Clip = { ...run[0], end: run[run.length - 1].end };
+  return [...clips.slice(0, indices[0]), merged, ...clips.slice(indices[indices.length - 1] + 1)];
+}
+
+// Each copy lands right after its own original - what a single Duplicate already does.
+export function duplicateClips(clips: Clip[], ids: string[], makeId: () => string): Clip[] {
+  const copy = new Set(ids);
+  if (!clips.some((c) => copy.has(c.id))) return clips;
+  return clips.flatMap((c) => (copy.has(c.id) ? [c, { ...c, id: makeId() }] : [c]));
 }
 
 // Moves the clip at `fromIndex` to sit at `toIndex` in the array - i.e. changes its playback
@@ -255,7 +331,7 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
 // transition) - same "one function, Partial<T> patch" shape as updateOverlay, but standalone
 // since Clip (unlike every overlay type) has no updatedAt for anything to read back, so it can't
 // reuse updateOverlay<T extends {id,updatedAt}> as-is.
-export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction">>): Clip[] {
+export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted">>): Clip[] {
   return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
 
@@ -287,9 +363,9 @@ export function makeTextOverlay(x: number, y: number, width: number, fontSize: n
   };
 }
 
-export function makeImageOverlay(src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number): ImageOverlay {
+export function makeImageOverlay(src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number, asset?: OverlayAsset): ImageOverlay {
   const now = Date.now();
-  return { id: crypto.randomUUID(), src, x, y, width, height, opacity: 1, startTime, endTime, createdAt: now, updatedAt: now };
+  return { id: crypto.randomUUID(), src, ...(asset ? { asset } : {}), x, y, width, height, opacity: 1, startTime, endTime, createdAt: now, updatedAt: now };
 }
 
 export function makeBlurOverlay(x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number): BlurOverlay {
@@ -407,9 +483,36 @@ export function sendOverlayToBack<T extends { id: string }>(overlays: T[], id: s
 // (drag the chip body) is exactly "shift startTime/endTime together, leave everything else alone"
 // regardless of overlay kind.
 
-export function makeAudioOverlay(src: string, sourceDuration: number, startTime: number, endTime: number): AudioOverlay {
+export function makeAudioOverlay(src: string, sourceDuration: number, startTime: number, endTime: number, label?: string): AudioOverlay {
   const now = Date.now();
-  return { id: crypto.randomUUID(), src, sourceDuration, startTime, endTime, trimStart: 0, volume: 1, createdAt: now, updatedAt: now };
+  return { id: crypto.randomUUID(), src, sourceDuration, startTime, endTime, trimStart: 0, volume: 1, ...(label ? { label } : {}), createdAt: now, updatedAt: now };
+}
+
+// Whether an audio overlay came from "Detach audio" rather than being music the user added.
+// Overlays detached before the `detached` flag existed are recognized by where detach writes its
+// files (the app cache's detached-audio folder), so re-detaching also cleans those up.
+export function isDetachedAudioOverlay(o: AudioOverlay): boolean {
+  return o.detached === true || /[\\/]detached-audio[\\/]/.test(o.src);
+}
+
+// Stacks audio overlays into rows so overlapping ones (e.g. a detached voice and music pair, or
+// several detached streams) get their own row instead of drawing on top of each other. Greedy
+// by start time: each overlay takes the first row whose last overlay has already ended.
+export function packAudioRows(overlays: AudioOverlay[]): { rowOf: Map<string, number>; rowCount: number } {
+  const rowEnds: number[] = [];
+  const rowOf = new Map<string, number>();
+  const sorted = [...overlays].sort((a, b) => a.startTime - b.startTime || a.createdAt - b.createdAt);
+  for (const o of sorted) {
+    let row = rowEnds.findIndex((end) => end <= o.startTime + 1e-6);
+    if (row === -1) {
+      row = rowEnds.length;
+      rowEnds.push(o.endTime);
+    } else {
+      rowEnds[row] = o.endTime;
+    }
+    rowOf.set(o.id, row);
+  }
+  return { rowOf, rowCount: rowEnds.length };
 }
 
 // Drags one edge of an audio overlay's time range - unlike resizeOverlayTime (text/image, which
@@ -583,6 +686,88 @@ export function resizePipOverlayTime(overlays: PipOverlay[], id: string, edge: "
     const clampedEnd = Math.min(maxEnd, Math.max(time, o.startTime + MIN_OVERLAY_DURATION));
     return { ...o, endTime: clampedEnd, updatedAt: Date.now() };
   });
+}
+
+// Cuts one PiP overlay in two at `outputTime` - the PiP-lane counterpart to splitClipAt. The
+// second piece picks up exactly where the first leaves off in the pip's own source (trimStart
+// advanced by the first piece's length), so playing both back to back is visually identical to
+// the unsplit original. Everything else (geometry, shape, crop, audio) carries over to both pieces.
+// Returns the input unchanged when the cut would leave either piece shorter than
+// MIN_OVERLAY_DURATION (same "too close to an edge" rule splitClipAt applies to clips).
+export function splitPipOverlayAt(overlays: PipOverlay[], id: string, outputTime: number): PipOverlay[] {
+  const index = overlays.findIndex((o) => o.id === id);
+  if (index === -1) return overlays;
+  const o = overlays[index];
+  if (outputTime - o.startTime < MIN_OVERLAY_DURATION || o.endTime - outputTime < MIN_OVERLAY_DURATION) return overlays;
+  const now = Date.now();
+  const first: PipOverlay = { ...o, endTime: outputTime, updatedAt: now };
+  const second: PipOverlay = {
+    ...o,
+    id: crypto.randomUUID(),
+    startTime: outputTime,
+    trimStart: o.trimStart + (outputTime - o.startTime),
+    createdAt: now,
+    updatedAt: now,
+  };
+  return [...overlays.slice(0, index), first, second, ...overlays.slice(index + 1)];
+}
+
+// Cuts an audio overlay in two at `outputTime` (Split with an audio chip selected) - the way to
+// keep just the part of a song you want: cut, then delete the unwanted piece. Same shape as
+// splitPipOverlayAt; the fade-in stays on the first piece and the fade-out on the second, so the
+// song's own beginning and end still fade as they did.
+export function splitAudioOverlayAt(overlays: AudioOverlay[], id: string, outputTime: number): AudioOverlay[] {
+  const index = overlays.findIndex((o) => o.id === id);
+  if (index === -1) return overlays;
+  const o = overlays[index];
+  if (outputTime - o.startTime < MIN_OVERLAY_DURATION || o.endTime - outputTime < MIN_OVERLAY_DURATION) return overlays;
+  const now = Date.now();
+  const first: AudioOverlay = { ...o, endTime: outputTime, fadeOutSec: undefined, updatedAt: now };
+  const second: AudioOverlay = {
+    ...o,
+    id: crypto.randomUUID(),
+    startTime: outputTime,
+    trimStart: o.trimStart + (outputTime - o.startTime),
+    fadeInSec: undefined,
+    createdAt: now,
+    updatedAt: now,
+  };
+  return [...overlays.slice(0, index), first, second, ...overlays.slice(index + 1)];
+}
+
+// Tolerance for "this piece starts exactly where that one ends" - pieces produced by
+// splitPipOverlayAt share the exact same boundary value, but a boundary that has since been moved
+// through the store's own float math can drift by a hair.
+const PIP_CHAIN_EPSILON_SEC = 0.001;
+
+// Deletes one PiP piece and closes the gap it leaves - the PiP-lane counterpart to deleting a clip
+// (which the concat-based clip track does implicitly). Only the pieces CHAINED directly after the
+// deleted one move back: each successive piece of the same source that starts exactly where the
+// previous one ends, i.e. what splitting one PiP produces. Cut the unwanted middle out of a split
+// PiP and the pieces either side of it join up and play back to back. Anything not touching the
+// chain - a separately-placed PiP, or the gapped per-interval pieces a view-switch recording
+// produces (buildViewSwitchOverlays), which must stay in sync with the screen track - is left
+// exactly where it is.
+export function deletePipOverlayAndCloseGap(overlays: PipOverlay[], id: string): PipOverlay[] {
+  const deleted = overlays.find((o) => o.id === id);
+  if (!deleted) return overlays;
+  const remaining = overlays.filter((o) => o.id !== id);
+  const gap = deleted.endTime - deleted.startTime;
+
+  const chainIds = new Set<string>();
+  let chainEnd = deleted.endTime;
+  for (;;) {
+    const next = remaining.find(
+      (o) => !chainIds.has(o.id) && o.sourcePath === deleted.sourcePath && Math.abs(o.startTime - chainEnd) <= PIP_CHAIN_EPSILON_SEC
+    );
+    if (!next) break;
+    chainIds.add(next.id);
+    chainEnd = next.endTime;
+  }
+  if (chainIds.size === 0) return remaining;
+
+  const now = Date.now();
+  return remaining.map((o) => (chainIds.has(o.id) ? { ...o, startTime: o.startTime - gap, endTime: o.endTime - gap, updatedAt: now } : o));
 }
 
 // A time-offset sibling to duplicateOverlay above (which requires x/y - meaningless for an audio
