@@ -301,6 +301,21 @@ function objectIntersectsPoint(object: AnnotationObject, pdfPoint: Pt, radiusInP
   return false;
 }
 
+// Select-mode hit test for freehand ink (pen strokes and highlights): the top-most one whose path
+// passes within `toleranceInPdfUnits` of the point (plus its own half-width).
+export function findInkObjectAt(objects: AnnotationObject[], point: Pt, toleranceInPdfUnits: number): StrokeObject | HighlightObject | null {
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const object = objects[i];
+    if ((object.type === "stroke" || object.type === "highlight") && objectIntersectsPoint(object, point, toleranceInPdfUnits)) return object;
+  }
+  return null;
+}
+
+// Moves a stroke/highlight by a PDF-space offset.
+export function translateInkObject<T extends StrokeObject | HighlightObject>(object: T, dx: number, dy: number): T {
+  return { ...object, points: object.points.map((p) => ({ ...p, x: p.x + dx, y: p.y + dy })), updatedAt: Date.now() };
+}
+
 // Returns the objects on the page that intersect the eraser at this point. Callers accumulate
 // results across a whole pointer drag and remove them all as a single undo command.
 export function hitTestEraser(

@@ -41,6 +41,11 @@ const PDF_TOOL_OPTIONS: { value: AppSettings["pdfDefaultTool"]; label: string }[
   { value: "eraser", label: "Eraser" },
 ];
 
+const PDF_PAGE_TURN_OPTIONS: { value: AppSettings["pdfPageTurn"]; label: string }[] = [
+  { value: "flip", label: "Book flip" },
+  { value: "instant", label: "Instant" },
+];
+
 const Section: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
   <div className="mb-6 last:mb-0">
     <h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500 mb-3">{title}</h3>
@@ -1021,19 +1026,41 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     ))}
                   </select>
                 </Field>
+                <Field label="Fit to screen on open">
+                  <input
+                    type="checkbox"
+                    checked={settings.pdfFitOnOpen}
+                    onChange={(e) => update("pdfFitOnOpen", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
                 <Field label="Default zoom">
-                  <div className="flex items-center gap-2">
+                  <div className={`flex items-center gap-2 ${settings.pdfFitOnOpen ? "opacity-40" : ""}`}>
                     <input
                       type="range"
                       min={15}
                       max={300}
                       step={5}
+                      disabled={settings.pdfFitOnOpen}
                       value={Math.round(settings.pdfDefaultZoom * 100)}
                       onChange={(e) => update("pdfDefaultZoom", Number(e.target.value) / 100)}
                       className="w-28 accent-blue-500"
                     />
                     <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-10 text-right">{Math.round(settings.pdfDefaultZoom * 100)}%</span>
                   </div>
+                </Field>
+                <Field label="Two-page turn">
+                  <select
+                    className={fieldInputClass}
+                    value={settings.pdfPageTurn}
+                    onChange={(e) => update("pdfPageTurn", e.target.value as AppSettings["pdfPageTurn"])}
+                  >
+                    {PDF_PAGE_TURN_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
                 </Field>
                 <Field label="Pen color">
                   <input

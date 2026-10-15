@@ -12,6 +12,12 @@ export interface AppSettings {
   defaultFileExt: string;
   defaultFileNamePrefix: string;
   pdfDefaultZoom: number;
+  // On: a PDF opens fitted to the window (and stays fitted until zoomed by hand); off: it opens
+  // at pdfDefaultZoom.
+  pdfFitOnOpen: boolean;
+  // How a two-page spread changes: "flip" animates a book page turning, "instant" just swaps -
+  // the calmer choice for presenting.
+  pdfPageTurn: "flip" | "instant";
   pdfDefaultTool: "pen" | "highlighter" | "eraser" | "none";
   pdfDefaultPenColor: string;
   pdfDefaultHighlighterColor: string;
@@ -93,6 +99,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultFileExt: "mp4",
   defaultFileNamePrefix: "Recording",
   pdfDefaultZoom: 1.25,
+  pdfFitOnOpen: true,
+  pdfPageTurn: "flip",
   pdfDefaultTool: "pen",
   pdfDefaultPenColor: "#1a1a1a",
   pdfDefaultHighlighterColor: "#ffd43b",

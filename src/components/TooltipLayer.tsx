@@ -24,6 +24,9 @@ interface Tip {
     text: string;
     kbd: string | null;
     rect: DOMRect;
+    // "left" for controls docked against the right edge (the PDF viewer's vertical tools dock),
+    // where an above/below tip would sit on top of the neighbouring buttons instead.
+    side: "auto" | "left";
 }
 
 const tipTarget = (node: EventTarget | null): HTMLElement | null =>
@@ -32,7 +35,7 @@ const tipTarget = (node: EventTarget | null): HTMLElement | null =>
 const TooltipLayer = () => {
     const [tip, setTip] = useState<Tip | null>(null);
     const [style, setStyle] = useState<React.CSSProperties>({ visibility: "hidden" });
-    const [below, setBelow] = useState(false);
+    const [placement, setPlacement] = useState<"above" | "below" | "left">("above");
     const bubbleRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -43,7 +46,12 @@ const TooltipLayer = () => {
         const show = (el: HTMLElement) => {
             const text = el.getAttribute("data-tip");
             if (!text || !el.isConnected) return;
-            setTip({ text, kbd: el.getAttribute("data-tip-kbd"), rect: el.getBoundingClientRect() });
+            setTip({
+                text,
+                kbd: el.getAttribute("data-tip-kbd"),
+                rect: el.getBoundingClientRect(),
+                side: el.getAttribute("data-tip-side") === "left" ? "left" : "auto",
+            });
         };
 
         const hide = () => {
@@ -96,10 +104,16 @@ const TooltipLayer = () => {
         if (!tip || !bubbleRef.current) return;
         const { width, height } = bubbleRef.current.getBoundingClientRect();
         const r = tip.rect;
+        if (tip.side === "left" && r.left - width - GAP >= EDGE) {
+            const top = Math.max(EDGE, Math.min(r.top + r.height / 2 - height / 2, window.innerHeight - height - EDGE));
+            setPlacement("left");
+            setStyle({ left: r.left - width - GAP, top, ["--arrow-y" as string]: `${r.top + r.height / 2 - top}px` });
+            return;
+        }
         const flip = r.top - height - GAP < EDGE;
         const left = Math.max(EDGE, Math.min(r.left + r.width / 2 - width / 2, window.innerWidth - width - EDGE));
         const top = flip ? r.bottom + GAP : r.top - height - GAP;
-        setBelow(flip);
+        setPlacement(flip ? "below" : "above");
         setStyle({ left, top, ["--arrow-x" as string]: `${r.left + r.width / 2 - left}px` });
     }, [tip]);
 
@@ -129,8 +143,10 @@ const TooltipLayer = () => {
             </span>
             {/* Arrow pointing at the element. */}
             <span
-                className={`absolute w-2.5 h-2.5 rotate-45 bg-neutral-900/95 dark:bg-neutral-100/95 ${below ? "-top-1" : "-bottom-1"}`}
-                style={{ left: "calc(var(--arrow-x) - 5px)" }}
+                className={`absolute w-2.5 h-2.5 rotate-45 bg-neutral-900/95 dark:bg-neutral-100/95 ${
+                    placement === "left" ? "-right-1" : placement === "below" ? "-top-1" : "-bottom-1"
+                }`}
+                style={placement === "left" ? { top: "calc(var(--arrow-y) - 5px)" } : { left: "calc(var(--arrow-x) - 5px)" }}
             />
         </div>,
         document.body
