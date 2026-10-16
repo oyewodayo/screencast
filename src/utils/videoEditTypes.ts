@@ -111,13 +111,17 @@ export type TransitionType =
   | "horzopen"
   // Not ffmpeg names: a crossfade / horizontal blur plus a glow pass (transition_fold_step).
   | "lightleak"
-  | "whip";
+  | "whip"
+  // Not ffmpeg names: xfade custom expressions (page_curl_expr, zoom_blur_expr, color_sweep_expr).
+  | "pagecurl"
+  | "zoomblur"
+  | "colorsweep";
 // Where a light leak's hot spot travels.
 export type LeakDirection = "right" | "left" | "down" | "up" | "diagonal" | "center";
 // The look of transitions that have one (TransitionLookControls). All optional - undefined is the
 // default look. Export: transition_glow_filter (conversion.rs); preview: TransitionPreviewLayer.
 export interface TransitionLook {
-  // Light leak / flash colour, "#rrggbb".
+  // Light leak / flash / colour sweep colour, "#rrggbb".
   color?: string;
   // Glow strength, 0.1..1.5 (1 = default).
   intensity?: number;

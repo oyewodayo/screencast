@@ -4321,6 +4321,7 @@ fn transition_fold_step(
     i: usize,
     accumulated: f64,
     seg_dur: f64,
+    fps: f64,
     transition: Option<(&str, f64)>,
     look: Option<&TransitionLook>,
 ) -> (String, String, String) {
@@ -4331,10 +4332,26 @@ fn transition_fold_step(
             // At most 90% of the incoming clip - it plays entirely over that clip's own start.
             let d = duration.min(seg_dur * 0.9).max(0.05);
             let offset = accumulated.max(0.0);
-            // The app's own transitions are an ffmpeg xfade plus, for some, a glow pass over the
-            // transition window (transition_glow_filter).
             let default_look = TransitionLook::default();
             let look = look.unwrap_or(&default_look);
+            if let Some(body) = drawn_transition(name, i, d, fps, look) {
+                // Drawn transitions: the incoming clip simply follows the outgoing one, and the
+                // outgoing clip's frozen last frame ([old{i}], timed from 0) is drawn over its start
+                // - the same layering the live preview uses (TransitionPreviewLayer). `fps` after
+                // setpts, which leaves the stream's frame rate unknown: without one, the tpad that
+                // holds each sprite in drawn_transition emits just its one frame.
+                return (
+                    format!(
+                        "[{cur_v}]split[pre{i}][tail{i}];[tail{i}]tpad=stop_mode=clone:stop_duration={d:.3},trim=start={start:.3},setpts=PTS-STARTPTS,fps={fps:.3}[old{i}];\
+                         {body}[pre{i}][{cur_a}][tr{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];",
+                        start = (offset - 0.001).max(0.0)
+                    ),
+                    next_v,
+                    next_a,
+                );
+            }
+            // The app's own transitions are an ffmpeg xfade plus, for some, a glow pass over the
+            // transition window (transition_glow_filter).
             let (xfade_name, glow) = match name {
                 "lightleak" => ("fade", Some(transition_glow_filter(TransitionGlow::LightLeak, offset, d, look))),
                 "whip" => ("hblur", Some(transition_glow_filter(TransitionGlow::Flash, offset, d, look))),
@@ -4358,6 +4375,109 @@ fn transition_fold_step(
         None => format!("[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"),
     };
     (step, next_v, next_a)
+}
+
+// BT.601 limited-range Y, Cb, Cr of an 8-bit RGB colour.
+fn rgb_to_yuv((r, g, b): (f64, f64, f64)) -> (i64, i64, i64) {
+    let (r, g, b) = (r / 255.0, g / 255.0, b / 255.0);
+    let y = 16.0 + 65.481 * r + 128.553 * g + 24.966 * b;
+    let u = 128.0 - 37.797 * r - 74.203 * g + 112.0 * b;
+    let v = 128.0 + 112.0 * r - 93.786 * g - 18.214 * b;
+    (y.round() as i64, u.round() as i64, v.round() as i64)
+}
+
+// The filters drawing one of the app's drawn transitions over the start of the incoming clip:
+// [old{i}] (the outgoing clip's frozen last frame, d seconds, timed from 0) over [v{i}], into
+// [tr{i}]. None for the xfade-based ones. Each mirrors the live preview's drawing of the same
+// transition (renderTransitionFrame, transitionFrame.ts).
+//
+// Everything that moves is a per-FRAME expression (overlay x/y, perspective corners, eq) over
+// native filters - never a per-pixel one: xfade's custom expressions and geq cost about a second
+// per 1080p frame (measured against the bundled ffmpeg), where these cost next to nothing. The
+// only geq here draws a page curl's sprites once, on one quarter-size frame.
+fn drawn_transition(name: &str, i: usize, d: f64, fps: f64, look: &TransitionLook) -> Option<String> {
+    // Transition progress 0..1 from an overlay's / eq's `t` (seconds since the window began).
+    let q = format!("min(t/{d:.3},1)");
+    match name {
+        // The old frame rushes at the camera - zoom 1 -> 2.6 by `perspective` (whose expressions
+        // only know the frame count), smeared by `tmix` across successive zoom steps (a true zoom
+        // blur, strongest where the zoom is fastest), fading out over the new clip through a soft
+        // white flash.
+        "zoomblur" => {
+            let k = look.intensity.unwrap_or(1.0).clamp(0.1, 1.5);
+            let frames = (d * fps.max(1.0)).max(1.0);
+            let z = format!("(1+1.6*pow(min(in/{frames:.3},1),2))");
+            let tmix = (2.0 + 2.0 * k).round().clamp(2.0, 5.0) as i64;
+            Some(format!(
+                "[old{i}]perspective=x0='W/2-W/2/{z}':y0='H/2-H/2/{z}':x1='W/2+W/2/{z}':y1='H/2-H/2/{z}':x2='W/2-W/2/{z}':y2='H/2+H/2/{z}':x3='W/2+W/2/{z}':y3='H/2+H/2/{z}':sense=source:eval=frame,\
+                 tmix=frames={tmix},format=yuva420p,fade=t=out:st=0:d={d:.3}:alpha=1[zoom{i}];\
+                 [v{i}][zoom{i}]overlay=eof_action=pass,eq=brightness='{flash:.3}*pow(sin(PI*{q}),2)':eval=frame:enable='lte(t,{d:.3})'[tr{i}];",
+                flash = 0.35 * k,
+            ))
+        }
+        // A colour panel slides across - one frame plus a lighter band at each end long, so its
+        // leading edge has covered the old frame by the midpoint (when the old frame goes) and its
+        // trailing edge uncovers the new clip after. Eased in and out (smoothstep).
+        "colorsweep" => {
+            const ACCENT: f64 = 0.08;
+            let (r, g, b) = look.color.as_deref().and_then(parse_hex_color).unwrap_or((255.0, 176.0, 32.0));
+            let (y, u, v) = rgb_to_yuv((r, g, b));
+            let lift = |c: f64| (c + (255.0 - c) * 0.55).round() as u8;
+            let accent = format!("0x{:02x}{:02x}{:02x}", lift(r), lift(g), lift(b));
+            let lead = format!("({:.3}*{q}*{q}*(3-2*{q}))", 2.0 + 2.0 * ACCENT);
+            let vertical = !matches!(look.direction.as_deref(), Some("left") | Some("right"));
+            let pad = if vertical {
+                format!("pad=iw:ih*{span}:0:ih*{ACCENT}:color={accent}", span = 1.0 + 2.0 * ACCENT)
+            } else {
+                format!("pad=iw*{span}:ih:iw*{ACCENT}:0:color={accent}", span = 1.0 + 2.0 * ACCENT)
+            };
+            let (x, y_pos) = match look.direction.as_deref() {
+                Some("down") => ("0".to_string(), format!("main_h*{lead}-overlay_h")),
+                Some("right") => (format!("main_w*{lead}-overlay_w"), "0".to_string()),
+                Some("left") => (format!("main_w*(1-{lead})"), "0".to_string()),
+                _ => ("0".to_string(), format!("main_h*(1-{lead})")),
+            };
+            Some(format!(
+                "[old{i}]split[oldf{i}][panel{i}];\
+                 [panel{i}]trim=end_frame=1,lutyuv=y={y}:u={u}:v={v},{pad},tpad=stop_mode=clone:stop_duration={d:.3}[sweep{i}];\
+                 [v{i}][oldf{i}]overlay=eof_action=pass:enable='lt(t,{half:.3})'[under{i}];\
+                 [under{i}][sweep{i}]overlay=x='{x}':y='{y_pos}':eof_action=pass[tr{i}];",
+                half = d / 2.0,
+            ))
+        }
+        // The old page peels away from its bottom-right corner along a fold line u+v = k (u, v =
+        // fractions across / down the frame) sweeping from k=2 to 0: the page shows on one side,
+        // the new clip on the other, with a paper-white curl over the page's edge and soft shadows
+        // either side of it. Both layers are functions of u+v-k alone, so each is drawn ONCE, on a
+        // sprite three frames wide (a = 3x/w - 2 + y/h runs over every u+v-k the frame needs),
+        // and slid left by 2*q frame widths: the page's mask (white = page) onto black, and the
+        // curl + shadows (with alpha) straight over the result. Drawn at quarter size and scaled
+        // up, which also softens their edges.
+        "pagecurl" => {
+            let a = "(3*X/W-2+Y/H)";
+            let sprite = |planes: &str, fmt: &str| {
+                format!("trim=end_frame=1,scale=iw*3/4:ih/4,format={fmt},geq={planes},scale=iw*4:ih*4,tpad=stop_mode=clone:stop_duration={d:.3}")
+            };
+            let mask = sprite(&format!("lum='255*clip(0.5-{a}*60,0,1)':cb=128:cr=128"), "yuv420p");
+            let curl = sprite(
+                &format!(
+                    "lum='if(between({a},-0.45,0),180+45*sin(PI*-{a}/0.45),16)':cb=128:cr=128:\
+                     a='if(between({a},-0.45,0),255,if(between({a},-0.51,-0.45),255*0.3*({a}+0.51)/0.06,if(between({a},0,0.12),255*0.45*(1-{a}/0.12),0)))'"
+                ),
+                "yuva420p",
+            );
+            let slide = format!("x='-2*main_w*{q}':y=0");
+            Some(format!(
+                "[old{i}]split=4[page{i}][canvas{i}][maskf{i}][curlf{i}];\
+                 [maskf{i}]{mask}[masks{i}];[curlf{i}]{curl}[curls{i}];\
+                 [canvas{i}]lutyuv=y=0:u=128:v=128[black{i}];[black{i}][masks{i}]overlay={slide}[mask{i}];\
+                 [page{i}][mask{i}]alphamerge[peel{i}];\
+                 [v{i}][peel{i}]overlay=eof_action=pass[paged{i}];\
+                 [paged{i}][curls{i}]overlay={slide}:eof_action=pass[tr{i}];"
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4443,6 +4563,10 @@ const ALLOWED_TRANSITIONS: &[&str] = &[
     // Not ffmpeg names - xfade plus a glow pass (see transition_fold_step).
     "lightleak",
     "whip",
+    // xfade custom expressions (page_curl_expr, zoom_blur_expr, color_sweep_expr).
+    "pagecurl",
+    "zoomblur",
+    "colorsweep",
 ];
 
 fn sanitize_transition_name(name: &str) -> &str {
@@ -5270,7 +5394,7 @@ pub async fn export_trimmed_video(
                     .filter(|tr| tr.duration > 0.0)
                     .map(|tr| (sanitize_transition_name(&tr.transition_type), tr.duration));
                 let look = seg.transition_in.as_ref().and_then(|tr| tr.look.as_ref());
-                let (step, next_v, next_a) = transition_fold_step(&cur_v, &cur_a, i, accumulated, seg_dur, transition, look);
+                let (step, next_v, next_a) = transition_fold_step(&cur_v, &cur_a, i, accumulated, seg_dur, target_fps, transition, look);
                 filter.push_str(&step);
                 accumulated += seg_dur;
                 cur_v = next_v;
@@ -7269,7 +7393,7 @@ mod tests {
 
     #[test]
     fn transition_holds_the_outgoing_frame_and_starts_where_it_ends() {
-        let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fade", 1.0)), None);
+        let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("fade", 1.0)), None);
         assert_eq!((v.as_str(), a.as_str()), ("fold1v", "fold1a"));
         assert!(step.contains("[v0]tpad=stop_mode=clone:stop_duration=1.000[hold1]"), "{step}");
         assert!(step.contains("xfade=transition=fade:duration=1.000:offset=5.000"), "{step}");
@@ -7279,26 +7403,26 @@ mod tests {
     #[test]
     fn transition_is_capped_by_the_incoming_clip_only() {
         // A tiny first clip no longer limits the transition - it plays over the incoming clip.
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 0.5, 2.0, Some(("wipeleft", 3.0)), None);
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 0.5, 2.0, 30.0, Some(("wipeleft", 3.0)), None);
         assert!(step.contains("duration=1.800:offset=0.500"), "{step}");
     }
 
     #[test]
     fn no_transition_is_a_plain_concat() {
-        let (step, _, _) = transition_fold_step("fold1v", "fold1a", 2, 9.0, 4.0, None, None);
+        let (step, _, _) = transition_fold_step("fold1v", "fold1a", 2, 9.0, 4.0, 30.0, None, None);
         assert_eq!(step, "[fold1v][fold1a][v2][a2]concat=n=2:v=1:a=1[fold2v][fold2a];");
     }
 
     #[test]
     fn light_leak_and_whip_add_a_glow_pass_over_the_transition_window() {
-        let (step, v, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("lightleak", 1.0)), None);
+        let (step, v, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("lightleak", 1.0)), None);
         assert_eq!(v, "fold1v");
         assert!(step.contains("xfade=transition=fade:duration=1.000:offset=5.000[xf1];"), "{step}");
         assert!(step.contains("[xf1]format=yuv420p,geq="), "{step}");
         assert!(step.contains("enable='between(t,5.000,6.000)'[fold1v];"), "{step}");
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("whip", 0.5)), None);
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("whip", 0.5)), None);
         assert!(step.contains("xfade=transition=hblur"), "{step}");
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("horzopen", 0.5)), None);
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("horzopen", 0.5)), None);
         assert!(step.contains("xfade=transition=horzopen") && !step.contains("geq"), "{step}");
         assert_eq!(sanitize_transition_name("lightleak"), "lightleak");
     }
@@ -7317,12 +7441,35 @@ mod tests {
         assert!(glow.contains("(198-cb(X,Y))") && glow.contains("(83-cr(X,Y))"), "{glow}");
         assert!(glow.contains("min(1,1.500*") && !glow.contains("drop"), "{glow}");
         assert!(parse_hex_color("red").is_none() && parse_hex_color("#12345g").is_none());
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("horzopen", 0.5)), Some(&look));
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("horzopen", 0.5)), Some(&look));
         assert!(step.contains("xfade=transition=vertopen"), "{step}");
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fadewhite", 0.5)), Some(&look));
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("fadewhite", 0.5)), Some(&look));
         assert!(step.contains("xfade=transition=fade") && step.contains("geq="), "{step}");
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, Some(("fadewhite", 0.5)), None);
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("fadewhite", 0.5)), None);
         assert!(step.contains("xfade=transition=fadewhite") && !step.contains("geq"), "{step}");
+    }
+
+    #[test]
+    fn drawn_transitions_lay_the_frozen_frame_over_the_incoming_clip() {
+        for name in ["pagecurl", "zoomblur", "colorsweep"] {
+            assert_eq!(sanitize_transition_name(name), name);
+            let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some((name, 0.8)), None);
+            assert_eq!((v.as_str(), a.as_str()), ("fold1v", "fold1a"));
+            // The outgoing clip's last frame, held for the transition and timed from 0...
+            assert!(step.starts_with("[v0]split[pre1][tail1];[tail1]tpad=stop_mode=clone:stop_duration=0.800,trim=start=4.999,setpts=PTS-STARTPTS,fps=30.000[old1];"), "{step}");
+            // ...drawn over the incoming clip, which simply follows the outgoing one.
+            assert!(step.ends_with("[pre1][a0][tr1][a1]concat=n=2:v=1:a=1[fold1v][fold1a];"), "{step}");
+            assert!(!step.contains("xfade"), "{step}");
+        }
+        // The sweep's colour and direction come from the look - parsed, never interpolated raw.
+        let look = TransitionLook { color: Some("#2563eb".into()), direction: Some("left".into()), ..Default::default() };
+        let step = drawn_transition("colorsweep", 1, 0.8, 30.0, &look).unwrap();
+        let (y, u, v) = rgb_to_yuv((37.0, 99.0, 235.0));
+        assert!(step.contains(&format!("lutyuv=y={y}:u={u}:v={v}")) && step.contains("x='main_w*(1-"), "{step}");
+        let hostile = TransitionLook { color: Some("'; drop".into()), direction: Some("'; drop".into()), ..Default::default() };
+        let step = drawn_transition("colorsweep", 1, 0.8, 30.0, &hostile).unwrap();
+        assert!(step.contains("y='main_h*(1-") && !step.contains("drop"), "{step}");
+        assert!(drawn_transition("fade", 1, 0.8, 30.0, &look).is_none());
     }
 
     #[test]

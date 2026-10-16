@@ -20,7 +20,8 @@
 //   which also hides the source swap itself.
 import React, { useEffect, useRef, useState } from "react";
 import { FrameRect } from "../../utils/videoFrameRect";
-import { Clip, LeakDirection, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
+import { Clip, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
+import { renderTransitionFrame } from "./transitionFrame";
 import { clipFrameStyle } from "../../utils/videoColorFilters";
 import { hasGrade, sampleLut } from "../../utils/colorGrade";
 import { clipOutputDuration, sourceToOutputOffset } from "../../utils/clipTiming";
@@ -130,35 +131,6 @@ function gradedFrame(url: string, time: number, grade: Clip["grade"]): Promise<H
 // One frame before the outgoing clip's own end, in its source time.
 const lastFrameTime = (clip: Clip): number => Math.max(clip.start, clip.end - 1 / 30);
 
-const PIXELIZE_MAX_BLOCK_PX = 40;
-
-// A light leak's hot spot at progress p, as fractions of the frame - the same path
-// transition_glow_filter (conversion.rs) gives ffmpeg.
-function leakSpot(direction: LeakDirection | undefined, p: number): [number, number] {
-  const sweep = -0.2 + 1.4 * p;
-  switch (direction) {
-    case "left":
-      return [1.2 - 1.4 * p, 0.35];
-    case "down":
-      return [0.4, sweep];
-    case "up":
-      return [0.4, 1.2 - 1.4 * p];
-    case "diagonal":
-      return [sweep, sweep];
-    case "center":
-      return [0.5, 0.5];
-    default:
-      return [sweep, 0.35];
-  }
-}
-
-const withAlpha = (hex: string, alpha: number): string => {
-  const m = /^#([0-9a-f]{6})$/i.exec(hex);
-  if (!m) return hex;
-  const n = parseInt(m[1], 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
-};
-
 const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRect, clips, activeClipId, getPlaybackState, resolveClipUrl }) => {
   const activeIndex = activeClipId ? clips.findIndex((clip) => clip.id === activeClipId) : -1;
   const incoming = activeIndex > 0 && hasTransition(clips[activeIndex]) ? clips[activeIndex] : null;
@@ -198,6 +170,8 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
   const glowRef = useRef<HTMLDivElement>(null);
   const canvasHostRef = useRef<HTMLDivElement>(null);
   const pixelCanvasRef = useRef<HTMLCanvasElement>(null);
+  // Drawn transition layers (page curl, colour sweep), over everything.
+  const fxCanvasRef = useRef<HTMLCanvasElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const readyCanvas = frame && frame.key === frameKey ? frame.canvas : null;
 
@@ -224,148 +198,15 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
     if (!incoming || !readyCanvas || !root || !mover || !black || !glow) return;
     const type: TransitionType = incoming.transitionIn!.type;
     const look: TransitionLook = incoming.transitionIn!.look ?? {};
-    const strength = Math.max(0.1, Math.min(1.5, look.intensity ?? 1));
     const duration = transitionDuration(incoming);
     const expectedUrl = incomingUrl?.clipId === incoming.id ? incomingUrl.url : null;
-    const { left: L, top: T, width: W, height: H } = frameRect;
-    const R = containerW - L - W;
-    const B = containerH - T - H;
-    const cx = L + W / 2;
-    const cy = T + H / 2;
+    const geometry = { L: frameRect.left, T: frameRect.top, W: frameRect.width, H: frameRect.height, containerW, containerH };
 
     const show = (visible: boolean) => {
       root.style.display = visible ? "" : "none";
     };
-    const render = (p: number) => {
-      mover.style.opacity = "1";
-      mover.style.transform = "";
-      mover.style.transformOrigin = "";
-      mover.style.clipPath = "";
-      mover.style.setProperty("mask-image", "");
-      mover.style.setProperty("-webkit-mask-image", "");
-      mover.style.filter = "";
-      black.style.opacity = "0";
-      glow.style.opacity = "0";
-      glow.style.mixBlendMode = "screen";
-      const pixel = pixelCanvasRef.current;
-      if (pixel) pixel.style.display = "none";
-      switch (type) {
-        case "fadeblack":
-          // Out to black over the first half, black out over the second (xfade fadeblack).
-          if (p < 0.5) black.style.opacity = String(p * 2);
-          else {
-            mover.style.opacity = "0";
-            black.style.opacity = String(2 - p * 2);
-          }
-          break;
-        case "fadewhite": {
-          const color = look.color ?? "#ffffff";
-          if (color.toLowerCase() === "#ffffff" && look.intensity === undefined) {
-            // Out to white over the first half, white out over the second (xfade fadewhite).
-            glow.style.background = "#ffffff";
-            if (p < 0.5) glow.style.opacity = String(p * 2);
-            else {
-              mover.style.opacity = "0";
-              glow.style.opacity = String(2 - p * 2);
-            }
-          } else {
-            // Crossfade washed in the flash colour at its peak (the export's glow pass).
-            mover.style.opacity = String(1 - p);
-            glow.style.background = color;
-            glow.style.mixBlendMode = color.toLowerCase() === "#000000" ? "normal" : "screen";
-            glow.style.opacity = String(Math.min(1, strength * Math.sin(Math.PI * p)));
-          }
-          break;
-        }
-        case "lightleak": {
-          // Crossfade under a coloured burn whose hot spot travels across, white-hot at its peak.
-          mover.style.opacity = String(1 - p);
-          const [sx, sy] = leakSpot(look.direction, p);
-          const size = Math.max(0.3, Math.min(2.5, look.size ?? 1));
-          const color = look.color ?? "#ff7a2e";
-          glow.style.background = [
-            `radial-gradient(ellipse ${0.83 * size * W}px ${0.83 * size * H}px at ${sx * 100}% ${sy * 100}%, rgba(255,252,240,1) 0%, ${withAlpha(color, 0.95)} 35%, ${withAlpha(color, 0)} 100%)`,
-            `linear-gradient(${withAlpha(color, 0.5)}, ${withAlpha(color, 0.5)})`,
-          ].join(", ");
-          glow.style.opacity = String(Math.min(1, Math.sin(Math.PI * p) * 1.15 * strength));
-          break;
-        }
-        case "whip": {
-          // A sideways smear through a white flash.
-          mover.style.opacity = String(1 - p);
-          mover.style.transform = `translateX(${-W * 0.3 * p}px)`;
-          mover.style.filter = `blur(${Math.sin(Math.PI * p) * W * 0.03}px)`;
-          glow.style.background = "#ffffff";
-          glow.style.opacity = String(Math.min(1, 0.8 * strength * Math.sin(Math.PI * p) ** 2));
-          break;
-        }
-        case "horzopen": {
-          // The incoming clip opens out of a line through the middle - horizontal, or vertical (doors).
-          const vertical = look.orientation === "vertical";
-          const span = vertical ? W : H;
-          const mid = vertical ? cx : cy;
-          const soft = span * 0.04;
-          const band = p * (span / 2 + soft);
-          const a = mid - band;
-          const b = mid + band;
-          const mask = `linear-gradient(to ${vertical ? "right" : "bottom"}, #000 ${a}px, transparent ${a + soft}px, transparent ${Math.max(a + soft, b - soft)}px, #000 ${b}px)`;
-          mover.style.setProperty("mask-image", mask);
-          mover.style.setProperty("-webkit-mask-image", mask);
-          break;
-        }
-        case "wipeleft":
-          mover.style.clipPath = `inset(${T}px ${R + W * p}px ${B}px ${L}px)`;
-          break;
-        case "wiperight":
-          mover.style.clipPath = `inset(${T}px ${R}px ${B}px ${L + W * p}px)`;
-          break;
-        case "slideleft":
-          mover.style.transform = `translateX(${-W * p}px)`;
-          break;
-        case "slideright":
-          mover.style.transform = `translateX(${W * p}px)`;
-          break;
-        case "circleopen": {
-          const radius = (p * Math.hypot(W, H)) / 2;
-          const mask = `radial-gradient(circle at ${cx}px ${cy}px, transparent ${radius}px, #000 ${radius + 1}px)`;
-          mover.style.setProperty("mask-image", mask);
-          mover.style.setProperty("-webkit-mask-image", mask);
-          break;
-        }
-        case "radial": {
-          const angle = p * 360;
-          const mask = `conic-gradient(from 0deg at ${cx}px ${cy}px, transparent ${angle}deg, #000 ${angle}deg)`;
-          mover.style.setProperty("mask-image", mask);
-          mover.style.setProperty("-webkit-mask-image", mask);
-          break;
-        }
-        case "zoomin":
-          mover.style.transformOrigin = `${cx}px ${cy}px`;
-          mover.style.transform = `scale(${1 + p})`;
-          mover.style.opacity = String(1 - p);
-          break;
-        case "pixelize": {
-          // Coarsens toward the midpoint, then hands over to the new clip.
-          if (p >= 0.5 || !pixel) {
-            mover.style.opacity = "0";
-            break;
-          }
-          const block = 1 + (PIXELIZE_MAX_BLOCK_PX - 1) * (p * 2);
-          const w = Math.max(1, Math.round(W / block));
-          const h = Math.max(1, Math.round(H / block));
-          if (pixel.width !== w || pixel.height !== h) {
-            pixel.width = w;
-            pixel.height = h;
-          }
-          pixel.getContext("2d")?.drawImage(readyCanvas, 0, 0, w, h);
-          pixel.style.display = "block";
-          break;
-        }
-        default:
-          // fade, dissolve
-          mover.style.opacity = String(1 - p);
-      }
-    };
+    const render = (p: number) =>
+      renderTransitionFrame(type, look, p, { mover, black, glow, pixel: pixelCanvasRef.current, fx: fxCanvasRef.current, source: readyCanvas }, geometry);
 
     let raf = 0;
     const tick = () => {
@@ -410,6 +251,7 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
       </div>
       <div ref={blackRef} className="absolute bg-black" style={{ left: L, top: T, width: W, height: H, opacity: 0 }} />
       <div ref={glowRef} className="absolute" style={{ left: L, top: T, width: W, height: H, opacity: 0, mixBlendMode: "screen" }} />
+      <canvas ref={fxCanvasRef} className="absolute" style={{ left: L, top: T, width: W, height: H, display: "none" }} />
     </div>
   );
 };

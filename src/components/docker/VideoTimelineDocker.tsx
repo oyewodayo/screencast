@@ -4061,6 +4061,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <ClipEffectsPopover
               clip={clip}
               hasPrecedingClip={clipIndex > 0 || selectedCount > 1}
+              previousClip={clipIndex > 0 ? editStore.clips[clipIndex - 1] : undefined}
               isOnScreen={activeClip?.id === clip.id}
               anchor={effectsPopoverAnchor}
               selectedCount={selectedCount}

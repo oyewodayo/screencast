@@ -7,8 +7,25 @@
 import React from "react";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 import { LeakDirection, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
+import { DEFAULT_SWEEP_COLOR } from "../video/transitionFrame";
 
-export const transitionHasLook = (type: TransitionType | null): boolean => type === "lightleak" || type === "fadewhite" || type === "whip" || type === "horzopen";
+export const transitionHasLook = (type: TransitionType | null): boolean =>
+  type === "lightleak" || type === "fadewhite" || type === "whip" || type === "horzopen" || type === "zoomblur" || type === "colorsweep";
+
+const SWEEP_COLORS: { color: string; name: string }[] = [
+  { color: DEFAULT_SWEEP_COLOR, name: "Golden" },
+  { color: "#ff6a1a", name: "Orange" },
+  { color: "#ff3b6b", name: "Pink" },
+  { color: "#2563eb", name: "Blue" },
+  { color: "#10b981", name: "Green" },
+  { color: "#111111", name: "Black" },
+];
+const SWEEP_DIRECTIONS: { value: LeakDirection; label: string; title: string }[] = [
+  { value: "up", label: "↑", title: "Sweeps up from the bottom" },
+  { value: "down", label: "↓", title: "Sweeps down from the top" },
+  { value: "right", label: "→", title: "Sweeps left to right" },
+  { value: "left", label: "←", title: "Sweeps right to left" },
+];
 
 const LEAK_COLORS: { color: string; name: string }[] = [
   { color: "#ff7a2e", name: "Warm" },
@@ -121,7 +138,22 @@ const TransitionLookControls: React.FC<{ type: TransitionType; look: TransitionL
         {strength}
       </>
     );
-  if (type === "whip") return strength;
+  if (type === "whip" || type === "zoomblur") return strength;
+  if (type === "colorsweep") {
+    const direction = SWEEP_DIRECTIONS.some((d) => d.value === look.direction) ? look.direction : "up";
+    return (
+      <>
+        <ColorRow colors={SWEEP_COLORS} value={look.color ?? DEFAULT_SWEEP_COLOR} onChange={(color) => set({ color })} />
+        <Row label="Sweep">
+          {SWEEP_DIRECTIONS.map((d) => (
+            <Chip key={d.value} active={direction === d.value} title={d.title} onClick={() => set({ direction: d.value })}>
+              {d.label}
+            </Chip>
+          ))}
+        </Row>
+      </>
+    );
+  }
   if (type === "horzopen")
     return (
       <Row label="Opens">

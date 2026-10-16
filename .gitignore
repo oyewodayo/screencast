@@ -23,6 +23,7 @@ target
 .idea
 .DS_Store
 RECORDING_UPGRADE_NOTES.md
+VIDEO_EDITOR_ROADMAP.md
 *.suo
 *.ntvs*
 *.njsproj

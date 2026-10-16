@@ -16,7 +16,8 @@ import TransitionLookControls, { transitionHasLook } from "./TransitionLookContr
 import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
 import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
-import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
+import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS } from "../../utils/videoColorFilters";
+import TransitionGrid from "./TransitionGrid";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost } from "./ToolPanelHost";
 import ColorGradeControls from "./ColorGradeControls";
@@ -32,6 +33,8 @@ export const DEFAULT_TRANSITION_DURATION = 0.5;
 interface ClipEffectsPopoverProps {
   clip: Clip;
   hasPrecedingClip: boolean;
+  // The clip before this one, whose last frame the transition tiles play out of.
+  previousClip?: Clip;
   // Whether this clip is the one in the preview right now (the grade's histogram reads the screen).
   isOnScreen: boolean;
   anchor: { left: number; top: number };
@@ -56,7 +59,7 @@ const PresetButton: React.FC<{ active: boolean; onClick: () => void; children: R
   </button>
 );
 
-const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, isOnScreen, anchor, selectedCount, onUpdate, onClose }) => {
+const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, previousClip, isOnScreen, anchor, selectedCount, onUpdate, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
@@ -222,16 +225,7 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
       {hasPrecedingClip && (
         <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10" title="Plays over the start of this clip, from the previous clip's last frame - in the preview and the export alike">
           <span className="text-[10px] uppercase tracking-wide text-white/40">Transition (with previous clip)</span>
-          <PresetRow>
-            <PresetButton active={transitionType === null} onClick={() => setTransitionType(null)}>
-              None
-            </PresetButton>
-            {TRANSITION_PRESETS.map((p) => (
-              <PresetButton key={p.value} active={transitionType === p.value} onClick={() => setTransitionType(p.value)}>
-                {p.label}
-              </PresetButton>
-            ))}
-          </PresetRow>
+          <TransitionGrid value={transitionType} look={transitionLook} outgoing={previousClip} incoming={clip} onChange={setTransitionType} />
           {transitionType !== null && (
             <label className="flex items-center gap-2 text-[11px] pt-0.5">
               <span className="w-12 shrink-0 text-white/60">Duration</span>
