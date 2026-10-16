@@ -47,6 +47,7 @@ mod services {
     pub mod share;
     // Opt-out analytics + crash reports, compiled in only for release builds with keys.
     pub mod telemetry;
+    pub mod sidecars;
     pub mod trash;
     pub mod utility;
     pub mod whisper_model;
@@ -438,6 +439,9 @@ fn main() {
             commands::conversion::get_image_thumbnail,
             commands::conversion::get_video_thumbnail,
             commands::conversion::set_video_thumbnail,
+            commands::conversion::set_video_thumbnail_from_image,
+            commands::conversion::set_video_thumbnail_from_bytes,
+            commands::conversion::make_share_ready_copy,
             commands::conversion::get_video_scrub_sprite,
             commands::conversion::generate_captions,
             commands::conversion::generate_caption_words,
@@ -479,6 +483,7 @@ fn main() {
             services::utility::delete_folder,
             services::utility::move_file,
             services::utility::import_file,
+            services::utility::transfer_file,
             services::utility::get_platform,
             services::utility::get_briefcast_dir,
             services::utility::get_default_briefcast_dir,

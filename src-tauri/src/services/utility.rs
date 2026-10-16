@@ -819,9 +819,93 @@ pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String
     if dest_path.exists() {
         return Err("A file with that name already exists in that folder".to_string());
     }
+    crate::services::sidecars::check_destination_free(&dest_path)?;
 
     fs::rename(&source, &dest_path).map_err(|e| format!("Failed to move file: {}", e))?;
+    if let Err(e) = crate::services::sidecars::carry_sidecars(&source, &dest_path) {
+        let _ = fs::rename(&dest_path, &source);
+        return Err(e);
+    }
     path_to_str(&dest_path).map(|s| s.to_string())
+}
+
+// "Move to / Copy to" for the open file (the player's and timeline's file menus) - the one entry
+// point for a library file AND one opened from anywhere else on disk. `dest_folder_path` is a
+// library folder key ("" = root) unless `dest_is_absolute`, in which case it's any folder on disk
+// (the "Other location..." picker). Unlike move_file, a name already taken at the destination
+// gets a " (2)"-style suffix instead of failing, and a move between drives (where a rename can't
+// work - an external file on D: into the library on C:) falls back to copy-then-delete. The
+// file's saved edits travel with it either way (sidecars.rs). Returns the file's new path.
+#[command(async)]
+pub fn transfer_file(source_path: String, dest_folder_path: String, dest_is_absolute: bool, copy: bool) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
+    let dest_dir = if dest_is_absolute {
+        PathBuf::from(&dest_folder_path)
+    } else {
+        resolve_relative(&briefcast_dir()?, &dest_folder_path)?
+    };
+    if !dest_dir.is_dir() {
+        return Err("Destination folder does not exist".to_string());
+    }
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err("File does not exist".to_string());
+    }
+    let file_name = source.file_name().ok_or("Invalid source file name")?;
+    if !copy && dest_dir.join(file_name) == source {
+        return path_to_str(&source).map(|s| s.to_string());
+    }
+
+    let dest_path = free_destination(&dest_dir, Path::new(file_name))?;
+    let copy_with_sidecars = || -> Result<(), String> {
+        fs::copy(&source, &dest_path).map_err(|e| format!("Failed to copy file: {}", e))?;
+        if let Err(e) = crate::services::sidecars::copy_sidecars(&source, &dest_path) {
+            let _ = fs::remove_file(&dest_path);
+            return Err(e);
+        }
+        Ok(())
+    };
+
+    if copy {
+        copy_with_sidecars()?;
+    } else if fs::rename(&source, &dest_path).is_ok() {
+        if let Err(e) = crate::services::sidecars::carry_sidecars(&source, &dest_path) {
+            let _ = fs::rename(&dest_path, &source);
+            return Err(e);
+        }
+    } else {
+        // Most likely a different drive - copy, then remove the original only once the copy is whole.
+        copy_with_sidecars()?;
+        if let Err(e) = fs::remove_file(&source) {
+            let _ = fs::remove_file(&dest_path);
+            crate::services::sidecars::remove_sidecars(&dest_path);
+            return Err(format!("Copied the file, but couldn't remove the original - it may be open elsewhere ({})", e));
+        }
+        crate::services::sidecars::remove_sidecars(&source);
+    }
+    path_to_str(&dest_path).map(|s| s.to_string())
+}
+
+// `name` inside `dir`, or "stem (2).ext", "stem (3).ext"... - the first one with no file and no
+// leftover saved edits (sidecars.rs) already sitting there.
+fn free_destination(dir: &Path, name: &Path) -> Result<PathBuf, String> {
+    let is_free = |p: &Path| !p.exists() && crate::services::sidecars::check_destination_free(p).is_ok();
+    let first = dir.join(name);
+    if is_free(&first) {
+        return Ok(first);
+    }
+    let stem = name.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = name.extension().and_then(|e| e.to_str());
+    for n in 2..1000 {
+        let candidate = dir.join(match ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        });
+        if is_free(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err("Couldn't find a free name for the file in that folder".to_string())
 }
 
 // Copies an external file (e.g. dragged in from the OS file explorer) into a Briefcast folder,
@@ -987,8 +1071,14 @@ pub fn rename_file(old_path: String, new_name: String) -> Result<String, String>
     if new_path.exists() {
         return Err("A file with that name already exists".to_string());
     }
+    // The file's saved edits (timeline, annotations...) are renamed with it - see sidecars.rs.
+    crate::services::sidecars::check_destination_free(&new_path)?;
 
     fs::rename(&old, &new_path).map_err(|e| format!("Failed to rename file: {}", e))?;
+    if let Err(e) = crate::services::sidecars::carry_sidecars(&old, &new_path) {
+        let _ = fs::rename(&new_path, &old);
+        return Err(e);
+    }
 
     path_to_str(&new_path).map(|s| s.to_string())
 }
@@ -1227,6 +1317,33 @@ mod relocate_tests {
         assert!(base.join("src").join("inner").join("f.txt").exists());
         remove_any(&base.join("dest")).unwrap();
         assert!(!base.join("dest").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn transfer_file_suffixes_clashes_and_brings_saved_edits_along() {
+        let base = std::env::temp_dir().join(format!("briefcast_transfer_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (from, to) = (base.join("from"), base.join("to"));
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        let src = from.join("talk.mp4");
+        fs::write(&src, b"video").unwrap();
+        fs::write(crate::services::sidecars::sidecar_path(&src, ".edits.json"), "{}").unwrap();
+        fs::write(to.join("talk.mp4"), b"someone else").unwrap();
+        let dest = to.to_str().unwrap().to_string();
+
+        let copied = transfer_file(src.to_str().unwrap().into(), dest.clone(), true, true).unwrap();
+        assert!(copied.ends_with("talk (2).mp4"), "{copied}");
+        assert!(src.exists(), "a copy leaves the original");
+        assert!(crate::services::sidecars::sidecar_path(Path::new(&copied), ".edits.json").exists());
+
+        let moved = transfer_file(src.to_str().unwrap().into(), dest, true, false).unwrap();
+        assert!(moved.ends_with("talk (3).mp4"), "{moved}");
+        assert!(!src.exists());
+        assert!(crate::services::sidecars::existing_sidecars(&src).is_empty());
+        assert!(crate::services::sidecars::sidecar_path(Path::new(&moved), ".edits.json").exists());
+        assert_eq!(fs::read(to.join("talk.mp4")).unwrap(), b"someone else");
         let _ = fs::remove_dir_all(&base);
     }
 }

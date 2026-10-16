@@ -1,5 +1,6 @@
 import React, { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
 import type { ReframePreview } from "./video/ReframePreviewLayer";
+import type { FileTransferOptions } from "./docker/MoveCopyMenu";
 import "./docker/bottomDocker.css";
 import OsInfo from "./OsInfo";
 
@@ -76,6 +77,10 @@ interface Props {
   onConvertFile: (file: DockerFile) => void;
   onRenameFile: (file: DockerFile, newName: string) => Promise<void>;
   onDeleteFile: (file: DockerFile) => Promise<void>;
+  // "Move or copy to..." for the open file (MoveCopyMenu.tsx).
+  fileTransfer?: FileTransferOptions;
+  // Opens the player's "Set thumbnail" picker for the open video.
+  onSetThumbnail?: () => void;
   onExportedFile: (newPath: string, newFileName: string) => void;
   // Video-only: drag-in-a-clip support for the timeline, threaded straight through to
   // VideoTimelineDocker - see its own prop doc comments for what each of these actually does.
@@ -235,6 +240,8 @@ const BottomDocker = ({
   onConvertFile,
   onRenameFile,
   onDeleteFile,
+  fileTransfer,
+  onSetThumbnail,
   onExportedFile,
   draggingLibraryFile,
   pendingTimelineInsert,
@@ -677,6 +684,8 @@ const BottomDocker = ({
             onConvert={onConvertFile}
             onRename={onRenameFile}
             onDelete={onDeleteFile}
+            fileTransfer={fileTransfer}
+            onSetThumbnail={onSetThumbnail}
             onExported={onExportedFile}
             draggingLibraryFile={draggingLibraryFile}
             pendingTimelineInsert={pendingTimelineInsert}

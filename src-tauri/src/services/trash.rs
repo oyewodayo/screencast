@@ -114,6 +114,13 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
         }
     })?;
 
+    // Its saved edits go into the trash with it (and come back on restore) - left behind they'd
+    // be lost to a restore, and picked up by the next file to take this name (sidecars.rs).
+    if let Err(e) = crate::services::sidecars::carry_sidecars(&source, &destination) {
+        let _ = fs::rename(&destination, &source);
+        return Err(e);
+    }
+
     records.push(TrashRecord {
         trashed_name,
         original_path: path,
@@ -123,6 +130,7 @@ pub fn move_to_trash(path: String) -> Result<(), String> {
         // Unrecorded, the file would sit in .trash invisible to the Trash view and never restorable
         // - put it back where it was instead.
         let _ = fs::rename(&destination, &source);
+        let _ = crate::services::sidecars::carry_sidecars(&destination, &source);
         return Err(e);
     }
 
@@ -196,7 +204,17 @@ pub fn restore_from_trash(trashed_name: String) -> Result<String, String> {
         return Err("Trashed file is missing on disk".to_string());
     }
 
-    let destination = free_restore_path(&PathBuf::from(&record.original_path));
+    // A spot that's free of the file AND of any leftover edits under its name.
+    let mut destination = free_restore_path(&PathBuf::from(&record.original_path));
+    if crate::services::sidecars::check_destination_free(&destination).is_err() {
+        let parent = destination.parent().map(Path::to_path_buf).unwrap_or_default();
+        let stem = destination.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+        let ext = destination.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
+        destination = (1..)
+            .map(|n| parent.join(format!("{} (restored {}){}", stem, n, ext)))
+            .find(|c| !c.exists() && crate::services::sidecars::check_destination_free(c).is_ok())
+            .unwrap();
+    }
     if let Some(parent) = destination.parent() {
         if !parent.exists() {
             fs::create_dir_all(parent)
@@ -205,6 +223,10 @@ pub fn restore_from_trash(trashed_name: String) -> Result<String, String> {
     }
 
     fs::rename(&source, &destination).map_err(|e| format!("Failed to restore file: {}", e))?;
+    if let Err(e) = crate::services::sidecars::carry_sidecars(&source, &destination) {
+        let _ = fs::rename(&destination, &source);
+        return Err(e);
+    }
     write_manifest(&records)?;
 
     path_to_str(&destination).map(|s| s.to_string())
@@ -224,6 +246,7 @@ pub fn delete_trash_item(trashed_name: String) -> Result<(), String> {
     if path.exists() {
         fs::remove_file(&path).map_err(|e| format!("Failed to delete file: {}", e))?;
     }
+    crate::services::sidecars::remove_sidecars(&path);
     write_manifest(&records)?;
 
     Ok(())
@@ -236,6 +259,7 @@ pub fn empty_trash() -> Result<(), String> {
     for record in &records {
         let path = trash_dir()?.join(&record.trashed_name);
         let _ = fs::remove_file(&path);
+        crate::services::sidecars::remove_sidecars(&path);
     }
     write_manifest(&Vec::new())?;
     Ok(())
@@ -260,6 +284,7 @@ pub fn purge_expired_trash(retention_days: i64) -> Result<u32, String> {
     for record in &expired {
         let path = trash_dir()?.join(&record.trashed_name);
         let _ = fs::remove_file(&path);
+        crate::services::sidecars::remove_sidecars(&path);
     }
 
     if !expired.is_empty() {

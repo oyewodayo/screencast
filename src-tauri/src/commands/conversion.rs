@@ -456,8 +456,21 @@ pub async fn get_playable_preview(
     let input = PathBuf::from(&input_path);
     let cache_path = preview_cache_path(&input, "video", "mp4")?;
 
+    // One conversion per file at a time: the player, the timeline's filmstrip and an inserted
+    // clip can all ask for the same file at once (an iPhone HEVC .MOV none of them can decode) -
+    // the later callers wait here and then get the finished file from the check below.
+    let flight = {
+        static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> =
+            std::sync::OnceLock::new();
+        let mut map = IN_FLIGHT.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+        map.entry(cache_path.clone()).or_default().clone()
+    };
+    let _guard = flight.lock().await;
+
     // Already converted (fully, from a previous open) - just hand back the finished file, no
-    // need to ever re-run ffmpeg for the same source.
+    // need to ever re-run ffmpeg for the same source. Only ever a WHOLE file: the conversion
+    // writes to a .partial sibling and renames it into place once ffmpeg has succeeded, so an
+    // interrupted run (app closed mid-way) can't leave a truncated file to be served from here.
     if cache_path.exists() {
         return path_to_str(&cache_path).map(|s| s.to_string());
     }
@@ -466,6 +479,8 @@ pub async fn get_playable_preview(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create preview cache directory: {}", e))?;
     }
+    let partial_path = cache_path.with_extension("partial.mp4");
+    let _ = std::fs::remove_file(&partial_path); // a leftover from an interrupted run
 
     let codec_args = [
         "-c:v",
@@ -488,10 +503,159 @@ pub async fn get_playable_preview(
         &state,
         &[InputSpec::plain(input_path.clone())],
         &input_path,
-        cache_path,
+        partial_path.clone(),
         &codec_args,
     )
-    .await
+    .await?;
+    std::fs::rename(&partial_path, &cache_path).map_err(|e| {
+        let _ = std::fs::remove_file(&partial_path);
+        format!("Failed to finish the playable copy: {}", e)
+    })?;
+    path_to_str(&cache_path).map(|s| s.to_string())
+}
+
+// How long a share-ready copy holds the thumbnail before the video starts.
+const SHARE_COVER_SECONDS: f64 = 0.3;
+
+// A copy of the video that OPENS on its chosen thumbnail. WhatsApp, Telegram, Instagram and the
+// like ignore a video's embedded cover (set_video_thumbnail) and build their preview from its
+// first frame - so a video that starts on black shows as black there however carefully its cover
+// was chosen. This holds the thumbnail for SHARE_COVER_SECONDS at the start (silence under it),
+// then the video as it was: re-encoded to H.264/AAC MP4 (needed to join the two; also the format
+// every messaging app takes), fitted to the video's own size and frame rate. The original is left
+// alone; the copy lands next to it as "<name> (share-ready).mp4". Reports progress on the same
+// "conversion-progress" event as any conversion, keyed by the input path.
+#[tauri::command]
+pub async fn make_share_ready_copy(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    input_path: String,
+) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let cover = custom_thumbnail_path(&app_handle, &input)?;
+    if !cover.exists() {
+        return Err("Set a thumbnail for this video first".to_string());
+    }
+
+    let probe = {
+        let ffprobe_path = get_ffprobe_path(&app_handle)?;
+        let input = input.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
+            let mut cmd = Command::new(&ffprobe_path);
+            cmd.args(["-v", "quiet", "-print_format", "json", "-show_streams"]);
+            cmd.arg(path_to_str(&input)?);
+            #[cfg(windows)]
+            hide_console_window(&mut cmd);
+            let output = cmd.output().map_err(|e| format!("Failed to run ffprobe: {}", e))?;
+            serde_json::from_slice(&output.stdout).map_err(|e| format!("Failed to read the video's details: {}", e))
+        })
+        .await
+        .map_err(|e| format!("Video check panicked: {e}"))??
+    };
+    let streams = probe["streams"].as_array().cloned().unwrap_or_default();
+    let video = streams
+        .iter()
+        .find(|st| st["codec_type"] == "video" && st["disposition"]["attached_pic"].as_i64() != Some(1))
+        .ok_or("This file has no video to put a thumbnail on")?;
+    let has_audio = streams.iter().any(|st| st["codec_type"] == "audio");
+    let (mut width, mut height) = (video["width"].as_u64().unwrap_or(0), video["height"].as_u64().unwrap_or(0));
+    if width == 0 || height == 0 {
+        return Err("Couldn't read the video's size".to_string());
+    }
+    // ffmpeg turns a rotated phone video upright as it decodes - the opening frame has to match.
+    let rotation = video["side_data_list"]
+        .as_array()
+        .and_then(|list| list.iter().find_map(|d| d["rotation"].as_f64()))
+        .or_else(|| video["tags"]["rotate"].as_str().and_then(|r| r.parse::<f64>().ok()))
+        .unwrap_or(0.0);
+    if (rotation.abs() as i64) % 180 == 90 {
+        std::mem::swap(&mut width, &mut height);
+    }
+    let (width, height) = (width - width % 2, height - height % 2);
+    let fps = video["r_frame_rate"]
+        .as_str()
+        .filter(|r| {
+            let mut parts = r.split('/').map(|n| n.parse::<f64>().unwrap_or(0.0));
+            let (num, den) = (parts.next().unwrap_or(0.0), parts.next().unwrap_or(1.0));
+            den > 0.0 && num / den >= 1.0 && num / den <= 120.0
+        })
+        .unwrap_or("30")
+        .to_string();
+
+    let fit = format!("scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},format=yuv420p");
+    let cover_chain = format!("[1:v]{fit},trim=duration={SHARE_COVER_SECONDS},setpts=PTS-STARTPTS[c]");
+    let video_chain = format!("[0:V:0]{fit}[v]");
+    let graph = if has_audio {
+        format!(
+            "{cover_chain};{video_chain};anullsrc=r=48000:cl=stereo,atrim=duration={SHARE_COVER_SECONDS}[s];[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a];[c][s][v][a]concat=n=2:v=1:a=1[ov][oa]"
+        )
+    } else {
+        format!("{cover_chain};{video_chain};[c][v]concat=n=2:v=1:a=0[ov]")
+    };
+    let mut args: Vec<String> = vec!["-filter_complex".into(), graph, "-map".into(), "[ov]".into()];
+    if has_audio {
+        args.extend(["-map".into(), "[oa]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
+    }
+    args.extend(
+        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-map_metadata", "0", "-movflags", "+faststart"]
+            .iter()
+            .map(|a| a.to_string()),
+    );
+    // Pinned to the video's own rate - left to itself the joined output took the still image's
+    // default 25 fps and dropped one frame in six of a 30 fps video (measured: SSIM 0.96 against
+    // the original, vs 0.99 - the encoder's own ceiling at this CRF - with this).
+    args.extend(["-r".to_string(), fps.clone()]);
+    // The source's colour description carries over (an iPhone's Display-P3 tagging, HDR transfer...)
+    // - without it, colour-managed players show the copy slightly off.
+    for (flag, key) in [("-color_primaries", "color_primaries"), ("-color_trc", "color_transfer"), ("-colorspace", "color_space"), ("-color_range", "color_range")] {
+        if let Some(value) = video[key].as_str().filter(|v| !v.is_empty() && *v != "unknown" && *v != "reserved") {
+            args.extend([flag.to_string(), value.to_string()]);
+        }
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+    let output = input.with_file_name(format!("{stem} (share-ready).mp4"));
+    let cover_input = InputSpec {
+        path: path_to_str(&cover)?.to_string(),
+        pre_args: vec!["-framerate".into(), fps.clone(), "-loop".into(), "1".into(), "-t".into(), format!("{SHARE_COVER_SECONDS}")],
+    };
+    // The path actually written - "(1)" etc. is added when an earlier share-ready copy is there.
+    let written = run_conversion(
+        &app_handle,
+        &window,
+        &state,
+        &[InputSpec::plain(input_path.clone()), cover_input],
+        &input_path,
+        output,
+        &arg_refs,
+    )
+    .await?;
+
+    // Messaging apps read the first frame, but File Explorer reads the embedded cover - and
+    // without one it picks some frame from the middle. So the copy carries the cover too (the same
+    // re-mux set_video_thumbnail does - WhatsApp sends such files fine), and Briefcast shows it as
+    // well. Best effort: a copy without the embedded cover still does its main job.
+    let output = PathBuf::from(&written);
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let tmp = output.with_extension("thumbtmp.mp4");
+    match embed_cover_art(&ffmpeg_path, &output, &cover, &tmp, 1).await {
+        Ok(()) => {
+            if let Err(e) = std::fs::rename(&tmp, &output) {
+                let _ = std::fs::remove_file(&tmp);
+                log::warn!("Share-ready copy kept without an embedded cover: {e}");
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            log::warn!("Share-ready copy kept without an embedded cover: {e}");
+        }
+    }
+    if let Ok(custom) = custom_thumbnail_path(&app_handle, &output) {
+        let _ = std::fs::copy(&cover, custom);
+    }
+    path_to_str(&output).map(|s| s.to_string())
 }
 
 // How long an image clip's preview proxy runs - and so the longest an image clip can be stretched
@@ -1165,6 +1329,12 @@ pub async fn get_video_thumbnail(
     input_path: String,
 ) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
+    // One the user chose ("Set thumbnail") wins over any extracted frame - see custom_thumbnail_path.
+    if let Ok(custom) = custom_thumbnail_path(&app_handle, &input) {
+        if custom.exists() {
+            return path_to_str(&custom).map(|s| s.to_string());
+        }
+    }
     let cache_path = preview_cache_path(&input, "video_thumb_v1", "jpg")?;
 
     if cache_path.exists() {
@@ -1192,12 +1362,12 @@ pub async fn get_video_thumbnail(
     }
 
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
-    if let Err(err) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:01").await {
+    if let Err(err) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:01", 480).await {
         log::warn!(
             "Video thumbnail seek to 1s failed for {}: {err}; retrying at frame 0",
             input.display()
         );
-        if let Err(err2) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:00").await
+        if let Err(err2) = extract_video_frame(&ffmpeg_path, &input, &cache_path, "00:00:00", 480).await
         {
             let combined = format!("{err}; retry at frame 0 also failed: {err2}");
             log::error!("Video thumbnail failed for {}: {combined}", input.display());
@@ -1244,7 +1414,7 @@ pub async fn set_video_thumbnail(
     app_handle: AppHandle,
     input_path: String,
     time: f64,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
     let cache_path = preview_cache_path(&input, "video_thumb_v1", "jpg")?;
 
@@ -1255,7 +1425,184 @@ pub async fn set_video_thumbnail(
 
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
     let seek = format!("{:.3}", time.max(0.0));
-    extract_video_frame(&ffmpeg_path, &input, &cache_path, &seek).await?;
+    extract_video_frame(&ffmpeg_path, &input, &cache_path, &seek, 1920).await?;
+    embed_cover_and_replace(&app_handle, &ffmpeg_path, &input, &cache_path, &input_path).await
+}
+
+// set_video_thumbnail's counterpart for a picture from disk instead of one of the video's own
+// frames ("Choose image..." in the thumbnail picker). ffmpeg converts whatever image it is (png,
+// webp, a big camera jpg...) into the same downscaled jpg in get_video_thumbnail's cache slot,
+// then the same embed-and-replace step runs.
+#[tauri::command]
+pub async fn set_video_thumbnail_from_image(
+    app_handle: AppHandle,
+    input_path: String,
+    image_path: String,
+) -> Result<String, String> {
+    let input = PathBuf::from(&input_path);
+    let image = PathBuf::from(&image_path);
+    if !image.is_file() {
+        return Err("That image no longer exists".to_string());
+    }
+    let cache_path = preview_cache_path(&input, "video_thumb_v1", "jpg")?;
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    image_to_cover_jpg(&ffmpeg_path, &image, &cache_path).await?;
+    embed_cover_and_replace(&app_handle, &ffmpeg_path, &input, &cache_path, &input_path).await
+}
+
+// The thumbnail editor's output (a frame or picture with text/logo layers drawn on, composed in
+// the webview's canvas) - same as set_video_thumbnail_from_image, from the encoded bytes instead
+// of a file that already exists on disk.
+#[tauri::command]
+pub async fn set_video_thumbnail_from_bytes(
+    app_handle: AppHandle,
+    input_path: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("The edited thumbnail came through empty".to_string());
+    }
+    let input = PathBuf::from(&input_path);
+    let cache_path = preview_cache_path(&input, "video_thumb_v1", "jpg")?;
+    let parent = cache_path
+        .parent()
+        .ok_or("Invalid thumbnail cache path")?
+        .to_path_buf();
+    std::fs::create_dir_all(&parent)
+        .map_err(|e| format!("Failed to create thumbnail cache directory: {}", e))?;
+    let source = parent.join(format!("edited_{}.jpg", std::process::id()));
+    std::fs::write(&source, &bytes).map_err(|e| format!("Failed to write the edited thumbnail: {}", e))?;
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let converted = image_to_cover_jpg(&ffmpeg_path, &source, &cache_path).await;
+    let _ = std::fs::remove_file(&source);
+    converted?;
+    embed_cover_and_replace(&app_handle, &ffmpeg_path, &input, &cache_path, &input_path).await
+}
+
+async fn image_to_cover_jpg(ffmpeg_path: &PathBuf, image: &PathBuf, output: &PathBuf) -> Result<(), String> {
+    let ffmpeg_path = ffmpeg_path.clone();
+    let image = image.clone();
+    let output = output.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.arg("-y");
+        cmd.arg("-i").arg(path_to_str(&image)?);
+        // Even dimensions (mjpeg in an mp4 is happier) and never upscaled past the original.
+        cmd.args(["-frames:v", "1", "-update", "1", "-vf", "scale='min(1920,iw)':-2", "-q:v", "2"]);
+        cmd.arg(path_to_str(&output)?);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let result = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        if !result.status.success() || !output.exists() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("unknown ffmpeg error").to_string();
+            return Err(format!("Couldn't read that image: {reason}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Thumbnail image task panicked: {e}"))?
+}
+
+// Where a thumbnail the user chose is kept: the app's own data folder (not the temp-dir preview
+// cache, which Windows' disk cleanup empties), keyed by the file's path - so it survives restarts
+// and holds for files that can't carry a cover themselves (.mov, .avi, .mkv...).
+fn custom_thumbnail_path(app_handle: &AppHandle, input: &PathBuf) -> Result<PathBuf, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use tauri::Manager;
+    let mut hasher = DefaultHasher::new();
+    input.to_string_lossy().to_lowercase().hash(&mut hasher);
+    let dir = app_handle
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("No app data folder: {e}"))?
+        .join("custom_thumbnails");
+    Ok(dir.join(format!("{:x}.jpg", hasher.finish())))
+}
+
+// Why the cover can't go INTO this file, if it can't - the file is then left untouched and the
+// thumbnail lives in Briefcast only. Measured against the bundled ffmpeg:
+// - only the MP4 writer stores a cover; the QuickTime (.mov) writer silently drops it, so a .mov
+//   used to come out rewritten with no cover at all;
+// - keeping Apple's metadata (recording date, location, camera model) needs -movflags
+//   use_metadata_tags, which in turn makes the MP4 writer drop the cover - so an MP4 carrying
+//   those tags is never rewritten either: a cover isn't worth anyone's date/location history.
+// Otherwise returns the number of real (non-cover) video streams - where the new cover goes.
+fn embed_blocker(app_handle: &AppHandle, input: &PathBuf) -> Result<usize, &'static str> {
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if ext != "mp4" && ext != "m4v" {
+        return Err("format");
+    }
+    let ffprobe_path = get_ffprobe_path(app_handle).map_err(|_| "probe")?;
+    let mut cmd = Command::new(&ffprobe_path);
+    cmd.args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"]);
+    cmd.arg(path_to_str(input).map_err(|_| "probe")?);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let output = cmd.output().map_err(|_| "probe")?;
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| "probe")?;
+    let has_apple_tags = probe["format"]["tags"]
+        .as_object()
+        .map(|tags| tags.keys().any(|k| k.to_lowercase().starts_with("com.apple.")))
+        .unwrap_or(false);
+    if has_apple_tags {
+        return Err("metadata");
+    }
+    let real_videos = probe["streams"]
+        .as_array()
+        .map(|streams| {
+            streams
+                .iter()
+                .filter(|st| st["codec_type"] == "video" && st["disposition"]["attached_pic"].as_i64() != Some(1))
+                .count()
+        })
+        .unwrap_or(0);
+    if real_videos == 0 {
+        return Err("probe");
+    }
+    Ok(real_videos)
+}
+
+// Applies `cover` (already in get_video_thumbnail's cache slot) as this video's thumbnail: always
+// in Briefcast (custom_thumbnail_path), and also inside the file itself - a re-muxed copy swapped
+// in for the original - only where that's possible without losing anything (embed_blocker).
+// Returns "embedded", or "app-only:<why>" (embed_blocker's reason), so the picker can say which.
+async fn embed_cover_and_replace(
+    app_handle: &AppHandle,
+    ffmpeg_path: &PathBuf,
+    input: &PathBuf,
+    cover: &PathBuf,
+    input_path: &str,
+) -> Result<String, String> {
+    let cache_path = cover;
+    let custom = custom_thumbnail_path(app_handle, input)?;
+    if let Some(parent) = custom.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create the thumbnails folder: {}", e))?;
+    }
+    std::fs::copy(cache_path, &custom).map_err(|e| format!("Failed to keep the thumbnail: {}", e))?;
+
+    let blocker = {
+        let app_handle = app_handle.clone();
+        let input = input.clone();
+        tauri::async_runtime::spawn_blocking(move || embed_blocker(&app_handle, &input))
+            .await
+            .map_err(|e| format!("Thumbnail check panicked: {e}"))?
+    };
+    let video_streams = match blocker {
+        Ok(n) => n,
+        Err(reason) => {
+            let _ = app_handle.emit("video-thumbnail-updated", input_path);
+            return Ok(format!("app-only:{reason}"));
+        }
+    };
 
     let ext = input
         .extension()
@@ -1264,7 +1611,7 @@ pub async fn set_video_thumbnail(
         .to_string();
     let tmp_output = input.with_extension(format!("thumbtmp.{ext}"));
 
-    if let Err(err) = embed_cover_art(&ffmpeg_path, &input, &cache_path, &tmp_output).await {
+    if let Err(err) = embed_cover_art(ffmpeg_path, input, cache_path, &tmp_output, video_streams).await {
         let _ = std::fs::remove_file(&tmp_output);
         return Err(err);
     }
@@ -1273,15 +1620,15 @@ pub async fn set_video_thumbnail(
     // still open in the player that triggered this) holds the original file open - surfaced as a
     // clear, actionable error rather than a raw OS error code, with the half-written temp file
     // cleaned up either way so a retry doesn't trip over it.
-    if let Err(e) = std::fs::rename(&tmp_output, &input) {
+    if let Err(e) = std::fs::rename(&tmp_output, input) {
         let _ = std::fs::remove_file(&tmp_output);
         return Err(format!(
-            "Extracted the new thumbnail, but couldn't update the video file - it may still be open in the player. Try again in a moment. ({e})"
+            "Saved the thumbnail in Briefcast, but couldn't update the video file itself - it may still be open in the player. Try again in a moment. ({e})"
         ));
     }
 
-    let _ = app_handle.emit("video-thumbnail-updated", &input_path);
-    Ok(())
+    let _ = app_handle.emit("video-thumbnail-updated", input_path);
+    Ok("embedded".to_string())
 }
 
 // mjpeg-encodes only the newly-added cover-image stream (map 1); -c copy on both mapped streams
@@ -1293,6 +1640,7 @@ async fn embed_cover_art(
     input: &PathBuf,
     cover: &PathBuf,
     output: &PathBuf,
+    video_streams: usize,
 ) -> Result<(), String> {
     let ffmpeg_path = ffmpeg_path.clone();
     let input = input.clone();
@@ -1306,9 +1654,14 @@ async fn embed_cover_art(
         cmd.arg("-i").arg(path_to_str(&input)?);
         cmd.arg("-i").arg(path_to_str(&cover)?);
         cmd.args([
-            "-map", "0", "-map", "1", "-c", "copy", "-c:v:1", "mjpeg", "-disposition:v:1",
-            "attached_pic",
+            // Video first (0:V is video WITHOUT attached pictures - an old cover is dropped, or it
+            // would take the new one's place), then audio/subtitles, then the new cover.
+            "-map", "0:V", "-map", "0:a?", "-map", "0:s?", "-map", "1", "-map_metadata", "0",
+            "-c", "copy",
         ]);
+        // The cover is the video stream right after the real ones.
+        let cover_stream = format!("v:{video_streams}");
+        cmd.args([format!("-c:{cover_stream}"), "mjpeg".to_string(), format!("-disposition:{cover_stream}"), "attached_pic".to_string()]);
         cmd.arg(path_to_str(&output)?);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
@@ -1350,11 +1703,13 @@ async fn extract_video_frame(
     input: &PathBuf,
     output: &PathBuf,
     seek: &str,
+    max_width: u32,
 ) -> Result<(), String> {
     let ffmpeg_path = ffmpeg_path.clone();
     let input = input.clone();
     let output = output.clone();
     let seek = seek.to_string();
+    let scale = format!("scale='min({max_width},iw)':-2");
     tauri::async_runtime::spawn_blocking(move || {
         let mut cmd = Command::new(&ffmpeg_path);
         #[cfg(windows)]
@@ -1367,7 +1722,7 @@ async fn extract_video_frame(
             "-update",
             "1",
             "-vf",
-            "scale=480:-1",
+            &scale,
             "-q:v",
             "4",
         ]);
@@ -2927,7 +3282,7 @@ pub async fn extract_frame_still(app_handle: AppHandle, source_path: String, tim
 // Where a "Merge clips" render goes (the timeline's clip menu): a new file in the editor's media
 // folder next to reversed clips and frozen frames, named after the first clip's source. Each merge
 // is its own file - unlike those, there's no fixed range to find an earlier render by.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn merged_clip_output_path(source_path: String) -> Result<String, String> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2939,7 +3294,7 @@ pub fn merged_clip_output_path(source_path: String) -> Result<String, String> {
 
 // Deletes what a cancelled merge left behind (ffmpeg killed mid-write). Only ever a merge render in
 // the editor's own media folder - anything else is refused, so this can't be pointed at user files.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn discard_merged_clip(path: String) -> Result<(), String> {
     let target = PathBuf::from(&path);
     let dir = crate::services::utility::derived_media_dir()?;

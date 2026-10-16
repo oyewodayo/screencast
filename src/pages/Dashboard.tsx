@@ -6,6 +6,8 @@ import { buildCaptionLines } from "../utils/captions";
 import * as Y from "yjs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ask, open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
+import MoveCopyMenu, { FileTransferOptions, FileTransferRequest } from "../components/docker/MoveCopyMenu";
+import type { PopoverAnchor } from "../hooks/useClampedPopoverPosition";
 import BottomDocker from "../components/BottomDocker";
 import { listen, emit } from '@tauri-apps/api/event';
 import { WindowInfo } from "../Types";
@@ -133,6 +135,7 @@ import {
   IoMapOutline,
   IoImagesOutline,
   IoFolderOpenOutline,
+  IoImageOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -443,15 +446,12 @@ const Dashboard = () => {
   // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
   const [docsIndex, setDocsIndex] = useState<DocSummary[]>([]);
   // "Link notes" flyout inside a file's 3-dot menu when 2+ docs are already linked to it - same
-  // expand-in-place pattern as moveMenuOpenFor.
+  // expand-in-place pattern the old "Move to" flyout used.
   const [linkDocsMenuOpenFor, setLinkDocsMenuOpenFor] = useState<string | null>(null);
   // Spins the sidebar's manual refresh icon while a refresh is in flight — see handleRefreshFiles.
   const [isRefreshingFiles, setIsRefreshingFiles] = useState<boolean>(false);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>("");
-  // "Move to ▸" flyout inside a file's 3-dot menu — keyed by file.path, separate from openMenu
-  // so it can be nested inside that same popup instead of needing its own positioning.
-  const [moveMenuOpenFor, setMoveMenuOpenFor] = useState<string | null>(null);
   // Folder relative-path (see FileMap's keys) whose inline "new folder" input is active, or null
   // if none is. "" means creating a top-level folder directly under Briefcast.
   const [creatingFolderIn, setCreatingFolderIn] = useState<string | null>(null);
@@ -536,7 +536,8 @@ const Dashboard = () => {
   // currently visible under the active category. Cleared whenever the category tab changes so
   // a stale selection from "Video" doesn't silently carry over into "Audio".
   const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(new Set());
-  const [bulkMoveMenuOpen, setBulkMoveMenuOpen] = useState<boolean>(false);
+  // The one "Move or copy to..." menu (MoveCopyMenu.tsx) every sidebar/gallery Move-to opens.
+  const [transferMenu, setTransferMenu] = useState<{ files: { name: string; path: string }[]; anchor: PopoverAnchor } | null>(null);
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
   // Folder relative-path whose images are shown as a thumbnail grid in the main board - set by
   // clicking an Image-tab folder header in the sidebar (see the folder header onClick below), and
@@ -900,7 +901,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     if (sourcePath === selectedFile?.sourcePath) {
       // Back to the primary file - its asset URL is already resolved (selectedFile.path).
       previewSwitchPendingRef.current = false;
-      videoPlayerRef.current?.loadSource(selectedFile.path, time);
+      videoPlayerRef.current?.loadSource(selectedFile.path, time, selectedFile.sourcePath);
       return;
     }
     // Until the new source is in, the old one keeps playing (past its clip's end) and reporting
@@ -913,7 +914,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
         // resets previewSourcePathRef (effect above), and a late load here would otherwise swap
         // the newly opened video back out for this one.
         if (previewSourcePathRef.current !== sourcePath) return;
-        videoPlayerRef.current?.loadSource(url, time);
+        videoPlayerRef.current?.loadSource(url, time, isImageClipPath(sourcePath) ? undefined : sourcePath);
       })
       .catch((error) => console.error("Failed to load preview source for", sourcePath, error))
       .finally(() => {
@@ -2674,7 +2675,6 @@ const setScreen = () => {
 		const close = (e: Event) => {
 			if (e instanceof KeyboardEvent && e.key !== "Escape") return;
 			setOpenMenu(null);
-			setMoveMenuOpenFor(null);
 			setLinkDocsMenuOpenFor(null);
 		};
 
@@ -2867,9 +2867,7 @@ const setScreen = () => {
 	// that are exactly where they're being dropped.
 	const handleMoveFiles = async (fileList: FileEntry[], destFolder: string) => {
 		setOpenMenu(null);
-		setMoveMenuOpenFor(null);
 		setDragOverFolder(null);
-		setBulkMoveMenuOpen(false);
 		const toMove = fileList.filter((file) => findFileFolder(file.path) !== destFolder);
 		if (toMove.length === 0) return;
 		try {
@@ -3117,8 +3115,105 @@ const setScreen = () => {
 	// rename field — also fixes a latent staleness bug the inline rename used to have on its own:
 	// renaming the file currently open in the player left `selectedFile` pointing at a path that
 	// no longer existed on disk until the next unrelated refresh happened to fix it.
+	// "Move or copy to..." (MoveCopyMenu.tsx) for one file or a whole selection - a library folder,
+	// a brand-new one made right there, or anywhere on disk. Works the same for a file opened from
+	// outside the library; transfer_file (utility.rs) handles name clashes, other drives and saved
+	// edits. Files go one at a time (the backend serializes file moves anyway), so a failure part
+	// way leaves every earlier file correctly moved and accounted for.
+	const handleTransferFiles = async (fileList: { name: string; path: string }[], request: FileTransferRequest): Promise<void> => {
+		setOpenMenu(null);
+		setTransferMenu(null);
+		if (fileList.length === 0) return;
+		const pathName = (p: string) => p.split(/[\/]/).pop() ?? p;
+		let destFolder: string;
+		let absolute = false;
+		try {
+			if (request.dest.kind === "pick") {
+				const picked = await openFileDialog({ directory: true, multiple: false, title: request.copy ? "Copy to folder" : "Move to folder" });
+				if (typeof picked !== "string") return;
+				destFolder = picked;
+				absolute = true;
+			} else if (request.dest.kind === "new-folder") {
+				destFolder = await invoke<string>("create_folder", { parentPath: request.dest.parent, name: request.dest.name });
+			} else {
+				destFolder = request.dest.folder;
+			}
+		} catch (error) {
+			setError(`Failed to create folder: ${error}`);
+			return;
+		}
+		const destLabel = absolute ? pathName(destFolder) : folderDisplayName(destFolder);
+		const verb = request.copy ? "copy" : "move";
+		let done = 0;
+		let alreadyThere = 0;
+		let reopen: { path: string; name: string } | null = null;
+		const failures: string[] = [];
+		for (const file of fileList) {
+			const isOpen = selectedFile?.sourcePath === file.path;
+			// Moving the open video: its pending timeline edits go with it, nothing is left behind.
+			const undoPrepare = !request.copy && isOpen ? await editStore.prepareFileMove() : null;
+			try {
+				const newPath = await invoke<string>("transfer_file", { sourcePath: file.path, destFolderPath: destFolder, destIsAbsolute: absolute, copy: request.copy });
+				if (!request.copy && newPath === file.path) {
+					undoPrepare?.();
+					alreadyThere++;
+					continue;
+				}
+				done++;
+				if (!request.copy) {
+					const { pinned, recent } = repathFile(file.path, newPath);
+					setPinnedPaths(pinned);
+					setRecentPaths(recent);
+					repathPlaybackState(file.path, newPath);
+					await invoke("relink_doc_path", { oldPath: file.path, newPath }).catch((error) => console.error("Failed to repair doc links after move:", error));
+					if (isOpen) reopen = { path: newPath, name: pathName(newPath) };
+				}
+			} catch (error) {
+				undoPrepare?.();
+				console.error(`Error trying to ${verb} file:`, file.path, error);
+				failures.push(`${formatFileName(file.name)}: ${error}`);
+			}
+		}
+		if (!request.copy && done > 0) await refreshDocsIndex().catch(() => {});
+		await handleDirectoryFiles();
+		if (reopen) await loadFileForPlayback(reopen.path, reopen.name);
+		if (done > 0) setSelectedFilePaths(new Set());
+
+		const what = fileList.length === 1 ? formatFileName(fileList[0].name) : `${done} files`;
+		if (failures.length > 0) {
+			setError(`${request.copy ? "Copied" : "Moved"} ${done} of ${fileList.length} — couldn't ${verb} ${failures[0]}${failures.length > 1 ? ` (+${failures.length - 1} more)` : ""}`);
+		} else if (done > 0) {
+			setMessage(`${request.copy ? "Copied" : "Moved"} ${what} to ${destLabel}${alreadyThere > 0 ? ` (${alreadyThere} already there)` : ""}`);
+		} else if (alreadyThere > 0) {
+			setMessage(`${fileList.length === 1 ? formatFileName(fileList[0].name) + " is" : "They're"} already in ${destLabel}`);
+		}
+	};
+
+	// Opens "Set thumbnail" for a video - from the sidebar/gallery menus as well as the player's own
+	// settings. A video that isn't open yet is opened first; the picker then waits for it to load.
+	const [pendingThumbnailFor, setPendingThumbnailFor] = useState<string | null>(null);
+	const handleSetThumbnail = async (file: { name: string; path: string }) => {
+		setOpenMenu(null);
+		if (selectedFile?.sourcePath === file.path) {
+			videoPlayerRef.current?.openThumbnailPicker();
+			return;
+		}
+		setPendingThumbnailFor(file.path);
+		await loadFileForPlayback(file.path, file.name);
+	};
+	// Runs after VideoPlayer's own effects in the same commit, so the player already holds the newly
+	// opened file by now and openThumbnailPicker waits on the right <video> load.
+	useEffect(() => {
+		if (!pendingThumbnailFor || selectedFile?.sourcePath !== pendingThumbnailFor) return;
+		setPendingThumbnailFor(null);
+		videoPlayerRef.current?.openThumbnailPicker();
+	}, [pendingThumbnailFor, selectedFile?.sourcePath]);
+
+	const fileTransferOptions: FileTransferOptions = { folders: folderOptions, folderOf: findFileFolder, onTransfer: handleTransferFiles };
+
 	const renameFile = async (file: { name: string; path: string }, newName: string): Promise<void> => {
 		if (!newName || newName === file.name) return;
+		const undoPrepare = selectedFile?.sourcePath === file.path ? await editStore.prepareFileMove() : null;
 		try {
 			const newPath = await invoke<string>('rename_file', { oldPath: file.path, newName });
 			const { pinned, recent } = repathFile(file.path, newPath);
@@ -3137,6 +3232,7 @@ const setScreen = () => {
 				await loadFileForPlayback(newPath, newFileName);
 			}
 		} catch (error) {
+			undoPrepare?.();
 			console.error('Error renaming file:', error);
 			setError(`Failed to rename file: ${error}`);
 		}
@@ -3506,32 +3602,17 @@ const setScreen = () => {
                       {selectedFilePaths.size} selected
                     </span>
                     <div className="flex items-center gap-3">
-                      <div className="relative">
-                        <button
-                          type="button"
-                          onClick={() => setBulkMoveMenuOpen((prev) => !prev)}
-                          className="flex items-center gap-0.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                        >
-                          Move to
-                          <IoChevronForward size={11} className={`transition-transform ${bulkMoveMenuOpen ? 'rotate-90' : ''}`} />
-                        </button>
-                        {bulkMoveMenuOpen && (
-                          <div className="absolute right-0 top-full mt-1 w-40 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-md shadow-lg z-20 max-h-48 overflow-y-auto py-0.5">
-                            {Object.keys(files)
-                              .sort((a, b) => a.localeCompare(b))
-                              .map((destFolder) => (
-                                <button
-                                  key={destFolder || "__root__"}
-                                  title={destFolder || "Briefcast"}
-                                  className="w-full text-left px-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                  onClick={() => handleMoveFiles(getSelectedFileEntries(), destFolder)}
-                                >
-                                  {folderDisplayName(destFolder)}
-                                </button>
-                              ))}
-                          </div>
-                        )}
-                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          setTransferMenu({ files: getSelectedFileEntries(), anchor: { left: rect.left, top: rect.bottom + 4 } });
+                        }}
+                        className="flex items-center gap-0.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                      >
+                        Move / Copy
+                        <IoChevronForward size={11} />
+                      </button>
                       {isConvertibleCategory(activeFileCategory) && (
                         <button
                           type="button"
@@ -3875,7 +3956,6 @@ const setScreen = () => {
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     setOpenMenu(openMenu === file.path ? null : file.path);
-                                    setMoveMenuOpenFor(null);
                                     setLinkDocsMenuOpenFor(null);
                                   }}
                                 >
@@ -4019,48 +4099,33 @@ const setScreen = () => {
                                         </button>
                                       )}
 
-                                      {/* "Move to ▸" — expands in place into the folder list rather
-                                          than as a hover flyout, so it works the same on touch/
-                                          trackpad as a click, with no hover-timing to get wrong. */}
+                                      {/* Opens the shared Move/Copy menu (MoveCopyMenu.tsx) beside this one. */}
                                       <button
                                         className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
                                         onClick={(e) => {
                                           e.stopPropagation();
-                                          setMoveMenuOpenFor((prev) => (prev === file.path ? null : file.path));
+                                          const rect = e.currentTarget.getBoundingClientRect();
+                                          setTransferMenu({ files: filesToActOn(file), anchor: { left: rect.right + 4, top: rect.top } });
+                                          setOpenMenu(null);
                                         }}
                                       >
                                         <IoFolderOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
                                         <span className="flex-1 text-left">
-                                          {filesToActOn(file).length > 1 ? `Move ${filesToActOn(file).length} items to` : "Move to"}
+                                          {filesToActOn(file).length > 1 ? `Move or copy ${filesToActOn(file).length} items…` : "Move or copy to…"}
                                         </span>
-                                        <IoChevronForward
-                                          size={12}
-                                          className={`shrink-0 text-neutral-400 dark:text-neutral-500 transition-transform ${moveMenuOpenFor === file.path ? 'rotate-90' : ''}`}
-                                        />
+                                        <IoChevronForward size={12} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
                                       </button>
-                                      {moveMenuOpenFor === file.path && (
-                                        <div className="mx-1.5 mb-1 max-h-40 overflow-y-auto rounded-lg bg-gray-50 dark:bg-neutral-900/60 py-0.5">
-                                          {Object.keys(files)
-                                            .sort((a, b) => a.localeCompare(b))
-                                            .map((destFolder) => (
-                                              <button
-                                                key={destFolder || "__root__"}
-                                                title={destFolder || "Briefcast"}
-                                                disabled={destFolder === folder}
-                                                className={`w-full text-left pl-6 pr-3 py-1.5 text-xs truncate ${
-                                                  destFolder === folder
-                                                    ? "text-neutral-300 dark:text-neutral-600 cursor-default"
-                                                    : "hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                                }`}
-                                                onClick={(e) => {
-                                                  e.stopPropagation();
-                                                  if (destFolder !== folder) handleMoveFiles(filesToActOn(file), destFolder);
-                                                }}
-                                              >
-                                                {folderDisplayName(destFolder)}
-                                              </button>
-                                            ))}
-                                        </div>
+                                      {getFileCategory(file.name) === "video" && !isVideoProjectPath(file.path) && (
+                                        <button
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void handleSetThumbnail(file);
+                                          }}
+                                        >
+                                          <IoImageOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                          <span className="flex-1 text-left">Set thumbnail…</span>
+                                        </button>
                                       )}
 
                                       <button
@@ -4109,6 +4174,10 @@ const setScreen = () => {
               fileName={infoTrashItem.name}
               onClose={() => setInfoTrashItem(null)}
             />
+          )}
+
+          {transferMenu && (
+            <MoveCopyMenu files={transferMenu.files} options={fileTransferOptions} anchor={transferMenu.anchor} onClose={() => setTransferMenu(null)} />
           )}
 
           {infoFile && (
@@ -4451,9 +4520,7 @@ const setScreen = () => {
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
               onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
               onClearSelection={() => setSelectedFilePaths(new Set())}
-              folderOptions={folderOptions}
-              currentFolder={selectedFolder}
-              onMoveFiles={handleMoveFiles}
+              onOpenMoveCopy={(fileList, anchor) => setTransferMenu({ files: fileList, anchor })}
               onBulkDelete={handleBulkDeleteFiles}
             />
           ) : selectedFolder !== null && activeFileCategory === "video" ? (
@@ -4462,6 +4529,7 @@ const setScreen = () => {
               folderLabel={folderDisplayName(selectedFolder)}
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
               onOpenVideo={(file) => loadFileForPlayback(file.path, file.name)}
+              onSetThumbnail={(file) => void handleSetThumbnail(file)}
               onDeleteFile={handleDeleteFile}
               onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
@@ -4476,9 +4544,7 @@ const setScreen = () => {
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
               onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
               onClearSelection={() => setSelectedFilePaths(new Set())}
-              folderOptions={folderOptions}
-              currentFolder={selectedFolder}
-              onMoveFiles={handleMoveFiles}
+              onOpenMoveCopy={(fileList, anchor) => setTransferMenu({ files: fileList, anchor })}
               onBulkDelete={handleBulkDeleteFiles}
             />
           ) : selectedFolder !== null && activeFileCategory === "pdf" ? (
@@ -4500,9 +4566,7 @@ const setScreen = () => {
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
               onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
               onClearSelection={() => setSelectedFilePaths(new Set())}
-              folderOptions={folderOptions}
-              currentFolder={selectedFolder}
-              onMoveFiles={handleMoveFiles}
+              onOpenMoveCopy={(fileList, anchor) => setTransferMenu({ files: fileList, anchor })}
               onBulkDelete={handleBulkDeleteFiles}
             />
           ) : selectedFolder !== null && activeFileCategory === "document" ? (
@@ -4523,9 +4587,7 @@ const setScreen = () => {
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
               onSelectRange={(paths) => setSelectedFilePaths((prev) => new Set([...prev, ...paths]))}
               onClearSelection={() => setSelectedFilePaths(new Set())}
-              folderOptions={folderOptions}
-              currentFolder={selectedFolder}
-              onMoveFiles={handleMoveFiles}
+              onOpenMoveCopy={(fileList, anchor) => setTransferMenu({ files: fileList, anchor })}
               onBulkDelete={handleBulkDeleteFiles}
             />
           ) : (
@@ -4679,6 +4741,8 @@ const setScreen = () => {
         onConvertFile={(file) => setConversionFile(file)}
         onRenameFile={renameFile}
         onDeleteFile={handleDeleteFile}
+        fileTransfer={fileTransferOptions}
+        onSetThumbnail={() => videoPlayerRef.current?.openThumbnailPicker()}
         onExportedFile={handleVideoExported}
         draggingLibraryFile={
           draggingFiles && draggingFiles.length === 1 && getFileCategory(draggingFiles[0].name) === "video"

@@ -120,7 +120,9 @@ pub fn create_video_project(name: String, width: u32, height: u32, edit_state_js
     let stem = if safe.trim().is_empty() { "Untitled video".to_string() } else { safe.trim().to_string() };
     let mut path = root.join(format!("{}.{}", stem, VIDEO_PROJECT_EXTENSION));
     let mut n = 2;
-    while path.exists() {
+    // A name is only free if no file AND no leftover timeline uses it - writing the new project's
+    // timeline over another project's would destroy it (sidecars.rs).
+    while path.exists() || sidecar_path_for(&path).exists() {
         path = root.join(format!("{} ({}).{}", stem, n, VIDEO_PROJECT_EXTENSION));
         n += 1;
     }

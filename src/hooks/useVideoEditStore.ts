@@ -313,6 +313,12 @@ export interface UseVideoEditStoreResult {
   updateClipEffects: (id: string, patch: ClipEffectsPatch) => void;
   // Same patch applied to every clip as ONE undo step (NoiseReductionPopover's "Apply to all clips").
   updateAllClipEffects: (patch: ClipEffectsPatch) => void;
+  // A patch applied to each of `ids` as ONE undo step - the toolbar's effects/speed/cleanup tools
+  // acting on a Ctrl/Shift-click multi-selection. A function patch is asked per clip (null skips
+  // that clip), for edits that depend on the clip itself.
+  // Flushes, then stops saving to the open file's current path - see the implementation.
+  prepareFileMove: () => Promise<() => void>;
+  updateClipsEffects: (ids: string[], patch: ClipEffectsPatch | ((clip: Clip) => ClipEffectsPatch | null)) => void;
   // Applies the result of a detect_silence scan (conversion.rs) to one clip, splitting out and
   // dropping every detected dead-air range in a single undo step - see removeSilentRanges,
   // videoEditHandlers.ts, for the actual splice logic.
@@ -496,19 +502,35 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // window close - a bare setTimeout-scheduled invoke() has no way to block window teardown, so
   // without this a close right after an edit could tear down the webview before the IPC call ever
   // reached Rust.
+  // The path this file was just moved/renamed AWAY from (prepareFileMove) - nothing is saved there
+  // any more, or the switch-files flush below would recreate a stale .edits.json at the old path
+  // right after the real one travelled with the file.
+  const movedAwayFromRef = useRef<string | null>(null);
   const flushSave = useCallback((): Promise<void> => {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
     }
     const current = stateRef.current;
-    if (!sourcePath || !current) return Promise.resolve();
+    if (!sourcePath || !current || movedAwayFromRef.current === sourcePath) return Promise.resolve();
     return invoke("save_video_edit_state", { videoPath: sourcePath, json: JSON.stringify(current) })
       .then(() => undefined)
       .catch((err) => {
         console.error("Failed to save video edit state:", err);
       });
   }, [sourcePath]);
+
+  // Call right before the open file is moved or renamed: saves any pending edit to the current path
+  // (so it travels with the file), then stops saving there. Resolves to an undo for a move that
+  // then fails.
+  const prepareFileMove = useCallback(async (): Promise<() => void> => {
+    await flushSave();
+    const path = sourcePath ?? null;
+    movedAwayFromRef.current = path;
+    return () => {
+      if (movedAwayFromRef.current === path) movedAwayFromRef.current = null;
+    };
+  }, [flushSave, sourcePath]);
 
   const scheduleAutosave = useCallback(() => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -521,6 +543,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       void flushSave();
     };
   }, [sourcePath, flushSave]);
+  // Runs after the switch's cleanups above, so the moved-away path is only muted for that one flush
+  // - a different file later taking the old name saves normally.
+  useEffect(() => {
+    movedAwayFromRef.current = null;
+  }, [sourcePath]);
 
   // Guards the whole app window closing while this file's editor is open - mirrors
   // useDocsEditStore's own onCloseRequested guard (save-on-quit), plus a video-specific check the
@@ -780,6 +807,21 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const current = stateRef.current;
       if (!current) return;
       const clips = current.clips.reduce((acc, clip) => updateClipHandler(acc, clip.id, patch), current.clips);
+      if (clips === current.clips) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "edit-clip-effects");
+    },
+    [pushCommand]
+  );
+
+  const updateClipsEffects = useCallback(
+    (ids: string[], patch: ClipEffectsPatch | ((clip: Clip) => ClipEffectsPatch | null)) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const clips = ids.reduce((acc, id) => {
+        const clip = acc.find((c) => c.id === id);
+        const clipPatch = clip && (typeof patch === "function" ? patch(clip) : patch);
+        return clipPatch ? updateClipHandler(acc, id, clipPatch) : acc;
+      }, current.clips);
       if (clips === current.clips) return;
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "edit-clip-effects");
     },
@@ -1864,6 +1906,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     resizeClipEdge,
     updateClipEffects,
     updateAllClipEffects,
+    updateClipsEffects,
+    prepareFileMove,
     trimSilenceForClip,
     applyAutoZoomAtClicks,
     insertClipAt,

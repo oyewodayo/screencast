@@ -10,7 +10,7 @@ import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { IoClose, IoSpeedometerOutline } from "react-icons/io5";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost } from "./ToolPanelHost";
 import Slider from "./Slider";
 import NumberStepper from "./NumberStepper";
 import { ClipSpeedRamp, SPEED_RAMP_PRESETS, clipOutputDuration, clipSpeedSteps } from "../../utils/clipTiming";
@@ -34,6 +34,9 @@ interface SpeedPopoverProps {
   // speed field are just two views of the same underlying value.
   sourceDuration: number;
   anchor: { left: number; top: number };
+  // >1 while a multi-selection is being sped up together - each keeps its own length, so the one-
+  // clip Duration field (which solves for a speed from THIS clip's length) is hidden then.
+  selectedCount?: number;
   onUpdate: (speed: number | undefined) => void;
   // Speed ramp - a curve on top of `speed` (clipTiming.ts).
   ramp?: ClipSpeedRamp;
@@ -59,7 +62,7 @@ const RampGraph: React.FC<{ speed: number; ramp: ClipSpeedRamp }> = ({ speed, ra
   );
 };
 
-const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anchor, onUpdate, ramp, onRampChange, onClose }) => {
+const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anchor, selectedCount, onUpdate, ramp, onRampChange, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
@@ -98,6 +101,7 @@ const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anch
         <span className="text-xs font-medium flex items-center gap-1.5">
           <IoSpeedometerOutline size={13} />
           Speed
+          <SelectionCountBadge count={selectedCount} />
         </span>
         <button type="button" title="Close" onClick={onClose} className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white">
           <IoClose size={14} />
@@ -124,6 +128,7 @@ const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anch
         <NumberStepper value={speed} min={MIN_SPEED} max={MAX_SPEED} step={SPEED_STEP} decimals={2} suffix="x" onChange={setSpeed} />
       </div>
 
+      {(selectedCount ?? 1) <= 1 && (
       <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
         <span className="text-[10px] uppercase tracking-wide text-white/40">Duration</span>
         <div className="flex items-center justify-between gap-2 text-[11px]">
@@ -139,6 +144,7 @@ const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anch
           />
         </div>
       </div>
+      )}
 
       <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
         <span className="text-[10px] uppercase tracking-wide text-white/40">Speed ramp</span>

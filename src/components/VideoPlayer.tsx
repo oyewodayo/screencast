@@ -38,6 +38,8 @@ import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/p
 import CaptionOverlayLayer from './video/CaptionOverlayLayer';
 import GradeCanvas from './video/GradeCanvas';
 import { speedAtSource } from '../utils/clipTiming';
+import ThumbnailPicker, { ScrubSpriteMeta, ThumbnailChoice } from './video/ThumbnailPicker';
+import { getPlayableUrl, isPictureless } from '../utils/playableVideo';
 import type { Lut3D } from '../utils/colorGrade';
 import { PlayerCaptionsPanel, PlayerChaptersPanel } from './video/PlayerSidePanels';
 import { useToolPanelHost } from './docker/ToolPanelHost';
@@ -67,15 +69,6 @@ interface ConversionProgress {
 // Mirrors the Rust side's ScrubSprite (src-tauri/src/commands/conversion.rs), returned by
 // get_video_scrub_sprite - a pre-generated grid image of downsampled frames the scrub bar crops
 // per-hover instead of decoding a fresh frame on every mouse move.
-interface ScrubSpriteMeta {
-  url: string;
-  columns: number;
-  rows: number;
-  tileWidth: number;
-  tileHeight: number;
-  count: number;
-  interval: number;
-}
 
 // A user- or silence-detection-placed marker on the timeline - persisted as a `.chapters.json`
 // sidecar next to the video (save_video_chapters/load_video_chapters, video_edits.rs), the same
@@ -238,7 +231,9 @@ export interface VideoPlayerHandle {
   togglePlay: () => void;
   // Starts playback if paused (no-op if already playing) - unlike togglePlay, safe to call blind.
   play: () => void;
-  loadSource: (src: string, seekTime: number) => void;
+  // `sourcePath` (the file behind `src`) lets a clip the webview can't show - an HEVC .MOV playing
+  // sound over black, an .avi - be swapped for its playable copy (playableVideo.ts).
+  loadSource: (src: string, seekTime: number, sourcePath?: string) => void;
   // Imperatively overrides the crop transform for as long as a crop drag is in progress (pass
   // null once it ends) - ClipCropOverlay (Dashboard) calls this on every pointer move so the
   // actual video pixels track the drag in real time instead of only jumping to the new crop once
@@ -255,6 +250,8 @@ export interface VideoPlayerHandle {
   // source swap (loadSource) has finished: `src` is the URL last assigned, and `hasFrame` is false
   // until that source has decoded a frame to show.
   getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean } | null;
+  // Opens the "Set thumbnail" picker for this video (waits for it to load if it just opened).
+  openThumbnailPicker: () => void;
 }
 
 // Decoded noise samples (mono 48kHz PCM from decode_audio_range), keyed by file+range. A handful
@@ -486,17 +483,41 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     play: () => {
       if (videoRef.current?.paused) togglePauseAndPlay();
     },
-    loadSource: (src: string, seekTime: number) => {
+    loadSource: (src: string, seekTime: number, sourcePath?: string) => {
       const video = videoRef.current;
       if (!video) return;
-      const onLoaded = () => {
-        video.removeEventListener("loadedmetadata", onLoaded);
-        video.currentTime = seekTime;
-        video.play().catch(() => {});
+      const startAt = (url: string, onReady?: (v: HTMLVideoElement) => void) => {
+        const onLoaded = () => {
+          video.removeEventListener("loadedmetadata", onLoaded);
+          video.removeEventListener("error", onFailed);
+          if (onReady && video.getAttribute("src") === url && isPictureless(video)) return onReady(video);
+          video.currentTime = seekTime;
+          video.play().catch(() => {});
+        };
+        const onFailed = () => {
+          video.removeEventListener("loadedmetadata", onLoaded);
+          video.removeEventListener("error", onFailed);
+          if (onReady && video.getAttribute("src") === url) onReady(video);
+        };
+        video.addEventListener("loadedmetadata", onLoaded);
+        video.addEventListener("error", onFailed);
+        video.src = url;
+        video.load();
       };
-      video.addEventListener("loadedmetadata", onLoaded);
-      video.src = src;
-      video.load();
+      // Can't be shown as-is: switch to the playable copy - unless the player moved on meanwhile.
+      const recover = sourcePath
+        ? () => {
+            setIsRecovering(true);
+            setRecoveryProgress(0);
+            getPlayableUrl(sourcePath)
+              .then((url) => {
+                if (videoRef.current === video && video.getAttribute("src") === src) startAt(url);
+              })
+              .catch((err) => console.error("Couldn't make a playable copy of", sourcePath, err))
+              .finally(() => setIsRecovering(false));
+          }
+        : undefined;
+      startAt(src, recover);
     },
     previewCropLive: (crop: ClipCrop | null) => {
       liveCropOverrideRef.current = crop;
@@ -514,6 +535,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (!video) return null;
       return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2 };
     },
+    openThumbnailPicker: () => openThumbnailPickerRef.current(),
   }), []);
 
   const videoContainerRef = useRef<HTMLDivElement>(null);
@@ -670,11 +692,35 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [isDownloadingSpeechModel, setIsDownloadingSpeechModel] = useState<boolean>(false);
   const [captionsGenerationError, setCaptionsGenerationError] = useState<string | null>(null);
   const [thumbnailStatus, setThumbnailStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  // A visible snapshot of the exact frame about to become the thumbnail, plus the timestamp it was
-  // taken at - shown in a confirm/cancel picker (openThumbnailPicker/handleSetThumbnail below)
-  // rather than silently acting on whatever frame happened to be on screen when the button was
-  // clicked, which gave no way to see (or double check) what you were actually about to set.
-  const [thumbnailPreview, setThumbnailPreview] = useState<{ url: string; time: number } | null>(null);
+  // The thumbnail picker (ThumbnailPicker.tsx) - pick any frame or a picture from disk, always
+  // previewing the exact pixels about to be used rather than silently taking whatever frame
+  // happened to be on screen when the button was clicked.
+  const [thumbnailPickerOpen, setThumbnailPickerOpen] = useState(false);
+  // The URL last loaded for THIS file (src, or its converted stand-in) - see openThumbnailPicker.
+  const primarySrcRef = useRef<string | null>(null);
+  const openThumbnailPickerRef = useRef<() => void>(() => {});
+  const [thumbnailError, setThumbnailError] = useState<string | null>(null);
+  // What a save did (into the file, or Briefcast only) and the share-ready copy's progress, shown
+  // over the player until closed with its X - never timed out, since it can carry a next step.
+  const [thumbnailNotice, setThumbnailNotice] = useState<{ text: string; progress?: number; action?: { label: string; run: () => void } } | null>(null);
+  const showThumbnailNotice = (notice: { text: string; progress?: number; action?: { label: string; run: () => void } }) => setThumbnailNotice(notice);
+  // "Also make a share-ready copy" in the picker - remembered, since it's a per-person habit.
+  const [shareCopyOnSave, setShareCopyOnSave] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('briefcast.thumbnail.shareCopy') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const updateShareCopyOnSave = (on: boolean) => {
+    setShareCopyOnSave(on);
+    try {
+      localStorage.setItem('briefcast.thumbnail.shareCopy', on ? '1' : '0');
+    } catch {
+      // per-viewer convenience only
+    }
+  };
+  const shareCopyBusyRef = useRef(false);
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [showSkipTime, setShowSkipTime] = useState<boolean>(false);
 
@@ -744,6 +790,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   useEffect(() => {
     if ((mediaType === 'video' || mediaType === 'audio') && src && videoRef.current) {
       videoRef.current.src = src;
+      primarySrcRef.current = src;
       if (autoPlay) videoRef.current.play().catch(() => {});
     }
   }, [mediaType, src, autoPlay]);
@@ -1200,6 +1247,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // which isn't the right fix for an audio-only source that fails for a different reason).
   const handleVideoError = async (): Promise<void> => {
     if (mediaType !== 'video' || !filePath || !src) return;
+    // A clip switched in by loadSource recovers itself there - this is for THIS file only.
+    const showing = videoRef.current?.getAttribute('src');
+    if (showing && showing !== src) return;
     if (recoveryAttemptedForRef.current === src) return; // already tried once for this file
 
     recoveryAttemptedForRef.current = src;
@@ -1215,11 +1265,18 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     });
 
     try {
-      const playablePath = await invoke<string>('get_playable_preview', { inputPath: filePath });
-      const playableUrl = convertFileSrc(playablePath);
-      if (videoRef.current) {
-        videoRef.current.src = playableUrl;
-        if (autoPlay) await videoRef.current.play().catch(() => {});
+      const playableUrl = await getPlayableUrl(filePath);
+      const video = videoRef.current;
+      if (video && video.getAttribute('src') === src) {
+        // Pick up where it was - an HEVC file has been playing its sound all along.
+        const resumeAt = video.currentTime;
+        const wasPlaying = !video.paused || autoPlay;
+        video.addEventListener('loadedmetadata', () => {
+          if (resumeAt > 0 && resumeAt < video.duration) video.currentTime = resumeAt;
+        }, { once: true });
+        video.src = playableUrl;
+        primarySrcRef.current = playableUrl;
+        if (wasPlaying) await video.play().catch(() => {});
       }
     } catch (err) {
       console.error('Playback recovery failed:', err);
@@ -1329,35 +1386,104 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // it's done - Dashboard.tsx/VideoFolderGallery.tsx listen for that to bust their own already-
   // resolved thumbnail URL for this path, since the URL string itself doesn't change (same
   // content-addressed cache path), only its bytes did.
-  // Pauses on whatever frame is currently showing and snapshots it client-side (crossOrigin=
-  // "anonymous" on the <video> above is what makes this canvas draw legal rather than throwing a
-  // tainted-canvas SecurityError) so the confirm dialog shows the user the EXACT frame ffmpeg
-  // would extract at that same currentTime - not a guess, not a re-seek, the real pixels.
+  // The picker pauses on the frame currently showing and snapshots frames client-side (crossOrigin=
+  // "anonymous" on the <video> above is what makes that canvas draw legal rather than throwing a
+  // tainted-canvas SecurityError), so what it previews is the EXACT frame ffmpeg extracts at the
+  // same currentTime.
+  // During timeline playback the <video> may be showing an inserted clip's file (loadSource) -
+  // the picker must preview THIS file's frames, since that's whose frame time gets saved. So it
+  // switches back to this file first, and also waits out a file that hasn't loaded yet (opened
+  // from a menu with "Set thumbnail...").
   const openThumbnailPicker = (): void => {
     const video = videoRef.current;
-    if (!video || !Number.isFinite(video.duration)) return;
+    if (!video || !filePath || mediaType !== 'video') return;
     video.pause();
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    setThumbnailPreview({ url: canvas.toDataURL('image/jpeg', 0.85), time: video.currentTime });
+    setThumbnailError(null);
+    const primary = primarySrcRef.current;
+    const showingOther = !!primary && video.getAttribute('src') !== primary;
+    if (!showingOther && Number.isFinite(video.duration) && video.readyState >= 2) {
+      setThumbnailPickerOpen(true);
+      return;
+    }
+    const onReady = () => {
+      video.removeEventListener('loadeddata', onReady);
+      video.pause();
+      setThumbnailPickerOpen(true);
+    };
+    video.addEventListener('loadeddata', onReady);
+    if (showingOther) {
+      video.src = primary;
+      video.load();
+    }
   };
+  openThumbnailPickerRef.current = openThumbnailPicker;
 
-  const handleSetThumbnail = async (): Promise<void> => {
-    if (!filePath || !thumbnailPreview) return;
+  const handleSetThumbnail = async (choice: ThumbnailChoice): Promise<void> => {
+    if (!filePath) return;
     setThumbnailStatus('saving');
+    setThumbnailError(null);
     try {
-      await invoke('set_video_thumbnail', { inputPath: filePath, time: thumbnailPreview.time });
+      // "embedded" (it's in the file - Explorer and shared copies show it) or "app-only:<why>" (a
+      // .mov can't hold one, or doing so would erase camera metadata) - see embed_cover_and_replace.
+      const outcome =
+        choice.kind === 'composed'
+          ? await invoke<string>('set_video_thumbnail_from_bytes', { inputPath: filePath, bytes: choice.bytes })
+          : choice.kind === 'image'
+            ? await invoke<string>('set_video_thumbnail_from_image', { inputPath: filePath, imagePath: choice.path })
+            : await invoke<string>('set_video_thumbnail', { inputPath: filePath, time: choice.time });
       setThumbnailStatus('saved');
+      setThumbnailPickerOpen(false);
+      if (shareCopyOnSave) {
+        void makeShareReadyCopy();
+        return;
+      }
+      const saved =
+        outcome === 'embedded'
+          ? 'Thumbnail saved into the video file - File Explorer and shared copies show it too.'
+          : `Thumbnail saved in Briefcast. ${
+              outcome === 'app-only:metadata'
+                ? 'This file carries camera details (date, location) that saving it into the file would erase, so the file was left as it is.'
+                : outcome === 'app-only:format'
+                  ? "This file type can't hold a thumbnail of its own, so the file was left untouched."
+                  : "The file itself couldn't be checked, so it was left untouched."
+            }`;
+      showThumbnailNotice({
+        text: `${saved} Sharing on WhatsApp or Telegram? They show a video's first frame, not its thumbnail - a share-ready copy opens on it.`,
+        action: { label: 'Make share-ready copy', run: () => void makeShareReadyCopy() },
+      });
     } catch (err) {
       console.error('Failed to set thumbnail:', err);
       setThumbnailStatus('error');
+      setThumbnailError(String(err));
     } finally {
-      setThumbnailPreview(null);
       setTimeout(() => setThumbnailStatus('idle'), 2000);
+    }
+  };
+
+  // A copy that opens on the chosen thumbnail (make_share_ready_copy, conversion.rs) - what makes
+  // it show on WhatsApp, Telegram, Instagram..., which preview a video by its first frame and
+  // ignore the embedded cover. Saved next to the original; progress shows in the notice.
+  const makeShareReadyCopy = async (): Promise<void> => {
+    if (!filePath || shareCopyBusyRef.current) return;
+    shareCopyBusyRef.current = true;
+    const key = filePath;
+    showThumbnailNotice({ text: 'Making a share-ready copy…', progress: 0 });
+    const unlisten = await listen<ConversionProgress>('conversion-progress', (event) => {
+      if (event.payload.input_path !== key) return;
+      setThumbnailNotice((n) => (n && n.progress !== undefined ? { ...n, progress: Math.round(event.payload.progress) } : n));
+    });
+    try {
+      const output = await invoke<string>('make_share_ready_copy', { inputPath: key });
+      const name = output.split(/[\\/]/).pop() ?? output;
+      showThumbnailNotice({
+        text: `Saved "${name}" next to the original. Share that one - it opens on your thumbnail, so that's what WhatsApp and Telegram show.`,
+        action: { label: 'Show in folder', run: () => void invoke('open_file_from_directory', { filepath: output }) },
+      });
+    } catch (err) {
+      showThumbnailNotice({ text: `Couldn't make the share-ready copy: ${err}` });
+    } finally {
+      unlisten();
+      shareCopyBusyRef.current = false;
     }
   };
 
@@ -2725,6 +2851,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								videoRef.current.currentTime = resumeAt;
 							}
 							setVideoIntrinsicSize({ width: videoRef.current.videoWidth, height: videoRef.current.videoHeight });
+							// Sound but no picture (HEVC .MOV) never fires "error" - treat it as one.
+							if (isPictureless(videoRef.current)) void handleVideoError();
 							}
 						}}
 					>
@@ -2805,43 +2933,46 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					{mediaType === 'audio' && (
 						<canvas ref={visualizerCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
 					)}
-					{thumbnailPreview && (
-						<div
-							className="absolute inset-0 z-30 flex items-center justify-center bg-black/70"
-							onClick={() => setThumbnailPreview(null)}
-						>
-							<div
-								className="flex flex-col items-center gap-3 p-4 rounded-lg bg-neutral-900 ring-1 ring-white/10 shadow-2xl"
-								onClick={(e) => e.stopPropagation()}
-							>
-								<img
-									src={thumbnailPreview.url}
-									alt="Chosen thumbnail frame"
-									className="max-w-[60vw] max-h-[40vh] rounded ring-1 ring-white/10"
-								/>
-								<div className="text-white text-sm">
-									Use this frame ({formatChapterTime(thumbnailPreview.time)}) as the thumbnail?
-								</div>
-								<p className="text-neutral-400 text-xs max-w-[60vw] text-center">
-									This updates the video file itself, so it's also what shows in File Explorer or when you share the file elsewhere.
-								</p>
-								<div className="flex gap-2 mt-1">
+					{thumbnailPickerOpen && videoRef.current && (
+						<ThumbnailPicker
+							video={videoRef.current}
+							sprite={scrubSprite}
+							saving={thumbnailStatus === 'saving'}
+							error={thumbnailError}
+							onSave={(choice) => void handleSetThumbnail(choice)}
+							onCancel={() => setThumbnailPickerOpen(false)}
+							embedsInFile={!!filePath && /\.(mp4|m4v)$/i.test(filePath)}
+							shareCopy={shareCopyOnSave}
+							onShareCopyChange={updateShareCopyOnSave}
+						/>
+					)}
+					{thumbnailNotice && (
+						<div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 max-w-[80%] px-3 py-2 rounded-lg bg-neutral-900/90 ring-1 ring-white/10 text-white text-xs leading-snug shadow-lg flex items-start gap-2">
+							<span className="flex-1 flex flex-col gap-1.5">
+								<span>{thumbnailNotice.text}</span>
+								{thumbnailNotice.progress !== undefined && (
+									<span className="flex items-center gap-2">
+										<span className="flex-1 h-1 rounded-full bg-white/15 overflow-hidden">
+											<span className="block h-full bg-blue-500 transition-[width]" style={{ width: `${thumbnailNotice.progress}%` }} />
+										</span>
+										<span className="tabular-nums text-neutral-400">{thumbnailNotice.progress}%</span>
+									</span>
+								)}
+								{thumbnailNotice.action && (
 									<button
-										className="px-3.5 py-1.5 rounded-md text-sm text-neutral-300 hover:bg-white/10"
-										onClick={() => setThumbnailPreview(null)}
-										disabled={thumbnailStatus === 'saving'}
+										type="button"
+										onClick={() => thumbnailNotice.action?.run()}
+										className="self-start px-2 py-1 rounded-md bg-blue-600 hover:bg-blue-500 text-white font-medium"
 									>
-										Cancel
+										{thumbnailNotice.action.label}
 									</button>
-									<button
-										className="px-3.5 py-1.5 rounded-md text-sm font-medium bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
-										onClick={() => void handleSetThumbnail()}
-										disabled={thumbnailStatus === 'saving'}
-									>
-										{thumbnailStatus === 'saving' ? 'Saving…' : 'Use this frame'}
-									</button>
-								</div>
-							</div>
+								)}
+							</span>
+							{thumbnailNotice.progress === undefined && (
+								<button type="button" onClick={() => setThumbnailNotice(null)} className="shrink-0 text-neutral-400 hover:text-white" title="Dismiss">
+									<IoClose size={14} />
+								</button>
+							)}
 						</div>
 					)}
 					{isRecovering && (

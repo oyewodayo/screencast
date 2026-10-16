@@ -10,7 +10,10 @@ import {
   IoServerOutline,
   IoResizeOutline,
   IoCheckmark,
+  IoFolderOutline,
 } from "react-icons/io5";
+import MoveCopyMenu, { FileTransferOptions } from "./MoveCopyMenu";
+import type { PopoverAnchor } from "../../hooks/useClampedPopoverPosition";
 import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory";
 import { FILE_TOOLS_COPY } from "./fileToolsConfig";
 import VideoTimelineDocker from "./VideoTimelineDocker";
@@ -58,6 +61,10 @@ interface FileToolsDockerProps {
   onConvert: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
+  // "Move or copy to..." (MoveCopyMenu.tsx) - absent hides it.
+  fileTransfer?: FileTransferOptions;
+  // Video-only: opens the player's "Set thumbnail" picker.
+  onSetThumbnail?: () => void;
   // Video-only: fired once a timeline Save export finishes. See VideoTimelineDocker's own prop
   // doc comment - the source file is never modified, this is always a newly rendered file.
   onExported: (newPath: string, newFileName: string) => void;
@@ -128,6 +135,8 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onConvert,
   onRename,
   onDelete,
+  fileTransfer,
+  onSetThumbnail,
   onExported,
   draggingLibraryFile,
   pendingTimelineInsert,
@@ -174,6 +183,8 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onConvert={onConvert}
         onRename={onRename}
         onDelete={onDelete}
+        fileTransfer={fileTransfer}
+        onSetThumbnail={onSetThumbnail}
         onExported={onExported}
         draggingLibraryFile={draggingLibraryFile}
         pendingTimelineInsert={pendingTimelineInsert}
@@ -206,7 +217,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
     );
   }
 
-  return <FileToolsDockerGeneric file={file} category={category} copy={copy} onConvert={onConvert} onRename={onRename} onDelete={onDelete} />;
+  return <FileToolsDockerGeneric file={file} category={category} copy={copy} onConvert={onConvert} onRename={onRename} onDelete={onDelete} fileTransfer={fileTransfer} />;
 };
 
 // The original generic panel (info + rename/convert/reveal/delete), still used for audio/image/
@@ -220,8 +231,11 @@ const FileToolsDockerGeneric: React.FC<{
   onConvert: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
-}> = ({ file, category, copy, onConvert, onRename, onDelete }) => {
+  // "Move or copy to..." (MoveCopyMenu.tsx) - absent hides it.
+  fileTransfer?: FileTransferOptions;
+}> = ({ file, category, copy, onConvert, onRename, onDelete, fileTransfer }) => {
   const [info, setInfo] = useState<FileInfo>({});
+  const [transferAnchor, setTransferAnchor] = useState<PopoverAnchor | null>(null);
   const [loadingInfo, setLoadingInfo] = useState(false);
 
   useEffect(() => {
@@ -355,6 +369,19 @@ const FileToolsDockerGeneric: React.FC<{
               <IoSwapHorizontalOutline /> Convert
             </button>
           )}
+          {fileTransfer && (
+            <button
+              type="button"
+              onClick={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                setTransferAnchor({ left: rect.left, top: rect.bottom + 4 });
+              }}
+              className="flex items-center gap-1.5 p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+            >
+              <IoFolderOutline /> Move / Copy
+            </button>
+          )}
+          {fileTransfer && transferAnchor && <MoveCopyMenu files={[file]} options={fileTransfer} anchor={transferAnchor} onClose={() => setTransferAnchor(null)} />}
           <button
             type="button"
             onClick={handleShowInFolder}

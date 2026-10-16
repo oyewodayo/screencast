@@ -21,7 +21,7 @@ import { createPortal } from "react-dom";
 import { IoClose, IoSyncOutline, IoEarOutline, IoCopyOutline, IoSparkles, IoPlay, IoPause } from "react-icons/io5";
 import { MdOutlineNoiseControlOff } from "react-icons/md";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost } from "./ToolPanelHost";
 import { AudioCleanup } from "../../utils/videoEditTypes";
 import Slider from "./Slider";
 import NumberStepper from "./NumberStepper";
@@ -50,6 +50,8 @@ interface NoiseReductionPopoverProps {
   anchor: { left: number; top: number };
   // How many clips "Apply to all" would touch - the button is hidden for a single-clip timeline.
   clipCount: number;
+  // >1 while the cleanup is edited for a multi-selection (stills in it are skipped).
+  selectedCount?: number;
   onUpdate: (patch: AudioCleanupPatch) => void;
   onApplyToAll: (patch: AudioCleanupPatch) => void;
   onClose: () => void;
@@ -103,6 +105,7 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
   status,
   anchor,
   clipCount,
+  selectedCount,
   onUpdate,
   onApplyToAll,
   onClose,
@@ -181,6 +184,7 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
         <span className="text-xs font-semibold flex items-center gap-1.5">
           <MdOutlineNoiseControlOff size={15} className="text-blue-400" />
           Clean up audio
+          <SelectionCountBadge count={selectedCount} />
         </span>
         <div className="flex items-center gap-1.5">
           {statusLabel && (

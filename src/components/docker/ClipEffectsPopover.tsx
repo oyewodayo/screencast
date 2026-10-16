@@ -18,7 +18,7 @@ import { IoClose } from "react-icons/io5";
 import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
 import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost } from "./ToolPanelHost";
 import ColorGradeControls from "./ColorGradeControls";
 
 export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "flipHorizontal" | "muted">>;
@@ -35,6 +35,9 @@ interface ClipEffectsPopoverProps {
   // Whether this clip is the one in the preview right now (the grade's histogram reads the screen).
   isOnScreen: boolean;
   anchor: { left: number; top: number };
+  // How many clips the edits land on (a Ctrl/Shift-click multi-selection) - the controls show this
+  // `clip`'s values, and every change is applied to all of them.
+  selectedCount?: number;
   onUpdate: (patch: ClipEffectsPatch) => void;
   onClose: () => void;
 }
@@ -53,7 +56,7 @@ const PresetButton: React.FC<{ active: boolean; onClick: () => void; children: R
   </button>
 );
 
-const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, isOnScreen, anchor, onUpdate, onClose }) => {
+const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, isOnScreen, anchor, selectedCount, onUpdate, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
@@ -102,7 +105,10 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
       className={dockHost ? `${DOCKED_PANEL_CLASS} p-3 gap-3` : "w-72 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-3"}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium">Clip effects</span>
+        <span className="text-xs font-medium flex items-center gap-1.5">
+          Clip effects
+          <SelectionCountBadge count={selectedCount} />
+        </span>
         <button type="button" title="Close" onClick={onClose} className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white">
           <IoClose size={14} />
         </button>
