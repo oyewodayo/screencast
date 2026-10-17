@@ -47,3 +47,8 @@ VIDEO_EDITOR_ROADMAP.md
 # Only docs/README.md - a pointer to it - is published with the app source.
 docs/*
 !docs/README.md
+
+# Music library: generated Originals, built output, and source audio (kept out of git - see music-library/README.md)
+music-library/originals/
+music-library/dist/
+music-library/audio/

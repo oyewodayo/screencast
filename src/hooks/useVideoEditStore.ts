@@ -51,6 +51,7 @@ import {
 } from "../handlers/videoEditHandlers";
 import { gradeCubeForClip } from "../utils/gradeLuts";
 import { clipOutputDuration } from "../utils/clipTiming";
+import { computeSpeechTimeline, duckEnvelopeFor, isDucked } from "../utils/musicDucking";
 import type { OverlayKeyframe } from "../utils/keyframes";
 import type { OverlayAsset } from "../utils/videoAssets";
 
@@ -154,7 +155,10 @@ type ImageOverlayContentPatch = Partial<
   Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset" | "reveal">
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
-type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src" | "bpm" | "beats">>;
+type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src" | "bpm" | "beats" | "duckUnderSpeech" | "duckLevel">>;
+// What a caller can set up front on a new audio overlay beyond its timing (a library song arrives
+// with its part, title, licence, beats and ducking already decided).
+export type NewAudioOverlayExtras = Partial<Pick<AudioOverlay, "trimStart" | "label" | "library" | "bpm" | "beats" | "fadeInSec" | "fadeOutSec" | "volume" | "duckUnderSpeech" | "duckLevel">>;
 type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted">>;
 type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted">>;
 
@@ -218,7 +222,7 @@ export interface UseVideoEditStoreResult {
   // caller, via get_conversion_info) rather than looking it up itself, matching how addImageOverlay
   // is given its content up front instead of a "content added later" placeholder flow.
   audioOverlays: AudioOverlay[];
-  addAudioOverlay: (src: string, sourceDuration: number, startTime: number, endTime: number) => string;
+  addAudioOverlay: (src: string, sourceDuration: number, startTime: number, endTime: number, extras?: NewAudioOverlayExtras) => string;
   updateAudioOverlayContent: (id: string, patch: AudioOverlayContentPatch) => void;
   cutImagesOnBeat: (everyBeats: number) => void;
   // Trims into the source (see resizeAudioOverlayTime in videoEditHandlers.ts) rather than just
@@ -1080,10 +1084,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   );
 
   const addAudioOverlay = useCallback(
-    (src: string, sourceDuration: number, startTime: number, endTime: number): string => {
+    (src: string, sourceDuration: number, startTime: number, endTime: number, extras?: NewAudioOverlayExtras): string => {
       const current = stateRef.current;
       if (!current) return "";
-      const overlay = makeAudioOverlay(src, sourceDuration, startTime, endTime);
+      const overlay = { ...makeAudioOverlay(src, sourceDuration, startTime, endTime), ...extras };
       const audioOverlays = addOverlay(current.audioOverlays, overlay);
       pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "add-audio");
       return overlay.id;
@@ -1670,6 +1674,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         // No client-side rendering step for audio (unlike text/image, which render to a PNG first)
         // - these just pass straight through to Rust, which reads the original source file
         // directly and builds the amix/afade/adelay filter chain itself (see export_trimmed_video).
+        // Ducked music gets the same speech envelope the preview plays (musicDucking.ts) - the scan
+        // is cached, so this is instant unless nothing has asked for it yet this session.
+        const speech = current.audioOverlays.some(isDucked) ? await computeSpeechTimeline(current) : [];
         const audioOverlays = current.audioOverlays
           .filter((o) => !o.muted)
           .map((o) => ({
@@ -1680,6 +1687,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             volume: o.volume,
             fadeIn: o.fadeInSec ?? 0,
             fadeOut: o.fadeOutSec ?? 0,
+            duck: duckEnvelopeFor(o, speech),
           }));
 
         // Captions go to Rust as a finished ASS script (burned in last, with libass) rather than

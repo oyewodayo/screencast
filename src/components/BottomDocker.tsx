@@ -93,6 +93,8 @@ interface Props {
   // The exact output time right now, read off the player itself (Dashboard's getExactOutputTime) -
   // for keeping audio overlays in sync, where the ~4Hz currentTime is too stale to measure against.
   getExactOutputTime?: () => number | null;
+  // The player's source time, frame-accurate - null mid-switch (Dashboard's getTimelinePlayerTime).
+  getPlayerTime?: () => number | null;
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
@@ -248,6 +250,7 @@ const BottomDocker = ({
   onTimelineInsertHandled,
   onOutputTimeChange,
   getExactOutputTime,
+  getPlayerTime,
   onActiveClipChange,
   onReframePreviewChange,
   noiseReductionStatus,
@@ -692,6 +695,7 @@ const BottomDocker = ({
             onTimelineInsertHandled={onTimelineInsertHandled}
             onOutputTimeChange={onOutputTimeChange}
             getExactOutputTime={getExactOutputTime}
+            getPlayerTime={getPlayerTime}
             onActiveClipChange={onActiveClipChange}
             onReframePreviewChange={onReframePreviewChange}
             noiseReductionStatus={noiseReductionStatus}

@@ -233,7 +233,10 @@ export interface VideoPlayerHandle {
   play: () => void;
   // `sourcePath` (the file behind `src`) lets a clip the webview can't show - an HEVC .MOV playing
   // sound over black, an .avi - be swapped for its playable copy (playableVideo.ts).
-  loadSource: (src: string, seekTime: number, sourcePath?: string) => void;
+  // `seekTime` may be a function, read once the new source is ready - a gapless handoff
+  // (ClipHandoffLayer) passes where its standby has got to by then. Resolves once the player has
+  // landed on that frame (or the load failed).
+  loadSource: (src: string, seekTime: number | (() => number), sourcePath?: string) => Promise<void>;
   // Imperatively overrides the crop transform for as long as a crop drag is in progress (pass
   // null once it ends) - ClipCropOverlay (Dashboard) calls this on every pointer move so the
   // actual video pixels track the drag in real time instead of only jumping to the new crop once
@@ -250,7 +253,7 @@ export interface VideoPlayerHandle {
   // source swap (loadSource) has finished: `src` is the URL last assigned, and `hasFrame` is false
   // until that source has decoded a frame to show. `paused` lets a layer that plays its own
   // <video> in step (the transition's moving outgoing tail) follow play/pause/scrub.
-  getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean; paused: boolean } | null;
+  getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean; paused: boolean; seeking: boolean; volume: number; muted: boolean } | null;
   // Opens the "Set thumbnail" picker for this video (waits for it to load if it just opened).
   openThumbnailPicker: () => void;
 }
@@ -484,21 +487,31 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     play: () => {
       if (videoRef.current?.paused) togglePauseAndPlay();
     },
-    loadSource: (src: string, seekTime: number, sourcePath?: string) => {
+    loadSource: (src: string, seekTime: number | (() => number), sourcePath?: string) => {
       const video = videoRef.current;
-      if (!video) return;
+      if (!video) return Promise.resolve();
+      let settle: () => void = () => {};
+      const done = new Promise<void>((resolve) => {
+        const timer = window.setTimeout(resolve, 6000);
+        settle = () => {
+          window.clearTimeout(timer);
+          resolve();
+        };
+      });
       const startAt = (url: string, onReady?: (v: HTMLVideoElement) => void) => {
         const onLoaded = () => {
           video.removeEventListener("loadedmetadata", onLoaded);
           video.removeEventListener("error", onFailed);
           if (onReady && video.getAttribute("src") === url && isPictureless(video)) return onReady(video);
-          video.currentTime = seekTime;
+          video.addEventListener("seeked", settle, { once: true });
+          video.currentTime = typeof seekTime === "function" ? seekTime() : seekTime;
           video.play().catch(() => {});
         };
         const onFailed = () => {
           video.removeEventListener("loadedmetadata", onLoaded);
           video.removeEventListener("error", onFailed);
           if (onReady && video.getAttribute("src") === url) onReady(video);
+          else settle();
         };
         video.addEventListener("loadedmetadata", onLoaded);
         video.addEventListener("error", onFailed);
@@ -519,6 +532,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
           }
         : undefined;
       startAt(src, recover);
+      return done;
     },
     previewCropLive: (crop: ClipCrop | null) => {
       liveCropOverrideRef.current = crop;
@@ -534,7 +548,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     getPlaybackState: () => {
       const video = videoRef.current;
       if (!video) return null;
-      return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2, paused: video.paused };
+      return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2, paused: video.paused, seeking: video.seeking, volume: video.volume, muted: video.muted };
     },
     openThumbnailPicker: () => openThumbnailPickerRef.current(),
   }), []);

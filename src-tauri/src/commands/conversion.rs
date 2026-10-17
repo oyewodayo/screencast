@@ -3819,6 +3819,51 @@ pub struct OverlayAudio {
     pub volume: f64,
     pub fade_in: f64,
     pub fade_out: f64,
+    // Music ducking: lowered to `level` while someone speaks - see duck_volume_filter.
+    #[serde(default)]
+    pub duck: Option<DuckEnvelope>,
+}
+
+// Where to lower a music track under speech, worked out by the frontend (src/utils/musicDucking.ts,
+// which applies the very same curve to the live preview): `ranges` are output-timeline seconds of
+// speech; the gain eases down `attack` s before each one starts (the export can look ahead, so the
+// music is already down when the first word lands) and back up over `release` s after it ends.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuckEnvelope {
+    pub level: f64,
+    pub attack: f64,
+    pub release: f64,
+    pub ranges: Vec<[f64; 2]>,
+}
+
+// "-x" for a non-negative x, "+|x|" otherwise - ffmpeg's expression parser doesn't need it, but a
+// "t--1.2" in a filter graph is easy to misread when debugging one.
+fn minus_term(x: f64) -> String {
+    if x >= 0.0 { format!("-{:.3}", x) } else { format!("+{:.3}", -x) }
+}
+
+// A `volume` filter (evaluated per audio frame) for one overlay's ducking, in the overlay's own
+// local time (its chain is atrim'd and asetpts'd to start at 0 = its start_time). Per speech range,
+// a trapezoid rising over `attack` and falling over `release`; summed and capped at 1, since the
+// frontend merges ranges whose ramps would otherwise meet. None when there's nothing to duck.
+fn duck_volume_filter(duck: &DuckEnvelope, start_time: f64, duration: f64) -> Option<String> {
+    let level = duck.level.clamp(0.0, 1.0);
+    let (attack, release) = (duck.attack.max(0.01), duck.release.max(0.01));
+    if level >= 0.999 {
+        return None;
+    }
+    let terms: Vec<String> = duck
+        .ranges
+        .iter()
+        .map(|[s, e]| (s - start_time, e - start_time))
+        .filter(|(s, e)| s.is_finite() && e.is_finite() && e > s && e + release > 0.0 && s - attack < duration)
+        .map(|(s, e)| format!("clip((t{})/{:.3},0,1)*clip(({:.3}-t)/{:.3},0,1)", minus_term(s - attack), attack, e + release, release))
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    Some(format!("volume='1-{:.3}*min(1,{})':eval=frame", 1.0 - level, terms.join("+")))
 }
 
 // A picture-in-picture video layer - e.g. a webcam recorded separately from the screen (see
@@ -6603,6 +6648,10 @@ pub async fn export_trimmed_video(
                     "[{}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,volume={:.3}",
                     input_index, audio_ov.trim_start, trim_end, audio_ov.volume
                 );
+                if let Some(duck) = audio_ov.duck.as_ref().and_then(|d| duck_volume_filter(d, audio_ov.start_time, audio_ov.end_time - audio_ov.start_time)) {
+                    chain.push(',');
+                    chain.push_str(&duck);
+                }
                 if audio_ov.fade_in > 0.0 {
                     chain.push_str(&format!(",afade=t=in:st=0:d={:.3}", audio_ov.fade_in));
                 }
@@ -7611,6 +7660,19 @@ pub struct SubjectTrack {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duck_filter_is_local_to_the_overlay_and_skips_far_ranges() {
+        let duck = DuckEnvelope { level: 0.25, attack: 0.25, release: 0.5, ranges: vec![[11.0, 13.0], [50.0, 51.0], [2.0, 3.0]] };
+        // Overlay plays output 10..20: only the 11..13 range touches it, shifted to local 1..3.
+        let f = super::duck_volume_filter(&duck, 10.0, 10.0).unwrap();
+        assert_eq!(f, "volume='1-0.750*min(1,clip((t-0.750)/0.250,0,1)*clip((3.500-t)/0.500,0,1))':eval=frame");
+        // A range starting before the overlay gives a "+" offset, never "--".
+        let early = DuckEnvelope { ranges: vec![[9.0, 12.0]], ..duck };
+        assert!(super::duck_volume_filter(&early, 10.0, 10.0).unwrap().contains("clip((t+1.250)/0.250"));
+        let none = DuckEnvelope { level: 1.0, attack: 0.25, release: 0.5, ranges: vec![[11.0, 12.0]] };
+        assert!(super::duck_volume_filter(&none, 10.0, 10.0).is_none());
+    }
+
     use super::*;
 
     // Bare-minimum KeepSegment with every optional field off - individual tests override just the

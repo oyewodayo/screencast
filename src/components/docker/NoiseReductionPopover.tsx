@@ -21,7 +21,7 @@ import { createPortal } from "react-dom";
 import { IoClose, IoSyncOutline, IoEarOutline, IoCopyOutline, IoSparkles, IoPlay, IoPause } from "react-icons/io5";
 import { MdOutlineNoiseControlOff } from "react-icons/md";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
 import { AudioCleanup } from "../../utils/videoEditTypes";
 import Slider from "./Slider";
 import NumberStepper from "./NumberStepper";
@@ -127,16 +127,10 @@ const NoiseReductionPopover: React.FC<NoiseReductionPopoverProps> = ({
   const anythingOn = strength > 0 || !!cleanup?.lowCut || !!cleanup?.hum || !!cleanup?.gate || !!cleanup?.level;
   const samplingEnabled = mode === "reduce" && strength > 0;
 
-  useEffect(() => {
-    // A docked panel stays open until its X / toolbar button closes it.
-    if (dockHost) return;
-    const close = (e: PointerEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-noise-reduction-popover]")) return;
-      onClose();
-    };
-    document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, [onClose, dockHost]);
+  // A click elsewhere closes it - unless that click opened the sidebar, which docks it instead,
+  // gliding into place. Docked, it stays open until its X / toolbar button closes it.
+  useFloatingDismiss("[data-noise-reduction-popover]", onClose, !!dockHost);
+  useDockSnap(popoverRef, !!dockHost);
 
   // Never leave the player stuck on the original if the popover closes mid-compare. Via a ref so
   // a new callback identity on re-render doesn't fire the cleanup mid-hold.

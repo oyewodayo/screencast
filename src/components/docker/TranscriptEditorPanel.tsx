@@ -13,7 +13,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IoClose, IoCutOutline, IoDocumentTextOutline, IoPauseOutline } from "react-icons/io5";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
 import { CaptionTrack, CaptionWord, Clip } from "../../utils/videoEditTypes";
 import {
   ClipCut,
@@ -70,15 +70,10 @@ const TranscriptEditorPanel: React.FC<TranscriptEditorPanelProps> = ({ anchor, c
     telemetryEvent: "editor_transcript_generated",
   });
 
-  useEffect(() => {
-    if (dockHost) return; // a docked panel stays open until closed
-    const close = (e: PointerEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-transcript-panel]")) return;
-      onClose();
-    };
-    document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, [onClose, dockHost]);
+  // A click elsewhere closes it - unless that click opened the sidebar, which docks it instead,
+  // gliding into place. Docked, it stays open until its X / toolbar button closes it.
+  useFloatingDismiss("[data-transcript-panel]", onClose, !!dockHost);
+  useDockSnap(popoverRef, !!dockHost);
 
   // The real silences in each source's audio (detect_silence - the same scan Trim silence uses),
   // so pauses are measured rather than guessed from word timings. Once per file per panel open;
@@ -177,6 +172,7 @@ const TranscriptEditorPanel: React.FC<TranscriptEditorPanelProps> = ({ anchor, c
       setSelected(new Set());
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
       e.preventDefault();
+      e.stopPropagation(); // all the words, not also every clip on the timeline
       setSelected(new Set(tokens.map((t) => t.key)));
     }
   };

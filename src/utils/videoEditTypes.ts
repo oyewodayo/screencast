@@ -422,8 +422,29 @@ export interface AudioOverlay {
   // the timeline, snapped to, and what "cut images on the beat" fits to (beatSync.ts).
   bpm?: number;
   beats?: number[];
+  // Set for songs and sound effects added from the built-in music library (MusicLibraryPanel):
+  // what it is and the licence it was offered under - the credit line export offers to copy, and
+  // what restore_music_track uses to fetch the file again if it's gone missing from disk.
+  library?: AudioLibraryInfo;
+  // Music ducking: this track dips to duckLevel (0..1, default DEFAULT_DUCK_LEVEL) wherever someone
+  // is speaking - the video's own sound, or a detached Voice track - in the preview and the export
+  // alike (src/utils/musicDucking.ts).
+  duckUnderSpeech?: boolean;
+  duckLevel?: number;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface AudioLibraryInfo {
+  trackId: string;
+  title: string;
+  artist: string;
+  kind: "music" | "sfx";
+  license: string;
+  licenseUrl?: string;
+  // The credit line the licence asks for (CC-BY), when it asks for one.
+  attribution?: string;
+  sourceUrl?: string;
 }
 
 // A picture-in-picture video layer - e.g. a webcam recording captured separately from the screen

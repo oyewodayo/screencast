@@ -11,7 +11,7 @@
 // arm/disarm toggle and SpeedPopover, respectively) rather than living in here - both have enough
 // of their own subfeatures to earn a dedicated surface instead of being one more section buried
 // inside "Clip effects".
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { ColorGrid, MotionGrid } from "./EffectPreviewGrids";
 import { hasGrade } from "../../utils/colorGrade";
 import TransitionLookControls, { transitionHasLook } from "./TransitionLookControls";
@@ -20,7 +20,7 @@ import { IoClose } from "react-icons/io5";
 import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
 import TransitionGrid from "./TransitionGrid";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
 import ColorGradeControls from "./ColorGradeControls";
 
 export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "flipHorizontal" | "muted">>;
@@ -74,16 +74,10 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
 
-  useEffect(() => {
-    // A docked panel stays open until its X / toolbar button closes it.
-    if (dockHost) return;
-    const close = (e: PointerEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-clip-effects-popover]")) return;
-      onClose();
-    };
-    document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, [onClose, dockHost]);
+  // A click elsewhere closes it - unless that click opened the sidebar, which docks it instead,
+  // gliding into place. Docked, it stays open until its X / toolbar button closes it.
+  useFloatingDismiss("[data-clip-effects-popover]", onClose, !!dockHost);
+  useDockSnap(popoverRef, !!dockHost);
 
   const colorPreset = clip.colorFilter?.preset ?? "none";
   const colorIntensity = clip.colorFilter?.intensity ?? DEFAULT_COLOR_INTENSITY;

@@ -22,9 +22,11 @@ import { createPortal } from "react-dom";
 import { IoClose, IoPause, IoPlay } from "react-icons/io5";
 import { AudioOverlay } from "../../utils/videoEditTypes";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, useDockSnap, useFloatingDismiss, useToolPanelHost } from "./ToolPanelHost";
+import { creditLine, needsCredit } from "../../utils/musicLibrary";
+import { DEFAULT_DUCK_LEVEL, isSpeechOverlay } from "../../utils/musicDucking";
 
-export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "bpm" | "beats" | "trimStart" | "endTime">>;
+export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "bpm" | "beats" | "trimStart" | "endTime" | "duckUnderSpeech" | "duckLevel">>;
 
 const MIN_PART_SEC = 0.1;
 const FIT_FADE_OUT_SEC = 2;
@@ -65,21 +67,22 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
 
-  useEffect(() => {
-    // A docked panel stays open until its X / toolbar button closes it.
-    if (dockHost) return;
-    const close = (e: PointerEvent) => {
-      // Ignore the click that's still landing on the popover itself (or the chip that opened it -
-      // that click already toggles selection on its own, this listener would otherwise immediately
-      // re-close what it just opened).
-      if (e.target instanceof Element && e.target.closest("[data-audio-overlay-popover]")) return;
-      onClose();
-    };
-    document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, [onClose, dockHost]);
+  // A click elsewhere closes it (not the chip that opened it - that click toggles selection on its
+  // own) - unless that click opened the sidebar, which docks it instead, gliding into place.
+  useFloatingDismiss("[data-audio-overlay-popover], [data-audio-chip]", onClose, !!dockHost);
+  useDockSnap(popoverRef, !!dockHost);
 
   const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
+  const library = overlay.library;
+  const credit = library && needsCredit(library) ? creditLine(library) : null;
+  const [creditCopied, setCreditCopied] = useState(false);
+  const copyCredit = () => {
+    if (!credit) return;
+    void navigator.clipboard.writeText(credit).then(() => {
+      setCreditCopied(true);
+      window.setTimeout(() => setCreditCopied(false), 1500);
+    });
+  };
 
   // The part of the song that plays, in seconds into the file. It always plays at 1x, so its length
   // on the timeline is (to - from) and only the end moves when either changes.
@@ -143,9 +146,16 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
         >
           {previewing ? <IoPause size={12} /> : <IoPlay size={12} className="ml-px" />}
         </button>
-        <span className="flex-1 min-w-0 text-xs font-medium truncate" title={fileName}>
-          {fileName}
-        </span>
+        {library ? (
+          <span className="flex-1 min-w-0 leading-tight" title={`${library.title} - ${library.artist}`}>
+            <span className="block text-xs font-medium truncate">{library.title}</span>
+            <span className="block text-[10px] text-white/45 truncate">{library.artist}</span>
+          </span>
+        ) : (
+          <span className="flex-1 min-w-0 text-xs font-medium truncate" title={fileName}>
+            {fileName}
+          </span>
+        )}
         <span className="shrink-0 text-[10px] tabular-nums text-white/45" title="Preview position in this part">
           {formatSec(Math.max(0, Math.min(previewAt, partTo) - partFrom))}
         </span>
@@ -267,6 +277,30 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
         <span className="text-white/60">sec</span>
       </label>
 
+      {!isSpeechOverlay(overlay) && (
+        <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
+          <label className="flex items-center justify-between gap-2 text-[11px] cursor-pointer" title="Dips this track while someone is speaking - in the preview and the saved video alike">
+            <span className="text-white/80">Lower under speech</span>
+            <input type="checkbox" checked={!!overlay.duckUnderSpeech} onChange={(e) => onUpdate({ duckUnderSpeech: e.target.checked })} className="accent-teal-400" />
+          </label>
+          {overlay.duckUnderSpeech && (
+            <label className="flex items-center gap-2 text-[11px]">
+              <span className="w-12 shrink-0 text-white/60">Dips to</span>
+              <input
+                type="range"
+                min={0}
+                max={0.8}
+                step={0.05}
+                value={overlay.duckLevel ?? DEFAULT_DUCK_LEVEL}
+                onChange={(e) => onUpdate({ duckLevel: Number(e.target.value) })}
+                className="flex-1 accent-teal-400"
+              />
+              <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round((overlay.duckLevel ?? DEFAULT_DUCK_LEVEL) * 100)}%</span>
+            </label>
+          )}
+        </div>
+      )}
+
       <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
         <div className="flex items-center justify-between">
           <span className="text-[10px] uppercase tracking-wide text-white/40">Beats</span>
@@ -311,6 +345,30 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
         )}
         {beatState.error && <p className="text-[10px] leading-snug text-red-300">{beatState.error}</p>}
       </div>
+
+      {library && (
+        <div className="flex flex-col gap-1 pt-1 border-t border-white/10">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] uppercase tracking-wide text-white/40">Licence</span>
+            <span className="text-[10px] text-white/50" title={library.licenseUrl}>
+              {library.license.replace(/-/g, " ")}
+            </span>
+          </div>
+          {credit ? (
+            <>
+              <p className="text-[10px] leading-snug text-white/55">Free to use - put this credit in your video's description:</p>
+              <div className="flex items-start gap-1.5">
+                <code className="flex-1 min-w-0 px-1.5 py-1 rounded bg-white/5 text-[10px] leading-snug text-white/75 break-words">{credit}</code>
+                <button type="button" onClick={copyCredit} className="shrink-0 px-1.5 py-1 rounded text-[10px] bg-white/10 hover:bg-white/15 text-white/80">
+                  {creditCopied ? "Copied" : "Copy"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <p className="text-[10px] leading-snug text-white/45">Free to use, no credit needed.</p>
+          )}
+        </div>
+      )}
 
       <div className="flex items-center justify-between pt-1 border-t border-white/10">
         <button

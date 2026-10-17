@@ -47,6 +47,7 @@ import { useGradeLut } from "../utils/gradeLuts";
 import { clipOutputDuration, sourceToOutputOffset } from "../utils/clipTiming";
 import { OverlayKeyframe, keyframeAt, keyframeStateAt, upsertKeyframe } from "../utils/keyframes";
 import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
+import ClipHandoffLayer, { ClipHandoffApi } from "../components/video/ClipHandoffLayer";
 import ReframePreviewLayer, { type ReframePreview } from "../components/video/ReframePreviewLayer";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
@@ -717,8 +718,14 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // selectedFile.sourcePath, but a cross-clip preview seek (see handleSeekActiveFile below) can
   // point it at a different file entirely without touching selectedFile itself.
   const previewSourcePathRef = useRef<string | null>(null);
-  // True while handleSeekActiveFile is still resolving a different file's URL - see there.
+  // True while handleSeekActiveFile is switching the player to a different file - from resolving its
+  // URL until the player has landed on the requested frame. Meanwhile the player still shows and
+  // reports the clip being left, so its time reports are ignored.
   const previewSwitchPendingRef = useRef(false);
+  // Where that switch is headed (source time) - what the playback state reports until it's there.
+  const pendingSeekTimeRef = useRef(0);
+  // Gapless clip changes (ClipHandoffLayer): a warmed standby of the next clip that covers the switch.
+  const handoffRef = useRef<ClipHandoffApi | null>(null);
 
   // useCallback'd (stable identity across renders, not just a stable cache Map) because these
   // three resolvers are passed as props into ImageFolderGallery, whose own thumbnail-resolving
@@ -778,7 +785,26 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     [resolveTimelineFrame]
   );
   // Stable (TransitionPreviewLayer's animation loop restarts whenever it changes).
-  const getPlayerPlaybackState = useCallback(() => videoPlayerRef.current?.getPlaybackState() ?? null, []);
+  // During a clip handoff, the standby stands in for the player; mid-switch without one, the player's
+  // own report still belongs to the clip it's leaving, so it reads as "not there yet".
+  const getMainPlaybackState = useCallback(() => videoPlayerRef.current?.getPlaybackState() ?? null, []);
+  const getPlayerPlaybackState = useCallback(() => {
+    const handoff = handoffRef.current;
+    if (handoff?.isActive()) return handoff.state();
+    const main = videoPlayerRef.current?.getPlaybackState() ?? null;
+    if (main && previewSwitchPendingRef.current) return { ...main, src: null, time: pendingSeekTimeRef.current, hasFrame: false };
+    return main;
+  }, []);
+  // The timeline's frame-accurate clip-boundary check reads this - null while it can't be trusted.
+  const getTimelinePlayerTime = useCallback((): number | null => {
+    const handoff = handoffRef.current;
+    if (handoff?.isActive()) return handoff.state()?.time ?? null;
+    if (previewSwitchPendingRef.current) return null;
+    const main = videoPlayerRef.current?.getPlaybackState();
+    return main && !main.seeking ? main.time : null;
+  }, []);
+  const isMainSwitching = useCallback(() => previewSwitchPendingRef.current, []);
+  const seekMainPlayer = useCallback((time: number) => videoPlayerRef.current?.seek(time), []);
 
   // The exact output time right now - the on-screen clip's output start plus how far the player is
   // into it, read from the <video> itself. For per-frame preview (keyframed overlays); the
@@ -786,7 +812,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   const outputTimingRef = useRef<{ clips: Clip[]; activeId: string | null }>({ clips: [], activeId: null });
   outputTimingRef.current = { clips: editStore.clips, activeId: activeClipEffects?.id ?? null };
   const getExactOutputTime = useCallback((): number | null => {
-    const playback = videoPlayerRef.current?.getPlaybackState();
+    const playback = getPlayerPlaybackState();
     const { clips, activeId } = outputTimingRef.current;
     const index = clips.findIndex((c) => c.id === activeId);
     if (!playback || index < 0) return null;
@@ -794,7 +820,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     for (let i = 0; i < index; i++) start += clipOutputDuration(clips[i]);
     const clip = clips[index];
     return start + sourceToOutputOffset(clip, Math.max(clip.start, Math.min(clip.end, playback.time)));
-  }, []);
+  }, [getPlayerPlaybackState]);
   // Any clip's preview source as the player loads it - the primary file's already-resolved URL,
   // an image's proxy, or another video's asset URL (TransitionPreviewLayer compares this against
   // what the player actually has loaded).
@@ -892,34 +918,47 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // `resume` (playback running from one clip into the next): keep playing even if the previous
   // clip ran to the very end of its file, which leaves the <video> paused in "ended".
   const handleSeekActiveFile = (sourcePath: string, time: number, resume = false) => {
+    // Playback running on into the next clip: a warmed standby of it takes over on this very frame
+    // (ClipHandoffLayer) while the player gets there, then the player lands where the standby is.
+    const handoff = handoffRef.current;
+    const bridged = !!handoff && resume && handoff.begin(sourcePath, time);
+    if (!bridged && handoff?.isActive()) handoff.cancel();
+    const target = () => (bridged && handoffRef.current?.isActive() ? handoffRef.current.targetTime() : time);
+    pendingSeekTimeRef.current = time;
+    // The playhead goes straight to the new spot. Until the player gets there it still reports the
+    // clip it's leaving - for an image clip, a time at that clip's end, which the timeline read as
+    // "already at the end of the next clip": the playhead leapt ahead, then fell back.
+    setPlayerCurrentTime(time);
     if (previewSourcePathRef.current === sourcePath) {
-      videoPlayerRef.current?.seek(time);
-      if (resume) videoPlayerRef.current?.play();
+      const player = videoPlayerRef.current;
+      const state = player?.getPlaybackState();
+      // Running straight on into a clip that starts where playback already is (a split) - no seek,
+      // so no stutter.
+      const continuous = resume && !!state && !state.paused && Math.abs(state.time - time) < 0.08;
+      if (!continuous) player?.seek(target());
+      if (resume) player?.play();
       return;
     }
     previewSourcePathRef.current = sourcePath;
+    previewSwitchPendingRef.current = true;
+    const settled = () => {
+      if (previewSourcePathRef.current === sourcePath) previewSwitchPendingRef.current = false;
+    };
     if (sourcePath === selectedFile?.sourcePath) {
       // Back to the primary file - its asset URL is already resolved (selectedFile.path).
-      previewSwitchPendingRef.current = false;
-      videoPlayerRef.current?.loadSource(selectedFile.path, time, selectedFile.sourcePath);
+      void (videoPlayerRef.current?.loadSource(selectedFile.path, target, selectedFile.sourcePath) ?? Promise.resolve()).finally(settled);
       return;
     }
-    // Until the new source is in, the old one keeps playing (past its clip's end) and reporting
-    // its own time - which the timeline would read as having already left the clip it just moved
-    // to, and skip straight past it. Hold position reports until the swap happens.
-    previewSwitchPendingRef.current = true;
     resolveTimelineClipUrl(sourcePath)
       .then((url) => {
         // Dropped if the player has moved on while the URL resolved - opening a different file
         // resets previewSourcePathRef (effect above), and a late load here would otherwise swap
         // the newly opened video back out for this one.
         if (previewSourcePathRef.current !== sourcePath) return;
-        videoPlayerRef.current?.loadSource(url, time, isImageClipPath(sourcePath) ? undefined : sourcePath);
+        return videoPlayerRef.current?.loadSource(url, target, isImageClipPath(sourcePath) ? undefined : sourcePath);
       })
       .catch((error) => console.error("Failed to load preview source for", sourcePath, error))
-      .finally(() => {
-        if (previewSourcePathRef.current === sourcePath) previewSwitchPendingRef.current = false;
-      });
+      .finally(settled);
   };
   // Prepares every image clip's preview proxy ahead of the playhead, one at a time, so playback
   // crossing into an image doesn't stall on its first encode. Re-runs on every edit, but anything
@@ -4377,7 +4416,7 @@ const setScreen = () => {
                 loop={isAudioSelected && audioRepeatMode === "one"}
                 onTimeUpdate={(time) => {
                   handleMediaTimeUpdate(time);
-                  if (!previewSwitchPendingRef.current) setPlayerCurrentTime(time);
+                  if (!previewSwitchPendingRef.current && !handoffRef.current?.isActive()) setPlayerCurrentTime(time);
                 }}
                 onPlayStateChange={setPlayerIsPlaying}
                 onEnded={handleMediaEnded}
@@ -4391,6 +4430,19 @@ const setScreen = () => {
                   getFileCategory(selectedFile.name) === "video"
                     ? (frameRect) => (
                         <>
+                          {/* The next clip, covering the player while it switches to it. Under
+                              the transition preview, which draws the outgoing clip over it. */}
+                          <ClipHandoffLayer
+                            frameRect={frameRect}
+                            clips={editStore.clips}
+                            activeClipId={activeClipEffects?.id ?? null}
+                            apiRef={handoffRef}
+                            resolveClipUrl={resolveTimelineClipUrl}
+                            getMainState={getMainPlaybackState}
+                            isMainSwitching={isMainSwitching}
+                            seekMain={seekMainPlayer}
+                            onTime={setPlayerCurrentTime}
+                          />
                           {/* First, so it sits under every overlay - export composites the
                               transition into the base video before any overlay too. */}
                           <TransitionPreviewLayer
@@ -4753,6 +4805,7 @@ const setScreen = () => {
         onTimelineInsertHandled={() => setPendingTimelineInsert(null)}
         onOutputTimeChange={setCurrentOutputTime}
         getExactOutputTime={getExactOutputTime}
+        getPlayerTime={getTimelinePlayerTime}
         onActiveClipChange={setActiveClipEffects}
         onReframePreviewChange={setReframePreview}
         noiseReductionStatus={noiseReductionStatus}

@@ -6,11 +6,11 @@
 // ramping, etc.) to earn its own button rather than being one more section buried inside "Clip
 // effects", the same reasoning Crop already got its own standalone toolbar button for. Same portal
 // + useClampedPopoverPosition + outside-click-close shape as ClipEffectsPopover/SilenceDetectionPopover.
-import React, { useEffect } from "react";
+import React from "react";
 import { createPortal } from "react-dom";
 import { IoClose, IoSpeedometerOutline } from "react-icons/io5";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
 import Slider from "./Slider";
 import NumberStepper from "./NumberStepper";
 import { ClipSpeedRamp, SPEED_RAMP_PRESETS, clipOutputDuration, clipSpeedSteps } from "../../utils/clipTiming";
@@ -67,16 +67,10 @@ const SpeedPopover: React.FC<SpeedPopoverProps> = ({ speed, sourceDuration, anch
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
 
-  useEffect(() => {
-    // A docked panel stays open until its X / toolbar button closes it.
-    if (dockHost) return;
-    const close = (e: PointerEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-speed-popover]")) return;
-      onClose();
-    };
-    document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, [onClose, dockHost]);
+  // A click elsewhere closes it - unless that click opened the sidebar, which docks it instead,
+  // gliding into place. Docked, it stays open until its X / toolbar button closes it.
+  useFloatingDismiss("[data-speed-popover]", onClose, !!dockHost);
+  useDockSnap(popoverRef, !!dockHost);
 
   const setSpeed = (next: number) => onUpdate(Math.abs(next - 1) < 0.001 ? undefined : Math.max(MIN_SPEED, Math.min(MAX_SPEED, next)));
   // Duration is just 1/speed scaled by sourceDuration - editing it directly sets speed to

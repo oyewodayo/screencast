@@ -6,14 +6,14 @@
 // Docks into the sidebar's Tools tab like the other settings panels (ToolPanelHost.tsx), floating
 // as a popover only when there's no sidebar to dock into. The style controls and caption list are
 // shared with the player's viewing-captions panel (captions/CaptionControls.tsx).
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { IoClose, IoDocumentAttachOutline, IoRefresh, IoTrashOutline } from "react-icons/io5";
 import { MdClosedCaptionOff } from "react-icons/md";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { DOCKED_PANEL_CLASS, useToolPanelHost } from "./ToolPanelHost";
+import { DOCKED_PANEL_CLASS, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
 import { CaptionSettings, CaptionTrack, CaptionWord } from "../../utils/videoEditTypes";
 import { CaptionLine, cuesToCaptionWords, parseSubtitleFile } from "../../utils/captions";
 import { CAPTIONS_LANGUAGE_OPTIONS } from "../../utils/videoUtils";
@@ -61,16 +61,10 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
   const [language, setLanguage] = useState<string>(captions?.language ?? "auto");
   const [transcriptOnly, setTranscriptOnly] = useTranscriptOnly();
 
-  useEffect(() => {
-    // A docked panel stays open until its X / toolbar button closes it.
-    if (dockHost) return;
-    const close = (e: PointerEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-captions-panel]")) return;
-      onClose();
-    };
-    document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, [onClose, dockHost]);
+  // A click elsewhere closes it - unless that click opened the sidebar, which docks it instead,
+  // gliding into place. Docked, it stays open until its X / toolbar button closes it.
+  useFloatingDismiss("[data-captions-panel]", onClose, !!dockHost);
+  useDockSnap(popoverRef, !!dockHost);
 
   const missingSources = sourcePaths.filter((p) => !captions?.transcripts[p]);
 

@@ -59,6 +59,9 @@ import SplitScreenPanel from "../video/SplitScreenPanel";
 import HighlightIntroPanel from "../video/HighlightIntroPanel";
 import { assetEntry, makeAsset } from "../../utils/videoAssets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
+import MusicLibraryPanel from "./MusicLibraryPanel";
+import { libraryInfoOf, restoreMusicTrack, VideoContext } from "../../utils/musicLibrary";
+import { computeSpeechTimeline, DEFAULT_DUCK_LEVEL, duckGainAt, isDucked, isSpeechOverlay, TimeRange } from "../../utils/musicDucking";
 import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION } from "./ClipEffectsPopover";
 import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
 import MoveCopyMenu, { FileTransferOptions } from "./MoveCopyMenu";
@@ -150,6 +153,8 @@ const SEEK_TOLERANCE_SEC = 0.25;
 // How close to a clip's end playback counts as having finished it - a little under a frame, so a
 // file whose real length rounds a hair short of the clip's stored end still moves on.
 const CLIP_END_EPSILON_SEC = 0.05;
+// The per-frame boundary check crosses within half a frame of the cut.
+const FRAME_BOUNDARY_SEC = 0.012;
 // How far an audio overlay may drift from the picture while playing before it's re-seeked.
 const AUDIO_DRIFT_TOLERANCE_SEC = 0.3;
 // After re-seeking an audio overlay, how long to let it rebuffer before judging its drift again -
@@ -495,6 +500,8 @@ interface VideoTimelineDockerProps {
   // The exact output time right now, read off the player itself (Dashboard's getExactOutputTime) -
   // for keeping audio overlays in sync, where the ~4Hz currentTime is too stale to measure against.
   getExactOutputTime?: () => number | null;
+  // The player's source time right now, frame-accurate - null while it can't be trusted (mid-switch).
+  getPlayerTime?: () => number | null;
   // Reports the ACTIVE clip's own color/Ken Burns effect fields upward, so VideoPlayer (mounted
   // as a sibling subtree by Dashboard) can drive live CSS filter/transform on the <video> element
   // without needing to know about clips at all - same "report state this component already tracks
@@ -578,6 +585,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onTimelineInsertHandled,
   onOutputTimeChange,
   getExactOutputTime,
+  getPlayerTime,
   onActiveClipChange,
   onReframePreviewChange,
   noiseReductionStatus = "idle",
@@ -973,6 +981,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [splitAnchor, setSplitAnchor] = useState<{ left: number; top: number } | null>(null);
   // Highlight intro builder (HighlightIntroPanel).
   const [introAnchor, setIntroAnchor] = useState<{ left: number; top: number } | null>(null);
+  // The music & sound-effects library (MusicLibraryPanel).
+  const [musicAnchor, setMusicAnchor] = useState<{ left: number; top: number } | null>(null);
   const captionsButtonRef = useRef<HTMLButtonElement>(null);
   // Edit by transcript (TranscriptEditorPanel) - whole-timeline like Captions, sharing its transcripts.
   const [transcriptAnchor, setTranscriptAnchor] = useState<{ left: number; top: number } | null>(null);
@@ -994,6 +1004,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     audio: audioPopoverAnchor !== null,
     captions: captionsAnchor !== null,
     transcript: transcriptAnchor !== null,
+    music: musicAnchor !== null,
   };
   const prevDockedPanelsOpen = useRef(dockedPanelsOpen);
   useEffect(() => {
@@ -1008,6 +1019,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (opened !== "audio") setAudioPopoverAnchor(null);
     if (opened !== "captions") setCaptionsAnchor(null);
     if (opened !== "transcript") setTranscriptAnchor(null);
+    if (opened !== "music") setMusicAnchor(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions, dockedPanelsOpen.transcript]);
   const [viewSwitchState, setViewSwitchState] = useState<ViewSwitchDetectState>({ status: "loading" });
@@ -1964,6 +1976,26 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         return;
       }
 
+      // Ctrl/Cmd+A selects every clip on the timeline (then Delete, Duplicate, Speed, Effects...
+      // act on all of them); Escape clears the selection. preventDefault stops the page's own
+      // select-all highlighting everything.
+      if ((e.ctrlKey || e.metaKey) && key === "a") {
+        if (editStore.clips.length === 0) return;
+        e.preventDefault();
+        onSelectOverlay?.(null);
+        onSelectImageOverlay?.(null);
+        onSelectBlurOverlay?.(null);
+        onSelectPipOverlay?.(null);
+        setSelectedAudioOverlayId(null);
+        setAudioPopoverAnchor(null);
+        setSelectedClipIds(editStore.clips.map((c) => c.id));
+        return;
+      }
+      if (e.key === "Escape" && selectedClipIds.length > 1) {
+        setSelectedClipIds(selectedClipId ? [selectedClipId] : []);
+        return;
+      }
+
       if (e.key !== "Delete" && e.key !== "Backspace") return;
 
       if (selectedOverlayId) {
@@ -2443,17 +2475,52 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (nextIndex < baseClips.length) {
       // Playback running out of one clip carries on into the next - even if the <video> paused
       // itself on reaching the end of its file. A scrub past the end while paused stays paused.
-      const resume = isPlaying || wasPlayingRef.current;
-      activeClipIndexRef.current = nextIndex;
-      lastAppliedTimeRef.current = baseClips[nextIndex].start;
-      onSeek(baseClips[nextIndex].sourcePath, baseClips[nextIndex].start, resume);
-    } else if (isPlaying && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
+      advanceToClip(nextIndex, isPlaying || wasPlayingRef.current);
+    } else if (isPlaying && !stopRequestedRef.current && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
       // Finished the last clip in playback order - stop there rather than playing on into the
       // rest of its source (an image clip's proxy runs for minutes; a trimmed video's tail was
       // cut for a reason). Play again restarts from clip 0 (handleTransportPlayClick).
+      stopRequestedRef.current = true;
       onTogglePlay();
     }
   }, [currentTime, editStore.clips]);
+  function advanceToClip(index: number, resume: boolean) {
+    const clip = baseClips[index];
+    activeClipIndexRef.current = index;
+    lastAppliedTimeRef.current = clip.start;
+    onSeek(clip.sourcePath, clip.start, resume);
+  }
+  // The effect above only hears the player's position a few times a second (timeupdate), so on its
+  // own a clip ran up to a quarter second past its cut before the next one was asked for. While
+  // playing, this checks every frame and crosses over on the frame the clip ends - the next clip's
+  // standby (ClipHandoffLayer) takes over in the same tick.
+  const boundaryCheckRef = useRef<() => void>(() => {});
+  const stopRequestedRef = useRef(false);
+  boundaryCheckRef.current = () => {
+    const t = getPlayerTime?.();
+    const index = activeClipIndexRef.current;
+    const clip = baseClips[index];
+    if (t == null || !clip || t < clip.start - SEEK_TOLERANCE_SEC) return;
+    if (t < clip.end - FRAME_BOUNDARY_SEC) return;
+    if (index + 1 < baseClips.length) advanceToClip(index + 1, true);
+    else if (!stopRequestedRef.current) {
+      // The end of the last clip - stop there (see the effect above). Once: isPlaying only turns
+      // false a render later, and a second toggle would start it again.
+      stopRequestedRef.current = true;
+      onTogglePlay();
+    }
+  };
+  useEffect(() => {
+    if (isPlaying) stopRequestedRef.current = false;
+    if (!isPlaying || !getPlayerTime) return;
+    let raf = 0;
+    const tick = () => {
+      boundaryCheckRef.current();
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [isPlaying, getPlayerTime]);
   // isPlaying as of the previous commit, for the effect above: on reaching the end of its file the
   // <video> reports its final time and its pause together, so that effect can see the clip end
   // with isPlaying already false. Declared after it so it still holds the previous value there.
@@ -2651,6 +2718,47 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // re-seeked the audio, which is what made detached audio skip and stutter. While playing, small
   // drift is left alone (a seek is far more audible than 0.3s of slip); paused or after a scrub
   // it's snapped exactly. Also re-checked a few times a second while playing, independent of renders.
+  // ---- Music library + ducking ----------------------------------------------------------------
+  // Where a library track lands (the playhead - or, with it at the very end, the start; same rule
+  // as a file) and what the library's "Suggested for this video" goes on.
+  const musicPlaceAt = currentOutputTime < totalOutputDuration - MIN_AUDIO_START_ROOM_SEC ? currentOutputTime : 0;
+  const musicContext = useMemo<VideoContext>(() => {
+    const imageClips = editStore.clips.filter((c) => isImageClipPath(c.sourcePath)).length;
+    const hasSpeech =
+      (!editStore.videoAudioMuted && editStore.clips.some((c) => !c.muted && !isImageClipPath(c.sourcePath))) || editStore.audioOverlays.some((o) => isSpeechOverlay(o) && !o.muted);
+    return { videoDuration: totalOutputDuration, hasSpeech, isMontage: editStore.clips.length > 0 && imageClips / editStore.clips.length >= 0.5 };
+  }, [editStore.clips, editStore.videoAudioMuted, editStore.audioOverlays, totalOutputDuration]);
+
+  // Speech on the output timeline, for ducked tracks - only worked out once something is ducked.
+  // The per-file scans are cached (musicDucking.ts), so re-running this after an edit is cheap.
+  const anyDucked = editStore.audioOverlays.some(isDucked);
+  const speechRangesRef = useRef<TimeRange[]>([]);
+  useEffect(() => {
+    if (!anyDucked) return;
+    let cancelled = false;
+    computeSpeechTimeline({ clips: editStore.clips, videoAudioMuted: editStore.videoAudioMuted, audioOverlays: editStore.audioOverlays }).then((r) => {
+      if (!cancelled) speechRangesRef.current = r;
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [anyDucked, editStore.clips, editStore.videoAudioMuted, editStore.audioOverlays]);
+
+  // A library song missing from disk (app data cleared, project opened on another machine) is
+  // fetched again - checked once per overlay per session, which is just a file-exists test.
+  const restoreCheckedRef = useRef(new Set<string>());
+  useEffect(() => {
+    for (const o of editStore.audioOverlays) {
+      const key = `${o.id}|${o.src}`;
+      if (!o.library || restoreCheckedRef.current.has(key)) continue;
+      restoreCheckedRef.current.add(key);
+      restoreMusicTrack(o.library.trackId, o.src)
+        .then((path) => path && path !== o.src && editStore.updateAudioOverlayContent(o.id, { src: path }))
+        .catch((err) => console.warn("Couldn't restore library track", o.library?.title, err));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editStore.audioOverlays]);
+
   const syncAudioOverlaysRef = useRef<() => void>(() => {});
   const audioSeekAtRef = useRef<Map<string, number>>(new Map());
   syncAudioOverlaysRef.current = () => {
@@ -2685,7 +2793,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       let envelope = 1;
       if (fadeIn > 0) envelope = Math.min(envelope, (now - o.startTime) / fadeIn);
       if (fadeOut > 0) envelope = Math.min(envelope, (o.endTime - now) / fadeOut);
-      audio.volume = o.muted ? 0 : o.volume * Math.max(0, Math.min(1, envelope));
+      const duck = isDucked(o) ? duckGainAt(speechRangesRef.current, now, o.duckLevel ?? DEFAULT_DUCK_LEVEL) : 1;
+      audio.volume = o.muted ? 0 : o.volume * Math.max(0, Math.min(1, envelope)) * duck;
     });
   };
   useEffect(() => {
@@ -2693,9 +2802,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [currentOutputTime, isPlaying, editStore.audioOverlays]);
   useEffect(() => {
     if (!isPlaying || editStore.audioOverlays.length === 0) return;
-    const id = window.setInterval(() => syncAudioOverlaysRef.current(), 100);
+    // Faster while something is ducked, so its volume ramps glide rather than step.
+    const id = window.setInterval(() => syncAudioOverlaysRef.current(), anyDucked ? 40 : 100);
     return () => window.clearInterval(id);
-  }, [isPlaying, editStore.audioOverlays.length]);
+  }, [isPlaying, editStore.audioOverlays.length, anyDucked]);
 
   return (
     // The webview's native menu (Save image as / Copy image / Inspect) means nothing on a timeline -
@@ -3140,12 +3250,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <MdPictureInPictureAlt size={15} className={isPlacingPip ? "text-fuchsia-400" : undefined} />
           </ActionButton>
-          <ActionButton
-            title={isPlacingAudio ? "Choosing an audio file…" : "Add audio overlay"}
-            onClick={() => setIsPlacingAudio((v) => !v)}
+          <button
+            type="button"
+            data-music-library-button
+            title={isPlacingAudio ? "Choosing an audio file…" : "Add music & sound effects (free library, or a file of your own)"}
+            onClick={(e) => {
+              if (musicAnchor) {
+                setMusicAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setMusicAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              musicAnchor ? "bg-neutral-700 text-teal-300" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
           >
             <IoMusicalNotesOutline size={15} className={isPlacingAudio ? "text-teal-400" : undefined} />
-          </ActionButton>
+          </button>
           </div>
         </div>
 
@@ -3946,6 +4068,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 return (
                   <div
                     key={overlay.id}
+                    data-audio-chip
                     onPointerDown={beginAudioOverlayDrag(overlay)}
                     onPointerMove={handleAudioOverlayDragMove}
                     onPointerUp={endAudioOverlayDrag}
@@ -4121,6 +4244,48 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             />
           );
         })()}
+
+      {musicAnchor && (
+        <MusicLibraryPanel
+          anchor={musicAnchor}
+          placeAt={musicPlaceAt}
+          videoDuration={totalOutputDuration}
+          context={musicContext}
+          timelinePlaying={isPlaying}
+          onPreviewStart={() => {
+            if (isPlaying) onTogglePlay();
+          }}
+          onAdd={(track, path, part, beats) => {
+            const isMusic = track.kind === "music";
+            const startTime = musicPlaceAt;
+            const id = editStore.addAudioOverlay(path, track.duration, startTime, startTime + part.length, {
+              trimStart: part.start,
+              label: track.title,
+              library: libraryInfoOf(track),
+              ...(beats ?? {}),
+              // Starting mid-song fades in so it doesn't land on a cut-off note; stopping before the
+              // song does fades out, so it never ends abruptly.
+              ...(isMusic && part.start > 0.05 ? { fadeInSec: 0.4 } : {}),
+              ...(isMusic && part.start + part.length < track.duration - 0.5 ? { fadeOutSec: Math.min(2, part.length / 4) } : {}),
+              // Under a voice, music sits back automatically.
+              ...(isMusic && musicContext.hasSpeech ? { duckUnderSpeech: true } : {}),
+            });
+            setSelectedAudioOverlayId(id);
+            if (isMusic) {
+              // A song's finer controls live in its own panel - open it where the library was.
+              setAudioPopoverAnchor(musicAnchor);
+              setMusicAnchor(null);
+            }
+            return id;
+          }}
+          onLateBeats={(id, b) => editStore.updateAudioOverlayContent(id, { bpm: b.bpm, beats: b.beats })}
+          onPickFile={() => {
+            setMusicAnchor(null);
+            setIsPlacingAudio(true);
+          }}
+          onClose={() => setMusicAnchor(null)}
+        />
+      )}
 
       {introAnchor && (
         <HighlightIntroPanel
