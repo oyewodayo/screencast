@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,6 +41,48 @@ pub struct ConversionState {
     // Set by cancel_conversion - a run that fails because the user stopped it is never retried
     // (export_trimmed_video's software fallback). Cleared as each run starts.
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+// Exports running from the background queue (src/utils/exportQueue.ts), by job id - each on its
+// own ConversionState, so cancelling one (cancel_export_job) never stops another export or any
+// other conversion, and nothing else's cancel stops it.
+#[derive(Default)]
+pub struct ExportJobs(std::sync::Mutex<HashMap<String, ConversionState>>);
+
+// Keeps a job registered for exactly as long as its export_trimmed_video call runs.
+struct ExportJobGuard<'a> {
+    jobs: &'a ExportJobs,
+    id: String,
+    state: ConversionState,
+}
+
+impl<'a> ExportJobGuard<'a> {
+    fn register(jobs: &'a ExportJobs, id: &str) -> Self {
+        let state = ConversionState::default();
+        jobs.0.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), state.clone());
+        Self { jobs, id: id.to_string(), state }
+    }
+}
+
+impl Drop for ExportJobGuard<'_> {
+    fn drop(&mut self) {
+        self.jobs.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
+}
+
+// A job id as it may appear in a temp file name.
+fn sanitize_job_id(id: &str) -> String {
+    id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect()
+}
+
+#[tauri::command]
+pub async fn cancel_export_job(export_jobs: State<'_, ExportJobs>, job_id: String) -> Result<(), String> {
+    let job = export_jobs.0.lock().unwrap_or_else(|e| e.into_inner()).get(&job_id).cloned();
+    match job {
+        Some(state) => cancel_state(&state).await,
+        // Already finished (or never started) - nothing to stop.
+        None => Ok(()),
+    }
 }
 
 // Helper function to parse duration from FFmpeg output (format: HH:MM:SS.ms)
@@ -142,7 +184,7 @@ impl InputSpec {
 async fn run_conversion(
     app_handle: &AppHandle,
     window: &Window,
-    state: &State<'_, ConversionState>,
+    state: &ConversionState,
     inputs: &[InputSpec],
     progress_key: &str,
     output: PathBuf,
@@ -158,12 +200,49 @@ async fn run_conversion(
 async fn run_conversion_timed(
     app_handle: &AppHandle,
     window: &Window,
-    state: &State<'_, ConversionState>,
+    state: &ConversionState,
     inputs: &[InputSpec],
     progress_key: &str,
     output: PathBuf,
     codec_args: &[&str],
     expected_duration: Option<f64>,
+) -> Result<String, String> {
+    run_conversion_with(app_handle, window, state, inputs, progress_key, output, codec_args, expected_duration, &RunExtras::default()).await
+}
+
+// What a background export (the queue - see export_trimmed_video's job_id) adds to a run.
+#[derive(Default)]
+struct RunExtras {
+    // A second output after the main one: the live preview frame, written to `preview` as a small
+    // JPEG that ffmpeg replaces atomically (-update 1 -atomic_writing 1) as the render advances.
+    preview_args: Vec<String>,
+    // (job id, file): the frame is read back whenever it changes and sent as export-job-preview.
+    preview: Option<(String, PathBuf)>,
+    // Below-normal CPU priority, so the editor keeps every core it asks for while this renders.
+    low_priority: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportJobPreview {
+    job_id: String,
+    data_url: String,
+}
+
+// How often the preview frame file is checked for a newer frame.
+const PREVIEW_FRAME_POLL_MS: u64 = 300;
+
+#[allow(clippy::too_many_arguments)]
+async fn run_conversion_with(
+    app_handle: &AppHandle,
+    window: &Window,
+    state: &ConversionState,
+    inputs: &[InputSpec],
+    progress_key: &str,
+    output: PathBuf,
+    codec_args: &[&str],
+    expected_duration: Option<f64>,
+    extras: &RunExtras,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     state.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -204,17 +283,61 @@ async fn run_conversion_timed(
     // -nostats suppresses that human status line so it doesn't clutter the stderr scan below.
     cmd.args(["-y", "-progress", "pipe:1", "-nostats"]);
     cmd.arg(path_to_str(&output)?);
+    cmd.args(&extras.preview_args);
     // No interactive input is ever needed (the -y above suppresses overwrite prompts), and
     // leaving stdin inherited from the parent risks ffmpeg blocking on a read that never
     // resolves when run from a console-attached dev build.
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    if extras.low_priority {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (as hide_console_window) | BELOW_NORMAL_PRIORITY_CLASS.
+        cmd.creation_flags(0x0800_0000 | 0x0000_4000);
+    }
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start conversion: {}", e))?;
 
     let pid = child.id();
+    #[cfg(unix)]
+    if extras.low_priority {
+        let _ = Command::new("renice").args(["-n", "10", "-p", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    // The live preview frame: re-read whenever ffmpeg has replaced it, until the run ends.
+    let preview_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    if let Some((job_id, path)) = extras.preview.clone() {
+        let running = preview_running.clone();
+        let window = window.clone();
+        std::thread::spawn(move || {
+            let mut last_modified = None;
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(PREVIEW_FRAME_POLL_MS));
+                let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else { continue };
+                if last_modified == Some(modified) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else { continue };
+                // A complete JPEG ends FF D9 - the rename makes this always true, but a torn read
+                // must never reach the page as a broken image.
+                if bytes.len() < 4 || bytes[bytes.len() - 2..] != [0xFF, 0xD9] {
+                    continue;
+                }
+                last_modified = Some(modified);
+                let data_url = format!("data:image/jpeg;base64,{}", BASE64.encode(&bytes));
+                let _ = window.emit("export-job-preview", ExportJobPreview { job_id: job_id.clone(), data_url });
+            }
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+    struct StopPreview(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopPreview {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _stop_preview = StopPreview(preview_running);
     {
         let mut active_process = state.active_process.lock().await;
         *active_process = Some(pid);
@@ -420,7 +543,7 @@ pub async fn convert_to_mp4(
 // sitting here under the *same* path+mtime key the corrected decoder would also produce, so nothing
 // short of a namespace change would ever have invalidated it. Bump the namespace's suffix (e.g.
 // "heic_v3") again if a future decoder change needs the same guarantee.
-fn preview_cache_path(
+pub(crate) fn preview_cache_path(
     input: &PathBuf,
     namespace: &str,
     output_ext: &str,
@@ -896,7 +1019,7 @@ pub async fn convert_image(
 async fn convert_heic_windows(
     app_handle: &AppHandle,
     window: &Window,
-    state: &State<'_, ConversionState>,
+    state: &ConversionState,
     input: &PathBuf,
     output: PathBuf,
     output_format: &str,
@@ -1039,7 +1162,7 @@ async fn convert_heic_windows(
 async fn convert_heic_unix(
     app_handle: &AppHandle,
     window: &Window,
-    state: &State<'_, ConversionState>,
+    state: &ConversionState,
     input: &PathBuf,
     output: PathBuf,
     output_format: &str,
@@ -1135,6 +1258,10 @@ pub async fn get_heic_preview(
     state: State<'_, ConversionState>,
     input_path: String,
 ) -> Result<String, String> {
+    heic_preview(app_handle, window, &state, input_path).await
+}
+
+async fn heic_preview(app_handle: AppHandle, window: Window, state: &ConversionState, input_path: String) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
     let cache_path = preview_cache_path(&input, "heic_v2", "png")?;
 
@@ -3666,6 +3793,10 @@ pub struct OverlayImage {
     // `data_base64` is unused when this is set.
     #[serde(default)]
     pub frames: Option<OverlayFrames>,
+    // A CSS mix-blend-mode name ("multiply", "screen"...) - the preview's look - composited by
+    // blend_composite. None/"normal" (or anything not in blend_mode_ffmpeg) is a plain overlay.
+    #[serde(default)]
+    pub blend_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3753,26 +3884,35 @@ fn opacity_commands(kfs: &[OverlayKeyframe], target: &str, start: f64, end: f64)
     format!("sendcmd=c='{}'", cmds.join(";"))
 }
 
-// The time window a blur region is on screen, for its filters' `enable`.
-fn blur_window(bv: &OverlayBlur) -> String {
-    format!("between(t,{:.3},{:.3})", bv.start_time, bv.end_time)
-}
-
 // One keyframed value over time as an ffmpeg expression in `tvar`: held at the first keyframe's
 // value before it, eased between each pair, held at the last after it - the same piecewise curve
 // keyframeStateAt (keyframes.ts) draws in the preview.
+//
+// Piece i is the eased segment from keyframe i to i+1 (the last piece holds the last value), and
+// the pieces are chosen by a balanced tree of time comparisons rather than a chain: a motion
+// track bakes hundreds of keyframes, and a chain of hundreds of nested if()s is as deep as it is
+// long for ffmpeg's recursive expression parser and costs every frame a walk down all of it.
 fn keyframe_expr(kfs: &[OverlayKeyframe], tvar: &str, value: impl Fn(&OverlayKeyframe) -> f64) -> String {
     let mut sorted: Vec<&OverlayKeyframe> = kfs.iter().collect();
     sorted.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
-    let last = sorted[sorted.len() - 1];
-    let mut expr = format!("{:.4}", value(last));
-    for i in (0..sorted.len().saturating_sub(1)).rev() {
+    let n = sorted.len();
+    let piece = |i: usize| -> String {
+        if i + 1 >= n {
+            return format!("{:.4}", value(sorted[n - 1]));
+        }
         let (a, b) = (sorted[i], sorted[i + 1]);
         let p = format!("clip(({tvar}-{:.4})/{:.4},0,1)", a.time, (b.time - a.time).max(1e-3));
-        let segment = format!("({:.4}+({:.4})*{})", value(a), value(b) - value(a), easing_expr(&a.easing, &p));
-        expr = format!("if(lt({tvar},{:.4}),{segment},{expr})", b.time);
+        format!("({:.4}+({:.4})*{})", value(a), value(b) - value(a), easing_expr(&a.easing, &p))
+    };
+    // Pieces lo..=hi; piece i covers [time of keyframe i, time of keyframe i+1).
+    fn build(lo: usize, hi: usize, tvar: &str, sorted: &[&OverlayKeyframe], piece: &dyn Fn(usize) -> String) -> String {
+        if lo == hi {
+            return piece(lo);
+        }
+        let mid = (lo + hi) / 2;
+        format!("if(lt({tvar},{:.4}),{},{})", sorted[mid + 1].time, build(lo, mid, tvar, sorted, piece), build(mid + 1, hi, tvar, sorted, piece))
     }
-    expr
+    build(0, n - 1, tvar, &sorted, &piece)
 }
 
 // A blurred region burned into the output video for its own [start_time,end_time) window - unlike
@@ -3798,6 +3938,70 @@ pub struct OverlayBlur {
     pub mask_data_base64: Option<String>,
     pub start_time: f64,
     pub end_time: f64,
+    // The preview's CSS blur radius (a Gaussian's standard deviation) in output pixels -
+    // gaussian_blur_chain reproduces it. None: the older boxblur radius from `intensity`.
+    #[serde(default)]
+    pub sigma: Option<f64>,
+    // Keyframed (e.g. motion-tracked) position: x/y are the region's top-left in output pixels at
+    // absolute output seconds; scale/opacity are ignored (the region keeps its size).
+    #[serde(default)]
+    pub keyframes: Option<Vec<OverlayKeyframe>>,
+}
+
+// An adjustment layer (adjustmentLayers.ts): grades and/or blurs everything beneath it in the
+// stack for its window - "under" sits on the video itself (below blur regions and every overlay),
+// "over" above every overlay and PiP (captions stay on top). The preview is a backdrop-filter of
+// the same CSS functions in the same order, so this composes exactly what the browser draws.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustmentLayerSpec {
+    pub start_time: f64,
+    pub end_time: f64,
+    pub placement: String,
+    // CSS colour filter functions in order ("brightness", "contrast", "saturate", "hue-rotate"
+    // (degrees), "sepia", "grayscale"), applied after the blur as the backdrop-filter list is.
+    #[serde(default)]
+    pub color_ops: Vec<CssOpSpec>,
+    // Gaussian standard deviation in output pixels (CSS blur()); 0/None = none.
+    #[serde(default)]
+    pub blur_sigma: Option<f64>,
+    // The "vignette" look's strength (vignetteBackground) drawn over the adjusted picture.
+    #[serde(default)]
+    pub vignette: Option<f64>,
+    // 0..1, how much of the adjustment shows (the preview element's opacity).
+    #[serde(default = "one")]
+    pub opacity: f64,
+    #[serde(default)]
+    pub fade_in: f64,
+    #[serde(default)]
+    pub fade_out: f64,
+    // Where the effect applies: a grey mask PNG (renderAdjustmentMask) whose top-left sits at
+    // (mask_x, mask_y) in output pixels - the effect is confined to that box and weighted by the
+    // mask. None: the whole frame.
+    #[serde(default)]
+    pub mask_data_base64: Option<String>,
+    #[serde(default)]
+    pub mask_x: i64,
+    #[serde(default)]
+    pub mask_y: i64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CssOpSpec {
+    pub op: String,
+    pub value: f64,
+}
+
+// A chapter of the exported video - embedded in the MP4 (embed_chapters) and written to its
+// `.chapters.json` sidecar so the player shows it. `time` is output seconds.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ChapterSpec {
+    pub time: f64,
+    pub label: String,
 }
 
 // A background music/voiceover track to mix into the output's own audio - unlike OverlayImage,
@@ -3897,6 +4101,9 @@ pub struct PipOverlay {
     // effective_video_volume already folds audio_muted into the primary track's own volume,
     // rather than carrying a separate bool here too.
     pub volume: f64,
+    // CSS mix-blend-mode, as OverlayImage.blend_mode.
+    #[serde(default)]
+    pub blend_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -3955,12 +4162,17 @@ fn pip_overlay_chain(
     stage_index: usize,
     current_label: &str,
     out_label: &str,
+    // The final frame's size - needed to blend (blend_composite); None composites normally.
+    frame: Option<(i64, i64)>,
 ) -> String {
     let duration = (pip.end_time - pip.start_time).max(0.01);
     let trim_end = pip.trim_start + duration;
+    // Re-timed to start at the PiP's own start_time on the output timeline - starting it at 0 made
+    // the overlay below (which takes the latest frame at or before each output moment) show the
+    // wrong part of the source, or freeze on its last frame, whenever a PiP didn't start at 0:00.
     let cover = format!(
-        "trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS,{src_crop}scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}",
-        ts = pip.trim_start, te = trim_end, src_crop = pip_crop_fragment(pip.crop), w = pip.width, h = pip.height
+        "trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS+{st:.4}/TB,{src_crop}scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}",
+        ts = pip.trim_start, te = trim_end, st = pip.start_time, src_crop = pip_crop_fragment(pip.crop), w = pip.width, h = pip.height
     );
     let shape = sanitize_pip_shape(&pip.shape);
     let video_label = format!("pip{}v", stage_index);
@@ -4017,11 +4229,304 @@ fn pip_overlay_chain(
         }
     };
 
+    if let (Some(mode), Some(frame)) = (pip.blend_mode.as_deref().and_then(blend_mode_ffmpeg), frame) {
+        let layer = BlendLayer { label: &composited_label, x: pip.x.to_string(), y: pip.y.to_string(), width: pip.width, height: pip.height, moving: false, fps: PIP_BLEND_FPS };
+        chain.push_str(&blend_composite(current_label, &layer, frame, mode, pip.start_time, pip.end_time, &format!("pipb{stage_index}"), out_label));
+        return chain;
+    }
     chain.push_str(&format!(
         "[{current}][{composited}]overlay=x={x}:y={y}:enable='between(t,{start:.3},{end:.3})'[{out}];",
         current = current_label, composited = composited_label, x = pip.x, y = pip.y, start = pip.start_time, end = pip.end_time, out = out_label
     ));
     chain
+}
+
+// ---- Blend modes -------------------------------------------------------------------------------
+//
+// An overlay with a CSS mix-blend-mode (the preview sets it on the overlay's element, over the
+// video) is composited the way the W3C compositing spec defines: the blend function B(backdrop,
+// source) per RGB channel, then mixed over the backdrop by the layer's alpha -
+// result = backdrop + alpha * (B - backdrop). The blend runs in planar RGB (gbrp), where every
+// mode below was measured against the spec's formula on all 65,536 8-bit pairs: within 2 levels
+// (most exact). Soft light (31 dB off) and dodge/burn (wrong at the extremes) aren't offered.
+// The backdrop is blend's TOP input - overlay/hard-light are only the spec's with it that way round.
+fn blend_mode_ffmpeg(mode: &str) -> Option<&'static str> {
+    match mode {
+        "multiply" => Some("multiply"),
+        "screen" => Some("screen"),
+        "overlay" => Some("overlay"),
+        "hard-light" => Some("hardlight"),
+        "darken" => Some("darken"),
+        "lighten" => Some("lighten"),
+        "difference" => Some("difference"),
+        "exclusion" => Some("exclusion"),
+        // CSS plus-lighter: min(1, alpha*source + backdrop) - an add of the premultiplied layer.
+        "plus-lighter" => Some("addition"),
+        _ => None,
+    }
+}
+
+// A PiP's own frames are sampled onto its blend canvas at up to this rate (a source faster than
+// the canvas would otherwise lose frames there).
+const PIP_BLEND_FPS: f64 = 60.0;
+
+// The layer blend_composite blends: an rgba stream of width x height, at (x, y) of the frame
+// (ffmpeg expressions in `t`, overlay_w/overlay_h and W/H when `moving`), timed in absolute
+// output seconds.
+struct BlendLayer<'a> {
+    label: &'a str,
+    x: String,
+    y: String,
+    width: i64,
+    height: i64,
+    // Position changes over time: the blend then covers the whole frame instead of the layer's box.
+    moving: bool,
+    // Rate the layer is drawn onto its canvas at.
+    fps: f64,
+}
+
+// Composites `layer` onto [current] with blend `mode` over [start, end], writing [out]. Only the
+// layer's own box is touched (for a still one; the frame for a moving one) - the rest passes
+// through untouched, never round-tripped through RGB.
+#[allow(clippy::too_many_arguments)]
+fn blend_composite(current: &str, layer: &BlendLayer, (fw, fh): (i64, i64), mode: &str, start: f64, end: f64, tag: &str, out: &str) -> String {
+    // The box, clamped to the frame and widened to even edges: 4:2:0 chroma can only be cropped on
+    // even pixels, so an odd edge would shift the backdrop half a chroma sample against the layer.
+    let (rx, ry, rw, rh) = if layer.moving {
+        (0, 0, fw, fh)
+    } else {
+        let (x, y) = (layer.x.parse::<i64>().unwrap_or(0), layer.y.parse::<i64>().unwrap_or(0));
+        let x0 = x.clamp(0, fw) & !1;
+        let y0 = y.clamp(0, fh) & !1;
+        let x1 = ((x + layer.width).clamp(0, fw) + 1) & !1;
+        let y1 = ((y + layer.height).clamp(0, fh) + 1) & !1;
+        (x0, y0, (x1.min(fw) - x0).max(2), (y1.min(fh) - y0).max(2))
+    };
+    let (lx, ly) = if layer.moving {
+        (layer.x.clone(), layer.y.clone())
+    } else {
+        ((layer.x.parse::<i64>().unwrap_or(0) - rx).to_string(), (layer.y.parse::<i64>().unwrap_or(0) - ry).to_string())
+    };
+    let dur = (end - start).max(0.01);
+    let add = mode == "addition";
+    // The layer's straight colour (premultiplied for an add) and its alpha - an add's result is
+    // already final wherever the layer covers anything, so its mask is just "covered or not".
+    let colour = if add { "format=gbrap,premultiply=inplace=1,format=gbrp" } else { "format=gbrp" };
+    let alpha = if add { "alphaextract,lut=c0='if(gt(val,0),255,0)'" } else { "alphaextract" };
+    format!(
+        "color=c=black@0:s={rw}x{rh}:r={fps:.3}:d={d:.3},format=rgba,setpts=PTS+{start:.4}/TB[{tag}cv];\
+         [{tag}cv][{layer}]overlay=x='{lx}':y='{ly}':format=auto:eof_action=pass[{tag}ly];\
+         [{tag}ly]split=2[{tag}lc0][{tag}la0];[{tag}lc0]{colour}[{tag}lc];[{tag}la0]{alpha}[{tag}la];\
+         [{current}]split=2[{tag}bg][{tag}bd0];\
+         [{tag}bd0]trim=start={start:.4}:end={end:.4},crop={rw}:{rh}:{rx}:{ry},format=gbrp[{tag}bd];\
+         [{tag}bd][{tag}lc]blend=all_mode={mode}:shortest=1,format=gbrap[{tag}bl];\
+         [{tag}bl][{tag}la]alphamerge[{tag}bm];\
+         [{tag}bg][{tag}bm]overlay=x={rx}:y={ry}:eof_action=pass:format=auto[{out}];",
+        fps = layer.fps,
+        d = dur + 0.1,
+        layer = layer.label,
+    )
+}
+
+// ---- Gaussian blur -----------------------------------------------------------------------------
+//
+// CSS blur(sigma) - what the preview's backdrop-filter draws - as three box blurs whose widths are
+// chosen (Kovesi's method) so their combined variance is sigma^2: within 1% of sigma and a few % of
+// the Gaussian's shape, and O(1) per pixel at any radius. ffmpeg's gblur was measured first: its
+// IIR approximation was 7-77% off the Gaussian depending on `steps`. Chroma is half-resolution in
+// 4:2:0, so its planes get sigma/2 - a blur of Y, Cb and Cr is then exactly a blur of RGB.
+fn box_widths_for_sigma(sigma: f64, passes: usize) -> Vec<i64> {
+    let n = passes as f64;
+    let ideal = (12.0 * sigma * sigma / n + 1.0).sqrt();
+    let mut wl = ideal.floor() as i64;
+    if wl % 2 == 0 {
+        wl -= 1;
+    }
+    let wl = wl.max(1);
+    let wu = wl + 2;
+    // How many passes use the narrower box: whichever split lands the combined sigma closest
+    // (Kovesi's closed form rounds, which can miss by a few % at small sigmas).
+    let sigma_with = |m: usize| (((m as f64) * (wl * wl - 1) as f64 + ((passes - m) as f64) * (wu * wu - 1) as f64) / 12.0).sqrt();
+    let m = (0..=passes).min_by(|a, b| (sigma_with(*a) - sigma).abs().total_cmp(&(sigma_with(*b) - sigma).abs())).unwrap_or(passes);
+    (0..passes).map(|i| if i < m { wl } else { wu }).collect()
+}
+
+// The filter fragment (no leading/trailing comma, "" when there's nothing to blur) blurring a
+// `w`x`h` yuv420p stream by `sigma` px. Radii are clamped to what boxblur allows on that size.
+fn gaussian_blur_chain(sigma: f64, w: i64, h: i64, enable: Option<&str>) -> String {
+    if !(sigma > 0.25) {
+        return String::new();
+    }
+    let luma = box_widths_for_sigma(sigma, 3);
+    let chroma = box_widths_for_sigma(sigma / 2.0, 3);
+    let max_luma = (w.min(h) / 2 - 1).max(0);
+    let max_chroma = (((w + 1) / 2).min((h + 1) / 2) / 2 - 1).max(0);
+    let enable = enable.map(|e| format!(":enable='{e}'")).unwrap_or_default();
+    luma.iter()
+        .zip(&chroma)
+        .map(|(wl, wc)| (((wl - 1) / 2).min(max_luma), ((wc - 1) / 2).min(max_chroma)))
+        .filter(|(rl, rc)| *rl > 0 || *rc > 0)
+        .map(|(rl, rc)| format!("boxblur=luma_radius={rl}:luma_power=1:chroma_radius={rc}:chroma_power=1{enable}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+// One blur region onto [current], writing [out]: its patch of the picture cut out for its own
+// window, blurred, shaped by its mask (when it has one) and laid back where it came from.
+fn blur_region_chain(bv: &OverlayBlur, i: usize, mask_input: Option<usize>, current: &str, out_label: &str) -> String {
+    let mut graph = String::new();
+    let src_label = format!("bb{}src", i);
+    let bg_label = format!("bb{}bg", i);
+    // The blurred copy only exists for the region's own window (trim), so nothing is
+    // cropped or blurred for the rest of the video.
+    graph.push_str(&format!(
+        "[{}]split=2[{}][{}];",
+        current, bg_label, src_label
+    ));
+    // Where the region is: fixed, or keyframed (a motion track) - on even pixels either
+    // way (4:2:0 chroma crops on even pixels), kept inside the frame, and the same
+    // expression for the crop and the overlay so the blurred patch lands where it was cut.
+    let (x_expr, y_expr) = match bv.keyframes.as_ref().filter(|k| !k.is_empty()) {
+        Some(kfs) => (keyframe_expr(kfs, "t", |k| k.x), keyframe_expr(kfs, "t", |k| k.y)),
+        None => (bv.x.to_string(), bv.y.to_string()),
+    };
+    let crop_x = format!("clip(2*floor(({x_expr})/2),0,iw-ow)");
+    let crop_y = format!("clip(2*floor(({y_expr})/2),0,ih-oh)");
+    let place_x = format!("clip(2*floor(({x_expr})/2),0,main_w-overlay_w)");
+    let place_y = format!("clip(2*floor(({y_expr})/2),0,main_h-overlay_h)");
+    // The preview's Gaussian (CSS blur(sigma)); an older frontend sends only intensity,
+    // which keeps the boxblur it always had.
+    let blur = match bv.sigma {
+        Some(sigma) => gaussian_blur_chain(sigma, bv.width, bv.height, None),
+        None => {
+            let radius = ((bv.intensity.max(0.0).min(1.0)) * (bv.height as f64) * 0.08).round().clamp(1.0, 60.0) as i64;
+            format!("boxblur=luma_radius={radius}:luma_power=1:chroma_radius={radius}:chroma_power=1")
+        }
+    };
+    let blur = if blur.is_empty() { "null".to_string() } else { blur };
+    let cut = format!(
+        "[{src_label}]trim=start={:.4}:end={:.4},crop=w={}:h={}:x='{crop_x}':y='{crop_y}',{blur}",
+        bv.start_time, bv.end_time, bv.width, bv.height
+    );
+
+    // A plain axis-aligned rectangle needs nothing past the crop+blur - crop already
+    // produces exactly that shape. Anything mask-shaped merges the mask PNG's luma in as
+    // the blurred patch's alpha (`alphamerge`), so only the shape stays blurred and the
+    // rest of the crop shows the original pixels once `overlay` blends by alpha below.
+    let composited_label = match mask_input {
+        None => {
+            let blurred_label = format!("bb{}blur", i);
+            graph.push_str(&format!("{cut}[{blurred_label}];"));
+            blurred_label
+        }
+        Some(mask_input) => {
+            let cropped_label = format!("bb{}crop", i);
+            let mask_gray_label = format!("bb{}maskgray", i);
+            let masked_label = format!("bb{}masked", i);
+            graph.push_str(&format!("{cut},format=rgba[{cropped_label}];"));
+            graph.push_str(&format!(
+                "[{}:v]format=gray,setpts=PTS-STARTPTS+{:.4}/TB[{}];",
+                mask_input, bv.start_time, mask_gray_label
+            ));
+            graph.push_str(&format!(
+                "[{}][{}]alphamerge[{}];",
+                cropped_label, mask_gray_label, masked_label
+            ));
+            masked_label
+        }
+    };
+
+    graph.push_str(&format!(
+        "[{bg_label}][{composited_label}]overlay=x='{place_x}':y='{place_y}':eof_action=pass[{out_label}];"
+    ));
+    graph
+}
+
+// ---- Adjustment layers -------------------------------------------------------------------------
+
+fn css_op_from_spec(spec: &CssOpSpec) -> Option<CssColorOp> {
+    let v = spec.value;
+    if !v.is_finite() {
+        return None;
+    }
+    Some(match spec.op.as_str() {
+        "brightness" => CssColorOp::Brightness(v),
+        "contrast" => CssColorOp::Contrast(v),
+        "saturate" => CssColorOp::Saturate(v),
+        "hue-rotate" => CssColorOp::HueRotate(v),
+        "sepia" => CssColorOp::Sepia(v),
+        "grayscale" => CssColorOp::Grayscale(v),
+        _ => return None,
+    })
+}
+
+// One adjustment layer onto [current], writing [out]. The adjusted copy is cut to the layer's
+// window and box (trim + crop) so nothing outside either is ever processed, then laid back over
+// the untouched picture - weighted by its mask, opacity and fades.
+#[allow(clippy::too_many_arguments)]
+fn adjustment_layer_chain(layer: &AdjustmentLayerSpec, mask_input: Option<(usize, i64, i64)>, (fw, fh): (i64, i64), current: &str, tag: &str, out: &str) -> String {
+    // The frontend renders the mask on even edges inside the frame (4:2:0 chroma can only be
+    // cropped on even pixels); kept that way here whatever arrives, the mask scaled to match.
+    let (rx, ry, rw, rh) = match mask_input {
+        Some((_, mw, mh)) => {
+            let x0 = layer.mask_x.clamp(0, (fw - 2).max(0)) & !1;
+            let y0 = layer.mask_y.clamp(0, (fh - 2).max(0)) & !1;
+            (x0, y0, (mw.min(fw - x0) & !1).max(2), (mh.min(fh - y0) & !1).max(2))
+        }
+        None => (0, 0, fw, fh),
+    };
+    let (start, end) = (layer.start_time, layer.end_time.max(layer.start_time + 0.01));
+    let mut fx: Vec<String> = vec![format!("trim=start={start:.4}:end={end:.4}")];
+    if mask_input.is_some() {
+        fx.push(format!("crop={rw}:{rh}:{rx}:{ry}"));
+    }
+    let blur = gaussian_blur_chain(layer.blur_sigma.unwrap_or(0.0), rw, rh, None);
+    if !blur.is_empty() {
+        fx.push(blur);
+    }
+    let ops: Vec<CssColorOp> = layer.color_ops.iter().filter_map(css_op_from_spec).collect();
+    fx.push("format=rgba".into());
+    if !ops.is_empty() {
+        let (m, o) = compose_css_color_ops(&ops);
+        fx.push(format!(
+            "colorchannelmixer=rr={:.6}:rg={:.6}:rb={:.6}:ra={:.6}:gr={:.6}:gg={:.6}:gb={:.6}:ga={:.6}:br={:.6}:bg={:.6}:bb={:.6}:ba={:.6}:aa=1",
+            m[0][0], m[0][1], m[0][2], o[0], m[1][0], m[1][1], m[1][2], o[1], m[2][0], m[2][1], m[2][2], o[2]
+        ));
+    }
+    let mut graph = format!("[{current}]split=2[{tag}bg][{tag}src];[{tag}src]{}[{tag}a0];", fx.join(","));
+    let mut cur = format!("{tag}a0");
+    if let Some(v) = layer.vignette.filter(|v| *v > 0.001) {
+        // Drawn over the adjusted picture, as the preview's gradient sits on top of its backdrop.
+        graph.push_str(&vignette_layer(v, rw, rh, 30.0, &cur, &format!("{tag}a1"), tag));
+        graph.push_str(&format!("[{tag}a1]format=rgba[{tag}a2];"));
+        cur = format!("{tag}a2");
+    }
+    if let Some((input, _, _)) = mask_input {
+        graph.push_str(&format!(
+            "[{input}:v]format=gray,scale={rw}:{rh},setpts=PTS-STARTPTS+{start:.4}/TB[{tag}mk];[{cur}][{tag}mk]alphamerge[{tag}a3];"
+        ));
+        cur = format!("{tag}a3");
+    }
+    let mut alpha_ops: Vec<String> = Vec::new();
+    let opacity = layer.opacity.clamp(0.0, 1.0);
+    if opacity < 0.999 {
+        alpha_ops.push(format!("colorchannelmixer=aa={opacity:.4}"));
+    }
+    let span = end - start;
+    let fade_in = layer.fade_in.clamp(0.0, span / 2.0);
+    let fade_out = layer.fade_out.clamp(0.0, span / 2.0);
+    if fade_in > 0.01 {
+        alpha_ops.push(format!("fade=in:st={start:.4}:d={fade_in:.4}:alpha=1"));
+    }
+    if fade_out > 0.01 {
+        alpha_ops.push(format!("fade=out:st={:.4}:d={fade_out:.4}:alpha=1", end - fade_out));
+    }
+    if !alpha_ops.is_empty() {
+        graph.push_str(&format!("[{cur}]{}[{tag}a4];", alpha_ops.join(",")));
+        cur = format!("{tag}a4");
+    }
+    graph.push_str(&format!("[{tag}bg][{cur}]overlay=x={rx}:y={ry}:eof_action=pass:format=auto[{out}];"));
+    graph
 }
 
 // Per-segment color grade fragment, chained directly onto that segment's own trim step (before
@@ -4063,6 +4568,7 @@ fn color_filter_chain(cf: &ClipColorFilter) -> String {
 // feColorMatrix equivalents).
 #[derive(Clone, Copy, Debug)]
 enum CssColorOp {
+    Brightness(f64),
     Grayscale(f64),
     Sepia(f64),
     Saturate(f64),
@@ -4074,6 +4580,10 @@ impl CssColorOp {
     // (matrix, offset) on 0..1 RGB.
     fn affine(self) -> ([[f64; 3]; 3], [f64; 3]) {
         match self {
+            CssColorOp::Brightness(b) => {
+                let b = b.max(0.0);
+                ([[b, 0.0, 0.0], [0.0, b, 0.0], [0.0, 0.0, b]], [0.0; 3])
+            }
             CssColorOp::Grayscale(a) => {
                 let s = 1.0 - a.clamp(0.0, 1.0);
                 ([[0.2126 + 0.7874 * s, 0.7152 - 0.7152 * s, 0.0722 - 0.0722 * s], [0.2126 - 0.2126 * s, 0.7152 + 0.2848 * s, 0.0722 - 0.0722 * s], [0.2126 - 0.2126 * s, 0.7152 - 0.7152 * s, 0.0722 + 0.9278 * s]], [0.0; 3])
@@ -4142,7 +4652,7 @@ fn segment_vignette(seg: &KeepSegment, w: Option<i64>, h: Option<i64>, label: &s
 // rgba(0,0,0,0.6t) 100%) laid over the clip's finished frame (vignetteBackground,
 // videoColorFilters.ts) - drawn once, small, scaled up (a smooth gradient loses nothing) and looped
 // as a static layer, so it costs one overlay per frame. A graph fragment taking [in] to [out].
-fn vignette_layer(intensity: f64, w: i64, h: i64, fps: f64, input: &str, out: &str, i: usize) -> String {
+fn vignette_layer(intensity: f64, w: i64, h: i64, fps: f64, input: &str, out: &str, i: impl std::fmt::Display) -> String {
     let t = intensity.clamp(0.0, 1.0);
     let s0 = (40.0 - 15.0 * t) / 100.0;
     // Distance from the centre on the ellipse through the corners (CSS's default farthest-corner).
@@ -4529,11 +5039,11 @@ fn is_heic_path(path: &str) -> bool {
 
 // The file ffmpeg should actually read for an image clip - the image itself, or for HEIC/HEIF its
 // decoded PNG (generated once, then a cache hit).
-async fn still_image_source(app_handle: &AppHandle, window: &Window, state: &State<'_, ConversionState>, path: &str) -> Result<String, String> {
+async fn still_image_source(app_handle: &AppHandle, window: &Window, state: &ConversionState, path: &str) -> Result<String, String> {
     if !is_heic_path(path) {
         return Ok(path.to_string());
     }
-    get_heic_preview(app_handle.clone(), window.clone(), state.clone(), path.to_string()).await
+    heic_preview(app_handle.clone(), window.clone(), state, path.to_string()).await
 }
 
 // Frame rate every image segment is looped at (`-loop 1 -framerate`) - there's no source rate to
@@ -5124,7 +5634,7 @@ fn overlay_slide_offset_expr(ov: &OverlayImage, animation: &str) -> (String, Str
     }
 }
 
-fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
+pub(crate) fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64 {
     const FALLBACK_FPS: f64 = 30.0;
     let mut cmd = Command::new(ffprobe_path);
     cmd.args([
@@ -5271,7 +5781,7 @@ fn resolve_export_quality(quality: Option<&str>) -> (&'static str, &'static str)
     }
 }
 
-fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
+pub(crate) fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
     let mut cmd = Command::new(ffprobe_path);
     cmd.args([
         "-v",
@@ -5339,6 +5849,23 @@ fn audio_trim_chain(
 // for `-i`, not a data URL. `data_base64` may carry a "data:image/png;base64," prefix (what
 // canvas.toDataURL() produces) or be the bare payload; splitting on the last comma handles both
 // without the caller needing to know which.
+// An overlay image's pixel size, read from its PNG header (the first frame's, for a sequence).
+fn overlay_layer_size(ov: &OverlayImage) -> Option<(i64, i64)> {
+    let data = match &ov.frames {
+        Some(frames) => frames.unique.first()?,
+        None => &ov.data_base64,
+    };
+    let payload = data.rsplit(',').next().unwrap_or(data);
+    // The IHDR's width/height sit at bytes 16..24 - 32 base64 characters decode them.
+    let head = BASE64.decode(payload.get(..32)?).ok()?;
+    if head.len() < 24 || &head[1..4] != b"PNG" {
+        return None;
+    }
+    let w = u32::from_be_bytes(head[16..20].try_into().ok()?) as i64;
+    let h = u32::from_be_bytes(head[20..24].try_into().ok()?) as i64;
+    (w > 0 && h > 0).then_some((w, h))
+}
+
 fn write_temp_overlay_png(data_base64: &str, index: usize) -> Result<PathBuf, String> {
     let payload = data_base64.rsplit(',').next().unwrap_or(data_base64);
     let bytes = BASE64
@@ -5556,7 +6083,7 @@ fn smart_render_jobs(
 async fn smart_render_export(
     app_handle: &AppHandle,
     window: &Window,
-    state: &State<'_, ConversionState>,
+    state: &ConversionState,
     segments: &[KeepSegment],
     has_audio: &[bool],
     volume: f64,
@@ -5754,10 +6281,32 @@ pub async fn export_trimmed_video(
     output_frame: Option<OutputFrame>,
     // Loudness target in LUFS (e.g. -14 for YouTube/Spotify, -16 for podcasts); None = as mixed.
     loudness_lufs: Option<f64>,
+    // Adjustment layers (see AdjustmentLayerSpec), in stacking order; None = none.
+    adjustment_layers: Option<Vec<AdjustmentLayerSpec>>,
+    // Chapters embedded in the file and written to its .chapters.json sidecar; None = none.
+    chapters: Option<Vec<ChapterSpec>>,
+    // Set by the background export queue (exportQueue.ts): the run gets its own cancel state
+    // (cancel_export_job), progress events keyed "export-job:<id>", a live preview frame
+    // (export-job-preview events) and below-normal CPU priority so editing stays smooth meanwhile.
+    job_id: Option<String>,
+    export_jobs: State<'_, ExportJobs>,
 ) -> Result<String, String> {
     if segments.is_empty() {
         return Err("No segments to export".to_string());
     }
+    // A queued job runs on its own ConversionState, registered for cancel_export_job until it ends.
+    let job = job_id.as_ref().map(|id| ExportJobGuard::register(&export_jobs, id));
+    let state: &ConversionState = match &job {
+        Some(guard) => &guard.state,
+        None => &state,
+    };
+    let progress_key: String = match &job_id {
+        Some(id) => format!("export-job:{id}"),
+        None => output_base_path.clone(),
+    };
+    let preview_frame = job_id.as_ref().map(|id| std::env::temp_dir().join(format!("briefcast_export_preview_{}_{}.jpg", std::process::id(), sanitize_job_id(id))));
+    let adjustment_layers = adjustment_layers.unwrap_or_default();
+    let chapters = chapters.unwrap_or_default();
     // HEIC/HEIF image clips render from their decoded PNG (see still_image_source) - swapped in
     // before anything below reads a segment's path, so every later step just sees a plain image.
     let mut segments = segments;
@@ -5952,6 +6501,43 @@ pub async fn export_trimmed_video(
         inputs.push(seeking_input(pip.source_path.clone(), seek));
     }
 
+    // Adjustment layers' region masks, after everything else (no index arithmetic above changes):
+    // (input index, mask width, mask height) per layer that has one.
+    let mut adjustment_masks: Vec<Option<(usize, i64, i64)>> = Vec::with_capacity(adjustment_layers.len());
+    for (i, layer) in adjustment_layers.iter().enumerate() {
+        let Some(data) = &layer.mask_data_base64 else {
+            adjustment_masks.push(None);
+            continue;
+        };
+        let path = match write_temp_overlay_png(data, 10_000 + i) {
+            Ok(path) => path,
+            Err(e) => {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(e);
+            }
+        };
+        temp_overlay_paths.push(path.clone());
+        let (mw, mh) = image::image_dimensions(&path).map(|(w, h)| (w as i64, h as i64)).unwrap_or((0, 0));
+        if mw < 2 || mh < 2 {
+            adjustment_masks.push(None);
+            continue;
+        }
+        adjustment_masks.push(Some((inputs.len(), mw, mh)));
+        inputs.push(InputSpec {
+            path: path.to_string_lossy().to_string(),
+            pre_args: vec![
+                "-loop".into(),
+                "1".into(),
+                "-framerate".into(),
+                format!("{}", OVERLAY_INPUT_FPS),
+                "-t".into(),
+                format!("{:.3}", (layer.end_time - layer.start_time).clamp(0.01, total_duration.max(0.01)) + 0.1),
+            ],
+        });
+    }
+
     // Written next to the overlay PNGs (and cleaned up by the same loop once the export finishes).
     let captions_ass_path: Option<PathBuf> = match captions_ass.as_deref().filter(|a| !a.trim().is_empty()) {
         Some(ass) => {
@@ -6010,10 +6596,12 @@ pub async fn export_trimmed_video(
     // wherever whole GOPs survive - smart_render_export. "small" asks for recompression, so it
     // still re-encodes. Anything smart render can't do (or can't verify) falls through to the
     // normal render below.
+    let has_adjustments = !adjustment_layers.is_empty();
     let plain_cuts = !has_video_overlays
         && !has_blur_overlays
         && !has_audio_overlays
         && !has_pip_overlays
+        && !has_adjustments
         && !has_clip_effects
         && !has_transitions
         && captions_ass_path.is_none()
@@ -6026,16 +6614,13 @@ pub async fn export_trimmed_video(
             let (probe, path) = (ffprobe_path.clone(), seg.source_path.clone());
             has_audio.push(blocking(move || probe_has_audio(&probe, &path)).await?);
         }
-        let smart = smart_render_export(&app_handle, &window, &state, &segments, &has_audio, effective_video_volume, &output_base_path, output.clone()).await;
+        let smart = smart_render_export(&app_handle, &window, state, &segments, &has_audio, effective_video_volume, &progress_key, output.clone()).await;
         match smart {
             Ok(Some(path)) => {
                 for temp_path in &temp_overlay_paths {
                     let _ = std::fs::remove_file(temp_path);
                 }
-                if let Some(target) = loudness_lufs {
-                    normalize_loudness(&app_handle, &path, target).await?;
-                }
-                return Ok(path);
+                return finish_export(&app_handle, path, loudness_lufs, &chapters).await;
             }
             Ok(None) => {}
             Err(e) => {
@@ -6047,11 +6632,14 @@ pub async fn export_trimmed_video(
         }
     }
 
+    // A queued export's live preview frame output (RunExtras), filled in by whichever path runs.
+    let mut preview_args: Vec<String> = Vec::new();
     let owned_args: Vec<String> = if segments.len() == 1
         && !has_video_overlays
         && !has_blur_overlays
         && !has_audio_overlays
         && !has_pip_overlays
+        && !has_adjustments
         && !has_clip_effects
         && captions_ass_path.is_none()
         && output_frame.is_none()
@@ -6064,6 +6652,10 @@ pub async fn export_trimmed_video(
         // whole file up to the cut first.
         if seg.start > 0.0 {
             inputs[0].pre_args = vec!["-ss".into(), format!("{:.6}", seg.start)];
+        }
+        if let Some(path) = &preview_frame {
+            // Its own length too, or the preview output alone would read on to the file's end.
+            preview_args = ["-map", "0:v:0", "-t"].iter().map(|s| s.to_string()).chain([format!("{:.6}", (seg.end - seg.start).max(0.0)), "-vf".into(), PREVIEW_FRAME_FILTER.into()]).chain(preview_output_args(path)).collect();
         }
         let mut args = vec![
             "-t".into(),
@@ -6382,61 +6974,27 @@ pub async fn export_trimmed_video(
             filter.push_str(&reframe_chain("base", "framed", frame));
             current_label = "framed".to_string();
         }
+        // Adjustment layers placed "under" grade/blur the video itself - before blur regions and
+        // every overlay, as the preview mounts them beneath VideoOverlayLayer.
+        let adjust_frame = video_width.zip(video_height).map(|(w, h)| match &output_frame {
+            Some(frame) => (frame.width, frame.height),
+            None => (w, h),
+        });
+        let adjust_pass = |filter: &mut String, current_label: &mut String, over: bool| {
+            let Some(frame) = adjust_frame else { return };
+            for (i, layer) in adjustment_layers.iter().enumerate() {
+                if (layer.placement == "over") != over {
+                    continue;
+                }
+                let out = format!("adj{i}out");
+                filter.push_str(&adjustment_layer_chain(layer, adjustment_masks[i], frame, current_label, &format!("adj{i}"), &out));
+                *current_label = out;
+            }
+        };
+        adjust_pass(&mut filter, &mut current_label, false);
         for (i, bv) in blur_overlays.iter().enumerate() {
-            // Scaled off the region's own height (not a fixed px count) so a small region doesn't
-            // get an absurdly large radius relative to itself and vice versa; clamped both for
-            // sane performance (boxblur's cost scales with radius) and so intensity:1 still reads
-            // as "blurred", not "solid color", on a very tall region.
-            let radius = ((bv.intensity.max(0.0).min(1.0)) * (bv.height as f64) * 0.08)
-                .round()
-                .clamp(1.0, 60.0) as i64;
-            let src_label = format!("bb{}src", i);
-            let bg_label = format!("bb{}bg", i);
             let out_label = format!("bb{}out", i);
-            filter.push_str(&format!(
-                "[{}]split=2[{}][{}];",
-                current_label, src_label, bg_label
-            ));
-
-            // A plain axis-aligned rectangle (blur_mask_input_index[i] is None) needs nothing past
-            // the bare crop+boxblur - ffmpeg's crop already produces exactly that shape. Anything
-            // mask-shaped instead formats the blurred crop to rgba and merges in the mask PNG's own
-            // luma as its alpha channel (`alphamerge`) before compositing, so only the masked-in
-            // shape stays blurred and the rest of the crop shows through to bg's original pixels
-            // once `overlay` blends by alpha below.
-            let composited_label = match blur_mask_input_index[i] {
-                None => {
-                    let blurred_label = format!("bb{}blur", i);
-                    filter.push_str(&format!(
-                        "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1:enable='{}'[{}];",
-                        src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, blur_window(bv), blurred_label
-                    ));
-                    blurred_label
-                }
-                Some(mask_input) => {
-                    let cropped_label = format!("bb{}crop", i);
-                    let mask_gray_label = format!("bb{}maskgray", i);
-                    let masked_label = format!("bb{}masked", i);
-                    filter.push_str(&format!(
-                        "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1:enable='{}',format=rgba[{}];",
-                        src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, blur_window(bv), cropped_label
-                    ));
-                    filter.push_str(&format!(
-                        "[{}:v]format=gray,setpts=PTS-STARTPTS+{:.4}/TB[{}];",
-                        mask_input, bv.start_time, mask_gray_label
-                    ));
-                    filter.push_str(&format!(
-                        "[{}][{}]alphamerge[{}];",
-                        cropped_label, mask_gray_label, masked_label
-                    ));
-                    masked_label
-                }
-            };
-
-            filter.push_str(&format!(
-                "[{}][{}]overlay=x={}:y={}:enable='between(t,{:.3},{:.3})'[{}];",
-                bg_label, composited_label, bv.x, bv.y, bv.start_time, bv.end_time, out_label
-            ));
+            filter.push_str(&blur_region_chain(bv, i, blur_mask_input_index[i], &current_label, &out_label));
             current_label = out_label;
         }
 
@@ -6523,11 +7081,18 @@ pub async fn export_trimmed_video(
                 x_expr = format!("({x_expr})+overlay_w*(1/({s})-1)/2");
                 y_expr = format!("({y_expr})+overlay_h*(1/({s})-1)/2");
             }
-            let next_label = if i + 1 == overlays.len() {
-                "outv".to_string()
-            } else {
-                format!("ov{}", i)
-            };
+            // Never "outv" itself - later stages (PiP, adjustment layers, captions) read from here;
+            // the final rename below names whatever ran last.
+            let next_label = format!("ov{}", i);
+            // A blend mode composites through blend_composite instead: over the overlay's own box
+            // when it stays put, the whole frame when anything moves it.
+            if let (Some(mode), Some(frame), Some((w, h))) = (ov.blend_mode.as_deref().and_then(blend_mode_ffmpeg), adjust_frame, overlay_layer_size(ov)) {
+                let moving = kfs.is_some() || animation.starts_with("slide") || scale_at("t").is_some();
+                let layer = BlendLayer { label: &composited_label, x: x_expr.clone(), y: y_expr.clone(), width: w, height: h, moving, fps: OVERLAY_INPUT_FPS };
+                filter.push_str(&blend_composite(&current_label, &layer, frame, mode, ov.start_time, ov.end_time, &format!("ovb{i}"), &next_label));
+                current_label = next_label;
+                continue;
+            }
             filter.push_str(&format!(
                 "[{}][{}]overlay=x='{}':y='{}':enable='between(t,{:.3},{:.3})'[{}];",
                 current_label,
@@ -6556,9 +7121,12 @@ pub async fn export_trimmed_video(
                 i,
                 &current_label,
                 &out_label,
+                adjust_frame,
             ));
             current_label = out_label;
         }
+        // Adjustment layers placed "over" act on everything composited so far (captions excepted).
+        adjust_pass(&mut filter, &mut current_label, true);
 
         // Whatever [current_label] is pointing at (the plain trim/concat [base], or the last blur/
         // image/text/pip stage that actually ran) needs to end up named [outv] for the -map below -
@@ -6576,7 +7144,12 @@ pub async fn export_trimmed_video(
             current_label = "capv".to_string();
         }
 
-        if current_label != "outv" {
+        if let Some(path) = &preview_frame {
+            // The queue's live preview: a small copy of the finished picture, a couple of frames
+            // per second of output, split off the very last stage.
+            filter.push_str(&format!("[{current_label}]split=2[outv][prevtap];[prevtap]{PREVIEW_FRAME_FILTER}[prevv];"));
+            preview_args = ["-map", "[prevv]"].iter().map(|s| s.to_string()).chain(preview_output_args(path)).collect();
+        } else if current_label != "outv" {
             filter.push_str(&format!("[{}]copy[outv];", current_label));
         }
 
@@ -6741,10 +7314,15 @@ pub async fn export_trimmed_video(
     let encoders: Vec<Vec<String>> = hardware.into_iter().chain(std::iter::once(software)).collect();
     let output_seconds: f64 = segments.iter().map(segment_output_duration).sum();
 
+    let extras = RunExtras {
+        preview: job_id.as_ref().zip(preview_frame.clone()).filter(|_| !preview_args.is_empty()).map(|(id, path)| (id.clone(), path)),
+        preview_args,
+        low_priority: job_id.is_some(),
+    };
     let mut result = Err("No encoder to run".to_string());
     for (attempt, video_encoder) in encoders.iter().enumerate() {
         let codec_args: Vec<&str> = owned_args.iter().chain(video_encoder.iter()).map(|s| s.as_str()).collect();
-        result = run_conversion_timed(&app_handle, &window, &state, &inputs, &output_base_path, output.clone(), &codec_args, Some(output_seconds)).await;
+        result = run_conversion_with(&app_handle, &window, state, &inputs, &progress_key, output.clone(), &codec_args, Some(output_seconds), &extras).await;
         let cancelled = state.cancelled.load(std::sync::atomic::Ordering::SeqCst);
         if result.is_ok() || cancelled || attempt + 1 == encoders.len() {
             break;
@@ -6756,13 +7334,76 @@ pub async fn export_trimmed_video(
         let _ = std::fs::remove_file(temp_path);
     }
 
-    match (result, loudness_lufs) {
-        (Ok(path), Some(target)) => {
-            normalize_loudness(&app_handle, &path, target).await?;
-            Ok(path)
-        }
-        (result, _) => result,
+    finish_export(&app_handle, result?, loudness_lufs, &chapters).await
+}
+
+// ffmpeg arguments writing the live preview frame (RunExtras) after whatever selects its stream.
+const PREVIEW_FRAME_FILTER: &str = "fps=2,scale=-2:240:flags=bilinear";
+fn preview_output_args(path: &Path) -> Vec<String> {
+    ["-an", "-sn", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-q:v", "5"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(path.to_string_lossy().to_string()))
+        .collect()
+}
+
+// What every finished export still gets: its loudness target, then its chapters.
+async fn finish_export(app_handle: &AppHandle, path: String, loudness_lufs: Option<f64>, chapters: &[ChapterSpec]) -> Result<String, String> {
+    if let Some(target) = loudness_lufs {
+        normalize_loudness(app_handle, &path, target).await?;
     }
+    if !chapters.is_empty() {
+        embed_chapters(app_handle, &path, chapters).await?;
+    }
+    Ok(path)
+}
+
+// Chapters into the file itself (MP4/MOV chapter atoms - VLC, QuickTime, most players list them)
+// by a stream-copy remux, and into its .chapters.json sidecar so Briefcast's own player shows them.
+async fn embed_chapters(app_handle: &AppHandle, path: &str, chapters: &[ChapterSpec]) -> Result<(), String> {
+    let mut sorted: Vec<ChapterSpec> = chapters.iter().filter(|c| c.time.is_finite() && c.time >= 0.0).cloned().collect();
+    sorted.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+    if sorted.is_empty() {
+        return Ok(());
+    }
+    let ffmpeg = get_ffmpeg_path(app_handle)?;
+    let ffprobe = get_ffprobe_path(app_handle)?;
+    let target = PathBuf::from(path);
+    let duration = {
+        let (probe, p) = (ffprobe.clone(), target.clone());
+        blocking(move || probe_duration_secs(&probe, &p)).await?.unwrap_or(0.0)
+    };
+    // ffmetadata: each chapter runs to the next one (the last to the end); its title escaped.
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('=', "\\=").replace(';', "\\;").replace('#', "\\#").replace('\n', " ");
+    let mut meta = String::from(";FFMETADATA1\n");
+    for (i, c) in sorted.iter().enumerate() {
+        let end = sorted.get(i + 1).map(|n| n.time).unwrap_or(duration.max(c.time + 0.001));
+        meta.push_str(&format!("[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle={}\n", (c.time * 1000.0).round() as i64, (end * 1000.0).round() as i64, escape(&c.label)));
+    }
+    let meta_path = std::env::temp_dir().join(format!("briefcast_chapters_{}.txt", std::process::id()));
+    std::fs::write(&meta_path, meta).map_err(|e| format!("Couldn't write the chapters: {}", e))?;
+    let ext = target.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".into());
+    let remuxed = target.with_extension(format!("chapters.{ext}"));
+    let args: Vec<String> = vec![
+        "-v".into(), "error".into(), "-y".into(), "-i".into(), path.to_string(), "-i".into(), meta_path.to_string_lossy().to_string(),
+        "-map".into(), "0".into(), "-map_metadata".into(), "0".into(), "-map_chapters".into(), "1".into(), "-c".into(), "copy".into(),
+        "-movflags".into(), "+faststart".into(), remuxed.to_string_lossy().to_string(),
+    ];
+    let ran = blocking(move || run_ffmpeg_quiet(&ffmpeg, &args)).await?;
+    let _ = std::fs::remove_file(&meta_path);
+    match ran {
+        Ok(()) => std::fs::rename(&remuxed, &target).map_err(|e| format!("Couldn't add the chapters: {}", e))?,
+        Err(e) => {
+            // The video itself is fine - only its chapters are missing.
+            let _ = std::fs::remove_file(&remuxed);
+            log::warn!("Embedding chapters failed: {e}");
+        }
+    }
+    let sidecar: Vec<serde_json::Value> = sorted
+        .iter()
+        .map(|c| serde_json::json!({ "id": format!("ch-{}", (c.time * 1000.0).round() as i64), "time": c.time, "label": c.label }))
+        .collect();
+    crate::services::video_edits::save_video_chapters(path.to_string(), serde_json::to_string(&sidecar).unwrap_or_default())
 }
 
 // Integrated loudness (LUFS) of a file's audio, measured with ffmpeg's EBU R128 scanner.
@@ -7004,6 +7645,10 @@ pub async fn extract_clip_audio(
 // Cancel ongoing conversion
 #[tauri::command]
 pub async fn cancel_conversion(state: State<'_, ConversionState>) -> Result<(), String> {
+    cancel_state(&state).await
+}
+
+async fn cancel_state(state: &ConversionState) -> Result<(), String> {
     let mut active_process = state.active_process.lock().await;
     // Always raised: a smart render's parallel jobs (run_smart_jobs) watch this flag rather than
     // one tracked process.
@@ -8267,6 +8912,7 @@ mod tests {
     #[test]
     fn overlay_position_expr_none_and_fade_are_static_coordinates() {
         let ov = OverlayImage {
+            blend_mode: None,
             data_base64: String::new(),
             x: 100,
             y: 200,
@@ -8289,6 +8935,7 @@ mod tests {
     #[test]
     fn overlay_position_expr_slide_left_only_animates_x() {
         let ov = OverlayImage {
+            blend_mode: None,
             data_base64: String::new(),
             x: 100,
             y: 200,
@@ -8819,5 +9466,266 @@ mod tests {
         let e = keyframe_expr(&[kf(2.0, 100.0, "linear"), kf(1.0, 0.0, "ease")], "t", |k| k.x);
         assert_eq!(e, "if(lt(t,2.0000),(0.0000+(100.0000)*(clip((t-1.0000)/1.0000,0,1))*(clip((t-1.0000)/1.0000,0,1))*(3-2*(clip((t-1.0000)/1.0000,0,1)))),100.0000)");
         assert!(keyframe_expr(&[kf(0.0, 0.0, "hold"), kf(1.0, 10.0, "linear")], "t", |k| k.x).contains("(0.0000+(10.0000)*0)"));
+    }
+
+    #[test]
+    fn keyframe_expressions_stay_shallow() {
+        // A motion track's worth of keyframes: the comparisons nest log2(n) deep, not n.
+        let kfs: Vec<OverlayKeyframe> = (0..300)
+            .map(|i| OverlayKeyframe { time: i as f64 / 30.0, x: (i * 3) as f64, y: 0.0, scale: 1.0, opacity: 1.0, easing: "linear".into() })
+            .collect();
+        let e = keyframe_expr(&kfs, "t", |k| k.x);
+        // How many if()s are open at once: each remembers the paren depth it opened at.
+        let (mut parens, mut open_ifs, mut max_depth) = (0usize, Vec::<usize>::new(), 0usize);
+        for (i, c) in e.char_indices() {
+            match c {
+                '(' => {
+                    if e[..i].ends_with("if") {
+                        open_ifs.push(parens);
+                        max_depth = max_depth.max(open_ifs.len());
+                    }
+                    parens += 1;
+                }
+                ')' => {
+                    parens -= 1;
+                    if open_ifs.last() == Some(&parens) {
+                        open_ifs.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(max_depth <= 10, "nested {max_depth} deep");
+        assert!(e.starts_with("if(lt(t,"), "{}", &e[..60]);
+    }
+
+    #[test]
+    fn three_boxes_make_the_gaussian() {
+        for sigma in [1.5, 4.0, 12.0, 40.0, 130.0] {
+            let widths = box_widths_for_sigma(sigma, 3);
+            let variance: f64 = widths.iter().map(|w| ((w * w - 1) as f64) / 12.0).sum();
+            // Whole-pixel box widths can't land a tiny sigma exactly; at real blur sizes they do.
+            let tolerance = if sigma < 3.0 { 0.08 } else if sigma < 8.0 { 0.05 } else { 0.02 };
+            assert!((variance.sqrt() - sigma).abs() / sigma < tolerance, "sigma {sigma}: {widths:?} -> {}", variance.sqrt());
+        }
+        assert_eq!(gaussian_blur_chain(0.1, 100, 100, None), "");
+        // Radii never exceed what boxblur accepts on a small region.
+        let chain = gaussian_blur_chain(80.0, 40, 30, None);
+        assert!(!chain.is_empty() && !chain.contains("luma_radius=20") && !chain.contains("luma_radius=4"), "{chain}");
+    }
+
+    #[test]
+    fn only_measured_blend_modes_reach_ffmpeg() {
+        assert_eq!(blend_mode_ffmpeg("hard-light"), Some("hardlight"));
+        assert_eq!(blend_mode_ffmpeg("plus-lighter"), Some("addition"));
+        for unsafe_mode in ["soft-light", "color-dodge", "normal", "multiply'; drop", ""] {
+            assert_eq!(blend_mode_ffmpeg(unsafe_mode), None, "{unsafe_mode}");
+        }
+    }
+
+    // Not a unit test: renders each new compositing path with the real ffmpeg ($FFMPEG_DIR) and
+    // checks pixels against the formula the preview's CSS uses (W3C compositing / CSS filters).
+    #[test]
+    #[ignore]
+    fn new_effects_render_like_the_spec() {
+        let Ok(dir) = std::env::var("FFMPEG_DIR") else { return };
+        let ffmpeg = PathBuf::from(&dir).join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        let tmp = std::env::temp_dir().join(format!("briefcast_fx_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (w, h) = (320usize, 240usize);
+        let run = |args: &[String]| {
+            let out = Command::new(&ffmpeg).args(["-v", "error", "-y"]).args(args).output().unwrap();
+            assert!(out.status.success(), "ffmpeg failed: {}\n{:?}", String::from_utf8_lossy(&out.stderr), args);
+            out.stdout
+        };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        // One rgb24 frame of [out] at output time t.
+        let frame = |inputs: &[Vec<String>], graph: &str, t: f64| -> Vec<u8> {
+            let mut args: Vec<String> = Vec::new();
+            for i in inputs {
+                args.extend(i.iter().cloned());
+            }
+            args.extend(s(&["-filter_complex", graph, "-map", "[out]", "-ss"]));
+            args.push(format!("{t:.3}"));
+            args.extend(s(&["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]));
+            let px = run(&args);
+            assert_eq!(px.len(), w * h * 3, "graph: {graph}");
+            px
+        };
+        let at = |px: &[u8], x: usize, y: usize| -> [f64; 3] {
+            let i = (y * w + x) * 3;
+            [px[i] as f64, px[i + 1] as f64, px[i + 2] as f64]
+        };
+        let near = |got: [f64; 3], want: [f64; 3], tol: f64, what: &str| {
+            for c in 0..3 {
+                assert!((got[c] - want[c]).abs() <= tol, "{what}: got {got:?}, want {want:?}");
+            }
+        };
+        let base_rgb = [200.0, 100.0, 50.0];
+        let base = s(&["-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=30:d=3"]);
+        // A 64x64 layer of (100, 200, 250) at half alpha.
+        let layer_png = tmp.join("layer.png");
+        run(&s(&["-f", "lavfi", "-i", "color=c=0x64C8FA@0.5:s=64x64,format=rgba", "-frames:v", "1", &layer_png.to_string_lossy()]));
+        let layer = s(&["-loop", "1", "-framerate", "30", "-t", "1.1", "-i", &layer_png.to_string_lossy()]);
+        let alpha = 128.0 / 255.0;
+        let src = [100.0, 200.0, 250.0];
+        let w3c = |mode: &str, b: f64, s: f64| -> f64 {
+            let (b, s) = (b / 255.0, s / 255.0);
+            let multiply = |a: f64, c: f64| a * c;
+            let screen = |a: f64, c: f64| a + c - a * c;
+            let r = match mode {
+                "multiply" => multiply(b, s),
+                "screen" => screen(b, s),
+                // Overlay is hard-light with the roles swapped: the backdrop decides.
+                "overlay" => if b <= 0.5 { multiply(s, 2.0 * b) } else { screen(s, 2.0 * b - 1.0) },
+                "difference" => (b - s).abs(),
+                _ => unreachable!(),
+            };
+            r * 255.0
+        };
+        for mode in ["multiply", "screen", "overlay", "difference"] {
+            let ff = blend_mode_ffmpeg(mode).unwrap();
+            let l = BlendLayer { label: "lay", x: "100".into(), y: "80".into(), width: 64, height: 64, moving: false, fps: 30.0 };
+            let graph = format!("[0:v]format=yuv420p[base];[1:v]format=rgba,setpts=PTS-STARTPTS+0.5/TB[lay];{}", blend_composite("base", &l, (320, 240), ff, 0.5, 1.5, "t0", "out"));
+            let graph = graph.trim_end_matches(';');
+            let px = frame(&[base.clone(), layer.clone()], graph, 1.0);
+            let want: Vec<f64> = (0..3).map(|c| base_rgb[c] + alpha * (w3c(mode, base_rgb[c], src[c]) - base_rgb[c])).collect();
+            near(at(&px, 132, 112), [want[0], want[1], want[2]], 4.0, mode);
+            near(at(&px, 20, 20), base_rgb, 3.0, &format!("{mode} outside"));
+            let before = frame(&[base.clone(), layer.clone()], graph, 0.2);
+            near(at(&before, 132, 112), base_rgb, 3.0, &format!("{mode} before its window"));
+        }
+        // Add (plus-lighter): min(1, alpha * source + backdrop).
+        let l = BlendLayer { label: "lay", x: "100".into(), y: "80".into(), width: 64, height: 64, moving: false, fps: 30.0 };
+        let graph = format!("[0:v]format=yuv420p[base];[1:v]format=rgba,setpts=PTS-STARTPTS+0.5/TB[lay];{}", blend_composite("base", &l, (320, 240), "addition", 0.5, 1.5, "t1", "out"));
+        let px = frame(&[base.clone(), layer.clone()], graph.trim_end_matches(';'), 1.0);
+        near(at(&px, 132, 112), [(200.0 + alpha * 100.0f64).min(255.0), 100.0 + alpha * 200.0, 50.0 + alpha * 250.0], 4.0, "add");
+        // Moving: x goes 0 -> 200 over 0.5..1.5s, so at 1.0s the layer's centre is at 132.
+        let kfs = vec![
+            OverlayKeyframe { time: 0.5, x: 0.0, y: 80.0, scale: 1.0, opacity: 1.0, easing: "linear".into() },
+            OverlayKeyframe { time: 1.5, x: 200.0, y: 80.0, scale: 1.0, opacity: 1.0, easing: "linear".into() },
+        ];
+        let l = BlendLayer { label: "lay", x: keyframe_expr(&kfs, "t", |k| k.x), y: keyframe_expr(&kfs, "t", |k| k.y), width: 64, height: 64, moving: true, fps: 30.0 };
+        let graph = format!("[0:v]format=yuv420p[base];[1:v]format=rgba,setpts=PTS-STARTPTS+0.5/TB[lay];{}", blend_composite("base", &l, (320, 240), "multiply", 0.5, 1.5, "t2", "out"));
+        let px = frame(&[base.clone(), layer.clone()], graph.trim_end_matches(';'), 1.0);
+        let want: Vec<f64> = (0..3).map(|c| base_rgb[c] + alpha * (w3c("multiply", base_rgb[c], src[c]) - base_rgb[c])).collect();
+        near(at(&px, 132, 112), [want[0], want[1], want[2]], 5.0, "moving multiply");
+        near(at(&px, 40, 112), base_rgb, 3.0, "where the moving layer has left");
+
+        // Adjustment layers: CSS brightness(0.5) over 0.5..1.5s.
+        let adj = |ops: Vec<CssOpSpec>, extra: &dyn Fn(&mut AdjustmentLayerSpec)| {
+            let mut a = AdjustmentLayerSpec { start_time: 0.5, end_time: 1.5, placement: "under".into(), color_ops: ops, blur_sigma: None, vignette: None, opacity: 1.0, fade_in: 0.0, fade_out: 0.0, mask_data_base64: None, mask_x: 0, mask_y: 0 };
+            extra(&mut a);
+            a
+        };
+        let dim = vec![CssOpSpec { op: "brightness".into(), value: 0.5 }];
+        let a = adj(dim.clone(), &|_| {});
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a0", "out"));
+        let px = frame(&[base.clone()], graph.trim_end_matches(';'), 1.0);
+        near(at(&px, 160, 120), [100.0, 50.0, 25.0], 3.0, "brightness");
+        let px = frame(&[base.clone()], graph.trim_end_matches(';'), 0.2);
+        near(at(&px, 160, 120), base_rgb, 3.0, "brightness before its window");
+        // Half opacity mixes halfway; a fade-in is halfway up half-way through it.
+        let a = adj(dim.clone(), &|a| a.opacity = 0.5);
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a1", "out"));
+        near(at(&frame(&[base.clone()], graph.trim_end_matches(';'), 1.0), 160, 120), [150.0, 75.0, 37.5], 3.0, "opacity");
+        let a = adj(dim.clone(), &|a| a.fade_in = 0.5);
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a2", "out"));
+        near(at(&frame(&[base.clone()], graph.trim_end_matches(';'), 0.75), 160, 120), [150.0, 75.0, 37.5], 6.0, "fade in");
+        // A mask confines it: the left half only.
+        let mask_png = tmp.join("mask.png");
+        run(&s(&["-f", "lavfi", "-i", "color=c=white:s=160x240,format=gray", "-frames:v", "1", &mask_png.to_string_lossy()]));
+        let mask = s(&["-loop", "1", "-framerate", "30", "-t", "1.1", "-i", &mask_png.to_string_lossy()]);
+        let a = adj(dim.clone(), &|_| {});
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, Some((1, 160, 240)), (320, 240), "base", "a3", "out"));
+        let px = frame(&[base.clone(), mask.clone()], graph.trim_end_matches(';'), 1.0);
+        near(at(&px, 40, 120), [100.0, 50.0, 25.0], 3.0, "masked in");
+        near(at(&px, 280, 120), base_rgb, 3.0, "masked out");
+        // Blur: a black|white edge comes out as the Gaussian's integral - 1 sigma in, ~84%.
+        let edge = s(&["-f", "lavfi", "-i", "color=c=black:s=320x240:r=30:d=3,drawbox=x=160:y=0:w=160:h=240:color=white:t=fill"]);
+        let a = adj(vec![], &|a| a.blur_sigma = Some(10.0));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a4", "out"));
+        let px = frame(&[edge.clone()], graph.trim_end_matches(';'), 1.0);
+        let phi = |z: f64| 0.5 * (1.0 + erf(z / std::f64::consts::SQRT_2));
+        for x in [150usize, 155, 160, 165, 170, 180] {
+            let want = 255.0 * phi((x as f64 + 0.5 - 160.0) / 10.0);
+            assert!((at(&px, x, 120)[1] - want).abs() < 10.0, "blur at x={x}: {} vs {want}", at(&px, x, 120)[1]);
+        }
+        // A vignette layer and a colour look together still render.
+        let a = adj(vec![CssOpSpec { op: "saturate".into(), value: 1.6 }, CssOpSpec { op: "hue-rotate".into(), value: 10.0 }], &|a| a.vignette = Some(0.8));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a5", "out"));
+        frame(&[base.clone()], graph.trim_end_matches(';'), 1.0);
+
+        // A keyframed blur region lands where its keyframes put it.
+        let checker = s(&["-f", "lavfi", "-i", "color=c=black:s=320x240:r=30:d=3,geq=lum='if(mod(floor(X/4)+floor(Y/4),2),235,16)':cb=128:cr=128"]);
+        let bv = OverlayBlur {
+            x: 0,
+            y: 80,
+            width: 64,
+            height: 64,
+            intensity: 0.5,
+            mask_data_base64: None,
+            start_time: 0.5,
+            end_time: 1.5,
+            sigma: Some(8.0),
+            keyframes: Some(kfs.clone()),
+        };
+        let graph = format!("[0:v]format=yuv420p[base];{}", blur_region_chain(&bv, 0, None, "base", "out"));
+        let px = frame(&[checker.clone()], graph.trim_end_matches(';'), 1.0);
+        let variance = |x0: usize, y0: usize| {
+            let v: Vec<f64> = (0..16).flat_map(|j| (0..16).map(move |i| (i, j))).map(|(i, j)| at(&px, x0 + i, y0 + j)[1]).collect();
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64
+        };
+        assert!(variance(124, 104) < 200.0, "inside the moved region it's blurred: {}", variance(124, 104));
+        assert!(variance(20, 104) > 2000.0, "where it was isn't: {}", variance(20, 104));
+
+        // Picture-in-picture starting at 3s, 2s into its source, shows source 3s at output 4s.
+        let pip_src = s(&["-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=10"]);
+        let pip = PipOverlay {
+            source_path: String::new(),
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 120,
+            shape: "rectangle".into(),
+            corner_radius: None,
+            crop: None,
+            trim_start: 2.0,
+            start_time: 3.0,
+            end_time: 5.0,
+            volume: 0.0,
+            blend_mode: None,
+        };
+        let long_base = s(&["-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=30:d=6"]);
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let px = frame(&[long_base.clone(), pip_src.clone()], graph.trim_end_matches(';'), 4.0);
+        let reference = |t: f64| run(&s(&["-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=10", "-ss", &format!("{t:.3}"), "-frames:v", "1", "-vf", "scale=160:120,format=yuv420p,format=rgb24", "-f", "rawvideo", "pipe:1"]));
+        let mse = |r: &[u8]| {
+            let mut sum = 0.0;
+            for y in 0..120 {
+                for x in 0..160 {
+                    for c in 0..3 {
+                        let d = px[(y * w + x) * 3 + c] as f64 - r[(y * 160 + x) * 3 + c] as f64;
+                        sum += d * d;
+                    }
+                }
+            }
+            sum / (160.0 * 120.0 * 3.0)
+        };
+        let (right, wrong) = (mse(&reference(3.0)), mse(&reference(4.0)));
+        assert!(right < 60.0 && right * 4.0 < wrong, "pip timing: mse {right} at the right moment vs {wrong}");
+        // ...and blends: screen over the base.
+        let pip = PipOverlay { blend_mode: Some("screen".into()), ..pip };
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        frame(&[long_base.clone(), pip_src.clone()], graph.trim_end_matches(';'), 4.0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Abramowitz-Stegun 7.1.26 (|error| < 1.5e-7) - plenty for a pixel check.
+    fn erf(x: f64) -> f64 {
+        let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+        let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-x * x).exp();
+        if x >= 0.0 { y } else { -y }
     }
 }

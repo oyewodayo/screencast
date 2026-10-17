@@ -253,6 +253,27 @@ export type TextOverlayCornerStyle = "square" | "rounded" | "pill";
 // see textReveal.ts; they export exactly (as a frame sequence).
 export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down" | "pop" | "typewriter" | "words" | "rise";
 
+// How an overlay mixes with the picture under it - CSS mix-blend-mode names (the preview sets them
+// on the overlay's element). Export composites the same formula (blend_composite, conversion.rs);
+// only modes whose ffmpeg counterpart was measured equal to the spec are offered (see blendModes.ts).
+export type BlendMode = "normal" | "multiply" | "screen" | "overlay" | "hard-light" | "darken" | "lighten" | "difference" | "exclusion" | "plus-lighter";
+
+// Set on an overlay whose keyframes came from motion tracking (motionTracking.ts): what was
+// followed and how, so the panel can show it and track again. The keyframes themselves are
+// ordinary keyframes - preview and export play them like any other.
+export interface OverlayTrackInfo {
+  sourcePath: string;
+  // The target box at the moment it was picked: output-frame fractions, and that moment's time
+  // from the overlay's start.
+  target: { x: number; y: number; width: number; height: number };
+  anchorTime: number;
+  // Whether the overlay grows and shrinks with the object.
+  followScale: boolean;
+  // Share of the tracked span where the object was lost (the overlay held there).
+  lostFraction: number;
+  trackedAt: number;
+}
+
 // A caption/title composited over the video preview (v1 is preview-only - not yet burned into
 // exported files, see export_trimmed_video). Core text/formatting mirrors TextObject
 // (pdfAnnotationTypes.ts), reusing the same TextRange/TextColorRun types rather than redeclaring
@@ -285,6 +306,8 @@ export interface TextOverlay {
   strokeWidth?: number;
   cornerStyle?: TextOverlayCornerStyle; // undefined means "square", the pre-existing look
   animation?: OverlayAnimation; // undefined means "none", the pre-existing look
+  blendMode?: BlendMode; // undefined means "normal"
+  track?: OverlayTrackInfo;
   // Controls for a letter-by-letter title reveal (animation "typewriter"/"words"/"rise") - pace,
   // delay, caret, exit, accent underline. See textReveal.ts.
   reveal?: TextRevealSettings;
@@ -343,6 +366,8 @@ export interface ImageOverlay {
   flipHorizontal?: boolean; // undefined/false means not mirrored
   flipVertical?: boolean;
   animation?: OverlayAnimation; // undefined means "none", the pre-existing look
+  blendMode?: BlendMode; // undefined means "normal"
+  track?: OverlayTrackInfo;
   // The visible sub-rectangle of the source picture, set via the dedicated Crop mode
   // (ImageOverlayCropPanel.tsx) - fractions of the SOURCE IMAGE's own natural pixel dimensions,
   // unlike every other field on this type (all normalized against the video frame instead). All
@@ -384,6 +409,10 @@ export interface BlurOverlay {
   shape?: BlurShape; // undefined means "rectangle", the pre-existing look
   cornerRadius?: number; // fraction of frameRect.height, rectangle only - same basis as ImageOverlay.cornerRadius
   rotation?: number; // degrees, clockwise - same basis as ImageOverlay.rotation
+  // Keyframed position (e.g. a motion track following a face): x/y as on text/image keyframes;
+  // scale and opacity aren't used - the region keeps its size and strength.
+  keyframes?: OverlayKeyframe[];
+  track?: OverlayTrackInfo;
   startTime: number;
   endTime: number;
   createdAt: number;
@@ -484,8 +513,63 @@ export interface PipOverlay {
   // happen for a pip created through the normal add flow.
   volume: number; // 0..1, defaults to 1
   muted?: boolean;
+  blendMode?: BlendMode; // undefined means "normal"
   createdAt: number;
   updatedAt: number;
+}
+
+// An adjustment layer: grades and/or blurs everything beneath it for its time range, at once -
+// "under" sits on the video itself (beneath blur regions and every overlay: grade the footage,
+// keep titles crisp); "over" sits above every overlay and picture-in-picture (only captions stay
+// on top). The preview is a backdrop-filter of CSS filter functions (adjustmentLayers.ts) and
+// export composes the very same functions in the same order (adjustment_layer_chain, conversion.rs).
+export type AdjustmentPlacement = "under" | "over";
+export interface AdjustmentRegion {
+  // Fractions of the frame, like an overlay's box.
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  shape: "rectangle" | "ellipse";
+  // Soft edge, 0..1 of the region's shorter half-side.
+  feather: number;
+  // Apply everywhere EXCEPT the region (a spotlight: blur or darken the background).
+  invert: boolean;
+}
+export interface AdjustmentLayer {
+  id: string;
+  name?: string;
+  startTime: number;
+  endTime: number;
+  placement: AdjustmentPlacement;
+  // A colour look preset (the same presets clips have; "vignette" is the vignette field instead).
+  look?: ClipColorFilter;
+  // CSS filter factors: 1 = unchanged (brightness/contrast/saturation), degrees for hue.
+  brightness?: number;
+  contrast?: number;
+  saturation?: number;
+  hue?: number;
+  // Gaussian blur, as a fraction of the frame's height (0 = none).
+  blur?: number;
+  vignette?: number;
+  // 0..1 - how much of the adjustment shows; fades ramp it in/out at the ends (seconds).
+  opacity?: number;
+  fadeIn?: number;
+  fadeOut?: number;
+  // Where it applies; undefined = the whole frame.
+  region?: AdjustmentRegion;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// A chapter of the edited video, anchored to a moment of a SOURCE file (like captions) so it
+// stays on the same shot through later cuts and reorders - videoChapters.ts maps it onto the
+// output timeline. Exported into the file, its .chapters.json and the YouTube description.
+export interface VideoChapter {
+  id: string;
+  sourcePath: string;
+  sourceTime: number;
+  label: string;
 }
 
 // What export_trimmed_video (Rust) actually consumes - plain, ordered [start,end) ranges, each
@@ -575,6 +659,8 @@ export interface VideoEditState {
   blurOverlays: BlurOverlay[];
   audioOverlays: AudioOverlay[];
   pipOverlays: PipOverlay[];
+  adjustmentLayers: AdjustmentLayer[];
+  chapters: VideoChapter[];
   // The primary video's OWN audio level - distinct from any AudioOverlay's own volume/muted (those
   // are separate mixed-in tracks; this is the original soundtrack that was always there). A plain
   // pair of fields rather than an array item like the overlays above, matching the "one track"
@@ -597,6 +683,8 @@ export interface EditableFields {
   blurOverlays: BlurOverlay[];
   audioOverlays: AudioOverlay[];
   pipOverlays: PipOverlay[];
+  adjustmentLayers: AdjustmentLayer[];
+  chapters: VideoChapter[];
   videoAudioMuted: boolean;
   videoAudioVolume: number;
   captions: CaptionTrack | null;
@@ -640,7 +728,12 @@ export interface VideoEditCommand {
     | "edit-track-audio"
     | "detach-audio"
     | "edit-captions"
-    | "edit-transcript";
+    | "edit-transcript"
+    | "add-adjustment"
+    | "edit-adjustment"
+    | "delete-adjustment"
+    | "edit-chapters"
+    | "track-motion";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {
@@ -652,6 +745,8 @@ export function createEmptyState(sourcePath: string, duration: number): VideoEdi
     blurOverlays: [],
     audioOverlays: [],
     pipOverlays: [],
+    adjustmentLayers: [],
+    chapters: [],
     videoAudioMuted: false,
     videoAudioVolume: 1,
     captions: null,
@@ -744,6 +839,8 @@ export function createProjectState(imagePaths: string[], options: NewProjectOpti
     blurOverlays: [],
     audioOverlays: [],
     pipOverlays: [],
+    adjustmentLayers: [],
+    chapters: [],
     videoAudioMuted: false,
     videoAudioVolume: 1,
     captions: null,

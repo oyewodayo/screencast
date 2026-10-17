@@ -2996,18 +2996,10 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							<div className="text-white text-sm">Preparing video{recoveryProgress > 0 ? ` — ${recoveryProgress}%` : '...'}</div>
 						</div>
 					)}
-					{overlay && frameRect && (
-						<div
-							className="absolute pointer-events-none"
-							style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height }}
-						>
-							{overlay(frameRect)}
-						</div>
-					)}
 					{activeClipEffects?.colorFilter?.preset === 'vignette' && frameRect && (
 						// No CSS `filter` primitive produces a vignette, unlike every other color preset
-						// above - a radial-gradient div positioned to the exact same frameRect the overlay
-						// render-prop div just above already uses is the simplest equivalent.
+						// above - a radial-gradient div over the same frameRect the overlay render-prop
+						// uses. Beneath that layer: export darkens the clip itself, under every overlay.
 						<div
 							className="absolute pointer-events-none"
 							style={{
@@ -3018,6 +3010,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								background: vignetteBackground(activeClipEffects.colorFilter.intensity),
 							}}
 						/>
+					)}
+					{overlay && frameRect && (
+						<div
+							className="absolute pointer-events-none"
+							style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height }}
+						>
+							{overlay(frameRect)}
+						</div>
 					)}
 					</>
 			}

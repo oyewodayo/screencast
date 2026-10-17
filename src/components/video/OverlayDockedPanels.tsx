@@ -20,6 +20,7 @@ import {
   IoCopyOutline,
   IoCropOutline,
   IoLocateOutline,
+  IoNavigateOutline,
   IoRefreshOutline,
   IoSwapHorizontalOutline,
   IoSwapVerticalOutline,
@@ -29,7 +30,9 @@ import { MdFormatAlignCenter, MdFormatAlignJustify, MdFormatAlignLeft, MdFormatA
 import Slider from "../docker/Slider";
 import NumberStepper from "../docker/NumberStepper";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
-import { BlurShape, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
+import { AdjustmentLayer, AdjustmentPlacement, AdjustmentRegion, BlendMode, BlurShape, ColorFilterPreset, OverlayAnimation, OverlayTrackInfo, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
+import { MAX_ADJUSTMENT_BLUR } from "../../utils/adjustmentLayers";
+import { BLEND_MODES } from "../../utils/blendModes";
 import { TextAlign } from "../../utils/pdfAnnotationTypes";
 import { ImageRevealDirection, ImageRevealSettings, ImageRevealStyle } from "../../utils/imageReveal";
 import { TEXT_REVEAL_SPEED_MAX, TEXT_REVEAL_SPEED_MIN, TextReveal, TextRevealSettings, isTextReveal, textRevealSeconds } from "../../utils/textReveal";
@@ -391,7 +394,81 @@ interface CommonProps {
   // Keyframed motion (keyframes.ts) - omitted where the overlay type doesn't support it.
   keyframes?: OverlayKeyframe[];
   onKeyframes?: (keyframes: OverlayKeyframe[] | undefined) => void;
+  // Blend mode (blendModes.ts) - omitted where it doesn't apply.
+  blendMode?: BlendMode;
+  onBlendMode?: (mode: BlendMode | undefined) => void;
+  // Motion tracking (motionTracking.ts): what the keyframes were tracked from, and starting a
+  // track (Dashboard shows the target picker).
+  track?: OverlayTrackInfo;
+  onTrackMotion?: () => void;
 }
+
+// How the overlay mixes with the picture under it.
+const BlendSection: React.FC<{ value: BlendMode | undefined; onChange: (mode: BlendMode | undefined) => void }> = ({ value, onChange }) => {
+  const current = BLEND_MODES.find((m) => m.value === (value ?? "normal")) ?? BLEND_MODES[0];
+  return (
+    <Section title="Blend">
+      <select
+        value={current.value}
+        onMouseDown={(e) => e.stopPropagation()}
+        onChange={(e) => onChange(e.target.value === "normal" ? undefined : (e.target.value as BlendMode))}
+        title="How this mixes with the video under it - the export renders exactly the same"
+        className="w-full bg-white/10 rounded-md px-2 py-1.5 text-[12px] text-white outline-none"
+      >
+        {BLEND_MODES.map((m) => (
+          <option key={m.value} value={m.value} className="bg-neutral-900">
+            {m.label}
+          </option>
+        ))}
+      </select>
+      <p className="text-[11px] leading-snug text-white/45">{current.hint}</p>
+    </Section>
+  );
+};
+
+const formatSpan = (sec: number) => (sec >= 60 ? `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s` : `${sec.toFixed(1)}s`);
+
+// Motion tracking: pin to something moving (the picker opens on the video), or the state of an
+// existing track - re-track it, or let go of it.
+const TrackingBlock: React.FC<{ track?: OverlayTrackInfo; onTrack?: () => void; onRemove: () => void; keyframeCount: number; span: number }> = ({ track, onTrack, onRemove, keyframeCount, span }) => {
+  if (!onTrack && !track) return null;
+  if (!track) {
+    return (
+      <button
+        type="button"
+        onClick={onTrack}
+        title="Drag a box over something moving and this follows it - preview and export alike"
+        className="self-start flex items-center gap-1.5 px-2 py-1 rounded text-[11px] text-white/80 bg-white/5 hover:bg-white/10"
+      >
+        <IoNavigateOutline size={12} />
+        Track motion…
+      </button>
+    );
+  }
+  const lost = Math.round(track.lostFraction * 100);
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md bg-emerald-500/10 ring-1 ring-emerald-400/20 px-2 py-1.5">
+      <div className="flex items-center gap-1.5 text-[11px] text-emerald-200">
+        <IoNavigateOutline size={12} />
+        <span className="flex-1">Following motion{track.followScale ? " and size" : ""}</span>
+        <span className="tabular-nums text-emerald-200/60">{formatSpan(span)}</span>
+      </div>
+      <p className="text-[10px] leading-snug text-white/45">
+        {keyframeCount} keyframes{lost > 0 ? ` · lost sight of it ${lost}% of the time (held in place there)` : ""}. Drag the overlay to move it along the whole path.
+      </p>
+      <div className="flex items-center gap-2">
+        {onTrack && (
+          <button type="button" onClick={onTrack} className="px-2 py-0.5 rounded text-[11px] text-white/80 bg-white/5 hover:bg-white/10">
+            Track again…
+          </button>
+        )}
+        <button type="button" onClick={onRemove} className="ml-auto text-[10px] text-white/40 hover:text-white/80">
+          Stop following
+        </button>
+      </div>
+    </div>
+  );
+};
 
 // Position pad - for a keyframed overlay it shows and sets the keyframe at the playhead (its
 // position there), not the base x/y the keyframes have replaced.
@@ -427,8 +504,20 @@ const MotionSection: React.FC<CommonProps> = (props) => {
   const setHere = (patch: Partial<OverlayKeyframe>) =>
     onKeyframes(upsertKeyframe(keyframes, { time: local, easing: here?.easing ?? "ease", ...state, ...patch } as OverlayKeyframe));
   const sorted = [...(keyframes ?? [])].sort((a, b) => a.time - b.time);
+  const tracking = (
+    <TrackingBlock track={props.track} onTrack={props.onTrackMotion} onRemove={() => onKeyframes(undefined)} keyframeCount={sorted.length} span={props.endTime - props.startTime} />
+  );
+  if (props.track && keyframes && keyframes.length > 0) {
+    return (
+      <Section title="Motion">
+        {tracking}
+        <SliderRow label="Opacity" value={Math.round(state.opacity * 100)} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && onKeyframes(keyframes.map((k) => ({ ...k, opacity: v / 100 })))} />
+      </Section>
+    );
+  }
   return (
     <Section title="Motion">
+      {tracking}
       {!keyframes || keyframes.length === 0 ? (
         <div className="flex flex-col gap-1.5">
           <p className="text-[11px] leading-snug text-white/50">
@@ -803,6 +892,7 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
         </LabeledRow>
       </Section>
 
+      {props.onBlendMode && <BlendSection value={props.blendMode} onChange={props.onBlendMode} />}
       <AnimationSection text value={props.animation} onChange={props.onAnimation} />
       {isTextReveal(props.animation) && props.onReveal && (
         <RevealSection
@@ -1157,6 +1247,7 @@ export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
       </div>
     </Section>
 
+    {props.onBlendMode && <BlendSection value={props.blendMode} onChange={props.onBlendMode} />}
     {!props.asset && props.onReveal && <ImageRevealSection reveal={props.reveal} onChange={props.onReveal} />}
     <AnimationSection value={props.animation} onChange={props.onAnimation} />
     <MotionSection {...props} />
@@ -1241,8 +1332,112 @@ export const BlurDockedPanel: React.FC<BlurDockedPanelProps> = (props) => (
       </div>
     </Section>
 
-    <PositionSection x={props.x} y={props.y} width={props.width} height={props.height} onPlace={props.onPlace} />
+    {(props.onTrackMotion || props.track) && props.onKeyframes && (
+      <Section title="Motion">
+        <TrackingBlock
+          track={props.keyframes?.length ? props.track : undefined}
+          onTrack={props.onTrackMotion}
+          onRemove={() => props.onKeyframes?.(undefined)}
+          keyframeCount={props.keyframes?.length ?? 0}
+          span={props.endTime - props.startTime}
+        />
+        {!props.keyframes?.length && <p className="text-[11px] leading-snug text-white/45">Keep a face or a number plate hidden as it moves.</p>}
+      </Section>
+    )}
+    <KeyframeAwarePosition {...props} />
     <TimingSection start={props.startTime} end={props.endTime} playhead={props.playhead} onSet={props.onSetTime} />
     <ActionBar onDuplicate={props.onDuplicate} onDelete={props.onDelete} />
   </>
 );
+
+// ---------- adjustment layer ----------
+
+export interface AdjustmentDockedPanelProps {
+  layer: AdjustmentLayer;
+  playhead: number;
+  onChange: (patch: Partial<AdjustmentLayer>) => void;
+  onSetTime?: (edge: "start" | "end", time: number) => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}
+
+const LOOKS: { value: ColorFilterPreset; label: string }[] = [
+  { value: "none", label: "None" },
+  { value: "vibrant", label: "Vibrant" },
+  { value: "cinematic", label: "Film" },
+  { value: "warm", label: "Warm" },
+  { value: "cool", label: "Cool" },
+  { value: "bw", label: "B&W" },
+];
+
+export const AdjustmentDockedPanel: React.FC<AdjustmentDockedPanelProps> = ({ layer, playhead, onChange, onSetTime, onDuplicate, onDelete }) => {
+  const region = layer.region;
+  const pct = (v: number) => `${Math.round(v * 100)}%`;
+  const setRegion = (patch: Partial<AdjustmentRegion> | null) =>
+    onChange({ region: patch === null ? undefined : { ...(region ?? { x: 0.3, y: 0.25, width: 0.4, height: 0.5, shape: "ellipse", feather: 0.35, invert: false }), ...patch } });
+  const span = Math.max(0.1, layer.endTime - layer.startTime);
+  return (
+    <>
+      <Section title="Applies to">
+        <Segmented<AdjustmentPlacement>
+          value={layer.placement}
+          onChange={(placement) => onChange({ placement })}
+          options={[
+            { value: "under", label: "The video", title: "Grade or blur the footage; titles, pictures and picture-in-picture stay untouched" },
+            { value: "over", label: "Everything", title: "Also covers every title, picture and picture-in-picture beneath it (captions stay on top)" },
+          ]}
+        />
+      </Section>
+
+      <Section title="Look">
+        <ChipGrid<ColorFilterPreset>
+          options={LOOKS}
+          value={layer.look?.preset ?? "none"}
+          onChange={(preset) => onChange({ look: preset === "none" ? undefined : { preset, intensity: layer.look?.intensity ?? 0.7 } })}
+        />
+        {layer.look && layer.look.preset !== "none" && (
+          <SliderRow label="Amount" value={layer.look.intensity} min={0} max={1} step={0.01} format={pct} onChange={(intensity) => onChange({ look: { ...layer.look!, intensity } })} />
+        )}
+      </Section>
+
+      <Section title="Adjust">
+        <SliderRow label="Brightness" value={layer.brightness ?? 1} min={0.4} max={1.6} step={0.01} marks={[1]} format={pct} onChange={(brightness) => onChange({ brightness })} />
+        <SliderRow label="Contrast" value={layer.contrast ?? 1} min={0.4} max={1.6} step={0.01} marks={[1]} format={pct} onChange={(contrast) => onChange({ contrast })} />
+        <SliderRow label="Saturation" value={layer.saturation ?? 1} min={0} max={2} step={0.01} marks={[1]} format={pct} onChange={(saturation) => onChange({ saturation })} />
+        <SliderRow label="Hue" value={layer.hue ?? 0} min={-180} max={180} step={1} marks={[0]} format={(v) => `${Math.round(v)}°`} onChange={(hue) => onChange({ hue })} />
+        <SliderRow label="Blur" value={(layer.blur ?? 0) / MAX_ADJUSTMENT_BLUR} min={0} max={1} step={0.01} format={pct} onChange={(v) => onChange({ blur: v * MAX_ADJUSTMENT_BLUR })} />
+        <SliderRow label="Vignette" value={layer.vignette ?? 0} min={0} max={1} step={0.01} format={pct} onChange={(vignette) => onChange({ vignette })} />
+      </Section>
+
+      <Section title="Where">
+        <Segmented<"frame" | "rectangle" | "ellipse">
+          value={region ? region.shape : "frame"}
+          onChange={(v) => setRegion(v === "frame" ? null : { shape: v })}
+          options={[
+            { value: "frame", label: "Whole frame", title: "The whole picture" },
+            { value: "rectangle", label: <span className="w-3.5 h-2.5 border-[1.5px] border-current" />, title: "A rectangle - drag it on the video" },
+            { value: "ellipse", label: <span className="w-3.5 h-2.5 border-[1.5px] border-current rounded-full" />, title: "An ellipse - drag it on the video" },
+          ]}
+        />
+        {region && (
+          <>
+            <SliderRow label="Soft edge" value={region.feather} min={0} max={1} step={0.01} format={pct} onChange={(feather) => setRegion({ feather })} />
+            <LabeledRow label="Outside">
+              <Switch on={region.invert} label="Apply everywhere except the area - blur or darken the background around a subject" onChange={(invert) => setRegion({ invert })} />
+              <span className="text-white/40">{region.invert ? "everything but the area" : "inside the area"}</span>
+            </LabeledRow>
+          </>
+        )}
+      </Section>
+
+      <Section title="Strength">
+        <SliderRow label="Mix" value={layer.opacity ?? 1} min={0} max={1} step={0.01} format={pct} onChange={(opacity) => onChange({ opacity })} />
+        <SliderRow label="Fade in" value={layer.fadeIn ?? 0} min={0} max={Math.min(5, span / 2)} step={0.05} format={(v) => `${v.toFixed(1)}s`} onChange={(fadeIn) => onChange({ fadeIn })} />
+        <SliderRow label="Fade out" value={layer.fadeOut ?? 0} min={0} max={Math.min(5, span / 2)} step={0.05} format={(v) => `${v.toFixed(1)}s`} onChange={(fadeOut) => onChange({ fadeOut })} />
+      </Section>
+
+      <TimingSection start={layer.startTime} end={layer.endTime} playhead={playhead} onSet={onSetTime} />
+      <ActionBar onDuplicate={onDuplicate} onDelete={onDelete} />
+    </>
+  );
+};

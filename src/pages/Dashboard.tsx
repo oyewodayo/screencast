@@ -40,7 +40,13 @@ import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
 import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
-import { Clip, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
+import { Clip, OverlayTrackInfo, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
+import AdjustmentLayersLayer from "../components/video/AdjustmentLayersLayer";
+import TrackTargetPicker from "../components/video/TrackTargetPicker";
+import ExportQueueChip from "../components/docker/ExportQueueChip";
+import { type Box as TrackBox, cancelTracking, trackOverlay } from "../utils/motionTracking";
+import { type ExportJob, installGlobalCloseGuard, onJobFinished } from "../utils/exportQueue";
+import SharePanel from "../components/video/SharePanel";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
 import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
 import { useGradeLut } from "../utils/gradeLuts";
@@ -591,13 +597,17 @@ const Dashboard = () => {
   // Moving a keyframed overlay sets its keyframe at the playhead rather than its base x/y (which
   // the keyframes have replaced): the move is added to where the keyframes put it there.
   const keyframeAwarePatch = <P extends { x?: number; y?: number; keyframes?: OverlayKeyframe[] }>(
-    overlay: { x: number; y: number; startTime: number; endTime: number; keyframes?: OverlayKeyframe[] } | undefined,
+    overlay: { x: number; y: number; startTime: number; endTime: number; keyframes?: OverlayKeyframe[]; track?: OverlayTrackInfo } | undefined,
     patch: P
   ): P => {
     if (!overlay?.keyframes?.length || patch.keyframes !== undefined) return patch;
     const dx = patch.x !== undefined ? patch.x - overlay.x : 0;
     const dy = patch.y !== undefined ? patch.y - overlay.y : 0;
     if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return patch;
+    if (overlay.track) {
+      // A motion-tracked overlay keeps following: the drag moves its whole path.
+      return { ...patch, keyframes: overlay.keyframes.map((k) => ({ ...k, x: k.x + dx, y: k.y + dy })) } as P;
+    }
     const local = Math.max(0, Math.min(overlay.endTime - overlay.startTime, currentOutputTime - overlay.startTime));
     const state = keyframeStateAt(overlay.keyframes, local)!;
     const here = keyframeAt(overlay.keyframes, local);
@@ -615,6 +625,15 @@ const Dashboard = () => {
   const [selectedImageOverlayId, setSelectedImageOverlayId] = useState<string | null>(null);
   const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
   const [selectedBlurOverlayId, setSelectedBlurOverlayId] = useState<string | null>(null);
+  const [selectedAdjustmentId, setSelectedAdjustmentId] = useState<string | null>(null);
+  // Motion tracking (motionTracking.ts): picking what to follow, then following it.
+  const [trackSession, setTrackSession] = useState<null | {
+    kind: "text" | "image" | "blur";
+    id: string;
+    initial: TrackBox;
+    tracking: { progress: number; jobId: string } | null;
+    error: string | null;
+  }>(null);
   const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
   const [selectedPipOverlayId, setSelectedPipOverlayId] = useState<string | null>(null);
   const [isPlacingPip, setIsPlacingPip] = useState<boolean>(false);
@@ -821,6 +840,77 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     const clip = clips[index];
     return start + sourceToOutputOffset(clip, Math.max(clip.start, Math.min(clip.end, playback.time)));
   }, [getPlayerPlaybackState]);
+
+  // ---- Motion tracking: pick what to follow on the paused frame, follow it, bake it into the
+  // overlay's keyframes (motionTracking.ts) as one undo step.
+  const trackAnchorRef = useRef(0);
+  const overlayForTracking = (kind: "text" | "image" | "blur", id: string) =>
+    kind === "text" ? editStore.textOverlays.find((o) => o.id === id) : kind === "image" ? editStore.imageOverlays.find((o) => o.id === id) : editStore.blurOverlays.find((o) => o.id === id);
+  const startMotionTrack = (kind: "text" | "image" | "blur", id: string) => {
+    const o = overlayForTracking(kind, id);
+    if (!o) return;
+    const t = getExactOutputTime() ?? currentOutputTime;
+    if (t < o.startTime - 1e-3 || t > o.endTime + 1e-3) {
+      setMessage("Move the playhead to a moment when the overlay is on screen, then track");
+      return;
+    }
+    if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
+    trackAnchorRef.current = t;
+    const state = keyframeStateAt(o.keyframes, t - o.startTime) ?? { x: o.x, y: o.y };
+    // The picker starts on the overlay itself - right for a blur region over what it hides; for a
+    // title or sticker the user drags it onto the thing to follow.
+    const initial = { x: Math.max(0, Math.min(1 - o.width, state.x)), y: Math.max(0, Math.min(1 - o.height, state.y)), width: Math.min(1, o.width), height: Math.min(1, o.height) };
+    setTrackSession({ kind, id, initial, tracking: null, error: null });
+  };
+  const runMotionTrack = async (target: TrackBox, followScale: boolean) => {
+    const session = trackSession;
+    const o = session && overlayForTracking(session.kind, session.id);
+    if (!session || !o || !selectedFile) return;
+    const jobId = crypto.randomUUID();
+    setTrackSession((s) => (s ? { ...s, tracking: { progress: 0, jobId }, error: null } : s));
+    try {
+      const frame = await resolveTimelineFrame(selectedFile.sourcePath);
+      const result = await trackOverlay({
+        clips: editStore.clips,
+        frame,
+        overlay: o,
+        target,
+        anchorTime: trackAnchorRef.current,
+        followScale,
+        positionOnly: session.kind === "blur",
+        jobId,
+        onProgress: (progress) => setTrackSession((s) => (s?.tracking?.jobId === jobId ? { ...s, tracking: { progress, jobId } } : s)),
+      });
+      const patch = { keyframes: result.keyframes, track: result.track };
+      if (session.kind === "text") editStore.updateTextOverlayContent(session.id, patch);
+      else if (session.kind === "image") editStore.updateImageOverlayContent(session.id, patch);
+      else editStore.updateBlurOverlayContent(session.id, patch);
+      setTrackSession(null);
+      const lost = Math.round(result.track.lostFraction * 100);
+      setMessage(lost > 20 ? `Following it - it was out of sight ${lost}% of the time, held in place there` : "Pinned - it follows the motion now");
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      setTrackSession((s) => (s && s.tracking?.jobId === jobId ? { ...s, tracking: null, error: /cancel/i.test(text) ? null : text } : s));
+    }
+  };
+  const cancelMotionTrack = () => {
+    if (trackSession?.tracking) void cancelTracking(trackSession.tracking.jobId);
+    setTrackSession(null);
+  };
+
+  // One thing selected at a time across overlays and adjustment layers (each has its own panel).
+  const selectAdjustment = useCallback((id: string | null) => {
+    setSelectedAdjustmentId(id);
+    if (id) {
+      setSelectedOverlayId(null);
+      setSelectedImageOverlayId(null);
+      setSelectedBlurOverlayId(null);
+      setSelectedPipOverlayId(null);
+    }
+  }, []);
+  useEffect(() => {
+    if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedPipOverlayId) setSelectedAdjustmentId(null);
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedPipOverlayId]);
   // Any clip's preview source as the player loads it - the primary file's already-resolved URL,
   // an image's proxy, or another video's asset URL (TransitionPreviewLayer compares this against
   // what the player actually has loaded).
@@ -2386,6 +2476,19 @@ const setScreen = () => {
 	// this is exactly the same kind of event (a new file appeared in the library, backed by a
 	// real render already sitting on disk). The video that was being edited is left exactly as it
 	// was; this just adds its trimmed/cut sibling alongside it.
+	// Background exports (exportQueue.ts): each finished file joins the library; nothing jumps away
+	// from what's being edited - the exports panel offers to open, show or share it.
+	const libraryRefreshRef = useRef<() => void>(() => {});
+	libraryRefreshRef.current = () => void handleDirectoryFiles();
+	useEffect(() => {
+		installGlobalCloseGuard();
+		return onJobFinished((job) => {
+			libraryRefreshRef.current();
+			setMessage(`Exported ${formatFileName(job.resultPath?.split(/[\\/]/).pop() ?? job.title)}`);
+		});
+	}, []);
+	const [shareJob, setShareJob] = useState<ExportJob | null>(null);
+
 	const handleVideoExported = async (newPath: string, newFileName: string) => {
 		await handleDirectoryFiles();
 		setMessage(`Saved edited video: ${formatFileName(newFileName)}`);
@@ -4452,6 +4555,9 @@ const setScreen = () => {
                             getPlaybackState={getPlayerPlaybackState}
                             resolveClipUrl={resolveTimelineClipUrl}
                           />
+                          {/* Adjustment layers on the video itself - beneath blur regions and every
+                              overlay, where export applies them. */}
+                          <AdjustmentLayersLayer mode="under" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
                           {reframePreview && <ReframePreviewLayer preview={reframePreview} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />}
                           <VideoOverlayLayer
                           frameRect={frameRect}
@@ -4494,6 +4600,7 @@ const setScreen = () => {
                             else if (kind === "image") editStore.resizeImageOverlayTime(id, edge, clamped);
                             else editStore.resizeBlurOverlayTime(id, edge, clamped);
                           }}
+                          onTrackMotion={startMotionTrack}
                           totalOutputDuration={totalOutputDuration}
                         />
                         <PipOverlayLayer
@@ -4510,6 +4617,7 @@ const setScreen = () => {
                           onUpdatePipOverlayContent={editStore.updatePipOverlayContent}
                           onDeletePipOverlay={editStore.deletePipOverlay}
                         />
+                        <AdjustmentLayersLayer mode="over" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
                         {/* Above PiP and every other overlay - same stacking as the export, where the
                             captions are the last video stage (export_trimmed_video). */}
                         {editStore.captions?.settings.enabled && captionLines.length > 0 && (
@@ -4520,6 +4628,30 @@ const setScreen = () => {
                             currentOutputTime={currentOutputTime}
                             isPlaying={playerIsPlaying}
                             clipSpeed={activeClipEffects?.speed ?? 1}
+                          />
+                        )}
+                        <AdjustmentLayersLayer
+                          mode="controls"
+                          frameRect={frameRect}
+                          layers={editStore.adjustmentLayers}
+                          currentOutputTime={currentOutputTime}
+                          selectedId={selectedAdjustmentId}
+                          onSelect={selectAdjustment}
+                          onUpdate={editStore.updateAdjustmentLayer}
+                          onSetTime={(id, edge, time) => editStore.resizeAdjustmentLayerTime(id, edge, Math.max(0, Math.min(totalOutputDuration, time)))}
+                          onDuplicate={(id) => selectAdjustment(editStore.duplicateAdjustmentLayer(id))}
+                          onDelete={editStore.deleteAdjustmentLayer}
+                        />
+                        {trackSession && (
+                          <TrackTargetPicker
+                            key={`${trackSession.kind}:${trackSession.id}`}
+                            frameRect={frameRect}
+                            initial={trackSession.initial}
+                            canFollowScale={trackSession.kind !== "blur"}
+                            tracking={trackSession.tracking}
+                            error={trackSession.error}
+                            onTrack={(target, followScale) => void runMotionTrack(target, followScale)}
+                            onCancel={cancelMotionTrack}
                           />
                         )}
                         {isCroppingClip && activeClipEffects && (
@@ -4820,6 +4952,8 @@ const setScreen = () => {
         onToggleArmPlaceImage={() => setIsPlacingImage((v) => !v)}
         selectedBlurOverlayId={selectedBlurOverlayId}
         onSelectBlurOverlay={setSelectedBlurOverlayId}
+        selectedAdjustmentId={selectedAdjustmentId}
+        onSelectAdjustment={selectAdjustment}
         isPlacingBlur={isPlacingBlur}
         onToggleArmPlaceBlur={() => setIsPlacingBlur((v) => !v)}
         selectedPipOverlayId={selectedPipOverlayId}
@@ -4916,6 +5050,11 @@ const setScreen = () => {
       )}
 
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
+        <ExportQueueChip
+          onOpen={(job) => job.resultPath && void loadFileForPlayback(job.resultPath, job.resultPath.split(/[\\/]/).pop() ?? job.title)}
+          onShare={setShareJob}
+        />
+        {shareJob?.resultPath && <SharePanel filePath={shareJob.resultPath} meta={shareJob.share} durationSec={shareJob.durationSec} onClose={() => setShareJob(null)} />}
         {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}
         {error && <Toast key={`err-${error}`} message={error} variant="error" onDismiss={() => setError("")} />}
         {pendingUpdate && (

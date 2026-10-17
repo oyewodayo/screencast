@@ -33,8 +33,10 @@ import AssetFloatingControls from "./AssetFloatingControls";
 import { assetEntry } from "../../utils/videoAssets";
 import { OverlayKeyframe, keyframeStateAt } from "../../utils/keyframes";
 import { FrameRect } from "../../utils/videoFrameRect";
+import { BLUR_SIGMA_FRACTION } from "../../utils/videoOverlayRender";
 import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { overlayAnimationStyle } from "../../utils/overlayAnimation";
+import { cssBlendMode } from "../../utils/blendModes";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { renderFormattedSegments } from "../../utils/textFormatting";
@@ -61,13 +63,10 @@ const DEFAULT_IMAGE_WIDTH_FRACTION = 0.25;
 const MIN_IMAGE_WIDTH_PX = 24;
 const DEFAULT_BLUR_WIDTH_FRACTION = 0.18;
 const DEFAULT_BLUR_HEIGHT_FRACTION = 0.18;
-// Blur strength is stored as 0..1 (BlurOverlay.intensity), not a raw px radius, so it stays
-// meaningful regardless of the frame's actual size - resolved to a CSS px radius here as a
-// fraction of frameRect.height, the same "fraction of the frame, not a fixed px" convention
-// fontSize/padding already use. Doesn't need to exactly match the export-side radius formula in
-// export_trimmed_video (crop pixels vs CSS backdrop-filter px are different spaces entirely) -
-// just to look comparably strong at intensity 0 vs 1.
-const BLUR_PREVIEW_SCALE = 0.12;
+// Blur strength is stored as 0..1 (BlurOverlay.intensity), resolved to a CSS blur() radius (a
+// Gaussian's standard deviation) as a fraction of frameRect.height - export blurs with the same
+// Gaussian at the same fraction of its own frame (BLUR_SIGMA_FRACTION).
+const BLUR_PREVIEW_SCALE = BLUR_SIGMA_FRACTION;
 const MIN_BLUR_WIDTH_PX = 24;
 
 const TEXT_STYLE_PRESETS: { name: string; patch: TextOverlayContentPatch }[] = [
@@ -99,6 +98,8 @@ type TextOverlayContentPatch = Partial<
     | "padding"
     | "keyframes"
     | "reveal"
+    | "blendMode"
+    | "track"
   >
 >;
 type ImageOverlayContentPatch = Partial<
@@ -124,6 +125,8 @@ type ImageOverlayContentPatch = Partial<
     | "cropHeight"
     | "asset"
     | "reveal"
+    | "blendMode"
+    | "track"
   >
 >;
 // "rounded" is a flat px amount (converted to a frameRect.height fraction at click time) rather
@@ -255,13 +258,15 @@ interface VideoOverlayLayerProps {
   onAddBlurOverlay: (x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number) => string;
   onUpdateBlurOverlayContent: (
     id: string,
-    patch: Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>
+    patch: Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation" | "keyframes" | "track">>
   ) => void;
   onDeleteBlurOverlay: (id: string) => void;
   onDuplicateBlurOverlay: (id: string) => void;
   // Sets one edge of an overlay's time range (output seconds) - the docked panels' timing
   // controls. Same store operation as dragging the overlay chip's edge on the timeline.
   onSetOverlayTime?: (kind: "text" | "image" | "blur", id: string, edge: "start" | "end", time: number) => void;
+  // Starts motion tracking for an overlay (Dashboard runs the target picker and the track).
+  onTrackMotion?: (kind: "text" | "image" | "blur", id: string) => void;
 }
 
 // A compact numeric stepper matching the image panel's own rotation input (a native
@@ -669,6 +674,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onUpdateBlurOverlayContent,
   onDeleteBlurOverlay,
   onDuplicateBlurOverlay,
+  onTrackMotion,
 }) => {
   // Text and image overlays are selected/edited independently by id, but their toolbars
   // (including the animation-picker popover each one owns) are two visually separate floating
@@ -1334,7 +1340,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   // so a keyframed box moves from where it's shown; the drop is then turned into a keyframe at the
   // playhead (Dashboard's keyframeAwarePatch adds the drag's movement to the keyframed state).
   const keyframedRef = useRef<{ id: string; x: number; y: number; startTime: number; keyframes: OverlayKeyframe[] }[]>([]);
-  keyframedRef.current = [...overlays, ...imageOverlays]
+  keyframedRef.current = [...overlays, ...imageOverlays, ...blurOverlays]
     .filter((o) => o.keyframes && o.keyframes.length > 0)
     .map((o) => ({ id: o.id, x: o.x, y: o.y, startTime: o.startTime, keyframes: o.keyframes! }));
   const frameSizeRef = useRef({ w: frameRect.width, h: frameRect.height });
@@ -1350,13 +1356,15 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       const now = getOutputTime?.() ?? currentOutputTimeRef.current;
       const { w, h } = frameSizeRef.current;
       for (const o of keyframedRef.current) {
-        const el = document.querySelector<HTMLElement>(`[data-kf-overlay="${o.id}"]`);
-        if (!el) continue;
+        const els = document.querySelectorAll<HTMLElement>(`[data-kf-overlay="${o.id}"]`);
+        if (els.length === 0) continue;
         const state = keyframeStateAt(o.keyframes, now - o.startTime);
         if (!state) continue;
-        el.style.translate = `${(state.x - o.x) * w}px ${(state.y - o.y) * h}px`;
-        el.style.scale = String(state.scale);
-        el.style.setProperty("--kf-opacity", String(state.opacity));
+        for (const el of els) {
+          el.style.translate = `${(state.x - o.x) * w}px ${(state.y - o.y) * h}px`;
+          el.style.scale = String(state.scale);
+          el.style.setProperty("--kf-opacity", String(state.opacity));
+        }
       }
     };
     raf = requestAnimationFrame(tick);
@@ -1558,6 +1566,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             onPointerUp={endBlurDrag}
             onPointerCancel={endBlurDrag}
             onContextMenu={openContextMenu("blur", o.id)}
+            data-kf-overlay={o.keyframes?.length ? o.id : undefined}
             title="Drag to move"
             className={`absolute cursor-move outline outline-2 transition-colors ${
               isSelected ? "outline-dashed outline-white" : "outline-transparent hover:outline-white/40"
@@ -1619,55 +1628,43 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         const rotateHandleRise = rotateHandleRiseFor(roomAbovePx);
         const showRotateStem = roomAbovePx >= 32;
         const anim = overlayAnimationStyle(o.animation, o.startTime, o.endTime, currentOutputTime, frameRect.width, frameRect.height);
-        return (
-          <div
-            key={o.id}
-            onPointerDown={beginImageDrag(o)}
-            onPointerMove={handleImageDragMove}
-            onPointerUp={endImageDrag}
-            onPointerCancel={endImageDrag}
-            onContextMenu={openContextMenu("image", o.id)}
-            title="Drag to move"
-            data-kf-overlay={o.keyframes?.length ? o.id : undefined}
-            className={`absolute cursor-move outline outline-2 transition-colors ${isSelected ? "outline-dashed outline-white" : "outline-transparent hover:outline-white/40"}`}
-            style={{
-              left: o.x * frameRect.width,
-              top: o.y * frameRect.height,
-              width: o.width * frameRect.width,
-              height: o.height * frameRect.height,
-              // --kf-opacity: keyframed fade, written every frame by the keyframe loop below.
-              opacity: o.keyframes?.length ? `calc(${o.opacity * anim.opacity} * var(--kf-opacity, 1))` : o.opacity * anim.opacity,
-              borderRadius: o.asset ? undefined : radiusPx,
-              // translate (slide animation) is listed before rotate so it applies in screen-space,
-              // outside the image's own local rotation - see overlayAnimationStyle's own comment on
-              // why "peek and retreat" rather than a conveyor, and CSS's own transform-composition
-              // order (each function transforms the *coordinate system* for the ones after it, so
-              // rotate here only ever spins the box around its own center, never around some
-              // already-translated point).
-              transform:
-                [
-                  anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
-                  anim.scale !== 1 ? `scale(${anim.scale})` : null,
-                  o.rotation ? `rotate(${o.rotation}deg)` : null,
-                ]
-                  .filter(Boolean)
-                  .join(" ") || undefined,
-              // Border and drop shadow combine into one box-shadow rather than a real `border` - a
-              // real border adds to the box's layout size unless box-sizing is pinned, and
-              // box-shadow already composes multiple layers for free via commas. Both are drawn as
-              // OUTER shadows (no `inset`) - box-shadow paints as part of the box's own border step,
-              // which happens before its children paint, so an inset ring here would sit entirely
-              // behind the <img> child below and never actually be visible (this was the "border
-              // doesn't show" bug: it was rendering, just permanently hidden under the picture). An
-              // outer ring instead grows 3px past the box's own edge, into space the <img> doesn't
-              // reach, so nothing paints over it.
-              // A shape draws its own shadow (following its outline, not this box) - see AssetCanvas.
-              boxShadow: o.asset
-                ? undefined
-                : [o.borderColor ? `0 0 0 3px ${o.borderColor}` : null, o.shadow ? "0 6px 16px rgba(0,0,0,0.45)" : null].filter(Boolean).join(", ") || undefined,
-              pointerEvents: placingAnything ? "none" : "auto",
-            }}
-          >
+        // translate (slide animation) is listed before rotate so it applies in screen-space,
+        // outside the image's own local rotation - see overlayAnimationStyle's own comment on
+        // why "peek and retreat" rather than a conveyor, and CSS's own transform-composition
+        // order (each function transforms the *coordinate system* for the ones after it, so
+        // rotate here only ever spins the box around its own center, never around some
+        // already-translated point).
+        const transform =
+          [
+            anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
+            anim.scale !== 1 ? `scale(${anim.scale})` : null,
+            o.rotation ? `rotate(${o.rotation}deg)` : null,
+          ]
+            .filter(Boolean)
+            .join(" ") || undefined;
+        // Border and drop shadow combine into one box-shadow rather than a real `border` - a
+        // real border adds to the box's layout size unless box-sizing is pinned, and
+        // box-shadow already composes multiple layers for free via commas. Both are drawn as
+        // OUTER shadows (no `inset`) - box-shadow paints as part of the box's own border step,
+        // which happens before its children paint, so an inset ring here would sit entirely
+        // behind the <img> child below and never actually be visible (this was the "border
+        // doesn't show" bug: it was rendering, just permanently hidden under the picture). An
+        // outer ring instead grows 3px past the box's own edge, into space the <img> doesn't
+        // reach, so nothing paints over it.
+        // A shape draws its own shadow (following its outline, not this box) - see AssetCanvas.
+        const boxShadow = o.asset
+          ? undefined
+          : [o.borderColor ? `0 0 0 3px ${o.borderColor}` : null, o.shadow ? "0 6px 16px rgba(0,0,0,0.45)" : null].filter(Boolean).join(", ") || undefined;
+        const box: React.CSSProperties = { left: o.x * frameRect.width, top: o.y * frameRect.height, width: o.width * frameRect.width, height: o.height * frameRect.height };
+        const look: React.CSSProperties = {
+          // --kf-opacity: keyframed fade, written every frame by the keyframe loop below.
+          opacity: o.keyframes?.length ? `calc(${o.opacity * anim.opacity} * var(--kf-opacity, 1))` : o.opacity * anim.opacity,
+          borderRadius: o.asset ? undefined : radiusPx,
+          transform,
+          boxShadow,
+        };
+        const picture = (
+          <>
             {o.asset ? (
               <AssetCanvas
                 asset={o.asset}
@@ -1716,6 +1713,10 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 }}
               />
             ))}
+          </>
+        );
+        const handles = (
+          <>
             {isSelected && (
               <>
                 <ResizeHandles
@@ -1750,6 +1751,37 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 />
               </>
             )}
+          </>
+        );
+        const dragProps = {
+          onPointerDown: beginImageDrag(o),
+          onPointerMove: handleImageDragMove,
+          onPointerUp: endImageDrag,
+          onPointerCancel: endImageDrag,
+          onContextMenu: openContextMenu("image", o.id),
+          title: "Drag to move",
+          className: `absolute cursor-move outline outline-2 transition-colors ${isSelected ? "outline-dashed outline-white" : "outline-transparent hover:outline-white/40"}`,
+        };
+        const blendMode = cssBlendMode(o.blendMode);
+        if (blendMode) {
+          // A blend mode applies to the whole element it's set on - so the picture blends from
+          // its own element, and the outline and handles sit on a plain one over it (blending
+          // them too would make them vanish - white under Multiply).
+          return (
+            <React.Fragment key={o.id}>
+              <div data-kf-overlay={o.keyframes?.length ? o.id : undefined} className="absolute pointer-events-none" style={{ ...box, ...look, mixBlendMode: blendMode }}>
+                {picture}
+              </div>
+              <div {...dragProps} data-kf-overlay={o.keyframes?.length ? o.id : undefined} style={{ ...box, transform, pointerEvents: placingAnything ? "none" : "auto" }}>
+                {handles}
+              </div>
+            </React.Fragment>
+          );
+        }
+        return (
+          <div key={o.id} {...dragProps} data-kf-overlay={o.keyframes?.length ? o.id : undefined} style={{ ...box, ...look, pointerEvents: placingAnything ? "none" : "auto" }}>
+            {picture}
+            {handles}
           </div>
         );
       })}
@@ -1768,6 +1800,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               data-kf-overlay={o.keyframes?.length ? o.id : undefined}
               className="absolute whitespace-pre-wrap break-words cursor-text outline outline-2 outline-transparent hover:outline-white/40 transition-colors"
               style={{
+                mixBlendMode: cssBlendMode(o.blendMode),
                 left: o.x * frameRect.width,
                 top: o.y * frameRect.height,
                 width: o.width * frameRect.width,
@@ -1922,7 +1955,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 playhead={currentOutputTime}
                 onPlace={(x, y) => setEditingOverlay((prev) => (prev ? { ...prev, x, y } : prev))}
                 keyframes={editingOverlayData.keyframes}
-                onKeyframes={(keyframes) => onUpdateTextOverlayContent(editingOverlayData.id, { keyframes })}
+                onKeyframes={(keyframes) => onUpdateTextOverlayContent(editingOverlayData.id, { keyframes, ...(keyframes ? {} : { track: undefined }) })}
+                blendMode={editingOverlayData.blendMode}
+                onBlendMode={(blendMode) => onUpdateTextOverlayContent(editingOverlayData.id, { blendMode })}
+                track={editingOverlayData.track}
+                onTrackMotion={onTrackMotion ? () => onTrackMotion("text", editingOverlayData.id) : undefined}
                 onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("text", editingOverlayData.id, edge, time) : undefined}
                 onDuplicate={() => onDuplicateTextOverlay(editingOverlayData.id)}
                 onFront={() => onBringTextOverlayToFront(editingOverlayData.id)}
@@ -2122,7 +2159,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 playhead={currentOutputTime}
                 onPlace={(x, y) => onUpdateImageOverlayContent(o.id, { x, y })}
                 keyframes={o.keyframes}
-                onKeyframes={(keyframes) => onUpdateImageOverlayContent(o.id, { keyframes })}
+                onKeyframes={(keyframes) => onUpdateImageOverlayContent(o.id, { keyframes, ...(keyframes ? {} : { track: undefined }) })}
+                blendMode={o.blendMode}
+                onBlendMode={(blendMode) => onUpdateImageOverlayContent(o.id, { blendMode })}
+                track={o.track}
+                onTrackMotion={onTrackMotion ? () => onTrackMotion("image", o.id) : undefined}
                 onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("image", o.id, edge, time) : undefined}
                 onDuplicate={() => onDuplicateImageOverlay(o.id)}
                 onFront={() => onBringImageOverlayToFront(o.id)}
@@ -2372,6 +2413,10 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 endTime={o.endTime}
                 playhead={currentOutputTime}
                 onPlace={(x, y) => onUpdateBlurOverlayContent(o.id, { x, y })}
+                keyframes={o.keyframes}
+                onKeyframes={(keyframes) => onUpdateBlurOverlayContent(o.id, { keyframes, ...(keyframes ? {} : { track: undefined }) })}
+                track={o.track}
+                onTrackMotion={onTrackMotion ? () => onTrackMotion("blur", o.id) : undefined}
                 onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("blur", o.id, edge, time) : undefined}
                 onDuplicate={() => onDuplicateBlurOverlay(o.id)}
                 onDelete={() => {

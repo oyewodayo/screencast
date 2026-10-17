@@ -13,6 +13,7 @@ mod commands {
     pub mod conversion;
     pub mod embedded_scan;
     pub mod file_info;
+    pub mod motion_tracking;
     pub mod music_library;
     pub mod native_playback;
     pub mod snip;
@@ -29,6 +30,7 @@ mod services {
     pub mod docs;
     pub mod docs_search;
     pub mod file_watcher;
+    pub mod google_share;
     pub mod image_annotations;
     pub mod pdf_annotations;
     // Serves a phone's browser as a camera source over the LAN - see the module's own doc
@@ -349,6 +351,9 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
         .manage(commands::conversion::ConversionState::default())
+        .manage(commands::conversion::ExportJobs::default())
+        .manage(commands::motion_tracking::MotionTrackJobs::default())
+        .manage(services::google_share::GoogleShareState::default())
         .manage(commands::native_playback::NativePlaybackState::default())
         .manage(services::file_watcher::FileWatcherState::default())
         .manage(services::phone_camera::PhoneCameraState::default())
@@ -433,6 +438,17 @@ fn main() {
             commands::conversion::analyze_subject_track,
             commands::conversion::batch_convert_to_mp4,
             commands::conversion::cancel_conversion,
+            commands::conversion::cancel_export_job,
+            commands::motion_tracking::track_motion,
+            commands::motion_tracking::cancel_motion_track,
+            commands::motion_tracking::video_frame_size,
+            services::google_share::google_account_status,
+            services::google_share::google_sign_in,
+            services::google_share::google_cancel_sign_in,
+            services::google_share::google_sign_out,
+            services::google_share::youtube_upload,
+            services::google_share::drive_share_link,
+            services::google_share::cancel_share_upload,
             commands::conversion::get_conversion_info,
             commands::conversion::get_supported_conversion_formats,
             commands::conversion::should_convert_file,

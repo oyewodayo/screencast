@@ -479,6 +479,11 @@ const withAlphaHex = (hex: string, alpha: number): string => {
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
 };
 
+// A blur region's strength as its Gaussian's standard deviation, per unit of intensity, as a
+// fraction of the frame's height - the preview's CSS blur() radius (VideoOverlayLayer) and the
+// export's Gaussian (gaussian_blur_chain, conversion.rs) both use it, so they blur the same.
+export const BLUR_SIGMA_FRACTION = 0.12;
+
 // A plain axis-aligned rectangle (the common case) needs no mask at all - export_trimmed_video's
 // crop+boxblur+overlay chain already produces exactly that shape on its own. Ellipse, rounded
 // corners, and rotation can't be expressed as ffmpeg filter *parameters* the way a plain crop can,

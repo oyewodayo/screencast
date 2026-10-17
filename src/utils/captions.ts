@@ -794,3 +794,20 @@ export function cuesToCaptionWords(cues: SubtitleCue[]): CaptionWord[] {
   }
   return words;
 }
+
+// The caption lines as an .srt file (output-timed) - what a YouTube upload attaches as its
+// subtitle track, so the captions there are the very lines burned into / shown with the video.
+export function buildSrt(lines: CaptionLine[]): string {
+  const stamp = (sec: number) => {
+    const ms = Math.max(0, Math.round(sec * 1000));
+    const h = Math.floor(ms / 3600000);
+    const m = Math.floor((ms % 3600000) / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+    return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms % 1000, 3)}`;
+  };
+  return lines
+    .filter((l) => l.words.length > 0 && l.end > l.start)
+    .map((l, i) => `${i + 1}\n${stamp(l.start)} --> ${stamp(l.end)}\n${l.words.map((w) => w.text).join(" ").trim()}\n`)
+    .join("\n");
+}

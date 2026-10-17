@@ -30,6 +30,7 @@ import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { FrameRect, computeLetterboxRect } from "../../utils/videoFrameRect";
 import { MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
 import PipOverlayPopover, { PipOverlayPatch } from "./PipOverlayPopover";
+import { cssBlendMode } from "../../utils/blendModes";
 import ClipCropOverlay from "./ClipCropOverlay";
 
 const DEFAULT_PIP_WIDTH_FRACTION = 0.28;
@@ -362,6 +363,7 @@ const PipVideoElement: React.FC<{
           pointerEvents: "auto",
           touchAction: "none",
           zIndex: isSelected ? SELECTED_PIP_Z_INDEX : undefined,
+          mixBlendMode: cssBlendMode(overlay.blendMode),
         }}
       >
         <video

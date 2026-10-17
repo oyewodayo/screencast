@@ -8,10 +8,11 @@
 import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { IoClose, IoCropOutline, IoTrashOutline } from "react-icons/io5";
-import { PipOverlay, PipShape } from "../../utils/videoEditTypes";
+import { BlendMode, PipOverlay, PipShape } from "../../utils/videoEditTypes";
+import { BLEND_MODES } from "../../utils/blendModes";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 
-export type PipOverlayPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted">>;
+export type PipOverlayPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted" | "blendMode">>;
 
 const SHAPE_OPTIONS: { value: PipShape; label: string }[] = [
   { value: "circle", label: "Circle" },
@@ -112,6 +113,25 @@ const PipOverlayPopover: React.FC<PipOverlayPopoverProps> = ({ overlay, anchor, 
         </div>
         {overlay.shape === "rounded" && (
           <Slider label="Radius" value={overlay.cornerRadius ?? 0.08} onChange={(cornerRadius) => onUpdate({ cornerRadius })} max={0.3} />
+        )}
+      </div>
+
+      <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
+        <span className="text-[10px] uppercase tracking-wide text-white/40">Blend</span>
+        <select
+          value={overlay.blendMode ?? "normal"}
+          onChange={(e) => onUpdate({ blendMode: e.target.value === "normal" ? undefined : (e.target.value as BlendMode) })}
+          title={BLEND_MODES.find((m) => m.value === (overlay.blendMode ?? "normal"))?.hint}
+          className="w-full bg-white/10 rounded px-2 py-1 text-[11px] text-white outline-none"
+        >
+          {BLEND_MODES.map((m) => (
+            <option key={m.value} value={m.value} className="bg-neutral-900">
+              {m.label}
+            </option>
+          ))}
+        </select>
+        {(overlay.blendMode === "screen" || overlay.blendMode === "plus-lighter") && (
+          <span className="text-[10px] leading-snug text-white/45">Black disappears - drop light leaks, flares or dust footage over the video.</span>
         )}
       </div>
 

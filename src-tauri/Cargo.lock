@@ -17,6 +17,7 @@ dependencies = [
  "libc",
  "local-ip-address",
  "log",
+ "motion-track",
  "notify-debouncer-mini",
  "qrcode",
  "rcgen",
@@ -2965,6 +2966,10 @@ dependencies = [
  "wasi",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "motion-track"
+version = "0.1.0"
 
 [[package]]
 name = "moxcms"

@@ -121,6 +121,8 @@ interface Props {
   // props above.
   selectedBlurOverlayId?: string | null;
   onSelectBlurOverlay?: (id: string | null) => void;
+  selectedAdjustmentId?: string | null;
+  onSelectAdjustment?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
   // Video-only: PiP-overlay selection/placement state, same threading as the overlay props above.
@@ -265,6 +267,8 @@ const BottomDocker = ({
   onToggleArmPlaceImage,
   selectedBlurOverlayId,
   onSelectBlurOverlay,
+  selectedAdjustmentId,
+  onSelectAdjustment,
   isPlacingBlur,
   onToggleArmPlaceBlur,
   selectedPipOverlayId,
@@ -710,6 +714,8 @@ const BottomDocker = ({
             onToggleArmPlaceImage={onToggleArmPlaceImage}
             selectedBlurOverlayId={selectedBlurOverlayId}
             onSelectBlurOverlay={onSelectBlurOverlay}
+            selectedAdjustmentId={selectedAdjustmentId}
+            onSelectAdjustment={onSelectAdjustment}
             isPlacingBlur={isPlacingBlur}
             onToggleArmPlaceBlur={onToggleArmPlaceBlur}
             selectedPipOverlayId={selectedPipOverlayId}

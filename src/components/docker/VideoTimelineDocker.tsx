@@ -48,7 +48,7 @@ import {
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, MIN_AUDIO_START_ROOM_SEC, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AudioOverlay, BlurOverlay, Clip, IMAGE_CLIP_EXTENSIONS, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
+import { AdjustmentLayer, AudioOverlay, BlurOverlay, Clip, IMAGE_CLIP_EXTENSIONS, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS, MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
 import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
@@ -80,6 +80,10 @@ import ViewSwitchPopover, { ViewSwitchDetectState } from "./ViewSwitchPopover";
 import ToolModePopover, { TimelineToolMode } from "./ToolModePopover";
 import { useToolPanelHost } from "./ToolPanelHost";
 import CaptionsPanel from "./CaptionsPanel";
+import ChaptersPanel from "./ChaptersPanel";
+import { enqueue as enqueueExport } from "../../utils/exportQueue";
+import { outputChapters } from "../../utils/videoChapters";
+import { IoBookmarkOutline, IoColorFilterOutline } from "react-icons/io5";
 import { buildCaptionLines } from "../../utils/captions";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import ToolSearch from "./ToolSearch";
@@ -538,6 +542,9 @@ interface VideoTimelineDockerProps {
   // Blur-region selection/placement, same threading/reasoning as the text/image-overlay props above.
   selectedBlurOverlayId?: string | null;
   onSelectBlurOverlay?: (id: string | null) => void;
+  // Adjustment layers (AdjustmentLayersLayer.tsx draws them and their settings).
+  selectedAdjustmentId?: string | null;
+  onSelectAdjustment?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
 
@@ -600,6 +607,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onToggleArmPlaceImage,
   selectedBlurOverlayId = null,
   onSelectBlurOverlay,
+  selectedAdjustmentId = null,
+  onSelectAdjustment,
   isPlacingBlur = false,
   onToggleArmPlaceBlur,
   selectedPipOverlayId = null,
@@ -975,6 +984,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // Captions tool (CaptionsPanel) - whole-timeline, so unlike Effects/Speed it needs no selected
   // clip and isn't closed by selection changes.
   const [captionsAnchor, setCaptionsAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Chapters (ChaptersPanel) - whole-timeline like Captions.
+  const [chaptersAnchor, setChaptersAnchor] = useState<{ left: number; top: number } | null>(null);
   // Elements gallery (shapes and animated elements - videoAssets.ts).
   const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
   // Split screen builder (SplitScreenPanel).
@@ -1388,6 +1399,67 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
       seekToOutputTime(liveStartTime);
     }
+  };
+
+  // ---- Adjustment-layer lane: move / retime, the blur lane's shape. ----------------------------
+  const [adjustResizeDrag, setAdjustResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; startValue: number; oppositeBound: number; liveValue: number }>(null);
+  const [adjustDrag, setAdjustDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
+  const renderAdjustmentLayers: AdjustmentLayer[] = editStore.adjustmentLayers.map((l) => {
+    if (adjustResizeDrag && l.id === adjustResizeDrag.id) return adjustResizeDrag.edge === "start" ? { ...l, startTime: adjustResizeDrag.liveValue } : { ...l, endTime: adjustResizeDrag.liveValue };
+    if (adjustDrag && l.id === adjustDrag.id) return { ...l, startTime: adjustDrag.liveStartTime, endTime: adjustDrag.liveStartTime + adjustDrag.duration };
+    return l;
+  });
+  const beginAdjustResizeDrag = (layer: AdjustmentLayer, edge: "start" | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    onSelectAdjustment?.(layer.id);
+    const startValue = edge === "start" ? layer.startTime : layer.endTime;
+    setAdjustResizeDrag({ id: layer.id, edge, startClientX: e.clientX, startValue, oppositeBound: edge === "start" ? layer.endTime : layer.startTime, liveValue: startValue });
+  };
+  const handleAdjustResizeDragMove = (e: React.PointerEvent) => {
+    if (!adjustResizeDrag) return;
+    e.stopPropagation();
+    const raw = snapToTargets(adjustResizeDrag.startValue + (e.clientX - adjustResizeDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
+    const liveValue =
+      adjustResizeDrag.edge === "start"
+        ? Math.max(0, Math.min(raw, adjustResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
+        : Math.min(totalOutputDuration, Math.max(raw, adjustResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
+    setAdjustResizeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
+  };
+  const endAdjustResizeDrag = () => {
+    if (!adjustResizeDrag) return;
+    const { id, edge, liveValue } = adjustResizeDrag;
+    setAdjustResizeDrag(null);
+    editStore.resizeAdjustmentLayerTime(id, edge, liveValue);
+  };
+  const beginAdjustDrag = (layer: AdjustmentLayer) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setAdjustDrag({ id: layer.id, startClientX: e.clientX, startTime: layer.startTime, duration: layer.endTime - layer.startTime, isDragging: false, liveStartTime: layer.startTime });
+  };
+  const handleAdjustDragMove = (e: React.PointerEvent) => {
+    if (!adjustDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - adjustDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    const raw = snapToTargets(adjustDrag.startTime + (e.clientX - adjustDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
+    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - adjustDrag.duration));
+    setAdjustDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endAdjustDrag = () => {
+    if (!adjustDrag) return;
+    const { id, isDragging, liveStartTime, duration } = adjustDrag;
+    setAdjustDrag(null);
+    if (isDragging) editStore.moveAdjustmentLayerTime(id, liveStartTime);
+    onSelectAdjustment?.(id);
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime);
+  };
+  const addAdjustmentLayer = () => {
+    const total = totalOutputDuration;
+    if (total <= 0) return;
+    const length = Math.min(5, total);
+    const startTime = Math.max(0, Math.min(currentOutputTime, total - length));
+    const id = editStore.addAdjustmentLayer(startTime, startTime + length, { look: { preset: "cinematic", intensity: 0.7 } });
+    onSelectAdjustment?.(id);
   };
 
   // ---- PiP-overlay lane drag (move) / resize (trim into source) - move is shaped like the blur
@@ -1967,6 +2039,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onSelectImageOverlay?.(editStore.duplicateImageOverlay(selectedImageOverlayId));
         } else if (selectedBlurOverlayId) {
           onSelectBlurOverlay?.(editStore.duplicateBlurOverlay(selectedBlurOverlayId));
+        } else if (selectedAdjustmentId) {
+          onSelectAdjustment?.(editStore.duplicateAdjustmentLayer(selectedAdjustmentId));
         } else if (selectedAudioOverlayId) {
           setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(selectedAudioOverlayId));
           setAudioPopoverAnchor(null);
@@ -2010,6 +2084,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         e.preventDefault();
         editStore.deleteBlurOverlay(selectedBlurOverlayId);
         onSelectBlurOverlay?.(null);
+      } else if (selectedAdjustmentId) {
+        e.preventDefault();
+        editStore.deleteAdjustmentLayer(selectedAdjustmentId);
+        onSelectAdjustment?.(null);
       } else if (selectedAudioOverlayId) {
         e.preventDefault();
         editStore.deleteAudioOverlay(selectedAudioOverlayId);
@@ -2023,7 +2101,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAudioOverlayId, selectedPipOverlayId, selectedClipId, selectedClipIds.join(), editStore]);
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAdjustmentId, selectedAudioOverlayId, selectedPipOverlayId, selectedClipId, selectedClipIds.join(), editStore]);
 
   // Pressing Play after the sequence has already played through to the end needs to restart from
   // clip 0 - native <video> never auto-rewinds on .play() once it's reached "ended", it just sits
@@ -2082,6 +2160,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [exportOptionsOpen, exportFormat, exportFraming, exportFollowSubject, exportAnchor, videoPixelSize, editStore.clips]);
   useEffect(() => () => onReframePreviewChange?.(null), [onReframePreviewChange]);
 
+  // Rendering overlays to pictures for the export takes a moment before the job is queued.
+  const [preparingExport, setPreparingExport] = useState(false);
   const handleSave = async () => {
     let track: [number, number, number][] | undefined;
     if (following) {
@@ -2092,13 +2172,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         return;
       }
     }
-    const result = await editStore.exportEdited(videoPixelSize, {
-      quality: exportQuality,
-      outputPath: customOutputPath ?? undefined,
-      outputFrame: exportSize ? { ...exportSize, mode: exportFraming, anchorX: exportAnchor.x, anchorY: exportAnchor.y, track } : null,
-      loudnessLufs: exportLoudness,
-    });
-    if (result) onExported(result.path, result.name);
+    // Rendered by the background queue (exportQueue.ts) - editing carries straight on, and the
+    // exports chip shows the frame being rendered, the progress and what's left.
+    setPreparingExport(true);
+    try {
+      const payload = await editStore.prepareExport(videoPixelSize, {
+        quality: exportQuality,
+        outputPath: customOutputPath ?? undefined,
+        outputFrame: exportSize ? { ...exportSize, mode: exportFraming, anchorX: exportAnchor.x, anchorY: exportAnchor.y, track } : null,
+        loudnessLufs: exportLoudness,
+      });
+      if (!payload) return;
+      const format = EXPORT_FORMATS.find((f) => f.value === exportFormat);
+      const detail = [format && format.size ? format.label : null, exportQuality === "high" ? "High quality" : exportQuality === "small" ? "Small file" : "Standard", formatTimestamp(totalOutputDuration)].filter(Boolean).join(" · ");
+      enqueueExport(payload, file.name.replace(/\.[^.]+$/, ""), detail);
+    } finally {
+      setPreparingExport(false);
+    }
   };
 
   // Defaults the save dialog to exactly the same "<name> (edited).<ext>" filename
@@ -2667,7 +2757,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // of duplicates.
   // Music beats too (beat sync), so text, images and cuts can be dropped right on the beat.
   const beatTimes = useMemo(() => beatOutputTimes(editStore.audioOverlays), [editStore.audioOverlays]);
-  const overlaySnapTargets = [currentOutputTime, ...outputStarts, ...outputStarts.map((s, i) => s + clipDurations[i]), ...beatTimes];
+  const chapterMarks = useMemo(() => outputChapters(editStore.clips, editStore.chapters), [editStore.clips, editStore.chapters]);
+  const overlaySnapTargets = [currentOutputTime, ...outputStarts, ...outputStarts.map((s, i) => s + clipDurations[i]), ...beatTimes, ...chapterMarks.map((c) => c.time)];
 
   useEffect(() => {
     onOutputTimeChange?.(currentOutputTime);
@@ -3244,6 +3335,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <MdBlurOn size={15} className={isPlacingBlur ? "text-sky-400" : undefined} />
           </ActionButton>
+          <ActionButton title="Add adjustment layer - grade or blur everything beneath it for a stretch of the video" onClick={addAdjustmentLayer}>
+            <IoColorFilterOutline size={15} className={selectedAdjustmentId ? "text-violet-300" : undefined} />
+          </ActionButton>
+          <button
+            type="button"
+            title="Chapters - for the exported file and YouTube"
+            onClick={(e) => {
+              if (chaptersAnchor) {
+                setChaptersAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setChaptersAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${chaptersAnchor ? "bg-neutral-700 text-violet-300" : "text-neutral-300 hover:bg-neutral-700"}`}
+          >
+            <IoBookmarkOutline size={15} />
+          </button>
           <ActionButton
             title={isPlacingPip ? "Choosing a video file…" : "Add picture-in-picture video (e.g. a separately-recorded webcam)"}
             onClick={() => onToggleArmPlacePip?.()}
@@ -3280,21 +3389,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               // An unedited recording would only export a copy of itself, so Save waits for an edit -
               // but a project has never been rendered at all, so it can always be saved (once it
               // has a clip).
-              disabled={(isProject ? editStore.clips.length === 0 : !editStore.canUndo) || editStore.isExporting}
+              disabled={(isProject ? editStore.clips.length === 0 : !editStore.canUndo) || preparingExport}
               className="flex items-center gap-1.5 h-7 pl-2.5 pr-2 rounded-l text-xs font-medium bg-blue-600 text-white hover:bg-blue-500 disabled:bg-neutral-700 disabled:text-neutral-400 disabled:cursor-default"
             >
               <IoSaveOutline size={14} />
-              {editStore.isExporting
-                ? editStore.exportProgress != null
-                  ? `Saving… ${Math.round(editStore.exportProgress)}%`
-                  : "Saving…"
-                : "Save"}
+              {preparingExport ? "Preparing…" : "Save"}
             </button>
             <button
               ref={exportOptionsButtonRef}
               type="button"
               title="Export options (quality, destination)"
-              disabled={!editStore.canUndo || editStore.isExporting}
+              disabled={!editStore.canUndo || preparingExport}
               onClick={() => {
                 if (exportOptionsAnchor) {
                   setExportOptionsAnchor(null);
@@ -3562,6 +3667,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               {/* Beat markers (beat sync) - small amber ticks along the bottom of the ruler. */}
               {beatTimes.map((t, i) => (
                 <div key={`beat-${i}`} className="absolute bottom-0 w-px h-2 bg-amber-400/80 pointer-events-none" style={{ left: t * pxPerSec }} />
+              ))}
+              {/* Chapter markers - violet flags; the label shows on hover. */}
+              {chapterMarks.map((c) => (
+                <div key={c.id} title={c.label} className="absolute top-0 h-full pointer-events-auto" style={{ left: c.time * pxPerSec }}>
+                  <div className="absolute top-0 bottom-0 w-px bg-violet-400/90" />
+                  <div className="absolute top-0 left-0 w-2.5 h-2 bg-violet-400/90" style={{ clipPath: "polygon(0 0, 100% 0, 70% 50%, 100% 100%, 0 100%)" }} />
+                </div>
               ))}
             </div>
 
@@ -3976,6 +4088,56 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               })}
             </div>
 
+            {/* Adjustment-layer lane - violet; the chip names what the layer does. */}
+            <div className={`h-8 relative border-t border-neutral-800 ${renderAdjustmentLayers.length === 0 ? "hidden" : ""}`}>
+              {renderAdjustmentLayers.map((layer) => {
+                const left = layer.startTime * pxPerSec;
+                const width = Math.max(1, (layer.endTime - layer.startTime) * pxPerSec);
+                const isSelected = selectedAdjustmentId === layer.id;
+                const what = [
+                  layer.look && layer.look.preset !== "none" ? layer.look.preset : null,
+                  (layer.blur ?? 0) > 0 ? "blur" : null,
+                  layer.region ? (layer.region.invert ? "outside" : "area") : null,
+                ].filter(Boolean).join(" · ");
+                return (
+                  <React.Fragment key={layer.id}>
+                    <div
+                      onPointerDown={beginAdjustDrag(layer)}
+                      onPointerMove={handleAdjustDragMove}
+                      onPointerUp={endAdjustDrag}
+                      onPointerCancel={endAdjustDrag}
+                      title={`Adjustment layer${layer.placement === "over" ? " over everything" : " on the video"}${what ? ` - ${what}` : ""}`}
+                      className={`absolute inset-y-1 rounded overflow-hidden border-2 flex items-center gap-1 px-2 text-[11px] text-white truncate cursor-grab active:cursor-grabbing ${
+                        isSelected ? "border-dashed border-white bg-violet-900/60" : "border-violet-400 bg-violet-950/60"
+                      }`}
+                      style={{ left, width }}
+                    >
+                      <IoColorFilterOutline size={12} className="shrink-0" />
+                      {layer.name ?? (what || "Adjustment")}
+                    </div>
+                    <div
+                      onPointerDown={beginAdjustResizeDrag(layer, "start")}
+                      onPointerMove={handleAdjustResizeDragMove}
+                      onPointerUp={endAdjustResizeDrag}
+                      onPointerCancel={endAdjustResizeDrag}
+                      title="Drag to retime this adjustment layer's start"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-violet-400 hover:bg-violet-300 rounded cursor-ew-resize z-10"
+                      style={{ left }}
+                    />
+                    <div
+                      onPointerDown={beginAdjustResizeDrag(layer, "end")}
+                      onPointerMove={handleAdjustResizeDragMove}
+                      onPointerUp={endAdjustResizeDrag}
+                      onPointerCancel={endAdjustResizeDrag}
+                      title="Drag to retime this adjustment layer's end"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-violet-400 hover:bg-violet-300 rounded cursor-ew-resize z-10"
+                      style={{ left: left + width }}
+                    />
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
             {/* PiP-overlay lane - same time-based chip/drag pattern as the blur lane above (fuchsia
                 instead of sky-blue), with edge handles that trim into the source (resizePipOverlayTime)
                 instead of just retiming an empty box, matching the audio lane's own resize style.
@@ -4343,6 +4505,21 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             onSelectImageOverlay?.(id);
             setElementsAnchor(null);
           }}
+        />
+      )}
+
+      {chaptersAnchor && (
+        <ChaptersPanel
+          anchor={chaptersAnchor}
+          clips={editStore.clips}
+          chapters={editStore.chapters}
+          captions={editStore.captions}
+          currentOutputTime={currentOutputTime}
+          durationSec={totalOutputDuration}
+          primarySourcePath={file.path}
+          onChange={editStore.setChapters}
+          onSeek={seekToOutputTime}
+          onClose={() => setChaptersAnchor(null)}
         />
       )}
 

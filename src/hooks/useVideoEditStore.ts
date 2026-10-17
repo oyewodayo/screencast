@@ -1,11 +1,15 @@
 // hooks/useVideoEditStore.ts
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CaptionLine, buildCaptionLines, buildCaptionsAss, defaultCaptionSettings, replaceCaptionLineText } from "../utils/captions";
+import { CaptionLine, buildCaptionLines, buildCaptionsAss, buildSrt, defaultCaptionSettings, replaceCaptionLineText } from "../utils/captions";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS } from "../utils/videoEditTypes";
+import { AdjustmentLayer, AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter } from "../utils/videoEditTypes";
+import { adjustmentLayerExport, makeAdjustmentLayer } from "../utils/adjustmentLayers";
+import { exportBlendMode } from "../utils/blendModes";
+import { chaptersForExport } from "../utils/videoChapters";
+import { confirmCloseWithActiveExports, hasActiveJobs, setEditorCloseGuard, type ExportJobPayload } from "../utils/exportQueue";
 import {
   applyCommand,
   addOverlay,
@@ -80,7 +84,7 @@ interface ExportKeyframe {
   easing: string;
 }
 import { beatOutputTimes, fitImageClipsToBeats } from "../utils/beatSync";
-import { blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
+import { BLUR_SIGMA_FRACTION, blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
 import { isTextReveal } from "../utils/textReveal";
 const appWindow = getCurrentWebviewWindow()
 
@@ -122,6 +126,9 @@ async function fetchDuration(path: string): Promise<number | null> {
   }
 }
 
+// Same-kind edits closer together than this merge into one undo step (pushCommand).
+const EDIT_MERGE_MS = 700;
+
 // Mirrors export_trimmed_video's own `quality`/`output_path` params (conversion.rs) - both
 // optional so a caller that passes nothing gets the exact same default behavior as before this
 // existed (resolve_export_quality's own "standard" fallback, and the default "<name> (edited).ext"
@@ -149,17 +156,18 @@ function exportOverlayAnimation(animation: OverlayAnimation | undefined): string
 }
 
 type TextOverlayContentPatch = Partial<
-  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal">
+  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal" | "blendMode" | "track">
 >;
 type ImageOverlayContentPatch = Partial<
-  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset" | "reveal">
+  Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset" | "reveal" | "blendMode" | "track">
 >;
-type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>;
+type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation" | "keyframes" | "track">>;
+export type AdjustmentLayerPatch = Partial<Omit<AdjustmentLayer, "id" | "createdAt" | "updatedAt">>;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src" | "bpm" | "beats" | "duckUnderSpeech" | "duckLevel">>;
 // What a caller can set up front on a new audio overlay beyond its timing (a library song arrives
 // with its part, title, licence, beats and ducking already decided).
 export type NewAudioOverlayExtras = Partial<Pick<AudioOverlay, "trimStart" | "label" | "library" | "bpm" | "beats" | "fadeInSec" | "fadeOutSec" | "volume" | "duckUnderSpeech" | "duckLevel">>;
-type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted">>;
+type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted" | "blendMode">>;
 type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted">>;
 
 export interface UseVideoEditStoreResult {
@@ -216,6 +224,20 @@ export interface UseVideoEditStoreResult {
   moveBlurOverlayTime: (id: string, newStartTime: number) => void;
   deleteBlurOverlay: (id: string) => void;
   duplicateBlurOverlay: (id: string) => string;
+  // Adjustment layers (adjustmentLayers.ts) - timed like overlays, stacked in array order.
+  adjustmentLayers: AdjustmentLayer[];
+  addAdjustmentLayer: (startTime: number, endTime: number, patch?: AdjustmentLayerPatch) => string;
+  updateAdjustmentLayer: (id: string, patch: AdjustmentLayerPatch) => void;
+  resizeAdjustmentLayerTime: (id: string, edge: "start" | "end", time: number) => void;
+  moveAdjustmentLayerTime: (id: string, newStartTime: number) => void;
+  deleteAdjustmentLayer: (id: string) => void;
+  duplicateAdjustmentLayer: (id: string) => string;
+  // Chapters (videoChapters.ts), anchored to source moments; replaced as a whole list.
+  chapters: VideoChapter[];
+  setChapters: (chapters: VideoChapter[]) => void;
+  // Everything one export needs, snapshotted now - what the background queue renders while
+  // editing carries on (exportQueue.ts). Null when there's nothing to export.
+  prepareExport: (timelinePixelSize: { width: number; height: number } | null, options?: ExportOptions) => Promise<ExportJobPayload | null>;
   // Background music/voiceover overlays - unlike text/image, these have no position on the frame
   // (VideoOverlayLayer isn't involved at all) and their whole UI lives in VideoTimelineDocker's own
   // timeline lane. `addAudioOverlay` takes the source file's own duration (already known by the
@@ -463,6 +485,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 blurOverlays: parsed.blurOverlays ?? [],
                 audioOverlays: parsed.audioOverlays ?? [],
                 pipOverlays: parsed.pipOverlays ?? [],
+                adjustmentLayers: parsed.adjustmentLayers ?? [],
+                chapters: parsed.chapters ?? [],
                 videoAudioMuted: parsed.videoAudioMuted ?? false,
                 videoAudioVolume: parsed.videoAudioVolume ?? 1,
                 captions: parsed.captions ?? null,
@@ -568,7 +592,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         return;
       }
       pendingClose = (async () => {
-        if (isExportingRef.current) {
+        if (hasActiveJobs()) {
+          // Background exports (exportQueue.ts) - cancelled if the user goes ahead.
+          if (!(await confirmCloseWithActiveExports())) return;
+        } else if (isExportingRef.current) {
           const shouldCancelAndClose = await ask(
             "A video export is still in progress. Closing now will cancel it, and the exported file will be incomplete.",
             { title: "Export in progress", kind: "warning" }
@@ -584,7 +611,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       pendingClose = null; // lets a later close attempt (the user declined this one) re-prompt cleanly
     });
 
+    setEditorCloseGuard(true);
     return () => {
+      setEditorCloseGuard(false);
       unlistenPromise.then((unlisten) => unlisten());
     };
   }, [sourcePath, flushSave]);
@@ -600,6 +629,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [sourcePath, registerSourceDuration]
   );
 
+  const lastCommandRef = useRef<{ label: VideoEditCommand["label"]; at: number } | null>(null);
   const pushCommand = useCallback(
     (before: EditableFields, after: EditableFields, label: VideoEditCommand["label"]) => {
       // A recording never ends up with nothing to preview/export; a project may be emptied (it's
@@ -612,7 +642,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       // the same stale timeline and overwrite one another, leaving only the last one standing.
       if (stateRef.current) stateRef.current = { ...stateRef.current, ...applyCommand(command) };
       setState((prev) => (prev ? { ...prev, ...applyCommand(command), updatedAt: new Date().toISOString() } : prev));
-      setUndoStack((prev) => [...prev, command]);
+      // A run of the same kind of edit in quick succession - a slider being dragged, a value being
+      // nudged - is one undo step: it keeps the first edit's "before" and the latest "after".
+      const now = Date.now();
+      const merge = label.startsWith("edit-") && lastCommandRef.current?.label === label && now - lastCommandRef.current.at < EDIT_MERGE_MS;
+      lastCommandRef.current = { label, at: now };
+      setUndoStack((prev) => (merge && prev.length > 0 && prev[prev.length - 1].label === label ? [...prev.slice(0, -1), { ...prev[prev.length - 1], after }] : [...prev, command]));
       setRedoStack([]);
       scheduleAutosave();
     },
@@ -630,6 +665,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     blurOverlays: current.blurOverlays,
     audioOverlays: current.audioOverlays,
     pipOverlays: current.pipOverlays,
+    adjustmentLayers: current.adjustmentLayers ?? [],
+    chapters: current.chapters ?? [],
     videoAudioMuted: current.videoAudioMuted,
     videoAudioVolume: current.videoAudioVolume,
     captions: current.captions ?? null,
@@ -1083,6 +1120,78 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const addAdjustmentLayer = useCallback(
+    (startTime: number, endTime: number, patch?: AdjustmentLayerPatch): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const layer = makeAdjustmentLayer(startTime, endTime, patch);
+      pushCommand(snapshot(current, {}), snapshot(current, { adjustmentLayers: [...(current.adjustmentLayers ?? []), layer] }), "add-adjustment");
+      return layer.id;
+    },
+    [pushCommand]
+  );
+
+  const updateAdjustmentLayer = useCallback(
+    (id: string, patch: AdjustmentLayerPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const adjustmentLayers = updateOverlay<AdjustmentLayer>(current.adjustmentLayers ?? [], id, patch);
+      pushCommand(snapshot(current, {}), snapshot(current, { adjustmentLayers }), "edit-adjustment");
+    },
+    [pushCommand]
+  );
+
+  const resizeAdjustmentLayerTime = useCallback(
+    (id: string, edge: "start" | "end", time: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const adjustmentLayers = resizeOverlayTime(current.adjustmentLayers ?? [], id, edge, totalOutputDuration(current.clips), time);
+      pushCommand(snapshot(current, {}), snapshot(current, { adjustmentLayers }), "edit-adjustment");
+    },
+    [pushCommand]
+  );
+
+  const moveAdjustmentLayerTime = useCallback(
+    (id: string, newStartTime: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const adjustmentLayers = moveOverlayTime(current.adjustmentLayers ?? [], id, newStartTime, totalOutputDuration(current.clips));
+      pushCommand(snapshot(current, {}), snapshot(current, { adjustmentLayers }), "edit-adjustment");
+    },
+    [pushCommand]
+  );
+
+  const deleteAdjustmentLayer = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { adjustmentLayers: deleteOverlay(current.adjustmentLayers ?? [], id) }), "delete-adjustment");
+    },
+    [pushCommand]
+  );
+
+  const duplicateAdjustmentLayer = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      const original = current?.adjustmentLayers?.find((l) => l.id === id);
+      if (!current || !original) return "";
+      const now = Date.now();
+      const copy: AdjustmentLayer = { ...original, id: crypto.randomUUID(), createdAt: now, updatedAt: now };
+      pushCommand(snapshot(current, {}), snapshot(current, { adjustmentLayers: [...current.adjustmentLayers, copy] }), "add-adjustment");
+      return copy.id;
+    },
+    [pushCommand]
+  );
+
+  const setChapters = useCallback(
+    (chapters: VideoChapter[]) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { chapters }), "edit-chapters");
+    },
+    [pushCommand]
+  );
+
   const addAudioOverlay = useCallback(
     (src: string, sourceDuration: number, startTime: number, endTime: number, extras?: NewAudioOverlayExtras): string => {
       const current = stateRef.current;
@@ -1240,6 +1349,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           imageOverlays: current.imageOverlays.map(later),
           blurOverlays: current.blurOverlays.map(later),
           pipOverlays: current.pipOverlays.map(later),
+          adjustmentLayers: (current.adjustmentLayers ?? []).map(later),
           audioOverlays: keepMusicInPlace ? current.audioOverlays : current.audioOverlays.map(later),
         }),
         "insert"
@@ -1470,6 +1580,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   );
 
   const undo = useCallback(() => {
+    lastCommandRef.current = null;
     setUndoStack((prevUndo) => {
       if (prevUndo.length === 0) return prevUndo;
       const command = prevUndo[prevUndo.length - 1];
@@ -1481,6 +1592,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   }, [scheduleAutosave]);
 
   const redo = useCallback(() => {
+    lastCommandRef.current = null;
     setRedoStack((prevRedo) => {
       if (prevRedo.length === 0) return prevRedo;
       const command = prevRedo[prevRedo.length - 1];
@@ -1518,188 +1630,218 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // videoEditTypes.ts) and rendering an overlay to a real PNG needs real pixel dimensions.
   // Overlays whose own render comes back null (empty text, zero-size box, an image that failed to
   // decode) are just skipped rather than failing the whole export.
-  const exportEdited = useCallback(
-    async (
-      timelinePixelSize: { width: number; height: number } | null,
-      options?: ExportOptions
-    ): Promise<{ path: string; name: string } | null> => {
+  // Builds everything one export of the timeline needs - overlays rendered to pictures, blur and
+  // picture-in-picture boxes in output pixels, adjustment layers with their masks, captions,
+  // chapters - from the timeline as it is right now. The background export queue (exportQueue.ts)
+  // renders it later while editing carries on, so nothing here may read the timeline again.
+  // `timelinePixelSize` is the primary file's native resolution: TextOverlay/ImageOverlay keep
+  // position/size as frame fractions, and rendering an overlay to a real PNG needs real pixels.
+  // Overlays whose render comes back null (empty text, zero-size box, an image that failed to
+  // decode) are skipped rather than failing the export.
+  const prepareExport = useCallback(
+    async (timelinePixelSize: { width: number; height: number } | null, options?: ExportOptions): Promise<ExportJobPayload | null> => {
       const current = stateRef.current;
       if (!sourcePath || !current || current.clips.length === 0) return null;
-      setIsExporting(true);
-      setExportError(null);
       // Overlays, blur regions, picture-in-picture and captions are laid out on the FINAL frame -
       // the platform format's when one is chosen (export fits the video into it first).
       const videoPixelSize = options?.outputFrame ? { width: options.outputFrame.width, height: options.outputFrame.height } : timelinePixelSize;
-      try {
-        const overlays: {
-          dataBase64: string;
-          x: number;
-          y: number;
-          startTime: number;
-          endTime: number;
-          animation: string;
-          keyframes?: ExportKeyframe[];
-          frames?: { unique: string[]; sequence: number[] };
-        }[] = [];
-        if (videoPixelSize) {
-          const { width: pxW, height: pxH } = videoPixelSize;
-          // Keyframes in the export's terms: absolute output seconds, and the rendered PNG's own
-          // top-left in pixels (offset from the overlay's x/y by however the renderer padded it).
-          const exportKeyframes = (o: { x: number; y: number; startTime: number; keyframes?: OverlayKeyframe[] }, xPx: number, yPx: number) =>
-            o.keyframes && o.keyframes.length > 0
-              ? o.keyframes.map((k) => ({
-                  time: o.startTime + k.time,
-                  x: xPx + (k.x - o.x) * pxW,
-                  y: yPx + (k.y - o.y) * pxH,
-                  scale: k.scale,
-                  opacity: k.opacity,
-                  easing: k.easing,
-                }))
-              : undefined;
-          for (const o of current.textOverlays) {
-            if (isTextReveal(o.animation)) {
-              // Letter-by-letter titles burn in as a frame sequence (textReveal.ts).
-              // eslint-disable-next-line no-await-in-loop
-              const seq = await renderTextRevealFrames(o, pxW, pxH);
-              if (seq)
-                overlays.push({
-                  dataBase64: "",
-                  x: seq.xPx,
-                  y: seq.yPx,
-                  startTime: o.startTime,
-                  endTime: o.endTime,
-                  animation: "none",
-                  keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                  frames: { unique: seq.unique, sequence: seq.sequence },
-                });
-              continue;
-            }
-            const rendered = renderTextOverlayToPng(o, pxW, pxH);
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx) });
-          }
-          for (const o of current.imageOverlays) {
-            if (o.asset) {
-              // A shape/animated element burns in as a frame sequence of its own animation -
-              // drawn by the same function as the preview (videoAssets.ts).
-              // eslint-disable-next-line no-await-in-loop
-              const seq = await renderAssetFrames(o, pxW, pxH);
-              if (seq)
-                overlays.push({
-                  dataBase64: "",
-                  x: seq.xPx,
-                  y: seq.yPx,
-                  startTime: o.startTime,
-                  endTime: o.endTime,
-                  animation: exportOverlayAnimation(o.animation),
-                  keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                  frames: { unique: seq.unique, sequence: seq.sequence },
-                });
-              continue;
-            }
-            if (o.reveal) {
-              // A revealing picture burns in as a frame sequence of its reveal (imageReveal.ts).
-              // eslint-disable-next-line no-await-in-loop
-              const seq = await renderImageRevealFrames(o, pxW, pxH);
-              if (seq)
-                overlays.push({
-                  dataBase64: "",
-                  x: seq.xPx,
-                  y: seq.yPx,
-                  startTime: o.startTime,
-                  endTime: o.endTime,
-                  animation: exportOverlayAnimation(o.animation),
-                  keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                  frames: { unique: seq.unique, sequence: seq.sequence },
-                });
-              continue;
-            }
+      const overlays: {
+        dataBase64: string;
+        x: number;
+        y: number;
+        startTime: number;
+        endTime: number;
+        animation: string;
+        keyframes?: ExportKeyframe[];
+        frames?: { unique: string[]; sequence: number[] };
+        blendMode?: string;
+      }[] = [];
+      if (videoPixelSize) {
+        const { width: pxW, height: pxH } = videoPixelSize;
+        // Keyframes in the export's terms: absolute output seconds, and the rendered PNG's own
+        // top-left in pixels (offset from the overlay's x/y by however the renderer padded it).
+        const exportKeyframes = (o: { x: number; y: number; startTime: number; keyframes?: OverlayKeyframe[] }, xPx: number, yPx: number) =>
+          o.keyframes && o.keyframes.length > 0
+            ? o.keyframes.map((k) => ({
+                time: o.startTime + k.time,
+                x: xPx + (k.x - o.x) * pxW,
+                y: yPx + (k.y - o.y) * pxH,
+                scale: k.scale,
+                opacity: k.opacity,
+                easing: k.easing,
+              }))
+            : undefined;
+        // Pictures and elements first, then text: the preview stacks text above them
+        // (VideoOverlayLayer draws its text boxes last), so the export does too.
+        for (const o of current.imageOverlays) {
+          const blendMode = exportBlendMode(o.blendMode);
+          if (o.asset) {
+            // A shape/animated element burns in as a frame sequence of its own animation -
+            // drawn by the same function as the preview (videoAssets.ts).
             // eslint-disable-next-line no-await-in-loop
-            const rendered = await renderImageOverlayToPng(o, pxW, pxH);
-            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx) });
-          }
-        }
-
-        // A plain rectangle has no fixed content to pre-render (it depends on whatever the
-        // underlying frame looks like at each instant), so it just resolves position/size to real
-        // output pixels and lets Rust build the crop+boxblur+overlay filter chain directly off the
-        // video's own decoded frames (see export_trimmed_video). Anything else - ellipse, rounded
-        // corners, or rotated - can't be expressed as filter parameters the way a plain crop can,
-        // so it DOES get a client-side render step: a black/white mask PNG (renderBlurMaskToPng),
-        // sent alongside the overlay so Rust can apply it via `alphamerge` instead of a bare crop
-        // (see blurNeedsMask's own doc comment for why this is one branch, not three).
-        const blurOverlays = videoPixelSize
-          ? current.blurOverlays.map((o) => {
-              const base = {
-                x: Math.round(o.x * videoPixelSize.width),
-                y: Math.round(o.y * videoPixelSize.height),
-                width: Math.round(o.width * videoPixelSize.width),
-                height: Math.round(o.height * videoPixelSize.height),
-                intensity: o.intensity,
+            const seq = await renderAssetFrames(o, pxW, pxH);
+            if (seq)
+              overlays.push({
+                dataBase64: "",
+                x: seq.xPx,
+                y: seq.yPx,
                 startTime: o.startTime,
                 endTime: o.endTime,
-                maskDataBase64: undefined as string | undefined,
-              };
-              if (!blurNeedsMask(o)) return base;
-              const mask = renderBlurMaskToPng(o, videoPixelSize.width, videoPixelSize.height);
-              if (!mask) return base;
-              return { ...base, x: mask.xPx, y: mask.yPx, width: mask.widthPx, height: mask.heightPx, maskDataBase64: mask.dataUrl };
-            })
-          : [];
+                animation: exportOverlayAnimation(o.animation),
+                keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
+                frames: { unique: seq.unique, sequence: seq.sequence },
+                blendMode,
+              });
+            continue;
+          }
+          if (o.reveal) {
+            // A revealing picture burns in as a frame sequence of its reveal (imageReveal.ts).
+            // eslint-disable-next-line no-await-in-loop
+            const seq = await renderImageRevealFrames(o, pxW, pxH);
+            if (seq)
+              overlays.push({
+                dataBase64: "",
+                x: seq.xPx,
+                y: seq.yPx,
+                startTime: o.startTime,
+                endTime: o.endTime,
+                animation: exportOverlayAnimation(o.animation),
+                keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
+                frames: { unique: seq.unique, sequence: seq.sequence },
+                blendMode,
+              });
+            continue;
+          }
+          // eslint-disable-next-line no-await-in-loop
+          const rendered = await renderImageOverlayToPng(o, pxW, pxH);
+          if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx), blendMode });
+        }
+        for (const o of current.textOverlays) {
+          const blendMode = exportBlendMode(o.blendMode);
+          if (isTextReveal(o.animation)) {
+            // Letter-by-letter titles burn in as a frame sequence (textReveal.ts).
+            // eslint-disable-next-line no-await-in-loop
+            const seq = await renderTextRevealFrames(o, pxW, pxH);
+            if (seq)
+              overlays.push({
+                dataBase64: "",
+                x: seq.xPx,
+                y: seq.yPx,
+                startTime: o.startTime,
+                endTime: o.endTime,
+                animation: "none",
+                keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
+                frames: { unique: seq.unique, sequence: seq.sequence },
+                blendMode,
+              });
+            continue;
+          }
+          const rendered = renderTextOverlayToPng(o, pxW, pxH);
+          if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx), blendMode });
+        }
+      }
 
-        // No client-side rendering step for PiP either (unlike text/image) - there's no picture to
-        // pre-render (it depends on the pip source's own decoded frames at each instant, the same
-        // reason a plain-rectangle blur region needs none), so this just resolves position/size to
-        // real output pixels and lets Rust build the trim+scale+mask+overlay filter chain directly
-        // (see pip_overlay_chain, conversion.rs).
-        const pipOverlays = videoPixelSize
-          ? current.pipOverlays.map((o) => ({
-              sourcePath: o.sourcePath,
-              x: Math.round(o.x * videoPixelSize.width),
-              y: Math.round(o.y * videoPixelSize.height),
-              width: Math.round(o.width * videoPixelSize.width),
-              height: Math.round(o.height * videoPixelSize.height),
-              shape: o.shape,
-              cornerRadius: o.cornerRadius,
-              crop: o.crop,
-              trimStart: o.trimStart,
+      // A plain rectangle has no fixed content to pre-render (it depends on whatever the
+      // underlying frame looks like at each instant), so it just resolves position/size to real
+      // output pixels and lets Rust build the crop+blur+overlay filter chain directly off the
+      // video's own decoded frames. Anything else - ellipse, rounded corners, or rotated - gets a
+      // black/white mask PNG (renderBlurMaskToPng) that Rust applies via `alphamerge`. `sigma` is
+      // the preview's own Gaussian (CSS blur) in output pixels; keyframes (a motion track) move it.
+      const blurOverlays = videoPixelSize
+        ? current.blurOverlays.map((o) => {
+            const W = videoPixelSize.width;
+            const H = videoPixelSize.height;
+            const base = {
+              x: Math.round(o.x * W),
+              y: Math.round(o.y * H),
+              width: Math.round(o.width * W),
+              height: Math.round(o.height * H),
+              intensity: o.intensity,
+              sigma: Math.max(0, o.intensity) * BLUR_SIGMA_FRACTION * H,
               startTime: o.startTime,
               endTime: o.endTime,
-              // Collapsed to a single 0..1 number for Rust (no separate muted flag) - same
-              // "0.0 when muted, otherwise the real level" convention effective_video_volume
-              // already uses (conversion.rs) for the primary track's own mute/volume pair.
-              volume: (o.muted ?? true) ? 0 : o.volume,
-            }))
-          : [];
+              maskDataBase64: undefined as string | undefined,
+              keyframes: undefined as ExportKeyframe[] | undefined,
+            };
+            const mask = blurNeedsMask(o) ? renderBlurMaskToPng(o, W, H) : null;
+            const placed = mask ? { ...base, x: mask.xPx, y: mask.yPx, width: mask.widthPx, height: mask.heightPx, maskDataBase64: mask.dataUrl } : base;
+            // The region has to fit in the frame (export crops it out of each frame).
+            placed.width = Math.max(2, Math.min(W, placed.width));
+            placed.height = Math.max(2, Math.min(H, placed.height));
+            if (o.keyframes && o.keyframes.length > 0) {
+              const dx = placed.x - o.x * W;
+              const dy = placed.y - o.y * H;
+              placed.keyframes = o.keyframes.map((k) => ({ time: o.startTime + k.time, x: k.x * W + dx, y: k.y * H + dy, scale: 1, opacity: 1, easing: k.easing }));
+            } else if (!placed.maskDataBase64) {
+              // A still rectangle is cut to the part of it that's on the frame.
+              const x0 = Math.max(0, placed.x);
+              const y0 = Math.max(0, placed.y);
+              placed.width = Math.max(2, Math.min(W, placed.x + placed.width) - x0);
+              placed.height = Math.max(2, Math.min(H, placed.y + placed.height) - y0);
+              placed.x = Math.min(x0, W - placed.width);
+              placed.y = Math.min(y0, H - placed.height);
+            }
+            return placed;
+          })
+        : [];
 
-        // No client-side rendering step for audio (unlike text/image, which render to a PNG first)
-        // - these just pass straight through to Rust, which reads the original source file
-        // directly and builds the amix/afade/adelay filter chain itself (see export_trimmed_video).
-        // Ducked music gets the same speech envelope the preview plays (musicDucking.ts) - the scan
-        // is cached, so this is instant unless nothing has asked for it yet this session.
-        const speech = current.audioOverlays.some(isDucked) ? await computeSpeechTimeline(current) : [];
-        const audioOverlays = current.audioOverlays
-          .filter((o) => !o.muted)
-          .map((o) => ({
-            sourcePath: o.src,
+      // No client-side rendering step for PiP either (unlike text/image) - there's no picture to
+      // pre-render (it depends on the pip source's own decoded frames at each instant), so this
+      // just resolves position/size to real output pixels and lets Rust build the
+      // trim+scale+mask+overlay filter chain directly (see pip_overlay_chain, conversion.rs).
+      const pipOverlays = videoPixelSize
+        ? current.pipOverlays.map((o) => ({
+            sourcePath: o.sourcePath,
+            x: Math.round(o.x * videoPixelSize.width),
+            y: Math.round(o.y * videoPixelSize.height),
+            width: Math.round(o.width * videoPixelSize.width),
+            height: Math.round(o.height * videoPixelSize.height),
+            shape: o.shape,
+            cornerRadius: o.cornerRadius,
+            crop: o.crop,
+            trimStart: o.trimStart,
             startTime: o.startTime,
             endTime: o.endTime,
-            trimStart: o.trimStart,
-            volume: o.volume,
-            fadeIn: o.fadeInSec ?? 0,
-            fadeOut: o.fadeOutSec ?? 0,
-            duck: duckEnvelopeFor(o, speech),
-          }));
+            // Collapsed to a single 0..1 number for Rust (no separate muted flag) - same
+            // "0.0 when muted, otherwise the real level" convention effective_video_volume
+            // already uses (conversion.rs) for the primary track's own mute/volume pair.
+            volume: (o.muted ?? true) ? 0 : o.volume,
+            blendMode: exportBlendMode(o.blendMode),
+          }))
+        : [];
 
-        // Captions go to Rust as a finished ASS script (burned in last, with libass) rather than
-        // per-line PNGs - hundreds of timed lines, each re-drawn per word for emphasis, is exactly
-        // what a subtitle renderer is for and far too many overlay inputs for the PNG path.
-        const captionLines = current.captions?.settings.enabled ? buildCaptionLines(current.clips, current.captions) : [];
-        const captionsAss =
-          videoPixelSize && current.captions && captionLines.length > 0
-            ? buildCaptionsAss(captionLines, current.captions.settings, videoPixelSize.width, videoPixelSize.height)
-            : null;
+      // No client-side rendering step for audio - these pass straight through to Rust, which reads
+      // the source files directly and builds the amix/afade/adelay chain itself. Ducked music gets
+      // the same speech envelope the preview plays (musicDucking.ts).
+      const speech = current.audioOverlays.some(isDucked) ? await computeSpeechTimeline(current) : [];
+      const audioOverlays = current.audioOverlays
+        .filter((o) => !o.muted)
+        .map((o) => ({
+          sourcePath: o.src,
+          startTime: o.startTime,
+          endTime: o.endTime,
+          trimStart: o.trimStart,
+          volume: o.volume,
+          fadeIn: o.fadeInSec ?? 0,
+          fadeOut: o.fadeOutSec ?? 0,
+          duck: duckEnvelopeFor(o, speech),
+        }));
 
-        const resultPath = await invoke<string>("export_trimmed_video", {
+      // Captions go to Rust as a finished ASS script (burned in last, with libass) rather than
+      // per-line PNGs - hundreds of timed lines, each re-drawn per word for emphasis, is exactly
+      // what a subtitle renderer is for and far too many overlay inputs for the PNG path.
+      const captionLines = current.captions?.settings.enabled ? buildCaptionLines(current.clips, current.captions) : [];
+      const captionsAss =
+        videoPixelSize && current.captions && captionLines.length > 0
+          ? buildCaptionsAss(captionLines, current.captions.settings, videoPixelSize.width, videoPixelSize.height)
+          : null;
+
+      const adjustmentLayers = videoPixelSize
+        ? (current.adjustmentLayers ?? []).map((l) => adjustmentLayerExport(l, videoPixelSize.width, videoPixelSize.height)).filter((l) => l !== null)
+        : [];
+
+      return {
+        args: {
           outputBasePath: sourcePath,
           segments: await withGradeLuts(toKeepSegments(current.clips), current.clips),
           overlays,
@@ -1715,7 +1857,31 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           captionsAss,
           outputFrame: options?.outputFrame ?? null,
           loudnessLufs: options?.loudnessLufs ?? null,
-        });
+          adjustmentLayers,
+          chapters: chaptersForExport(current.clips, current.chapters ?? []),
+        },
+        sourcePath,
+        durationSec: totalOutputDuration(current.clips),
+        share: {
+          title: (sourcePath.split(/[\\/]/).pop() ?? "Video").replace(/\.[^.]+$/, ""),
+          chapters: chaptersForExport(current.clips, current.chapters ?? []),
+          srt: captionLines.length > 0 ? buildSrt(captionLines) : null,
+          language: current.captions?.language ?? null,
+        },
+      };
+    },
+    [sourcePath]
+  );
+
+  // Renders the timeline now, in the foreground - what the queue's runner does with a prepared job.
+  const exportEdited = useCallback(
+    async (timelinePixelSize: { width: number; height: number } | null, options?: ExportOptions): Promise<{ path: string; name: string } | null> => {
+      setIsExporting(true);
+      setExportError(null);
+      try {
+        const payload = await prepareExport(timelinePixelSize, options);
+        if (!payload) return null;
+        const resultPath = await invoke<string>("export_trimmed_video", { ...payload.args, jobId: null });
         const name = resultPath.split(/[\\/]/).pop() ?? resultPath;
         return { path: resultPath, name };
       } catch (err) {
@@ -1726,7 +1892,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         setExportProgress(null);
       }
     },
-    [sourcePath]
+    [prepareExport]
   );
 
   const mergeCancelledRef = useRef(false);
@@ -1874,6 +2040,16 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     moveBlurOverlayTime,
     deleteBlurOverlay,
     duplicateBlurOverlay,
+    adjustmentLayers: state?.adjustmentLayers ?? [],
+    addAdjustmentLayer,
+    updateAdjustmentLayer,
+    resizeAdjustmentLayerTime,
+    moveAdjustmentLayerTime,
+    deleteAdjustmentLayer,
+    duplicateAdjustmentLayer,
+    chapters: state?.chapters ?? [],
+    setChapters,
+    prepareExport,
     addAudioOverlay,
     detachVideoAudio,
     updateAudioOverlayContent,

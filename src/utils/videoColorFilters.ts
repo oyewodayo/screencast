@@ -65,22 +65,42 @@ export const TRANSITION_PRESETS: { value: TransitionType; label: string }[] = [
 // "vignette" returns "" here - it has no CSS `filter` primitive, so VideoPlayer renders it as a
 // separate radial-gradient div over frameRect instead (see its own comment for why).
 export function cssFilterForColorPreset(cf: ClipColorFilter): string {
+  return cssFilterFromOps(colorPresetOps(cf));
+}
+
+// One CSS filter function on colour - what both the preview's CSS and export's colour matrix are
+// built from (color_filter_chain / css_op_from_spec in conversion.rs compose the same list).
+export type CssColorOpName = "brightness" | "contrast" | "saturate" | "hue-rotate" | "sepia" | "grayscale";
+export interface CssColorOp {
+  op: CssColorOpName;
+  value: number; // degrees for hue-rotate
+}
+
+export function colorPresetOps(cf: ClipColorFilter): CssColorOp[] {
   const t = Math.max(0, Math.min(1, cf.intensity));
   switch (cf.preset) {
     case "vibrant":
-      return `saturate(${1 + 0.6 * t}) contrast(${1 + 0.15 * t})`;
+      return [{ op: "saturate", value: 1 + 0.6 * t }, { op: "contrast", value: 1 + 0.15 * t }];
     case "cinematic":
-      return `contrast(${1 + 0.2 * t}) saturate(${1 - 0.15 * t}) sepia(${0.08 * t}) hue-rotate(-5deg)`;
+      return [
+        { op: "contrast", value: 1 + 0.2 * t },
+        { op: "saturate", value: 1 - 0.15 * t },
+        { op: "sepia", value: 0.08 * t },
+        { op: "hue-rotate", value: -5 },
+      ];
     case "bw":
-      return `grayscale(${t})`;
+      return [{ op: "grayscale", value: t }];
     case "warm":
-      return `sepia(${0.35 * t}) saturate(${1 + 0.1 * t})`;
+      return [{ op: "sepia", value: 0.35 * t }, { op: "saturate", value: 1 + 0.1 * t }];
     case "cool":
-      return `hue-rotate(${10 * t}deg) saturate(${1 + 0.05 * t})`;
+      return [{ op: "hue-rotate", value: 10 * t }, { op: "saturate", value: 1 + 0.05 * t }];
     default:
-      return "";
+      return [];
   }
 }
+
+export const cssFilterFromOps = (ops: CssColorOp[]): string =>
+  ops.map(({ op, value }) => (op === "hue-rotate" ? `hue-rotate(${value}deg)` : `${op}(${value})`)).join(" ");
 
 // The "vignette" preset's darkened edges as a CSS background over the frame (VideoPlayer's
 // vignette layer and the colour picker's tiles).
