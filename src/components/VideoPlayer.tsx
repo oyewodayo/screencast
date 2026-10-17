@@ -31,7 +31,7 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
-import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, playerFraming } from '../utils/videoColorFilters';
+import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
 import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
 import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile } from '../utils/captions';
 import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
@@ -248,8 +248,9 @@ export interface VideoPlayerHandle {
   // What's actually on screen right now, read straight off the <video> - for per-frame preview
   // layers (TransitionPreviewLayer) that need the exact current time and need to know whether a
   // source swap (loadSource) has finished: `src` is the URL last assigned, and `hasFrame` is false
-  // until that source has decoded a frame to show.
-  getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean } | null;
+  // until that source has decoded a frame to show. `paused` lets a layer that plays its own
+  // <video> in step (the transition's moving outgoing tail) follow play/pause/scrub.
+  getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean; paused: boolean } | null;
   // Opens the "Set thumbnail" picker for this video (waits for it to load if it just opened).
   openThumbnailPicker: () => void;
 }
@@ -457,7 +458,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       : 0;
     // Export's exact framing: fitted into the project frame, then flip -> crop -> Ken Burns
     // (clipFrameAffine), clipped to the frame (playerFraming).
-    const m = clipFrameAffine({ crop, kenBurns: kb, flipHorizontal: effects?.flipHorizontal }, progress);
+    const m = clipFrameAffine({ crop, kenBurns: kb, flipHorizontal: effects?.flipHorizontal, sourceStart: effects?.sourceStart, sourceEnd: effects?.sourceEnd }, progress);
     const framing = playerFraming(
       m,
       { width: video.clientWidth, height: video.clientHeight },
@@ -533,7 +534,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     getPlaybackState: () => {
       const video = videoRef.current;
       if (!video) return null;
-      return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2 };
+      return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2, paused: video.paused };
     },
     openThumbnailPicker: () => openThumbnailPickerRef.current(),
   }), []);
@@ -3000,7 +3001,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								top: frameRect.top,
 								width: frameRect.width,
 								height: frameRect.height,
-								background: `radial-gradient(ellipse at center, transparent ${40 - 15 * activeClipEffects.colorFilter.intensity}%, rgba(0,0,0,${(0.6 * activeClipEffects.colorFilter.intensity).toFixed(3)}) 100%)`,
+								background: vignetteBackground(activeClipEffects.colorFilter.intensity),
 							}}
 						/>
 					)}

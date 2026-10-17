@@ -159,6 +159,42 @@ impl HwEncoding {
     pub fn high_quality_args(&self) -> Vec<String> {
         pick(self.encoder.high_quality_candidates(), self.mode)
     }
+
+    /// Encoder flags for an editor export at a quality tier ("small" / "standard" / "high" - the
+    /// Save button's picker), aimed at matching the software x264 each tier used to use
+    /// (veryfast crf 28 / medium crf 23 / slow crf 18) frame for frame while encoding many times
+    /// faster. Calibrated against x264 on real footage (PSNR / SSIM to a lossless reference, this
+    /// machine's QSV): global_quality 26 / 23 / 17 land level with or just above those x264
+    /// settings - 5x faster at standard, 12x at high, files ~15-30% larger. The other encoders use
+    /// their constant-quality scales' equivalent points, quality-first presets.
+    ///
+    /// None unless constant-quality mode probed successfully (mode 0): a bitrate-only fallback
+    /// can't promise the tier's quality, so exports then stay on software x264.
+    pub fn export_args(&self, tier: &str) -> Option<Vec<String>> {
+        if self.mode != 0 {
+            return None;
+        }
+        let pick3 = |small: &'static str, standard: &'static str, high: &'static str| match tier {
+            "small" => small,
+            "high" => high,
+            _ => standard,
+        };
+        let args: Vec<&str> = match self.encoder {
+            HwEncoder::Nvenc => {
+                let cq = pick3("27", "21", "17");
+                vec!["-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0", "-spatial-aq", "1", "-bf", "3"]
+            }
+            HwEncoder::Qsv => vec!["-preset", "slower", "-global_quality", pick3("26", "23", "17")],
+            HwEncoder::Amf => {
+                let (p, b) = (pick3("26", "21", "17"), pick3("28", "23", "19"));
+                vec!["-quality", "quality", "-rc", "cqp", "-qp_i", p, "-qp_p", p, "-qp_b", b]
+            }
+            HwEncoder::VideoToolbox => vec!["-realtime", "0", "-q:v", pick3("50", "65", "78")],
+        };
+        let mut out = vec!["-c:v".to_string(), self.name().to_string()];
+        out.extend(args.into_iter().map(String::from));
+        Some(out)
+    }
 }
 
 fn pick(mut candidates: Vec<Vec<&'static str>>, index: usize) -> Vec<String> {
@@ -282,6 +318,23 @@ mod tests {
         } else if cfg!(any(target_os = "windows", target_os = "linux")) {
             assert!(!list.is_empty());
         }
+    }
+
+    #[test]
+    fn exports_use_constant_quality_only() {
+        for encoder in [HwEncoder::Nvenc, HwEncoder::Qsv, HwEncoder::Amf, HwEncoder::VideoToolbox] {
+            let cq = HwEncoding { encoder, mode: 0 };
+            for tier in ["small", "standard", "high", "anything"] {
+                let args = cq.export_args(tier).unwrap();
+                assert_eq!(args[..2], ["-c:v".to_string(), encoder.name().to_string()]);
+                assert!(!args.iter().any(|a| a == "12M" || a == "20M"), "{args:?}");
+            }
+            // A bitrate-only encoder can't promise a tier's quality - exports stay on x264.
+            assert!(HwEncoding { encoder, mode: 1 }.export_args("standard").is_none());
+        }
+        let qsv = HwEncoding { encoder: HwEncoder::Qsv, mode: 0 };
+        assert!(qsv.export_args("high").unwrap().contains(&"17".to_string()));
+        assert!(qsv.export_args("small").unwrap().contains(&"26".to_string()));
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub enum ConversionStatus {
 #[derive(Default, Clone)]
 pub struct ConversionState {
     active_process: Arc<Mutex<Option<u32>>>, // Store PID instead of Child
+    // Set by cancel_conversion - a run that fails because the user stopped it is never retried
+    // (export_trimmed_video's software fallback). Cleared as each run starts.
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // Helper function to parse duration from FFmpeg output (format: HH:MM:SS.ms)
@@ -145,7 +148,25 @@ async fn run_conversion(
     output: PathBuf,
     codec_args: &[&str],
 ) -> Result<String, String> {
+    run_conversion_timed(app_handle, window, state, inputs, progress_key, output, codec_args, None).await
+}
+
+// The same, with the output's length known up front (an export of cuts from a long recording):
+// progress is measured against that, not against the first input file's whole length - which for
+// a 60s cut out of a 10-minute recording read 10% at the finish line.
+#[allow(clippy::too_many_arguments)]
+async fn run_conversion_timed(
+    app_handle: &AppHandle,
+    window: &Window,
+    state: &State<'_, ConversionState>,
+    inputs: &[InputSpec],
+    progress_key: &str,
+    output: PathBuf,
+    codec_args: &[&str],
+    expected_duration: Option<f64>,
+) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    state.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
 
     for input in inputs {
         if !input.existing_path().exists() {
@@ -205,7 +226,7 @@ async fn run_conversion(
     // Total duration comes from ffmpeg's initial "Duration: HH:MM:SS.ms" line on stderr;
     // current position comes from the structured -progress stream on stdout. Shared so the
     // stdout reader thread can turn "out_time_us" into a percentage once duration is known.
-    let duration = Arc::new(std::sync::Mutex::new(None::<f64>));
+    let duration = Arc::new(std::sync::Mutex::new(expected_duration.filter(|d| *d > 0.0)));
 
     let duration_for_stderr = duration.clone();
     // Returns the accumulated stderr (rather than stashing it in a Mutex read right after
@@ -2983,7 +3004,7 @@ pub struct ClipTransitionIn {
     pub transition_type: String, // "crossfade" - only variant in v1
     pub duration: f64, // seconds
     // How a light leak / flash / bar open looks (TransitionLook, videoEditTypes.ts). Every field
-    // is sanitized before reaching the filter graph (transition_glow_filter).
+    // is parsed/clamped before reaching the filter graph (transition_window_graph).
     #[serde(default)]
     pub look: Option<TransitionLook>,
 }
@@ -3048,6 +3069,10 @@ pub struct KeepSegment {
     // which play over music. Rendered as silence of the segment's exact length.
     #[serde(default)]
     pub muted: Option<bool>,
+    // The source's own frame rate - what Ken Burns clocks itself by (ken_burns_chain). Filled in by
+    // export_trimmed_video before the graph is built; never sent by the frontend.
+    #[serde(skip)]
+    pub source_fps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3109,11 +3134,52 @@ fn segment_speed_filter(seg: &KeepSegment) -> String {
 
 // The video branch of one segment: trim to its range, effects, then its speed.
 fn segment_video_chain(input: &str, seg: &KeepSegment, extra: &str) -> String {
+    segment_video_chain_with_tail(input, seg, extra, 0.0)
+}
+
+// The same, reading `tail` source seconds past the segment's end - the tail handle a transition
+// out of it plays (transition_tail). Effects are unchanged by it: Ken Burns holds its end state
+// past the clip's own length, and the speed map's last step simply continues.
+fn segment_video_chain_with_tail(input: &str, seg: &KeepSegment, extra: &str, tail: f64) -> String {
     format!(
         "{input}trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS{extra},{}",
         seg.start,
-        seg.end,
+        seg.end + tail.max(0.0),
         segment_speed_filter(seg)
+    )
+}
+
+// How long the transition INTO `seg` plays, in output seconds - at most 90% of `seg`, the same
+// clamp transition_fold_step applies. None when it has none.
+fn transition_window(seg: &KeepSegment) -> Option<f64> {
+    seg.transition_in
+        .as_ref()
+        .filter(|tr| tr.duration > 0.0)
+        .map(|tr| tr.duration.min(segment_output_duration(seg) * 0.9).max(0.05))
+}
+
+// Source seconds to read past a segment's end so it can keep PLAYING through the next clip's
+// transition (window `d` output seconds) instead of freezing - at the speed it ends on, plus a
+// little slack. Zero for a stabilized clip: its camera-path analysis covers only its own frames
+// (stabilization_transforms), so it holds its last frame instead (as the preview does,
+// TransitionPreviewLayer's hasMovingTail). A still's tail is the same picture either way.
+fn tail_source_seconds(seg: &KeepSegment, d: f64) -> f64 {
+    if seg.stabilize.is_some() {
+        return 0.0;
+    }
+    let end_speed = segment_steps(seg).last().map(|s| s.2).unwrap_or(1.0);
+    d * end_speed + 0.1
+}
+
+// Splits a segment's (tail-extended) picture `[src]` into the segment itself `[main]`, exactly
+// `dur` output seconds, and its tail `[tail]`: the next `d` seconds, timed from 0 - the outgoing
+// side of the transition into the next clip. Padded with the segment's last frame first, so the
+// tail is always a full `d` long even when the source file ends at (or soon after) the cut.
+fn transition_tail(src: &str, main: &str, tail: &str, dur: f64, d: f64, fps: f64) -> String {
+    format!(
+        "[{src}]tpad=stop_mode=clone:stop_duration={d:.3},split[{src}m][{src}t];\
+         [{src}m]trim=end={dur:.6}[{main}];\
+         [{src}t]trim=start={dur:.6},setpts=PTS-STARTPTS,fps={fps:.3},settb=AVTB,trim=end={d:.3}[{tail}];"
     )
 }
 
@@ -3585,10 +3651,8 @@ pub struct OverlayImage {
     pub y: i64,
     pub start_time: f64,
     pub end_time: f64,
-    // Mirrors OverlayAnimation (videoEditTypes.ts) minus "pop" - the frontend maps "pop" to "fade"
-    // before sending (see exportEdited's own comment), since a true scale-up/overshoot animation
-    // needs a time-varying overlay *size*, not just x/y or alpha, which is a bigger lift than the
-    // x/y-expression approach overlay_position_expr below uses for slide-*. Sanitized against
+    // Mirrors OverlayAnimation (videoEditTypes.ts): "pop" scales per frame (overlay_pop_scale_expr),
+    // slide-* moves via overlay_position_expr, fade fades the alpha. Sanitized against
     // ALLOWED_OVERLAY_ANIMATIONS the same way transition_type already is (sanitize_transition_name)
     // - interpolated directly into the filter_complex string, so this is a real security boundary.
     pub animation: String,
@@ -3636,6 +3700,62 @@ fn easing_expr(easing: &str, p: &str) -> String {
         "hold" => "0".to_string(),
         _ => p.to_string(),
     }
+}
+
+// easing_expr's curves, evaluated here.
+fn ease_value(easing: &str, p: f64) -> f64 {
+    let p = p.clamp(0.0, 1.0);
+    match easing {
+        "ease" => p * p * (3.0 - 2.0 * p),
+        "ease-in" => p * p,
+        "ease-out" => 1.0 - (1.0 - p) * (1.0 - p),
+        "hold" => 0.0,
+        _ => p,
+    }
+}
+
+// keyframe_expr's curve evaluated at time `t` - held before the first keyframe and after the last.
+fn keyframe_value(kfs: &[OverlayKeyframe], t: f64, value: impl Fn(&OverlayKeyframe) -> f64) -> f64 {
+    let mut sorted: Vec<&OverlayKeyframe> = kfs.iter().collect();
+    sorted.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+    let (first, last) = (sorted[0], sorted[sorted.len() - 1]);
+    if t <= first.time {
+        return value(first);
+    }
+    for pair in sorted.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if t < b.time {
+            let p = (t - a.time) / (b.time - a.time).max(1e-3);
+            return value(a) + (value(b) - value(a)) * ease_value(&a.easing, p);
+        }
+    }
+    value(last)
+}
+
+// A keyframed overlay's opacity as per-frame alpha commands for `target` (a named
+// colorchannelmixer): its value at every frame where it changes - from the overlay's start through
+// its last keyframe - and nothing after, where it holds.
+fn opacity_commands(kfs: &[OverlayKeyframe], target: &str, start: f64, end: f64) -> String {
+    let opacity = |t: f64| keyframe_value(kfs, t, |k| k.opacity.clamp(0.0, 1.0));
+    let last_change = kfs.iter().map(|k| k.time).fold(start, f64::max).min(end);
+    let frames = ((last_change - start) * OVERLAY_INPUT_FPS).ceil().max(0.0) as usize;
+    // Only where the 8-bit alpha actually changes - a hold costs no commands.
+    let mut cmds: Vec<String> = Vec::new();
+    let mut last = String::new();
+    for n in 0..=frames {
+        let t = start + n as f64 / OVERLAY_INPUT_FPS;
+        let v = format!("{:.4}", (opacity(t) * 255.0).round() / 255.0);
+        if v != last {
+            cmds.push(format!("{t:.4} {target} aa {v}"));
+            last = v;
+        }
+    }
+    format!("sendcmd=c='{}'", cmds.join(";"))
+}
+
+// The time window a blur region is on screen, for its filters' `enable`.
+fn blur_window(bv: &OverlayBlur) -> String {
+    format!("between(t,{:.3},{:.3})", bv.start_time, bv.end_time)
 }
 
 // One keyframed value over time as an ffmpeg expression in `tvar`: held at the first keyframe's
@@ -3865,20 +3985,129 @@ fn pip_overlay_chain(
 // counterpart (cssFilterForColorPreset, src/utils/videoColorFilters.ts); if one is retuned, retune
 // the other so preview and export don't silently drift apart. Empty string (no-op) for
 // "none"/unrecognized so callers can unconditionally append the result without an extra branch.
+//
+// Exactly the preview's look: each preset is the same list of CSS filter functions the preview
+// applies (cssFilterForColorPreset), and every one of them is defined by the Filter Effects spec as
+// a fixed colour matrix (contrast as an affine scale about 0.5). The list composes into ONE affine
+// map, applied in a single colorchannelmixer pass - the offset rides on the alpha column (alpha is
+// 255 in rgba, so ra/ga/ba are a per-channel offset). Nothing here is tuned "to look similar": it
+// is the same arithmetic the browser does. "vignette" isn't a colour map - see vignette_layer.
 fn color_filter_chain(cf: &ClipColorFilter) -> String {
-    let t = cf.intensity.max(0.0).min(1.0);
-    match cf.preset.as_str() {
-        "vibrant" => format!(",eq=saturation={:.3}:contrast={:.3}", 1.0 + 0.6 * t, 1.0 + 0.15 * t),
-        "cinematic" => format!(
-            ",eq=contrast={:.3}:saturation={:.3}:gamma={:.3},colorbalance=rs={:.3}:bs={:.3}:rm={:.3}:bm={:.3}",
-            1.0 + 0.2 * t, 1.0 - 0.15 * t, 1.0 - 0.05 * t, -0.10 * t, 0.15 * t, -0.05 * t, 0.10 * t
-        ),
-        "bw" => format!(",eq=saturation={:.3}", 1.0 - t),
-        "warm" => format!(",colorbalance=rs={:.3}:bs={:.3}:rm={:.3}:bm={:.3}", 0.20 * t, -0.20 * t, 0.15 * t, -0.15 * t),
-        "cool" => format!(",colorbalance=rs={:.3}:bs={:.3}:rm={:.3}:bm={:.3}", -0.20 * t, 0.20 * t, -0.15 * t, 0.15 * t),
-        "vignette" => format!(",vignette=angle=PI/{:.3}", (6.0 - 4.0 * t).max(2.2)),
-        _ => String::new(),
+    let t = cf.intensity.clamp(0.0, 1.0);
+    let ops: Vec<CssColorOp> = match cf.preset.as_str() {
+        "vibrant" => vec![CssColorOp::Saturate(1.0 + 0.6 * t), CssColorOp::Contrast(1.0 + 0.15 * t)],
+        "cinematic" => vec![
+            CssColorOp::Contrast(1.0 + 0.2 * t),
+            CssColorOp::Saturate(1.0 - 0.15 * t),
+            CssColorOp::Sepia(0.08 * t),
+            CssColorOp::HueRotate(-5.0),
+        ],
+        "bw" => vec![CssColorOp::Grayscale(t)],
+        "warm" => vec![CssColorOp::Sepia(0.35 * t), CssColorOp::Saturate(1.0 + 0.1 * t)],
+        "cool" => vec![CssColorOp::HueRotate(10.0 * t), CssColorOp::Saturate(1.0 + 0.05 * t)],
+        _ => return String::new(),
+    };
+    let (m, o) = compose_css_color_ops(&ops);
+    format!(
+        ",format=rgba,colorchannelmixer=rr={:.6}:rg={:.6}:rb={:.6}:ra={:.6}:gr={:.6}:gg={:.6}:gb={:.6}:ga={:.6}:br={:.6}:bg={:.6}:bb={:.6}:ba={:.6}:aa=1,format=yuv420p",
+        m[0][0], m[0][1], m[0][2], o[0], m[1][0], m[1][1], m[1][2], o[1], m[2][0], m[2][1], m[2][2], o[2]
+    )
+}
+
+// One CSS filter function on colour (Filter Effects Module, "filter functions" - their SVG
+// feColorMatrix equivalents).
+#[derive(Clone, Copy, Debug)]
+enum CssColorOp {
+    Grayscale(f64),
+    Sepia(f64),
+    Saturate(f64),
+    HueRotate(f64), // degrees
+    Contrast(f64),
+}
+
+impl CssColorOp {
+    // (matrix, offset) on 0..1 RGB.
+    fn affine(self) -> ([[f64; 3]; 3], [f64; 3]) {
+        match self {
+            CssColorOp::Grayscale(a) => {
+                let s = 1.0 - a.clamp(0.0, 1.0);
+                ([[0.2126 + 0.7874 * s, 0.7152 - 0.7152 * s, 0.0722 - 0.0722 * s], [0.2126 - 0.2126 * s, 0.7152 + 0.2848 * s, 0.0722 - 0.0722 * s], [0.2126 - 0.2126 * s, 0.7152 - 0.7152 * s, 0.0722 + 0.9278 * s]], [0.0; 3])
+            }
+            CssColorOp::Sepia(a) => {
+                let s = 1.0 - a.clamp(0.0, 1.0);
+                ([[0.393 + 0.607 * s, 0.769 - 0.769 * s, 0.189 - 0.189 * s], [0.349 - 0.349 * s, 0.686 + 0.314 * s, 0.168 - 0.168 * s], [0.272 - 0.272 * s, 0.534 - 0.534 * s, 0.131 + 0.869 * s]], [0.0; 3])
+            }
+            CssColorOp::Saturate(s) => {
+                let s = s.max(0.0);
+                ([[0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s], [0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s], [0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s]], [0.0; 3])
+            }
+            CssColorOp::HueRotate(deg) => {
+                let (s, c) = deg.to_radians().sin_cos();
+                (
+                    [
+                        [0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928],
+                        [0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283],
+                        [0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072],
+                    ],
+                    [0.0; 3],
+                )
+            }
+            CssColorOp::Contrast(c) => {
+                let c = c.max(0.0);
+                ([[c, 0.0, 0.0], [0.0, c, 0.0], [0.0, 0.0, c]], [0.5 - 0.5 * c; 3])
+            }
+        }
     }
+}
+
+// The filter list applied left to right, as one affine map: x -> M x + o.
+fn compose_css_color_ops(ops: &[CssColorOp]) -> ([[f64; 3]; 3], [f64; 3]) {
+    let mut m = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mut o = [0.0; 3];
+    for op in ops {
+        let (a, b) = op.affine();
+        let mut nm = [[0.0; 3]; 3];
+        let mut no = [0.0; 3];
+        for r in 0..3 {
+            for c in 0..3 {
+                nm[r][c] = (0..3).map(|k| a[r][k] * m[k][c]).sum();
+            }
+            no[r] = (0..3).map(|k| a[r][k] * o[k]).sum::<f64>() + b[r];
+        }
+        m = nm;
+        o = no;
+    }
+    (m, o)
+}
+
+// Where a segment's video chain should end, and what follows it: a vignette preset puts its layer
+// between the chain and `label` (vignette_layer, over the clip's finished frame as the preview
+// draws it); anything else ends straight at `label`.
+fn segment_vignette(seg: &KeepSegment, w: Option<i64>, h: Option<i64>, label: &str, i: usize) -> (String, String) {
+    match (&seg.color_filter, w, h) {
+        (Some(cf), Some(w), Some(h)) if cf.preset == "vignette" => {
+            let pre = format!("{label}nv");
+            (pre.clone(), vignette_layer(cf.intensity, w, h, 30.0, &pre, label, i))
+        }
+        _ => (label.to_string(), String::new()),
+    }
+}
+
+// The "vignette" preset: the preview's radial-gradient(ellipse at center, transparent s0%,
+// rgba(0,0,0,0.6t) 100%) laid over the clip's finished frame (vignetteBackground,
+// videoColorFilters.ts) - drawn once, small, scaled up (a smooth gradient loses nothing) and looped
+// as a static layer, so it costs one overlay per frame. A graph fragment taking [in] to [out].
+fn vignette_layer(intensity: f64, w: i64, h: i64, fps: f64, input: &str, out: &str, i: usize) -> String {
+    let t = intensity.clamp(0.0, 1.0);
+    let s0 = (40.0 - 15.0 * t) / 100.0;
+    // Distance from the centre on the ellipse through the corners (CSS's default farthest-corner).
+    let r = "(hypot(X/W-0.5,Y/H-0.5)*1.414214)";
+    let alpha = format!("255*{:.4}*clip(({r}-{s0:.4})/{:.4},0,1)", 0.6 * t, (1.0 - s0).max(1e-3));
+    let (lw, lh) = ((w / 4).max(2), (h / 4).max(2));
+    format!(
+        "color=black:s={lw}x{lh}:d=1:r={fps:.3},format=yuva420p,geq=lum=16:cb=128:cr=128:a='{alpha}',scale={w}:{h}:flags=bilinear,loop=loop=-1:size=1[vig{i}];\
+         [{input}][vig{i}]overlay=shortest=1:format=auto[{out}];"
+    )
 }
 
 // Per-segment Ken Burns fragment - a time-varying `crop` (using ffmpeg's own `t`/`iw`/`ih`/`ow`/
@@ -3889,46 +4118,100 @@ fn color_filter_chain(cf: &ClipColorFilter) -> String {
 // leave this segment's frames smaller than its neighbors'. Chosen over ffmpeg's `zoompan` filter
 // deliberately - zoompan's own output-size handling is more version-sensitive across ffmpeg
 // builds than crop's plain expression support, and this only needs to spike-test cleanly once.
-fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64) -> String {
-    let amount = kb.intensity.unwrap_or(0.5).max(0.0).min(1.0);
+//
+// The window - a zoom and centre (fractions of the frame) over time - is kenBurnsWindow's
+// (videoColorFilters.ts) arithmetic exactly, preset for preset. It's drawn with `perspective`
+// mapping the window's corners to the frame: per-frame and sub-pixel, so a slow push or a shake
+// glides instead of stepping a whole pixel at a time. (crop can't do it: its width/height are
+// evaluated once at setup - every zoom used to export frozen at one size.) perspective only knows
+// the frame number, so the stream is first held to a constant `fps` (the source's own rate):
+// seconds = n / fps, exactly, even for a variable-frame-rate phone video.
+fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64, fps: f64) -> String {
+    let a = kb.intensity.unwrap_or(0.5).clamp(0.0, 1.0);
     let d = duration.max(0.01);
-    let progress = match kb.span {
-        Some([a, b]) if (a, b) != (0.0, 1.0) => {
-            let (a, b) = (a.max(0.0).min(1.0), b.max(0.0).min(1.0));
-            format!("({a:.6}+{:.6}*min(t/{d:.3},1))", b - a)
-        }
-        _ => format!("min(t/{d:.3},1)"),
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+    let (s0, s1) = match kb.span {
+        Some([x, y]) => (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)),
+        None => (0.0, 1.0),
     };
-    match kb.preset.as_str() {
-        "zoom-in" | "zoom-out" => {
-            let z = 1.0 + 0.30 * amount;
-            let p = if kb.preset == "zoom-in" {
-                format!("(1+({z:.4}-1)*{progress})")
+    // p: 0..1 along the whole move; t: seconds along it (a split-off piece continues its clock).
+    // perspective's `in` counts frames from 1.
+    let p = format!("({s0:.6}+{:.6}*min((in-1)/{fps:.4}/{d:.4},1))", s1 - s0);
+    let t = format!("({p}*{:.6})", d / (s1 - s0).max(1e-3));
+    let tx = kb.target_x.unwrap_or(0.5).clamp(0.0, 1.0);
+    let ty = kb.target_y.unwrap_or(0.5).clamp(0.0, 1.0);
+    let tau = std::f64::consts::TAU;
+    let wobble = |f: f64, ph: f64| {
+        format!(
+            "(0.5*sin({:.6}*{t}+{ph})+0.3*sin({:.6}*{t}+{:.4})+0.2*sin({:.6}*{t}+{:.4}))",
+            tau * 1.1 * f,
+            tau * 2.3 * f,
+            1.3 + ph,
+            tau * 4.7 * f,
+            2.1 + ph
+        )
+    };
+    // (zoom, centre x, centre y) as expressions.
+    let (z, cx, cy): (String, String, String) = match kb.preset.as_str() {
+        "zoom-in" => (format!("(1+{:.4}*{p})", 0.3 * a), tx.to_string(), ty.to_string()),
+        "zoom-out" => (format!("({:.4}-{:.4}*{p})", 1.0 + 0.3 * a, 0.3 * a), tx.to_string(), ty.to_string()),
+        "pan-left" | "pan-right" | "pan-up" | "pan-down" => {
+            let z = 1.0 + 0.15 * a;
+            let dir = if matches!(kb.preset.as_str(), "pan-right" | "pan-down") { p.clone() } else { format!("(1-{p})") };
+            let along = format!("({:.6}*{dir}+{:.6})", 1.0 - 1.0 / z, 1.0 / (2.0 * z));
+            if kb.preset.starts_with("pan-l") || kb.preset.starts_with("pan-r") {
+                (format!("{z:.4}"), along, "0.5".into())
             } else {
-                format!("({z:.4}-({z:.4}-1)*{progress})")
-            };
-            // clip(...) rather than the plain "(iw-ow)/2" center every zoom used before targetX/
-            // targetY existed - ow/oh are themselves time-varying here (they're `iw/p`/`ih/p`
-            // above), so keeping the window fully on-frame at every instant needs a real clamp,
-            // not just a fixed offset. Defaults (0.5, 0.5) reduce to exactly the old centered math.
-            let tx = kb.target_x.unwrap_or(0.5).max(0.0).min(1.0);
-            let ty = kb.target_y.unwrap_or(0.5).max(0.0).min(1.0);
-            format!(
-                ",crop=w='iw/{p}':h='ih/{p}':x='clip({tx:.4}*iw-ow/2,0,iw-ow)':y='clip({ty:.4}*ih-oh/2,0,ih-oh)',scale={out_w}:{out_h}"
-            )
+                (format!("{z:.4}"), "0.5".into(), along)
+            }
         }
-        "pan-left" | "pan-right" => {
-            let z = 1.0 + 0.15 * amount;
-            let dir = if kb.preset == "pan-right" {
-                progress.clone()
-            } else {
-                format!("1-{progress}")
-            };
-            format!(",crop=w='iw/{z:.4}':h='ih/{z:.4}':x='(iw-ow)*({dir})':y='(ih-oh)/2',scale={out_w}:{out_h}")
+        "push" => (format!("(1+{:.4}*{p}*{p}*(3-2*{p}))", 0.3 * a), tx.to_string(), ty.to_string()),
+        "punch-in" => {
+            let c = format!("(clip({t}/0.35,0,1)-1)");
+            (format!("(1+{:.4}*(1+2.70158*pow({c},3)+1.70158*pow({c},2)))", 0.4 * a), tx.to_string(), ty.to_string())
         }
-        _ => String::new(),
-    }
+        "bounce-in" => {
+            let c = format!("clip({t}/1.2,0,1)");
+            (format!("(1+{:.4}*(1-exp(-6*{c})*cos({:.6}*{c})))", 0.3 * a, 3.0 * tau), tx.to_string(), ty.to_string())
+        }
+        "drift" => {
+            let z = 1.0 + 0.2 * a;
+            let along = format!("({:.6}+{:.6}*{p})", 1.0 / (2.0 * z), 1.0 - 1.0 / z);
+            (format!("{z:.4}"), along.clone(), along)
+        }
+        "sway" => {
+            let z = 1.0 + 0.12 * a;
+            (format!("{z:.4}"), format!("(0.5+{:.6}*sin({:.6}*{t}))", 0.48 * (1.0 - 1.0 / z), tau / 2.5), "0.5".into())
+        }
+        "float" => {
+            let z = 1.0 + 0.14 * a;
+            let r = 0.45 * (1.0 - 1.0 / z);
+            (format!("{z:.4}"), format!("(0.5+{r:.6}*cos({:.6}*{t}))", tau / 4.0), format!("(0.5+{r:.6}*sin({:.6}*{t}))", tau / 4.0))
+        }
+        "breathe" => (format!("(1+{:.4}*(0.5-0.5*cos({:.6}*{t})))", 0.12 * a, tau / 3.0), tx.to_string(), ty.to_string()),
+        "pulse" => (format!("(1+{:.4}*pow(0.5+0.5*cos({:.6}*{t}),6))", 0.1 * a, tau / 0.5), tx.to_string(), ty.to_string()),
+        "shake" | "vibrate" => {
+            let fast = kb.preset == "vibrate";
+            let z = 1.0 + if fast { 0.02 + 0.04 * a } else { 0.03 + 0.07 * a };
+            let m = 0.45 * (1.0 - 1.0 / z);
+            let f = if fast { KB_VIBRATE_RATE } else { 1.0 };
+            (format!("{z:.4}"), format!("(0.5+{m:.6}*{})", wobble(f, 0.0)), format!("(0.5+{m:.6}*{})", wobble(f, 4.1)))
+        }
+        _ => return String::new(),
+    };
+    // The window kept fully on the frame, then its corners (source pixels) sent to the frame's.
+    let half = format!("(0.5/{z})");
+    let cx = format!("clip({cx},{half},1-{half})");
+    let cy = format!("clip({cy},{half},1-{half})");
+    let (l, r) = (format!("(({cx})-{half})*W"), format!("(({cx})+{half})*W"));
+    let (top, bot) = (format!("(({cy})-{half})*H"), format!("(({cy})+{half})*H"));
+    format!(
+        ",fps={fps:.4},perspective=x0='{l}':y0='{top}':x1='{r}':y1='{top}':x2='{l}':y2='{bot}':x3='{r}':y3='{bot}':interpolation=cubic:sense=source:eval=frame,scale={out_w}:{out_h}"
+    )
 }
+
+// How much faster "vibrate"'s wobble runs than "shake"'s - KB_VIBRATE_RATE in videoColorFilters.ts.
+const KB_VIBRATE_RATE: f64 = 5.0;
 
 // Per-segment crop fragment - a static (non-time-varying) version of ken_burns_chain's own crop
 // idiom, generalized to independent width/height: crop a free-form window out of the frame.
@@ -4278,15 +4561,19 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
     if seg.flip_horizontal.unwrap_or(false) {
         extra.push_str(",hflip");
     }
-    if let Some(cf) = &seg.color_filter {
-        if cf.preset != "none" {
-            extra.push_str(&color_filter_chain(cf));
-        }
-    }
-    // The grade, right after the preset - the same order the preview's WebGL layer draws them in
-    // (CSS preset filter on top of the graded frame is equivalent: both are per-pixel color maps).
+    // The grade, then the colour preset - the preview's order: GradeCanvas draws the graded frame
+    // and the preset's CSS filter applies on top of it (colour maps don't commute, so the order is
+    // part of matching it).
     if let Some(path) = lut_path {
         extra.push_str(&format!(",lut3d=file='{}':interp=trilinear", path));
+    }
+    if let Some(cf) = &seg.color_filter {
+        if cf.preset == "vignette" && (out_w.is_none() || out_h.is_none()) {
+            // No frame size to draw the exact layer at (segment_vignette) - ffmpeg's own falloff.
+            extra.push_str(&format!(",vignette=angle=PI/{:.3}", (6.0 - 4.0 * cf.intensity.clamp(0.0, 1.0)).max(2.2)));
+        } else if cf.preset != "none" {
+            extra.push_str(&color_filter_chain(cf));
+        }
     }
     if let (Some(crop), Some(w), Some(h)) = (&seg.crop, out_w, out_h) {
         extra.push_str(&crop_chain(crop));
@@ -4299,7 +4586,7 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         // (segment_video_chain), so `t` here is source time - the same progress the preview uses
         // (source-time fraction, VideoPlayer.tsx), and the same for a speed ramp as for a constant
         // speed.
-        extra.push_str(&ken_burns_chain(kb, seg.end - seg.start, w, h));
+        extra.push_str(&ken_burns_chain(kb, seg.end - seg.start, w, h, seg.source_fps.unwrap_or(30.0)));
     }
     extra
 }
@@ -4307,14 +4594,18 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
 // One left-to-right fold step joining segment `i` ([v{i}]/[a{i}]) onto everything folded so far
 // ([cur_v]/[cur_a], `accumulated` seconds long). Returns the filter text and the new labels.
 //
-// A transition plays over the START of the incoming clip, from the outgoing clip's frozen last
-// frame - [cur_v] is held on its last frame (`tpad` clone) for the transition's length, and the
-// xfade begins exactly where the outgoing content ends. So a transition never eats into either
-// clip and the output is exactly the sum of the clips' own lengths - the same timeline the editor
-// shows, which is what keeps text/image overlays and captions (all timed on that timeline) in
-// sync after a transition, and what the live preview (TransitionPreviewLayer) reproduces: the
-// outgoing clip's last frame over the incoming clip as it starts. Audio simply cuts (concat):
-// with nothing overlapping there's nothing to crossfade, and no clip's sound gets shortened.
+// A transition plays over the START of the incoming clip, from the outgoing clip still PLAYING
+// past its out-point - its tail handle ([old{i}], transition_tail), drawn over the incoming clip's
+// first `d` seconds exactly the way the live preview draws it (renderTransitionFrame,
+// transitionFrame.ts, over TransitionPreviewLayer). The incoming clip simply follows the outgoing
+// one, so a transition never eats into either clip and the output is exactly the sum of the
+// clips' own lengths - the same timeline the editor shows, which is what keeps text/image overlays
+// and captions (all timed on that timeline) in sync. Audio simply cuts (concat): the tail is
+// picture only, so no cut-away sound returns and no clip's sound gets shortened.
+//
+// `frame` is the output size every segment has been fitted to; without one (it couldn't be
+// determined) only size-independent drawing is possible, so every transition becomes a crossfade.
+#[allow(clippy::too_many_arguments)]
 fn transition_fold_step(
     cur_v: &str,
     cur_a: &str,
@@ -4322,6 +4613,7 @@ fn transition_fold_step(
     accumulated: f64,
     seg_dur: f64,
     fps: f64,
+    frame: Option<(i64, i64)>,
     transition: Option<(&str, f64)>,
     look: Option<&TransitionLook>,
 ) -> (String, String, String) {
@@ -4331,46 +4623,20 @@ fn transition_fold_step(
         Some((name, duration)) => {
             // At most 90% of the incoming clip - it plays entirely over that clip's own start.
             let d = duration.min(seg_dur * 0.9).max(0.05);
-            let offset = accumulated.max(0.0);
+            let _ = accumulated;
             let default_look = TransitionLook::default();
             let look = look.unwrap_or(&default_look);
-            if let Some(body) = drawn_transition(name, i, d, fps, look) {
-                // Drawn transitions: the incoming clip simply follows the outgoing one, and the
-                // outgoing clip's frozen last frame ([old{i}], timed from 0) is drawn over its start
-                // - the same layering the live preview uses (TransitionPreviewLayer). `fps` after
-                // setpts, which leaves the stream's frame rate unknown: without one, the tpad that
-                // holds each sprite in drawn_transition emits just its one frame.
-                return (
-                    format!(
-                        "[{cur_v}]split[pre{i}][tail{i}];[tail{i}]tpad=stop_mode=clone:stop_duration={d:.3},trim=start={start:.3},setpts=PTS-STARTPTS,fps={fps:.3}[old{i}];\
-                         {body}[pre{i}][{cur_a}][tr{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];",
-                        start = (offset - 0.001).max(0.0)
-                    ),
-                    next_v,
-                    next_a,
-                );
-            }
-            // The app's own transitions are an ffmpeg xfade plus, for some, a glow pass over the
-            // transition window (transition_glow_filter).
-            let (xfade_name, glow) = match name {
-                "lightleak" => ("fade", Some(transition_glow_filter(TransitionGlow::LightLeak, offset, d, look))),
-                "whip" => ("hblur", Some(transition_glow_filter(TransitionGlow::Flash, offset, d, look))),
-                // A white flash is ffmpeg's own; any other colour goes through the glow pass.
-                "fadewhite" if look.color.as_deref().and_then(parse_hex_color).is_some_and(|c| c != (255.0, 255.0, 255.0)) || look.intensity.is_some() => {
-                    ("fade", Some(transition_glow_filter(TransitionGlow::Flash, offset, d, look)))
-                }
-                "horzopen" if look.orientation.as_deref() == Some("vertical") => ("vertopen", None),
-                other => (other, None),
-            };
-            let xfade_out = if glow.is_some() { format!("xf{i}") } else { next_v.clone() };
-            let mut step = format!(
-                "[{cur_v}]tpad=stop_mode=clone:stop_duration={d:.3}[hold{i}];[hold{i}][v{i}]xfade=transition={xfade_name}:duration={d:.3}:offset={offset:.3}[{xfade_out}];"
-            );
-            if let Some(glow) = glow {
-                step.push_str(&format!("[{xfade_out}]{glow}[{next_v}];"));
-            }
-            step.push_str(&format!("[{cur_a}][a{i}]concat=n=2:v=0:a=1[{next_a}];"));
-            step
+            let name = if frame.is_some() { name } else { "fade" };
+            let body = transition_window_graph(name, i, d, fps, frame.unwrap_or((2, 2)), look);
+            // The incoming clip's first `d` seconds ([head{i}]) get the transition drawn over
+            // them; the rest ([rest{i}]) follows untouched. The join is pinned back to the
+            // timeline's frame rate: setpts leaves [rest{i}]'s unknown, and an unknown rate reaches
+            // the encoder as its 25fps default - silently dropping frames from 30/60fps footage.
+            format!(
+                "[v{i}]split[vh{i}][vr{i}];[vh{i}]trim=end={d:.6}[head{i}];[vr{i}]trim=start={d:.6},setpts=PTS-STARTPTS,fps={fps:.3}[rest{i}];\
+                 {body}\
+                 [{cur_v}][tr{i}][rest{i}]concat=n=3:v=1:a=0,fps={fps:.3},settb=AVTB[{next_v}];[{cur_a}][a{i}]concat=n=2:v=0:a=1[{next_a}];"
+            )
         }
         None => format!("[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"),
     };
@@ -4386,38 +4652,209 @@ fn rgb_to_yuv((r, g, b): (f64, f64, f64)) -> (i64, i64, i64) {
     (y.round() as i64, u.round() as i64, v.round() as i64)
 }
 
-// The filters drawing one of the app's drawn transitions over the start of the incoming clip:
-// [old{i}] (the outgoing clip's frozen last frame, d seconds, timed from 0) over [v{i}], into
-// [tr{i}]. None for the xfade-based ones. Each mirrors the live preview's drawing of the same
-// transition (renderTransitionFrame, transitionFrame.ts).
+// A per-frame command series for `target` (a named filter instance, "gblur@w3"): `param` set to
+// value(p) at every frame of the window, p = transition progress 0..1. How a filter whose options
+// aren't expressions (a blur radius, a pixel block size) follows the transition exactly.
+fn sendcmd_series(target: &str, params: &[&str], d: f64, fps: f64, value: impl Fn(f64) -> f64) -> String {
+    let frames = (d * fps).ceil().max(1.0) as usize;
+    // Only where the value changes.
+    let mut cmds: Vec<String> = Vec::new();
+    let mut last = String::new();
+    for k in 0..=frames {
+        let t = k as f64 / fps;
+        let v = format!("{:.3}", value((t / d).min(1.0)));
+        if v != last {
+            let set: Vec<String> = params.iter().map(|p| format!("{target} {p} {v}")).collect();
+            cmds.push(format!("{t:.4} {}", set.join(",")));
+            last = v;
+        }
+    }
+    format!("sendcmd=c='{}'", cmds.join(";"))
+}
+
+// Draws one transition over the incoming clip's first `d` seconds: [old{i}] (the outgoing clip's
+// tail, timed from 0) over [head{i}], into [tr{i}]. Every case mirrors renderTransitionFrame
+// (transitionFrame.ts) step for step - the same layers in the same order (outgoing picture, black
+// dip, glow, drawn layers), the same curves - so the export is the preview.
 //
-// Everything that moves is a per-FRAME expression (overlay x/y, perspective corners, eq) over
-// native filters - never a per-pixel one: xfade's custom expressions and geq cost about a second
-// per 1080p frame (measured against the bundled ffmpeg), where these cost next to nothing. The
-// only geq here draws a page curl's sprites once, on one quarter-size frame.
-fn drawn_transition(name: &str, i: usize, d: f64, fps: f64, look: &TransitionLook) -> Option<String> {
-    // Transition progress 0..1 from an overlay's / eq's `t` (seconds since the window began).
+// Everything that moves is per FRAME (overlay x/y and enable, perspective corners, sendcmd'd blur
+// and pixel size) over native filters. Per-pixel maths (geq) only ever runs on small frames scaled
+// up afterwards - masks and glows are smooth or soft-edged, so nothing is lost - since full-size
+// per-pixel expressions cost about a second per 1080p frame (measured against the bundled ffmpeg).
+// Glows composite with `blend=screen` in RGB: a colour layer premultiplied by its opacity, screened
+// on, is exactly CSS's mix-blend-mode:screen at that opacity.
+fn transition_window_graph(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64, i64), look: &TransitionLook) -> String {
+    let k = look.intensity.unwrap_or(1.0).clamp(0.1, 1.5);
+    // Progress in an overlay's/eq's `t`, and in geq's `T`.
+    let pt = format!("min(t/{d:.4},1)");
+    let pg = format!("min(T/{d:.4},1)");
+    let fade_out = format!("format=yuva420p,fade=t=out:st=0:d={d:.4}:alpha=1");
+    let half = d / 2.0;
+    // A uniform layer (8x8, scaled up): yuva with this luma and per-frame alpha (0..1 in `pg`).
+    let flat = |src: &str, out: &str, luma: i64, alpha: &str| {
+        format!("[{src}]scale=8:8,format=yuva420p,geq=lum={luma}:cb=128:cr=128:a='255*({alpha})',scale={w}:{h}[{out}];")
+    };
+    // A screen-blended RGB glow (premultiplied 0..255 per channel), computed on a small frame.
+    let screen = |src: &str, base: &str, out: &str, div: i64, r: &str, g: &str, b: &str| {
+        let (lw, lh) = ((w / div).max(2), (h / div).max(2));
+        format!(
+            "[{src}]scale={lw}:{lh},format=gbrp,geq=r='{r}':g='{g}':b='{b}',scale={w}:{h}[gl{i}];\
+             [{base}]format=gbrp[bg{i}];[bg{i}][gl{i}]blend=all_mode=screen:shortest=1,format=yuv420p[{out}];"
+        )
+    };
+    // A soft mask (luma = opacity of the outgoing picture), computed at half size.
+    let mask = |src: &str, out: &str, lum: &str| {
+        let (lw, lh) = ((w / 2).max(2), (h / 2).max(2));
+        format!("[{src}]scale={lw}:{lh},format=gray,geq=lum='{lum}',scale={w}:{h}:flags=bilinear[{out}];")
+    };
+    let masked = |lum: &str| {
+        format!(
+            "[old{i}]split[ma{i}][mm{i}];{m}[ma{i}]format=yuva420p[mb{i}];[mb{i}][mk{i}]alphamerge[mo{i}];[head{i}][mo{i}]overlay=eof_action=pass[tr{i}];",
+            m = mask(&format!("mm{i}"), &format!("mk{i}"), lum)
+        )
+    };
+    let tint = look.color.as_deref().and_then(parse_hex_color);
+    match name {
+        "dissolve" => {
+            // Grain by grain: a fixed noise field (160 cells across) and every cell whose value
+            // the progress has passed shows the new clip. The same hash as the preview's.
+            let s = "(sin(X*12.9898+Y*78.233)*43758.5453)";
+            format!(
+                "[old{i}]split[ma{i}][mm{i}];[mm{i}]format=gray,scale=160:-1,geq=lum='255*gte({s}-floor({s}),{pg})',scale={w}:{h}:flags=bilinear[mk{i}];\
+                 [ma{i}]format=yuva420p[mb{i}];[mb{i}][mk{i}]alphamerge[mo{i}];[head{i}][mo{i}]overlay=eof_action=pass[tr{i}];"
+            )
+        }
+        "fadeblack" | "fadewhite" if name == "fadeblack" || (tint.map_or(true, |c| c == (255.0, 255.0, 255.0)) && look.intensity.is_none()) => {
+            // Out to black/white over the first half, then from it over the second.
+            let luma = if name == "fadeblack" { 16 } else { 235 };
+            format!(
+                "[old{i}]split[oa{i}][ob{i}];[head{i}][oa{i}]overlay=eof_action=pass:enable='lt(t,{half:.4})'[x{i}];{dip}[x{i}][dip{i}]overlay=eof_action=pass[tr{i}];",
+                dip = flat(&format!("ob{i}"), &format!("dip{i}"), luma, &format!("if(lt({pg},0.5),2*{pg},2-2*{pg})"))
+            )
+        }
+        "fadewhite" => {
+            // A crossfade washed in the flash colour at its peak - screened on, or laid over for black.
+            let (r, g, b) = tint.unwrap_or((255.0, 255.0, 255.0));
+            let o = format!("min(1,{k:.3}*sin(PI*{pg}))");
+            let lead = format!("[old{i}]split[oa{i}][ob{i}];[oa{i}]{fade_out}[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass[x{i}];");
+            if (r, g, b) == (0.0, 0.0, 0.0) {
+                format!("{lead}{}[x{i}][dip{i}]overlay=eof_action=pass[tr{i}];", flat(&format!("ob{i}"), &format!("dip{i}"), 16, &o))
+            } else {
+                format!("{lead}{}", screen(&format!("ob{i}"), &format!("x{i}"), &format!("tr{i}"), 8, &format!("{r}*{o}"), &format!("{g}*{o}"), &format!("{b}*{o}")))
+            }
+        }
+        "lightleak" => {
+            // A crossfade under a coloured burn whose hot spot travels across: CSS's
+            // radial-gradient(ellipse 0.83*size, white-hot -> colour@0.95 at 35% -> clear) over a
+            // flat colour@0.5, interpolated premultiplied as CSS does, screened at min(1, 1.15k sin).
+            let (r, g, b) = tint.unwrap_or((255.0, 122.0, 46.0));
+            let size = look.size.unwrap_or(1.0).clamp(0.3, 2.5);
+            let (sx, sy) = match look.direction.as_deref() {
+                Some("left") => (format!("(1.2-1.4*{pg})"), "0.35".to_string()),
+                Some("down") => ("0.4".to_string(), format!("(-0.2+1.4*{pg})")),
+                Some("up") => ("0.4".to_string(), format!("(1.2-1.4*{pg})")),
+                Some("diagonal") => (format!("(-0.2+1.4*{pg})"), format!("(-0.2+1.4*{pg})")),
+                Some("center") => ("0.5".to_string(), "0.5".to_string()),
+                _ => (format!("(-0.2+1.4*{pg})"), "0.35".to_string()),
+            };
+            let rad = 0.83 * size;
+            let dist = format!("hypot((X/W-{sx})/{rad:.4},(Y/H-{sy})/{rad:.4})");
+            let t1 = format!("clip({dist}/0.35,0,1)");
+            let t2 = format!("clip(({dist}-0.35)/0.65,0,1)");
+            let alpha = format!("if(lt({dist},0.35),1-0.05*{t1},0.95*(1-{t2}))");
+            let o = format!("min(1,{:.3}*sin(PI*{pg}))", 1.15 * k);
+            let channel = |hot: f64, c: f64| {
+                format!("{o}*(if(lt({dist},0.35),{hot}*(1-{t1})+{c1:.3}*{t1},{c1:.3}*(1-{t2}))+{half_c:.3}*(1-{alpha}))", c1 = c * 0.95, half_c = c * 0.5)
+            };
+            format!(
+                "[old{i}]split[oa{i}][ob{i}];[oa{i}]{fade_out}[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass[x{i}];{}",
+                screen(&format!("ob{i}"), &format!("x{i}"), &format!("tr{i}"), 16, &channel(255.0, r), &channel(252.0, g), &channel(240.0, b))
+            )
+        }
+        "whip" => {
+            // A sideways smear through a white flash: blur sin(pi p)*3% of the width, sliding 30%.
+            let blur = sendcmd_series(&format!("gblur@w{i}"), &["sigma"], d, fps, |p| (std::f64::consts::PI * p).sin() * 0.03 * w as f64);
+            format!(
+                "[old{i}]split[oa{i}][ob{i}];[oa{i}]format=yuva420p,{blur},gblur@w{i}=sigma=0,fade=t=out:st=0:d={d:.4}:alpha=1[oc{i}];\
+                 [head{i}][oc{i}]overlay=x='-0.3*main_w*{pt}':y=0:eof_action=pass[x{i}];{flash}[x{i}][fl{i}]overlay=eof_action=pass[tr{i}];",
+                flash = flat(&format!("ob{i}"), &format!("fl{i}"), 235, &format!("min(1,{:.3}*pow(sin(PI*{pg}),2))", 0.8 * k))
+            )
+        }
+        "zoomblur" | "zoomin" => {
+            // The old picture zooms at the camera about the centre - zoom blur also smears (blur
+            // before the zoom, as CSS applies `filter` before `transform`) through a white flash.
+            let frames = (d * fps.max(1.0)).max(1.0);
+            // perspective's `in` counts frames from 1.
+            let p = format!("min((in-1)/{frames:.3},1)");
+            let z = if name == "zoomblur" { format!("(1+1.6*pow({p},2))") } else { format!("(1+{p})") };
+            let persp = format!(
+                "perspective=x0='W/2-W/2/{z}':y0='H/2-H/2/{z}':x1='W/2+W/2/{z}':y1='H/2-H/2/{z}':x2='W/2-W/2/{z}':y2='H/2+H/2/{z}':x3='W/2+W/2/{z}':y3='H/2+H/2/{z}':sense=source:eval=frame"
+            );
+            if name == "zoomin" {
+                return format!("[old{i}]{persp},{fade_out}[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass[tr{i}];");
+            }
+            let blur = sendcmd_series(&format!("gblur@z{i}"), &["sigma"], d, fps, |p| p * 0.012 * w as f64 * k);
+            format!(
+                "[old{i}]split[oa{i}][ob{i}];[oa{i}]format=yuva420p,{blur},gblur@z{i}=sigma=0,{persp},fade=t=out:st=0:d={d:.4}:alpha=1[oc{i}];\
+                 [head{i}][oc{i}]overlay=eof_action=pass[x{i}];{flash}[x{i}][fl{i}]overlay=eof_action=pass[tr{i}];",
+                flash = flat(&format!("ob{i}"), &format!("fl{i}"), 235, &format!("min(1,{:.3}*pow(sin(PI*{pg}),2))", 0.35 * k))
+            )
+        }
+        "horzopen" => {
+            // The new clip opens out of a line through the middle (or doors, vertical): the old
+            // picture's opacity is CSS's linear-gradient(#000 a, clear a+soft, clear b-soft, #000 b),
+            // stop positions clamped to be increasing as CSS does.
+            let axis = if look.orientation.as_deref() == Some("vertical") { "X/W" } else { "Y/H" };
+            let band = format!("({pg}*0.54)");
+            let (s1, s2) = (format!("(0.5-{band})"), format!("(0.54-{band})"));
+            let s3 = format!("max({s2},0.46+{band})");
+            let s4 = format!("max({s3},0.5+{band})");
+            let v = axis;
+            let lum = format!(
+                "255*if(lte({v},{s1}),1,if(lt({v},{s2}),1-({v}-{s1})/0.04,if(lt({v},{s3}),0,if(lt({v},{s4}),({v}-{s3})/max({s4}-{s3},1e-6),1))))"
+            );
+            masked(&lum)
+        }
+        "circleopen" => masked(&format!("255*gt(hypot(X-W/2,Y-H/2),{pg}*hypot(W,H)/2)")),
+        "radial" => {
+            // A sweep clockwise from 12 o'clock (CSS conic-gradient from 0deg).
+            let a = "atan2(X-W/2,H/2-Y)";
+            masked(&format!("255*gte(if(lt({a},0),{a}+2*PI,{a}),{pg}*2*PI)"))
+        }
+        "wipeleft" | "wiperight" => {
+            // A hard edge, exact to the pixel: a half-white sprite two frames wide slid across.
+            let (pad_x, x) = if name == "wipeleft" { ("0", format!("-main_w*{pt}")) } else { ("iw", format!("main_w*{pt}-main_w")) };
+            format!(
+                "[old{i}]split=3[ma{i}][mc{i}][ms{i}];\
+                 [ms{i}]trim=end_frame=1,lutyuv=y=255:u=128:v=128,pad=iw*2:ih:{pad_x}:0:black,tpad=stop_mode=clone:stop_duration={d:.4}[sp{i}];\
+                 [mc{i}]lutyuv=y=0:u=128:v=128[cv{i}];[cv{i}][sp{i}]overlay=x='{x}':y=0[mk{i}];\
+                 [ma{i}]format=yuva420p[mb{i}];[mb{i}][mk{i}]alphamerge[mo{i}];[head{i}][mo{i}]overlay=eof_action=pass[tr{i}];"
+            )
+        }
+        "slideleft" | "slideright" => {
+            let sign = if name == "slideleft" { "-" } else { "" };
+            format!("[head{i}][old{i}]overlay=x='{sign}main_w*{pt}':y=0:eof_action=pass[tr{i}];")
+        }
+        "pixelize" => {
+            // Coarsens toward the midpoint (blocks up to 1/24 of the width), then the new clip.
+            let max_block = (w as f64 / 24.0).max(2.0);
+            let px = sendcmd_series(&format!("pixelize@p{i}"), &["w", "h"], d, fps, |p| (1.0 + (max_block - 1.0) * (2.0 * p).min(1.0)).round());
+            format!("[old{i}]{px},pixelize@p{i}=w=1:h=1[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass:enable='lt(t,{half:.4})'[tr{i}];")
+        }
+        "pagecurl" | "colorsweep" => drawn_transition(name, i, d, look),
+        _ => format!("[old{i}]{fade_out}[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass[tr{i}];"),
+    }
+}
+
+// The two transitions drawn from sprites slid per frame (page curl, colour sweep): [old{i}] (the
+// outgoing clip's tail, `d` seconds, timed from 0) over [head{i}], into [tr{i}].
+fn drawn_transition(name: &str, i: usize, d: f64, look: &TransitionLook) -> String {
+    // Transition progress 0..1 from an overlay's `t` (seconds since the window began).
     let q = format!("min(t/{d:.3},1)");
     match name {
-        // The old frame rushes at the camera - zoom 1 -> 2.6 by `perspective` (whose expressions
-        // only know the frame count), smeared by `tmix` across successive zoom steps (a true zoom
-        // blur, strongest where the zoom is fastest), fading out over the new clip through a soft
-        // white flash.
-        "zoomblur" => {
-            let k = look.intensity.unwrap_or(1.0).clamp(0.1, 1.5);
-            let frames = (d * fps.max(1.0)).max(1.0);
-            let z = format!("(1+1.6*pow(min(in/{frames:.3},1),2))");
-            let tmix = (2.0 + 2.0 * k).round().clamp(2.0, 5.0) as i64;
-            Some(format!(
-                "[old{i}]perspective=x0='W/2-W/2/{z}':y0='H/2-H/2/{z}':x1='W/2+W/2/{z}':y1='H/2-H/2/{z}':x2='W/2-W/2/{z}':y2='H/2+H/2/{z}':x3='W/2+W/2/{z}':y3='H/2+H/2/{z}':sense=source:eval=frame,\
-                 tmix=frames={tmix},format=yuva420p,fade=t=out:st=0:d={d:.3}:alpha=1[zoom{i}];\
-                 [v{i}][zoom{i}]overlay=eof_action=pass,eq=brightness='{flash:.3}*pow(sin(PI*{q}),2)':eval=frame:enable='lte(t,{d:.3})'[tr{i}];",
-                flash = 0.35 * k,
-            ))
-        }
         // A colour panel slides across - one frame plus a lighter band at each end long, so its
-        // leading edge has covered the old frame by the midpoint (when the old frame goes) and its
-        // trailing edge uncovers the new clip after. Eased in and out (smoothstep).
+        // leading edge has covered the old picture by the midpoint (when the old picture goes) and
+        // its trailing edge uncovers the new clip after. Eased in and out (smoothstep).
         "colorsweep" => {
             const ACCENT: f64 = 0.08;
             let (r, g, b) = look.color.as_deref().and_then(parse_hex_color).unwrap_or((255.0, 176.0, 32.0));
@@ -4437,13 +4874,13 @@ fn drawn_transition(name: &str, i: usize, d: f64, fps: f64, look: &TransitionLoo
                 Some("left") => (format!("main_w*(1-{lead})"), "0".to_string()),
                 _ => ("0".to_string(), format!("main_h*(1-{lead})")),
             };
-            Some(format!(
+            format!(
                 "[old{i}]split[oldf{i}][panel{i}];\
                  [panel{i}]trim=end_frame=1,lutyuv=y={y}:u={u}:v={v},{pad},tpad=stop_mode=clone:stop_duration={d:.3}[sweep{i}];\
-                 [v{i}][oldf{i}]overlay=eof_action=pass:enable='lt(t,{half:.3})'[under{i}];\
+                 [head{i}][oldf{i}]overlay=eof_action=pass:enable='lt(t,{half:.3})'[under{i}];\
                  [under{i}][sweep{i}]overlay=x='{x}':y='{y_pos}':eof_action=pass[tr{i}];",
                 half = d / 2.0,
-            ))
+            )
         }
         // The old page peels away from its bottom-right corner along a fold line u+v = k (u, v =
         // fractions across / down the frame) sweeping from k=2 to 0: the page shows on one side,
@@ -4453,85 +4890,32 @@ fn drawn_transition(name: &str, i: usize, d: f64, fps: f64, look: &TransitionLoo
         // and slid left by 2*q frame widths: the page's mask (white = page) onto black, and the
         // curl + shadows (with alpha) straight over the result. Drawn at quarter size and scaled
         // up, which also softens their edges.
-        "pagecurl" => {
+        _ => {
             let a = "(3*X/W-2+Y/H)";
             let sprite = |planes: &str, fmt: &str| {
-                format!("trim=end_frame=1,scale=iw*3/4:ih/4,format={fmt},geq={planes},scale=iw*4:ih*4,tpad=stop_mode=clone:stop_duration={d:.3}")
+                format!("trim=end_frame=1,scale=iw*3/2:ih/2,format={fmt},geq={planes},scale=iw*2:ih*2:flags=bilinear,tpad=stop_mode=clone:stop_duration={d:.3}")
             };
             let mask = sprite(&format!("lum='255*clip(0.5-{a}*60,0,1)':cb=128:cr=128"), "yuv420p");
+            // The curl's coverage, antialiased over ~1.5 sprite pixels at both its edges (a step
+            // in `a` per pixel is 3/W), and the shadows' opacity either side of it.
+            let e = "(4.5/W)";
+            let f = format!("(clip(({a}+0.45)/{e},0,1)*clip(-{a}/{e},0,1))");
+            let shadow = format!("if(between({a},-0.51,-0.45),0.3*({a}+0.51)/0.06,if(between({a},0,0.12),0.45*(1-{a}/0.12),0))");
             let curl = sprite(
-                &format!(
-                    "lum='if(between({a},-0.45,0),180+45*sin(PI*-{a}/0.45),16)':cb=128:cr=128:\
-                     a='if(between({a},-0.45,0),255,if(between({a},-0.51,-0.45),255*0.3*({a}+0.51)/0.06,if(between({a},0,0.12),255*0.45*(1-{a}/0.12),0)))'"
-                ),
+                &format!("lum='if(gt({f},0),180+45*sin(PI*clip(-{a}/0.45,0,1)),16)':cb=128:cr=128:a='255*({f}+(1-{f})*{shadow})'"),
                 "yuva420p",
             );
             let slide = format!("x='-2*main_w*{q}':y=0");
-            Some(format!(
+            format!(
                 "[old{i}]split=4[page{i}][canvas{i}][maskf{i}][curlf{i}];\
                  [maskf{i}]{mask}[masks{i}];[curlf{i}]{curl}[curls{i}];\
                  [canvas{i}]lutyuv=y=0:u=128:v=128[black{i}];[black{i}][masks{i}]overlay={slide}[mask{i}];\
                  [page{i}][mask{i}]alphamerge[peel{i}];\
-                 [v{i}][peel{i}]overlay=eof_action=pass[paged{i}];\
+                 [head{i}][peel{i}]overlay=eof_action=pass[paged{i}];\
                  [paged{i}][curls{i}]overlay={slide}:eof_action=pass[tr{i}];"
-            ))
+            )
         }
-        _ => None,
     }
-}
-
-#[derive(Clone, Copy)]
-enum TransitionGlow {
-    // A warm orange burn sweeping across the frame, blowing out to near-white at its peak.
-    LightLeak,
-    // An even white flash at the midpoint.
-    Flash,
-}
-
-// The light-leak / flash pass laid over a transition's [offset, offset+d) window: pulls luma up
-// toward white (screen-like) and tints chroma, strongest at the transition's midpoint. The live
-// preview's TransitionPreviewLayer draws the same envelope with CSS gradients.
-//
-// `look` steers it: colour (the tint chroma heads toward), intensity (0.1..1.5 times the glow),
-// and for a light leak the direction its hot spot travels and the spot's size.
-fn transition_glow_filter(kind: TransitionGlow, offset: f64, d: f64, look: &TransitionLook) -> String {
-    let p = format!("clip((T-{offset:.3})/{d:.3},0,1)");
-    let s = format!("sin(PI*{p})");
-    let k = look.intensity.unwrap_or(1.0).clamp(0.1, 1.5);
-    let default_color = match kind {
-        TransitionGlow::LightLeak => (255.0, 122.0, 46.0),
-        TransitionGlow::Flash => (255.0, 255.0, 255.0),
-    };
-    let (r, g, b) = look.color.as_deref().and_then(parse_hex_color).unwrap_or(default_color);
-    // BT.601 chroma of the tint colour.
-    let cb_target = (128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b).clamp(16.0, 240.0);
-    let cr_target = (128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b).clamp(16.0, 240.0);
-    let (gain, tint) = match kind {
-        TransitionGlow::LightLeak => {
-            // Where the hot spot is at progress p (fractions of the frame).
-            let (cx, cy) = match look.direction.as_deref() {
-                Some("left") => (format!("(1.2-1.4*{p})"), "0.35".to_string()),
-                Some("down") => ("0.4".to_string(), format!("(-0.2+1.4*{p})")),
-                Some("up") => ("0.4".to_string(), format!("(1.2-1.4*{p})")),
-                Some("diagonal") => (format!("(-0.2+1.4*{p})"), format!("(-0.2+1.4*{p})")),
-                Some("center") => ("0.5".to_string(), "0.5".to_string()),
-                _ => (format!("(-0.2+1.4*{p})"), "0.35".to_string()),
-            };
-            let size = look.size.unwrap_or(1.0).clamp(0.3, 2.5);
-            let falloff = format!("clip(1.25-hypot(X/W-{cx},Y/H-{cy})*{:.3},0,1)", 1.5 / size);
-            (format!("min(1,{k:.3}*{s}*(0.3+0.9*{falloff}))"), format!("min(1,1.6*{s})*{:.3}", (0.85 * k).min(1.0)))
-        }
-        TransitionGlow::Flash => {
-            // White flashes go white; coloured ones wash the frame in their colour as they peak.
-            let tinted = (r, g, b) != (255.0, 255.0, 255.0);
-            (format!("min(1,{:.3}*{s}*{s})", 0.8 * k), if tinted { format!("min(1,{k:.3}*{s})") } else { "0".to_string() })
-        }
-    };
-    let (cb_target, cr_target) = (cb_target.round() as i64, cr_target.round() as i64);
-    format!(
-        "format=yuv420p,geq=lum='lum(X,Y)+(255-lum(X,Y))*{gain}':cb='cb(X,Y)+({cb_target}-cb(X,Y))*{tint}*(1-0.65*{gain})':cr='cr(X,Y)+({cr_target}-cr(X,Y))*{tint}*(1-0.65*{gain})':enable='between(t,{offset:.3},{end:.3})'",
-        end = offset + d
-    )
 }
 
 // Frame rate of a source file's first video stream, as a plain f64 (e.g. 30.0, 59.94) - only ever
@@ -4577,9 +4961,9 @@ fn sanitize_transition_name(name: &str) -> &str {
         .unwrap_or("fade")
 }
 
-// Mirrors OverlayImage.animation's own doc comment - "pop" is deliberately absent (frontend maps
-// it to "fade" before it ever reaches here). Same security-boundary reasoning as
-// ALLOWED_TRANSITIONS: this string is interpolated directly into the filter_complex below.
+// Every OverlayAnimation that burns in as a whole-overlay animation (title reveals are rendered
+// into their own frames instead). Same security-boundary reasoning as ALLOWED_TRANSITIONS: this
+// string is interpolated directly into the filter_complex below.
 const ALLOWED_OVERLAY_ANIMATIONS: &[&str] = &[
     "none",
     "fade",
@@ -4587,6 +4971,7 @@ const ALLOWED_OVERLAY_ANIMATIONS: &[&str] = &[
     "slide-right",
     "slide-up",
     "slide-down",
+    "pop",
 ];
 
 fn sanitize_overlay_animation(name: &str) -> &str {
@@ -4608,16 +4993,27 @@ fn sanitize_overlay_animation(name: &str) -> &str {
 const OVERLAY_ANIMATION_RAMP_SEC: f64 = 0.4;
 const OVERLAY_SLIDE_DISTANCE_FRACTION: f64 = 0.12;
 
+fn overlay_animation_ramp(start_time: f64, end_time: f64) -> f64 {
+    OVERLAY_ANIMATION_RAMP_SEC.min((end_time - start_time) / 2.0).max(0.001)
+}
+
+// The preview's `progress` (0 at either edge of the overlay's window, 1 once fully arrived) in
+// time variable `tv`.
+fn overlay_arrival_expr(start_time: f64, end_time: f64, tv: &str) -> String {
+    let ramp = overlay_animation_ramp(start_time, end_time);
+    format!("clip(min(({tv}-{start_time:.3})/{ramp:.4},({end_time:.3}-{tv})/{ramp:.4}),0,1)")
+}
+
 fn overlay_slide_remaining_expr(start_time: f64, end_time: f64) -> String {
-    let ramp = OVERLAY_ANIMATION_RAMP_SEC
-        .min((end_time - start_time) / 2.0)
-        .max(0.001);
-    format!(
-        "(1-clip(min((t-{start:.3})/{ramp:.4},({end:.3}-t)/{ramp:.4}),0,1))",
-        start = start_time,
-        end = end_time,
-        ramp = ramp
-    )
+    format!("(1-{})", overlay_arrival_expr(start_time, end_time, "t"))
+}
+
+// "pop": the overlay's scale over time in `tv` - the preview's ease-out-back overshoot
+// (easeOutBack, VideoOverlayLayer.tsx) of the same arrival progress: from nothing, past full size,
+// settling at 1; symmetric on the way out.
+fn overlay_pop_scale_expr(start_time: f64, end_time: f64, tv: &str) -> String {
+    let p = overlay_arrival_expr(start_time, end_time, tv);
+    format!("if(gte({p},1),1,max(0.01,1+2.70158*pow({p}-1,3)+1.70158*pow({p}-1,2)))")
 }
 
 // The overlay filter's own x/y, as ffmpeg expression strings - a plain integer for "none"/"fade"
@@ -4666,6 +5062,20 @@ fn overlay_position_expr(ov: &OverlayImage, animation: &str) -> (String, String)
             ),
         ),
         _ => (ov.x.to_string(), ov.y.to_string()),
+    }
+}
+
+// Just a slide's offset from the resting position ("0" for anything else) - added to a keyframed
+// position, where the resting spot itself moves.
+fn overlay_slide_offset_expr(ov: &OverlayImage, animation: &str) -> (String, String) {
+    let r = overlay_slide_remaining_expr(ov.start_time, ov.end_time);
+    let f = OVERLAY_SLIDE_DISTANCE_FRACTION;
+    match animation {
+        "slide-left" => (format!("-(main_w*{f})*{r}"), "0".into()),
+        "slide-right" => (format!("(main_w*{f})*{r}"), "0".into()),
+        "slide-up" => ("0".into(), format!("-(main_h*{f})*{r}")),
+        "slide-down" => ("0".into(), format!("(main_h*{f})*{r}")),
+        _ => ("0".into(), "0".into()),
     }
 }
 
@@ -4748,6 +5158,66 @@ fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
 // the same visual quality; "small"'s faster preset trades some of that quality back for a shorter
 // export - both directions users of a screen-recording tool routinely want (a quick draft to share
 // immediately vs. a final archival-quality copy).
+// ---- Input seeking ------------------------------------------------------------------------------
+//
+// Every `-i` that only needs part of a long file jumps straight to it: an input-level `-ss` seeks
+// the demuxer to the keyframe before that point and decodes only from there, where a bare `trim=`
+// in the filter graph decoded (and threw away) everything from the very start of the file first -
+// a cut at minute 50 of a recording decoded 50 minutes, once per segment taken from that file.
+// Measured on a 10-minute 1080p source, three 20s cuts: 92.5s of decoding down to 6.6s.
+//
+// It's frame-exact and changes nothing in the picture: the seek lands SEEK_PREROLL_SECS early and
+// the graph's own trim/atrim still make the cut, with every source time shifted by the seek (the
+// input's timestamps start at 0 where the seek landed). Only times read from the INPUT shift -
+// a segment's range, its speed-ramp steps and its audio noise sample.
+const SEEK_PREROLL_SECS: f64 = 1.0;
+
+// Where a segment's input can start reading: just before its own range or its noise sample
+// (which can sit anywhere in the file, even before the clip), whichever is earlier. 0 for stills
+// (looped, nothing to seek) and when it's near the file's start anyway.
+fn segment_input_seek(seg: &KeepSegment) -> f64 {
+    if is_still_image_path(&seg.source_path) {
+        return 0.0;
+    }
+    let sample_start = seg.audio_cleanup.as_ref().and_then(|c| c.noise_sample).map(|s| s.start).unwrap_or(f64::INFINITY);
+    let seek = seg.start.min(sample_start) - SEEK_PREROLL_SECS;
+    if seek.is_finite() && seek > 0.0 { seek } else { 0.0 }
+}
+
+// Re-times a segment for an input that starts `by` seconds into its file.
+fn shift_segment_times(seg: &mut KeepSegment, by: f64) {
+    if by == 0.0 {
+        return;
+    }
+    seg.start -= by;
+    seg.end -= by;
+    if let Some(steps) = seg.speed_steps.as_mut() {
+        for step in steps {
+            step.source_start -= by;
+            step.source_end -= by;
+        }
+    }
+    if let Some(sample) = seg.audio_cleanup.as_mut().and_then(|c| c.noise_sample.as_mut()) {
+        sample.start -= by;
+        sample.end -= by;
+    }
+}
+
+// An input reading `path` from `seek` seconds in (plain when 0).
+fn seeking_input(path: String, seek: f64) -> InputSpec {
+    if seek > 0.0 {
+        InputSpec { path, pre_args: vec!["-ss".into(), format!("{seek:.6}")] }
+    } else {
+        InputSpec::plain(path)
+    }
+}
+
+// The seek for an overlay track used from `trim_start` seconds into its file.
+fn trim_input_seek(trim_start: f64) -> f64 {
+    let seek = trim_start - SEEK_PREROLL_SECS;
+    if seek.is_finite() && seek > 0.0 { seek } else { 0.0 }
+}
+
 fn resolve_export_quality(quality: Option<&str>) -> (&'static str, &'static str) {
     match quality.unwrap_or("standard") {
         "high" => ("slow", "18"),
@@ -4764,20 +5234,27 @@ fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height",
+        "stream=width,height:stream_side_data=rotation:stream_tags=rotate",
         "-of",
-        "csv=s=x:p=0",
+        "json",
         source_path,
     ]);
     #[cfg(windows)]
     hide_console_window(&mut cmd);
     let output = cmd.output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let (w, h) = text.trim().split_once('x')?;
-    match (w.parse::<i64>(), h.parse::<i64>()) {
-        (Ok(w), Ok(h)) if w > 0 && h > 0 => Some((w, h)),
-        _ => None,
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let video = probe["streams"].get(0)?;
+    let (w, h) = (video["width"].as_i64()?, video["height"].as_i64()?);
+    if w <= 0 || h <= 0 {
+        return None;
     }
+    // The size the frames DECODE at: ffmpeg turns a rotated phone video upright as it decodes.
+    let rotation = video["side_data_list"]
+        .as_array()
+        .and_then(|list| list.iter().find_map(|d| d["rotation"].as_f64()))
+        .or_else(|| video["tags"]["rotate"].as_str().and_then(|r| r.parse::<f64>().ok()))
+        .unwrap_or(0.0);
+    Some(if (rotation.abs() as i64) % 180 == 90 { (h, w) } else { (w, h) })
 }
 
 // One segment's audio branch of the filter graph, trimmed to [start,end) and labeled `out_label` -
@@ -4868,6 +5345,311 @@ fn write_temp_overlay_sequence(frames: &OverlayFrames, index: usize, created: &m
     Ok(dir.join(format!("{}_f%06d.png", prefix)).to_string_lossy().to_string())
 }
 
+// ---- Smart render (plain cuts) ------------------------------------------------------------------
+//
+// See services/smart_render.rs for the idea. This runs it: every piece of every clip (copied GOPs,
+// re-encoded edges) and the audio as independent ffmpeg jobs at once, joins the pieces into an
+// avc3 MP4, then checks the result - the exact frame count and a clean decode across every join -
+// before trusting it. Ok(None) means "not this time" (not eligible, or the result didn't check
+// out) and the caller renders normally; nothing a user sees ever depends on smart render working.
+
+// The re-encoded edges are a second of video or two around each cut: encode them at a quality
+// well above any export tier, so they sit invisibly between the untouched copied stretches.
+const SMART_EDGE_CRF: &str = "16";
+
+struct SmartJob {
+    args: Vec<String>,
+}
+
+// Runs `jobs` as concurrent ffmpeg processes (at most `parallel` at once), reporting progress as
+// each finishes. Stops everything on the first failure or when the user cancels.
+fn run_smart_jobs(
+    ffmpeg: &std::path::Path,
+    jobs: Vec<SmartJob>,
+    parallel: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+    mut on_done: impl FnMut(usize, usize),
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let total = jobs.len();
+    let mut queue = jobs.into_iter();
+    let mut running: Vec<std::process::Child> = Vec::new();
+    let mut done = 0;
+    let kill_all = |running: &mut Vec<std::process::Child>| {
+        for child in running.iter_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    };
+    loop {
+        while running.len() < parallel.max(1) {
+            let Some(job) = queue.next() else { break };
+            let mut cmd = Command::new(ffmpeg);
+            #[cfg(windows)]
+            hide_console_window(&mut cmd);
+            cmd.args(&job.args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+            running.push(cmd.spawn().map_err(|e| format!("Failed to start ffmpeg: {}", e))?);
+        }
+        if running.is_empty() {
+            return Ok(());
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            kill_all(&mut running);
+            return Err("Export cancelled".to_string());
+        }
+        let mut i = 0;
+        while i < running.len() {
+            match running[i].try_wait() {
+                Ok(Some(status)) => {
+                    let mut child = running.swap_remove(i);
+                    if !status.success() {
+                        let mut err = String::new();
+                        if let Some(mut stderr) = child.stderr.take() {
+                            let _ = std::io::Read::read_to_string(&mut stderr, &mut err);
+                        }
+                        kill_all(&mut running);
+                        return Err(format!("A smart render piece failed: {}", err.trim()));
+                    }
+                    done += 1;
+                    on_done(done, total);
+                }
+                Ok(None) => i += 1,
+                Err(e) => {
+                    kill_all(&mut running);
+                    return Err(format!("Lost track of an ffmpeg job: {}", e));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+// What one smart render runs: a job per piece (each to its own .ts in `work`), the audio job,
+// the concat list joining the pieces in order, where the joins fall (output seconds), the total
+// length and the exact frame count to verify against.
+struct SmartBuild {
+    jobs: Vec<SmartJob>,
+    list: String,
+    joins: Vec<f64>,
+    seconds: f64,
+    expected_frames: usize,
+    audio_out: PathBuf,
+}
+
+fn smart_render_jobs(
+    segments: &[KeepSegment],
+    plans: &[Vec<crate::services::smart_render::Piece>],
+    video: &crate::services::smart_render::SourceVideo,
+    has_audio: &[bool],
+    volume: f64,
+    work: &std::path::Path,
+) -> Result<SmartBuild, String> {
+    use crate::services::smart_render::Piece;
+    let fps = video.fps();
+    let rate = format!("{}/{}", video.fps_num, video.fps_den);
+    let expected_frames: usize = plans.iter().flatten().map(Piece::frames).sum();
+    let eps = 0.25 / fps;
+    let mut jobs = Vec::new();
+    let mut list = String::new();
+    let mut joins = Vec::new();
+    let mut at = 0.0;
+    for (seg, plan) in segments.iter().zip(plans) {
+        for piece in plan {
+            let out = work.join(format!("p{:05}.ts", jobs.len()));
+            let out_str = path_to_str(&out)?.to_string();
+            let args: Vec<String> = match piece {
+                Piece::Copy { start, frames, .. } => vec![
+                    "-v".into(), "error".into(), "-ss".into(), format!("{start:.6}"), "-i".into(), seg.source_path.clone(),
+                    "-map".into(), "0:v:0".into(), "-frames:v".into(), frames.to_string(), "-c:v".into(), "copy".into(),
+                    "-bsf:v".into(), "h264_mp4toannexb".into(), "-an".into(), "-sn".into(), "-dn".into(),
+                    "-f".into(), "mpegts".into(), "-muxdelay".into(), "0".into(), "-muxpreload".into(), "0".into(), "-y".into(), out_str.clone(),
+                ],
+                Piece::Encode { start, end, frames } => {
+                    let seek = (start - 1.0).max(0.0);
+                    vec![
+                        "-v".into(), "error".into(), "-ss".into(), format!("{seek:.6}"), "-i".into(), seg.source_path.clone(),
+                        "-map".into(), "0:v:0".into(),
+                        "-vf".into(), format!("trim=start={:.6}:end={:.6},setpts=PTS-STARTPTS,fps={rate}", start - seek - eps, end - seek - eps),
+                        "-frames:v".into(), frames.to_string(), "-an".into(), "-sn".into(), "-dn".into(),
+                        "-c:v".into(), "libx264".into(), "-preset".into(), "medium".into(), "-crf".into(), SMART_EDGE_CRF.into(), "-pix_fmt".into(), "yuv420p".into(),
+                        "-f".into(), "mpegts".into(), "-muxdelay".into(), "0".into(), "-muxpreload".into(), "0".into(), "-y".into(), out_str.clone(),
+                    ]
+                }
+            };
+            jobs.push(SmartJob { args });
+            let secs = piece.frames() as f64 / fps;
+            list.push_str(&format!("file '{}'\nduration {secs:.6}\n", out_str.replace('\'', "'\\''")));
+            at += secs;
+            joins.push(at);
+        }
+    }
+    joins.pop(); // the end of the last piece isn't a join
+
+    // The audio: every clip's sound, trimmed exactly, joined, at the track volume (seeking inputs).
+    let audio_out = work.join("audio.m4a");
+    {
+        let mut args: Vec<String> = vec!["-v".into(), "error".into()];
+        let mut graph = String::new();
+        let mut joined = String::new();
+        for (i, (seg, plan)) in segments.iter().zip(plans).enumerate() {
+            let seek = segment_input_seek(seg);
+            // Exactly as long as the clip's video (whole frames), so sound and picture stay locked
+            // across any number of cuts instead of drifting by a fraction of a frame at each.
+            let seconds = plan.iter().map(Piece::frames).sum::<usize>() as f64 / fps;
+            args.extend(["-ss".into(), format!("{seek:.6}"), "-i".into(), seg.source_path.clone()]);
+            graph.push_str(&audio_trim_chain(has_audio[i], i, seg.start - seek, seg.start - seek + seconds, 1.0, &(Vec::new(), None), &format!("a{i}")));
+            joined.push_str(&format!("[a{i}]"));
+        }
+        graph.push_str(&format!("{joined}concat=n={}:v=0:a=1,volume={volume:.3}[outa]", segments.len()));
+        args.extend(["-filter_complex".into(), graph, "-map".into(), "[outa]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "128k".into(), "-y".into(), path_to_str(&audio_out)?.to_string()]);
+        jobs.push(SmartJob { args });
+    }
+    Ok(SmartBuild { jobs, list, joins, seconds: at, expected_frames, audio_out })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn smart_render_export(
+    app_handle: &AppHandle,
+    window: &Window,
+    state: &State<'_, ConversionState>,
+    segments: &[KeepSegment],
+    has_audio: &[bool],
+    volume: f64,
+    progress_key: &str,
+    output: PathBuf,
+) -> Result<Option<String>, String> {
+    use crate::services::smart_render::{plan_clip, probe_packets, probe_source, Piece, SourceVideo};
+    let ext = output.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    // MP4 only: avc3 (parameter sets in-stream) is an MP4 sample entry; a .mov keeps one set.
+    if !matches!(ext.as_str(), "mp4" | "m4v") || segments.is_empty() {
+        return Ok(None);
+    }
+    let ffmpeg = get_ffmpeg_path(app_handle)?;
+    let ffprobe = get_ffprobe_path(app_handle)?;
+
+    // Every clip's source must be copyable, and all of them alike (one stream can't change size
+    // or rate mid-file). Then each clip's split, from its source's packet index.
+    let owned: Vec<(String, f64, f64)> = segments.iter().map(|s| (s.source_path.clone(), s.start, s.end)).collect();
+    let probe = ffprobe.clone();
+    let planned = blocking(move || -> Option<(SourceVideo, Vec<Vec<Piece>>)> {
+        let mut video: Option<SourceVideo> = None;
+        let mut sources: HashMap<String, SourceVideo> = HashMap::new();
+        let mut plans = Vec::with_capacity(owned.len());
+        for (path, start, end) in &owned {
+            let v = match sources.get(path) {
+                Some(v) => v.clone(),
+                None => {
+                    let v = probe_source(&probe, path)?;
+                    sources.insert(path.clone(), v.clone());
+                    v
+                }
+            };
+            if !v.copyable() || video.as_ref().is_some_and(|first| (first.width, first.height, first.fps_num, first.fps_den) != (v.width, v.height, v.fps_num, v.fps_den)) {
+                return None;
+            }
+            let packets = probe_packets(&probe, path, (start - 1.0).max(0.0), end + 1.0)?;
+            let plan = plan_clip(&packets, *start, *end, v.fps());
+            if plan.is_empty() {
+                return None;
+            }
+            plans.push(plan);
+            video.get_or_insert(v);
+        }
+        Some((video?, plans))
+    })
+    .await?;
+    let Some((video, plans)) = planned else { return Ok(None) };
+    // Worth it only when something is actually copied.
+    if !plans.iter().flatten().any(|p| matches!(p, Piece::Copy { .. })) {
+        return Ok(None);
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("briefcast_smart_{}_{stamp}", std::process::id()));
+    std::fs::create_dir_all(&work).map_err(|e| format!("Failed to create a work folder: {}", e))?;
+    let _cleanup = TempDir(work.clone());
+    let SmartBuild { jobs, list, joins, seconds: at, expected_frames, audio_out } = smart_render_jobs(segments, &plans, &video, has_audio, volume, &work)?;
+
+    // Run them all, a few at once.
+    let parallel = std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(2).clamp(1, 4);
+    let cancelled = state.cancelled.clone();
+    let progress_window = window.clone();
+    let key = progress_key.to_string();
+    let output_name = output.to_string_lossy().to_string();
+    let ffmpeg_jobs = ffmpeg.clone();
+    cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+    let ran = blocking(move || {
+        run_smart_jobs(&ffmpeg_jobs, jobs, parallel, &cancelled, |done, total| {
+            let progress = done as f64 / total as f64 * 90.0;
+            let _ = progress_window.emit(
+                "conversion-progress",
+                ConversionProgress {
+                    input_path: key.clone(),
+                    output_path: output_name.clone(),
+                    progress,
+                    status: ConversionStatus::Processing,
+                    message: format!("Converting... {:.1}%", progress),
+                },
+            );
+        })
+    })
+    .await?;
+    if let Err(e) = ran {
+        if state.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(e);
+        }
+        log::warn!("Smart render fell back to a full render: {}", e);
+        return Ok(None);
+    }
+
+    // Join: the pieces in order (each with its own parameter sets - avc3), with the audio.
+    let list_path = work.join("pieces.txt");
+    std::fs::write(&list_path, list).map_err(|e| format!("Failed to write the piece list: {}", e))?;
+    let inputs = [
+        InputSpec { path: path_to_str(&list_path)?.to_string(), pre_args: vec!["-f".into(), "concat".into(), "-safe".into(), "0".into()] },
+        InputSpec::plain(path_to_str(&audio_out)?.to_string()),
+    ];
+    let mux_args = ["-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-tag:v", "avc3", "-movflags", "+faststart"];
+    let written = match run_conversion_timed(app_handle, window, state, &inputs, progress_key, output, &mux_args, Some(at)).await {
+        Ok(path) => path,
+        Err(e) if state.cancelled.load(std::sync::atomic::Ordering::SeqCst) => return Err(e),
+        Err(e) => {
+            log::warn!("Smart render's join failed, falling back to a full render: {}", e);
+            return Ok(None);
+        }
+    };
+
+    // Check it: exactly the frames planned, and every join decodes cleanly.
+    let check_path = written.clone();
+    let ok = blocking(move || {
+        let mut cmd = Command::new(&ffprobe);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", &check_path]);
+        let count = cmd.output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok());
+        if count != Some(expected_frames) {
+            log::warn!("Smart render produced {:?} frames, expected {}", count, expected_frames);
+            return false;
+        }
+        joins.iter().all(|&j| {
+            let mut cmd = Command::new(&ffmpeg);
+            #[cfg(windows)]
+            hide_console_window(&mut cmd);
+            cmd.args(["-v", "error", "-ss", &format!("{:.6}", (j - 1.0).max(0.0)), "-i", &check_path, "-t", "2", "-map", "0:v:0", "-f", "null", "-"]);
+            match cmd.output() {
+                Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stderr).trim().is_empty(),
+                Err(_) => false,
+            }
+        })
+    })
+    .await?;
+    if !ok {
+        log::warn!("Smart render's result didn't verify - falling back to a full render");
+        let _ = std::fs::remove_file(&written);
+        return Ok(None);
+    }
+    Ok(Some(written))
+}
+
 // Renders the edited (trimmed/split/reordered) video described by `segments` - an ordered list
 // of the *kept* time ranges, each independently naming which source file it comes from, produced
 // by VideoTimelineDocker's trim handles, split+delete tool, and drag-to-reorder/drag-in - to a
@@ -4915,7 +5697,7 @@ pub async fn export_trimmed_video(
     // "high", or "small" - the encode speed/CRF trade-off the Save button's quality picker offers.
     quality: Option<String>,
     // Overrides the default "<output_base_path's name> (edited).<ext>" location - set when the
-    // user picks a destination via the Save button's "Choose location…" option. Still runs through
+    // user picks a destination via the Save button's "Choose locationâ€¦" option. Still runs through
     // unique_output_path (run_conversion) the same as the default location does, so a second export
     // to the exact same custom path doesn't clobber the first.
     output_path: Option<String>,
@@ -4974,11 +5756,14 @@ pub async fn export_trimmed_video(
     };
 
     // An image segment is a single still looped into a constant-rate stream long enough to cover
-    // its own [start,end) window - trim= below then cuts it exactly like a video segment.
+    // its own [start,end) window plus any transition tail out of it - trim= below then cuts it
+    // exactly like a video segment.
     let mut inputs: Vec<InputSpec> = segments
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             if is_still_image_path(&s.source_path) {
+                let tail = segments.get(i + 1).and_then(transition_window).map(|d| tail_source_seconds(s, d)).unwrap_or(0.0);
                 InputSpec {
                     path: s.source_path.clone(),
                     pre_args: vec![
@@ -4987,7 +5772,7 @@ pub async fn export_trimmed_video(
                         "-framerate".into(),
                         format!("{}", IMAGE_SEGMENT_FPS),
                         "-t".into(),
-                        format!("{:.3}", s.end + 0.5),
+                        format!("{:.3}", s.end + tail + 0.5),
                     ],
                 }
             } else {
@@ -5037,10 +5822,10 @@ pub async fn export_trimmed_video(
             }
         };
         temp_overlay_paths.push(path.clone());
-        // -loop 1 turns the single PNG frame into a looped stream; -t caps it at the *whole*
-        // output's duration rather than just this overlay's own [start,end) window - the overlay
-        // filter's own enable='between(t,start,end)' below is what actually gates when it's
-        // visible, so the input stream itself doesn't need to be time-shifted to line up.
+        // -loop 1 turns the single PNG into a stream that lasts only as long as the overlay is on
+        // screen; the graph shifts it to start at start_time (like a frame sequence). Looping it
+        // for the whole output instead decoded the PNG at 30fps for the entire video, per
+        // overlay - most of that only to be hidden by the overlay's enable window.
         inputs.push(InputSpec {
             path: path.to_string_lossy().to_string(),
             pre_args: vec![
@@ -5049,7 +5834,7 @@ pub async fn export_trimmed_video(
                 "-framerate".into(),
                 format!("{}", OVERLAY_INPUT_FPS),
                 "-t".into(),
-                format!("{:.3}", total_duration.max(0.01)),
+                format!("{:.3}", (ov.end_time - ov.start_time).clamp(0.01, total_duration.max(0.01)) + 0.1),
             ],
         });
     }
@@ -5075,13 +5860,17 @@ pub async fn export_trimmed_video(
                 };
                 temp_overlay_paths.push(path.clone());
                 let input_index = inputs.len();
+                // Only for the region's own window (shifted into place in the graph) - see the
+                // overlay PNGs above.
                 inputs.push(InputSpec {
                     path: path.to_string_lossy().to_string(),
                     pre_args: vec![
                         "-loop".into(),
                         "1".into(),
+                        "-framerate".into(),
+                        format!("{}", OVERLAY_INPUT_FPS),
                         "-t".into(),
-                        format!("{:.3}", total_duration.max(0.01)),
+                        format!("{:.3}", (bv.end_time - bv.start_time).clamp(0.01, total_duration.max(0.01)) + 0.1),
                     ],
                 });
                 blur_mask_input_index.push(Some(input_index));
@@ -5098,8 +5887,12 @@ pub async fn export_trimmed_video(
     // there's no client-side rendering step for audio (see OverlayAudio's own doc comment), so
     // this just opens each track's original source file directly, atrim-ing into it in the filter
     // graph below rather than pre-shaping the input stream itself.
-    for audio_ov in &audio_overlays {
-        inputs.push(InputSpec::plain(audio_ov.source_path.clone()));
+    // Each seeks to just before the part it plays (see segment_input_seek), its trim re-timed to match.
+    let mut audio_overlays = audio_overlays;
+    for audio_ov in audio_overlays.iter_mut() {
+        let seek = trim_input_seek(audio_ov.trim_start);
+        audio_ov.trim_start -= seek;
+        inputs.push(seeking_input(audio_ov.source_path.clone(), seek));
     }
 
     // PiP sources come last (after audio overlays) so audio_input_base's own formula further down
@@ -5107,8 +5900,11 @@ pub async fn export_trimmed_video(
     // them. Each gets the FULL source file as its own `-i` (no -loop/-t pre_args, unlike the image/
     // blur PNGs above) since pip_overlay_chain's own `trim=` does the windowing instead.
     let pip_input_base = inputs.len();
-    for pip in &pip_overlays {
-        inputs.push(InputSpec::plain(pip.source_path.clone()));
+    let mut pip_overlays = pip_overlays;
+    for pip in pip_overlays.iter_mut() {
+        let seek = trim_input_seek(pip.trim_start);
+        pip.trim_start -= seek;
+        inputs.push(seeking_input(pip.source_path.clone(), seek));
     }
 
     // Written next to the overlay PNGs (and cleaned up by the same loop once the export finishes).
@@ -5165,6 +5961,47 @@ pub async fn export_trimmed_video(
     // before this feature existed.
     let has_transitions = segments.iter().skip(1).any(|s| s.transition_in.is_some());
 
+    // Plain cuts (nothing drawn, nothing re-timed or re-coloured) keep the source's own video
+    // wherever whole GOPs survive - smart_render_export. "small" asks for recompression, so it
+    // still re-encodes. Anything smart render can't do (or can't verify) falls through to the
+    // normal render below.
+    let plain_cuts = !has_video_overlays
+        && !has_blur_overlays
+        && !has_audio_overlays
+        && !has_pip_overlays
+        && !has_clip_effects
+        && !has_transitions
+        && captions_ass_path.is_none()
+        && output_frame.is_none()
+        && quality.as_deref() != Some("small");
+    if plain_cuts {
+        let ffprobe_path = get_ffprobe_path(&app_handle)?;
+        let mut has_audio = Vec::with_capacity(segments.len());
+        for seg in &segments {
+            let (probe, path) = (ffprobe_path.clone(), seg.source_path.clone());
+            has_audio.push(blocking(move || probe_has_audio(&probe, &path)).await?);
+        }
+        let smart = smart_render_export(&app_handle, &window, &state, &segments, &has_audio, effective_video_volume, &output_base_path, output.clone()).await;
+        match smart {
+            Ok(Some(path)) => {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                if let Some(target) = loudness_lufs {
+                    normalize_loudness(&app_handle, &path, target).await?;
+                }
+                return Ok(path);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(e);
+            }
+        }
+    }
+
     let owned_args: Vec<String> = if segments.len() == 1
         && !has_video_overlays
         && !has_blur_overlays
@@ -5178,17 +6015,14 @@ pub async fn export_trimmed_video(
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
         let seg = &segments[0];
+        // Seeks on the INPUT (keyframe, then frame-exact): as output options -ss/-to decoded the
+        // whole file up to the cut first.
+        if seg.start > 0.0 {
+            inputs[0].pre_args = vec!["-ss".into(), format!("{:.6}", seg.start)];
+        }
         let mut args = vec![
-            "-ss".into(),
-            format!("{:.3}", seg.start),
-            "-to".into(),
-            format!("{:.3}", seg.end),
-            "-c:v".into(),
-            "libx264".into(),
-            "-preset".into(),
-            quality_preset.into(),
-            "-crf".into(),
-            quality_crf.into(),
+            "-t".into(),
+            format!("{:.6}", (seg.end - seg.start).max(0.0)),
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
@@ -5202,6 +6036,45 @@ pub async fn export_trimmed_video(
         }
         args
     } else {
+        // Each segment's input seeks to just before what it uses, and its times are re-based on
+        // where that input now starts (segment_input_seek). After the stabilization analysis above,
+        // which reads the file itself at absolute times.
+        let ffmpeg_for_decode = get_ffmpeg_path(&app_handle)?;
+        let ffprobe_for_decode = get_ffprobe_path(&app_handle)?;
+        let mut decode_choice: HashMap<String, bool> = HashMap::new();
+        // Source seconds each file is read for - only a long read of a heavy source is worth racing.
+        let mut seconds_from: HashMap<String, f64> = HashMap::new();
+        for seg in &segments {
+            *seconds_from.entry(seg.source_path.clone()).or_default() += seg.end - seg.start;
+        }
+        for (i, seg) in segments.iter_mut().enumerate() {
+            // GPU decoding for heavy (1440p+) sources where it measurably wins on this machine -
+            // see services/hw_decoder.rs.
+            let worth_racing = seconds_from.get(&seg.source_path).copied().unwrap_or(0.0) >= crate::services::hw_decoder::MIN_SECONDS_TO_PROBE;
+            if !is_still_image_path(&seg.source_path) && worth_racing {
+                let hw = match decode_choice.get(&seg.source_path) {
+                    Some(&hw) => hw,
+                    None => {
+                        let (ffmpeg, ffprobe, path, at) = (ffmpeg_for_decode.clone(), ffprobe_for_decode.clone(), seg.source_path.clone(), seg.start);
+                        let hw = blocking(move || {
+                            crate::services::smart_render::probe_source(&ffprobe, &path)
+                                .is_some_and(|v| crate::services::hw_decoder::should_hw_decode(&ffmpeg, &path, &v.codec, v.width, v.height, at))
+                        })
+                        .await?;
+                        decode_choice.insert(seg.source_path.clone(), hw);
+                        hw
+                    }
+                };
+                if hw {
+                    inputs[i].pre_args.extend(["-hwaccel".into(), "auto".into()]);
+                }
+            }
+            let seek = segment_input_seek(seg);
+            if seek > 0.0 {
+                inputs[i].pre_args.extend(["-ss".into(), format!("{seek:.6}")]);
+                shift_segment_times(seg, seek);
+            }
+        }
         let mut filter = String::new();
         // Probed once up front (not per-branch) since all three shapes below - single segment,
         // plain concat, transition fold - need it: see audio_trim_chain's own doc comment for why.
@@ -5242,7 +6115,7 @@ pub async fn export_trimmed_video(
         // Falls back to a real probe only when the frontend didn't already resolve this AND some
         // segment actually needs it (crop/Ken Burns) - see probe_video_dimensions' own doc comment.
         let dimensions_probe_handle =
-            if (video_width.is_none() || video_height.is_none()) && has_clip_effects {
+            if (video_width.is_none() || video_height.is_none()) && (has_clip_effects || has_transitions) {
                 let ffprobe_path = ffprobe_path.clone();
                 // A real video's size beats a photo's as the output frame - photos come in any
                 // size/orientation, and an odd dimension would also break yuv420p encoding.
@@ -5290,17 +6163,37 @@ pub async fn export_trimmed_video(
             _ if has_image_segments => (Some(1920), Some(1080)),
             other => other,
         };
+        // Ken Burns clocks itself by its source's own frame rate (ken_burns_chain) - one probe per
+        // file that has one; a still is looped at IMAGE_SEGMENT_FPS.
+        let mut kb_rates: HashMap<String, f64> = HashMap::new();
+        for seg in segments.iter_mut().filter(|s| s.ken_burns.is_some()) {
+            let rate = if is_still_image_path(&seg.source_path) {
+                IMAGE_SEGMENT_FPS
+            } else if let Some(rate) = kb_rates.get(&seg.source_path) {
+                *rate
+            } else {
+                let (ffprobe_path, source_path) = (ffprobe_path.clone(), seg.source_path.clone());
+                let rate = blocking(move || probe_frame_rate(&ffprobe_path, &source_path)).await?;
+                kb_rates.insert(seg.source_path.clone(), rate);
+                rate
+            };
+            seg.source_fps = Some(rate);
+        }
         // Every segment gets fitted to the output frame once sources can differ in size - an
         // image anywhere, or clips from more than one file. A single-file timeline keeps its
         // exact pre-existing filter graph.
-        let fit_frame = has_image_segments || unique_source_paths.len() > 1;
+        // Transitions are drawn at the output size (transition_window_graph), so with any, every
+        // segment is fitted to it too - exactly that size, frame for frame (a no-op scale for a
+        // source already that size).
+        let fit_frame = has_image_segments || unique_source_paths.len() > 1 || (has_transitions && video_width.is_some() && video_height.is_some());
 
         // Base video (trim, or trim+concat) always lands in a [base] node so the overlay chain
         // below has one consistent label to start from regardless of how many segments there were.
         if segments.len() == 1 {
             let seg = &segments[0];
             let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[0].as_deref(), stab_paths[0].as_deref());
-            filter.push_str(&format!("{}[base];", segment_video_chain("[0:v]", seg, &extra)));
+            let (end, vignette) = segment_vignette(seg, video_width, video_height, "base", 0);
+            filter.push_str(&format!("{}[{end}];{vignette}", segment_video_chain("[0:v]", seg, &extra)));
             filter.push_str(&segment_audio_chain(
                 segment_has_audio[0],
                 0,
@@ -5317,7 +6210,8 @@ pub async fn export_trimmed_video(
             let mut concat_inputs = String::new();
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref());
-                filter.push_str(&format!("{}[v{i}];", segment_video_chain(&format!("[{i}:v]"), seg, &extra)));
+                let (end, vignette) = segment_vignette(seg, video_width, video_height, &format!("v{i}"), i);
+                filter.push_str(&format!("{}[{end}];{vignette}", segment_video_chain(&format!("[{i}:v]"), seg, &extra)));
                 filter.push_str(&segment_audio_chain(
                     segment_has_audio[i],
                     i,
@@ -5362,11 +6256,34 @@ pub async fn export_trimmed_video(
             // the bundled ffmpeg). Pinning every segment to AVTB makes all fold steps agree.
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref());
-                filter.push_str(&format!(
-                    "{},fps={:.3},settb=AVTB[v{i}];",
-                    segment_video_chain(&format!("[{i}:v]"), seg, &extra),
-                    target_fps
-                ));
+                // A transition into the next clip plays this one's tail handle (transition_tail):
+                // read past the cut, then split the tail off as [old{i+1}].
+                match segments.get(i + 1).and_then(transition_window) {
+                    Some(d) => {
+                        let (end, vignette) = segment_vignette(seg, video_width, video_height, &format!("full{i}"), i);
+                        filter.push_str(&format!(
+                            "{},fps={:.3},settb=AVTB[{end}];{vignette}",
+                            segment_video_chain_with_tail(&format!("[{i}:v]"), seg, &extra, tail_source_seconds(seg, d)),
+                            target_fps
+                        ));
+                        filter.push_str(&transition_tail(
+                            &format!("full{i}"),
+                            &format!("v{i}"),
+                            &format!("old{}", i + 1),
+                            segment_output_duration(seg),
+                            d,
+                            target_fps,
+                        ));
+                    }
+                    None => {
+                        let (end, vignette) = segment_vignette(seg, video_width, video_height, &format!("v{i}"), i);
+                        filter.push_str(&format!(
+                            "{},fps={:.3},settb=AVTB[{end}];{vignette}",
+                            segment_video_chain(&format!("[{i}:v]"), seg, &extra),
+                            target_fps
+                        ));
+                    }
+                }
                 filter.push_str(&segment_audio_chain(
                     segment_has_audio[i],
                     i,
@@ -5394,7 +6311,7 @@ pub async fn export_trimmed_video(
                     .filter(|tr| tr.duration > 0.0)
                     .map(|tr| (sanitize_transition_name(&tr.transition_type), tr.duration));
                 let look = seg.transition_in.as_ref().and_then(|tr| tr.look.as_ref());
-                let (step, next_v, next_a) = transition_fold_step(&cur_v, &cur_a, i, accumulated, seg_dur, target_fps, transition, look);
+                let (step, next_v, next_a) = transition_fold_step(&cur_v, &cur_a, i, accumulated, seg_dur, target_fps, video_width.zip(video_height), transition, look);
                 filter.push_str(&step);
                 accumulated += seg_dur;
                 cur_v = next_v;
@@ -5446,8 +6363,8 @@ pub async fn export_trimmed_video(
                 None => {
                     let blurred_label = format!("bb{}blur", i);
                     filter.push_str(&format!(
-                        "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1[{}];",
-                        src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, blurred_label
+                        "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1:enable='{}'[{}];",
+                        src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, blur_window(bv), blurred_label
                     ));
                     blurred_label
                 }
@@ -5456,12 +6373,12 @@ pub async fn export_trimmed_video(
                     let mask_gray_label = format!("bb{}maskgray", i);
                     let masked_label = format!("bb{}masked", i);
                     filter.push_str(&format!(
-                        "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1,format=rgba[{}];",
-                        src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, cropped_label
+                        "[{}]crop=w={}:h={}:x={}:y={},boxblur=luma_radius={}:luma_power=1:chroma_radius={}:chroma_power=1:enable='{}',format=rgba[{}];",
+                        src_label, bv.width, bv.height, bv.x, bv.y, radius, radius, blur_window(bv), cropped_label
                     ));
                     filter.push_str(&format!(
-                        "[{}:v]format=gray[{}];",
-                        mask_input, mask_gray_label
+                        "[{}:v]format=gray,setpts=PTS-STARTPTS+{:.4}/TB[{}];",
+                        mask_input, bv.start_time, mask_gray_label
                     ));
                     filter.push_str(&format!(
                         "[{}][{}]alphamerge[{}];",
@@ -5488,11 +6405,10 @@ pub async fn export_trimmed_video(
         let overlay_input_base = segments.len();
         for (i, ov) in overlays.iter().enumerate() {
             let mut source_label = format!("{}:v", overlay_input_base + i);
-            // A frame sequence starts at timestamp 0 - shifted to start at the overlay's own
-            // start_time, so everything below (fade st=, opacity's T, the enable window) reads the
-            // same absolute output times it does for a looped still.
-            let is_sequence = ov.frames.is_some();
-            if is_sequence {
+            // Every overlay input (a frame sequence, or a still looped for its own window) starts
+            // at timestamp 0 - shifted to start at the overlay's own start_time, so everything
+            // below (fade st=, the opacity commands, the enable window) reads absolute output times.
+            {
                 let shifted = format!("ovseq{}", i);
                 filter.push_str(&format!(
                     "[{}]format=rgba,setpts=PTS-STARTPTS+{:.4}/TB[{}];",
@@ -5502,10 +6418,12 @@ pub async fn export_trimmed_video(
             }
             let animation = sanitize_overlay_animation(&ov.animation);
             let composited_label = if animation == "fade" {
+                // The preview's ramp: 0.4s, or half the overlay's length if that's shorter.
+                let ramp = overlay_animation_ramp(ov.start_time, ov.end_time);
                 let faded_label = format!("ovfade{}", i);
-                let fade_out_start = (ov.end_time - 0.4).max(ov.start_time);
+                let fade_out_start = (ov.end_time - ramp).max(ov.start_time);
                 filter.push_str(&format!(
-                    "[{}]fade=in:st={:.3}:d=0.4:alpha=1,fade=out:st={:.3}:d=0.4:alpha=1[{}];",
+                    "[{}]fade=in:st={:.3}:d={ramp:.4}:alpha=1,fade=out:st={:.3}:d={ramp:.4}:alpha=1[{}];",
                     source_label, ov.start_time, fade_out_start, faded_label
                 ));
                 faded_label
@@ -5514,44 +6432,51 @@ pub async fn export_trimmed_video(
             };
             let (mut x_expr, mut y_expr) = overlay_position_expr(ov, animation);
             let mut composited_label = composited_label;
-            if let Some(kfs) = ov.keyframes.as_ref().filter(|k| !k.is_empty()) {
-                // Keyframed motion: scale (per frame, by frame number), opacity (per pixel, by
-                // time) and position - scaling about the box's centre, as the preview does.
-                let scales = kfs.iter().any(|k| (k.scale - 1.0).abs() > 1e-3);
-                let fades = kfs.iter().any(|k| (k.opacity - 1.0).abs() > 1e-3);
-                if scales {
-                    // `n` counts this input's frames: from output time 0 for a looped still, from
-                    // start_time for a (shifted) frame sequence.
-                    let frame_time = if is_sequence {
-                        format!("({:.4}+n/{})", ov.start_time, OVERLAY_INPUT_FPS)
-                    } else {
-                        format!("(n/{})", OVERLAY_INPUT_FPS)
-                    };
-                    let s = keyframe_expr(kfs, &frame_time, |k| k.scale.max(0.01));
-                    let scaled = format!("ovkfs{}", i);
-                    filter.push_str(&format!(
-                        "[{composited_label}]scale=w='max(2,trunc(iw*({s})/2)*2)':h='max(2,trunc(ih*({s})/2)*2)':eval=frame[{scaled}];"
-                    ));
-                    composited_label = scaled;
+            let kfs = ov.keyframes.as_ref().filter(|k| !k.is_empty());
+            let pops = animation == "pop";
+            let kf_scales = kfs.is_some_and(|kfs| kfs.iter().any(|k| (k.scale - 1.0).abs() > 1e-3));
+            // The overlay's scale over time in `tv`: its keyframed scale times pop's overshoot -
+            // the preview multiplies the two the same way (the box's scale() transform inside the
+            // keyframe layer's). None when it never scales.
+            let scale_at = |tv: &str| -> Option<String> {
+                let kf = kfs.filter(|_| kf_scales).map(|kfs| keyframe_expr(kfs, tv, |k| k.scale.max(0.01)));
+                let pop = pops.then(|| overlay_pop_scale_expr(ov.start_time, ov.end_time, tv));
+                match (kf, pop) {
+                    (Some(a), Some(b)) => Some(format!("({a})*({b})")),
+                    (a, b) => a.or(b),
                 }
-                if fades {
-                    let o = keyframe_expr(kfs, "T", |k| k.opacity.clamp(0.0, 1.0));
+            };
+            // Scale per frame - `n` counts this input's frames, which start at start_time.
+            let frame_time = format!("({:.4}+n/{})", ov.start_time, OVERLAY_INPUT_FPS);
+            if let Some(s) = scale_at(&frame_time) {
+                let scaled = format!("ovkfs{}", i);
+                filter.push_str(&format!(
+                    "[{composited_label}]scale=w='max(2,trunc(iw*({s})/2)*2)':h='max(2,trunc(ih*({s})/2)*2)':eval=frame[{scaled}];"
+                ));
+                composited_label = scaled;
+            }
+            if let Some(kfs) = kfs {
+                // Keyframed opacity: one alpha factor per frame (opacity_commands), applied by
+                // colorchannelmixer - a multiply per pixel, where the per-pixel expression it
+                // replaces (geq) cost ~1µs a pixel.
+                if kfs.iter().any(|k| (k.opacity - 1.0).abs() > 1e-3) {
                     let faded = format!("ovkfa{}", i);
                     filter.push_str(&format!(
-                        "[{composited_label}]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({o})'[{faded}];"
+                        "[{composited_label}]format=rgba,{},colorchannelmixer@ka{i}=aa=1[{faded}];",
+                        opacity_commands(kfs, &format!("colorchannelmixer@ka{i}"), ov.start_time, ov.end_time)
                     ));
                     composited_label = faded;
                 }
-                let x = keyframe_expr(kfs, "t", |k| k.x);
-                let y = keyframe_expr(kfs, "t", |k| k.y);
-                if scales {
-                    let s = keyframe_expr(kfs, "t", |k| k.scale.max(0.01));
-                    x_expr = format!("({x})+overlay_w*(1/({s})-1)/2");
-                    y_expr = format!("({y})+overlay_h*(1/({s})-1)/2");
-                } else {
-                    x_expr = x;
-                    y_expr = y;
-                }
+                // A slide still plays on top of keyframed motion, as in the preview: its offset
+                // from the resting spot is added to the keyframed position.
+                let (slide_x, slide_y) = overlay_slide_offset_expr(ov, animation);
+                x_expr = format!("({})+({slide_x})", keyframe_expr(kfs, "t", |k| k.x));
+                y_expr = format!("({})+({slide_y})", keyframe_expr(kfs, "t", |k| k.y));
+            }
+            if let Some(s) = scale_at("t") {
+                // Scaled about the box's centre, as the preview does.
+                x_expr = format!("({x_expr})+overlay_w*(1/({s})-1)/2");
+                y_expr = format!("({y_expr})+overlay_h*(1/({s})-1)/2");
             }
             let next_label = if i + 1 == overlays.len() {
                 "outv".to_string()
@@ -5729,20 +6654,24 @@ pub async fn export_trimmed_video(
         // Trailing `;` is harmless to ffmpeg either way, but trimmed for consistency with how the
         // original concat-only filter string here was always built without one.
         let filter = filter.trim_end_matches(';').to_string();
+        // A long graph (many clips, transitions' per-frame commands, keyframed overlays) goes to
+        // ffmpeg as a script file: Windows caps a whole command line at 32,767 characters.
+        let (graph_flag, graph_arg) = if filter.len() > 8000 {
+            let script = std::env::temp_dir().join(format!("briefcast_graph_{}.txt", std::process::id()));
+            std::fs::write(&script, &filter).map_err(|e| format!("Failed to write the export's filter graph: {}", e))?;
+            temp_overlay_paths.push(script.clone());
+            ("-filter_complex_script", script.to_string_lossy().to_string())
+        } else {
+            ("-filter_complex", filter)
+        };
 
         vec![
-            "-filter_complex".into(),
-            filter,
+            graph_flag.into(),
+            graph_arg,
             "-map".into(),
             "[outv]".into(),
             "-map".into(),
             format!("[{}]", audio_label),
-            "-c:v".into(),
-            "libx264".into(),
-            "-preset".into(),
-            quality_preset.into(),
-            "-crf".into(),
-            quality_crf.into(),
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
@@ -5751,18 +6680,28 @@ pub async fn export_trimmed_video(
             "+faststart".into(),
         ]
     };
-    let codec_args: Vec<&str> = owned_args.iter().map(|s| s.as_str()).collect();
 
-    let result = run_conversion(
-        &app_handle,
-        &window,
-        &state,
-        &inputs,
-        &output_base_path,
-        output,
-        &codec_args,
-    )
-    .await;
+    // The video encoder: this machine's proven hardware encoder at the tier's calibrated quality
+    // (HwEncoding::export_args - same picture as x264, many times faster), else software x264.
+    // A hardware encode that fails for any reason other than the user cancelling is re-run in
+    // software, so a flaky driver costs time, never the export.
+    let software: Vec<String> = ["-c:v", "libx264", "-preset", quality_preset, "-crf", quality_crf].iter().map(|s| s.to_string()).collect();
+    let tier = quality.clone().unwrap_or_default();
+    let ffmpeg_for_probe = get_ffmpeg_path(&app_handle)?;
+    let hardware = blocking(move || crate::services::hw_encoder::detect(&ffmpeg_for_probe)).await?.and_then(|hw| hw.export_args(&tier));
+    let encoders: Vec<Vec<String>> = hardware.into_iter().chain(std::iter::once(software)).collect();
+    let output_seconds: f64 = segments.iter().map(segment_output_duration).sum();
+
+    let mut result = Err("No encoder to run".to_string());
+    for (attempt, video_encoder) in encoders.iter().enumerate() {
+        let codec_args: Vec<&str> = owned_args.iter().chain(video_encoder.iter()).map(|s| s.as_str()).collect();
+        result = run_conversion_timed(&app_handle, &window, &state, &inputs, &output_base_path, output.clone(), &codec_args, Some(output_seconds)).await;
+        let cancelled = state.cancelled.load(std::sync::atomic::Ordering::SeqCst);
+        if result.is_ok() || cancelled || attempt + 1 == encoders.len() {
+            break;
+        }
+        log::warn!("Hardware export encode failed, re-running in software: {:?}", result.as_ref().err());
+    }
 
     for temp_path in &temp_overlay_paths {
         let _ = std::fs::remove_file(temp_path);
@@ -6017,6 +6956,9 @@ pub async fn extract_clip_audio(
 #[tauri::command]
 pub async fn cancel_conversion(state: State<'_, ConversionState>) -> Result<(), String> {
     let mut active_process = state.active_process.lock().await;
+    // Always raised: a smart render's parallel jobs (run_smart_jobs) watch this flag rather than
+    // one tracked process.
+    state.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
 
     if let Some(pid) = active_process.take() {
         #[cfg(windows)]
@@ -6040,7 +6982,8 @@ pub async fn cancel_conversion(state: State<'_, ConversionState>) -> Result<(), 
 
         Ok(())
     } else {
-        Err("No active conversion to cancel".to_string())
+        // Nothing tracked by pid - a smart render in progress stops on the flag set above.
+        Ok(())
     }
 }
 
@@ -6690,6 +7633,7 @@ mod tests {
             stabilize: None,
             speed_steps: None,
             muted: None,
+            source_fps: None,
         }
     }
 
@@ -6836,9 +7780,18 @@ mod tests {
     }
 
     #[test]
+    fn pop_scales_from_nothing_past_full_size_and_back() {
+        let s = overlay_pop_scale_expr(1.0, 3.0, "t");
+        // The preview's ease-out-back over a 0.4s ramp at each end.
+        assert!(s.contains("clip(min((t-1.000)/0.4000,(3.000-t)/0.4000),0,1)") && s.contains("2.70158*pow("), "{s}");
+        // A very short overlay ramps over half its length, as the preview does.
+        assert!(overlay_pop_scale_expr(1.0, 1.5, "t").contains("/0.2500"));
+    }
+
+    #[test]
     fn sanitize_overlay_animation_passes_through_allowed_values_only() {
         assert_eq!(sanitize_overlay_animation("slide-left"), "slide-left");
-        assert_eq!(sanitize_overlay_animation("pop"), "none"); // "pop" is preview-only, never sent
+        assert_eq!(sanitize_overlay_animation("pop"), "pop"); // burned in as a per-frame scale
         assert_eq!(sanitize_overlay_animation("anything-else"), "none");
     }
 
@@ -6880,26 +7833,92 @@ mod tests {
     }
 
     #[test]
-    fn color_filter_chain_bw_at_full_intensity_fully_desaturates() {
+    fn color_filter_chain_bw_at_full_intensity_is_css_grayscale() {
         let cf = ClipColorFilter {
             preset: "bw".to_string(),
             intensity: 1.0,
         };
-        assert_eq!(color_filter_chain(&cf), ",eq=saturation=0.000");
+        // CSS grayscale(1): every channel = 0.2126 R + 0.7152 G + 0.0722 B.
+        let chain = color_filter_chain(&cf);
+        assert!(chain.starts_with(",format=rgba,colorchannelmixer=rr=0.212600:rg=0.715200:rb=0.072200:ra=0.000000:gr=0.212600:"), "{chain}");
+        assert!(chain.ends_with(":aa=1,format=yuv420p"), "{chain}");
     }
 
     #[test]
     fn color_filter_chain_clamps_out_of_range_intensity() {
-        let over = ClipColorFilter {
-            preset: "bw".to_string(),
-            intensity: 5.0,
-        };
-        let under = ClipColorFilter {
-            preset: "bw".to_string(),
-            intensity: -5.0,
-        };
-        assert_eq!(color_filter_chain(&over), ",eq=saturation=0.000"); // clamped to 1.0
-        assert_eq!(color_filter_chain(&under), ",eq=saturation=1.000"); // clamped to 0.0
+        let over = ClipColorFilter { preset: "bw".to_string(), intensity: 5.0 };
+        let full = ClipColorFilter { preset: "bw".to_string(), intensity: 1.0 };
+        assert_eq!(color_filter_chain(&over), color_filter_chain(&full)); // clamped to 1.0
+        // Clamped to 0: grayscale(0) is the identity.
+        let under = ClipColorFilter { preset: "bw".to_string(), intensity: -5.0 };
+        assert!(color_filter_chain(&under).contains("rr=1.000000:rg=0.000000:rb=0.000000:ra=0.000000"), "{}", color_filter_chain(&under));
+    }
+
+    #[test]
+    fn css_color_ops_compose_like_the_browser() {
+        // contrast then saturate: M = S*C, o = S*(0.5-0.5c) - an affine map, applied in one pass.
+        let (m, o) = compose_css_color_ops(&[CssColorOp::Contrast(2.0), CssColorOp::Saturate(1.0)]);
+        assert!((m[0][0] - 2.0).abs() < 1e-9 && m[0][1].abs() < 1e-9 && (o[0] + 0.5).abs() < 1e-9);
+        // A grey stays grey through any saturate / hue-rotate (their rows sum to 1).
+        let (m, o) = compose_css_color_ops(&[CssColorOp::Saturate(1.6), CssColorOp::HueRotate(37.0)]);
+        for r in 0..3 {
+            assert!(((m[r][0] + m[r][1] + m[r][2]) * 0.4 + o[r] - 0.4).abs() < 1e-6);
+        }
+        // Every preset at zero intensity is the identity (only cinematic's fixed hue nudge isn't).
+        for preset in ["vibrant", "bw", "warm", "cool"] {
+            let chain = color_filter_chain(&ClipColorFilter { preset: preset.to_string(), intensity: 0.0 });
+            assert!(chain.contains("rr=1.000000:rg=0.000000:rb=0.000000:ra=0.000000:gr=0.000000:gg=1.000000"), "{preset}: {chain}");
+        }
+    }
+
+    #[test]
+    fn a_vignette_is_a_layer_over_the_finished_frame() {
+        let mut seg = base_segment();
+        seg.color_filter = Some(ClipColorFilter { preset: "vignette".to_string(), intensity: 1.0 });
+        let (end, graph) = segment_vignette(&seg, Some(1280), Some(720), "v2", 2);
+        assert_eq!(end, "v2nv");
+        assert!(graph.starts_with("color=black:s=320x180:") && graph.ends_with("[v2nv][vig2]overlay=shortest=1:format=auto[v2];"), "{graph}");
+        // Not a colour map, and without a frame size, ffmpeg's own vignette.
+        assert_eq!(color_filter_chain(seg.color_filter.as_ref().unwrap()), "");
+        assert!(segment_effect_chain(&seg, None, None, false, None, None).contains(",vignette="));
+        assert!(!segment_effect_chain(&seg, Some(1280), Some(720), false, None, None).contains("vignette"));
+    }
+
+    #[test]
+    fn segments_seek_to_just_before_what_they_use() {
+        let mut seg = base_segment();
+        seg.start = 600.0;
+        seg.end = 620.0;
+        assert_eq!(segment_input_seek(&seg), 599.0);
+        // A noise sample earlier in the file pulls the seek back to it.
+        seg.audio_cleanup = Some(AudioCleanup { noise_sample: Some(NoiseSample { start: 100.0, end: 101.0 }), ..Default::default() });
+        assert_eq!(segment_input_seek(&seg), 99.0);
+        seg.speed_steps = Some(vec![SpeedStep { source_start: 600.0, source_end: 610.0, speed: 2.0 }]);
+        shift_segment_times(&mut seg, 99.0);
+        assert_eq!((seg.start, seg.end), (501.0, 521.0));
+        assert_eq!(seg.speed_steps.as_ref().unwrap()[0].source_start, 501.0);
+        let sample = seg.audio_cleanup.as_ref().unwrap().noise_sample.unwrap();
+        assert_eq!((sample.start, sample.end), (1.0, 2.0));
+        // Near the file's start, and stills: no seek.
+        seg.start = 0.4;
+        seg.audio_cleanup = None;
+        assert_eq!(segment_input_seek(&seg), 0.0);
+        seg.source_path = "photo.jpg".into();
+        seg.start = 300.0;
+        assert_eq!(segment_input_seek(&seg), 0.0);
+        assert_eq!(trim_input_seek(42.5), 41.5);
+        assert_eq!(trim_input_seek(0.3), 0.0);
+    }
+
+    #[test]
+    fn keyframed_opacity_is_per_frame_commands_only_where_it_changes() {
+        let kf = |time: f64, opacity: f64| OverlayKeyframe { time, x: 0.0, y: 0.0, scale: 1.0, opacity, easing: "linear".into() };
+        let cmds = opacity_commands(&[kf(10.0, 0.0), kf(11.0, 1.0)], "colorchannelmixer@ka0", 10.0, 60.0);
+        assert!(cmds.starts_with("sendcmd=c='10.0000 colorchannelmixer@ka0 aa 0.0000;"), "{cmds}");
+        assert!(cmds.ends_with("11.0000 colorchannelmixer@ka0 aa 1.0000'"), "{cmds}");
+        // 31 frames across the fade, nothing for the 49s it then holds.
+        assert_eq!(cmds.matches("aa ").count(), 31, "{cmds}");
+        assert!((keyframe_value(&[kf(0.0, 0.0), kf(2.0, 1.0)], 0.5, |k| k.opacity) - 0.25).abs() < 1e-9);
     }
 
     #[test]
@@ -6942,7 +7961,22 @@ mod tests {
             target_y: None,
             span: None,
         };
-        assert_eq!(ken_burns_chain(&kb, 5.0, 1920, 1080), "");
+        assert_eq!(ken_burns_chain(&kb, 5.0, 1920, 1080, 30.0), "");
+    }
+
+    #[test]
+    fn every_ken_burns_motion_animates_per_frame_on_the_source_clock() {
+        for preset in [
+            "zoom-in", "zoom-out", "pan-left", "pan-right", "pan-up", "pan-down", "push", "punch-in", "bounce-in", "drift", "sway", "float", "breathe", "pulse",
+            "shake", "vibrate",
+        ] {
+            let kb = ClipKenBurns { preset: preset.to_string(), intensity: Some(0.7), target_x: None, target_y: None, span: None };
+            let chain = ken_burns_chain(&kb, 4.0, 1280, 720, 29.97);
+            // Held to the source rate first, so the frame number is an exact clock.
+            assert!(chain.starts_with(",fps=29.9700,perspective=x0='"), "{preset}: {chain}");
+            assert!(chain.contains("(in-1)/29.9700/4.0000") && chain.contains(":eval=frame"), "{preset}: {chain}");
+            assert!(chain.ends_with(",scale=1280:720"), "{preset}: {chain}");
+        }
     }
 
     #[test]
@@ -6954,10 +7988,10 @@ mod tests {
             target_y: None,
             span: None,
         };
-        let chain = ken_burns_chain(&kb, 5.0, 1920, 1080);
+        let chain = ken_burns_chain(&kb, 5.0, 1920, 1080, 30.0);
         assert!(
-            chain.starts_with(",crop="),
-            "expected a crop expression, got: {chain}"
+            chain.contains(",perspective="),
+            "expected a per-frame perspective window, got: {chain}"
         );
         assert!(
             chain.ends_with(",scale=1920:1080"),
@@ -6974,8 +8008,8 @@ mod tests {
             target_y: None,
             span: Some([0.5, 1.0]),
         };
-        let chain = ken_burns_chain(&kb, 4.0, 1920, 1080);
-        assert!(chain.contains("(0.500000+0.500000*min(t/4.000,1))"), "{chain}");
+        let chain = ken_burns_chain(&kb, 4.0, 1920, 1080, 30.0);
+        assert!(chain.contains("(0.500000+0.500000*min((in-1)/30.0000/4.0000,1))"), "{chain}");
     }
 
     #[test]
@@ -7022,7 +8056,7 @@ mod tests {
         });
         let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None);
         let hflip_pos = chain.find("hflip").expect("hflip missing");
-        let color_pos = chain.find("eq=saturation").expect("color filter missing");
+        let color_pos = chain.find("colorchannelmixer").expect("color filter missing");
         let crop_pos = chain.find("crop=").expect("crop missing");
         assert!(
             hflip_pos < color_pos && color_pos < crop_pos,
@@ -7392,88 +8426,249 @@ mod tests {
     // ---- transition_fold_step ------------------------------------------------------------------
 
     #[test]
-    fn transition_holds_the_outgoing_frame_and_starts_where_it_ends() {
-        let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("fade", 1.0)), None);
+    fn transition_draws_the_outgoing_tail_over_the_incoming_head() {
+        let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some((1920, 1080)), Some(("fade", 1.0)), None);
         assert_eq!((v.as_str(), a.as_str()), ("fold1v", "fold1a"));
-        assert!(step.contains("[v0]tpad=stop_mode=clone:stop_duration=1.000[hold1]"), "{step}");
-        assert!(step.contains("xfade=transition=fade:duration=1.000:offset=5.000"), "{step}");
-        assert!(step.contains("[a0][a1]concat=n=2:v=0:a=1[fold1a]"), "audio just cuts: {step}");
+        // The incoming clip's first second gets the transition, the rest follows untouched.
+        assert!(step.starts_with("[v1]split[vh1][vr1];[vh1]trim=end=1.000000[head1];[vr1]trim=start=1.000000,setpts=PTS-STARTPTS,fps=30.000[rest1];"), "{step}");
+        assert!(step.contains("[old1]format=yuva420p,fade=t=out:st=0:d=1.0000:alpha=1[oc1];[head1][oc1]overlay=eof_action=pass[tr1];"), "{step}");
+        // Pinned to the timeline's rate - an unknown one would reach the encoder as 25fps.
+        assert!(step.ends_with("[v0][tr1][rest1]concat=n=3:v=1:a=0,fps=30.000,settb=AVTB[fold1v];[a0][a1]concat=n=2:v=0:a=1[fold1a];"), "audio just cuts: {step}");
+        assert!(!step.contains("xfade"), "{step}");
+    }
+
+    #[test]
+    fn a_segment_reads_its_tail_handle_and_splits_it_off() {
+        let mut seg = base_segment();
+        seg.start = 2.0;
+        seg.end = 6.0;
+        seg.speed = Some(2.0);
+        // Plays on at its end speed: 0.5s of transition = 1s of source, plus slack.
+        assert!((tail_source_seconds(&seg, 0.5) - 1.1).abs() < 1e-9);
+        assert!(segment_video_chain_with_tail("[0:v]", &seg, "", 1.1).starts_with("[0:v]trim=start=2.000:end=7.100,"));
+        // Stabilized clips hold their last frame instead.
+        seg.stabilize = Some(StabilizeSettings { strength: 0.5 });
+        assert_eq!(tail_source_seconds(&seg, 0.5), 0.0);
+        let split = transition_tail("full0", "v0", "old1", 2.0, 0.5, 30.0);
+        assert!(split.starts_with("[full0]tpad=stop_mode=clone:stop_duration=0.500,split[full0m][full0t];"), "{split}");
+        assert!(split.contains("[full0m]trim=end=2.000000[v0];"), "{split}");
+        assert!(split.contains("[full0t]trim=start=2.000000,setpts=PTS-STARTPTS,fps=30.000,settb=AVTB,trim=end=0.500[old1];"), "{split}");
     }
 
     #[test]
     fn transition_is_capped_by_the_incoming_clip_only() {
         // A tiny first clip no longer limits the transition - it plays over the incoming clip.
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 0.5, 2.0, 30.0, Some(("wipeleft", 3.0)), None);
-        assert!(step.contains("duration=1.800:offset=0.500"), "{step}");
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 0.5, 2.0, 30.0, Some((1920, 1080)), Some(("wipeleft", 3.0)), None);
+        assert!(step.contains("[vh1]trim=end=1.800000[head1]"), "{step}");
     }
 
     #[test]
     fn no_transition_is_a_plain_concat() {
-        let (step, _, _) = transition_fold_step("fold1v", "fold1a", 2, 9.0, 4.0, 30.0, None, None);
+        let (step, _, _) = transition_fold_step("fold1v", "fold1a", 2, 9.0, 4.0, 30.0, Some((1920, 1080)), None, None);
         assert_eq!(step, "[fold1v][fold1a][v2][a2]concat=n=2:v=1:a=1[fold2v][fold2a];");
     }
 
     #[test]
-    fn light_leak_and_whip_add_a_glow_pass_over_the_transition_window() {
-        let (step, v, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("lightleak", 1.0)), None);
-        assert_eq!(v, "fold1v");
-        assert!(step.contains("xfade=transition=fade:duration=1.000:offset=5.000[xf1];"), "{step}");
-        assert!(step.contains("[xf1]format=yuv420p,geq="), "{step}");
-        assert!(step.contains("enable='between(t,5.000,6.000)'[fold1v];"), "{step}");
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("whip", 0.5)), None);
-        assert!(step.contains("xfade=transition=hblur"), "{step}");
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("horzopen", 0.5)), None);
-        assert!(step.contains("xfade=transition=horzopen") && !step.contains("geq"), "{step}");
-        assert_eq!(sanitize_transition_name("lightleak"), "lightleak");
+    fn every_transition_builds_a_window_and_unknown_sizes_crossfade() {
+        for name in ALLOWED_TRANSITIONS {
+            let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some((1280, 720)), Some((name, 0.6)), None);
+            assert!(step.contains("[tr1]") && step.contains("[old1]") && step.contains("[head1]"), "{name}: {step}");
+            assert!(!step.contains("xfade") && !step.contains("st(") && !step.contains("ld("), "{name}: {step}");
+        }
+        // No known frame size: drawing at the output size is impossible, so a plain crossfade.
+        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, None, Some(("pagecurl", 0.6)), None);
+        assert!(step.contains("[old1]format=yuva420p,fade=t=out") && !step.contains("geq"), "{step}");
     }
 
     #[test]
-    fn transition_looks_are_sanitized_into_the_glow() {
-        let look = TransitionLook {
-            color: Some("#3b82f6".to_string()),
+    fn per_frame_values_follow_the_preview_curves() {
+        // A whip's blur: sin(pi p) * 3% of the width, one command per frame of the window.
+        let blur = sendcmd_series("gblur@w1", &["sigma"], 0.5, 30.0, |p| (std::f64::consts::PI * p).sin() * 0.03 * 1000.0);
+        assert!(blur.starts_with("sendcmd=c='0.0000 gblur@w1 sigma 0.000;0.0333 gblur@w1 sigma 6.237;"), "{blur}");
+        assert!(blur.ends_with("0.5000 gblur@w1 sigma 0.000'"), "{blur}");
+        // Pixelize sets both block dimensions together.
+        let px = sendcmd_series("pixelize@p1", &["w", "h"], 0.1, 10.0, |_| 5.0);
+        // ...and only when it changes: a constant value is a single command.
+        assert_eq!(px, "sendcmd=c='0.0000 pixelize@p1 w 5.000,pixelize@p1 h 5.000'");
+        let step = transition_window_graph("whip", 1, 0.5, 30.0, (1000, 500), &TransitionLook::default());
+        assert!(step.contains("gblur@w1=sigma=0") && step.contains("overlay=x='-0.3*main_w*min(t/0.5000,1)'"), "{step}");
+    }
+
+    #[test]
+    fn transition_looks_are_parsed_never_interpolated_raw() {
+        let hostile = TransitionLook {
+            color: Some("'; drop".to_string()),
             intensity: Some(9.0),
             direction: Some("'; drop".to_string()),
             size: Some(1.0),
-            orientation: Some("vertical".to_string()),
+            orientation: Some("'; drop".to_string()),
         };
-        let glow = transition_glow_filter(TransitionGlow::LightLeak, 1.0, 0.5, &look);
-        // Blue: chroma heads to high Cb / low Cr; intensity clamped to 1.5; bad direction ignored.
-        assert!(glow.contains("(198-cb(X,Y))") && glow.contains("(83-cr(X,Y))"), "{glow}");
-        assert!(glow.contains("min(1,1.500*") && !glow.contains("drop"), "{glow}");
+        for name in ALLOWED_TRANSITIONS {
+            let step = transition_window_graph(name, 1, 0.5, 30.0, (1280, 720), &hostile);
+            assert!(!step.contains("drop"), "{name}: {step}");
+        }
         assert!(parse_hex_color("red").is_none() && parse_hex_color("#12345g").is_none());
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("horzopen", 0.5)), Some(&look));
-        assert!(step.contains("xfade=transition=vertopen"), "{step}");
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("fadewhite", 0.5)), Some(&look));
-        assert!(step.contains("xfade=transition=fade") && step.contains("geq="), "{step}");
-        let (step, _, _) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some(("fadewhite", 0.5)), None);
-        assert!(step.contains("xfade=transition=fadewhite") && !step.contains("geq"), "{step}");
+        // Intensity is clamped to 1.5: the flash's sin() peak scale.
+        let look = TransitionLook { color: Some("#3b82f6".into()), intensity: Some(9.0), ..Default::default() };
+        let step = transition_window_graph("fadewhite", 1, 0.5, 30.0, (1280, 720), &look);
+        assert!(step.contains("blend=all_mode=screen") && step.contains("min(1,1.500*sin(PI*"), "{step}");
+        // A plain white flash dips through white like fadeblack does through black.
+        let step = transition_window_graph("fadewhite", 1, 0.5, 30.0, (1280, 720), &TransitionLook::default());
+        assert!(step.contains("geq=lum=235") && !step.contains("blend"), "{step}");
+        // Doors: a vertical opening reads the x axis.
+        let step = transition_window_graph("horzopen", 1, 0.5, 30.0, (1280, 720), &TransitionLook { orientation: Some("vertical".into()), ..Default::default() });
+        assert!(step.contains("lte(X/W,"), "{step}");
+    }
+
+    // Not a unit test: writes the real export graph for two 2s clips joined by each transition
+    // (1s) to $DUMP_TRANSITION_GRAPHS/<name>.txt, for rendering against the preview (parity check).
+    #[test]
+    #[ignore]
+    fn dump_transition_graphs() {
+        let Ok(dir) = std::env::var("DUMP_TRANSITION_GRAPHS") else { return };
+        // Every colour preset at 80%, and the vignette layer at 640x360.
+        for preset in ["vibrant", "cinematic", "bw", "warm", "cool"] {
+            std::fs::write(format!("{dir}/color_{preset}.chain"), color_filter_chain(&ClipColorFilter { preset: preset.into(), intensity: 0.8 })).unwrap();
+        }
+        std::fs::write(format!("{dir}/color_vignette.graph"), vignette_layer(0.8, 640, 360, 30.0, "0:v", "out", 0)).unwrap();
+        // And every Ken Burns motion over a 4s clip at 30fps, output 640x360.
+        for preset in [
+            "zoom-in", "zoom-out", "pan-left", "pan-right", "pan-up", "pan-down", "push", "punch-in", "bounce-in", "drift", "sway", "float", "breathe", "pulse",
+            "shake", "vibrate",
+        ] {
+            let kb = ClipKenBurns { preset: preset.to_string(), intensity: Some(0.8), target_x: None, target_y: None, span: None };
+            std::fs::write(format!("{dir}/kb_{preset}.chain"), ken_burns_chain(&kb, 4.0, 640, 360, 30.0)).unwrap();
+        }
+        let look: TransitionLook = std::env::var("DUMP_TRANSITION_LOOK").ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
+        let mut seg0 = base_segment();
+        seg0.end = 2.0;
+        let mut seg1 = base_segment();
+        seg1.end = 2.0;
+        for name in ALLOWED_TRANSITIONS {
+            let mut graph = String::new();
+            graph.push_str(&format!("{},fps=30.000,settb=AVTB[full0];", segment_video_chain_with_tail("[0:v]", &seg0, "", tail_source_seconds(&seg0, 1.0))));
+            graph.push_str(&transition_tail("full0", "v0", "old1", 2.0, 1.0, 30.0));
+            graph.push_str(&format!("{},fps=30.000,settb=AVTB[v1];", segment_video_chain("[1:v]", &seg1, "")));
+            graph.push_str("anullsrc=channel_layout=stereo:sample_rate=44100:duration=2[a0];anullsrc=channel_layout=stereo:sample_rate=44100:duration=2[a1];");
+            let (step, v, _) = transition_fold_step("v0", "a0", 1, 2.0, 2.0, 30.0, Some((640, 360)), Some((name, 1.0)), Some(&look));
+            graph.push_str(&step);
+            graph.push_str(&format!("[{v}]format=yuv420p[out]"));
+            std::fs::write(format!("{dir}/{name}.txt"), graph).unwrap();
+        }
+    }
+
+    // Not a unit test: smart-renders three clips of $DUMP_SOURCE with the bundled ffmpeg in
+    // $FFMPEG_DIR - mid-GOP cuts (copy + both edges), a cut starting on a keyframe, and a clip too
+    // short to hold a GOP (encoded whole) - into $DUMP_TRANSITION_GRAPHS/smart.mp4, verifying it
+    // exactly as smart_render_export does.
+    #[test]
+    #[ignore]
+    fn smart_render_end_to_end() {
+        use crate::services::smart_render::{plan_clip, probe_packets, probe_source};
+        let (Ok(dir), Ok(source), Ok(bin)) = (std::env::var("DUMP_TRANSITION_GRAPHS"), std::env::var("DUMP_SOURCE"), std::env::var("FFMPEG_DIR")) else { return };
+        let (ffmpeg, ffprobe) = (PathBuf::from(&bin).join("ffmpeg.exe"), PathBuf::from(&bin).join("ffprobe.exe"));
+        let started = std::time::Instant::now();
+        let segs: Vec<KeepSegment> = [(121.3, 140.7), (300.0, 320.0), (539.5, 541.0)]
+            .iter()
+            .map(|&(start, end)| KeepSegment { source_path: source.clone(), start, end, ..base_segment() })
+            .collect();
+        let video = probe_source(&ffprobe, &source).expect("probe");
+        assert!(video.copyable(), "{video:?}");
+        let plans: Vec<_> = segs.iter().map(|s| plan_clip(&probe_packets(&ffprobe, &source, s.start - 1.0, s.end + 1.0).unwrap(), s.start, s.end, video.fps())).collect();
+        println!("plans: {plans:?}");
+        let work = PathBuf::from(&dir).join("smart_work");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let build = smart_render_jobs(&segs, &plans, &video, &[true, true, true], 1.0, &work).unwrap();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        run_smart_jobs(&ffmpeg, build.jobs, 4, &flag, |d, t| println!("job {d}/{t} at {:.1}s", started.elapsed().as_secs_f64())).unwrap();
+        std::fs::write(work.join("pieces.txt"), &build.list).unwrap();
+        let out = PathBuf::from(&dir).join("smart.mp4");
+        let status = Command::new(&ffmpeg)
+            .args(["-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
+            .arg(work.join("pieces.txt"))
+            .arg("-i")
+            .arg(&build.audio_out)
+            .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-tag:v", "avc3", "-movflags", "+faststart"])
+            .arg(&out)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        println!("smart render done in {:.1}s, {} frames expected, joins at {:?}", started.elapsed().as_secs_f64(), build.expected_frames, build.joins);
+        let count = Command::new(&ffprobe).args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim().parse::<usize>().unwrap(), build.expected_frames);
+        for j in &build.joins {
+            let o = Command::new(&ffmpeg).args(["-v", "error", "-ss", &format!("{:.6}", (j - 1.0).max(0.0)), "-i"]).arg(&out).args(["-t", "2", "-map", "0:v:0", "-f", "null", "-"]).output().unwrap();
+            assert!(o.status.success() && o.stderr.is_empty(), "join at {j}: {}", String::from_utf8_lossy(&o.stderr));
+        }
+    }
+
+    // Not a unit test: writes an export graph (three 20s cuts from minutes 2, 5 and 9 of $DUMP_SOURCE,
+    // joined by crossfade and page curl, colour preset + vignette on one) twice - as before input
+    // seeking ("plain") and with it ("seek") - each as `<inputs args>\n<graph>` for benchmarking.
+    #[test]
+    #[ignore]
+    fn dump_export_benchmark_graph() {
+        let (Ok(dir), Ok(source)) = (std::env::var("DUMP_TRANSITION_GRAPHS"), std::env::var("DUMP_SOURCE")) else { return };
+        for seeking in [false, true] {
+            let mut segs: Vec<KeepSegment> = [(120.0, 140.0), (300.0, 320.0), (540.0, 560.0)]
+                .iter()
+                .map(|&(start, end)| KeepSegment { source_path: source.clone(), start, end, ..base_segment() })
+                .collect();
+            segs[1].transition_in = Some(ClipTransitionIn { transition_type: "fade".into(), duration: 0.8, look: None });
+            segs[2].transition_in = Some(ClipTransitionIn { transition_type: "pagecurl".into(), duration: 0.8, look: None });
+            segs[2].color_filter = Some(ClipColorFilter { preset: "cinematic".into(), intensity: 0.8 });
+            let mut inputs = Vec::new();
+            for seg in segs.iter_mut() {
+                let seek = if seeking { segment_input_seek(seg) } else { 0.0 };
+                shift_segment_times(seg, seek);
+                inputs.push(if seek > 0.0 { format!("-ss {seek:.6} -i") } else { "-i".to_string() });
+            }
+            let mut g = String::new();
+            for (i, seg) in segs.iter().enumerate() {
+                let extra = segment_effect_chain(seg, Some(1920), Some(1080), true, None, None);
+                match segs.get(i + 1).and_then(transition_window) {
+                    Some(d) => {
+                        g.push_str(&format!("{},fps=30.000,settb=AVTB[full{i}];", segment_video_chain_with_tail(&format!("[{i}:v]"), seg, &extra, tail_source_seconds(seg, d))));
+                        g.push_str(&transition_tail(&format!("full{i}"), &format!("v{i}"), &format!("old{}", i + 1), segment_output_duration(seg), d, 30.0));
+                    }
+                    None => g.push_str(&format!("{},fps=30.000,settb=AVTB[v{i}];", segment_video_chain(&format!("[{i}:v]"), seg, &extra))),
+                }
+                g.push_str(&audio_trim_chain(true, i, seg.start, seg.end, 1.0, &(Vec::new(), None), &format!("a{i}")));
+            }
+            let (mut cv, mut ca) = ("v0".to_string(), "a0".to_string());
+            for i in 1..segs.len() {
+                let tr = segs[i].transition_in.as_ref().map(|t| (t.transition_type.as_str(), t.duration));
+                let (step, v, a) = transition_fold_step(&cv, &ca, i, 0.0, segment_output_duration(&segs[i]), 30.0, Some((1920, 1080)), tr, None);
+                g.push_str(&step);
+                (cv, ca) = (v, a);
+            }
+            g.push_str(&format!("[{cv}]format=yuv420p[outv];[{ca}]anull[outa]"));
+            let name = if seeking { "seek" } else { "plain" };
+            std::fs::write(format!("{dir}/export_{name}.txt"), format!("{}\n{g}", inputs.join("|"))).unwrap();
+        }
     }
 
     #[test]
-    fn drawn_transitions_lay_the_frozen_frame_over_the_incoming_clip() {
-        for name in ["pagecurl", "zoomblur", "colorsweep"] {
+    fn drawn_transitions_slide_sprites_over_the_incoming_head() {
+        for name in ["pagecurl", "colorsweep"] {
             assert_eq!(sanitize_transition_name(name), name);
-            let (step, v, a) = transition_fold_step("v0", "a0", 1, 5.0, 5.0, 30.0, Some((name, 0.8)), None);
-            assert_eq!((v.as_str(), a.as_str()), ("fold1v", "fold1a"));
-            // The outgoing clip's last frame, held for the transition and timed from 0...
-            assert!(step.starts_with("[v0]split[pre1][tail1];[tail1]tpad=stop_mode=clone:stop_duration=0.800,trim=start=4.999,setpts=PTS-STARTPTS,fps=30.000[old1];"), "{step}");
-            // ...drawn over the incoming clip, which simply follows the outgoing one.
-            assert!(step.ends_with("[pre1][a0][tr1][a1]concat=n=2:v=1:a=1[fold1v][fold1a];"), "{step}");
-            assert!(!step.contains("xfade"), "{step}");
+            let step = drawn_transition(name, 1, 0.8, &TransitionLook::default());
+            assert!(step.contains("[old1]") && step.contains("[head1]") && step.ends_with("[tr1];"), "{step}");
         }
         // The sweep's colour and direction come from the look - parsed, never interpolated raw.
         let look = TransitionLook { color: Some("#2563eb".into()), direction: Some("left".into()), ..Default::default() };
-        let step = drawn_transition("colorsweep", 1, 0.8, 30.0, &look).unwrap();
+        let step = drawn_transition("colorsweep", 1, 0.8, &look);
         let (y, u, v) = rgb_to_yuv((37.0, 99.0, 235.0));
         assert!(step.contains(&format!("lutyuv=y={y}:u={u}:v={v}")) && step.contains("x='main_w*(1-"), "{step}");
         let hostile = TransitionLook { color: Some("'; drop".into()), direction: Some("'; drop".into()), ..Default::default() };
-        let step = drawn_transition("colorsweep", 1, 0.8, 30.0, &hostile).unwrap();
+        let step = drawn_transition("colorsweep", 1, 0.8, &hostile);
         assert!(step.contains("y='main_h*(1-") && !step.contains("drop"), "{step}");
-        assert!(drawn_transition("fade", 1, 0.8, 30.0, &look).is_none());
     }
 
     #[test]
-    fn graded_segments_get_lut3d_after_their_color_preset() {
+    fn graded_segments_get_their_color_preset_after_the_lut3d() {
+        // The preview's order: the graded frame (GradeCanvas), the preset's CSS filter on top.
         let seg = KeepSegment {
             color_filter: Some(ClipColorFilter { preset: "warm".to_string(), intensity: 0.5 }),
             lut_cube: Some("LUT_3D_SIZE 2".to_string()),
@@ -7482,7 +8677,7 @@ mod tests {
         assert!(segment_needs_filter_graph(&seg));
         let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, Some(r"C\:/tmp/g.cube"), None);
         let lut = chain.find(r"lut3d=file='C\:/tmp/g.cube':interp=trilinear").expect("lut3d step");
-        assert!(chain.find("colorbalance").or(chain.find("eq=")).unwrap() < lut, "{chain}");
+        assert!(lut < chain.find("colorchannelmixer").unwrap(), "{chain}");
     }
 
     #[test]

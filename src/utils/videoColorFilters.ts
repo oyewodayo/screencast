@@ -19,11 +19,23 @@ export const COLOR_FILTER_PRESETS: { value: ColorFilterPreset; label: string }[]
   { value: "vignette", label: "Vignette" },
 ];
 
-export const KEN_BURNS_PRESETS: { value: KenBurnsPreset; label: string }[] = [
-  { value: "zoom-in", label: "Zoom in" },
-  { value: "zoom-out", label: "Zoom out" },
-  { value: "pan-left", label: "Pan left" },
-  { value: "pan-right", label: "Pan right" },
+export const KEN_BURNS_PRESETS: { value: KenBurnsPreset; label: string; hint: string }[] = [
+  { value: "zoom-in", label: "Zoom in", hint: "A steady push in" },
+  { value: "zoom-out", label: "Zoom out", hint: "A steady pull back" },
+  { value: "push", label: "Smooth push", hint: "Eases in, glides, eases to a stop - a dolly move" },
+  { value: "punch-in", label: "Punch in", hint: "A quick snap closer that springs into place" },
+  { value: "bounce-in", label: "Bounce in", hint: "Zooms in on an elastic spring" },
+  { value: "pan-left", label: "Pan ←", hint: "Travels right to left" },
+  { value: "pan-right", label: "Pan →", hint: "Travels left to right" },
+  { value: "pan-up", label: "Pan ↑", hint: "Tilts from the bottom up" },
+  { value: "pan-down", label: "Pan ↓", hint: "Tilts from the top down" },
+  { value: "drift", label: "Drift", hint: "A slow diagonal float across the frame" },
+  { value: "sway", label: "Sway", hint: "Rocks gently side to side" },
+  { value: "float", label: "Float", hint: "Circles slowly, as if hovering" },
+  { value: "breathe", label: "Breathe", hint: "Slowly pushes in and pulls back, over and over" },
+  { value: "pulse", label: "Pulse", hint: "Punchy zoom kicks on a beat" },
+  { value: "shake", label: "Shake", hint: "Handheld camera wobble" },
+  { value: "vibrate", label: "Vibrate", hint: "A fast rumble, like an impact or a bass drop" },
 ];
 
 // Names ffmpeg's own `xfade` transition names directly - see TransitionType's own doc comment
@@ -70,6 +82,11 @@ export function cssFilterForColorPreset(cf: ClipColorFilter): string {
   }
 }
 
+// The "vignette" preset's darkened edges as a CSS background over the frame (VideoPlayer's
+// vignette layer and the colour picker's tiles).
+export const vignetteBackground = (intensity: number): string =>
+  `radial-gradient(ellipse at center, transparent ${40 - 15 * intensity}%, rgba(0,0,0,${(0.6 * intensity).toFixed(3)}) 100%)`;
+
 // ---- Frame geometry: flip, crop and Ken Burns as one exact map ----------------------------------
 //
 // Export runs, per segment: hflip -> crop (stretched back to the frame) -> Ken Burns (a window
@@ -103,12 +120,87 @@ function cropWindow(crop: ClipCrop): { x: number; y: number; w: number; h: numbe
   return { x: clamp(crop.x || 0, 0, 1 - w), y: clamp(crop.y || 0, 0, 1 - h), w, h };
 }
 
+// Shared by kenBurnsWindow and ken_burns_chain (conversion.rs), which spells each one out as an
+// ffmpeg expression: change one, change the other.
+const TAU = 2 * Math.PI;
+// How much faster "vibrate"'s wobble runs than "shake"'s (top component ~24Hz - under a 30fps
+// export's Nyquist limit, so it reads as a rumble, not aliasing).
+const KB_VIBRATE_RATE = 5;
+const smooth01 = (x: number) => {
+  const c = clamp(x, 0, 1);
+  return c * c * (3 - 2 * c);
+};
+const easeOutBack01 = (x: number) => {
+  const c = clamp(x, 0, 1) - 1;
+  return 1 + 2.70158 * c * c * c + 1.70158 * c * c;
+};
+// Spring settling at 1 (decaying cosine), 0 at x=0.
+const elastic01 = (x: number) => {
+  const c = clamp(x, 0, 1);
+  return 1 - Math.exp(-6 * c) * Math.cos(3 * TAU * c);
+};
+// Smooth pseudo-random wobble in -1..1: three incommensurate sines. `f` scales every frequency.
+const wobble = (t: number, f: number, phase: number) =>
+  0.5 * Math.sin(TAU * 1.1 * f * t + phase) + 0.3 * Math.sin(TAU * 2.3 * f * t + 1.3 + phase) + 0.2 * Math.sin(TAU * 4.7 * f * t + 2.1 + phase);
+
+// The window centred on (cx, cy) at `zoom`, kept fully on the frame (crop_chain's clamp).
+const onFrame = (zoom: number, cx: number, cy: number) => {
+  const half = 1 / (2 * zoom);
+  return { zoom, cx: clamp(cx, half, 1 - half), cy: clamp(cy, half, 1 - half) };
+};
+
 // Ken Burns' window at `progress` (0..1 through the clip): its zoom and centre, as fractions of the
-// frame it runs on - ken_burns_chain's arithmetic exactly.
-export function kenBurnsWindow(kb: ClipKenBurns, progress: number): { zoom: number; cx: number; cy: number } | null {
+// frame it runs on - ken_burns_chain's arithmetic exactly. `durationSec` is the clip's own source
+// length: the moving-on-a-clock presets (oscillations, a punch-in's snap) run in its seconds.
+export function kenBurnsWindow(kb: ClipKenBurns, progress: number, durationSec = 5): { zoom: number; cx: number; cy: number } | null {
   const amount = clamp(kb.intensity ?? 0.5, 0, 1);
   const [s0, s1] = kb.span ?? [0, 1];
   const p = clamp(s0 + (s1 - s0) * clamp(progress, 0, 1), 0, 1);
+  // Seconds along the whole move (a split-off piece continues its parent's clock).
+  const t = p * (Math.max(0.01, durationSec) / Math.max(1e-3, s1 - s0));
+  const tx = clamp(kb.targetX ?? 0.5, 0, 1);
+  const ty = clamp(kb.targetY ?? 0.5, 0, 1);
+  switch (kb.preset) {
+    case "pan-up":
+    case "pan-down": {
+      const zoom = 1 + 0.15 * amount;
+      const dir = kb.preset === "pan-down" ? p : 1 - p;
+      return { zoom, cx: 0.5, cy: (1 - 1 / zoom) * dir + 1 / (2 * zoom) };
+    }
+    case "push":
+      return onFrame(1 + 0.3 * amount * smooth01(p), tx, ty);
+    case "punch-in":
+      return onFrame(1 + 0.4 * amount * easeOutBack01(t / 0.35), tx, ty);
+    case "bounce-in":
+      return onFrame(1 + 0.3 * amount * elastic01(t / 1.2), tx, ty);
+    case "drift": {
+      const zoom = 1 + 0.2 * amount;
+      const travel = 1 - 1 / zoom;
+      return { zoom, cx: 1 / (2 * zoom) + travel * p, cy: 1 / (2 * zoom) + travel * p };
+    }
+    case "sway": {
+      const zoom = 1 + 0.12 * amount;
+      return onFrame(zoom, 0.5 + 0.48 * (1 - 1 / zoom) * Math.sin((TAU * t) / 2.5), 0.5);
+    }
+    case "float": {
+      const zoom = 1 + 0.14 * amount;
+      const r = 0.45 * (1 - 1 / zoom);
+      return onFrame(zoom, 0.5 + r * Math.cos((TAU * t) / 4), 0.5 + r * Math.sin((TAU * t) / 4));
+    }
+    case "breathe":
+      return onFrame(1 + 0.12 * amount * (0.5 - 0.5 * Math.cos((TAU * t) / 3)), tx, ty);
+    case "pulse":
+      return onFrame(1 + 0.1 * amount * Math.pow(0.5 + 0.5 * Math.cos((TAU * t) / 0.5), 6), tx, ty);
+    case "shake":
+    case "vibrate": {
+      // Zoomed in just enough that the wobble never shows an edge.
+      const fast = kb.preset === "vibrate";
+      const zoom = 1 + (fast ? 0.02 + 0.04 * amount : 0.03 + 0.07 * amount);
+      const m = 0.45 * (1 - 1 / zoom);
+      const f = fast ? KB_VIBRATE_RATE : 1;
+      return onFrame(zoom, 0.5 + m * wobble(t, f, 0), 0.5 + m * wobble(t, f, 4.1));
+    }
+  }
   switch (kb.preset) {
     case "zoom-in":
     case "zoom-out": {
@@ -132,14 +224,19 @@ export function kenBurnsWindow(kb: ClipKenBurns, progress: number): { zoom: numb
 
 // Where each point of the source frame lands in the output frame for this clip at `progress`.
 export function clipFrameAffine(
-  clip: { crop?: ClipCrop | null; kenBurns?: ClipKenBurns; flipHorizontal?: boolean },
+  // start/end: the clip's own source range (its Ken Burns clock); ActiveClipEffects-style
+  // sourceStart/sourceEnd work too.
+  clip: { crop?: ClipCrop | null; kenBurns?: ClipKenBurns; flipHorizontal?: boolean; start?: number; end?: number; sourceStart?: number; sourceEnd?: number },
   progress: number
 ): FrameAffine {
   let m = IDENTITY;
   if (clip.flipHorizontal) m = then(m, -1, 1, 1, 0);
   const crop = clip.crop ? cropWindow(clip.crop) : null;
   if (crop) m = then(m, 1 / crop.w, -crop.x / crop.w, 1 / crop.h, -crop.y / crop.h);
-  const win = clip.kenBurns ? kenBurnsWindow(clip.kenBurns, progress) : null;
+  const start = clip.start ?? clip.sourceStart;
+  const end = clip.end ?? clip.sourceEnd;
+  const duration = start !== undefined && end !== undefined ? end - start : undefined;
+  const win = clip.kenBurns ? kenBurnsWindow(clip.kenBurns, progress, duration) : null;
   if (win) m = then(m, win.zoom, 0.5 - win.cx * win.zoom, win.zoom, 0.5 - win.cy * win.zoom);
   return m;
 }
@@ -221,7 +318,7 @@ export function containRect(boxW: number, boxH: number, videoW: number, videoH: 
 // plus the color preset filter. For elements standing in for a clip's frame elsewhere (they fill
 // it exactly): the transition preview's frozen outgoing frame and the clip viewer popup.
 export function clipFrameStyle(
-  clip: Pick<Clip, "crop" | "kenBurns" | "flipHorizontal" | "colorFilter">,
+  clip: Pick<Clip, "crop" | "kenBurns" | "flipHorizontal" | "colorFilter"> & Partial<Pick<Clip, "start" | "end">>,
   progress: number,
   // The frame's size in px when the styled element is larger than it (centred in it).
   frame?: { width: number; height: number }

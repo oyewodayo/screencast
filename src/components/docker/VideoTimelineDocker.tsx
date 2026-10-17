@@ -79,6 +79,7 @@ import { useToolPanelHost } from "./ToolPanelHost";
 import CaptionsPanel from "./CaptionsPanel";
 import { buildCaptionLines } from "../../utils/captions";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
+import ToolSearch from "./ToolSearch";
 import { subscribeVideoFrames } from "../../utils/videoFrameCache";
 import { getPlayableUrl, isPictureless } from "../../utils/playableVideo";
 import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
@@ -847,6 +848,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [toolMode, setToolMode] = useState<TimelineToolMode>("select");
   const [toolModeAnchor, setToolModeAnchor] = useState<{ left: number; top: number } | null>(null);
   const toolModeButtonRef = useRef<HTMLButtonElement>(null);
+  // The whole toolbar - ToolSearch (Ctrl+K) finds tools by its buttons' titles.
+  const toolbarRef = useRef<HTMLDivElement>(null);
   // Ctrl/Shift-click builds a multi-selection (Duplicate/Delete act on all of it). The last clip
   // picked is the primary selectedClipId every single-clip tool - crop, speed, effects - uses.
   const [selectedClipIdsRaw, setSelectedClipIds] = useState<string[]>([]);
@@ -2825,7 +2828,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       ))}
 
       {/* Toolbar */}
-      <div className="flex items-center justify-between gap-2 px-1 py-1 rounded-md bg-neutral-900 text-neutral-200 min-w-0">
+      <div ref={toolbarRef} className="flex items-center justify-between gap-2 px-1 py-1 rounded-md bg-neutral-900 text-neutral-200 min-w-0">
         {/* Select tool stays fixed (never scrolls away) - only the tool cluster to its right, which
             keeps growing as features get added, scrolls once the panel is too narrow to fit it all.
             min-w-0 on every ancestor down to the scroll container itself is required for the
@@ -2852,6 +2855,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             {toolMode === "razor" ? <IoCutOutline size={14} /> : <BsCursor size={13} />}
             <IoChevronDown size={10} />
           </button>
+          <ToolSearch toolbarRef={toolbarRef} />
           <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
           <div className="timeline-toolbar-scroll flex items-center gap-0.5 min-w-0 overflow-x-auto">
           <ActionButton title="Undo" onClick={editStore.undo} disabled={!editStore.canUndo}>

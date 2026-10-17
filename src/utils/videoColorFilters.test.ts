@@ -1,5 +1,42 @@
 import { describe, expect, it } from "vitest";
-import { affineCssTransform, clipFrameAffine, kenBurnsWindow, playerFraming } from "./videoColorFilters";
+import { KEN_BURNS_PRESETS, affineCssTransform, clipFrameAffine, kenBurnsWindow, playerFraming } from "./videoColorFilters";
+
+describe("kenBurnsWindow - camera motions", () => {
+  it("never shows past the frame's edge, for any motion at any moment", () => {
+    for (const { value } of KEN_BURNS_PRESETS)
+      for (const intensity of [0, 0.5, 1])
+        for (let i = 0; i <= 200; i++) {
+          const w = kenBurnsWindow({ preset: value, intensity }, i / 200, 6)!;
+          const half = 1 / (2 * w.zoom);
+          expect(w.zoom, value).toBeGreaterThanOrEqual(1 - 1e-9);
+          expect(w.cx - half, value).toBeGreaterThanOrEqual(-1e-9);
+          expect(w.cx + half, value).toBeLessThanOrEqual(1 + 1e-9);
+          expect(w.cy - half, value).toBeGreaterThanOrEqual(-1e-9);
+          expect(w.cy + half, value).toBeLessThanOrEqual(1 + 1e-9);
+        }
+  });
+
+  it("runs the oscillating motions on the clip's clock in seconds, whatever its length", () => {
+    // Breathe repeats every 3s: the same window at 1s into a 6s clip and 4s into it.
+    const at = (sec: number, len: number) => kenBurnsWindow({ preset: "breathe", intensity: 1 }, sec / len, len)!.zoom;
+    expect(at(1, 6)).toBeCloseTo(at(4, 6), 9);
+    // ...and the same 1s in, whether the clip is 6s or 20s long.
+    expect(at(1, 6)).toBeCloseTo(at(1, 20), 9);
+    // Pulse kicks every half second.
+    const pulse = (sec: number) => kenBurnsWindow({ preset: "pulse", intensity: 1 }, sec / 4, 4)!.zoom;
+    expect(pulse(1)).toBeCloseTo(1.1, 9);
+    expect(pulse(1.25)).toBeCloseTo(1, 9);
+  });
+
+  it("punches in fast and settles, and shakes without drifting off", () => {
+    const punch = (sec: number) => kenBurnsWindow({ preset: "punch-in", intensity: 1 }, sec / 5, 5)!.zoom;
+    expect(punch(0)).toBeCloseTo(1, 9);
+    expect(punch(0.25)).toBeGreaterThan(1.4); // overshooting on the way in
+    expect(punch(2)).toBeCloseTo(1.4, 9);
+    const shake = Array.from({ length: 100 }, (_, i) => kenBurnsWindow({ preset: "shake", intensity: 1 }, i / 100, 5)!);
+    expect(new Set(shake.map((w) => w.cx.toFixed(4))).size).toBeGreaterThan(50);
+  });
+});
 
 const parseMatrix = (t: string) => t.slice(7, -1).split(", ").map(Number);
 const apply = (m: ReturnType<typeof clipFrameAffine>, u: number, v: number) => [m.ax * u + m.bx, m.ay * v + m.by];

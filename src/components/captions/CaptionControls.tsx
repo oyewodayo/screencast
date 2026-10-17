@@ -85,10 +85,22 @@ export const TranscriptOnlyButton: React.FC<{ on: boolean; onChange: (next: bool
 
 // ---------- style controls ----------
 
+// The style tiles' sample line; with word emphasis on, the highlight steps along it the way it
+// follows speech in the video.
+const SAMPLE_WORDS = ["This", "is", "styled"];
+const SAMPLE_WORD_MS = 420;
+
 export const CaptionStyleControls: React.FC<{
   settings: CaptionSettings;
   onUpdate: (patch: Partial<CaptionSettings>) => void;
-}> = ({ settings, onUpdate }) => (
+}> = ({ settings, onUpdate }) => {
+  const [spoken, setSpoken] = useState(0);
+  useEffect(() => {
+    if (!settings.emphasis) return;
+    const timer = window.setInterval(() => setSpoken((i) => (i + 1) % SAMPLE_WORDS.length), SAMPLE_WORD_MS);
+    return () => window.clearInterval(timer);
+  }, [settings.emphasis]);
+  return (
   <>
     <div className={`flex flex-col gap-1.5 ${settings.enabled ? "" : "opacity-50"}`}>
       <SectionLabel>Style</SectionLabel>
@@ -108,8 +120,12 @@ export const CaptionStyleControls: React.FC<{
               }`}
             >
               <span style={captionBoxStyle(def, 12)}>
-                <span style={captionWordStyle(def, thumbSettings, true, 12)}>{def.uppercase ? "THIS" : "This"}</span>{" "}
-                <span style={captionWordStyle(def, thumbSettings, false, 12)}>{def.uppercase ? "IS STYLED" : "is styled"}</span>
+                {SAMPLE_WORDS.map((word, i) => (
+                  <React.Fragment key={word}>
+                    {i > 0 && " "}
+                    <span style={captionWordStyle(def, thumbSettings, settings.emphasis ? i === spoken : i === 0, 12)}>{def.uppercase ? word.toUpperCase() : word}</span>
+                  </React.Fragment>
+                ))}
               </span>
             </button>
           );
@@ -185,7 +201,8 @@ export const CaptionStyleControls: React.FC<{
       </div>
     </div>
   </>
-);
+  );
+};
 
 // ---------- caption list ----------
 

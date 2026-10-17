@@ -49,7 +49,25 @@ export interface ClipGrade {
 // via rAF, not React state - see the effect in VideoPlayer.tsx) and export (a time-varying
 // ffmpeg crop+scale chain, see ken_burns_chain in conversion.rs) both compute progress the same
 // way: 0 at the clip's own start, 1 at its own end.
-export type KenBurnsPreset = "zoom-in" | "zoom-out" | "pan-left" | "pan-right";
+// The window is a zoom + centre over time (kenBurnsWindow, videoColorFilters.ts); the newer ones
+// move on the clip's own clock in seconds (oscillations keep their pace whatever the clip's length).
+export type KenBurnsPreset =
+  | "zoom-in"
+  | "zoom-out"
+  | "pan-left"
+  | "pan-right"
+  | "pan-up"
+  | "pan-down"
+  | "push"
+  | "punch-in"
+  | "bounce-in"
+  | "drift"
+  | "sway"
+  | "float"
+  | "breathe"
+  | "pulse"
+  | "shake"
+  | "vibrate";
 export interface ClipKenBurns {
   preset: KenBurnsPreset;
   intensity?: number; // 0..1, undefined means 0.5 (moderate) - how far the zoom/pan travels
@@ -229,11 +247,10 @@ export type TextOverlayCornerStyle = "square" | "rounded" | "pill";
 // the last; "slide-<direction>" instead keeps opacity at 1 and, over that same ramp, slides the box
 // in from (and back out to) the named off-screen side. Both clamp their ramp to half the overlay's
 // own duration so a very short overlay still finishes entering before it starts leaving.
-// "pop" is preview-only, same as every "slide-*" variant already was before this comment existed
-// - see exportEdited's own comment (useVideoEditStore.ts) for why burning a scale-varying overlay
-// into the export is deferred rather than attempted here.
+// "pop" scales the box from nothing past full size and back (an ease-out-back overshoot); it
+// exports as a per-frame scale (overlay_pop_scale_expr, conversion.rs).
 // "typewriter"/"words"/"rise" are text-only title reveals, letter by letter or word by word -
-// see textReveal.ts; they export exactly (as a frame sequence), unlike "pop".
+// see textReveal.ts; they export exactly (as a frame sequence).
 export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down" | "pop" | "typewriter" | "words" | "rise";
 
 // A caption/title composited over the video preview (v1 is preview-only - not yet burned into

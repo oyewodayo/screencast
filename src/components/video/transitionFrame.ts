@@ -33,7 +33,45 @@ export interface TransitionGeometry {
   containerH: number;
 }
 
-const PIXELIZE_MAX_BLOCK_PX = 40;
+// Pixelize's coarsest block, as a fraction of the frame width (export: transition_window_graph).
+const PIXELIZE_MAX_BLOCK_FRACTION = 1 / 24;
+
+// Dissolve's grain: a fixed noise field DISSOLVE_COLS cells across (rows to the frame's aspect),
+// each cell switching to the new clip once the progress passes its value - the same hash, grid
+// and bilinear upscale as the export's mask (transition_window_graph, conversion.rs).
+const DISSOLVE_COLS = 160;
+const noiseFields = new Map<string, Float32Array>();
+function noiseField(cols: number, rows: number): Float32Array {
+  const key = `${cols}x${rows}`;
+  let field = noiseFields.get(key);
+  if (!field) {
+    field = new Float32Array(cols * rows);
+    for (let y = 0; y < rows; y++)
+      for (let x = 0; x < cols; x++) {
+        const s = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+        field[y * cols + x] = s - Math.floor(s);
+      }
+    noiseFields.set(key, field);
+  }
+  return field;
+}
+let dissolveCanvas: HTMLCanvasElement | null = null;
+// The outgoing picture's dissolve mask at progress p, as a data URL (opaque = still showing).
+function dissolveMask(W: number, H: number, p: number): string {
+  const cols = DISSOLVE_COLS;
+  const rows = Math.max(1, Math.round((cols * H) / W));
+  const field = noiseField(cols, rows);
+  dissolveCanvas ??= document.createElement("canvas");
+  if (dissolveCanvas.width !== cols || dissolveCanvas.height !== rows) {
+    dissolveCanvas.width = cols;
+    dissolveCanvas.height = rows;
+  }
+  const ctx = dissolveCanvas.getContext("2d")!;
+  const image = ctx.createImageData(cols, rows);
+  for (let i = 0; i < field.length; i++) image.data[i * 4 + 3] = field[i] >= p ? 255 : 0;
+  ctx.putImageData(image, 0, 0);
+  return dissolveCanvas.toDataURL();
+}
 
 // Page curl: how wide the curl is, and the shadows either side of it, in u+v units (u, v =
 // position across / down the frame, 0..1). Same constants as drawn_transition (conversion.rs).
@@ -354,19 +392,36 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
         mover.style.opacity = "0";
         break;
       }
-      const block = 1 + (PIXELIZE_MAX_BLOCK_PX - 1) * (p * 2);
+      const block = 1 + (Math.max(2, W * PIXELIZE_MAX_BLOCK_FRACTION) - 1) * Math.min(1, p * 2);
       const w = Math.max(1, Math.round(W / block));
       const h = Math.max(1, Math.round(H / block));
       if (pixel.width !== w || pixel.height !== h) {
         pixel.width = w;
         pixel.height = h;
       }
-      pixel.getContext("2d")?.drawImage(els.source, 0, 0, w, h);
+      const ctx = pixel.getContext("2d");
+      if (ctx) {
+        // Block averages, like ffmpeg's pixelize - not a single nearest sample.
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(els.source, 0, 0, w, h);
+      }
       pixel.style.display = "block";
       break;
     }
+    case "dissolve": {
+      const mask = `url(${dissolveMask(W, H, p)})`;
+      mover.style.setProperty("mask-image", mask);
+      mover.style.setProperty("-webkit-mask-image", mask);
+      for (const prefix of ["", "-webkit-"]) {
+        mover.style.setProperty(`${prefix}mask-size`, `${W}px ${H}px`);
+        mover.style.setProperty(`${prefix}mask-position`, `${L}px ${T}px`);
+        mover.style.setProperty(`${prefix}mask-repeat`, "no-repeat");
+      }
+      break;
+    }
     default:
-      // fade, dissolve
+      // fade
       mover.style.opacity = String(1 - p);
   }
 }

@@ -11,12 +11,13 @@
 // arm/disarm toggle and SpeedPopover, respectively) rather than living in here - both have enough
 // of their own subfeatures to earn a dedicated surface instead of being one more section buried
 // inside "Clip effects".
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
+import { ColorGrid, MotionGrid } from "./EffectPreviewGrids";
+import { hasGrade } from "../../utils/colorGrade";
 import TransitionLookControls, { transitionHasLook } from "./TransitionLookControls";
 import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
 import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
-import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS } from "../../utils/videoColorFilters";
 import TransitionGrid from "./TransitionGrid";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost } from "./ToolPanelHost";
@@ -44,6 +45,15 @@ interface ClipEffectsPopoverProps {
   onUpdate: (patch: ClipEffectsPatch) => void;
   onClose: () => void;
 }
+
+type EffectsTab = "look" | "motion" | "sound" | "transition";
+const TABS: { value: EffectsTab; label: string; title: string }[] = [
+  { value: "look", label: "Look", title: "Colour presets and grading" },
+  { value: "motion", label: "Motion", title: "Camera moves and stabilizing" },
+  { value: "sound", label: "Sound", title: "This clip's own sound" },
+  { value: "transition", label: "Transition", title: "How this clip comes in from the one before" },
+];
+const TAB_STORAGE_KEY = "briefcast.clipEffects.tab";
 
 const PresetRow: React.FC<{ children: React.ReactNode }> = ({ children }) => <div className="flex flex-wrap gap-1">{children}</div>;
 
@@ -92,6 +102,31 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
     onUpdate({ kenBurns: preset ? { preset, intensity: kenBurnsIntensity, targetX: clip.kenBurns?.targetX, targetY: clip.kenBurns?.targetY } : undefined });
   };
 
+  const [tab, setTab] = useState<EffectsTab>(() => {
+    try {
+      const saved = localStorage.getItem(TAB_STORAGE_KEY);
+      if (TABS.some((t) => t.value === saved)) return saved as EffectsTab;
+    } catch {
+      // storage unavailable - the default tab is fine
+    }
+    return "look";
+  });
+  const chooseTab = (next: EffectsTab) => {
+    setTab(next);
+    try {
+      localStorage.setItem(TAB_STORAGE_KEY, next);
+    } catch {
+      // not remembered this time
+    }
+  };
+  // Which tabs hold something switched on for this clip.
+  const active: Record<EffectsTab, boolean> = {
+    look: (clip.colorFilter?.preset ?? "none") !== "none" || hasGrade(clip.grade),
+    motion: !!clip.kenBurns || !!clip.stabilize,
+    sound: !!clip.muted,
+    transition: !!clip.transitionIn && hasPrecedingClip,
+  };
+
   const transitionType = clip.transitionIn?.type ?? null;
   const transitionDuration = clip.transitionIn?.duration ?? DEFAULT_TRANSITION_DURATION;
   const transitionLook = clip.transitionIn?.look;
@@ -117,139 +152,152 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
         </button>
       </div>
 
-      <div className="flex flex-col gap-1.5">
-        <span className="text-[10px] uppercase tracking-wide text-white/40">Color</span>
-        <PresetRow>
-          {COLOR_FILTER_PRESETS.map((p) => (
-            <PresetButton key={p.value} active={colorPreset === p.value} onClick={() => setColorPreset(p.value)}>
-              {p.label}
-            </PresetButton>
-          ))}
-        </PresetRow>
-        {colorPreset !== "none" && (
-          <label className="flex items-center gap-2 text-[11px] pt-0.5">
-            <span className="w-12 shrink-0 text-white/60">Intensity</span>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={colorIntensity}
-              onChange={(e) => onUpdate({ colorFilter: { preset: colorPreset, intensity: Number(e.target.value) } })}
-              className="flex-1 accent-blue-400"
-            />
-            <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(colorIntensity * 100)}%</span>
-          </label>
-        )}
+      <div role="tablist" className="grid grid-cols-4 gap-0.5 p-0.5 rounded-md bg-white/[0.05]">
+        {TABS.map((t) => (
+          <button
+            key={t.value}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.value}
+            title={t.title}
+            onClick={() => chooseTab(t.value)}
+            className={`relative h-7 rounded text-[11px] font-medium transition-colors ${tab === t.value ? "bg-white/[0.12] text-white" : "text-white/55 hover:text-white hover:bg-white/[0.06]"}`}
+          >
+            {t.label}
+            {active[t.value] && <span className="absolute top-1 right-1.5 w-1.5 h-1.5 rounded-full bg-blue-400" title="In use on this clip" />}
+          </button>
+        ))}
       </div>
 
-      <div className="pt-1 border-t border-white/10">
-        <ColorGradeControls grade={clip.grade} onChange={(grade) => onUpdate({ grade })} isOnScreen={isOnScreen} />
-      </div>
-
-      {!isImageClipPath(clip.sourcePath) && (
-        <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
-          <span className="text-[10px] uppercase tracking-wide text-white/40">Stabilize</span>
-          <PresetRow>
-            <PresetButton active={!clip.stabilize} onClick={() => onUpdate({ stabilize: undefined })}>
-              Off
-            </PresetButton>
-            <PresetButton active={!!clip.stabilize} onClick={() => onUpdate({ stabilize: { strength: clip.stabilize?.strength ?? DEFAULT_STABILIZE_STRENGTH } })}>
-              Remove camera shake
-            </PresetButton>
-          </PresetRow>
-          {clip.stabilize && (
-            <>
+      {tab === "look" && (
+        <>
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[10px] uppercase tracking-wide text-white/40">Color</span>
+            <ColorGrid clip={clip} value={colorPreset} intensity={colorIntensity} onChange={setColorPreset} />
+            {colorPreset !== "none" && (
               <label className="flex items-center gap-2 text-[11px] pt-0.5">
-                <span className="w-12 shrink-0 text-white/60">Strength</span>
+                <span className="w-12 shrink-0 text-white/60">Intensity</span>
                 <input
                   type="range"
                   min={0}
                   max={1}
                   step={0.01}
-                  value={clip.stabilize.strength}
-                  onChange={(e) => onUpdate({ stabilize: { strength: Number(e.target.value) } })}
+                  value={colorIntensity}
+                  onChange={(e) => onUpdate({ colorFilter: { preset: colorPreset, intensity: Number(e.target.value) } })}
                   className="flex-1 accent-blue-400"
                 />
-                <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(clip.stabilize.strength * 100)}%</span>
+                <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(colorIntensity * 100)}%</span>
               </label>
-              <p className="text-[10px] leading-snug text-white/45">
-                Applied when you save. Stronger is steadier but crops in a little more. Right-click the clip and choose View clip to preview it stabilized.
-              </p>
-            </>
+            )}
+          </div>
+          <div className="pt-1 border-t border-white/10">
+            <ColorGradeControls grade={clip.grade} onChange={(grade) => onUpdate({ grade })} isOnScreen={isOnScreen} />
+          </div>
+        </>
+      )}
+
+      {tab === "motion" && (
+        <>
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[10px] uppercase tracking-wide text-white/40">Camera motion</span>
+            <MotionGrid clip={clip} value={kenBurnsPreset} intensity={kenBurnsIntensity} onChange={setKenBurnsPreset} />
+            {kenBurnsPreset !== null && (
+              <label className="flex items-center gap-2 text-[11px] pt-0.5">
+                <span className="w-12 shrink-0 text-white/60">Amount</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={kenBurnsIntensity}
+                  onChange={(e) => onUpdate({ kenBurns: { ...clip.kenBurns, preset: kenBurnsPreset, intensity: Number(e.target.value) } })}
+                  className="flex-1 accent-blue-400"
+                />
+                <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(kenBurnsIntensity * 100)}%</span>
+              </label>
+            )}
+          </div>
+          {!isImageClipPath(clip.sourcePath) && (
+            <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
+              <span className="text-[10px] uppercase tracking-wide text-white/40">Stabilize</span>
+              <PresetRow>
+                <PresetButton active={!clip.stabilize} onClick={() => onUpdate({ stabilize: undefined })}>
+                  Off
+                </PresetButton>
+                <PresetButton active={!!clip.stabilize} onClick={() => onUpdate({ stabilize: { strength: clip.stabilize?.strength ?? DEFAULT_STABILIZE_STRENGTH } })}>
+                  Remove camera shake
+                </PresetButton>
+              </PresetRow>
+              {clip.stabilize && (
+                <>
+                  <label className="flex items-center gap-2 text-[11px] pt-0.5">
+                    <span className="w-12 shrink-0 text-white/60">Strength</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={clip.stabilize.strength}
+                      onChange={(e) => onUpdate({ stabilize: { strength: Number(e.target.value) } })}
+                      className="flex-1 accent-blue-400"
+                    />
+                    <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(clip.stabilize.strength * 100)}%</span>
+                  </label>
+                  <p className="text-[10px] leading-snug text-white/45">
+                    Applied when you save. Stronger is steadier but crops in a little more. Right-click the clip and choose View clip to preview it stabilized.
+                  </p>
+                </>
+              )}
+            </div>
           )}
+        </>
+      )}
+
+      {tab === "sound" && (
+        <div className="flex items-center justify-between gap-2 text-[11px]">
+          <span className="text-[10px] uppercase tracking-wide text-white/40">Clip sound</span>
+          <button
+            type="button"
+            title={clip.muted ? "This clip plays silently - click to hear it" : "Silence just this clip (e.g. under music)"}
+            onClick={() => onUpdate({ muted: clip.muted ? undefined : true })}
+            className={`px-2 h-6 rounded transition-colors ${clip.muted ? "text-red-300 bg-red-500/15" : "text-white/70 bg-white/[0.06] hover:bg-white/10"}`}
+          >
+            {clip.muted ? "Muted" : "On"}
+          </button>
         </div>
       )}
 
-      <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
-        <span className="text-[10px] uppercase tracking-wide text-white/40">Ken Burns</span>
-        <PresetRow>
-          <PresetButton active={kenBurnsPreset === null} onClick={() => setKenBurnsPreset(null)}>
-            None
-          </PresetButton>
-          {KEN_BURNS_PRESETS.map((p) => (
-            <PresetButton key={p.value} active={kenBurnsPreset === p.value} onClick={() => setKenBurnsPreset(p.value)}>
-              {p.label}
-            </PresetButton>
-          ))}
-        </PresetRow>
-        {kenBurnsPreset !== null && (
-          <label className="flex items-center gap-2 text-[11px] pt-0.5">
-            <span className="w-12 shrink-0 text-white/60">Amount</span>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={kenBurnsIntensity}
-              onChange={(e) => onUpdate({ kenBurns: { ...clip.kenBurns, preset: kenBurnsPreset, intensity: Number(e.target.value) } })}
-              className="flex-1 accent-blue-400"
-            />
-            <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(kenBurnsIntensity * 100)}%</span>
-          </label>
-        )}
-      </div>
-
-      <div className="flex items-center justify-between gap-2 pt-1 border-t border-white/10 text-[11px]">
-        <span className="text-[10px] uppercase tracking-wide text-white/40">Clip sound</span>
-        <button
-          type="button"
-          title={clip.muted ? "This clip plays silently - click to hear it" : "Silence just this clip (e.g. under music)"}
-          onClick={() => onUpdate({ muted: clip.muted ? undefined : true })}
-          className={`px-2 h-6 rounded transition-colors ${clip.muted ? "text-red-300 bg-red-500/15" : "text-white/70 bg-white/[0.06] hover:bg-white/10"}`}
-        >
-          {clip.muted ? "Muted" : "On"}
-        </button>
-      </div>
-
-      {hasPrecedingClip && (
-        <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10" title="Plays over the start of this clip, from the previous clip's last frame - in the preview and the export alike">
-          <span className="text-[10px] uppercase tracking-wide text-white/40">Transition (with previous clip)</span>
-          <TransitionGrid value={transitionType} look={transitionLook} outgoing={previousClip} incoming={clip} onChange={setTransitionType} />
-          {transitionType !== null && (
-            <label className="flex items-center gap-2 text-[11px] pt-0.5">
-              <span className="w-12 shrink-0 text-white/60">Duration</span>
-              <input
-                type="range"
-                min={0.2}
-                max={1.5}
-                step={0.05}
-                value={transitionDuration}
-                onChange={(e) => onUpdate({ transitionIn: { ...clip.transitionIn, type: transitionType, duration: Number(e.target.value) } })}
-                className="flex-1 accent-blue-400"
+      {tab === "transition" &&
+        (hasPrecedingClip ? (
+          <div className="flex flex-col gap-1.5" title="Plays over the start of this clip, as the previous clip keeps playing out - in the preview and the export alike">
+            <span className="text-[10px] uppercase tracking-wide text-white/40">Transition (with previous clip)</span>
+            <TransitionGrid value={transitionType} look={transitionLook} outgoing={previousClip} incoming={clip} onChange={setTransitionType} />
+            {transitionType !== null && (
+              <label className="flex items-center gap-2 text-[11px] pt-0.5">
+                <span className="w-12 shrink-0 text-white/60">Duration</span>
+                <input
+                  type="range"
+                  min={0.2}
+                  max={1.5}
+                  step={0.05}
+                  value={transitionDuration}
+                  onChange={(e) => onUpdate({ transitionIn: { ...clip.transitionIn, type: transitionType, duration: Number(e.target.value) } })}
+                  className="flex-1 accent-blue-400"
+                />
+                <span className="w-10 shrink-0 text-right tabular-nums text-white/60">{transitionDuration.toFixed(2)}s</span>
+              </label>
+            )}
+            {transitionType !== null && transitionHasLook(transitionType) && (
+              <TransitionLookControls
+                type={transitionType}
+                look={transitionLook}
+                onChange={(look) => onUpdate({ transitionIn: { type: transitionType, duration: transitionDuration, look } })}
               />
-              <span className="w-10 shrink-0 text-right tabular-nums text-white/60">{transitionDuration.toFixed(2)}s</span>
-            </label>
-          )}
-          {transitionType !== null && transitionHasLook(transitionType) && (
-            <TransitionLookControls
-              type={transitionType}
-              look={transitionLook}
-              onChange={(look) => onUpdate({ transitionIn: { type: transitionType, duration: transitionDuration, look } })}
-            />
-          )}
-        </div>
-      )}
+            )}
+          </div>
+        ) : (
+          <p className="text-[11px] leading-snug text-white/50">This is the first clip - there's nothing before it to transition from. Select a later clip to set how it comes in.</p>
+        ))}
     </div>,
     dockHost ?? document.body
   );

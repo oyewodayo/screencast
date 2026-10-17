@@ -11,7 +11,9 @@
 // moment its textarea loses focus. The blur panel's X/Y/W/H fields are the one exception (real
 // inputs), safe there since a blur region has no editing session to end.
 import { KEYFRAME_EASINGS, KEYFRAME_SNAP_SEC, KeyframeEasing, OverlayKeyframe, keyframeAt, keyframeStateAt, removeKeyframeAt, upsertKeyframe } from "../../utils/keyframes";
-import React from "react";
+import React, { useEffect, useRef } from "react";
+import RevealText from "./RevealText";
+import { overlayAnimationStyle } from "../../utils/overlayAnimation";
 import {
   IoArrowDown,
   IoArrowUp,
@@ -27,7 +29,7 @@ import { MdFormatAlignCenter, MdFormatAlignJustify, MdFormatAlignLeft, MdFormatA
 import Slider from "../docker/Slider";
 import NumberStepper from "../docker/NumberStepper";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
-import { BlurShape, OverlayAnimation, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
+import { BlurShape, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { TextAlign } from "../../utils/pdfAnnotationTypes";
 import { ImageRevealDirection, ImageRevealSettings, ImageRevealStyle } from "../../utils/imageReveal";
 import { TEXT_REVEAL_SPEED_MAX, TEXT_REVEAL_SPEED_MIN, TextReveal, TextRevealSettings, isTextReveal, textRevealSeconds } from "../../utils/textReveal";
@@ -151,7 +153,7 @@ const IconButton: React.FC<{ title: string; onClick: () => void; active?: boolea
 const ANIMATIONS: { value: OverlayAnimation; label: string; title: string }[] = [
   { value: "none", label: "None", title: "No animation" },
   { value: "fade", label: "Fade", title: "Fade in and out" },
-  { value: "pop", label: "Pop", title: "Pop in (preview only)" },
+  { value: "pop", label: "Pop", title: "Pop in with a springy overshoot" },
   { value: "slide-left", label: "← Slide", title: "Slide in from the right, out to the left" },
   { value: "slide-right", label: "Slide →", title: "Slide in from the left, out to the right" },
   { value: "slide-up", label: "↑ Slide", title: "Slide up" },
@@ -165,26 +167,91 @@ const TEXT_REVEALS: { value: OverlayAnimation; label: string; title: string }[] 
   { value: "rise", label: "Rise", title: "Letters bounce up one after another" },
 ];
 
-const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange: (next: OverlayAnimation) => void; text?: boolean }> = ({ value, onChange, text }) => (
-  <Section title="Animation">
-    <div className="grid grid-cols-4 gap-1">
-      {(text ? [...ANIMATIONS, ...TEXT_REVEALS] : ANIMATIONS).map((a) => (
-        <button
-          key={a.value}
-          type="button"
-          title={a.title}
-          onMouseDown={keepFocus}
-          onClick={() => onChange(a.value)}
-          className={`h-7 rounded-md text-[11px] transition-colors ${
-            (value ?? "none") === a.value ? "bg-blue-500/25 text-blue-200 ring-1 ring-blue-400/50" : "bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10"
-          }`}
-        >
-          {a.label}
-        </button>
-      ))}
-    </div>
-  </Section>
-);
+// The animation picker's tiles play each animation on a sample title, on a loop: on screen for
+// SAMPLE_LIFE_SEC (entering and leaving), then a short empty pause. Drawn with the player's own
+// functions (overlayAnimationStyle, RevealText), so a tile moves exactly like the overlay will.
+const SAMPLE_LIFE_SEC = 2.2;
+const SAMPLE_CYCLE_SEC = SAMPLE_LIFE_SEC + 0.6;
+const SAMPLE_TEXT = "Title";
+const sampleOverlay = (animation: OverlayAnimation): TextOverlay => ({
+  id: `sample-${animation}`,
+  text: SAMPLE_TEXT,
+  color: "#ffffff",
+  x: 0,
+  y: 0,
+  width: 1,
+  height: 1,
+  fontSize: 0.3,
+  startTime: 0,
+  endTime: SAMPLE_LIFE_SEC,
+  createdAt: 0,
+  updatedAt: 0,
+});
+
+const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange: (next: OverlayAnimation) => void; text?: boolean }> = ({ value, onChange, text }) => {
+  const gridRef = useRef<HTMLDivElement>(null);
+  const boxes = useRef(new Map<OverlayAnimation, HTMLSpanElement>());
+  const startRef = useRef(performance.now());
+  const loopTime = () => ((performance.now() - startRef.current) / 1000) % SAMPLE_CYCLE_SEC;
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const t = loopTime();
+      boxes.current.forEach((el, animation) => {
+        const box = el.parentElement;
+        if (!box) return;
+        if (t >= SAMPLE_LIFE_SEC) {
+          el.style.opacity = "0";
+          return;
+        }
+        const s = overlayAnimationStyle(animation, 0, SAMPLE_LIFE_SEC, t, box.clientWidth, box.clientHeight);
+        el.style.opacity = String(s.opacity);
+        el.style.transform = `translate(${s.translateXPx}px, ${s.translateYPx}px) scale(${s.scale})`;
+      });
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  return (
+    <Section title="Animation">
+      <div ref={gridRef} className="grid grid-cols-4 gap-1">
+        {(text ? [...ANIMATIONS, ...TEXT_REVEALS] : ANIMATIONS).map((a) => {
+          const selected = (value ?? "none") === a.value;
+          return (
+            <button
+              key={a.value}
+              type="button"
+              title={a.title}
+              onMouseDown={keepFocus}
+              onClick={() => onChange(a.value)}
+              className={`flex flex-col items-stretch gap-0.5 p-0.5 rounded-md transition-colors ${selected ? "bg-blue-500/20 ring-1 ring-blue-400/50" : "bg-white/[0.04] hover:bg-white/10"}`}
+            >
+              <span className="relative h-7 rounded-[5px] bg-neutral-950/70 overflow-hidden flex items-center justify-center text-[12px] font-semibold text-white">
+                {isTextReveal(a.value) ? (
+                  <span className="relative">
+                    <RevealText overlay={sampleOverlay(a.value)} kind={a.value} paddingPx={0} getTime={loopTime} />
+                  </span>
+                ) : (
+                  <span
+                    ref={(el) => {
+                      if (el && a.value !== "none") boxes.current.set(a.value, el);
+                      else boxes.current.delete(a.value);
+                    }}
+                    className="inline-block"
+                  >
+                    {SAMPLE_TEXT}
+                  </span>
+                )}
+              </span>
+              <span className={`truncate text-center text-[10px] leading-tight ${selected ? "text-blue-200" : "text-white/60"}`}>{a.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </Section>
+  );
+};
 
 const POSITION_MARGIN = 0.04;
 

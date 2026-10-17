@@ -821,11 +821,22 @@ mod shutdown_tests {
         p
     }
 
+    // Waits (generously) until the stand-in process has actually started writing, as a real ffmpeg
+    // has by the time Stop is pressed. PowerShell alone can take seconds to start under a parallel
+    // `cargo test` - longer than IDLE_GRACE - which made these tests flaky, not the logic.
+    fn wait_until_writing(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn a_process_that_exits_promptly_is_not_killed() {
         let path = temp("quick");
         fs::write(&path, b"done").unwrap();
-        let mut child = ps("exit 0");
+        // cmd starts in milliseconds, unlike PowerShell - "exits promptly" is then really prompt.
+        let mut child = Command::new("cmd").args(["/C", "exit 0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn cmd");
         assert!(!wait_for_ffmpeg_to_finalize(&mut child, &path));
         let _ = fs::remove_file(&path);
     }
@@ -841,6 +852,7 @@ mod shutdown_tests {
             path.display()
         );
         let mut child = ps(&script);
+        wait_until_writing(&path);
         let started = Instant::now();
         let killed = wait_for_ffmpeg_to_finalize(&mut child, &path);
         assert!(!killed, "a process still growing the output file must not be force-killed");
@@ -1470,6 +1482,41 @@ pub fn silent_command<P: AsRef<OsStr>>(program: P) -> Command {
     cmd
 }
 
+// Lip sync for a recording that takes picture and sound (or two sources of either) from separate
+// live devices - every macOS/Linux mode with a mic, system audio or a camera beside the screen.
+//
+// By default ffmpeg rebases EACH input to zero at its own first packet, so where a device's stream
+// lands depends on how long that device took to open - on Windows, before its own fix
+// (services/audio_capture.rs), that measured 0.3s to 3.3s of drift between voice and picture. But
+// these devices already stamp their packets on one shared clock: avfoundation (screen, cameras,
+// mics, virtual loopback devices) with the Mac's host clock; x11grab and PulseAudio with the wall
+// clock - and v4l2 cameras too once told to (`-ts abs`, converting their monotonic stamps). Keeping
+// those stamps (`-copyts`) and shifting the whole recording so its earliest packet is zero
+// (`-start_at_zero`) puts every device at the moment its samples were actually captured, whatever
+// order they opened in. A single input needs nothing - it's already one clock.
+pub(crate) fn sync_live_inputs(args: Vec<String>) -> Vec<String> {
+    let inputs = args.iter().filter(|a| *a == "-i").count();
+    if inputs < 2 || args.iter().any(|a| a == "-copyts") {
+        return args;
+    }
+    let mut out: Vec<String> = vec!["-copyts".into(), "-start_at_zero".into()];
+    let mut demuxer: Option<String> = None;
+    for arg in args {
+        if arg == "-i" && demuxer.as_deref() == Some("v4l2") {
+            out.extend(["-ts".into(), "abs".into()]);
+        }
+        if arg == "-i" {
+            demuxer = None;
+        }
+        let set_demuxer = out.last().is_some_and(|prev| prev == "-f");
+        if set_demuxer {
+            demuxer = Some(arg.clone());
+        }
+        out.push(arg);
+    }
+    out
+}
+
 // Shared ffmpeg-process bookkeeping used by the macOS/Linux platform modules (Windows's own
 // per-mode functions predate this and are left with their own inline spawn logic — see win.rs —
 // so nothing about their existing, working behavior changes here). Every mode boils down to
@@ -1489,6 +1536,7 @@ pub(crate) async fn spawn_recording(
         *app_state = Some(output_path.clone());
     }
 
+    let args = sync_live_inputs(args);
     log::debug!("FFmpeg args: {:?}", args);
 
     let mut cmd = silent_command(ffmpeg_path);
@@ -2719,6 +2767,39 @@ async fn create_or_replace_rec_completed_modal(
     })
     .await
     .map_err(|e| format!("Modal window creation task panicked: {}", e))?
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::sync_live_inputs;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn separate_live_devices_keep_their_shared_clock() {
+        // Linux: x11grab screen + PulseAudio mic + v4l2 camera.
+        let args = v(&["-f", "x11grab", "-framerate", "30", "-i", ":0.0", "-f", "pulse", "-i", "mic", "-f", "v4l2", "-video_size", "320x240", "-i", "/dev/video0", "-c:v", "libx264", "out.mp4"]);
+        let out = sync_live_inputs(args);
+        assert_eq!(out[..2], v(&["-copyts", "-start_at_zero"])[..]);
+        // The camera is switched to wall-clock stamps; the others already are.
+        assert_eq!(out.iter().filter(|a| *a == "abs").count(), 1);
+        let cam = out.iter().position(|a| a == "/dev/video0").unwrap();
+        assert_eq!(out[cam - 3..cam], v(&["-ts", "abs", "-i"])[..]);
+        // macOS: screen + separate mic.
+        let mac = sync_live_inputs(v(&["-f", "avfoundation", "-i", "1:", "-f", "avfoundation", "-i", ":0", "out.mp4"]));
+        assert_eq!(mac, v(&["-copyts", "-start_at_zero", "-f", "avfoundation", "-i", "1:", "-f", "avfoundation", "-i", ":0", "out.mp4"]));
+    }
+
+    #[test]
+    fn one_input_is_already_one_clock() {
+        let args = v(&["-f", "avfoundation", "-i", "1:0", "out.mp4"]);
+        assert_eq!(sync_live_inputs(args.clone()), args);
+        // Applied once only.
+        let twice = sync_live_inputs(sync_live_inputs(v(&["-i", "a", "-i", "b", "o"])));
+        assert_eq!(twice.iter().filter(|a| *a == "-copyts").count(), 1);
+    }
 }
 
 #[cfg(test)]

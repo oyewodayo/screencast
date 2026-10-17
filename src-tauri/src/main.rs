@@ -89,6 +89,8 @@ mod services {
     // a real subprocess encode with the exact intended flags, which is platform-agnostic by
     // construction - nothing here needed to be Windows-specific.
     pub mod hw_encoder;
+    pub mod smart_render;
+    pub mod hw_decoder;
     // HEIC/HEIF decoding via WIC/WinRT (Windows' own photo codec) - see the module's doc comment
     // for why convert_image (commands/conversion.rs) can't just hand these to ffmpeg: this bundled
     // ffmpeg build mis-decodes multi-image HEIC files (Portrait mode, Deep Fusion, etc.) as a

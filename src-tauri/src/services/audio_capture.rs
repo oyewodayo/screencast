@@ -260,7 +260,43 @@ fn run_capture(
     writer
         .finalize()
         .map_err(|e| format!("Failed to finalize the audio WAV file: {}", e))?;
-    Ok(timeline.finish(wav_path.to_path_buf()))
+    let mut result = timeline.finish(wav_path.to_path_buf());
+    if matches!(source, AudioSource::SystemOutput) {
+        // Loopback stamps sound when the audio engine mixes it; it reaches the ears the output
+        // device's latency later, and players time their picture to the ears (Bluetooth
+        // headphones: often 150-250ms). Placing system audio at the moment it's HEARD records
+        // what the person saw and heard together - see playback_latency_hns.
+        let latency = playback_latency_hns().unwrap_or(0);
+        log::info!("System audio placed {:.1}ms after its mix time (playback device latency)", latency as f64 / 10_000.0);
+        result.first_sample_hns += latency;
+    }
+    Ok(result)
+}
+
+// How long after the audio engine mixes a sound the default playback device plays it, in 100ns
+// units: the render stream's latency as the driver reports it (engine buffering plus the device's
+// own hardware latency - a Bluetooth headset's codec delay included where its driver reports it)
+// plus one engine period. Measured on a fresh shared-mode render client, the same kind every
+// player opens. None if the device can't be queried (then no shift - the previous behaviour).
+fn playback_latency_hns() -> Option<i64> {
+    use windows::Win32::Media::Audio::{eConsole, eRender, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED};
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
+    // Upper bound on what's believed: past this the driver is reporting nonsense.
+    const MAX_HNS: i64 = 5_000_000;
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let client: IAudioClient = device.Activate(CLSCTX_ALL, None).ok()?;
+        let format = client.GetMixFormat().ok()?;
+        let initialized = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, format, None);
+        CoTaskMemFree(Some(format as *const _));
+        initialized.ok()?;
+        let stream = client.GetStreamLatency().ok()?;
+        let mut default_period = 0i64;
+        client.GetDevicePeriod(Some(&mut default_period), None).ok()?;
+        let total = stream + default_period;
+        (0..=MAX_HNS).contains(&total).then_some(total)
+    }
 }
 
 fn write_err(e: hound::Error) -> String {
@@ -389,6 +425,14 @@ pub fn now_hns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Not a unit test: what this machine's default playback device reports.
+    #[test]
+    #[ignore]
+    fn report_playback_latency() {
+        let _ = wasapi::initialize_mta();
+        println!("playback latency: {:?} hns", playback_latency_hns());
+    }
 
     const PACKET: u64 = 480; // 10ms
     fn hns(secs: f64) -> Option<i64> {

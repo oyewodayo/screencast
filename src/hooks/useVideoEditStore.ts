@@ -138,14 +138,10 @@ export interface ExportOptions {
   loudnessLufs?: number | null;
 }
 
-// export_trimmed_video's OverlayImage.animation accepts everything OverlayAnimation does except
-// "pop" - a true scale-up/overshoot animation needs a time-varying overlay *size* in the ffmpeg
-// filter graph, not just the x/y-expression approach slide-* uses (see overlay_position_expr,
-// conversion.rs), so it isn't burned in yet. Falls back to "fade" rather than "none" so a "pop"
-// overlay still gets *some* motion in the exported file instead of appearing as a static hard cut.
+// export_trimmed_video's OverlayImage.animation: every whole-overlay animation burns in exactly as
+// it previews - "pop" included (a per-frame scale, overlay_pop_scale_expr in conversion.rs).
 function exportOverlayAnimation(animation: OverlayAnimation | undefined): string {
   if (!animation || animation === "none") return "none";
-  if (animation === "pop") return "fade";
   // Title reveals are drawn into their own frames; an image never uses them.
   if (isTextReveal(animation)) return "none";
   return animation;
