@@ -569,6 +569,8 @@ fn main() {
             services::share::share_capabilities,
             services::share::open_share_url,
             services::share::copy_file_to_clipboard,
+            services::share::clipboard_file_paths,
+            services::share::save_pasted_image,
             services::share::share_file_native,
             services::share::email_file,
             services::docs::save_doc_image,

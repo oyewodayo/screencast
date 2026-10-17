@@ -82,6 +82,7 @@ import { useToolPanelHost } from "./ToolPanelHost";
 import CaptionsPanel from "./CaptionsPanel";
 import ChaptersPanel from "./ChaptersPanel";
 import { enqueue as enqueueExport } from "../../utils/exportQueue";
+import { copyItems, emptyClipboardItems } from "../../utils/timelineClipboard";
 import { outputChapters } from "../../utils/videoChapters";
 import { IoBookmarkOutline, IoColorFilterOutline } from "react-icons/io5";
 import { buildCaptionLines } from "../../utils/captions";
@@ -1401,6 +1402,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
   };
 
+  // Which kind of thing was selected most recently - what Ctrl+C copies when there are several.
+  const lastSelectedRef = useRef<"clips" | "overlay">("overlay");
+  useEffect(() => {
+    if (selectedClipIds.length > 0) lastSelectedRef.current = "clips";
+  }, [selectedClipIds.join()]);
+  useEffect(() => {
+    if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedAdjustmentId || selectedAudioOverlayId || selectedPipOverlayId) lastSelectedRef.current = "overlay";
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAdjustmentId, selectedAudioOverlayId, selectedPipOverlayId]);
+
   // ---- Adjustment-layer lane: move / retime, the blur lane's shape. ----------------------------
   const [adjustResizeDrag, setAdjustResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; startValue: number; oppositeBound: number; liveValue: number }>(null);
   const [adjustDrag, setAdjustDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
@@ -2027,6 +2037,56 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         editStore.redo();
         return;
       }
+      // Ctrl/Cmd+C copies the selected overlay or clips (Ctrl+X cuts them) - pasted at the playhead
+      // with Ctrl+V (Dashboard's paste handler, timelineClipboard.ts).
+      if ((e.ctrlKey || e.metaKey) && (key === "c" || key === "x")) {
+        const items = emptyClipboardItems();
+        const one = <T extends { id: string }>(list: T[], id: string | null) => list.filter((o) => o.id === id);
+        // Whatever was selected last wins (a clip and an overlay can both be selected).
+        if (lastSelectedRef.current === "clips" && selectedClipIds.length > 0) items.clips = editStore.clips.filter((c) => selectedClipIds.includes(c.id));
+        else if (selectedOverlayId) items.textOverlays = one(editStore.textOverlays, selectedOverlayId);
+        else if (selectedImageOverlayId) items.imageOverlays = one(editStore.imageOverlays, selectedImageOverlayId);
+        else if (selectedBlurOverlayId) items.blurOverlays = one(editStore.blurOverlays, selectedBlurOverlayId);
+        else if (selectedAdjustmentId) items.adjustmentLayers = one(editStore.adjustmentLayers, selectedAdjustmentId);
+        else if (selectedAudioOverlayId) items.audioOverlays = one(editStore.audioOverlays, selectedAudioOverlayId);
+        else if (selectedPipOverlayId) items.pipOverlays = one(editStore.pipOverlays, selectedPipOverlayId);
+        else if (selectedClipIds.length > 0) items.clips = editStore.clips.filter((c) => selectedClipIds.includes(c.id));
+        else return;
+        e.preventDefault();
+        void copyItems(items);
+        if (key === "x" && items.clips.length > 0) {
+          if (editStore.clips.length > selectedClipIds.length) {
+            editStore.deleteClips(selectedClipIds);
+            setSelectedClipIds([]);
+          }
+        } else if (key === "x") {
+          if (selectedOverlayId) {
+            editStore.deleteTextOverlay(selectedOverlayId);
+            onSelectOverlay?.(null);
+          } else if (selectedImageOverlayId) {
+            editStore.deleteImageOverlay(selectedImageOverlayId);
+            onSelectImageOverlay?.(null);
+          } else if (selectedBlurOverlayId) {
+            editStore.deleteBlurOverlay(selectedBlurOverlayId);
+            onSelectBlurOverlay?.(null);
+          } else if (selectedAdjustmentId) {
+            editStore.deleteAdjustmentLayer(selectedAdjustmentId);
+            onSelectAdjustment?.(null);
+          } else if (selectedAudioOverlayId) {
+            editStore.deleteAudioOverlay(selectedAudioOverlayId);
+            setSelectedAudioOverlayId(null);
+            setAudioPopoverAnchor(null);
+          } else if (selectedPipOverlayId) {
+            editStore.deletePipOverlay(selectedPipOverlayId);
+            onSelectPipOverlay?.(null);
+          } else if (items.clips.length > 0 && editStore.clips.length > selectedClipIds.length) {
+            editStore.deleteClips(selectedClipIds);
+            setSelectedClipIds([]);
+          }
+        }
+        return;
+      }
+
       // Ctrl/Cmd+D duplicates whatever overlay is currently selected - same "text takes priority
       // over image" ordering as Delete/Backspace below, for the same reason (the two can't be
       // selected at once in this UI, but if that ever changed, the more "local" selection wins).

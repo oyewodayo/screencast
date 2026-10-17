@@ -7,6 +7,7 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AdjustmentLayer, AudioOverlay, BlurOverlay, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter } from "../utils/videoEditTypes";
 import { adjustmentLayerExport, makeAdjustmentLayer } from "../utils/adjustmentLayers";
+import type { TimelineClipboardItems } from "../utils/timelineClipboard";
 import { exportBlendMode } from "../utils/blendModes";
 import { chaptersForExport } from "../utils/videoChapters";
 import { confirmCloseWithActiveExports, hasActiveJobs, setEditorCloseGuard, type ExportJobPayload } from "../utils/exportQueue";
@@ -72,6 +73,10 @@ export interface SplitScreenCell {
   // Fraction of the cell's own height; 0 = square corners.
   cornerRadius: number;
   muted: boolean;
+  // A picture rather than a video: its natural size, so it can be cropped to fill the cell.
+  image?: { width: number; height: number };
+  // The output frame's width / height (the cells' fractions are of it).
+  frameAspect?: number;
 }
 import { renderAssetFrames } from "../utils/videoAssets";
 
@@ -319,6 +324,7 @@ export interface UseVideoEditStoreResult {
   duplicateClips: (ids: string[]) => void;
   // Every image clip to one length (a fast photo montage) - one undo step.
   setImageClipLengths: (seconds: number) => void;
+  pasteItems: (items: TimelineClipboardItems, atIndex: number, atTime: number) => void;
   // Selected clips -> one clip (clip menu > Merge). Back-to-back split pieces just join (instant,
   // still editable); anything else is rendered into one new file with its effects baked in. Resolves
   // to the merged clip's id, or null if it couldn't be done.
@@ -755,6 +761,44 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const clips = duplicateClipsHandler(current.clips, ids, () => crypto.randomUUID());
       if (clips === current.clips) return;
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "insert");
+    },
+    [pushCommand]
+  );
+
+  // Paste (timelineClipboard.ts): copied clips go in at `atIndex`, copied overlays start at
+  // `atTime` keeping their length (and their own keyframes, which are relative to their start).
+  // Everything gets new ids; one undo step.
+  const pasteItems = useCallback(
+    (items: TimelineClipboardItems, atIndex: number, atTime: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const total = totalOutputDuration(current.clips);
+      const now = Date.now();
+      const fresh = <T extends { id: string }>(o: T): T => ({ ...o, id: crypto.randomUUID(), ...("createdAt" in o ? { createdAt: now, updatedAt: now } : {}) });
+      const clips = items.clips.length ? [...current.clips.slice(0, atIndex), ...items.clips.map(fresh), ...current.clips.slice(atIndex)] : current.clips;
+      // After the clips go in, the timeline is longer; overlays are timed against that.
+      const room = Math.max(0, (items.clips.length ? totalOutputDuration(clips) : total) - atTime);
+      const retime = <T extends { id: string; startTime: number; endTime: number }>(o: T): T => {
+        const length = Math.min(o.endTime - o.startTime, Math.max(0.1, room));
+        return { ...fresh(o), startTime: atTime, endTime: atTime + length };
+      };
+      pushCommand(
+        snapshot(current, {}),
+        snapshot(current, {
+          clips,
+          textOverlays: [...current.textOverlays, ...items.textOverlays.map(retime)],
+          imageOverlays: [...current.imageOverlays, ...items.imageOverlays.map(retime)],
+          blurOverlays: [...current.blurOverlays, ...items.blurOverlays.map(retime)],
+          pipOverlays: [...current.pipOverlays, ...items.pipOverlays.map(retime)],
+          audioOverlays: [...current.audioOverlays, ...items.audioOverlays.map((o) => {
+            const r = retime(o);
+            // A sound can't play past the end of its own file.
+            return { ...r, endTime: Math.min(r.endTime, r.startTime + Math.max(0.1, o.sourceDuration - o.trimStart)) };
+          })],
+          adjustmentLayers: [...(current.adjustmentLayers ?? []), ...items.adjustmentLayers.map(retime)],
+        }),
+        "insert"
+      );
     },
     [pushCommand]
   );
@@ -1304,7 +1348,25 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (cells: SplitScreenCell[], startTime: number, endTime: number, backdropColor: string | null): string[] => {
       const current = stateRef.current;
       if (!current || cells.length === 0) return [];
-      const pips = cells.map((c) => ({
+      // Picture cells are picture overlays, cropped (centred) to fill their cell like a video
+      // cell's cover fit; video cells are picture-in-picture layers.
+      const frameAspect = cells[0]?.frameAspect ?? 16 / 9;
+      const pictures = cells
+        .filter((c) => c.image)
+        .map((c) => {
+          const box = (c.width / c.height) * frameAspect;
+          const img = c.image!.width / Math.max(1, c.image!.height);
+          const crop = img > box ? { cropWidth: box / img, cropHeight: 1 } : { cropWidth: 1, cropHeight: img / box };
+          return {
+            ...makeImageOverlay(c.sourcePath, c.x, c.y, c.width, c.height, startTime, endTime),
+            cropX: (1 - crop.cropWidth) / 2,
+            cropY: (1 - crop.cropHeight) / 2,
+            ...crop,
+            // A picture's corner radius is a fraction of the frame's height, a PiP's of its box's.
+            ...(c.cornerRadius > 0 ? { cornerRadius: c.cornerRadius * c.height } : {}),
+          };
+        });
+      const pips = cells.filter((c) => !c.image).map((c) => ({
         ...makePipOverlay(c.sourcePath, c.sourceDuration, c.x, c.y, c.width, c.height, startTime, endTime),
         shape: (c.cornerRadius > 0 ? "rounded" : "rectangle") as PipOverlay["shape"],
         ...(c.cornerRadius > 0 ? { cornerRadius: c.cornerRadius } : {}),
@@ -1325,10 +1387,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         : [];
       pushCommand(
         snapshot(current, {}),
-        snapshot(current, { pipOverlays: [...current.pipOverlays, ...pips], imageOverlays: [...current.imageOverlays, ...backdrop] }),
+        snapshot(current, { pipOverlays: [...current.pipOverlays, ...pips], imageOverlays: [...current.imageOverlays, ...backdrop, ...pictures] }),
         "add-pip"
       );
-      return pips.map((p) => p.id);
+      return [...pips.map((p) => p.id), ...pictures.map((p) => p.id)];
     },
     [pushCommand]
   );
@@ -2094,6 +2156,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     deleteClips,
     duplicateClips,
     setImageClipLengths,
+    pasteItems,
     mergeClips,
     cancelMerge,
     replaceClipSource,

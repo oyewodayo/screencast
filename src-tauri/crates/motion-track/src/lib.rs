@@ -60,6 +60,11 @@ const STEP_SCALE_LIMIT: f64 = 0.12;
 const SCALE_RANGE: (f64, f64) = (0.15, 6.0);
 // Appearance template: sampled on a grid with this many cells along its longer side.
 const TEMPLATE_CELLS: usize = 24;
+// Every this many tracked frames the box is checked against the object's own appearance nearby
+// and pulled back onto it when that matches clearly better - flow alone slides slowly off a
+// plain-coloured object (a dark suit, a wall) without ever "failing".
+const ANCHOR_EVERY: usize = 4;
+const ANCHOR_GAIN: f32 = 0.08;
 // The coarse search's template grid, and how many of its best spots are refined.
 const COARSE_TEMPLATE_CELLS: usize = 12;
 const SEARCH_CANDIDATES: usize = 5;
@@ -414,6 +419,7 @@ pub struct Tracker {
     lost: bool,
     lost_frames: usize,
     drift_frames: usize,
+    tracked_frames: usize,
     last: Sample,
 }
 
@@ -426,7 +432,7 @@ impl Tracker {
         let coarse = Template::capture(&pyramid, cx, cy, w, h, COARSE_TEMPLATE_CELLS);
         let last = Sample { cx, cy, w, h, confidence: 1.0, lost: false };
         let prev = frame.data[..frame.width * frame.height].to_vec();
-        Tracker { prev, fw: frame.width, fh: frame.height, cache: None, cx, cy, w, h, w0: w, h0: h, velocity: (0.0, 0.0), template, coarse, lost: false, lost_frames: 0, drift_frames: 0, last }
+        Tracker { prev, fw: frame.width, fh: frame.height, cache: None, cx, cy, w, h, w0: w, h0: h, velocity: (0.0, 0.0), template, coarse, lost: false, lost_frames: 0, drift_frames: 0, tracked_frames: 0, last }
     }
 
     /// The box as it was last found (or held, while lost).
@@ -548,6 +554,36 @@ impl Tracker {
                 return (self.lose(), (next_pyramid, roi));
             }
         }
+        // Pull back onto the object's appearance when the flow has slid off it.
+        self.tracked_frames += 1;
+        if self.tracked_frames % ANCHOR_EVERY == 0 {
+            if let Some(t) = &self.template {
+                let base = next.base();
+                let (lx, ly) = (self.cx - ox, self.cy - oy);
+                let at = |x: f64, y: f64| Template::sample(base, 0, x, y, self.w, self.h, t.gw, t.gh).map(|v| t.ncc(&v));
+                if let Some(here) = at(lx, ly) {
+                    let (rx, ry) = (self.w * 0.25, self.h * 0.25);
+                    let stride = (self.w.min(self.h) / 24.0).max(1.0);
+                    let mut best = (here, lx, ly);
+                    let (nx, ny) = ((rx / stride) as i64, (ry / stride) as i64);
+                    for j in -ny..=ny {
+                        for i in -nx..=nx {
+                            let (x, y) = (lx + i as f64 * stride, ly + j as f64 * stride);
+                            if let Some(score) = at(x, y) {
+                                if score > best.0 {
+                                    best = (score, x, y);
+                                }
+                            }
+                        }
+                    }
+                    if best.0 > here + ANCHOR_GAIN && best.0 > 0.5 {
+                        // Half way there - a correction, not a jump.
+                        self.cx += (best.1 - lx) * 0.5;
+                        self.cy += (best.2 - ly) * 0.5;
+                    }
+                }
+            }
+        }
         let agreement = kept.len() as f64 / tracked.len().max(1) as f64;
         let confidence = ((1.0 - med_fb as f64 / FB_FAIL_PX as f64).clamp(0.0, 1.0) * (0.5 + agreement)).clamp(0.05, 1.0);
         (Sample { cx: self.cx, cy: self.cy, w: self.w, h: self.h, confidence, lost: false }, (next_pyramid, roi))
@@ -591,7 +627,9 @@ impl Tracker {
                         continue;
                     }
                     let Some(v) = Template::sample(&next.levels[l], l, cx, cy, w, h, coarse.gw, coarse.gh) else { continue };
-                    let score = coarse.ncc(&v);
+                    // Nearer where it was last seen is likelier: a far look-alike must match better.
+                    let far = (((i * i + j * j) as f64).sqrt() * step / radius.max(1.0)) as f32;
+                    let score = coarse.ncc(&v) - 0.12 * far;
                     if top.len() < SEARCH_CANDIDATES || score > top[top.len() - 1].0 {
                         // Neighbours of a better spot are the same find, not another candidate.
                         if let Some(k) = top.iter().position(|c| (c.1 - cx).abs() <= 2.0 * step && (c.2 - cy).abs() <= 2.0 * step) {
@@ -627,7 +665,8 @@ impl Tracker {
                     }
                 }
             }
-            if here.0 > best.0 {
+            let far = (((here.1 - self.cx).powi(2) + (here.2 - self.cy).powi(2)).sqrt() / radius.max(1.0)) as f32;
+            if here.0 - 0.12 * far > best.0 - 0.12 * ((((best.1 - self.cx).powi(2) + (best.2 - self.cy).powi(2)).sqrt() / radius.max(1.0)) as f32) || best.0 == f32::MIN {
                 best = (here.0, here.1, here.2, s);
             }
         }

@@ -237,14 +237,25 @@ impl TrackJob {
         let total = (((self.end - self.start) * self.fps).round() as usize).max(1);
         let mut done = 0usize;
 
-        // Forward, streaming: the first frame is the picked one.
-        let mut child = self.decoder(self.anchor, self.end - self.anchor + step * 0.5)?;
-        let mut stdout = child.stdout.take().ok_or("Couldn't read ffmpeg's output")?;
+        // Forward, streaming: the first frame is the picked one. Right at the end of a file (or in
+        // a gap between frames) there may be no frame to start from - then the nearest one
+        // before it is, up to half a second back.
         let mut frame = vec![0u8; self.frame_len()];
-        if stdout.read_exact(&mut frame).is_err() {
+        let mut opened = None;
+        for back in [0.0, step, 3.0 * step, 0.25, 0.5] {
+            let from = (self.anchor - back).max(0.0);
+            let mut child = self.decoder(from, self.end - from + step * 0.5)?;
+            let mut stdout = child.stdout.take().ok_or("Couldn't read ffmpeg's output")?;
+            if stdout.read_exact(&mut frame).is_ok() {
+                opened = Some((child, stdout));
+                break;
+            }
             let _ = child.kill();
-            return Err("Couldn't read that moment of the video".into());
+            let _ = child.wait();
         }
+        let Some((mut child, mut stdout)) = opened else {
+            return Err("Couldn't read that moment of the video".into());
+        };
         let anchor_frame = frame.clone();
         let mut forward = Tracker::new(self.gray(&frame), self.cx, self.cy, self.bw, self.bh);
         let mut times = vec![self.anchor];

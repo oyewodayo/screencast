@@ -3013,6 +3013,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					)}
 					{overlay && frameRect && (
 						<div
+							// Where files dragged from the sidebar can be dropped onto the picture (Dashboard).
+							data-video-frame
 							className="absolute pointer-events-none"
 							style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height }}
 						>

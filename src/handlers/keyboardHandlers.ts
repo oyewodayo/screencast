@@ -55,6 +55,8 @@ export const createKeyboardHandler = (
     if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
       return;
     }
+    // These are all plain keys - Ctrl+C, Ctrl+V and the like belong to copy and paste.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
 
     switch (e.key) {
       case "k":

@@ -46,6 +46,7 @@ import TrackTargetPicker from "../components/video/TrackTargetPicker";
 import ExportQueueChip from "../components/docker/ExportQueueChip";
 import { type Box as TrackBox, cancelTracking, trackOverlay } from "../utils/motionTracking";
 import { type ExportJob, installGlobalCloseGuard, onJobFinished } from "../utils/exportQueue";
+import { heldItemsFor, isTimelineMarker } from "../utils/timelineClipboard";
 import SharePanel from "../components/video/SharePanel";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
 import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
@@ -124,6 +125,7 @@ import {
   IoAddCircleOutline,
   IoBuildOutline,
   IoOptionsOutline,
+  IoAdd,
   IoPin,
   IoPinOutline,
   IoCreateOutline,
@@ -513,7 +515,10 @@ const Dashboard = () => {
   const sidebarDragRef = useRef<{ file: FileEntry; startX: number; startY: number; isDragging: boolean } | null>(null);
 
   const handleSidebarFilePointerDown = (file: FileEntry) => (e: React.PointerEvent) => {
-    if (getFileCategory(file.name) !== "video") return; // only meaningful for the video timeline
+    // Videos, pictures and sound can be dragged into the open video (addMediaToVideo).
+    const category = getFileCategory(file.name);
+    if (category !== "video" && category !== "image" && category !== "audio") return;
+    if (category !== "video" && !editingVideoRef.current) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     sidebarDragRef.current = { file, startX: e.clientX, startY: e.clientY, isDragging: false };
   };
@@ -524,6 +529,7 @@ const Dashboard = () => {
       drag.isDragging = true;
       setDraggingFiles([drag.file]);
     }
+    if (drag.isDragging) setDragPoint({ x: e.clientX, y: e.clientY, over: dropTargetAt(e.clientX, e.clientY) });
   };
   const handleSidebarFilePointerUp = (file: FileEntry) => (e: React.PointerEvent) => {
     const drag = sidebarDragRef.current;
@@ -534,11 +540,46 @@ const Dashboard = () => {
       return;
     }
     setDraggingFiles(null);
+    setDragPoint(null);
     const el = document.elementFromPoint(e.clientX, e.clientY);
+    // A drop zone that takes a file itself (a split screen's shot rows).
+    const zone = el?.closest("[data-media-drop]");
+    if (zone) {
+      zone.dispatchEvent(new CustomEvent("media-drop", { detail: { path: file.path }, bubbles: true }));
+      return;
+    }
     if (el?.closest("[data-timeline-track]")) {
-      setPendingTimelineInsert({ paths: [file.path], clientX: e.clientX });
+      // Sound gets its own track at the playhead; a video or picture goes where it was dropped.
+      if (getFileCategory(file.name) === "audio") void addMediaToVideo(file.path, "end");
+      else setPendingTimelineInsert({ paths: [file.path], clientX: e.clientX });
+      return;
+    }
+    // On the picture: shown there, where it was dropped.
+    const frame = videoFrameAt(e.clientX, e.clientY);
+    if (frame && editingVideoRef.current) {
+      const r = frame.getBoundingClientRect();
+      void addMediaToVideo(file.path, "overlay", { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height, frameAspect: r.width / Math.max(1, r.height) });
     }
   };
+  // The player's picture under (x, y), if that's where the point is - by its rectangle: the frame
+  // layer lets clicks through (pointer-events: none), so elementFromPoint never returns it.
+  const videoFrameAt = (x: number, y: number): HTMLElement | null => {
+    const frame = document.querySelector<HTMLElement>("[data-video-frame]");
+    const r = frame?.getBoundingClientRect();
+    if (!frame || !r || x < r.left || x > r.right || y < r.top || y > r.bottom) return null;
+    // Not when something else (a dialog, a menu) is on top there.
+    const top = document.elementFromPoint(x, y);
+    return top && top.closest(".video-container") ? frame : null;
+  };
+  // Where a sidebar drag would land, for the hint that follows the pointer.
+  const dropTargetAt = (x: number, y: number): "timeline" | "video" | "zone" | null => {
+    const el = document.elementFromPoint(x, y);
+    if (el?.closest("[data-media-drop]")) return "zone";
+    if (el?.closest("[data-timeline-track]")) return "timeline";
+    if (videoFrameAt(x, y) && editingVideoRef.current) return "video";
+    return null;
+  };
+  const [dragPoint, setDragPoint] = useState<{ x: number; y: number; over: "timeline" | "video" | "zone" | null } | null>(null);
   // Multi-select for bulk move — a set of file.path values, spanning whichever folders are
   // currently visible under the active category. Cleared whenever the category tab changes so
   // a stale selection from "Video" doesn't silently carry over into "Audio".
@@ -849,7 +890,14 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   const startMotionTrack = (kind: "text" | "image" | "blur", id: string) => {
     const o = overlayForTracking(kind, id);
     if (!o) return;
-    const t = getExactOutputTime() ?? currentOutputTime;
+    // The timeline's playhead; the player's exact clock refines it only when they agree (it can
+    // still report where playback ended after the timeline has moved on).
+    const exact = getExactOutputTime();
+    const t = exact !== null && Math.abs(exact - currentOutputTime) < 0.5 ? exact : currentOutputTime;
+    if (o.endTime - o.startTime < 0.25) {
+      setMessage("This overlay is only on screen for a moment - drag its end on the timeline to make it longer, then track");
+      return;
+    }
     if (t < o.startTime - 1e-3 || t > o.endTime + 1e-3) {
       setMessage("Move the playhead to a moment when the overlay is on screen, then track");
       return;
@@ -897,6 +945,131 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     if (trackSession?.tracking) void cancelTracking(trackSession.tracking.jobId);
     setTrackSession(null);
   };
+
+  // ---- Adding a library file to the open video: dragged from the sidebar or from its "+" menu.
+  // "insert" puts a video or picture on the timeline after the clip at the playhead, "end" after
+  // the last clip, "overlay" shows a picture (or a video, as picture-in-picture) on the video -
+  // at `at` (frame fractions) when dropped there - and sound always goes on its own track.
+  const editingVideoRef = useRef(false);
+  editingVideoRef.current = !!selectedFile && getFileCategory(selectedFile.name) === "video" && dockerMode === "file-tools";
+  const addMediaToVideo = async (path: string, how: "insert" | "end" | "overlay", at?: { x: number; y: number; frameAspect: number }) => {
+    const category = getFileCategory(path.split(/[\\/]/).pop() ?? path);
+    const total = totalOutputDuration;
+    const t = Math.max(0, Math.min(currentOutputTime, total));
+    const fileDuration = async () => {
+      const info = await invoke<Record<string, string>>("get_conversion_info", { inputPath: path });
+      const d = parseFloat(info.duration?.match(/[\d.]+/)?.[0] ?? "");
+      if (!Number.isFinite(d) || d <= 0) throw new Error("Couldn't read how long it is");
+      return d;
+    };
+    try {
+      if (category === "audio") {
+        const d = await fileDuration();
+        editStore.addAudioOverlay(path, d, t, Math.min(total, t + d));
+        setMessage("Added on its own audio track at the playhead");
+        return;
+      }
+      if (how !== "overlay") {
+        let index = editStore.clips.length;
+        if (how === "insert") {
+          let end = 0;
+          index = editStore.clips.findIndex((c) => (end += clipOutputDuration(c)) > t + 1e-3) + 1;
+          if (index <= 0) index = editStore.clips.length;
+        }
+        await editStore.insertClipAt(path, index);
+        return;
+      }
+      // On the video, centred where it was dropped (or in the middle), a third of the frame wide.
+      const frameAspect = at?.frameAspect ?? 16 / 9;
+      const place = (aspect: number) => {
+        const width = 0.33;
+        const height = Math.min(1, (width * frameAspect) / aspect);
+        const cx = at?.x ?? 0.5;
+        const cy = at?.y ?? 0.5;
+        return { x: Math.max(0, Math.min(1 - width, cx - width / 2)), y: Math.max(0, Math.min(1 - height, cy - height / 2)), width, height };
+      };
+      const start = total > 0 ? Math.max(0, Math.min(t, total - Math.min(5, total))) : 0;
+      if (category === "image") {
+        const size = await new Promise<{ w: number; h: number }>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+          img.onerror = () => reject(new Error("Couldn't open the picture"));
+          img.src = convertFileSrc(path);
+        });
+        const box = place(size.w / Math.max(1, size.h));
+        setSelectedImageOverlayId(editStore.addImageOverlay(path, box.x, box.y, box.width, box.height, start, Math.min(total, start + 5)));
+        return;
+      }
+      const [w, h] = await invoke<[number, number]>("video_frame_size", { sourcePath: path });
+      const d = await fileDuration();
+      const box = place(w / Math.max(1, h));
+      setSelectedPipOverlayId(editStore.addPipOverlay(path, d, box.x, box.y, box.width, box.height, t, Math.min(total, t + d)));
+    } catch (err) {
+      setError(`Couldn't add ${path.split(/[\\/]/).pop()}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  const [addMenuFor, setAddMenuFor] = useState<string | null>(null);
+
+  // Ctrl+V in the video editor: what was copied on the timeline (timelineClipboard.ts), pasted at
+  // the playhead - or, when something else was copied since, that: files copied in Explorer
+  // (videos go in as clips at the playhead, pictures onto the video, sound on its own track), or a
+  // picture on the clipboard (a screenshot, an image copied in a browser), saved to the library's
+  // Pasted folder and put on the video.
+  const pasteRef = useRef<(e: ClipboardEvent) => void>(() => {});
+  pasteRef.current = (e: ClipboardEvent) => {
+    if (!editingVideoRef.current) return;
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+    const data = e.clipboardData;
+    const text = data ? data.getData("text/plain") : null;
+    const held = heldItemsFor(text);
+    const t = Math.max(0, Math.min(currentOutputTime, totalOutputDuration));
+    if (held) {
+      e.preventDefault();
+      // Clips go in after the clip at the playhead.
+      let end = 0;
+      let index = editStore.clips.findIndex((c) => (end += clipOutputDuration(c)) > t + 1e-3) + 1;
+      if (index <= 0) index = editStore.clips.length;
+      editStore.pasteItems(held, index, t);
+      return;
+    }
+    if (text && isTimelineMarker(text)) return; // a copy from an older session - nothing held
+    const hasFiles = !!data && (data.files.length > 0 || Array.from(data.types).includes("Files"));
+    if (!hasFiles) return;
+    e.preventDefault();
+    const picture = data ? Array.from(data.files).find((f) => f.type.startsWith("image/")) : undefined;
+    void (async () => {
+      const paths = await invoke<string[]>("clipboard_file_paths").catch(() => [] as string[]);
+      const usable = paths.filter((p) => ["video", "image", "audio"].includes(getFileCategory(p.split(/[\\/]/).pop() ?? p) ?? ""));
+      if (usable.length > 0) {
+        for (const path of usable) {
+          // eslint-disable-next-line no-await-in-loop
+          await addMediaToVideo(path, getFileCategory(path.split(/[\\/]/).pop() ?? path) === "image" ? "overlay" : "insert");
+        }
+        setMessage(usable.length === 1 ? "Pasted into the video" : `Pasted ${usable.length} files into the video`);
+        return;
+      }
+      if (picture) {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(picture);
+        });
+        const saved = await invoke<string>("save_pasted_image", { dataBase64: dataUrl, extension: picture.type.split("/")[1] ?? "png" });
+        await addMediaToVideo(saved, "overlay");
+        void handleDirectoryFiles();
+        setMessage("Pasted the picture onto the video (saved in Pasted)");
+        return;
+      }
+      if (paths.length > 0) setMessage("Only videos, pictures and sound can be pasted into a video");
+    })().catch((err) => setError(`Couldn't paste: ${err instanceof Error ? err.message : String(err)}`));
+  };
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => pasteRef.current(e);
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, []);
 
   // One thing selected at a time across overlays and adjustment layers (each has its own panel).
   const selectAdjustment = useCallback((id: string | null) => {
@@ -4014,6 +4187,13 @@ const setScreen = () => {
                               data-file-path={file.path}
                               draggable
                               onDragStart={(e) => {
+                                // While a video is being edited, dragging a video, picture or sound
+                                // takes it into the editor (handleSidebarFilePointerDown) - the
+                                // browser's own drag would cancel that gesture the moment it began.
+                                if (editingVideoRef.current && ["video", "image", "audio"].includes(getFileCategory(file.name) ?? "")) {
+                                  e.preventDefault();
+                                  return;
+                                }
                                 setDraggingFiles(filesToActOn(file));
                                 e.dataTransfer.effectAllowed = "move";
                               }}
@@ -4085,6 +4265,53 @@ const setScreen = () => {
                                   className="shrink-0 text-gray-400 dark:text-neutral-500"
                                   title={`${linkedDocsByPath.get(file.path)!.length} linked note(s)`}
                                 />
+                              )}
+
+                              {/* Add to the video being edited: insert, append, or show on the picture. */}
+                              {editingVideoRef.current && ["video", "image", "audio"].includes(getFileCategory(file.name) ?? "") && file.path !== selectedFile?.sourcePath && (
+                                <div className="relative">
+                                  <button
+                                    title="Add to the video you're editing (or drag it onto the timeline or the picture)"
+                                    className={`p-1 rounded-md transition-colors ${addMenuFor === file.path ? 'opacity-100 bg-gray-200 dark:bg-neutral-700' : 'opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-neutral-700'}`}
+                                    onPointerDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (getFileCategory(file.name) === "audio") {
+                                        void addMediaToVideo(file.path, "end");
+                                        return;
+                                      }
+                                      setAddMenuFor(addMenuFor === file.path ? null : file.path);
+                                    }}
+                                  >
+                                    <IoAdd size={14} />
+                                  </button>
+                                  {addMenuFor === file.path && (
+                                    <div
+                                      onPointerDown={(e) => e.stopPropagation()}
+                                      className="absolute right-0 top-full mt-1.5 w-52 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl overflow-hidden z-20 py-1 text-sm text-neutral-700 dark:text-neutral-200"
+                                    >
+                                      {(
+                                        [
+                                          ["insert", "Insert at the playhead"],
+                                          ["end", "Add to the end"],
+                                          ["overlay", getFileCategory(file.name) === "image" ? "Show on the video" : "Show on the video (picture-in-picture)"],
+                                        ] as const
+                                      ).map(([how, label]) => (
+                                        <button
+                                          key={how}
+                                          className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700/70"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setAddMenuFor(null);
+                                            void addMediaToVideo(file.path, how);
+                                          }}
+                                        >
+                                          {label}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
                               )}
 
                               {/* Three vertical dots menu */}
@@ -4929,7 +5156,7 @@ const setScreen = () => {
         onSetThumbnail={() => videoPlayerRef.current?.openThumbnailPicker()}
         onExportedFile={handleVideoExported}
         draggingLibraryFile={
-          draggingFiles && draggingFiles.length === 1 && getFileCategory(draggingFiles[0].name) === "video"
+          draggingFiles && draggingFiles.length === 1 && ["video", "image", "audio"].includes(getFileCategory(draggingFiles[0].name) ?? "")
             ? { path: draggingFiles[0].path, name: draggingFiles[0].name }
             : null
         }
@@ -5050,6 +5277,28 @@ const setScreen = () => {
       )}
 
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 items-end">
+        {dragPoint && draggingFiles?.length === 1 && (
+          <div
+            className="fixed z-[90] pointer-events-none px-2.5 py-1.5 rounded-lg shadow-lg text-[12px] whitespace-nowrap bg-neutral-900/95 text-white ring-1 ring-white/10"
+            style={{ left: dragPoint.x + 14, top: dragPoint.y + 14 }}
+          >
+            <span className="font-medium">{draggingFiles[0].name}</span>
+            <span className="text-white/55">
+              {" · "}
+              {dragPoint.over === "timeline"
+                ? getFileCategory(draggingFiles[0].name) === "audio"
+                  ? "drop to add as a sound track"
+                  : "drop to insert here"
+                : dragPoint.over === "video"
+                  ? getFileCategory(draggingFiles[0].name) === "audio"
+                    ? "drop to add as a sound track"
+                    : "drop to show it here on the video"
+                  : dragPoint.over === "zone"
+                    ? "drop to use it here"
+                    : "drop on the timeline or the picture"}
+            </span>
+          </div>
+        )}
         <ExportQueueChip
           onOpen={(job) => job.resultPath && void loadFileForPlayback(job.resultPath, job.resultPath.split(/[\\/]/).pop() ?? job.title)}
           onShare={setShareJob}

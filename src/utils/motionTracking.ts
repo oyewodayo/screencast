@@ -187,6 +187,7 @@ export async function trackOverlay(req: TrackOverlayRequest): Promise<TrackOverl
     const s = run.find((r, i) => t < r.outEnd || i === run.length - 1)!;
     return { span: s, source: outputOffsetToSource(s.clip, Math.max(0, t - s.outStart)) };
   };
+  if (outTo - outFrom < 0.1) throw new Error("The overlay needs to be on screen longer over this clip to follow anything");
   const srcFrom = sourceAt(outFrom).source;
   const srcTo = sourceAt(Math.max(outFrom, outTo - 1e-3)).source;
 

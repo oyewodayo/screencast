@@ -53,6 +53,10 @@ import VideoTextEditor, { VideoTextEditorHandle, VideoTextFormat } from "./Video
 export const DEFAULT_OVERLAY_WIDTH_FRACTION = 0.4;
 export const DEFAULT_OVERLAY_FONT_FRACTION = 0.06;
 export const DEFAULT_OVERLAY_DURATION_SEC = 5;
+// Where a new overlay starts: at the playhead - or, near the end, early enough that it still gets
+// its full length (placed at the very end it would otherwise last a few milliseconds).
+const placementStart = (playhead: number, total: number): number =>
+  total > 0 ? Math.max(0, Math.min(playhead, total - Math.min(DEFAULT_OVERLAY_DURATION_SEC, total))) : playhead;
 // The padding every text overlay had before `padding` existed as its own field (a plain 2px,
 // unaffected by frame size) - expressed as a frameRect.height fraction so newly-opened editing
 // sessions (which stage padding as a fraction, same basis as fontSize) start from the exact same
@@ -885,7 +889,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       const fontSize = DEFAULT_OVERLAY_FONT_FRACTION;
       const nx = Math.max(0, Math.min((e.clientX - rect.left) / rect.width - width / 2, 1 - width));
       const ny = Math.max(0, Math.min((e.clientY - rect.top) / rect.height, 1 - fontSize * 1.3));
-      const startTime = currentOutputTime;
+      const startTime = placementStart(currentOutputTime, totalOutputDuration);
       const endTime = Math.min(totalOutputDuration, startTime + DEFAULT_OVERLAY_DURATION_SEC);
 
       const id = onAddTextOverlay(nx, ny, width, fontSize, startTime, endTime > startTime ? endTime : startTime + DEFAULT_OVERLAY_DURATION_SEC);
@@ -914,7 +918,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       const height = DEFAULT_BLUR_HEIGHT_FRACTION;
       const nx = Math.max(0, Math.min((e.clientX - rect.left) / rect.width - width / 2, 1 - width));
       const ny = Math.max(0, Math.min((e.clientY - rect.top) / rect.height - height / 2, 1 - height));
-      const startTime = currentOutputTime;
+      const startTime = placementStart(currentOutputTime, totalOutputDuration);
       const endTime = Math.min(totalOutputDuration, startTime + DEFAULT_OVERLAY_DURATION_SEC);
 
       const id = onAddBlurOverlay(nx, ny, width, height, 0.5, startTime, endTime > startTime ? endTime : startTime + DEFAULT_OVERLAY_DURATION_SEC);
@@ -978,7 +982,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         const height = frameRect.height > 0 ? (width * frameRect.width) / imageAspect / frameRect.height : width;
         const nx = Math.max(0, Math.min(0.5 - width / 2, 1 - width));
         const ny = Math.max(0, Math.min(0.5 - height / 2, 1 - height));
-        const startTime = currentOutputTime;
+        const startTime = placementStart(currentOutputTime, totalOutputDuration);
         const endTime = Math.min(totalOutputDuration, startTime + DEFAULT_OVERLAY_DURATION_SEC);
 
         const id = onAddImageOverlay(selected, nx, ny, width, height, startTime, endTime > startTime ? endTime : startTime + DEFAULT_OVERLAY_DURATION_SEC);

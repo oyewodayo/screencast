@@ -134,6 +134,46 @@ pub fn copy_file_to_clipboard(path: String) -> Result<(), String> {
     }
 }
 
+// Files copied in Explorer (the clipboard's CF_HDROP list) - what the video editor's Ctrl+V adds.
+#[command(async)]
+pub fn clipboard_file_paths() -> Vec<String> {
+    let _serial = serial();
+    #[cfg(windows)]
+    {
+        win::clipboard_files()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+// A picture pasted into the video editor (a screenshot, an image copied in a browser) saved into
+// the library's "Pasted" folder, so the video can use it like any other picture file.
+#[command(async)]
+pub fn save_pasted_image(data_base64: String, extension: String) -> Result<String, String> {
+    use base64::Engine;
+    let _serial = serial();
+    let ext = match extension.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "jpg",
+        "gif" => "gif",
+        "webp" => "webp",
+        _ => "png",
+    };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data_base64.rsplit(',').next().unwrap_or(&data_base64)).map_err(|e| format!("Couldn't read the picture: {e}"))?;
+    let dir = crate::services::utility::briefcast_dir()?.join("Pasted");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create the Pasted folder: {e}"))?;
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+    let mut path = dir.join(format!("Pasted {stamp}.{ext}"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("Pasted {stamp} ({n}).{ext}"));
+        n += 1;
+    }
+    std::fs::write(&path, bytes).map_err(|e| format!("Couldn't save the picture: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[command]
 pub async fn share_file_native(window: tauri::WebviewWindow, path: String, title: String, description: String) -> Result<(), String> {
     let file = existing_file(&path)?;
@@ -265,6 +305,30 @@ mod win {
     // CF_HDROP - the format Explorer's own Copy uses, so the file pastes into chat apps, web mail
     // and folders alike - plus "Preferred DropEffect" = copy, so pasting into a folder copies
     // rather than moves the staged file.
+    pub fn clipboard_files() -> Vec<String> {
+        use windows::Win32::System::DataExchange::{GetClipboardData, IsClipboardFormatAvailable};
+        use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+        const CF_HDROP: u32 = 15;
+        let mut out = Vec::new();
+        unsafe {
+            if IsClipboardFormatAvailable(CF_HDROP).is_err() || OpenClipboard(HWND(0)).is_err() {
+                return out;
+            }
+            if let Ok(handle) = GetClipboardData(CF_HDROP) {
+                let drop = HDROP(handle.0);
+                let count = DragQueryFileW(drop, u32::MAX, None);
+                for i in 0..count {
+                    let len = DragQueryFileW(drop, i, None) as usize;
+                    let mut buf = vec![0u16; len + 1];
+                    DragQueryFileW(drop, i, Some(&mut buf));
+                    out.push(String::from_utf16_lossy(&buf[..len]));
+                }
+            }
+            let _ = CloseClipboard();
+        }
+        out
+    }
+
     pub fn copy_file(path: &Path) -> Result<(), String> {
         const CF_HDROP: u32 = 15;
         const DROPEFFECT_COPY: u32 = 1;
