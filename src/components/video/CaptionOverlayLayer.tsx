@@ -77,7 +77,6 @@ const CaptionOverlayLayer: React.FC<CaptionOverlayLayerProps> = ({ frameRect, li
   }, [isPlaying, clipSpeed, lines]);
 
   const line = cursor.lineId ? lines.find((l) => l.id === cursor.lineId) ?? null : null;
-  const preset = CAPTION_PRESETS[settings.preset];
   const fontPx = captionFontPx(settings, frameRect.height);
   const edgeGap = settings.offset * frameRect.height;
 
@@ -91,32 +90,38 @@ const CaptionOverlayLayer: React.FC<CaptionOverlayLayerProps> = ({ frameRect, li
         paddingBottom: settings.position === "bottom" ? edgeGap : 0,
       }}
     >
-      {settings.enabled && line && (
-        // Row height includes the box padding, so a line that wraps stacks its per-row boxes
-        // (box-decoration-break: clone) edge to edge instead of overlapping.
-        <div style={{ maxWidth: "88%", textAlign: "center", fontSize: fontPx, lineHeight: `${captionRowHeightPx(preset, fontPx)}px` }}>
-          <span style={captionBoxStyle(preset, fontPx)}>
-            {line.words.map((w, i) => {
-              const active = i === cursor.word;
-              const scaled = active && settings.emphasis && preset.emphasisScale !== 1;
-              return (
-                <React.Fragment key={i}>
-                  {i > 0 && " "}
-                  <span
-                    style={{
-                      ...captionWordStyle(preset, settings, active, fontPx),
-                      display: scaled ? "inline-block" : undefined,
-                      transform: scaled ? `scale(${preset.emphasisScale})` : undefined,
-                    }}
-                  >
-                    {displayWord(w.text, settings)}
-                  </span>
-                </React.Fragment>
-              );
-            })}
-          </span>
-        </div>
-      )}
+      {settings.enabled && line && <CaptionLineView line={line} activeWord={cursor.word} settings={settings} fontPx={fontPx} />}
+    </div>
+  );
+};
+
+// One caption line as the preview draws it - also used by the Shorts previews (ShortsStudio).
+export const CaptionLineView: React.FC<{ line: CaptionLine; activeWord: number; settings: CaptionSettings; fontPx: number }> = ({ line, activeWord, settings, fontPx }) => {
+  const preset = CAPTION_PRESETS[settings.preset];
+  return (
+    // Row height includes the box padding, so a line that wraps stacks its per-row boxes
+    // (box-decoration-break: clone) edge to edge instead of overlapping.
+    <div style={{ maxWidth: "88%", textAlign: "center", fontSize: fontPx, lineHeight: `${captionRowHeightPx(preset, fontPx)}px` }}>
+      <span style={captionBoxStyle(preset, fontPx)}>
+        {line.words.map((w, i) => {
+          const active = i === activeWord;
+          const scaled = active && settings.emphasis && preset.emphasisScale !== 1;
+          return (
+            <React.Fragment key={i}>
+              {i > 0 && " "}
+              <span
+                style={{
+                  ...captionWordStyle(preset, settings, active, fontPx),
+                  display: scaled ? "inline-block" : undefined,
+                  transform: scaled ? `scale(${preset.emphasisScale})` : undefined,
+                }}
+              >
+                {displayWord(w.text, settings)}
+              </span>
+            </React.Fragment>
+          );
+        })}
+      </span>
     </div>
   );
 };

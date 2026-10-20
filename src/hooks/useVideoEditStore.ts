@@ -249,7 +249,11 @@ export interface UseVideoEditStoreResult {
   setChapters: (chapters: VideoChapter[]) => void;
   // Everything one export needs, snapshotted now - what the background queue renders while
   // editing carries on (exportQueue.ts). Null when there's nothing to export.
-  prepareExport: (timelinePixelSize: { width: number; height: number } | null, options?: ExportOptions) => Promise<ExportJobPayload | null>;
+  // `override` exports another timeline built from this one instead of the timeline itself (a
+  // short from Make it a Short - shortsBuild.ts); everything else about the export is the same.
+  prepareExport: (timelinePixelSize: { width: number; height: number } | null, options?: ExportOptions, override?: VideoEditState) => Promise<ExportJobPayload | null>;
+  // The whole timeline as it is now (null while loading) - for tools that derive a new one from it.
+  editState: VideoEditState | null;
   // Background music/voiceover overlays - unlike text/image, these have no position on the frame
   // (VideoOverlayLayer isn't involved at all) and their whole UI lives in VideoTimelineDocker's own
   // timeline lane. `addAudioOverlay` takes the source file's own duration (already known by the
@@ -1843,8 +1847,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // Overlays whose render comes back null (empty text, zero-size box, an image that failed to
   // decode) are skipped rather than failing the export.
   const prepareExport = useCallback(
-    async (timelinePixelSize: { width: number; height: number } | null, options?: ExportOptions): Promise<ExportJobPayload | null> => {
-      const current = stateRef.current;
+    async (timelinePixelSize: { width: number; height: number } | null, options?: ExportOptions, override?: VideoEditState): Promise<ExportJobPayload | null> => {
+      const current = override ?? stateRef.current;
       if (!sourcePath || !current || current.clips.length === 0) return null;
       // Overlays, blur regions, picture-in-picture and captions are laid out on the FINAL frame -
       // the platform format's when one is chosen (export fits the video into it first).
@@ -2284,6 +2288,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     chapters: state?.chapters ?? [],
     setChapters,
     prepareExport,
+    editState: state,
     addAudioOverlay,
     detachVideoAudio,
     updateAudioOverlayContent,

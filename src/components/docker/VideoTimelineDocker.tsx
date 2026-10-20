@@ -57,6 +57,7 @@ import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClamped
 import ElementsGallery from "../video/ElementsGallery";
 import SplitScreenPanel from "../video/SplitScreenPanel";
 import HighlightIntroPanel from "../video/HighlightIntroPanel";
+import ShortsStudio from "../shorts/ShortsStudio";
 import { assetEntry, makeAsset } from "../../utils/videoAssets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import MusicLibraryPanel from "./MusicLibraryPanel";
@@ -84,7 +85,7 @@ import ChaptersPanel from "./ChaptersPanel";
 import { enqueue as enqueueExport } from "../../utils/exportQueue";
 import { copyItems, emptyClipboardItems } from "../../utils/timelineClipboard";
 import { outputChapters } from "../../utils/videoChapters";
-import { IoBookmarkOutline, IoColorFilterOutline, IoPersonCircleOutline } from "react-icons/io5";
+import { IoBookmarkOutline, IoColorFilterOutline, IoPersonCircleOutline, IoSparkles } from "react-icons/io5";
 import { buildCaptionLines } from "../../utils/captions";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import ToolSearch from "./ToolSearch";
@@ -1005,6 +1006,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
   // Split screen builder (SplitScreenPanel).
   const [splitAnchor, setSplitAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Make it a Short (ShortsStudio).
+  const [shortsOpen, setShortsOpen] = useState(false);
   // Highlight intro builder (HighlightIntroPanel).
   const [introAnchor, setIntroAnchor] = useState<{ left: number; top: number } | null>(null);
   // The music & sound-effects library (MusicLibraryPanel).
@@ -2918,6 +2921,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoPixelSize?.width, videoPixelSize?.height, activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.grade, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.speedRamp, activeClip?.noiseReduction, activeClip?.audioCleanup, activeClip?.muted, activeClip?.sourcePath]);
+  // Leaving the editor takes the timeline's framing with it - otherwise the player keeps fitting
+  // whatever it shows next into this file's frame (a wide film shrunk into a tall recording's frame).
+  useEffect(() => () => onActiveClipChange?.(null), [onActiveClipChange]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -3575,6 +3581,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            title="Make it a Short - your best moments as vertical clips with captions"
+            onClick={() => setShortsOpen(true)}
+            disabled={captionSourcePaths.length === 0 || !editStore.editState}
+            className="flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium text-violet-200 bg-violet-500/15 hover:bg-violet-500/25 transition-colors disabled:opacity-40 disabled:cursor-default"
+          >
+            <IoSparkles size={13} />
+            Shorts
+          </button>
           <div className="flex items-center">
             <button
               type="button"
@@ -4688,6 +4704,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             setIsPlacingAudio(true);
           }}
           onClose={() => setMusicAnchor(null)}
+        />
+      )}
+
+      {shortsOpen && editStore.editState && (
+        <ShortsStudio
+          editState={editStore.editState}
+          sourcePaths={captionSourcePaths}
+          frame={videoPixelSize}
+          sourceDuration={editStore.getSourceDuration}
+          primaryPath={file.path}
+          onTranscribed={(language, transcripts) => editStore.setCaptionTranscripts(language, transcripts, { captionsEnabled: false })}
+          prepareExport={editStore.prepareExport}
+          onClose={() => setShortsOpen(false)}
         />
       )}
 

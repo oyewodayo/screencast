@@ -99,7 +99,7 @@ export function youtubeChapterLines(chapters: { time: number; label: string }[],
 
 // ---- Suggestions from the transcript ---------------------------------------------------------
 
-const STOPWORDS = new Set(
+export const STOPWORDS = new Set(
   (
     "a about above after again against all also am an and any are aren't as at be because been before being below between both but by can can't " +
     "cannot could couldn't did didn't do does doesn't doing don't down during each few for from further get got gonna had hadn't has hasn't have " +
@@ -112,10 +112,10 @@ const STOPWORDS = new Set(
   ).split(" ")
 );
 
-const tokenize = (text: string): string => text.toLowerCase().replace(/[^\p{L}\p{N}' -]/gu, "").replace(/^'+|'+$/g, "");
+export const tokenize = (text: string): string => text.toLowerCase().replace(/[^\p{L}\p{N}' -]/gu, "").replace(/^'+|'+$/g, "");
 
 // A light stem, so "model", "models" and "modeling" count as one word.
-function stem(word: string): string {
+export function stem(word: string): string {
   if (word.length <= 4) return word;
   for (const suffix of ["ations", "ation", "ings", "ing", "edly", "ed", "ies", "es", "ly", "s"]) {
     if (word.endsWith(suffix) && word.length - suffix.length >= 3) return suffix === "ies" ? word.slice(0, -3) + "y" : word.slice(0, -suffix.length);
@@ -143,7 +143,7 @@ function cosine(a: Map<string, number>, b: Map<string, number>): number {
   return na > 0 && nb > 0 ? dot / Math.sqrt(na * nb) : 0;
 }
 
-const titleCase = (s: string) => s.replace(/\b\p{L}/gu, (c) => c.toUpperCase());
+export const titleCase = (s: string) => s.replace(/\b\p{L}/gu, (c) => c.toUpperCase());
 
 export interface ChapterSuggestion {
   time: number; // output seconds
