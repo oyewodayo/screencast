@@ -1,10 +1,15 @@
 // components/docker/VideoTimelineDocker.tsx
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { analyzeReframe, anchorKnots } from "../../utils/reframeAnalysis";
+import { fillWindow } from "../../utils/reframeTrack";
+import type { ReframePreview } from "../video/ReframePreviewLayer";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { appCacheDir, join } from "@tauri-apps/api/path";
+import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdBlurOn, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt } from "react-icons/md";
+import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt, MdViewQuilt, MdFlashOn, MdTune, MdVideoLibrary } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -25,6 +30,7 @@ import {
   IoVolumeMuteOutline,
   IoEllipsisHorizontal,
   IoFolderOpenOutline,
+  IoFolderOutline,
   IoSwapHorizontalOutline,
   IoSwapHorizontal,
   IoChevronDown,
@@ -33,35 +39,92 @@ import {
   IoPause,
   IoAddCircleOutline,
   IoImageOutline,
+  IoShapesOutline,
   IoLocateOutline,
   IoSpeedometerOutline,
   IoSyncOutline,
   IoDownloadOutline,
+  IoDocumentTextOutline,
 } from "react-icons/io5";
 import { DockerFile } from "./FileToolsDocker";
-import { ExportQuality, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AudioOverlay, BlurOverlay, Clip, ImageOverlay, PipOverlay, TextOverlay } from "../../utils/videoEditTypes";
-import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
+import { ExportQuality, MIN_AUDIO_START_ROOM_SEC, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
+import { AdjustmentLayer, AudioOverlay, BlurOverlay, Clip, IMAGE_CLIP_EXTENSIONS, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
+import { FILE_CATEGORY_EXTENSIONS, MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
-import { buildViewSwitchOverlays, overlaysActiveAt, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
+import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
 import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
+import ElementsGallery from "../video/ElementsGallery";
+import SplitScreenPanel from "../video/SplitScreenPanel";
+import HighlightIntroPanel from "../video/HighlightIntroPanel";
+import { assetEntry, makeAsset } from "../../utils/videoAssets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
-import ClipEffectsPopover from "./ClipEffectsPopover";
+import MusicLibraryPanel from "./MusicLibraryPanel";
+import { libraryInfoOf, restoreMusicTrack, VideoContext } from "../../utils/musicLibrary";
+import { computeSpeechTimeline, DEFAULT_DUCK_LEVEL, duckGainAt, isDucked, isSpeechOverlay, TimeRange } from "../../utils/musicDucking";
+import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION } from "./ClipEffectsPopover";
+import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
+import MoveCopyMenu, { FileTransferOptions } from "./MoveCopyMenu";
+import ClipViewerModal from "./ClipViewerModal";
+import { beatOutputTimes } from "../../utils/beatSync";
+import { clipOutputDuration, outputOffsetToSource, sourceToOutputOffset } from "../../utils/clipTiming";
+import TranscriptEditorPanel from "./TranscriptEditorPanel";
+import { transitionDuration } from "../video/TransitionPreviewLayer";
 import SpeedPopover from "./SpeedPopover";
 import NoiseReductionPopover from "./NoiseReductionPopover";
-import ExtractAudioPopover from "./ExtractAudioPopover";
-import ExportOptionsPopover from "./ExportOptionsPopover";
+import ExtractAudioPopover, { DetachMode, SeparationEngineStatus } from "./ExtractAudioPopover";
+import ExportOptionsPopover, { EXPORT_FORMATS, ExportFormat, ExportFraming } from "./ExportOptionsPopover";
 import SilenceDetectionPopover, { SilenceDetectionState } from "./SilenceDetectionPopover";
 import AutoZoomPopover, { AutoZoomState } from "./AutoZoomPopover";
 import ViewSwitchPopover, { ViewSwitchDetectState } from "./ViewSwitchPopover";
 import ToolModePopover, { TimelineToolMode } from "./ToolModePopover";
+import { useToolPanelHost } from "./ToolPanelHost";
+import CaptionsPanel from "./CaptionsPanel";
+import ChaptersPanel from "./ChaptersPanel";
+import { enqueue as enqueueExport } from "../../utils/exportQueue";
+import { copyItems, emptyClipboardItems } from "../../utils/timelineClipboard";
+import { outputChapters } from "../../utils/videoChapters";
+import { IoBookmarkOutline, IoColorFilterOutline, IoPersonCircleOutline } from "react-icons/io5";
+import { buildCaptionLines } from "../../utils/captions";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
+import ToolSearch from "./ToolSearch";
+import MixerPanel, { type MixerChannel } from "./MixerPanel";
+import { audioChannelKey, audioChannelName, fileStem, isNeutralFx } from "../../utils/audioFx";
+
+// A video-track layer covering the whole frame - B-roll rather than a picture-in-picture.
+const isFullFrameLayer = (o: PipOverlay) => o.x <= 0.001 && o.y <= 0.001 && o.width >= 0.999 && o.height >= 0.999;
+import { resumeMixer, syncElementFx } from "../../utils/mixerGraph";
+import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
+import { isTrackHidden, pipTrack, tracksInUse, videoTrackLabel } from "../../utils/videoTracks";
+import { subscribeVideoFrames } from "../../utils/videoFrameCache";
+import { getPlayableUrl, isPictureless } from "../../utils/playableVideo";
+import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 const MIN_PX_PER_SEC = 8;
+const AUDIO_ROW_HEIGHT = 32; // px - one row of the audio lane; overlapping audio stacks into more rows
 const MAX_PX_PER_SEC = 200;
 const DEFAULT_PX_PER_SEC = 40;
-const THUMB_TARGET_WIDTH = 100; // px - roughly how wide each filmstrip frame should be
+const THUMB_TILE_HEIGHT = 52; // px - filmstrip tile height inside the h-16 clip track
+// Filmstrip frame cache density: one captured frame every FRAME_CACHE_STEP_SEC of source time,
+// capped at MAX_CACHED_FRAMES (the step widens for long videos). Tiles pick their nearest cached
+// frame, so this is what bounds how short a shot can be and still show up on the strip.
+const FRAME_CACHE_STEP_SEC = 0.5;
+const MAX_CACHED_FRAMES = 360;
+const THUMB_CAPTURE_HEIGHT = 90; // px - frames are downscaled at capture; tiles never draw larger
+
+// Nearest cached frame to `time` (frames sorted by time), or null if none captured yet.
+const nearestFrame = (frames: ThumbFrame[], time: number): ThumbFrame | null => {
+  if (frames.length === 0) return null;
+  let lo = 0;
+  let hi = frames.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].time < time) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo > 0 && Math.abs(frames[lo - 1].time - time) <= Math.abs(frames[lo].time - time)) return frames[lo - 1];
+  return frames[lo];
+};
 const NICE_TICK_INTERVALS = [1, 2, 3, 5, 10, 15, 30, 60, 120, 300, 600]; // seconds
 const MIN_TICK_SPACING_PX = 70;
 const MIN_CLIP_LENGTH = 0.05;
@@ -100,6 +163,17 @@ function snapToTargets(value: number, targets: number[], pxPerSec: number): numb
 // that effect immediately advanced again before clip 2 ever got a chance to play. Also used by
 // handleTransportPlayClick to decide "are we sitting at the very end of the sequence".
 const SEEK_TOLERANCE_SEC = 0.25;
+// How close to a clip's end playback counts as having finished it - a little under a frame, so a
+// file whose real length rounds a hair short of the clip's stored end still moves on.
+const CLIP_END_EPSILON_SEC = 0.05;
+// The per-frame boundary check crosses within half a frame of the cut.
+const FRAME_BOUNDARY_SEC = 0.012;
+// How far an audio overlay may drift from the picture while playing before it's re-seeked.
+const AUDIO_DRIFT_TOLERANCE_SEC = 0.3;
+// After re-seeking an audio overlay, how long to let it rebuffer before judging its drift again -
+// and the jump (a scrub, not drift) that's corrected even inside that window.
+const AUDIO_SEEK_SETTLE_MS = 1000;
+const AUDIO_JUMP_SEC = 1;
 
 // Module-level (not a useRef) so it survives this component unmounting - which happens every time
 // the tools/timeline panel is closed (BottomDocker swaps back to the recording docker) and
@@ -117,6 +191,8 @@ const formatTimestamp = (totalSeconds: number): string => {
   const seconds = Math.floor(totalSeconds % 60);
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 };
+
+type StoreClipPatch = Parameters<UseVideoEditStoreResult["updateClipEffects"]>[1];
 
 interface ThumbFrame {
   time: number; // source time this frame was captured at
@@ -149,6 +225,7 @@ const ActionButton: React.FC<{
 const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number }> = ({ overlay, widthPx, heightPx }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [peaks, setPeaks] = useState<number[] | null>(null);
+  const canvasRestoreTick = useCanvasRestoreTick();
 
   useEffect(() => {
     let cancelled = false;
@@ -183,9 +260,96 @@ const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heig
       const barHeight = Math.max(1, amp * heightPx);
       ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
     });
-  }, [peaks, widthPx, heightPx, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration]);
+    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
+  }, [peaks, widthPx, heightPx, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration, canvasRestoreTick]);
 
   return <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" style={{ width: widthPx, height: heightPx }} />;
+};
+
+const IMAGE_CLIP_TOOL_HINT = "Not available for image clips";
+
+// The classic spoked "wheel" activity indicator - 12 spokes fading round the circle, spun fast.
+const SpokeWheel: React.FC<{ size?: number }> = ({ size = 16 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" className="animate-spin text-white" style={{ animationDuration: "0.5s" }} aria-hidden>
+    {Array.from({ length: 12 }, (_, i) => (
+      <line key={i} x1="12" y1="2.5" x2="12" y2="7" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" opacity={0.15 + (0.85 * i) / 11} transform={`rotate(${i * 30} 12 12)`} />
+    ))}
+  </svg>
+);
+
+// A fixed-position menu kept fully inside the window - the track's "..." menu opens from a button
+// near the bottom of the screen, where opening straight down used to cut most of it off.
+const ViewportClampedMenu: React.FC<{ anchor: PopoverAnchor; className: string; children: React.ReactNode }> = ({ anchor, className, children }) => {
+  const { ref, position } = useClampedPopoverPosition(anchor);
+  return (
+    <div ref={ref} className={`fixed ${className}`} style={{ top: position.top, left: position.left }}>
+      {children}
+    </div>
+  );
+};
+// How long a freeze frame holds (clip menu) - stretch it on the timeline like any image clip.
+const FREEZE_FRAME_SECONDS = 2;
+
+// Space kept past the last clip for the "+" add button (36px wide, 10px from the clip).
+const ADD_BUTTON_ROOM_PX = 56;
+
+// An image clip's filmstrip - the same picture on every tile, from the gallery's own cached
+// thumbnail (get_image_thumbnail) rather than a full-resolution photo decode per tile. The primary
+// file's frame cache above can't serve these: it only ever holds frames of the primary video.
+const imageClipThumbUrls = new Map<string, Promise<string>>();
+const ImageClipTiles: React.FC<{ sourcePath: string; tileCount: number; tileWidth: number }> = ({ sourcePath, tileCount, tileWidth }) => {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let pending = imageClipThumbUrls.get(sourcePath);
+    if (!pending) {
+      pending = invoke<string>("get_image_thumbnail", { inputPath: sourcePath })
+        .then((thumbPath) => invoke<string>("convert_file_path_to_url", { filepath: thumbPath }))
+        .then((absolutePath) => convertFileSrc(absolutePath));
+      pending.catch(() => imageClipThumbUrls.delete(sourcePath)); // let a later render retry
+      imageClipThumbUrls.set(sourcePath, pending);
+    }
+    pending
+      .then((resolved) => !cancelled && setUrl(resolved))
+      .catch((err) => console.error("Failed to load image clip thumbnail for", sourcePath, err));
+    return () => {
+      cancelled = true;
+    };
+  }, [sourcePath]);
+  return (
+    <>
+      {Array.from({ length: tileCount }, (_, i) =>
+        url ? (
+          <img key={i} src={url} className="h-full shrink-0 object-cover" style={{ width: tileWidth }} draggable={false} alt="" />
+        ) : (
+          <div key={i} className="h-full shrink-0 bg-neutral-800" style={{ width: tileWidth }} />
+        )
+      )}
+    </>
+  );
+};
+
+// A video clip from a file other than the primary one - its own frames (videoFrameCache.ts),
+// never the primary's: borrowing those is what made an inserted video show the clips around it.
+const ForeignVideoClipTiles: React.FC<{ clip: Clip; tileCount: number; tileWidth: number; width: number; pxPerSec: number }> = ({ clip, tileCount, tileWidth, width, pxPerSec }) => {
+  const [frames, setFrames] = useState<ThumbFrame[]>([]);
+  useEffect(() => {
+    setFrames([]);
+    return subscribeVideoFrames(clip.sourcePath, setFrames);
+  }, [clip.sourcePath]);
+  return (
+    <>
+      {Array.from({ length: tileCount }, (_, k) => {
+        const outputOffset = Math.min((k + 0.5) * tileWidth, width) / pxPerSec;
+        const t = nearestFrame(frames, Math.min(clip.end, outputOffsetToSource(clip, outputOffset)));
+        return t ? (
+          <img key={k} src={t.src} className="h-full shrink-0 object-cover" style={{ width: tileWidth }} draggable={false} alt="" />
+        ) : (
+          <div key={k} className="h-full shrink-0 bg-neutral-800" style={{ width: tileWidth }} />
+        );
+      })}
+    </>
+  );
 };
 
 // Real waveform for a CLIP's own audio (not an AudioOverlay) - same decode-once/slice-per-render
@@ -204,6 +368,7 @@ const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: n
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [peaks, setPeaks] = useState<number[] | null>(null);
+  const canvasRestoreTick = useCanvasRestoreTick();
 
   useEffect(() => {
     let cancelled = false;
@@ -239,7 +404,8 @@ const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: n
       const barHeight = Math.max(1, amp * heightPx);
       ctx.fillRect(i * barWidth, heightPx - barHeight, Math.max(1, barWidth - 1), barHeight);
     });
-  }, [peaks, widthPx, heightPx, trimStart, trimEnd, sourceDuration]);
+    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
+  }, [peaks, widthPx, heightPx, trimStart, trimEnd, sourceDuration, canvasRestoreTick]);
 
   if (!peaks) return null;
   return (
@@ -302,7 +468,8 @@ interface VideoTimelineDockerProps {
   // in from elsewhere means "seek to this time" is ambiguous without saying which file. Dashboard
   // swaps the player's actual source when it differs from what's currently loaded; see its
   // handleSeekActiveFile for the details.
-  onSeek: (sourcePath: string, time: number) => void;
+  // `resume`: keep playing after the seek (playback crossing into the next clip).
+  onSeek: (sourcePath: string, time: number, resume?: boolean) => void;
   // Real play/pause state of the main player, and a way to toggle it - the transport button in
   // the track control rail below, same round-trip idea as currentTime/onSeek.
   isPlaying: boolean;
@@ -310,6 +477,10 @@ interface VideoTimelineDockerProps {
   onConvert: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
+  // "Move or copy to..." in the "..." menu (MoveCopyMenu.tsx) - absent hides it.
+  fileTransfer?: FileTransferOptions;
+  // "Set thumbnail..." in the "..." menu - opens the player's thumbnail picker.
+  onSetThumbnail?: () => void;
   // Fired once a Save export finishes - the new (edited) render, added to the library as a
   // separate file. `file` itself is never touched by editing or exporting.
   onExported: (newPath: string, newFileName: string) => void;
@@ -339,22 +510,27 @@ interface VideoTimelineDockerProps {
   // sibling subtree Dashboard owns) can time-gate which overlays are visible without duplicating
   // this component's own tricky SEEK_TOLERANCE_SEC-guarded active-clip tracking.
   onOutputTimeChange?: (outputTime: number) => void;
+  // The exact output time right now, read off the player itself (Dashboard's getExactOutputTime) -
+  // for keeping audio overlays in sync, where the ~4Hz currentTime is too stale to measure against.
+  getExactOutputTime?: () => number | null;
+  // The player's source time right now, frame-accurate - null while it can't be trusted (mid-switch).
+  getPlayerTime?: () => number | null;
   // Reports the ACTIVE clip's own color/Ken Burns effect fields upward, so VideoPlayer (mounted
   // as a sibling subtree by Dashboard) can drive live CSS filter/transform on the <video> element
   // without needing to know about clips at all - same "report state this component already tracks
   // upward for a sibling to consume" reasoning as onOutputTimeChange just above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
+  // While Export is set to Fill another shape: the window it keeps, for the player to show.
+  onReframePreviewChange?: (preview: ReframePreview | null) => void;
   // The reverse direction for noise reduction specifically: VideoPlayer (a sibling) is the one
   // that actually knows whether the live Web Audio denoiser is idle/calibrating/active (see its
   // own onNoiseReductionStatusChange prop), and NoiseReductionPopover (rendered by THIS component)
   // is what needs to show that as a spinner - Dashboard just relays the value it already round-
   // trips through activeClipEffects's own reverse-direction sibling, onActiveClipChange, above.
   noiseReductionStatus?: "idle" | "calibrating" | "active";
-  // Forwards NoiseReductionPopover's "Recalibrate from current playback" click to VideoPlayer's
-  // own imperative recalibrateNoiseReduction() (via videoPlayerRef, held by Dashboard - this
-  // component has no ref to VideoPlayer itself) - same "Dashboard is the only place that can
-  // reach across siblings" shape onLivePreview/onTogglePlayActiveFile already use.
-  onRecalibrateNoise?: () => void;
+  // NoiseReductionPopover's "Hold to compare" - forwarded to VideoPlayer's setNoisePreviewBypass
+  // (via videoPlayerRef, held by Dashboard - this component has no ref to VideoPlayer itself).
+  onPreviewNoiseOriginal?: (bypass: boolean) => void;
 
   // Text-overlay selection, lifted to Dashboard.tsx since it's shared with the preview-layer
   // editor mounted next to VideoPlayer - keeps a chip's selected styling here in sync with
@@ -375,6 +551,9 @@ interface VideoTimelineDockerProps {
   // Blur-region selection/placement, same threading/reasoning as the text/image-overlay props above.
   selectedBlurOverlayId?: string | null;
   onSelectBlurOverlay?: (id: string | null) => void;
+  // Adjustment layers (AdjustmentLayersLayer.tsx draws them and their settings).
+  selectedAdjustmentId?: string | null;
+  onSelectAdjustment?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
 
@@ -385,6 +564,10 @@ interface VideoTimelineDockerProps {
   onSelectPipOverlay?: (id: string | null) => void;
   isPlacingPip?: boolean;
   onToggleArmPlacePip?: () => void;
+  // "Fix webcam background" - marks a webcam bubble baked into the recording (WebcamBubbleMarker).
+  onMarkWebcamBubble?: () => void;
+  // Find & hide - outline something once, hide it everywhere (FindHideTool).
+  onFindAndHide?: () => void;
 
   // Whether the on-canvas crop tool (ClipCropOverlay, mounted as a sibling next to VideoPlayer by
   // Dashboard) is armed - unlike text/image/blur, there's nothing to "place", it just shows/hides
@@ -414,14 +597,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onConvert,
   onRename,
   onDelete,
+  fileTransfer,
+  onSetThumbnail,
   onExported,
   draggingLibraryFile,
   pendingTimelineInsert,
   onTimelineInsertHandled,
   onOutputTimeChange,
+  getExactOutputTime,
+  getPlayerTime,
   onActiveClipChange,
+  onReframePreviewChange,
   noiseReductionStatus = "idle",
-  onRecalibrateNoise,
+  onPreviewNoiseOriginal,
   selectedOverlayId = null,
   onSelectOverlay,
   isPlacingText = false,
@@ -432,24 +620,70 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onToggleArmPlaceImage,
   selectedBlurOverlayId = null,
   onSelectBlurOverlay,
+  selectedAdjustmentId = null,
+  onSelectAdjustment,
   isPlacingBlur = false,
   onToggleArmPlaceBlur,
   selectedPipOverlayId = null,
   onSelectPipOverlay,
   isPlacingPip = false,
   onToggleArmPlacePip,
+  onMarkWebcamBubble,
+  onFindAndHide,
   isCroppingClip = false,
   onToggleCroppingClip,
 }) => {
+  // The sidebar's Tools tab while it's open (see ToolPanelHost.tsx) - the clip/audio settings
+  // popovers dock into it instead of floating, which changes how they open and close below.
+  const toolPanelHost = useToolPanelHost();
+  const rootRef = useRef<HTMLDivElement>(null);
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
   // One hidden <audio> per audio overlay, kept in sync with the main player below - no existing
   // pattern for this in the codebase (see the plan's own Context: every other `new Audio(...)`
   // usage is a one-shot UI sound effect, not a seekable/synced source).
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  // Removing a playing <audio> from the DOM does NOT stop it (per the media spec it plays on until
+  // garbage collected, which can be seconds later) - so an overlay that's deleted, or the whole
+  // timeline closing, pauses its element explicitly.
+  const audioOverlayIdsKey = editStore.audioOverlays.map((o) => o.id).join("|");
+  useEffect(() => {
+    const live = new Set(audioOverlayIdsKey ? audioOverlayIdsKey.split("|") : []);
+    audioElementsRef.current.forEach((el, id) => {
+      if (live.has(id)) return;
+      el.pause();
+      audioElementsRef.current.delete(id);
+    });
+  }, [audioOverlayIdsKey]);
+  useEffect(() => {
+    const elements = audioElementsRef.current;
+    return () => elements.forEach((el) => el.pause());
+  }, []);
   const trackAreaRef = useRef<HTMLDivElement>(null);
+  const trackContentRef = useRef<HTMLDivElement>(null);
+  // Whether lanes are sitting below the timeline's capped height right now. The themed scrollbar
+  // is subtle enough that rows down there (e.g. a second Voice/Music pair) went unnoticed while
+  // still playing, so a visible "more below" hint is shown whenever this is true.
+  const [lanesHiddenBelow, setLanesHiddenBelow] = useState(false);
+  useEffect(() => {
+    const area = trackAreaRef.current;
+    const content = trackContentRef.current;
+    if (!area || !content) return;
+    const update = () => setLanesHiddenBelow(area.scrollHeight - area.scrollTop - area.clientHeight > 4);
+    update();
+    area.addEventListener("scroll", update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(area);
+    observer.observe(content);
+    return () => {
+      area.removeEventListener("scroll", update);
+      observer.disconnect();
+    };
+  }, []);
 
   const [duration, setDuration] = useState<number>(0);
+  // A video project (made from images, see isVideoProjectPath) rather than a recording.
+  const isProject = isVideoProjectPath(file.path);
   // Native pixel size of the primary file, read off the same hidden capture <video> already used
   // for thumbnails once its metadata loads - Save needs this to know what resolution to render
   // text/image overlay PNGs at for burn-in (see videoOverlayRender.ts / exportEdited), since
@@ -458,6 +692,30 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [pxPerSec, setPxPerSec] = useState<number>(DEFAULT_PX_PER_SEC);
   const [thumbnails, setThumbnails] = useState<ThumbFrame[]>([]);
   const [coverThumbnail, setCoverThumbnail] = useState<string | null>(null);
+  // The file's actual thumbnail (get_video_thumbnail - the one the gallery and Explorer show),
+  // reloaded the moment "Set thumbnail" saves a new one; the captured first frame above only
+  // stands in until it arrives, or for a file whose thumbnail can't be read.
+  const [savedThumbnail, setSavedThumbnail] = useState<string | null>(null);
+  useEffect(() => {
+    setSavedThumbnail(null);
+    if (isVideoProjectPath(file.path)) return;
+    let cancelled = false;
+    const load = (bust: boolean) =>
+      invoke<string>("get_video_thumbnail", { inputPath: file.path })
+        .then((thumbPath) => invoke<string>("convert_file_path_to_url", { filepath: thumbPath }))
+        .then((absolutePath) => {
+          if (!cancelled) setSavedThumbnail(convertFileSrc(absolutePath) + (bust ? `?t=${Date.now()}` : ""));
+        })
+        .catch(() => {});
+    void load(false);
+    const unlisten = listen<string>("video-thumbnail-updated", (event) => {
+      if (event.payload === file.path) void load(true);
+    });
+    return () => {
+      cancelled = true;
+      void unlisten.then((fn) => fn());
+    };
+  }, [file.path]);
 
   // Visibility/lock are still cosmetic-only (no backend behind them yet) - mute/volume are real,
   // backed by editStore.videoAudioMuted/videoAudioVolume (see the track-audio popover further
@@ -475,6 +733,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     return () => document.removeEventListener("pointerdown", close);
   }, [trackAudioPopoverAnchor]);
   const [menuOpen, setMenuOpen] = useState(false);
+  // The "..." menu's "Move or copy to..." opens in its place, at the same spot.
+  const [transferAnchor, setTransferAnchor] = useState<PopoverAnchor | null>(null);
   // The "..." menu is rendered through a portal (see moreMenuButtonRef/moreMenuPosition below)
   // rather than as a normal absolutely-positioned child - the Timeline panel has overflow-hidden
   // (for the track's rounded corners/border), and this menu anchors near the bottom of a short
@@ -502,11 +762,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     setRenamingInline(false);
   }, [file.name]);
 
-  // Load metadata once per file, then capture an evenly-spaced filmstrip (tagged with the source
-  // time each frame was captured at, so individual clip blocks can later slice out just their own
-  // frames) by seeking a hidden <video> and drawing each frame to a canvas - the visible player
-  // above has its own playback going, so reusing it here would fight the user's own scrubbing/
-  // playback.
+  // Load metadata once per file, then build a dense frame cache (every FRAME_CACHE_STEP_SEC of
+  // source time, downscaled to THUMB_CAPTURE_HEIGHT) by seeking a hidden <video> and drawing each
+  // frame to a canvas - the visible player above has its own playback going, so reusing it here
+  // would fight the user's own scrubbing/playback. Captured coarse-to-fine (every 16th slot, then
+  // 8th, 4th, 2nd, all) so the whole strip is roughly filled within a second or two and then
+  // sharpens; clip blocks pick the nearest cached frame per tile at render time, so zooming in
+  // reveals short shots a fixed handful of samples would have skipped entirely.
   useEffect(() => {
     setDuration(0);
     setThumbnails([]);
@@ -517,7 +779,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (!video || !canvas) return;
     let cancelled = false;
 
-    const captureFrameAt = (time: number): Promise<string | null> =>
+    const captureFrameAt = (time: number, maxHeight: number | null): Promise<string | null> =>
       new Promise((resolve) => {
         const onSeeked = () => {
           video.removeEventListener("seeked", onSeeked);
@@ -526,38 +788,72 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             resolve(null);
             return;
           }
-          canvas.width = video.videoWidth;
-          canvas.height = video.videoHeight;
+          const scale = maxHeight ? Math.min(1, maxHeight / video.videoHeight) : 1;
+          canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+          canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          resolve(canvas.toDataURL("image/jpeg", 0.6));
+          resolve(canvas.toDataURL("image/jpeg", 0.7));
         };
         video.addEventListener("seeked", onSeeked);
         video.currentTime = time;
       });
 
+    let swappedToPlayable = false;
     const handleLoadedMetadata = async () => {
       if (cancelled) return;
+      // Sound but no picture (an HEVC .MOV) - capture from the playable copy instead, once. Its
+      // own loadedmetadata comes back through here and carries on below.
+      if (!isProject && !swappedToPlayable && isPictureless(video)) {
+        swappedToPlayable = true;
+        try {
+          const url = await getPlayableUrl(file.path);
+          if (!cancelled) video.src = url;
+        } catch (err) {
+          console.error("No playable copy for the filmstrip:", err);
+        }
+        return;
+      }
       const total = video.duration;
       if (!Number.isFinite(total) || total <= 0) return;
       setDuration(total);
       editStore.setDuration(total);
       if (video.videoWidth > 0 && video.videoHeight > 0) setVideoPixelSize({ width: video.videoWidth, height: video.videoHeight });
+      // A project's primary file is only its black preview canvas - nothing worth a filmstrip.
+      if (isProject) return;
 
-      const containerWidth = trackAreaRef.current?.clientWidth ?? 600;
-      const count = Math.max(4, Math.min(40, Math.round(containerWidth / THUMB_TARGET_WIDTH)));
-
-      const cover = await captureFrameAt(0);
+      const cover = await captureFrameAt(0, null);
       if (cancelled) return;
       setCoverThumbnail(cover);
 
+      const count = Math.max(2, Math.min(MAX_CACHED_FRAMES, Math.ceil(total / FRAME_CACHE_STEP_SEC)));
+      // Sample each slot's midpoint (never exactly `total`, which some decoders can't seek to).
+      const slotTime = (i: number) => Math.min(total - 0.01, ((i + 0.5) / count) * total);
+      const order: number[] = [];
+      const seen = new Set<number>();
+      for (let stride = 16; stride >= 1; stride /= 2) {
+        for (let i = 0; i < count; i += stride) {
+          if (!seen.has(i)) {
+            seen.add(i);
+            order.push(i);
+          }
+        }
+      }
+
       const frames: ThumbFrame[] = [];
-      for (let i = 0; i < count; i++) {
-        if (cancelled) break;
-        const time = (i / count) * total;
-        const frame = await captureFrameAt(time);
-        if (cancelled) break;
-        frames.push({ time, src: frame ?? "" });
-        setThumbnails([...frames]);
+      let lastFlush = performance.now();
+      for (let n = 0; n < order.length; n++) {
+        if (cancelled) return;
+        const time = slotTime(order[n]);
+        const frame = await captureFrameAt(time, THUMB_CAPTURE_HEIGHT);
+        if (cancelled) return;
+        if (frame) frames.push({ time, src: frame });
+        // Batch React updates - a setState per frame for ~200 frames would re-render the whole
+        // timeline hundreds of times.
+        const now = performance.now();
+        if (now - lastFlush > 250 || n === order.length - 1) {
+          lastFlush = now;
+          setThumbnails([...frames].sort((a, b) => a.time - b.time));
+        }
       }
     };
 
@@ -584,8 +880,41 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [toolMode, setToolMode] = useState<TimelineToolMode>("select");
   const [toolModeAnchor, setToolModeAnchor] = useState<{ left: number; top: number } | null>(null);
   const toolModeButtonRef = useRef<HTMLButtonElement>(null);
-  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  // The whole toolbar - ToolSearch (Ctrl+K) finds tools by its buttons' titles.
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  // Ctrl/Shift-click builds a multi-selection (Duplicate/Delete act on all of it). The last clip
+  // picked is the primary selectedClipId every single-clip tool - crop, speed, effects - uses.
+  const [selectedClipIdsRaw, setSelectedClipIds] = useState<string[]>([]);
+  // Pruned to clips that still exist (after a delete or undo).
+  const selectedClipIds = selectedClipIdsRaw.filter((id) => editStore.clips.some((c) => c.id === id));
+  const selectedClipId = selectedClipIds.length > 0 ? selectedClipIds[selectedClipIds.length - 1] : null;
+  const setSelectedClipId = useCallback((id: string | null) => setSelectedClipIds(id ? [id] : []), []);
   const selectedClip = selectedClipId ? editStore.clips.find((c) => c.id === selectedClipId) ?? null : null;
+  // Audio cleanup/extraction, silence trimming and the recording-sidecar tools (auto zoom, view
+  // switches) all need real footage - a still image clip has no audio or recording data to read.
+  const selectedIsImage = !!selectedClip && isImageClipPath(selectedClip.sourcePath);
+  // Speed, effects, mirror and audio cleanup act on the WHOLE multi-selection as one undo step,
+  // not just its last pick - each popover still shows (and edits from) the primary clip's values.
+  // Per clip, a patch drops what that clip can't take: a transition-in on the first clip, footage-
+  // only fixes on a still, and Ken Burns keeps each clip's own zoom target.
+  const selectedCount = selectedClipIds.length;
+  const updateSelectedClips = (patch: StoreClipPatch) => {
+    if (selectedCount === 0) return;
+    const firstClipId = editStore.clips[0]?.id;
+    editStore.updateClipsEffects(selectedClipIds, (clip) => {
+      const next: StoreClipPatch = { ...patch };
+      const isImage = isImageClipPath(clip.sourcePath);
+      if (clip.id === firstClipId) delete next.transitionIn;
+      if (isImage) {
+        delete next.stabilize;
+        delete next.noiseReduction;
+        delete next.audioCleanup;
+      }
+      if (next.kenBurns && clip.id !== selectedClipId) next.kenBurns = { ...next.kenBurns, targetX: clip.kenBurns?.targetX, targetY: clip.kenBurns?.targetY };
+      return Object.keys(next).length > 0 ? next : null;
+    });
+  };
+  const selectionLabel = selectedCount > 1 ? `${selectedCount} selected clips` : "clip";
   // Effects popover (color grade/Ken Burns/transition) for whichever clip is selected - opened
   // from the toolbar's Effects button, closed the same "outside click" way AudioOverlayPopover
   // closes itself, plus whenever selection moves to a different clip (below) so it never keeps
@@ -593,8 +922,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [effectsPopoverAnchor, setEffectsPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
   const effectsButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    setEffectsPopoverAnchor(null);
-  }, [selectedClipId]);
+    if (!toolPanelHost) setEffectsPopoverAnchor(null);
+  }, [selectedClipId, toolPanelHost]);
 
   // Speed popover - split out of ClipEffectsPopover into its own standalone toolbar button/popover
   // (same "select a clip first" gating, closed the same way on selection change) since speed has
@@ -603,8 +932,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [speedPopoverAnchor, setSpeedPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
   const speedButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    setSpeedPopoverAnchor(null);
-  }, [selectedClipId]);
+    if (!toolPanelHost) setSpeedPopoverAnchor(null);
+  }, [selectedClipId, toolPanelHost]);
 
   // Noise reduction popover - same standalone toolbar button/popover shape as Speed just above,
   // for the same reason: an audio-cleanup feature with its own presets/strength control earns its
@@ -614,8 +943,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [noiseReductionPopoverAnchor, setNoiseReductionPopoverAnchor] = useState<{ left: number; top: number } | null>(null);
   const noiseReductionButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    setNoiseReductionPopoverAnchor(null);
-  }, [selectedClipId]);
+    if (!toolPanelHost) setNoiseReductionPopoverAnchor(null);
+  }, [selectedClipId, toolPanelHost]);
 
   // Extract-audio popover - same standalone toolbar button/popover shape as Speed/Reduce noise
   // above. isExtractingAudio is local (not threaded through editStore's isExporting/exportProgress)
@@ -635,6 +964,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const exportOptionsButtonRef = useRef<HTMLButtonElement>(null);
   const [exportQuality, setExportQuality] = useState<ExportQuality>("standard");
   const [customOutputPath, setCustomOutputPath] = useState<string | null>(null);
+  // Platform format / framing / loudness for Save (ExportOptionsPopover) - defaults keep the
+  // timeline's own frame and mix, exactly what Save always did.
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("original");
+  const [exportFraming, setExportFraming] = useState<ExportFraming>("fit-blur");
+  const [exportLoudness, setExportLoudness] = useState<number | null>(null);
+  const [exportAnchor, setExportAnchor] = useState({ x: 0.5, y: 0.5 });
+  const [exportFollowSubject, setExportFollowSubject] = useState(true);
+  const [reframeStatus, setReframeStatus] = useState<string | null>(null);
 
   // Trim Silence toolbar button - anchor null means the popover is closed; silenceState only
   // matters while it's open (loading/empty/error/results, see SilenceDetectionPopover). Scoped to
@@ -658,6 +995,79 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // original data" split handleDetectAutoZoom/handleApplyAutoZoom already use) but
   // ViewSwitchDetectState's own "results" variant only carries a count for display.
   const [viewSwitchAnchor, setViewSwitchAnchor] = useState<{ left: number; top: number } | null>(null);
+
+  // Captions tool (CaptionsPanel) - whole-timeline, so unlike Effects/Speed it needs no selected
+  // clip and isn't closed by selection changes.
+  const [captionsAnchor, setCaptionsAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Chapters (ChaptersPanel) - whole-timeline like Captions.
+  const [chaptersAnchor, setChaptersAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Elements gallery (shapes and animated elements - videoAssets.ts).
+  const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Split screen builder (SplitScreenPanel).
+  const [splitAnchor, setSplitAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Highlight intro builder (HighlightIntroPanel).
+  const [introAnchor, setIntroAnchor] = useState<{ left: number; top: number } | null>(null);
+  // The music & sound-effects library (MusicLibraryPanel).
+  const [musicAnchor, setMusicAnchor] = useState<{ left: number; top: number } | null>(null);
+  // The mixer (MixerPanel), and the strip it opens with its effects showing.
+  const [mixerAnchor, setMixerAnchor] = useState<{ left: number; top: number } | null>(null);
+  const [mixerFocus, setMixerFocus] = useState<string | null>(null);
+  const mixerButtonRef = useRef<HTMLButtonElement>(null);
+  const mixerSession = useMixerSession();
+  const openMixer = (focus: string | null) => {
+    const rect = mixerButtonRef.current?.getBoundingClientRect();
+    setMixerFocus(focus);
+    setMixerAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: 80, top: 80 });
+  };
+  // "Mixer & effects" asked for from elsewhere (a picture-in-picture's panel) - mixerState.ts.
+  const lastMixerRequest = useRef(mixerSession.request);
+  useEffect(() => {
+    if (mixerSession.request === lastMixerRequest.current) return;
+    lastMixerRequest.current = mixerSession.request;
+    if (mixerSession.request) openMixer(mixerSession.request.key);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mixerSession.request]);
+  const captionsButtonRef = useRef<HTMLButtonElement>(null);
+  // Edit by transcript (TranscriptEditorPanel) - whole-timeline like Captions, sharing its transcripts.
+  const [transcriptAnchor, setTranscriptAnchor] = useState<{ left: number; top: number } | null>(null);
+  const transcriptButtonRef = useRef<HTMLButtonElement>(null);
+  const captionLines = useMemo(() => buildCaptionLines(editStore.clips, editStore.captions), [editStore.clips, editStore.captions]);
+  // Image clips have no speech to transcribe.
+  const captionSourcePaths = useMemo(
+    () => Array.from(new Set(editStore.clips.map((c) => c.sourcePath).filter((path) => !isImageClipPath(path)))),
+    [editStore.clips]
+  );
+
+  // Docked, the settings panels follow the clip selection (effects above skip their close when
+  // docked) and nothing closes them on an outside click - so opening one closes whichever other
+  // was showing, keeping the sidebar's Tools tab to the one tool you're working with.
+  const dockedPanelsOpen = {
+    effects: effectsPopoverAnchor !== null,
+    speed: speedPopoverAnchor !== null,
+    noise: noiseReductionPopoverAnchor !== null,
+    audio: audioPopoverAnchor !== null,
+    captions: captionsAnchor !== null,
+    transcript: transcriptAnchor !== null,
+    music: musicAnchor !== null,
+    mixer: mixerAnchor !== null,
+  };
+  const prevDockedPanelsOpen = useRef(dockedPanelsOpen);
+  useEffect(() => {
+    const prev = prevDockedPanelsOpen.current;
+    prevDockedPanelsOpen.current = dockedPanelsOpen;
+    if (!toolPanelHost) return;
+    const opened = (Object.keys(dockedPanelsOpen) as (keyof typeof dockedPanelsOpen)[]).find((k) => dockedPanelsOpen[k] && !prev[k]);
+    if (!opened) return;
+    if (opened !== "effects") setEffectsPopoverAnchor(null);
+    if (opened !== "speed") setSpeedPopoverAnchor(null);
+    if (opened !== "noise") setNoiseReductionPopoverAnchor(null);
+    if (opened !== "audio") setAudioPopoverAnchor(null);
+    if (opened !== "captions") setCaptionsAnchor(null);
+    if (opened !== "transcript") setTranscriptAnchor(null);
+    if (opened !== "music") setMusicAnchor(null);
+    if (opened !== "mixer") setMixerAnchor(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions, dockedPanelsOpen.transcript, dockedPanelsOpen.music, dockedPanelsOpen.mixer]);
   const [viewSwitchState, setViewSwitchState] = useState<ViewSwitchDetectState>({ status: "loading" });
   const viewSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const viewSwitchDataRef = useRef<{ events: ViewSwitchEvent[]; webcamPath: string; clipOutputStart: number } | null>(null);
@@ -684,6 +1094,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // (always in OUTPUT pixels/seconds, via the shared pxPerSec scale) into the SOURCE-seconds
     // adjustment clip.start/end actually need.
     speed: number;
+    // -1 when dragging an image clip's START handle: a still has no source to trim into (its start
+    // is always 0), so that handle sets the clip's length instead - dragging it left lengthens the
+    // clip, i.e. moves `end` the opposite way to the pointer. 1 everywhere else.
+    direction: 1 | -1;
   }>(null);
 
   // Reordering runs on plain pointer events, not the HTML5 drag-and-drop API - Tauri's window
@@ -708,8 +1122,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // this is a fresh, never-edited video) - the track/preview always has *something* to render
   // against rather than going blank until the sidecar round-trip resolves. Never draggable/
   // resizable itself (see the `__pending__` checks below) since it isn't real state yet.
+  // A project never gets that placeholder: its primary file is a black canvas, not footage, so an
+  // empty project's timeline is genuinely empty.
   const baseClips: Clip[] =
-    editStore.clips.length > 0 ? editStore.clips : duration > 0 ? [{ id: "__pending__", sourcePath: file.path, start: 0, end: duration }] : [];
+    editStore.clips.length > 0 || isProject ? editStore.clips : duration > 0 ? [{ id: "__pending__", sourcePath: file.path, start: 0, end: duration }] : [];
 
   // Applies the in-progress resize (if any) so every position derived below - block widths, tick
   // marks, the playhead, other handles - stays visually consistent with the live drag instead of
@@ -727,7 +1143,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // reflects that just by being computed from this array, but currentOutputTime's own
   // source-time-elapsed-within-clip mapping and the resize-drag pixel<->source-seconds conversion
   // below both need their OWN explicit /speed or *speed - grep this file for `.speed` for every site.
-  const clipDurations = renderClips.map((c) => Math.max(0, (c.end - c.start) / (c.speed ?? 1)));
+  const clipDurations = renderClips.map((c) => clipOutputDuration(c));
   const outputStarts: number[] = [];
   {
     let acc = 0;
@@ -1020,6 +1436,76 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
   };
 
+  // Which kind of thing was selected most recently - what Ctrl+C copies when there are several.
+  const lastSelectedRef = useRef<"clips" | "overlay">("overlay");
+  useEffect(() => {
+    if (selectedClipIds.length > 0) lastSelectedRef.current = "clips";
+  }, [selectedClipIds.join()]);
+  useEffect(() => {
+    if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedAdjustmentId || selectedAudioOverlayId || selectedPipOverlayId) lastSelectedRef.current = "overlay";
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAdjustmentId, selectedAudioOverlayId, selectedPipOverlayId]);
+
+  // ---- Adjustment-layer lane: move / retime, the blur lane's shape. ----------------------------
+  const [adjustResizeDrag, setAdjustResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; startValue: number; oppositeBound: number; liveValue: number }>(null);
+  const [adjustDrag, setAdjustDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
+  const renderAdjustmentLayers: AdjustmentLayer[] = editStore.adjustmentLayers.map((l) => {
+    if (adjustResizeDrag && l.id === adjustResizeDrag.id) return adjustResizeDrag.edge === "start" ? { ...l, startTime: adjustResizeDrag.liveValue } : { ...l, endTime: adjustResizeDrag.liveValue };
+    if (adjustDrag && l.id === adjustDrag.id) return { ...l, startTime: adjustDrag.liveStartTime, endTime: adjustDrag.liveStartTime + adjustDrag.duration };
+    return l;
+  });
+  const beginAdjustResizeDrag = (layer: AdjustmentLayer, edge: "start" | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    onSelectAdjustment?.(layer.id);
+    const startValue = edge === "start" ? layer.startTime : layer.endTime;
+    setAdjustResizeDrag({ id: layer.id, edge, startClientX: e.clientX, startValue, oppositeBound: edge === "start" ? layer.endTime : layer.startTime, liveValue: startValue });
+  };
+  const handleAdjustResizeDragMove = (e: React.PointerEvent) => {
+    if (!adjustResizeDrag) return;
+    e.stopPropagation();
+    const raw = snapToTargets(adjustResizeDrag.startValue + (e.clientX - adjustResizeDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
+    const liveValue =
+      adjustResizeDrag.edge === "start"
+        ? Math.max(0, Math.min(raw, adjustResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
+        : Math.min(totalOutputDuration, Math.max(raw, adjustResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
+    setAdjustResizeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
+  };
+  const endAdjustResizeDrag = () => {
+    if (!adjustResizeDrag) return;
+    const { id, edge, liveValue } = adjustResizeDrag;
+    setAdjustResizeDrag(null);
+    editStore.resizeAdjustmentLayerTime(id, edge, liveValue);
+  };
+  const beginAdjustDrag = (layer: AdjustmentLayer) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setAdjustDrag({ id: layer.id, startClientX: e.clientX, startTime: layer.startTime, duration: layer.endTime - layer.startTime, isDragging: false, liveStartTime: layer.startTime });
+  };
+  const handleAdjustDragMove = (e: React.PointerEvent) => {
+    if (!adjustDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - adjustDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    const raw = snapToTargets(adjustDrag.startTime + (e.clientX - adjustDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
+    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - adjustDrag.duration));
+    setAdjustDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endAdjustDrag = () => {
+    if (!adjustDrag) return;
+    const { id, isDragging, liveStartTime, duration } = adjustDrag;
+    setAdjustDrag(null);
+    if (isDragging) editStore.moveAdjustmentLayerTime(id, liveStartTime);
+    onSelectAdjustment?.(id);
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime);
+  };
+  const addAdjustmentLayer = () => {
+    const total = totalOutputDuration;
+    if (total <= 0) return;
+    const length = Math.min(5, total);
+    const startTime = Math.max(0, Math.min(currentOutputTime, total - length));
+    const id = editStore.addAdjustmentLayer(startTime, startTime + length, { look: { preset: "cinematic", intensity: 0.7 } });
+    onSelectAdjustment?.(id);
+  };
+
   // ---- PiP-overlay lane drag (move) / resize (trim into source) - move is shaped like the blur
   // block above (a PipOverlay has no popover of its own to manage here, unlike audio - clicking its
   // actual video bubble in the preview, PipOverlayLayer.tsx, is what opens PipOverlayPopover), but
@@ -1034,6 +1520,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     duration: number;
     isDragging: boolean;
     liveStartTime: number;
+    // The video track it started on, and the one under the pointer now (dragging up or down moves
+    // it between tracks; the drop zone above the top one makes a new track).
+    startTrack: number;
+    liveTrack: number;
   }>(null);
 
   const renderPipOverlays: PipOverlay[] = editStore.pipOverlays.map((o) => {
@@ -1041,10 +1531,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       return pipOverlayResizeDrag.edge === "start" ? { ...o, startTime: pipOverlayResizeDrag.liveValue } : { ...o, endTime: pipOverlayResizeDrag.liveValue };
     }
     if (pipOverlayDrag && o.id === pipOverlayDrag.id) {
-      return { ...o, startTime: pipOverlayDrag.liveStartTime, endTime: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration };
+      return { ...o, startTime: pipOverlayDrag.liveStartTime, endTime: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration, track: pipOverlayDrag.liveTrack };
     }
     return o;
   });
+  // One lane per video track in use, top track first (it draws over the ones below it).
+  const videoTrackLanes = tracksInUse(renderPipOverlays).reverse();
+
+  // B-roll: pick videos; they go full frame over the main video from the playhead, back to back,
+  // on the lowest free video track.
+  const handleAddBroll = async () => {
+    const selected = await openFileDialog({ multiple: true, filters: [{ name: "Video", extensions: [...MEDIA_VIDEO_EXTENSIONS] }] });
+    const paths = selected === null ? [] : Array.isArray(selected) ? selected : [selected];
+    if (paths.length === 0) return;
+    const at = currentOutputTime < totalOutputDuration - 1 ? currentOutputTime : 0;
+    const ids = await editStore.addVideoLayers(paths, at);
+    if (ids[0]) onSelectPipOverlay?.(ids[0]);
+  };
 
   const beginPipOverlayResizeDrag = (overlay: PipOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
     e.stopPropagation();
@@ -1072,6 +1575,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
   const beginPipOverlayDrag = (overlay: PipOverlay) => (e: React.PointerEvent) => {
     e.stopPropagation();
+    if (toolMode === "razor") {
+      // Razor mode cuts the PiP right where the click landed, same as it does for clip blocks.
+      editStore.splitPipOverlay(overlay.id, outputTimeFromClientX(e.clientX));
+      onSelectPipOverlay?.(overlay.id);
+      setSelectedClipId(null);
+      return;
+    }
     e.currentTarget.setPointerCapture(e.pointerId);
     setPipOverlayDrag({
       id: overlay.id,
@@ -1080,6 +1590,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       duration: overlay.endTime - overlay.startTime,
       isDragging: false,
       liveStartTime: overlay.startTime,
+      startTrack: pipTrack(overlay),
+      liveTrack: pipTrack(overlay),
     });
   };
   const handlePipOverlayDragMove = (e: React.PointerEvent) => {
@@ -1089,16 +1601,28 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const deltaSec = (e.clientX - pipOverlayDrag.startClientX) / pxPerSec;
     const raw = snapToTargets(pipOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
     const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - pipOverlayDrag.duration));
-    setPipOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+    // The video-track lane under the pointer - or, above the top one, a new track over every other
+    // layer. (Lanes are in the DOM top track first.)
+    const lanes = Array.from(rootRef.current?.querySelectorAll<HTMLElement>("[data-video-track]") ?? []);
+    let overTrack: number | null = null;
+    for (const lane of lanes) {
+      const r = lane.getBoundingClientRect();
+      if (e.clientY >= r.top && e.clientY < r.bottom) overTrack = Number(lane.dataset.videoTrack);
+    }
+    if (overTrack === null && lanes.length > 0 && e.clientY < lanes[0].getBoundingClientRect().top) {
+      overTrack = Math.max(0, ...editStore.pipOverlays.filter((o) => o.id !== pipOverlayDrag.id).map(pipTrack)) + 1;
+    }
+    setPipOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved || (overTrack !== null && overTrack !== prev.liveTrack), liveStartTime, liveTrack: overTrack ?? prev.liveTrack } : prev));
   };
   const endPipOverlayDrag = () => {
     if (!pipOverlayDrag) return;
-    const { id, isDragging, liveStartTime, duration } = pipOverlayDrag;
+    const { id, isDragging, liveStartTime, duration, startTrack, liveTrack } = pipOverlayDrag;
     setPipOverlayDrag(null);
     if (isDragging) {
-      editStore.movePipOverlayTime(id, liveStartTime);
+      editStore.movePipOverlayTime(id, liveStartTime, liveTrack !== startTrack ? liveTrack : undefined);
     }
     onSelectPipOverlay?.(id);
+    setSelectedClipId(null);
     // Same reasoning as endBlurOverlayDrag's own comment: bring the playhead into the overlay's
     // own range on select, so choosing (or just placing) one from the timeline immediately shows
     // its actual video bubble in the preview instead of leaving it invisible off-screen in time -
@@ -1149,12 +1673,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         const sourceDuration = match ? parseFloat(match[0]) : NaN;
         if (cancelled || !Number.isFinite(sourceDuration) || sourceDuration <= 0) return;
 
-        const startTime = currentOutputTime;
-        // Defaults to the source's *full* natural length (clamped to what's left of the output
-        // timeline), unlike text/image's arbitrary short default - music/voiceover overlays
-        // usually want to play out completely rather than needing an immediate manual resize.
-        const endTime = Math.min(totalOutputDuration, startTime + sourceDuration);
-        if (endTime <= startTime) return; // no room left on the timeline to place it
+        // At the playhead - or, with the playhead at the very end, back at the start.
+        const startTime = currentOutputTime < totalOutputDuration - MIN_AUDIO_START_ROOM_SEC ? currentOutputTime : 0;
+        // The whole file, even past the video's end: the overhang shows dimmed on the lane (and is
+        // left out of the export), and stays there to drag/trim back in - cutting it off here lost
+        // the rest of the song for good.
+        const endTime = startTime + sourceDuration;
 
         const id = editStore.addAudioOverlay(selected, sourceDuration, startTime, endTime);
         setSelectedAudioOverlayId(id);
@@ -1189,6 +1713,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
     return o;
   });
+  const audioRows = packAudioRows(renderAudioOverlays);
+  // The lanes run as far as the longest audio overhang, so all of it stays on screen to work with.
+  const laneEndTime = renderAudioOverlays.reduce((end, o) => Math.max(end, o.endTime), totalOutputDuration);
 
   const selectAudioOverlay = (id: string, e: React.PointerEvent) => {
     setSelectedAudioOverlayId(id);
@@ -1212,7 +1739,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (!overlay) return;
     const deltaSec = (e.clientX - audioOverlayResizeDrag.startClientX) / pxPerSec;
     const raw = snapToTargets((audioOverlayResizeDrag.edge === "start" ? overlay.startTime : overlay.endTime) + deltaSec, overlaySnapTargets, pxPerSec);
-    const preview = resizeAudioOverlayTimeHandler([overlay], overlay.id, audioOverlayResizeDrag.edge, totalOutputDuration, raw)[0];
+    const preview = resizeAudioOverlayTimeHandler([overlay], overlay.id, audioOverlayResizeDrag.edge, Number.POSITIVE_INFINITY, raw)[0];
     const liveValue = audioOverlayResizeDrag.edge === "start" ? preview.startTime : preview.endTime;
     setAudioOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
   };
@@ -1225,6 +1752,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
   const beginAudioOverlayDrag = (overlay: AudioOverlay) => (e: React.PointerEvent) => {
     e.stopPropagation();
+    if (e.button === 2) return;
+    // Razor cuts the audio right where it's clicked - the audio lane's counterpart to
+    // handleRazorClipPointerDown - and selects the piece after the cut.
+    if (toolMode === "razor") {
+      const second = editStore.splitAudioOverlay(overlay.id, outputTimeFromClientX(e.clientX));
+      if (second) {
+        setSelectedAudioOverlayId(second);
+        setAudioPopoverAnchor(null);
+      }
+      return;
+    }
     e.currentTarget.setPointerCapture(e.pointerId);
     setAudioOverlayDrag({
       id: overlay.id,
@@ -1241,7 +1779,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const moved = Math.abs(e.clientX - audioOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
     const deltaSec = (e.clientX - audioOverlayDrag.startClientX) / pxPerSec;
     const raw = snapToTargets(audioOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - audioOverlayDrag.duration));
+    // Same rule as the store's moveAudioOverlayTime: may hang past the video's end, must start inside it.
+    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - MIN_AUDIO_START_ROOM_SEC));
     setAudioOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
   };
   const endAudioOverlayDrag = (e: React.PointerEvent) => {
@@ -1263,10 +1802,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const ticks = useMemo(() => {
     if (totalOutputDuration <= 0) return [];
     const result: number[] = [];
-    for (let t = 0; t <= totalOutputDuration; t += tickInterval) result.push(t);
+    for (let t = 0; t <= laneEndTime; t += tickInterval) result.push(t);
     return result;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [totalOutputDuration, tickInterval]);
+  }, [laneEndTime, totalOutputDuration, tickInterval]);
 
   // Which clip (by array index) is currently considered "active" for live-preview purposes - the
   // single source of truth the tracking effect below advances, and that every deliberate
@@ -1289,8 +1828,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         // SOURCE-time delta actually needed to seek the underlying <video> (whose own currentTime
         // is always source time) - a plain 1:1 add here would seek proportionally too little into
         // a sped-up clip's own source range (too much for a slowed-down one).
-        const speed = renderClips[i].speed ?? 1;
-        return { index: i, sourceTime: renderClips[i].start + Math.max(0, Math.min(outputTime - start, dur)) * speed };
+        return { index: i, sourceTime: outputOffsetToSource(renderClips[i], Math.max(0, Math.min(outputTime - start, dur))) };
       }
     }
     return { index: 0, sourceTime: 0 };
@@ -1314,6 +1852,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
 
   const handleScrubPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return; // right-click opens menus, it doesn't move the playhead
     e.currentTarget.setPointerCapture(e.pointerId);
     setSelectedClipId(null);
     seekToOutputTime(outputTimeFromClientX(e.clientX));
@@ -1329,10 +1868,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     setPxPerSec(Math.max(MIN_PX_PER_SEC, Math.min(MAX_PX_PER_SEC, containerWidth / totalOutputDuration)));
   };
 
-  const beginResizeDrag = (clip: Clip, index: number, edge: "start" | "end") => (e: React.PointerEvent) => {
+  const beginResizeDrag = (clip: Clip, index: number, handle: "start" | "end") => (e: React.PointerEvent) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
     setSelectedClipId(clip.id);
+    // See resizeDrag's `direction`: an image clip's start handle drives its end.
+    const direction: 1 | -1 = handle === "start" && isImageClipPath(clip.sourcePath) ? -1 : 1;
+    const edge = direction === -1 ? "end" : handle;
     const startValue = edge === "start" ? clip.start : clip.end;
     const oppositeBound = edge === "start" ? clip.end : clip.start;
     // This clip's *own* source file's duration - every clip can come from a different file, so
@@ -1344,15 +1886,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // range never moves as a result of trimming its OWN start/end (see outputStarts' own doc
     // comment: a clip's output position depends only on clips BEFORE it), so it's safe to read
     // straight off the ambient outputStarts/clipDurations here rather than re-deriving anything.
-    const speed = clip.speed ?? 1;
+    // The clip's average speed - what turns a mouse movement into a source-time trim. For a ramp
+    // that's only approximate mid-drag; the clip's real length is re-derived the moment it lands.
+    const speed = (clip.end - clip.start) / Math.max(1e-6, clipOutputDuration(clip));
     const clipOutputStart = outputStarts[index];
     const clipOutputEnd = clipOutputStart + clipDurations[index];
     // (currentOutputTime - clipOutputStart) is an OUTPUT-time delta - * speed converts it to the
     // SOURCE-time delta clip.start actually needs, same reasoning clipAtOutputTime's own comment
     // gives for the identical conversion.
+    // No playhead snap for the reversed image handle - the pointer isn't at the edge that moves.
     const playheadSourceTime =
-      currentOutputTime >= clipOutputStart && currentOutputTime < clipOutputEnd ? clip.start + (currentOutputTime - clipOutputStart) * speed : null;
-    setResizeDrag({ id: clip.id, edge, startClientX: e.clientX, startValue, oppositeBound, maxEnd, liveValue: startValue, playheadSourceTime, speed });
+      direction === 1 && currentOutputTime >= clipOutputStart && currentOutputTime < clipOutputEnd ? outputOffsetToSource(clip, currentOutputTime - clipOutputStart) : null;
+    setResizeDrag({ id: clip.id, edge, startClientX: e.clientX, startValue, oppositeBound, maxEnd, liveValue: startValue, playheadSourceTime, speed, direction });
   };
   const handleResizeDragMove = (e: React.PointerEvent) => {
     if (!resizeDrag) return;
@@ -1363,7 +1908,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // pxPerSec/speed (rather than the plain scale) into snapToTargets keeps its own "N screen
     // pixels" snap threshold correct in this now-source-time-scaled space instead of snapping N*
     // speed pixels early/late for a sped-up/slowed-down clip's own trim handle.
-    const deltaSec = ((e.clientX - resizeDrag.startClientX) / pxPerSec) * resizeDrag.speed;
+    const deltaSec = ((e.clientX - resizeDrag.startClientX) / pxPerSec) * resizeDrag.speed * resizeDrag.direction;
     const raw =
       resizeDrag.playheadSourceTime != null
         ? snapToTargets(resizeDrag.startValue + deltaSec, [resizeDrag.playheadSourceTime], pxPerSec / resizeDrag.speed)
@@ -1412,6 +1957,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   };
 
   const handleClipPointerDown = (clip: Clip, index: number) => (e: React.PointerEvent) => {
+    // Right button: the clip menu (onContextMenu) - not a drag, a razor cut or a scrub.
+    if (e.button === 2) {
+      e.stopPropagation();
+      return;
+    }
     if (toolMode === "razor") {
       handleRazorClipPointerDown(e);
       return;
@@ -1426,14 +1976,29 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       prev ? { ...prev, isDragging: prev.isDragging || moved, overIndex: computeOverIndex(e.clientX) } : prev
     );
   };
-  const endClipDrag = () => {
+  const endClipDrag = (e: React.PointerEvent) => {
     if (!clipDrag) return;
     const { index, clip, isDragging, overIndex } = clipDrag;
     setClipDrag(null);
     if (isDragging) {
       editStore.reorderClip(index, overIndex);
+    } else if (e.ctrlKey || e.metaKey) {
+      // Ctrl-click toggles this clip in or out of the selection.
+      setSelectedClipIds(selectedClipIds.includes(clip.id) ? selectedClipIds.filter((id) => id !== clip.id) : [...selectedClipIds, clip.id]);
+      onSelectPipOverlay?.(null);
+    } else if (e.shiftKey && selectedClipId) {
+      // Shift-click selects the run from the last-picked clip to this one, this one last (primary).
+      const anchorIndex = baseClips.findIndex((c) => c.id === selectedClipId);
+      const step = index >= anchorIndex ? 1 : -1;
+      const run: string[] = [];
+      for (let i = anchorIndex; i !== index + step; i += step) run.push(baseClips[i].id);
+      setSelectedClipIds(run);
+      onSelectPipOverlay?.(null);
     } else {
       setSelectedClipId(clip.id);
+      // One selection at a time across the clip and PiP lanes, so Split/Delete (which prefer a
+      // selected PiP) can never act on a PiP the user has since clicked away from.
+      onSelectPipOverlay?.(null);
       // Selecting a clip only jumps the playhead to its start while playback is paused - same
       // reasoning as endPipOverlayDrag's own comment just below: yanking the playhead back to a
       // clip's start on a plain click mid-playback reads as "clicking the timeline restarts the
@@ -1450,11 +2015,49 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // never on a bare time value searched across all clips - once clips can come from different
   // files, a raw source time alone is ambiguous (two clips from different files can easily share
   // overlapping ranges), so the caller has to say which clip it means.
+  //
+  // Exception: a selected PiP chip takes over both - Split cuts that PiP at the playhead (if the
+  // playhead is inside it) and Delete removes that PiP piece, closing the gap it leaves in its own
+  // split chain (deletePipOverlayAndCloseGap). Splitting/deleting the main clip underneath a PiP
+  // the user had explicitly selected was exactly the wrong-target surprise this avoids.
+  const selectedPip = selectedPipOverlayId ? editStore.pipOverlays.find((o) => o.id === selectedPipOverlayId) : undefined;
   const handleSplit = () => {
+    // A selected audio chip takes Split the same way a selected PiP does: cut it at the playhead,
+    // keep the second piece selected (it's usually the one to keep trimming/deleting).
+    if (selectedAudioOverlayId) {
+      const audio = editStore.audioOverlays.find((o) => o.id === selectedAudioOverlayId);
+      if (audio && currentOutputTime > audio.startTime && currentOutputTime < audio.endTime) {
+        const second = editStore.splitAudioOverlay(audio.id, currentOutputTime);
+        if (second) {
+          setSelectedAudioOverlayId(second);
+          setAudioPopoverAnchor(null);
+        }
+      }
+      return;
+    }
+    if (selectedPip) {
+      // Split at currentOutputTime - the PiP lane's own coordinate space - not currentTime, which
+      // is the active clip's SOURCE time. Deliberately never falls through to splitting the clip:
+      // with a PiP selected, a playhead outside it just means there's nothing of it to cut there.
+      if (currentOutputTime > selectedPip.startTime && currentOutputTime < selectedPip.endTime) {
+        editStore.splitPipOverlay(selectedPip.id, currentOutputTime);
+      }
+      return;
+    }
     const idx = activeClipIndexRef.current;
     if (idx >= 0 && idx < baseClips.length) editStore.splitAt(idx, currentTime);
   };
   const handleDeleteSegment = () => {
+    if (selectedPip) {
+      editStore.deletePipOverlay(selectedPip.id);
+      onSelectPipOverlay?.(null);
+      return;
+    }
+    if (selectedClipIds.length > 1) {
+      editStore.deleteClips(selectedClipIds);
+      setSelectedClipId(null);
+      return;
+    }
     const selectedIndex = selectedClipId ? baseClips.findIndex((c) => c.id === selectedClipId) : -1;
     const index = selectedIndex !== -1 ? selectedIndex : activeClipIndexRef.current;
     if (index < 0 || index >= baseClips.length) return;
@@ -1475,6 +2078,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      // Minimized docker (BottomDocker keeps this mounted, display:none, so docked tool panels
+      // survive) - no Delete/Split/undo on a timeline nobody can see.
+      if (rootRef.current && rootRef.current.offsetParent === null) return;
 
       // Ctrl/Cmd+Z undoes, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redoes - the two conventional redo
       // bindings, kept both since Windows apps commonly use either. Checked ahead of Delete/
@@ -1495,6 +2101,56 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         editStore.redo();
         return;
       }
+      // Ctrl/Cmd+C copies the selected overlay or clips (Ctrl+X cuts them) - pasted at the playhead
+      // with Ctrl+V (Dashboard's paste handler, timelineClipboard.ts).
+      if ((e.ctrlKey || e.metaKey) && (key === "c" || key === "x")) {
+        const items = emptyClipboardItems();
+        const one = <T extends { id: string }>(list: T[], id: string | null) => list.filter((o) => o.id === id);
+        // Whatever was selected last wins (a clip and an overlay can both be selected).
+        if (lastSelectedRef.current === "clips" && selectedClipIds.length > 0) items.clips = editStore.clips.filter((c) => selectedClipIds.includes(c.id));
+        else if (selectedOverlayId) items.textOverlays = one(editStore.textOverlays, selectedOverlayId);
+        else if (selectedImageOverlayId) items.imageOverlays = one(editStore.imageOverlays, selectedImageOverlayId);
+        else if (selectedBlurOverlayId) items.blurOverlays = one(editStore.blurOverlays, selectedBlurOverlayId);
+        else if (selectedAdjustmentId) items.adjustmentLayers = one(editStore.adjustmentLayers, selectedAdjustmentId);
+        else if (selectedAudioOverlayId) items.audioOverlays = one(editStore.audioOverlays, selectedAudioOverlayId);
+        else if (selectedPipOverlayId) items.pipOverlays = one(editStore.pipOverlays, selectedPipOverlayId);
+        else if (selectedClipIds.length > 0) items.clips = editStore.clips.filter((c) => selectedClipIds.includes(c.id));
+        else return;
+        e.preventDefault();
+        void copyItems(items);
+        if (key === "x" && items.clips.length > 0) {
+          if (editStore.clips.length > selectedClipIds.length) {
+            editStore.deleteClips(selectedClipIds);
+            setSelectedClipIds([]);
+          }
+        } else if (key === "x") {
+          if (selectedOverlayId) {
+            editStore.deleteTextOverlay(selectedOverlayId);
+            onSelectOverlay?.(null);
+          } else if (selectedImageOverlayId) {
+            editStore.deleteImageOverlay(selectedImageOverlayId);
+            onSelectImageOverlay?.(null);
+          } else if (selectedBlurOverlayId) {
+            editStore.deleteBlurOverlay(selectedBlurOverlayId);
+            onSelectBlurOverlay?.(null);
+          } else if (selectedAdjustmentId) {
+            editStore.deleteAdjustmentLayer(selectedAdjustmentId);
+            onSelectAdjustment?.(null);
+          } else if (selectedAudioOverlayId) {
+            editStore.deleteAudioOverlay(selectedAudioOverlayId);
+            setSelectedAudioOverlayId(null);
+            setAudioPopoverAnchor(null);
+          } else if (selectedPipOverlayId) {
+            editStore.deletePipOverlay(selectedPipOverlayId);
+            onSelectPipOverlay?.(null);
+          } else if (items.clips.length > 0 && editStore.clips.length > selectedClipIds.length) {
+            editStore.deleteClips(selectedClipIds);
+            setSelectedClipIds([]);
+          }
+        }
+        return;
+      }
+
       // Ctrl/Cmd+D duplicates whatever overlay is currently selected - same "text takes priority
       // over image" ordering as Delete/Backspace below, for the same reason (the two can't be
       // selected at once in this UI, but if that ever changed, the more "local" selection wins).
@@ -1507,10 +2163,34 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onSelectImageOverlay?.(editStore.duplicateImageOverlay(selectedImageOverlayId));
         } else if (selectedBlurOverlayId) {
           onSelectBlurOverlay?.(editStore.duplicateBlurOverlay(selectedBlurOverlayId));
+        } else if (selectedAdjustmentId) {
+          onSelectAdjustment?.(editStore.duplicateAdjustmentLayer(selectedAdjustmentId));
         } else if (selectedAudioOverlayId) {
           setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(selectedAudioOverlayId));
           setAudioPopoverAnchor(null);
+        } else if (selectedClipIds.length > 0) {
+          editStore.duplicateClips(selectedClipIds);
         }
+        return;
+      }
+
+      // Ctrl/Cmd+A selects every clip on the timeline (then Delete, Duplicate, Speed, Effects...
+      // act on all of them); Escape clears the selection. preventDefault stops the page's own
+      // select-all highlighting everything.
+      if ((e.ctrlKey || e.metaKey) && key === "a") {
+        if (editStore.clips.length === 0) return;
+        e.preventDefault();
+        onSelectOverlay?.(null);
+        onSelectImageOverlay?.(null);
+        onSelectBlurOverlay?.(null);
+        onSelectPipOverlay?.(null);
+        setSelectedAudioOverlayId(null);
+        setAudioPopoverAnchor(null);
+        setSelectedClipIds(editStore.clips.map((c) => c.id));
+        return;
+      }
+      if (e.key === "Escape" && selectedClipIds.length > 1) {
+        setSelectedClipIds(selectedClipId ? [selectedClipId] : []);
         return;
       }
 
@@ -1528,12 +2208,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         e.preventDefault();
         editStore.deleteBlurOverlay(selectedBlurOverlayId);
         onSelectBlurOverlay?.(null);
+      } else if (selectedAdjustmentId) {
+        e.preventDefault();
+        editStore.deleteAdjustmentLayer(selectedAdjustmentId);
+        onSelectAdjustment?.(null);
       } else if (selectedAudioOverlayId) {
         e.preventDefault();
         editStore.deleteAudioOverlay(selectedAudioOverlayId);
         setSelectedAudioOverlayId(null);
         setAudioPopoverAnchor(null);
-      } else if (selectedClipId) {
+      } else if (selectedPipOverlayId || selectedClipId) {
         e.preventDefault();
         handleDeleteSegment();
       }
@@ -1541,7 +2225,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAudioOverlayId, selectedClipId, editStore]);
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAdjustmentId, selectedAudioOverlayId, selectedPipOverlayId, selectedClipId, selectedClipIds.join(), editStore]);
 
   // Pressing Play after the sequence has already played through to the end needs to restart from
   // clip 0 - native <video> never auto-rewinds on .play() once it's reached "ended", it just sits
@@ -1562,9 +2246,73 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     onTogglePlay();
   };
 
+  // Fill following the subject: the camera path (reframeAnalysis.ts - memoised, so the preview
+  // and Save share one analysis).
+  const exportSize = EXPORT_FORMATS.find((f) => f.value === exportFormat)?.size;
+  const following = !!exportSize && exportFraming === "fill" && exportFollowSubject && !!videoPixelSize;
+  const runReframe = () =>
+    analyzeReframe(editStore.clips, videoPixelSize!, exportSize!, (done, total) =>
+      setReframeStatus(done < total ? `Finding the subject… clip ${done + 1} of ${total}` : null)
+    );
+
+  // Shows the kept window on the player while the export options are open.
+  const exportOptionsOpen = !!exportOptionsAnchor;
+  useEffect(() => {
+    if (!onReframePreviewChange) return;
+    if (!exportOptionsOpen || !exportSize || exportFraming !== "fill" || !videoPixelSize) {
+      onReframePreviewChange(null);
+      return;
+    }
+    const win = fillWindow(videoPixelSize, exportSize);
+    const label = `${exportFormat}${exportFollowSubject ? " · following the subject" : ""}`;
+    if (!exportFollowSubject) {
+      onReframePreviewChange({ window: win, knots: anchorKnots(videoPixelSize, exportSize, exportAnchor), label });
+      return;
+    }
+    let cancelled = false;
+    onReframePreviewChange({ window: win, knots: anchorKnots(videoPixelSize, exportSize, { x: 0.5, y: 0.5 }), label: `${exportFormat} · finding the subject…` });
+    runReframe()
+      .then((knots) => !cancelled && onReframePreviewChange({ window: win, knots, label }))
+      .catch((err) => {
+        if (cancelled) return;
+        setReframeStatus(`Couldn't follow the subject: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportOptionsOpen, exportFormat, exportFraming, exportFollowSubject, exportAnchor, videoPixelSize, editStore.clips]);
+  useEffect(() => () => onReframePreviewChange?.(null), [onReframePreviewChange]);
+
+  // Rendering overlays to pictures for the export takes a moment before the job is queued.
+  const [preparingExport, setPreparingExport] = useState(false);
   const handleSave = async () => {
-    const result = await editStore.exportEdited(videoPixelSize, { quality: exportQuality, outputPath: customOutputPath ?? undefined });
-    if (result) onExported(result.path, result.name);
+    let track: [number, number, number][] | undefined;
+    if (following) {
+      try {
+        track = (await runReframe()).map((k) => [k.t, k.x, k.y]);
+      } catch (err) {
+        setReframeStatus(`Couldn't follow the subject: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+    }
+    // Rendered by the background queue (exportQueue.ts) - editing carries straight on, and the
+    // exports chip shows the frame being rendered, the progress and what's left.
+    setPreparingExport(true);
+    try {
+      const payload = await editStore.prepareExport(videoPixelSize, {
+        quality: exportQuality,
+        outputPath: customOutputPath ?? undefined,
+        outputFrame: exportSize ? { ...exportSize, mode: exportFraming, anchorX: exportAnchor.x, anchorY: exportAnchor.y, track } : null,
+        loudnessLufs: exportLoudness,
+      });
+      if (!payload) return;
+      const format = EXPORT_FORMATS.find((f) => f.value === exportFormat);
+      const detail = [format && format.size ? format.label : null, exportQuality === "high" ? "High quality" : exportQuality === "small" ? "Small file" : "Standard", formatTimestamp(totalOutputDuration)].filter(Boolean).join(" · ");
+      enqueueExport(payload, file.name.replace(/\.[^.]+$/, ""), detail);
+    } finally {
+      setPreparingExport(false);
+    }
   };
 
   // Defaults the save dialog to exactly the same "<name> (edited).<ext>" filename
@@ -1572,8 +2320,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // conversion.rs) - the user is choosing WHERE to put it, not renaming it.
   const handleChooseExportLocation = async () => {
     const stem = file.path.replace(/\.[^./\\]+$/, "").split(/[\\/]/).pop() ?? file.name;
-    const ext = file.path.split(".").pop() ?? "mp4";
-    const chosen = await saveFileDialog({ defaultPath: `${stem} (edited).${ext}`, filters: [{ name: ext.toUpperCase(), extensions: [ext] }] });
+    // A project renders to "<name>.mp4" (see export_trimmed_video), not another project file.
+    const ext = isProject ? "mp4" : file.path.split(".").pop() ?? "mp4";
+    const chosen = await saveFileDialog({ defaultPath: isProject ? `${stem}.mp4` : `${stem} (edited).${ext}`, filters: [{ name: ext.toUpperCase(), extensions: [ext] }] });
     if (chosen) setCustomOutputPath(chosen);
   };
 
@@ -1595,6 +2344,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         end: selectedClip.end,
         speed: selectedClip.speed ?? 1,
         noiseReduction: selectedClip.noiseReduction ?? null,
+        audioCleanup: selectedClip.audioCleanup ?? null,
         volume: editStore.videoAudioMuted ? 0 : editStore.videoAudioVolume,
         outputFormat: format,
         outputPath: chosen,
@@ -1604,6 +2354,153 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       window.alert(`Failed to extract audio: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setIsExtractingAudio(false);
+    }
+  };
+
+  // Detach-audio popover's own facts, fetched each time it opens: how many audio streams the
+  // selected clip's source really has, and which (if any) Demucs engine is installed.
+  const [detachStreamCount, setDetachStreamCount] = useState<number | null>(null);
+  const [separationEngine, setSeparationEngine] = useState<SeparationEngineStatus | undefined>(undefined);
+  const [detachStatus, setDetachStatus] = useState<string | null>(null);
+  // Backend command that cancels whichever long step is running (engine download or separation);
+  // null when nothing cancellable is in flight. Drives the popover's Cancel button.
+  const [activeCancelCommand, setActiveCancelCommand] = useState<"cancel_separation_engine_download" | "cancel_voice_music_separation" | null>(null);
+  useEffect(() => {
+    if (!extractAudioAnchor || !selectedClip) return;
+    let cancelled = false;
+    setDetachStreamCount(null);
+    setSeparationEngine(undefined);
+    invoke<unknown[]>("probe_audio_streams", { sourcePath: selectedClip.sourcePath })
+      .then((streams) => !cancelled && setDetachStreamCount(streams.length))
+      .catch(() => !cancelled && setDetachStreamCount(1));
+    invoke<SeparationEngineStatus>("get_separation_engine")
+      .then((status) => !cancelled && setSeparationEngine(status))
+      .catch(() => !cancelled && setSeparationEngine({ installed: null, downloadBytes: null }));
+    return () => {
+      cancelled = true;
+    };
+    // Re-probe only when the popover opens or points at a different source.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extractAudioAnchor !== null, selectedClip?.sourcePath]);
+
+  // Detach audio: renders every clip's own audio (trim/speed/noise reduction applied, so each
+  // file's length matches that clip's output duration exactly) into the app cache, lays the
+  // results on the audio lane at that clip's output position, and mutes the video track - one undo
+  // step (detachVideoAudio). Two modes:
+  //  - "streams": one file per audio stream the source actually has (probe_audio_streams), so a
+  //    multi-track file comes apart into its real tracks; a single-track file gives one row.
+  //  - "voice-music": the clip's mixed audio is extracted, then split by Demucs
+  //    (separate_voice_music) into "Voice" and "Music" rows.
+  // Clips whose source has no audio are skipped. Placement is a snapshot: reordering clips
+  // afterwards does not drag their detached audio along.
+  const handleDetachAudio = async (mode: DetachMode) => {
+    const clips = editStore.clips;
+    if (clips.length === 0) return;
+    setIsExtractingAudio(true);
+    try {
+      // First "Voice and music" use: fetch the engine (download_separation_engine, audio_tracks.rs)
+      // before touching the timeline. The popover's button already reads "Download engine (~N MB)
+      // and detach", so clicking it is the consent - no second confirm dialog.
+      if (mode === "voice-music" && !separationEngine?.installed) {
+        setActiveCancelCommand("cancel_separation_engine_download");
+        setDetachStatus("Downloading AI audio engine…");
+        const unlisten = await listen<{ downloaded: number; total: number }>("separation-engine-download", (e) => {
+          const { downloaded, total } = e.payload;
+          const pct = total > 0 ? Math.floor((downloaded / total) * 100) : 0;
+          setDetachStatus(`Downloading AI audio engine… ${pct}% (${Math.round(downloaded / 1_000_000)} of ${Math.round(total / 1_000_000)} MB)`);
+        });
+        try {
+          const installed = await invoke<string>("download_separation_engine");
+          setSeparationEngine((prev) => ({ installed, downloadBytes: prev?.downloadBytes ?? null }));
+        } finally {
+          unlisten();
+          setActiveCancelCommand(null);
+        }
+      }
+      const dir = await join(await appCacheDir(), "detached-audio");
+      const tracks: { src: string; sourceDuration: number; startTime: number; endTime: number; label?: string }[] = [];
+      const streamsBySource = new Map<string, { index: number; language?: string | null; title?: string | null }[]>();
+      let outputStart = 0;
+      for (let ci = 0; ci < clips.length; ci++) {
+        const clip = clips[ci];
+        const clipDuration = clipOutputDuration(clip);
+        const startTime = outputStart;
+        outputStart += clipDuration;
+        // A still image clip has no audio to detach - it just leaves silence on the new track.
+        if (clipDuration < MIN_OVERLAY_DURATION || isImageClipPath(clip.sourcePath)) continue;
+        const clipOf = clips.length > 1 ? ` (clip ${ci + 1} of ${clips.length})` : "";
+
+        let streams = streamsBySource.get(clip.sourcePath);
+        if (!streams) {
+          streams = await invoke<{ index: number; language?: string | null; title?: string | null }[]>("probe_audio_streams", { sourcePath: clip.sourcePath }).catch(() => [{ index: 0 }]);
+          streamsBySource.set(clip.sourcePath, streams);
+        }
+        if (streams.length === 0) continue;
+
+        const extract = async (streamIndex: number | null) => {
+          const outputPath = await join(dir, `${crypto.randomUUID()}.wav`);
+          await invoke("extract_clip_audio", {
+            sourcePath: clip.sourcePath,
+            start: clip.start,
+            end: clip.end,
+            speed: clip.speed ?? 1,
+            noiseReduction: clip.noiseReduction ?? null,
+            audioCleanup: clip.audioCleanup ?? null,
+            volume: editStore.videoAudioVolume,
+            outputFormat: "wav",
+            outputPath,
+            streamIndex,
+          });
+          return outputPath;
+        };
+        const place = (src: string, label?: string) => tracks.push({ src, sourceDuration: clipDuration, startTime, endTime: startTime + clipDuration, label });
+
+        if (mode === "streams") {
+          for (const stream of streams) {
+            setDetachStatus(`Extracting track ${stream.index + 1} of ${streams.length}${clipOf}…`);
+            const src = await extract(streams.length > 1 ? stream.index : null);
+            const name = stream.title || (stream.language ? `Track ${stream.index + 1} · ${stream.language}` : `Track ${stream.index + 1}`);
+            place(src, streams.length > 1 ? name : undefined);
+          }
+        } else {
+          setDetachStatus(`Extracting audio${clipOf}…`);
+          const mixed = await extract(null);
+          // On a laptop CPU this runs several times slower than real time, so show the engine's
+          // own progress and allow Cancel rather than a bare spinner.
+          const separatingLabel = `Separating voice and music${clipOf}`;
+          setDetachStatus(`${separatingLabel}… starting`);
+          setActiveCancelCommand("cancel_voice_music_separation");
+          const unlisten = await listen<{ percent: number }>("separation-progress", (e) => {
+            setDetachStatus(`${separatingLabel}… ${Math.floor(e.payload.percent)}%`);
+          });
+          let stems: { voicePath: string; musicPath: string };
+          try {
+            stems = await invoke<{ voicePath: string; musicPath: string }>("separate_voice_music", { inputPath: mixed, outputDir: dir });
+          } finally {
+            unlisten();
+            setActiveCancelCommand(null);
+          }
+          place(stems.voicePath, "Voice");
+          place(stems.musicPath, "Music");
+        }
+      }
+      if (tracks.length === 0) {
+        window.alert("This video has no audio to detach.");
+        return;
+      }
+      editStore.detachVideoAudio(tracks);
+      setExtractAudioAnchor(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message === "SEPARATION_DOWNLOAD_CANCELLED" || message === "SEPARATION_CANCELLED") return;
+      window.alert(
+        message === "SEPARATION_ENGINE_MISSING"
+          ? "Voice/music separation needs Demucs, which isn't installed. Install it with \"pip install demucs\" and try again."
+          : `Failed to detach audio: ${message}`
+      );
+    } finally {
+      setIsExtractingAudio(false);
+      setDetachStatus(null);
     }
   };
 
@@ -1748,6 +2645,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // this panel and force-seeked an already-playing video back to the start each time.
   useEffect(() => {
     const first = baseClips[0];
+    // A project emptied of every clip goes back to its blank canvas (its primary file) rather
+    // than leaving the deleted clip's picture on screen - and forgets the old first clip, so
+    // bringing it back (undo) plays from it again.
+    if (!first && isProject && !editStore.loading) {
+      bootstrappedClipIdByFile.delete(file.path);
+      activeClipIndexRef.current = 0;
+      onSeek(file.path, 0);
+      return;
+    }
     if (!first || first.id === "__pending__" || bootstrappedClipIdByFile.get(file.path) === first.id) return;
     bootstrappedClipIdByFile.set(file.path, first.id);
     activeClipIndexRef.current = 0;
@@ -1772,16 +2678,70 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const activeIdx = activeClipIndexRef.current;
     if (activeIdx < 0 || activeIdx >= baseClips.length) return; // not bootstrapped yet
     const active = baseClips[activeIdx];
-    if (currentTime >= active.start - SEEK_TOLERANCE_SEC && currentTime < active.end + SEEK_TOLERANCE_SEC) return; // still inside it
+    // Leaving forward is judged against the clip's end itself (less a frame's worth), not end +
+    // tolerance: a clip that runs to the end of its file - any freshly added or duplicated whole
+    // video - stops dead at `end` when the <video> hits "ended", so it never got past end +
+    // tolerance and playback stalled there instead of moving on to the next clip. The tolerance
+    // stays on the start side, where a seek can land a hair early (see SEEK_TOLERANCE_SEC).
+    if (currentTime >= active.start - SEEK_TOLERANCE_SEC && currentTime < active.end - CLIP_END_EPSILON_SEC) return; // still inside it
 
     const nextIndex = activeIdx + 1;
     if (nextIndex < baseClips.length) {
-      activeClipIndexRef.current = nextIndex;
-      lastAppliedTimeRef.current = baseClips[nextIndex].start;
-      onSeek(baseClips[nextIndex].sourcePath, baseClips[nextIndex].start);
+      // Playback running out of one clip carries on into the next - even if the <video> paused
+      // itself on reaching the end of its file. A scrub past the end while paused stays paused.
+      advanceToClip(nextIndex, isPlaying || wasPlayingRef.current);
+    } else if (isPlaying && !stopRequestedRef.current && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
+      // Finished the last clip in playback order - stop there rather than playing on into the
+      // rest of its source (an image clip's proxy runs for minutes; a trimmed video's tail was
+      // cut for a reason). Play again restarts from clip 0 (handleTransportPlayClick).
+      stopRequestedRef.current = true;
+      onTogglePlay();
     }
-    // else: finished the last clip in playback order - let native playback end there naturally.
   }, [currentTime, editStore.clips]);
+  function advanceToClip(index: number, resume: boolean) {
+    const clip = baseClips[index];
+    activeClipIndexRef.current = index;
+    lastAppliedTimeRef.current = clip.start;
+    onSeek(clip.sourcePath, clip.start, resume);
+  }
+  // The effect above only hears the player's position a few times a second (timeupdate), so on its
+  // own a clip ran up to a quarter second past its cut before the next one was asked for. While
+  // playing, this checks every frame and crosses over on the frame the clip ends - the next clip's
+  // standby (ClipHandoffLayer) takes over in the same tick.
+  const boundaryCheckRef = useRef<() => void>(() => {});
+  const stopRequestedRef = useRef(false);
+  boundaryCheckRef.current = () => {
+    const t = getPlayerTime?.();
+    const index = activeClipIndexRef.current;
+    const clip = baseClips[index];
+    if (t == null || !clip || t < clip.start - SEEK_TOLERANCE_SEC) return;
+    if (t < clip.end - FRAME_BOUNDARY_SEC) return;
+    if (index + 1 < baseClips.length) advanceToClip(index + 1, true);
+    else if (!stopRequestedRef.current) {
+      // The end of the last clip - stop there (see the effect above). Once: isPlaying only turns
+      // false a render later, and a second toggle would start it again.
+      stopRequestedRef.current = true;
+      onTogglePlay();
+    }
+  };
+  useEffect(() => {
+    if (isPlaying) stopRequestedRef.current = false;
+    if (!isPlaying || !getPlayerTime) return;
+    let raf = 0;
+    const tick = () => {
+      boundaryCheckRef.current();
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [isPlaying, getPlayerTime]);
+  // isPlaying as of the previous commit, for the effect above: on reaching the end of its file the
+  // <video> reports its final time and its pause together, so that effect can see the clip end
+  // with isPlaying already false. Declared after it so it still holds the previous value there.
+  const wasPlayingRef = useRef(false);
+  useEffect(() => {
+    wasPlayingRef.current = isPlaying;
+  });
 
   const commitRename = async () => {
     const trimmed = renameValue.trim();
@@ -1802,12 +2762,92 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // draggingLibraryFile/pendingTimelineInsert above have to work around. Inserts right after
   // whichever clip is currently under the playhead, same insertion point a drop at the playhead
   // would produce.
-  const handleInsertClipViaPicker = async () => {
+  // `atEnd` appends instead (the "+" after the last clip).
+  // `atIndex` puts them at that exact slot instead (the clip menu's Insert clip > Before/After).
+  const handleInsertClipViaPicker = async (atEnd = false, atIndex?: number) => {
     setMenuOpen(false);
-    const selected = await openFileDialog({ multiple: false, filters: [{ name: "Video", extensions: FILE_CATEGORY_EXTENSIONS.video }] });
+    const selected = await openFileDialog({
+      multiple: true,
+      filters: [
+        { name: "Videos and images", extensions: [...MEDIA_VIDEO_EXTENSIONS, ...IMAGE_CLIP_EXTENSIONS] },
+      ],
+    });
+    if (!selected) return; // cancelled
+    const paths = Array.isArray(selected) ? selected : [selected];
+    // An empty timeline has no active clip - append; otherwise insert after the one on screen, in
+    // the order picked.
+    let insertIndex =
+      atIndex ?? (atEnd ? editStore.clips.length : baseClips.length === 0 ? 0 : Math.max(0, activeClipIndexRef.current + 1));
+    for (const path of paths) {
+      // eslint-disable-next-line no-await-in-loop
+      await editStore.insertClipAt(path, insertIndex);
+      insertIndex += 1;
+    }
+  };
+
+  // ---- Clip menu (right-click a clip) & clip viewer ------------------------------------------
+  // The clips a rendered merge is working on (clip menu > Merge) - they show a spinner at each break
+  // point between them, with a Cancel under it, until the render finishes.
+  const [mergingIds, setMergingIds] = useState<string[] | null>(null);
+  // Break points are at the start of every merging clip after the first one in timeline order.
+  const firstMergingIndex = mergingIds ? editStore.clips.findIndex((c) => mergingIds.includes(c.id)) : -1;
+  const [clipMenu, setClipMenu] = useState<{ clipId: string; anchor: { left: number; top: number } } | null>(null);
+  const [viewerClipId, setViewerClipId] = useState<string | null>(null);
+  // Selects the clip too (without moving the playhead, so "Split at playhead" still means the
+  // playhead's spot), which is what "All effects…" then opens against.
+  const openClipMenu = (clip: Clip) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Right-clicking inside a multi-selection keeps it, so the menu's Duplicate/Delete cover it all.
+    if (!selectedClipIds.includes(clip.id)) setSelectedClipId(clip.id);
+    setClipMenu({ clipId: clip.id, anchor: { left: e.clientX, top: e.clientY } });
+  };
+  const menuClipIndex = clipMenu ? editStore.clips.findIndex((c) => c.id === clipMenu.clipId) : -1;
+  const menuClip = menuClipIndex >= 0 ? editStore.clips[menuClipIndex] : null;
+  // The selection the menu's Duplicate/Delete act on - just the clicked clip unless it's part of one.
+  const menuSelection = menuClip && selectedClipIds.includes(menuClip.id) ? selectedClipIds : menuClip ? [menuClip.id] : [];
+  // The playhead's source time, if it's inside `clip` right now.
+  const playheadInClip = (clip: Clip): number | null => {
+    const active = baseClips[activeClipIndexRef.current];
+    return active?.id === clip.id && currentTime > clip.start && currentTime < clip.end ? currentTime : null;
+  };
+  const moveClip = (index: number, target: ClipMoveTarget) => {
+    const last = editStore.clips.length - 1;
+    const to = target === "earlier" ? index - 1 : target === "later" ? index + 1 : target === "start" ? 0 : last;
+    editStore.reorderClip(index, Math.max(0, Math.min(last, to)));
+  };
+  const handleSaveClipAs = async (clip: Clip, index: number) => {
+    const stem = clip.sourcePath.replace(/\.[^./\\]+$/, "").split(/[\\/]/).pop() ?? "clip";
+    const chosen = await saveFileDialog({ defaultPath: `${stem} - clip ${index + 1}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
+    if (!chosen) return;
+    const result = await editStore.exportClip(clip.id, videoPixelSize, chosen);
+    if (result) onExported(result.path, result.name);
+  };
+  const handleViewClip = (clip: Clip) => {
+    if (isPlaying) onTogglePlay(); // one thing playing at a time
+    setViewerClipId(clip.id);
+  };
+  const handleReplaceClip = async (clipId: string) => {
+    const selected = await openFileDialog({
+      multiple: false,
+      filters: [{ name: "Videos and images", extensions: [...MEDIA_VIDEO_EXTENSIONS, ...IMAGE_CLIP_EXTENSIONS] }],
+    });
     if (!selected || Array.isArray(selected)) return; // cancelled
-    const insertIndex = Math.max(0, activeClipIndexRef.current + 1);
-    await editStore.insertClipAt(selected, insertIndex);
+    await editStore.replaceClipSource(clipId, selected);
+  };
+  const viewerIndex = viewerClipId ? editStore.clips.findIndex((c) => c.id === viewerClipId) : -1;
+  // A clip action that renders media first (freeze frame, reverse): shows what's happening on the
+  // track while it runs, and the reason if it fails.
+  const [busyMessage, setBusyMessage] = useState<{ text: string; error?: boolean } | null>(null);
+  const runBusy = (text: string, task: () => Promise<void>) => {
+    setBusyMessage({ text });
+    task()
+      .then(() => setBusyMessage(null))
+      .catch((err) => {
+        console.error(text, err);
+        setBusyMessage({ text: String(err), error: true });
+        window.setTimeout(() => setBusyMessage(null), 6000);
+      });
   };
 
   // Playhead position on the (output/assembled) ruler - maps currentTime (a raw source
@@ -1827,7 +2867,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             // delta clipDurations[...] (now itself an output duration, see its own doc comment)
             // is expressed in, or a sped-up clip's own playhead position would read as running
             // past its output duration long before source playback actually finishes.
-            (currentTime - renderClips[activeIndexForDisplay].start) / (renderClips[activeIndexForDisplay].speed ?? 1),
+            sourceToOutputOffset(renderClips[activeIndexForDisplay], currentTime),
             clipDurations[activeIndexForDisplay]
           )
         )
@@ -1839,7 +2879,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // currentOutputTime's own consumers above already rely on) - the playhead plus every clip's own
   // boundary, deduped isn't needed since snapToTargets just takes whichever is nearest regardless
   // of duplicates.
-  const overlaySnapTargets = [currentOutputTime, ...outputStarts, ...outputStarts.map((s, i) => s + clipDurations[i])];
+  // Music beats too (beat sync), so text, images and cuts can be dropped right on the beat.
+  const beatTimes = useMemo(() => beatOutputTimes(editStore.audioOverlays), [editStore.audioOverlays]);
+  const chapterMarks = useMemo(() => outputChapters(editStore.clips, editStore.chapters), [editStore.clips, editStore.chapters]);
+  const overlaySnapTargets = [currentOutputTime, ...outputStarts, ...outputStarts.map((s, i) => s + clipDurations[i]), ...beatTimes, ...chapterMarks.map((c) => c.time)];
 
   useEffect(() => {
     onOutputTimeChange?.(currentOutputTime);
@@ -1859,16 +2902,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             sourceStart: activeClip.start,
             sourceEnd: activeClip.end,
             colorFilter: activeClip.colorFilter,
+            grade: activeClip.grade,
             kenBurns: activeClip.kenBurns,
             crop: activeClip.crop,
             flipHorizontal: activeClip.flipHorizontal,
             speed: activeClip.speed,
+            speedRamp: activeClip.speedRamp,
             noiseReduction: activeClip.noiseReduction,
+            audioCleanup: activeClip.audioCleanup,
+            muted: activeClip.muted,
+            sourcePath: activeClip.sourcePath,
+            frame: videoPixelSize ?? undefined,
           }
         : null
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.noiseReduction]);
+  }, [videoPixelSize?.width, videoPixelSize?.height, activeClip?.id, activeClip?.start, activeClip?.end, activeClip?.colorFilter, activeClip?.grade, activeClip?.kenBurns, activeClip?.crop, activeClip?.flipHorizontal, activeClip?.speed, activeClip?.speedRamp, activeClip?.noiseReduction, activeClip?.audioCleanup, activeClip?.muted, activeClip?.sourcePath]);
 
   // Keeps every audio overlay's hidden <audio> element in lockstep with the main player: paused
   // whenever the playhead is outside its own [startTime,endTime) range (overlaysActiveAt, same
@@ -1877,8 +2926,59 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // more than ~150ms of drift) - letting the browser's own playback clock advance it the rest of
   // the time avoids fighting/stuttering it every frame the way resetting currentTime continuously
   // would. Volume applies both the overlay's own level and a linear fade in/out envelope.
+  //
+  // Measured against the player's exact time (getExactOutputTime), not currentOutputTime: that one
+  // comes from a ~4Hz timeupdate and reaches here only after a full re-render, by which point the
+  // audio has played on - the gap alone used to exceed the old 0.15s threshold, so every tick
+  // re-seeked the audio, which is what made detached audio skip and stutter. While playing, small
+  // drift is left alone (a seek is far more audible than 0.3s of slip); paused or after a scrub
+  // it's snapped exactly. Also re-checked a few times a second while playing, independent of renders.
+  // ---- Music library + ducking ----------------------------------------------------------------
+  // Where a library track lands (the playhead - or, with it at the very end, the start; same rule
+  // as a file) and what the library's "Suggested for this video" goes on.
+  const musicPlaceAt = currentOutputTime < totalOutputDuration - MIN_AUDIO_START_ROOM_SEC ? currentOutputTime : 0;
+  const musicContext = useMemo<VideoContext>(() => {
+    const imageClips = editStore.clips.filter((c) => isImageClipPath(c.sourcePath)).length;
+    const hasSpeech =
+      (!editStore.videoAudioMuted && editStore.clips.some((c) => !c.muted && !isImageClipPath(c.sourcePath))) || editStore.audioOverlays.some((o) => isSpeechOverlay(o) && !o.muted);
+    return { videoDuration: totalOutputDuration, hasSpeech, isMontage: editStore.clips.length > 0 && imageClips / editStore.clips.length >= 0.5 };
+  }, [editStore.clips, editStore.videoAudioMuted, editStore.audioOverlays, totalOutputDuration]);
+
+  // Speech on the output timeline, for ducked tracks - only worked out once something is ducked.
+  // The per-file scans are cached (musicDucking.ts), so re-running this after an edit is cheap.
+  const anyDucked = editStore.audioOverlays.some(isDucked);
+  const speechRangesRef = useRef<TimeRange[]>([]);
   useEffect(() => {
-    const activeIds = new Set(overlaysActiveAt(editStore.audioOverlays, currentOutputTime).map((o) => o.id));
+    if (!anyDucked) return;
+    let cancelled = false;
+    computeSpeechTimeline({ clips: editStore.clips, videoAudioMuted: editStore.videoAudioMuted, audioOverlays: editStore.audioOverlays }).then((r) => {
+      if (!cancelled) speechRangesRef.current = r;
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [anyDucked, editStore.clips, editStore.videoAudioMuted, editStore.audioOverlays]);
+
+  // A library song missing from disk (app data cleared, project opened on another machine) is
+  // fetched again - checked once per overlay per session, which is just a file-exists test.
+  const restoreCheckedRef = useRef(new Set<string>());
+  useEffect(() => {
+    for (const o of editStore.audioOverlays) {
+      const key = `${o.id}|${o.src}`;
+      if (!o.library || restoreCheckedRef.current.has(key)) continue;
+      restoreCheckedRef.current.add(key);
+      restoreMusicTrack(o.library.trackId, o.src)
+        .then((path) => path && path !== o.src && editStore.updateAudioOverlayContent(o.id, { src: path }))
+        .catch((err) => console.warn("Couldn't restore library track", o.library?.title, err));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editStore.audioOverlays]);
+
+  const syncAudioOverlaysRef = useRef<() => void>(() => {});
+  const audioSeekAtRef = useRef<Map<string, number>>(new Map());
+  syncAudioOverlaysRef.current = () => {
+    const now = (isPlaying ? getExactOutputTime?.() : null) ?? currentOutputTime;
+    const activeIds = new Set(overlaysActiveAt(editStore.audioOverlays, now).map((o) => o.id));
     editStore.audioOverlays.forEach((o) => {
       const audio = audioElementsRef.current.get(o.id);
       if (!audio) return;
@@ -1886,8 +2986,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         if (!audio.paused) audio.pause();
         return;
       }
-      const desiredTime = o.trimStart + (currentOutputTime - o.startTime);
-      if (Math.abs(audio.currentTime - desiredTime) > 0.15) audio.currentTime = desiredTime;
+      const desiredTime = o.trimStart + (now - o.startTime);
+      const drift = Math.abs(audio.currentTime - desiredTime);
+      const tolerance = isPlaying && !audio.paused ? AUDIO_DRIFT_TOLERANCE_SEC : 0.05;
+      // A seek stalls the element while it rebuffers, its currentTime frozen at the target while the
+      // picture moves on - re-checking during that window always saw fresh drift and seeked again,
+      // a loop that kept the audio stuttering. So: never while it's still seeking, and only a real
+      // jump (a scrub) right after one.
+      const settling = audio.seeking || performance.now() - (audioSeekAtRef.current.get(o.id) ?? 0) < AUDIO_SEEK_SETTLE_MS;
+      if (drift > tolerance && (!settling || drift > AUDIO_JUMP_SEC)) {
+        audio.currentTime = desiredTime;
+        audioSeekAtRef.current.set(o.id, performance.now());
+      }
       if (isPlaying && audio.paused) {
         audio.play().catch((err) => console.error("Audio overlay failed to play:", o.src, err));
       }
@@ -1896,14 +3006,166 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       const fadeIn = o.fadeInSec ?? 0;
       const fadeOut = o.fadeOutSec ?? 0;
       let envelope = 1;
-      if (fadeIn > 0) envelope = Math.min(envelope, (currentOutputTime - o.startTime) / fadeIn);
-      if (fadeOut > 0) envelope = Math.min(envelope, (o.endTime - currentOutputTime) / fadeOut);
-      audio.volume = o.muted ? 0 : o.volume * Math.max(0, Math.min(1, envelope));
+      if (fadeIn > 0) envelope = Math.min(envelope, (now - o.startTime) / fadeIn);
+      if (fadeOut > 0) envelope = Math.min(envelope, (o.endTime - now) / fadeOut);
+      const duck = isDucked(o) ? duckGainAt(speechRangesRef.current, now, o.duckLevel ?? DEFAULT_DUCK_LEVEL) : 1;
+      const session = getMixerSession();
+      const soloOff = silencedBySolo(session, audioChannelKey(o));
+      audio.volume = o.muted || soloOff ? 0 : o.volume * Math.max(0, Math.min(1, envelope)) * duck;
+      // Its mixer effects - the element is routed through them once it has any, or the mixer's
+      // meters want it (mixerGraph.ts).
+      syncElementFx(audio, `audio:${o.id}`, o.fx, !isNeutralFx(o.fx) || session.open);
+      if (isPlaying) resumeMixer();
     });
-  }, [currentOutputTime, isPlaying, editStore.audioOverlays]);
+  };
+  useEffect(() => {
+    syncAudioOverlaysRef.current();
+  }, [currentOutputTime, isPlaying, editStore.audioOverlays, mixerSession]);
+  // The mixer's strips: the video's own sound, each audio track (its pieces together) and each
+  // picture-in-picture whose sound plays.
+  const mixerChannels = useMemo<MixerChannel[]>(() => {
+    const channels: MixerChannel[] = [
+      { key: VIDEO_CHANNEL, name: "Video sound", kind: "video", volume: editStore.videoAudioVolume, muted: editStore.videoAudioMuted, fx: editStore.videoAudioFx, meterIds: ["video"] },
+    ];
+    const groups = new Map<string, AudioOverlay[]>();
+    for (const o of editStore.audioOverlays) {
+      const key = audioChannelKey(o);
+      groups.set(key, [...(groups.get(key) ?? []), o]);
+    }
+    for (const [key, pieces] of groups) {
+      const first = pieces[0];
+      channels.push({
+        key,
+        name: audioChannelName(first),
+        kind: "audio",
+        volume: first.volume,
+        muted: pieces.every((p) => p.muted),
+        fx: first.fx,
+        meterIds: pieces.map((p) => `audio:${p.id}`),
+        detail: pieces.length > 1 ? `${pieces.length} pieces` : undefined,
+      });
+    }
+    for (const p of editStore.pipOverlays) {
+      if (p.muted !== false) continue;
+      channels.push({
+        key: pipChannelKey(p.id),
+        name: fileStem(p.sourcePath),
+        kind: "pip",
+        volume: Number.isFinite(p.volume) ? p.volume : 1,
+        muted: false,
+        fx: p.fx,
+        meterIds: [`pip:${p.id}`],
+      });
+    }
+    return channels;
+  }, [editStore.videoAudioVolume, editStore.videoAudioMuted, editStore.videoAudioFx, editStore.audioOverlays, editStore.pipOverlays]);
+
+  useEffect(() => {
+    if (!isPlaying || editStore.audioOverlays.length === 0) return;
+    // Faster while something is ducked, so its volume ramps glide rather than step.
+    const id = window.setInterval(() => syncAudioOverlaysRef.current(), anyDucked ? 40 : 100);
+    return () => window.clearInterval(id);
+  }, [isPlaying, editStore.audioOverlays.length, anyDucked]);
 
   return (
-    <div className="w-full flex flex-col gap-2">
+    // The webview's native menu (Save image as / Copy image / Inspect) means nothing on a timeline -
+    // clips get their own menu (openClipMenu), everything else simply gets none.
+    <div ref={rootRef} className="w-full flex flex-col gap-2" onContextMenu={(e) => e.preventDefault()}>
+      {clipMenu && menuClip && (
+        <ClipContextMenu
+          anchor={clipMenu.anchor}
+          clip={menuClip}
+          index={menuClipIndex}
+          clipCount={editStore.clips.length}
+          isImage={isImageClipPath(menuClip.sourcePath)}
+          canSplit={playheadInClip(menuClip) !== null}
+          canDelete={isProject || editStore.clips.length > 1}
+          onClose={() => setClipMenu(null)}
+          onView={() => handleViewClip(menuClip)}
+          onSaveAs={() => void handleSaveClipAs(menuClip, menuClipIndex)}
+          onSplit={() => {
+            const at = playheadInClip(menuClip);
+            if (at !== null) editStore.splitAt(menuClipIndex, at);
+          }}
+          selectionCount={menuSelection.length}
+          mergeIsInstant={menuSelection.length > 1 && mergeClipsInPlace(editStore.clips, menuSelection) !== null}
+          onMerge={() => {
+            const ids = menuSelection;
+            if (mergeClipsInPlace(editStore.clips, ids)) {
+              void editStore.mergeClips(ids, videoPixelSize).then((mergedId) => mergedId && setSelectedClipId(mergedId));
+              return;
+            }
+            if (mergingIds) return; // one render at a time
+            setMergingIds(ids);
+            runBusy(`Merging ${ids.length} clips…`, async () => {
+              try {
+                const mergedId = await editStore.mergeClips(ids, videoPixelSize);
+                if (mergedId) setSelectedClipId(mergedId);
+              } finally {
+                setMergingIds(null);
+              }
+            });
+          }}
+          onDuplicate={() => (menuSelection.length > 1 ? editStore.duplicateClips(menuSelection) : editStore.duplicateClip(menuClip.id))}
+          onReplace={() => void handleReplaceClip(menuClip.id)}
+          onInsert={(where) => void handleInsertClipViaPicker(false, where === "before" ? menuClipIndex : menuClipIndex + 1)}
+          onFreezeFrame={() => {
+            const at = playheadInClip(menuClip);
+            if (at === null) return;
+            const clipId = menuClip.id;
+            runBusy("Freezing the frame…", async () => {
+              const still = await invoke<string>("extract_frame_still", { sourcePath: menuClip.sourcePath, time: at });
+              editStore.freezeFrame(clipId, at, still, FREEZE_FRAME_SECONDS);
+            });
+          }}
+          onToggleReverse={() => {
+            const clip = menuClip;
+            if (clip.reversedFrom) {
+              editStore.setClipReversed(clip.id, null);
+              return;
+            }
+            runBusy("Reversing the clip…", async () => {
+              const reversed = await invoke<string>("render_reversed_clip", { sourcePath: clip.sourcePath, start: clip.start, end: clip.end });
+              editStore.setClipReversed(clip.id, reversed);
+            });
+          }}
+          onMove={(target) => moveClip(menuClipIndex, target)}
+          onSetTransition={(type) =>
+            editStore.updateClipEffects(menuClip.id, {
+              transitionIn: type ? { type, duration: menuClip.transitionIn?.duration ?? DEFAULT_TRANSITION_DURATION } : undefined,
+            })
+          }
+          onSetMotion={(preset) =>
+            editStore.updateClipEffects(menuClip.id, {
+              kenBurns: preset ? { ...menuClip.kenBurns, preset, intensity: menuClip.kenBurns?.intensity ?? DEFAULT_KEN_BURNS_INTENSITY } : undefined,
+            })
+          }
+          onSetColor={(preset) =>
+            editStore.updateClipEffects(menuClip.id, {
+              colorFilter: preset === "none" ? undefined : { preset, intensity: menuClip.colorFilter?.intensity ?? DEFAULT_COLOR_INTENSITY },
+            })
+          }
+          onSetAllImageLengths={(seconds) => editStore.setImageClipLengths(seconds)}
+          onSetLength={(seconds) => editStore.resizeClipEdge(menuClip.id, "end", menuClip.start + seconds * (menuClip.speed ?? 1))}
+          onToggleMirror={() => editStore.updateClipEffects(menuClip.id, { flipHorizontal: !menuClip.flipHorizontal })}
+          onOpenEffects={() => setEffectsPopoverAnchor({ left: clipMenu.anchor.left, top: clipMenu.anchor.top })}
+          onReveal={() => invoke("open_file_from_directory", { filepath: menuClip.sourcePath }).catch((error) => console.error("Failed to reveal file:", error))}
+          onDelete={() => {
+            if (menuSelection.length > 1) editStore.deleteClips(menuSelection);
+            else editStore.deleteClipAt(menuClipIndex);
+            setSelectedClipId(null);
+          }}
+        />
+      )}
+      {viewerIndex >= 0 && (
+        <ClipViewerModal
+          clip={editStore.clips[viewerIndex]}
+          index={viewerIndex}
+          clipCount={editStore.clips.length}
+          frame={videoPixelSize}
+          onClose={() => setViewerClipId(null)}
+        />
+      )}
       {/* Hidden capture rig - never shown, just decodes frames for the filmstrip/cover. */}
       {/* crossOrigin="anonymous" is required here, not optional - without it, drawing this asset://-
           sourced video onto captureCanvasRef taints the canvas, and toDataURL() throws
@@ -1918,20 +3180,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       {editStore.audioOverlays.map((o) => (
         <audio
           key={o.id}
+          // Only registers - an inline ref is detached and re-attached on every render, so pausing
+          // on detach here paused the audio several times a second during playback (the sync
+          // effect then restarted it), which is what made audio overlays skip. Removal is handled
+          // by the effect after audioElementsRef's declaration.
           ref={(el) => {
-            if (el) {
-              audioElementsRef.current.set(o.id, el);
-            } else {
-              // Removing a playing <audio> element from the DOM does NOT stop it per the HTML
-              // media spec - it keeps playing until garbage collected, which is not deterministic
-              // and can easily be seconds later. Without this, deleting an audio overlay while
-              // it's audibly playing left it audibly playing with no visible chip/UI left to
-              // indicate anything was still running.
-              audioElementsRef.current.get(o.id)?.pause();
-              audioElementsRef.current.delete(o.id);
-            }
+            if (el) audioElementsRef.current.set(o.id, el);
           }}
           src={convertFileSrc(o.src)}
+          // Lets Web Audio read its samples (the mixer's effects and meters) - asset:// answers CORS.
+          crossOrigin="anonymous"
           preload="auto"
           onError={(e) => {
             const el = e.currentTarget;
@@ -1942,7 +3200,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       ))}
 
       {/* Toolbar */}
-      <div className="flex items-center justify-between gap-2 px-1 py-1 rounded-md bg-neutral-900 text-neutral-200 min-w-0">
+      <div ref={toolbarRef} className="flex items-center justify-between gap-2 px-1 py-1 rounded-md bg-neutral-900 text-neutral-200 min-w-0">
         {/* Select tool stays fixed (never scrolls away) - only the tool cluster to its right, which
             keeps growing as features get added, scrolls once the panel is too narrow to fit it all.
             min-w-0 on every ancestor down to the scroll container itself is required for the
@@ -1953,7 +3211,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={toolModeButtonRef}
             type="button"
-            title={toolMode === "razor" ? "Razor tool - click a clip to split it there" : "Select tool"}
+            title={toolMode === "razor" ? "Razor tool - click a clip or audio to cut it there" : "Select tool"}
             onClick={() => {
               if (toolModeAnchor) {
                 setToolModeAnchor(null);
@@ -1969,6 +3227,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             {toolMode === "razor" ? <IoCutOutline size={14} /> : <BsCursor size={13} />}
             <IoChevronDown size={10} />
           </button>
+          <ToolSearch toolbarRef={toolbarRef} />
           <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
           <div className="timeline-toolbar-scroll flex items-center gap-0.5 min-w-0 overflow-x-auto">
           <ActionButton title="Undo" onClick={editStore.undo} disabled={!editStore.canUndo}>
@@ -1978,13 +3237,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoArrowRedo size={15} />
           </ActionButton>
           <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
-          <ActionButton title="Split at playhead" onClick={handleSplit} disabled={duration <= 0}>
+          <ActionButton
+            title={selectedPip ? "Split selected PiP at playhead" : "Split at playhead"}
+            onClick={handleSplit}
+            disabled={selectedPip ? !(currentOutputTime > selectedPip.startTime && currentOutputTime < selectedPip.endTime) : duration <= 0}
+          >
             <IoCutOutline size={15} />
           </ActionButton>
           <ActionButton
-            title={selectedClipId ? "Delete selected clip" : "Delete clip at playhead"}
+            title={selectedPip ? "Delete selected PiP piece" : selectedClipId ? "Delete selected clip" : "Delete clip at playhead"}
             onClick={handleDeleteSegment}
-            disabled={editStore.clips.length <= 1}
+            disabled={!selectedPip && editStore.clips.length <= 1}
           >
             <IoTrashOutline size={15} />
           </ActionButton>
@@ -1999,7 +3262,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={speedButtonRef}
             type="button"
-            title={selectedClipId ? "Clip speed" : "Select a clip to change its speed"}
+            title={selectedClipId ? (selectedCount > 1 ? `Speed for ${selectionLabel}` : "Clip speed") : "Select a clip to change its speed"}
             disabled={!selectedClipId}
             onClick={() => {
               if (speedPopoverAnchor) {
@@ -2018,8 +3281,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={noiseReductionButtonRef}
             type="button"
-            title={selectedClipId ? "Reduce background noise" : "Select a clip to reduce its noise"}
-            disabled={!selectedClipId}
+            title={selectedIsImage ? IMAGE_CLIP_TOOL_HINT : selectedClipId ? "Clean up audio (reduce or remove noise, hum, rumble)" : "Select a clip to clean up its audio"}
+            disabled={!selectedClipId || selectedIsImage}
             onClick={() => {
               if (noiseReductionPopoverAnchor) {
                 setNoiseReductionPopoverAnchor(null);
@@ -2035,14 +3298,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             {selectedClipId === activeClip?.id && noiseReductionStatus === "calibrating" ? (
               <IoSyncOutline size={15} className="text-blue-400 animate-spin" />
             ) : (
-              <MdOutlineNoiseControlOff size={15} className={selectedClip?.noiseReduction ? "text-blue-400" : undefined} />
+              <MdOutlineNoiseControlOff size={15} className={selectedClip && hasAudioCleanup(selectedClip) ? "text-blue-400" : undefined} />
             )}
           </button>
           <button
             ref={extractAudioButtonRef}
             type="button"
-            title={selectedClipId ? "Extract this clip's audio" : "Select a clip to extract its audio"}
-            disabled={!selectedClipId}
+            title={selectedIsImage ? IMAGE_CLIP_TOOL_HINT : selectedClipId ? "Extract or detach audio" : "Select a clip to extract or detach its audio"}
+            disabled={!selectedClipId || selectedIsImage}
             onClick={() => {
               if (extractAudioAnchor) {
                 setExtractAudioAnchor(null);
@@ -2058,8 +3321,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoDownloadOutline size={15} />
           </button>
           <ActionButton
-            title={selectedClipId ? "Mirror clip horizontally" : "Select a clip to mirror"}
-            onClick={() => selectedClip && editStore.updateClipEffects(selectedClip.id, { flipHorizontal: !selectedClip.flipHorizontal })}
+            title={selectedClipId ? `Mirror ${selectionLabel} horizontally` : "Select a clip to mirror"}
+            onClick={() => selectedClip && updateSelectedClips({ flipHorizontal: !selectedClip.flipHorizontal })}
             disabled={!selectedClipId}
           >
             <MdFlip size={15} className={selectedClip?.flipHorizontal ? "text-blue-400" : undefined} />
@@ -2067,7 +3330,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={effectsButtonRef}
             type="button"
-            title={selectedClipId ? "Clip effects" : "Select a clip to edit its effects"}
+            title={selectedClipId ? (selectedCount > 1 ? `Effects for ${selectionLabel}` : "Clip effects") : "Select a clip to edit its effects"}
             disabled={!selectedClipId}
             onClick={() => {
               if (effectsPopoverAnchor) {
@@ -2086,8 +3349,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={silenceButtonRef}
             type="button"
-            title={selectedClipId ? "Find and remove silent gaps in this clip" : "Select a clip to trim silence"}
-            disabled={!selectedClipId}
+            title={selectedIsImage ? IMAGE_CLIP_TOOL_HINT : selectedClipId ? "Find and remove silent gaps in this clip" : "Select a clip to trim silence"}
+            disabled={!selectedClipId || selectedIsImage}
             onClick={() => {
               if (silenceAnchor) {
                 setSilenceAnchor(null);
@@ -2104,8 +3367,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={autoZoomButtonRef}
             type="button"
-            title={selectedClipId ? "Zoom in automatically on recorded clicks in this clip" : "Select a clip to auto zoom"}
-            disabled={!selectedClipId}
+            title={selectedIsImage ? IMAGE_CLIP_TOOL_HINT : selectedClipId ? "Zoom in automatically on recorded clicks in this clip" : "Select a clip to auto zoom"}
+            disabled={!selectedClipId || selectedIsImage}
             onClick={() => {
               if (autoZoomAnchor) {
                 setAutoZoomAnchor(null);
@@ -2122,8 +3385,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <button
             ref={viewSwitchButtonRef}
             type="button"
-            title={selectedClipId ? "Cut to the camera during recorded screen/camera view switches in this clip" : "Select a clip to apply view switches"}
-            disabled={!selectedClipId}
+            title={selectedIsImage ? IMAGE_CLIP_TOOL_HINT : selectedClipId ? "Cut to the camera during recorded screen/camera view switches in this clip" : "Select a clip to apply view switches"}
+            disabled={!selectedClipId || selectedIsImage}
             onClick={() => {
               if (viewSwitchAnchor) {
                 setViewSwitchAnchor(null);
@@ -2143,30 +3406,171 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoText size={15} className={isPlacingText ? "text-blue-400" : undefined} />
           </ActionButton>
+          <button
+            ref={captionsButtonRef}
+            type="button"
+            title="Captions - generate, style and burn in captions"
+            onClick={() => {
+              if (captionsAnchor) {
+                setCaptionsAnchor(null);
+                return;
+              }
+              const rect = captionsButtonRef.current?.getBoundingClientRect();
+              if (rect) setCaptionsAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              captionsAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <MdClosedCaptionOff size={16} className={editStore.captions?.settings.enabled ? "text-blue-400" : undefined} />
+          </button>
+          <button
+            ref={transcriptButtonRef}
+            type="button"
+            title="Edit by transcript - delete words to cut them, remove filler words and long pauses"
+            onClick={() => {
+              if (transcriptAnchor) {
+                setTranscriptAnchor(null);
+                return;
+              }
+              const rect = transcriptButtonRef.current?.getBoundingClientRect();
+              if (rect) setTranscriptAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              transcriptAnchor ? "bg-neutral-700 text-blue-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoDocumentTextOutline size={15} />
+          </button>
           <ActionButton
             title={isPlacingImage ? "Choosing an image…" : "Add image overlay"}
             onClick={() => onToggleArmPlaceImage?.()}
           >
             <IoImageOutline size={15} className={isPlacingImage ? "text-amber-400" : undefined} />
           </ActionButton>
+          <button
+            type="button"
+            data-elements-trigger
+            title="Add shapes and animated elements"
+            onClick={(e) => {
+              if (elementsAnchor) {
+                setElementsAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setElementsAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              elementsAnchor ? "bg-neutral-700 text-amber-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <IoShapesOutline size={15} />
+          </button>
+          <button
+            type="button"
+            title="Split screen - several shots at once"
+            onClick={(e) => {
+              if (splitAnchor) {
+                setSplitAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setSplitAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              splitAnchor ? "bg-neutral-700 text-fuchsia-400" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <MdViewQuilt size={16} />
+          </button>
+          <button
+            type="button"
+            title="Highlight intro - a burst of quick cuts before the video"
+            onClick={(e) => {
+              if (introAnchor) {
+                setIntroAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setIntroAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              introAnchor ? "bg-neutral-700 text-amber-300" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <MdFlashOn size={16} />
+          </button>
           <ActionButton
             title={isPlacingBlur ? "Click the video preview to place a blur region" : "Add blur region"}
             onClick={() => onToggleArmPlaceBlur?.()}
           >
             <MdBlurOn size={15} className={isPlacingBlur ? "text-sky-400" : undefined} />
           </ActionButton>
+          <ActionButton title="Add adjustment layer - grade or blur everything beneath it for a stretch of the video" onClick={addAdjustmentLayer}>
+            <IoColorFilterOutline size={15} className={selectedAdjustmentId ? "text-violet-300" : undefined} />
+          </ActionButton>
+          <button
+            type="button"
+            title="Chapters - for the exported file and YouTube"
+            onClick={(e) => {
+              if (chaptersAnchor) {
+                setChaptersAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setChaptersAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${chaptersAnchor ? "bg-neutral-700 text-violet-300" : "text-neutral-300 hover:bg-neutral-700"}`}
+          >
+            <IoBookmarkOutline size={15} />
+          </button>
           <ActionButton
             title={isPlacingPip ? "Choosing a video file…" : "Add picture-in-picture video (e.g. a separately-recorded webcam)"}
             onClick={() => onToggleArmPlacePip?.()}
           >
             <MdPictureInPictureAlt size={15} className={isPlacingPip ? "text-fuchsia-400" : undefined} />
           </ActionButton>
-          <ActionButton
-            title={isPlacingAudio ? "Choosing an audio file…" : "Add audio overlay"}
-            onClick={() => setIsPlacingAudio((v) => !v)}
+          <ActionButton title="Add B-roll - videos over the main one, full frame, on a video track above it" onClick={() => void handleAddBroll()}>
+            <MdVideoLibrary size={15} />
+          </ActionButton>
+          {onFindAndHide && (
+            <ActionButton title="Find & hide - draw around something once (a logo, a name, a face) and blur or cover it everywhere it appears" onClick={onFindAndHide}>
+              <IoEyeOffOutline size={16} />
+            </ActionButton>
+          )}
+          {onMarkWebcamBubble && (
+            <ActionButton title="Fix webcam background - blur or replace what's behind you in a webcam bubble recorded into the video" onClick={onMarkWebcamBubble}>
+              <IoPersonCircleOutline size={16} />
+            </ActionButton>
+          )}
+          <button
+            type="button"
+            data-music-library-button
+            title={isPlacingAudio ? "Choosing an audio file…" : "Add music & sound effects (free library, or a file of your own)"}
+            onClick={(e) => {
+              if (musicAnchor) {
+                setMusicAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setMusicAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
+              musicAnchor ? "bg-neutral-700 text-teal-300" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
           >
             <IoMusicalNotesOutline size={15} className={isPlacingAudio ? "text-teal-400" : undefined} />
-          </ActionButton>
+          </button>
+          <button
+            ref={mixerButtonRef}
+            type="button"
+            data-mixer-button
+            title="Mixer - levels, EQ and compression for every sound"
+            onClick={() => (mixerAnchor ? setMixerAnchor(null) : openMixer(null))}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${mixerAnchor ? "bg-neutral-700 text-teal-300" : "text-neutral-300 hover:bg-neutral-700"}`}
+          >
+            <MdTune size={15} />
+          </button>
           </div>
         </div>
 
@@ -2176,21 +3580,20 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               type="button"
               title={editStore.exportError ?? "Save the trimmed/cut/reordered result as a new file - the original is never modified"}
               onClick={handleSave}
-              disabled={!editStore.canUndo || editStore.isExporting}
+              // An unedited recording would only export a copy of itself, so Save waits for an edit -
+              // but a project has never been rendered at all, so it can always be saved (once it
+              // has a clip).
+              disabled={(isProject ? editStore.clips.length === 0 : !editStore.canUndo) || preparingExport}
               className="flex items-center gap-1.5 h-7 pl-2.5 pr-2 rounded-l text-xs font-medium bg-blue-600 text-white hover:bg-blue-500 disabled:bg-neutral-700 disabled:text-neutral-400 disabled:cursor-default"
             >
               <IoSaveOutline size={14} />
-              {editStore.isExporting
-                ? editStore.exportProgress != null
-                  ? `Saving… ${Math.round(editStore.exportProgress)}%`
-                  : "Saving…"
-                : "Save"}
+              {preparingExport ? "Preparing…" : "Save"}
             </button>
             <button
               ref={exportOptionsButtonRef}
               type="button"
               title="Export options (quality, destination)"
-              disabled={!editStore.canUndo || editStore.isExporting}
+              disabled={!editStore.canUndo || preparingExport}
               onClick={() => {
                 if (exportOptionsAnchor) {
                   setExportOptionsAnchor(null);
@@ -2252,7 +3655,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       )}
 
       {/* Timeline */}
-      <div className="w-full flex border border-neutral-800 rounded-md overflow-hidden bg-neutral-950 text-neutral-200">
+      <div className="relative w-full flex border border-neutral-800 rounded-md overflow-hidden bg-neutral-950 text-neutral-200">
         {/* Track control rail */}
         <div className="w-14 shrink-0 flex flex-col items-center gap-1.5 py-2 bg-neutral-900 border-r border-neutral-800">
           <button
@@ -2324,9 +3727,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       a portal) - document.body, where this now renders, is outside the Timeline
                       panel's own text-neutral-200 ancestor, so without this the menu items fell
                       back to the page's default (invisible-on-dark) text color. */}
-                  <div
-                    className="fixed w-44 bg-neutral-800 border border-neutral-700 rounded-md shadow-lg z-50 text-sm text-neutral-200"
-                    style={{ top: moreMenuPosition.top, left: moreMenuPosition.left }}
+                  <ViewportClampedMenu
+                    anchor={moreMenuPosition}
+                    className="w-56 bg-neutral-800 border border-neutral-700 rounded-md shadow-lg z-50 text-sm text-neutral-200 whitespace-nowrap"
                   >
                     <button
                       type="button"
@@ -2346,18 +3749,45 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                         void handleInsertClipViaPicker();
                       }}
                     >
-                      <IoAddCircleOutline size={13} /> Insert clip…
+                      <IoAddCircleOutline size={13} /> Insert videos or images…
                     </button>
-                    <button
-                      type="button"
-                      className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
-                      onClick={() => {
-                        setMenuOpen(false);
-                        onConvert(file);
-                      }}
-                    >
-                      <IoSwapHorizontalOutline size={13} /> Convert
-                    </button>
+                    {/* A project file isn't media ffmpeg can convert - Save renders it instead. */}
+                    {!isProject && (
+                      <button
+                        type="button"
+                        className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          onConvert(file);
+                        }}
+                      >
+                        <IoSwapHorizontalOutline size={13} /> Convert
+                      </button>
+                    )}
+                    {fileTransfer && (
+                      <button
+                        type="button"
+                        className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          setTransferAnchor(moreMenuPosition);
+                        }}
+                      >
+                        <IoFolderOutline size={13} /> Move or copy to…
+                      </button>
+                    )}
+                    {onSetThumbnail && !isProject && (
+                      <button
+                        type="button"
+                        className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          onSetThumbnail();
+                        }}
+                      >
+                        <IoImageOutline size={13} /> Set thumbnail…
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
@@ -2375,27 +3805,50 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     >
                       <IoTrashOutline size={13} /> Delete
                     </button>
-                  </div>
+                  </ViewportClampedMenu>
                 </>,
                 document.body
               )}
           </div>
 
-          <div className="mt-1 w-10 h-7 rounded border border-neutral-700 bg-neutral-800 flex items-center justify-center overflow-hidden">
-            {coverThumbnail ? (
-              <img src={coverThumbnail} alt="Cover" className="w-full h-full object-cover" />
+          {fileTransfer && transferAnchor && <MoveCopyMenu files={[file]} options={fileTransfer} anchor={transferAnchor} alwaysDark onClose={() => setTransferAnchor(null)} />}
+
+          {/* Clicking the cover opens "Set thumbnail" - the place people look for it. */}
+          <button
+            type="button"
+            title={onSetThumbnail && !isProject ? "Set thumbnail…" : "Cover"}
+            disabled={!onSetThumbnail || isProject}
+            onClick={() => onSetThumbnail?.()}
+            className="mt-1 w-10 h-7 rounded border border-neutral-700 bg-neutral-800 flex items-center justify-center overflow-hidden enabled:hover:ring-2 enabled:hover:ring-blue-400 disabled:cursor-default"
+          >
+            {savedThumbnail || coverThumbnail ? (
+              <img
+                src={savedThumbnail ?? coverThumbnail ?? undefined}
+                alt="Cover"
+                className="w-full h-full object-cover"
+                onError={() => setSavedThumbnail(null)}
+              />
             ) : (
               <span className="text-[8px] text-neutral-500">Cover</span>
             )}
-          </div>
+          </button>
         </div>
 
         {/* Scrollable ruler + track */}
-        <div ref={trackAreaRef} className="flex-1 overflow-x-auto overflow-y-hidden relative select-none">
-          <div style={{ width: totalWidth }} className="relative">
+        {/* Capped height: lanes only exist once something is on them (empty ones are hidden
+            above), and past ~4 lanes the stack scrolls vertically here instead of growing the
+            panel up over the video preview. The ruler stays pinned while scrolling. */}
+        <div ref={trackAreaRef} className="flex-1 max-h-[236px] overflow-x-auto overflow-y-auto relative select-none">
+          {/* An empty project's track fills the panel (its drop zone/"Add media" needs the room);
+              otherwise the clips' own width plus space for the "+" after the last clip. */}
+          <div
+            ref={trackContentRef}
+            style={isProject && baseClips.length === 0 ? { width: "100%", minWidth: 320 } : { width: Math.max(totalWidth, laneEndTime * pxPerSec) + ADD_BUTTON_ROOM_PX }}
+            className="relative"
+          >
             {/* Ruler - represents the *assembled* (playback-order) timeline, not raw source time */}
             <div
-              className="h-6 relative border-b border-neutral-800 cursor-pointer"
+              className="sticky top-0 z-30 bg-neutral-950 h-6 border-b border-neutral-800 cursor-pointer"
               onPointerDown={handleScrubPointerDown}
               onPointerMove={handleScrubPointerMove}
             >
@@ -2403,6 +3856,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 <div key={t} className="absolute top-0 h-full flex flex-col items-start" style={{ left: t * pxPerSec }}>
                   <div className="w-px h-2 bg-neutral-700" />
                   <span className="text-[10px] text-neutral-500 pl-1">{formatTimestamp(t)}</span>
+                </div>
+              ))}
+              {/* Beat markers (beat sync) - small amber ticks along the bottom of the ruler. */}
+              {beatTimes.map((t, i) => (
+                <div key={`beat-${i}`} className="absolute bottom-0 w-px h-2 bg-amber-400/80 pointer-events-none" style={{ left: t * pxPerSec }} />
+              ))}
+              {/* Chapter markers - violet flags; the label shows on hover. */}
+              {chapterMarks.map((c) => (
+                <div key={c.id} title={c.label} className="absolute top-0 h-full pointer-events-auto" style={{ left: c.time * pxPerSec }}>
+                  <div className="absolute top-0 bottom-0 w-px bg-violet-400/90" />
+                  <div className="absolute top-0 left-0 w-2.5 h-2 bg-violet-400/90" style={{ clipPath: "polygon(0 0, 100% 0, 70% 50%, 100% 100%, 0 100%)" }} />
                 </div>
               ))}
             </div>
@@ -2443,41 +3907,88 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   outline), drag past a few px to reorder (see beginClipDrag's comment for why
                   this is pointer-based rather than the HTML5 drag-and-drop API), edge handles
                   below to resize. */}
+              {busyMessage && (
+                <div
+                  className={`absolute right-2 -top-6 z-30 px-2 py-0.5 rounded-full text-[10px] font-medium shadow ring-1 ring-black/40 ${
+                    busyMessage.error ? "bg-red-600 text-white" : "bg-neutral-800 text-white/80"
+                  }`}
+                >
+                  {busyMessage.text}
+                </div>
+              )}
+              {isProject && baseClips.length === 0 && (
+                <div className="absolute inset-1 flex items-center justify-center gap-2 rounded border border-dashed border-neutral-600 text-[11px] text-neutral-400">
+                  Drop images or videos here, or
+                  <button
+                    type="button"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={() => void handleInsertClipViaPicker()}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded bg-teal-600 text-white hover:bg-teal-500"
+                  >
+                    <IoAddCircleOutline size={12} /> Add media
+                  </button>
+                </div>
+              )}
               {renderClips.map((clip, i) => {
                 const isPending = clip.id === "__pending__";
                 const left = outputStarts[i] * pxPerSec;
                 const width = Math.max(1, clipDurations[i] * pxPerSec);
-                const isSelected = selectedClipId === clip.id;
+                const isSelected = selectedClipIds.includes(clip.id);
                 const isDragging = clipDrag?.index === i && clipDrag.isDragging;
                 const isDragOver = clipDrag?.isDragging && clipDrag.overIndex === i && clipDrag.index !== i;
-                const clipThumbs = thumbnails.filter((t) => t.time >= clip.start && t.time < clip.end);
+                // Fixed-width tiles (video aspect at THUMB_TILE_HEIGHT), each showing the cached
+                // frame nearest the source time at its own center - so tile count, and therefore
+                // how many distinct shots are visible, grows with zoom instead of stretching a
+                // fixed handful of frames across the clip.
+                const tileWidth = videoPixelSize ? Math.max(24, Math.round((THUMB_TILE_HEIGHT * videoPixelSize.width) / videoPixelSize.height)) : 92;
+                const tileCount = Math.max(1, Math.ceil(width / tileWidth));
+                const isForeignVideo = !isImageClipPath(clip.sourcePath) && clip.sourcePath !== file.path;
+                const clipThumbs = thumbnails.length === 0 || isForeignVideo ? [] : Array.from({ length: tileCount }, (_, k) => {
+                  const outputOffset = Math.min((k + 0.5) * tileWidth, width) / pxPerSec;
+                  return nearestFrame(thumbnails, Math.min(clip.end, outputOffsetToSource(clip, outputOffset)));
+                });
                 return (
                   <div
                     key={clip.id}
                     onPointerDown={isPending ? undefined : handleClipPointerDown(baseClips[i], i)}
+                    onContextMenu={isPending ? undefined : openClipMenu(baseClips[i])}
                     onPointerMove={toolMode === "razor" ? undefined : handleClipDragMove}
                     onPointerUp={toolMode === "razor" ? undefined : endClipDrag}
                     onPointerCancel={toolMode === "razor" ? undefined : endClipDrag}
-                    title={isPending ? undefined : toolMode === "razor" ? `Clip ${i + 1} of ${renderClips.length} — click to split here` : `Clip ${i + 1} of ${renderClips.length} — click to select, drag to reorder`}
+                    title={isPending ? undefined : toolMode === "razor" ? `Clip ${i + 1} of ${renderClips.length} — click to split here` : `Clip ${i + 1} of ${renderClips.length} — click to select (Ctrl/Shift-click for more), drag to reorder`}
                     className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-black flex ${
                       isPending ? "" : toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"
                     } ${isSelected ? "border-dashed border-white" : "border-teal-500"} ${isDragging ? "opacity-40" : ""} ${
+                      mergingIds?.includes(clip.id) ? "animate-pulse" : ""
+                    } ${
                       isDragOver ? "ring-2 ring-blue-400" : ""
                     }`}
                     style={{ left, width }}
                   >
-                    {clipThumbs.length > 0 ? (
+                    {isImageClipPath(clip.sourcePath) ? (
+                      <ImageClipTiles sourcePath={clip.sourcePath} tileCount={tileCount} tileWidth={tileWidth} />
+                    ) : isForeignVideo ? (
+                      <ForeignVideoClipTiles clip={clip} tileCount={tileCount} tileWidth={tileWidth} width={width} pxPerSec={pxPerSec} />
+                    ) : clipThumbs.length > 0 ? (
                       clipThumbs.map((t, ti) =>
-                        t.src ? (
-                          <img key={ti} src={t.src} className="h-full flex-1 object-cover" draggable={false} alt="" />
+                        t ? (
+                          <img key={ti} src={t.src} className="h-full shrink-0 object-cover" style={{ width: tileWidth }} draggable={false} alt="" />
                         ) : (
-                          <div key={ti} className="h-full flex-1 bg-neutral-800" />
+                          <div key={ti} className="h-full shrink-0 bg-neutral-800" style={{ width: tileWidth }} />
                         )
                       )
                     ) : (
                       <div className="h-full w-full bg-neutral-800" />
                     )}
-                    {!isPending && (
+                    {clip.stabilize && (
+                      <span
+                        title="Stabilized when saved"
+                        className="absolute top-0.5 left-0.5 z-[6] px-1 rounded-sm bg-black/70 text-[8px] leading-3 font-semibold uppercase tracking-wide text-teal-300 pointer-events-none"
+                      >
+                        Steady
+                      </span>
+                    )}
+                    {!isPending && !isImageClipPath(clip.sourcePath) && (
                       <ClipWaveform
                         sourcePath={clip.sourcePath}
                         trimStart={clip.start}
@@ -2491,26 +4002,87 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 );
               })}
 
-              {/* Transition markers - purely decorative (not interactive; edit the transition
-                  itself via the selected clip's Effects popover), at each boundary where the clip
-                  on the RIGHT has transitionIn set. Communicates the documented preview-vs-export
-                  gap (see ClipTransitionIn's own doc comment): live preview shows a hard cut here
-                  regardless of which transition style is picked - the real transition only
-                  renders in the exported file. */}
+              {/* "+" right after the last clip - the quick way to keep adding images/videos to the
+                  end, without hunting for "Insert" in the track menu. Pointer-down is stopped so it
+                  doesn't also scrub the playhead under it. */}
+              {baseClips.length > 0 && !resizeDrag && !clipDrag?.isDragging && (
+                <button
+                  type="button"
+                  title="Add images or videos to the end"
+                  aria-label="Add images or videos to the end"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={() => void handleInsertClipViaPicker(true)}
+                  className="absolute top-1/2 -translate-y-1/2 w-9 h-9 rounded-full flex items-center justify-center bg-neutral-800 border border-dashed border-teal-500/70 text-teal-400 shadow-sm hover:bg-teal-500 hover:text-white hover:border-solid hover:border-teal-400 hover:scale-105 active:scale-95 transition-all"
+                  style={{ left: totalOutputDuration * pxPerSec + 10 }}
+                >
+                  <IoAdd size={20} />
+                </button>
+              )}
+
+              {/* Transitions - at each boundary where the clip on the RIGHT has transitionIn set: a band
+                  over the stretch of that clip the transition plays across (its first `d` seconds -
+                  see transition_fold_step), the boundary marker, and the transition's name in small
+                  type under the cut. The name opens that clip's menu, to change or remove it. */}
               {renderClips.map((clip, i) => {
                 if (i === 0 || clip.id === "__pending__" || !clip.transitionIn) return null;
+                if (mergingIds?.includes(clip.id) && i > firstMergingIndex) return null; // the merge's Cancel sits there
                 const left = outputStarts[i] * pxPerSec;
+                const label = TRANSITION_PRESETS.find((p) => p.value === clip.transitionIn?.type)?.label ?? "Transition";
+                const seconds = transitionDuration(clip);
                 return (
-                  <div
-                    key={`transition-${clip.id}`}
-                    title={`${TRANSITION_PRESETS.find((p) => p.value === clip.transitionIn?.type)?.label ?? "Transition"} (preview shows a hard cut; export renders the real transition)`}
-                    className="absolute inset-y-1 w-4 -ml-2 flex items-center justify-center rounded bg-blue-500/80 z-10 pointer-events-none"
-                    style={{ left }}
-                  >
-                    <IoSwapHorizontalOutline size={10} className="text-white" />
-                  </div>
+                  <React.Fragment key={`transition-${clip.id}`}>
+                    <div
+                      className="absolute inset-y-1 rounded-r pointer-events-none z-[5] bg-gradient-to-r from-blue-400/45 to-blue-400/0"
+                      style={{ left, width: seconds * pxPerSec }}
+                    />
+                    <div
+                      title={`${label} · ${seconds.toFixed(1)}s`}
+                      className="absolute inset-y-1 w-4 -ml-2 flex items-center justify-center rounded bg-blue-500/80 z-10 pointer-events-none"
+                      style={{ left }}
+                    >
+                      <IoSwapHorizontalOutline size={10} className="text-white" />
+                    </div>
+                    <button
+                      type="button"
+                      title={`${label} · ${seconds.toFixed(1)}s - click to change`}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => openClipMenu(baseClips[i])(e)}
+                      className="absolute z-20 -translate-x-1/2 px-1 rounded-sm bg-blue-600 text-[9px] leading-[13px] font-medium text-white whitespace-nowrap shadow ring-1 ring-black/40 hover:bg-blue-500"
+                      style={{ left, bottom: -6 }}
+                    >
+                      {label}
+                    </button>
+                  </React.Fragment>
                 );
               })}
+
+              {/* A rendered merge in progress: a fast spinner on every break point between the clips it's
+                  joining, and a Cancel under each (where a transition's name usually sits) that stops
+                  the render and leaves the timeline as it was. */}
+              {mergingIds &&
+                renderClips.map((clip, i) => {
+                  if (i <= firstMergingIndex || !mergingIds.includes(clip.id)) return null;
+                  const left = outputStarts[i] * pxPerSec;
+                  return (
+                    <React.Fragment key={`merging-${clip.id}`}>
+                      <div className="absolute inset-y-1 z-30 -translate-x-1/2 flex items-center justify-center pointer-events-none" style={{ left }}>
+                        <span className="flex h-6 w-6 items-center justify-center rounded-full bg-black/60">
+                          <SpokeWheel />
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        title="Stop merging - the clips stay as they were"
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onClick={() => editStore.cancelMerge()}
+                        className="absolute z-30 -translate-x-1/2 px-1.5 rounded-sm bg-neutral-700 text-[9px] leading-[13px] font-medium text-white whitespace-nowrap shadow ring-1 ring-black/40 hover:bg-red-600"
+                        style={{ left, bottom: -6 }}
+                      >
+                        Cancel
+                      </button>
+                    </React.Fragment>
+                  );
+                })}
 
               {/* Resize handles - two per real clip (start/end edges), kept as separate overlay
                   elements (not nested inside the draggable clip block above) so interacting with
@@ -2521,13 +4093,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 const width = clipDurations[i] * pxPerSec;
                 return (
                   <React.Fragment key={`resize-${clip.id}`}>
+                    {/* Each handle sits just inside its own clip's edge rather than centred on it -
+                        centred, a clip's end handle and the next clip's start handle covered the
+                        same pixels and the later one always won, so only the last clip's end could
+                        ever be dragged out to lengthen it. */}
                     <div
                       onPointerDown={beginResizeDrag(baseClips[i], i, "start")}
                       onPointerMove={handleResizeDragMove}
                       onPointerUp={endResizeDrag}
                       onPointerCancel={endResizeDrag}
-                      title="Drag to trim this clip's start"
-                      className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
+                      title={isImageClipPath(clip.sourcePath) ? "Drag to change how long this image shows" : "Drag to trim this clip's start"}
+                      className="absolute inset-y-1 w-2 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
                       style={{ left }}
                     />
                     <div
@@ -2535,8 +4111,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerMove={handleResizeDragMove}
                       onPointerUp={endResizeDrag}
                       onPointerCancel={endResizeDrag}
-                      title="Drag to trim this clip's end"
-                      className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
+                      title={isImageClipPath(clip.sourcePath) ? "Drag to change how long this image shows" : "Drag to trim this clip's end"}
+                      className="absolute inset-y-1 w-2 -ml-2 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
                       style={{ left: left + width }}
                     />
                   </React.Fragment>
@@ -2549,7 +4125,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 the clip track above. Whole-chip drag retimes both edges together (moveTextOverlayTime);
                 the two edge handles retime just one side (resizeTextOverlayTime) - same
                 move-vs-resize split as the clip track, adapted from beginClipDrag/beginResizeDrag. */}
-            <div className="h-8 relative border-t border-neutral-800">
+            <div className={`h-8 relative border-t border-neutral-800 ${renderOverlays.length === 0 ? "hidden" : ""}`}>
               {renderOverlays.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
@@ -2601,12 +4177,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
             {/* Image-overlay lane - same time-based chip/drag/resize pattern as the text-overlay
                 lane above, just amber instead of purple and with no editable text to show. */}
-            <div className="h-8 relative border-t border-neutral-800">
+            <div className={`h-8 relative border-t border-neutral-800 ${renderImageOverlays.length === 0 ? "hidden" : ""}`}>
               {renderImageOverlays.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
                 const isSelected = selectedImageOverlayId === overlay.id;
-                const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
+                const fileName = overlay.asset ? assetEntry(overlay.asset.kind).label : overlay.src.split(/[\\/]/).pop() ?? overlay.src;
                 return (
                   <div
                     key={overlay.id}
@@ -2620,7 +4196,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     }`}
                     style={{ left, width }}
                   >
-                    <IoImageOutline size={11} className="shrink-0" />
+                    {overlay.asset ? <IoShapesOutline size={11} className="shrink-0" /> : <IoImageOutline size={11} className="shrink-0" />}
                     {fileName}
                   </div>
                 );
@@ -2655,7 +4231,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
             {/* Blur-overlay lane - same time-based chip/drag/resize pattern as the text/image
                 lanes above, sky-blue instead of purple/amber and with no filename/text to show. */}
-            <div className="h-8 relative border-t border-neutral-800">
+            <div className={`h-8 relative border-t border-neutral-800 ${renderBlurOverlays.length === 0 ? "hidden" : ""}`}>
               {renderBlurOverlays.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
@@ -2706,6 +4282,56 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               })}
             </div>
 
+            {/* Adjustment-layer lane - violet; the chip names what the layer does. */}
+            <div className={`h-8 relative border-t border-neutral-800 ${renderAdjustmentLayers.length === 0 ? "hidden" : ""}`}>
+              {renderAdjustmentLayers.map((layer) => {
+                const left = layer.startTime * pxPerSec;
+                const width = Math.max(1, (layer.endTime - layer.startTime) * pxPerSec);
+                const isSelected = selectedAdjustmentId === layer.id;
+                const what = [
+                  layer.look && layer.look.preset !== "none" ? layer.look.preset : null,
+                  (layer.blur ?? 0) > 0 ? "blur" : null,
+                  layer.region ? (layer.region.invert ? "outside" : "area") : null,
+                ].filter(Boolean).join(" · ");
+                return (
+                  <React.Fragment key={layer.id}>
+                    <div
+                      onPointerDown={beginAdjustDrag(layer)}
+                      onPointerMove={handleAdjustDragMove}
+                      onPointerUp={endAdjustDrag}
+                      onPointerCancel={endAdjustDrag}
+                      title={`Adjustment layer${layer.placement === "over" ? " over everything" : " on the video"}${what ? ` - ${what}` : ""}`}
+                      className={`absolute inset-y-1 rounded overflow-hidden border-2 flex items-center gap-1 px-2 text-[11px] text-white truncate cursor-grab active:cursor-grabbing ${
+                        isSelected ? "border-dashed border-white bg-violet-900/60" : "border-violet-400 bg-violet-950/60"
+                      }`}
+                      style={{ left, width }}
+                    >
+                      <IoColorFilterOutline size={12} className="shrink-0" />
+                      {layer.name ?? (what || "Adjustment")}
+                    </div>
+                    <div
+                      onPointerDown={beginAdjustResizeDrag(layer, "start")}
+                      onPointerMove={handleAdjustResizeDragMove}
+                      onPointerUp={endAdjustResizeDrag}
+                      onPointerCancel={endAdjustResizeDrag}
+                      title="Drag to retime this adjustment layer's start"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-violet-400 hover:bg-violet-300 rounded cursor-ew-resize z-10"
+                      style={{ left }}
+                    />
+                    <div
+                      onPointerDown={beginAdjustResizeDrag(layer, "end")}
+                      onPointerMove={handleAdjustResizeDragMove}
+                      onPointerUp={endAdjustResizeDrag}
+                      onPointerCancel={endAdjustResizeDrag}
+                      title="Drag to retime this adjustment layer's end"
+                      className="absolute inset-y-1 w-2 -ml-1 bg-violet-400 hover:bg-violet-300 rounded cursor-ew-resize z-10"
+                      style={{ left: left + width }}
+                    />
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
             {/* PiP-overlay lane - same time-based chip/drag pattern as the blur lane above (fuchsia
                 instead of sky-blue), with edge handles that trim into the source (resizePipOverlayTime)
                 instead of just retiming an empty box, matching the audio lane's own resize style.
@@ -2713,8 +4339,30 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 own time range - clicking or dragging a chip brings the playhead back into view
                 (endPipOverlayDrag), since PipOverlayLayer only renders a PiP's actual video bubble
                 while the playhead is inside that range. */}
-            <div className="h-8 relative border-t border-neutral-800">
-              {renderPipOverlays.map((overlay) => {
+            {videoTrackLanes.map((track) => {
+              const hidden = isTrackHidden(editStore.hiddenVideoTracks, track);
+              const laneLayers = renderPipOverlays.filter((o) => pipTrack(o) === track);
+              return (
+            <div key={`vtrack-${track}`} data-video-track={track} className={`h-8 relative border-t border-neutral-800 ${pipOverlayDrag?.isDragging && pipOverlayDrag.liveTrack === track ? "bg-fuchsia-500/5" : ""}`}>
+              {/* The track's name and eye - stays in view as the timeline scrolls. */}
+              <div className="sticky left-0 z-20 inline-flex items-center gap-0.5 h-full pl-1 pr-1.5 bg-gradient-to-r from-neutral-950 via-neutral-950/90 to-transparent pointer-events-none">
+                <span className="text-[9px] font-semibold text-fuchsia-300/80" title={`Video track ${videoTrackLabel(track)} - higher tracks draw over lower ones`}>
+                  {videoTrackLabel(track)}
+                  {pipOverlayDrag?.isDragging && pipOverlayDrag.liveTrack === track && laneLayers.length === 1 && !editStore.pipOverlays.some((o) => o.id !== pipOverlayDrag.id && pipTrack(o) === track) && (
+                    <span className="ml-1 font-normal text-fuchsia-200/80">new track - over everything below</span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  title={hidden ? `Show ${videoTrackLabel(track)} (in the preview and the saved video)` : `Hide ${videoTrackLabel(track)} (in the preview and the saved video)`}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={() => editStore.setVideoTrackHidden(track, !hidden)}
+                  className="pointer-events-auto p-0.5 rounded text-neutral-400 hover:text-white"
+                >
+                  {hidden ? <IoEyeOffOutline size={11} /> : <IoEyeOutline size={11} />}
+                </button>
+              </div>
+              {laneLayers.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
                 const isSelected = selectedPipOverlayId === overlay.id;
@@ -2725,15 +4373,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     onPointerMove={handlePipOverlayDragMove}
                     onPointerUp={endPipOverlayDrag}
                     onPointerCancel={endPipOverlayDrag}
-                    title="Picture-in-picture - click to jump the playhead here"
-                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center justify-between gap-1 px-2 text-[11px] text-white cursor-grab active:cursor-grabbing ${
+                    title={toolMode === "razor" ? "Picture-in-picture - click to split it here" : "Picture-in-picture - click to select (then Split/Delete act on it), drag to move"}
+                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center justify-between gap-1 px-2 text-[11px] text-white ${hidden ? "opacity-40" : ""} ${
+                      toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"
+                    } ${
                       isSelected ? "border-dashed border-white" : "border-fuchsia-400"
                     }`}
                     style={{ left, width }}
                   >
                     <span className="flex items-center gap-1 min-w-0 truncate">
-                      <MdPictureInPictureAlt size={12} className="shrink-0" />
-                      PiP
+                      {isFullFrameLayer(overlay) ? <MdVideoLibrary size={12} className="shrink-0" /> : <MdPictureInPictureAlt size={12} className="shrink-0" />}
+                      {isFullFrameLayer(overlay) ? fileStem(overlay.sourcePath) : "PiP"}
                     </span>
                     <button
                       type="button"
@@ -2751,7 +4401,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   </div>
                 );
               })}
-              {renderPipOverlays.map((overlay) => {
+              {laneLayers.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = (overlay.endTime - overlay.startTime) * pxPerSec;
                 return (
@@ -2778,37 +4428,57 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 );
               })}
             </div>
+              );
+            })}
 
             {/* Audio-overlay lane - same time-based chip pattern as the text/image lanes above,
                 teal instead of purple/amber, with a real waveform instead of an icon+filename and
                 edge handles that trim into the source (resizeAudioOverlayTime) instead of just
                 retiming an empty box. */}
-            <div className="h-8 relative border-t border-neutral-800">
+            <div
+              className={`relative border-t border-neutral-800 ${renderAudioOverlays.length === 0 ? "hidden" : ""}`}
+              style={{ height: audioRows.rowCount * AUDIO_ROW_HEIGHT }}
+            >
               {renderAudioOverlays.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
+                const top = (audioRows.rowOf.get(overlay.id) ?? 0) * AUDIO_ROW_HEIGHT + 4;
                 const isSelected = selectedAudioOverlayId === overlay.id;
                 const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
                 return (
                   <div
                     key={overlay.id}
+                    data-audio-chip
                     onPointerDown={beginAudioOverlayDrag(overlay)}
                     onPointerMove={handleAudioOverlayDragMove}
                     onPointerUp={endAudioOverlayDrag}
                     onPointerCancel={endAudioOverlayDrag}
-                    title={fileName}
-                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 cursor-grab active:cursor-grabbing ${
+                    title={toolMode === "razor" ? `${fileName} — click to cut here` : overlay.label ? `${overlay.label} — ${fileName}` : fileName}
+                    className={`absolute rounded overflow-hidden border-2 bg-neutral-800 ${toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"} ${
                       isSelected ? "border-dashed border-white" : "border-teal-400"
                     } ${overlay.muted ? "opacity-50" : ""}`}
-                    style={{ left, width }}
+                    style={{ left, width, top, height: AUDIO_ROW_HEIGHT - 8 }}
                   >
-                    <AudioChipWaveform overlay={overlay} widthPx={width} heightPx={28} />
+                    <AudioChipWaveform overlay={overlay} widthPx={width} heightPx={AUDIO_ROW_HEIGHT - 12} />
+                    {overlay.endTime > totalOutputDuration && (
+                      <div
+                        title="Past the end of the video - not in the export. Drag the end handle back, or use Fit to video."
+                        className="absolute inset-y-0 right-0 bg-neutral-950/70 bg-[repeating-linear-gradient(135deg,transparent_0_4px,rgba(255,255,255,0.08)_4px_8px)] pointer-events-none"
+                        style={{ width: Math.min(width, (overlay.endTime - Math.max(overlay.startTime, totalOutputDuration)) * pxPerSec) }}
+                      />
+                    )}
+                    {overlay.label && (
+                      <span className="absolute left-1.5 top-0 text-[9px] font-medium leading-tight text-white bg-black/60 px-1 rounded-b pointer-events-none">
+                        {overlay.label}
+                      </span>
+                    )}
                   </div>
                 );
               })}
               {renderAudioOverlays.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = (overlay.endTime - overlay.startTime) * pxPerSec;
+                const handleStyle = { top: (audioRows.rowOf.get(overlay.id) ?? 0) * AUDIO_ROW_HEIGHT + 4, height: AUDIO_ROW_HEIGHT - 8 };
                 return (
                   <React.Fragment key={`audio-overlay-resize-${overlay.id}`}>
                     <div
@@ -2817,8 +4487,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerUp={endAudioOverlayResizeDrag}
                       onPointerCancel={endAudioOverlayResizeDrag}
                       title="Drag to trim this audio's start"
-                      className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
-                      style={{ left }}
+                      className="absolute w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
+                      style={{ ...handleStyle, left }}
                     />
                     <div
                       onPointerDown={beginAudioOverlayResizeDrag(overlay, "end")}
@@ -2826,8 +4496,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       onPointerUp={endAudioOverlayResizeDrag}
                       onPointerCancel={endAudioOverlayResizeDrag}
                       title="Drag to trim this audio's end"
-                      className="absolute inset-y-1 w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
-                      style={{ left: left + width }}
+                      className="absolute w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
+                      style={{ ...handleStyle, left: left + width }}
                     />
                   </React.Fragment>
                 );
@@ -2835,11 +4505,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             </div>
 
             {/* Playhead */}
-            <div className="absolute top-0 bottom-0 w-px bg-white pointer-events-none" style={{ left: playheadLeft }}>
+            <div className="absolute top-0 bottom-0 z-40 w-px bg-white pointer-events-none" style={{ left: playheadLeft }}>
               <div className="w-2.5 h-2.5 bg-white rounded-sm -ml-[5px] -mt-0.5" />
             </div>
           </div>
         </div>
+
+        {lanesHiddenBelow && (
+          <button
+            type="button"
+            title="Some tracks are below - scroll to see them"
+            onClick={() => trackAreaRef.current?.scrollBy({ top: 96, behavior: "smooth" })}
+            className="absolute bottom-1.5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] text-white bg-neutral-700/90 hover:bg-neutral-600 shadow ring-1 ring-white/10"
+          >
+            More tracks below ↓
+          </button>
+        )}
       </div>
 
       {exportOptionsAnchor && (
@@ -2850,6 +4531,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           customOutputName={customOutputPath ? customOutputPath.split(/[\\/]/).pop() ?? customOutputPath : null}
           onChooseLocation={handleChooseExportLocation}
           onResetLocation={() => setCustomOutputPath(null)}
+          format={exportFormat}
+          onFormatChange={setExportFormat}
+          framing={exportFraming}
+          onFramingChange={setExportFraming}
+          loudness={exportLoudness}
+          onLoudnessChange={setExportLoudness}
+          fillAnchor={exportAnchor}
+          onFillAnchorChange={setExportAnchor}
+          followSubject={exportFollowSubject}
+          onFollowSubjectChange={setExportFollowSubject}
+          reframeStatus={reframeStatus}
           onClose={() => setExportOptionsAnchor(null)}
         />
       )}
@@ -2875,9 +4567,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           return (
             <ClipEffectsPopover
               clip={clip}
-              hasPrecedingClip={clipIndex > 0}
+              hasPrecedingClip={clipIndex > 0 || selectedCount > 1}
+              previousClip={clipIndex > 0 ? editStore.clips[clipIndex - 1] : undefined}
+              isOnScreen={activeClip?.id === clip.id}
               anchor={effectsPopoverAnchor}
-              onUpdate={(patch) => editStore.updateClipEffects(clip.id, patch)}
+              selectedCount={selectedCount}
+              onUpdate={updateSelectedClips}
               onClose={() => setEffectsPopoverAnchor(null)}
             />
           );
@@ -2893,7 +4588,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               speed={clip.speed ?? 1}
               sourceDuration={clip.end - clip.start}
               anchor={speedPopoverAnchor}
-              onUpdate={(speed) => editStore.updateClipEffects(clip.id, { speed })}
+              selectedCount={selectedCount}
+              onUpdate={(speed) => updateSelectedClips({ speed })}
+              ramp={clip.speedRamp}
+              onRampChange={(speedRamp) => updateSelectedClips({ speedRamp })}
               onClose={() => setSpeedPopoverAnchor(null)}
             />
           );
@@ -2907,14 +4605,196 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           return (
             <NoiseReductionPopover
               strength={clip.noiseReduction ?? 0}
+              cleanup={clip.audioCleanup}
               status={noiseReductionStatus}
               anchor={noiseReductionPopoverAnchor}
-              onUpdate={(noiseReduction) => editStore.updateClipEffects(clip.id, { noiseReduction })}
+              clipCount={editStore.clips.length}
+              selectedCount={selectedCount}
+              onUpdate={updateSelectedClips}
+              onApplyToAll={(patch) => editStore.updateAllClipEffects(patch)}
               onClose={() => setNoiseReductionPopoverAnchor(null)}
-              onRecalibrate={onRecalibrateNoise}
+              sourcePath={clip.sourcePath}
+              clipStart={clip.start}
+              clipEnd={clip.end}
+              playhead={activeClip?.id === clip.id ? currentTime : undefined}
+              onSeek={(t) => onSeek(clip.sourcePath, t)}
+              onPreviewOriginal={onPreviewNoiseOriginal}
+              isPlaying={isPlaying}
+              onTogglePlay={handleTransportPlayClick}
             />
           );
         })()}
+
+      {mixerAnchor && (
+        <MixerPanel
+          anchor={mixerAnchor}
+          channels={mixerChannels}
+          focusKey={mixerFocus}
+          onVolume={(key, volume) => {
+            if (key === VIDEO_CHANNEL) editStore.setVideoAudioVolume(volume);
+            else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { volume });
+            else editStore.updateAudioChannel(key, { volume });
+          }}
+          onMute={(key, muted) => {
+            if (key === VIDEO_CHANNEL) editStore.setVideoAudioMuted(muted);
+            else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { muted });
+            else editStore.updateAudioChannel(key, { muted });
+          }}
+          onFx={(key, fx) => {
+            if (key === VIDEO_CHANNEL) editStore.setVideoAudioFx(fx);
+            else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { fx: isNeutralFx(fx) ? undefined : fx });
+            else editStore.updateAudioChannel(key, { fx });
+          }}
+          onClose={() => setMixerAnchor(null)}
+        />
+      )}
+
+      {musicAnchor && (
+        <MusicLibraryPanel
+          anchor={musicAnchor}
+          placeAt={musicPlaceAt}
+          videoDuration={totalOutputDuration}
+          context={musicContext}
+          timelinePlaying={isPlaying}
+          onPreviewStart={() => {
+            if (isPlaying) onTogglePlay();
+          }}
+          onAdd={(track, path, part, beats) => {
+            const isMusic = track.kind === "music";
+            const startTime = musicPlaceAt;
+            const id = editStore.addAudioOverlay(path, track.duration, startTime, startTime + part.length, {
+              trimStart: part.start,
+              label: track.title,
+              library: libraryInfoOf(track),
+              ...(beats ?? {}),
+              // Starting mid-song fades in so it doesn't land on a cut-off note; stopping before the
+              // song does fades out, so it never ends abruptly.
+              ...(isMusic && part.start > 0.05 ? { fadeInSec: 0.4 } : {}),
+              ...(isMusic && part.start + part.length < track.duration - 0.5 ? { fadeOutSec: Math.min(2, part.length / 4) } : {}),
+              // Under a voice, music sits back automatically.
+              ...(isMusic && musicContext.hasSpeech ? { duckUnderSpeech: true } : {}),
+            });
+            setSelectedAudioOverlayId(id);
+            if (isMusic) {
+              // A song's finer controls live in its own panel - open it where the library was.
+              setAudioPopoverAnchor(musicAnchor);
+              setMusicAnchor(null);
+            }
+            return id;
+          }}
+          onLateBeats={(id, b) => editStore.updateAudioOverlayContent(id, { bpm: b.bpm, beats: b.beats })}
+          onPickFile={() => {
+            setMusicAnchor(null);
+            setIsPlacingAudio(true);
+          }}
+          onClose={() => setMusicAnchor(null)}
+        />
+      )}
+
+      {introAnchor && (
+        <HighlightIntroPanel
+          anchor={introAnchor}
+          clips={editStore.clips}
+          selectedClipIds={selectedClipIds}
+          audioOverlays={editStore.audioOverlays}
+          onApply={(introClips, into, keepMusic) => {
+            editStore.insertHighlightIntro(introClips, into, keepMusic);
+            setIntroAnchor(null);
+          }}
+          onClose={() => setIntroAnchor(null)}
+        />
+      )}
+
+      {splitAnchor && (
+        <SplitScreenPanel
+          anchor={splitAnchor}
+          clips={editStore.clips}
+          selectedClipIds={selectedClipIds}
+          playhead={currentOutputTime}
+          totalDuration={totalOutputDuration}
+          frameAspect={videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9}
+          onApply={(cells, startTime, endTime, backdrop) => {
+            editStore.addSplitScreen(cells, startTime, endTime, backdrop);
+            setSplitAnchor(null);
+          }}
+          onClose={() => setSplitAnchor(null)}
+        />
+      )}
+
+      {elementsAnchor && (
+        <ElementsGallery
+          anchor={elementsAnchor}
+          onClose={() => setElementsAnchor(null)}
+          onPick={(kind) => {
+            const entry = assetEntry(kind);
+            const frameAspect = videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9;
+            // Wide elements (underlines, bars) by width; everything else about a third of the frame tall.
+            let height = entry.aspect >= 3 ? 0.5 / entry.aspect * frameAspect : 0.32;
+            let width = (height * entry.aspect) / frameAspect;
+            if (width > 0.6) {
+              width = 0.6;
+              height = (width * frameAspect) / entry.aspect;
+            }
+            if (entry.fullFrame) {
+              width = 1;
+              height = 1;
+            }
+            const length = kind === "countdown" ? 3 : kind === "progress" ? 5 : kind === "reveal" ? 2.6 : entry.fullFrame ? 6 : 4;
+            const total = totalOutputDuration > 0 ? totalOutputDuration : length;
+            const startTime = Math.max(0, Math.min(currentOutputTime, total - Math.min(length, total)));
+            const endTime = Math.min(total, startTime + length);
+            const id = editStore.addImageOverlay("", 0.5 - width / 2, 0.5 - height / 2, width, height, startTime, endTime, makeAsset(kind));
+            onSelectImageOverlay?.(id);
+            setElementsAnchor(null);
+          }}
+        />
+      )}
+
+      {chaptersAnchor && (
+        <ChaptersPanel
+          anchor={chaptersAnchor}
+          clips={editStore.clips}
+          chapters={editStore.chapters}
+          captions={editStore.captions}
+          currentOutputTime={currentOutputTime}
+          durationSec={totalOutputDuration}
+          primarySourcePath={file.path}
+          onChange={editStore.setChapters}
+          onSeek={seekToOutputTime}
+          onClose={() => setChaptersAnchor(null)}
+        />
+      )}
+
+      {captionsAnchor && (
+        <CaptionsPanel
+          anchor={captionsAnchor}
+          captions={editStore.captions}
+          lines={captionLines}
+          sourcePaths={captionSourcePaths}
+          primarySourcePath={file.path}
+          currentOutputTime={currentOutputTime}
+          onGenerated={editStore.setCaptionTranscripts}
+          onUpdateSettings={editStore.updateCaptionSettings}
+          onEditLine={editStore.editCaptionLine}
+          onClear={editStore.clearCaptions}
+          onSeekLine={(line) => onSeek(line.sourcePath, line.sourceStart)}
+          onClose={() => setCaptionsAnchor(null)}
+        />
+      )}
+
+      {transcriptAnchor && (
+        <TranscriptEditorPanel
+          anchor={transcriptAnchor}
+          captions={editStore.captions}
+          clips={editStore.clips}
+          sourcePaths={captionSourcePaths}
+          currentOutputTime={currentOutputTime}
+          onGenerated={(language, transcripts) => editStore.setCaptionTranscripts(language, transcripts, { captionsEnabled: false })}
+          onCut={editStore.cutClipRanges}
+          onSeek={(token) => seekToOutputTime(token.outputStart)}
+          onClose={() => setTranscriptAnchor(null)}
+        />
+      )}
 
       {toolModeAnchor && <ToolModePopover mode={toolMode} anchor={toolModeAnchor} onSelect={setToolMode} onClose={() => setToolModeAnchor(null)} />}
 
@@ -2923,6 +4803,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           anchor={extractAudioAnchor}
           isExtracting={isExtractingAudio}
           onExtract={handleExtractAudio}
+          onDetach={handleDetachAudio}
+          streamCount={detachStreamCount}
+          separationEngine={separationEngine}
+          detachStatus={detachStatus}
+          onCancel={activeCancelCommand ? () => void invoke(activeCancelCommand) : null}
           onClose={() => setExtractAudioAnchor(null)}
         />
       )}
@@ -2941,6 +4826,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(overlay.id));
                 setAudioPopoverAnchor(null);
               }}
+              videoEnd={totalOutputDuration}
+              timelinePlaying={isPlaying}
+              onPreviewStart={() => {
+                if (isPlaying) onTogglePlay();
+              }}
+              onSplitAtPlayhead={
+                currentOutputTime > overlay.startTime + 0.1 && currentOutputTime < overlay.endTime - 0.1
+                  ? () => {
+                      const second = editStore.splitAudioOverlay(overlay.id, currentOutputTime);
+                      if (second) {
+                        setSelectedAudioOverlayId(second);
+                        setAudioPopoverAnchor(null);
+                      }
+                    }
+                  : null
+              }
+              hasImageClips={editStore.clips.some((c) => isImageClipPath(c.sourcePath))}
+              onCutImagesOnBeat={editStore.cutImagesOnBeat}
+              onOpenMixer={() => openMixer(audioChannelKey(overlay))}
               onDelete={() => {
                 editStore.deleteAudioOverlay(overlay.id);
                 setSelectedAudioOverlayId(null);

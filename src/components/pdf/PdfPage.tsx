@@ -1,11 +1,12 @@
 // components/pdf/PdfPage.tsx
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy, PageViewport } from "pdfjs-dist";
-import { AnnotationObject, AnnotationTool, ImageObject, Pt, TextAlign, TextColorRun, TextObject, TextRange } from "../../utils/pdfAnnotationTypes";
+import { AnnotationObject, AnnotationTool, HighlightObject, Pt, StrokeObject, TextAlign, TextColorRun, TextObject, TextRange } from "../../utils/pdfAnnotationTypes";
 import {
   clearCanvas,
   devicePointToPdfPoint,
   findImageObjectAt,
+  findInkObjectAt,
   findTextObjectAt,
   makeTextObject,
   measureTextBlock,
@@ -13,15 +14,19 @@ import {
   renderObject,
   renderPageObjects,
   TextLine,
+  translateInkObject,
 } from "../../handlers/pdfAnnotationHandlers";
 import useStrokeCapture from "../../hooks/useStrokeCapture";
 import { PageRenderCache } from "../../hooks/usePageRenderCache";
 import { preloadImage } from "../../utils/imageObjectCache";
 import TextNoteEditor from "./TextNoteEditor";
 import ImageAnnotationEditor from "./ImageAnnotationEditor";
+import InkSelectionEditor from "./InkSelectionEditor";
 import PdfTextLayer from "./PdfTextLayer";
+import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 const TEXT_NOTE_DEFAULT_WIDTH_PDF = 160;
+const INK_SELECT_TOLERANCE_DEVICE_PX = 6; // how close (beyond the line's own width) a tap must land to pick up a stroke
 const DRAG_THRESHOLD_DEVICE_PX = 5; // below this, a pointerdown+up on a note is a tap (edit), not a drag (move)
 
 interface PdfPageProps {
@@ -37,8 +42,9 @@ interface PdfPageProps {
   textFontSize: number;
   eraserRadius: number;
   interactive: boolean;
-  selectedImageId: string | null;
-  onSelectImage: (id: string | null) => void;
+  // The one image or pen/highlighter stroke showing selection chrome (Select mode).
+  selectedObjectId: string | null;
+  onSelectObject: (id: string | null) => void;
   onStrokeComplete: (object: AnnotationObject) => void;
   onObjectEdit: (before: AnnotationObject, after: AnnotationObject) => void;
   onObjectDelete: (object: AnnotationObject) => void;
@@ -82,8 +88,8 @@ const PdfPage: React.FC<PdfPageProps> = ({
   textFontSize,
   eraserRadius,
   interactive,
-  selectedImageId,
-  onSelectImage,
+  selectedObjectId,
+  onSelectObject,
   onStrokeComplete,
   onObjectEdit,
   onObjectDelete,
@@ -135,6 +141,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
   const liveBoldRunsRef = useRef<TextRange[]>([]);
   const liveItalicRunsRef = useRef<TextRange[]>([]);
   const liveTextAlignRef = useRef<TextAlign>("left");
+  const canvasRestoreTick = useCanvasRestoreTick();
 
   useEffect(() => {
     let cancelled = false;
@@ -184,7 +191,8 @@ const PdfPage: React.FC<PdfPageProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [pdfDoc, pageIndex, zoom, numPages, cache]);
+    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
+  }, [pdfDoc, pageIndex, zoom, numPages, cache, canvasRestoreTick]);
 
   // Text geometry for the highlighter's auto-height snapping. Deliberately a separate effect
   // keyed only on [pdfDoc, pageIndex] (not zoom) — text positions are already in zoom-independent
@@ -236,12 +244,12 @@ const PdfPage: React.FC<PdfPageProps> = ({
     const ctx = canvas?.getContext("2d");
     if (!ctx || !canvas) return;
     clearCanvas(ctx, canvas);
-    const visibleObjects = objects.filter((o) => o.id !== draggingTextId && o.id !== selectedImageId);
+    const visibleObjects = objects.filter((o) => o.id !== draggingTextId && o.id !== selectedObjectId);
     renderPageObjects(ctx, visibleObjects, viewport, viewport.scale);
     // imageVersion isn't read directly but is exactly what should trigger a redraw once a
     // previously-undecoded image finishes loading.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewport, objects, draggingTextId, selectedImageId, imageVersion]);
+  }, [viewport, objects, draggingTextId, selectedObjectId, imageVersion]);
 
   // Resolves whatever text session is currently open: commits it to the store (add / edit /
   // delete-if-cleared-to-empty) or discards it if nothing meaningful changed. Nothing is written
@@ -572,34 +580,60 @@ const PdfPage: React.FC<PdfPageProps> = ({
 
     const handlePointerDown = (e: PointerEvent): void => {
       if (e.pointerType === "mouse" && e.button !== 0) return;
+      // Presses on a selection's own chrome (handles, delete button, the dashed ink box) belong to
+      // that editor. This is a native listener on an ancestor, so it runs before React's
+      // stopPropagation in those editors ever could - without this check, a press on a handle
+      // that sits outside the object's bounds (the rotate knob, half of every corner) misses the
+      // hit test below and deselects the very thing being grabbed.
+      if (e.target instanceof Element && e.target.closest("[data-annotation-editor]")) return;
       const rect = wrapper.getBoundingClientRect();
       const pdfPoint = devicePointToPdfPoint(viewport, e.clientX - rect.left, e.clientY - rect.top, 1);
-      const hit = findImageObjectAt(objectsRef.current, pdfPoint);
-      onSelectImage(hit?.id ?? null);
+      const hit = findImageObjectAt(objectsRef.current, pdfPoint) ?? findInkObjectAt(objectsRef.current, pdfPoint, INK_SELECT_TOLERANCE_DEVICE_PX / viewport.scale);
+      onSelectObject(hit?.id ?? null);
       if (hit) e.preventDefault();
     };
 
     wrapper.addEventListener("pointerdown", handlePointerDown);
     return () => wrapper.removeEventListener("pointerdown", handlePointerDown);
-  }, [tool, interactive, viewport, onSelectImage]);
+  }, [tool, interactive, viewport, onSelectObject]);
 
   // Delete/Backspace removes the selected image, as long as this page is the one that actually
   // holds it (selection is a single id shared across the whole document, per PdfAnnotator) and
   // focus isn't in a text field that should get the keystroke instead.
-  const selectedImageObject = selectedImageId ? objects.find((o): o is ImageObject => o.type === "image" && o.id === selectedImageId) ?? null : null;
+  const selectedObject = selectedObjectId ? objects.find((o) => o.id === selectedObjectId) ?? null : null;
+  const selectedImageObject = selectedObject?.type === "image" ? selectedObject : null;
+  const selectedInkObject = selectedObject?.type === "stroke" || selectedObject?.type === "highlight" ? (selectedObject as StrokeObject | HighlightObject) : null;
   useEffect(() => {
-    if (!selectedImageObject) return;
+    if (!selectedObject || selectedObject.type === "text") return;
     const handleKeyDown = (e: KeyboardEvent): void => {
       if (e.key !== "Delete" && e.key !== "Backspace") return;
       const target = document.activeElement;
       if (target instanceof HTMLElement && (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
       e.preventDefault();
-      onObjectDelete(selectedImageObject);
-      onSelectImage(null);
+      onObjectDelete(selectedObject);
+      onSelectObject(null);
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [selectedImageObject, onObjectDelete, onSelectImage]);
+  }, [selectedObject, onObjectDelete, onSelectObject]);
+
+  // Device-px drag offset -> PDF-space offset (via two converted points, so it stays right for
+  // rotated pages too), applied to every point of the stroke as one undoable edit.
+  const handleInkMoveEnd = useCallback(
+    (dx: number, dy: number): void => {
+      if (!viewport || !selectedInkObject) return;
+      const [x0, y0] = viewport.convertToPdfPoint(0, 0);
+      const [x1, y1] = viewport.convertToPdfPoint(dx, dy);
+      onObjectEdit(selectedInkObject, translateInkObject(selectedInkObject, x1 - x0, y1 - y0));
+    },
+    [viewport, selectedInkObject, onObjectEdit]
+  );
+
+  const handleInkDelete = useCallback((): void => {
+    if (!selectedInkObject) return;
+    onObjectDelete(selectedInkObject);
+    onSelectObject(null);
+  }, [selectedInkObject, onObjectDelete, onSelectObject]);
 
   const handleImageMoveEnd = useCallback(
     (newLeftDevicePx: number, newTopDevicePx: number): void => {
@@ -637,8 +671,8 @@ const PdfPage: React.FC<PdfPageProps> = ({
   const handleImageDelete = useCallback((): void => {
     if (!selectedImageObject) return;
     onObjectDelete(selectedImageObject);
-    onSelectImage(null);
-  }, [selectedImageObject, onObjectDelete, onSelectImage]);
+    onSelectObject(null);
+  }, [selectedImageObject, onObjectDelete, onSelectObject]);
 
   useStrokeCapture({
     scratchCanvasRef,
@@ -696,6 +730,9 @@ const PdfPage: React.FC<PdfPageProps> = ({
           onResizeEnd={handleNoteResizeEnd}
           onResizeWidthEnd={handleNoteWidthResizeEnd}
         />
+      )}
+      {selectedInkObject && viewport && (
+        <InkSelectionEditor key={selectedInkObject.id} object={selectedInkObject} viewport={viewport} onMoveEnd={handleInkMoveEnd} onDelete={handleInkDelete} />
       )}
       {selectedImageObject && viewport && (() => {
         const topLeft = pdfPointToDevicePoint(viewport, { x: selectedImageObject.x, y: selectedImageObject.y, pressure: 1 });

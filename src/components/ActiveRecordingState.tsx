@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoMicCircle, IoPauseCircle, IoPlayCircle, IoRadioButtonOn, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoMapOutline, IoCutOutline } from 'react-icons/io5'
+import { IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoMapOutline, IoCutOutline } from 'react-icons/io5'
 
 export type RecordSource = "screen" | "video" | "audio";
 
@@ -77,10 +77,14 @@ interface Props {
     // before presenting/recording a screen that includes this window, so they don't end up baked
     // into the video.
     showRecordingPanelButtons: boolean;
+    // Live Screen <-> Camera cutting while recording (Alt+Shift+V) - see Dashboard's switchView.
+    canSwitchView?: boolean;
+    viewMode?: 'screen' | 'camera';
+    onSwitchView?: (mode: 'screen' | 'camera') => void;
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenMindmap,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenMindmap,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -125,49 +129,35 @@ const ActiveRecordingState = (
     }, [isRecording, recordingStartTime, isPaused, pauseStartedAt, pausedAccumulatedMs]);
 
 
+    // Shared look for every icon button in the bar - compact padded hit-area, neutral icon that
+    // darkens on hover, and a tinted "you are here" state for the active view.
+    const iconButtonClass = (active = false) =>
+        `cursor-pointer p-1.5 rounded-md text-base transition-all duration-150 active:scale-90 outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60 ${
+            active
+                ? "bg-blue-500/15 text-blue-600 dark:text-blue-400 hover:bg-blue-500/25"
+                : "text-neutral-600 dark:text-neutral-300 hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-white/10 dark:hover:text-white"
+        }`;
+
     return (
         // This bar floats over whatever the video player is showing (a `fixed bottom-0`
-        // overlay), so it can't rely on the page's own background for contrast - a dark or
-        // black video behind it would make unstyled icons/text disappear entirely. The
-        // gradient scrim guarantees legibility regardless of what's playing, same technique
-        // the video player's own control bar uses (player.css .video-controls-container).
-        // pointer-events-none on this whole wrapper, with it explicitly turned back on for the
-        // drag-region strip and the actual icon row below: this bar sits at the very top of the
-        // fixed bottom docker, right where the whiteboard/board page-tab strip's own controls
-        // (e.g. the page-menu chevron) end - even though pt-4's own gap is visually empty/
-        // transparent, without this it was still a real, click-intercepting DOM element sitting
-        // on top of whatever the tab strip renders in that last sliver of space, silently
-        // swallowing clicks meant for it.
-        <div className="bg-gradient-to-t from-black/15 via-black/5 to-transparent pt-4 pointer-events-none">
-            <div className='mx-2 h-4 pointer-events-auto' data-tauri-drag-region />
-            <div className='flex justify-between pl-2 pb-2 items-center align-middle pointer-events-auto'>
-                {/* Each icon gets its own padded hit-area that darkens on hover/focus so it
-                    reads clearly regardless of what's playing behind this bar (light or dark
-                    video frame, or the plain home screen) - a bare white icon with no feedback
-                    was easy to miss/misclick against bright content. */}
-                <div className="flex items-center">
-                   {showFileList ? (
-                        <button
-                        type="button"
-                        className="cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 hover:bg-black/40 active:bg-black/60 active:scale-90 focus-visible:bg-black/40 outline-none"
-                        onClick={() => handleFolderSettings()}
-                        title="Toggle file list"
-                        >
-                          <IoFolderOpen />
-                        </button>
-                    ) : (
-                        <button
-                        type="button"
-                        className="cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 hover:bg-black/40 active:bg-black/60 active:scale-90 focus-visible:bg-black/40 outline-none"
-                        onClick={() => handleFolderSettings()}
-                        title="Toggle file list"
-                        >
-                          <IoFolder />
-                        </button>
-                    )}
+        // overlay), so it can't rely on the page's own background for contrast. It used to use a
+        // gradient scrim with white icons for that; it now has a flat, near-opaque background
+        // matching the footer below it, with neutral icons, so it's legible over a bright or
+        // dark video frame alike without any shadow above it.
+        <div className="bg-neutral-50/95 dark:bg-neutral-900/95 backdrop-blur-sm border-t border-neutral-200 dark:border-neutral-800">
+            <div className='flex justify-between px-2 py-1 items-center align-middle' data-tauri-drag-region>
+                <div className="flex items-center gap-0.5">
                     <button
                     type="button"
-                    className="cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 hover:bg-black/40 active:bg-black/60 active:scale-90 focus-visible:bg-black/40 outline-none"
+                    className={iconButtonClass()}
+                    onClick={() => handleFolderSettings()}
+                    title="Toggle file list"
+                    >
+                      {showFileList ? <IoFolderOpen /> : <IoFolder />}
+                    </button>
+                    <button
+                    type="button"
+                    className={iconButtonClass()}
                     onClick={() => handleOpenExternalFile()}
                     title="Open file from anywhere"
                     >
@@ -175,11 +165,7 @@ const ActiveRecordingState = (
                     </button>
                     <button
                     type="button"
-                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
-                      isBoard
-                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
-                        : "hover:bg-black/40 active:bg-black/60"
-                    }`}
+                    className={iconButtonClass(isBoard)}
                     onClick={() => handleOpenBoard()}
                     title="Board"
                     >
@@ -187,11 +173,7 @@ const ActiveRecordingState = (
                     </button>
                     <button
                     type="button"
-                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
-                      isDocs
-                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
-                        : "hover:bg-black/40 active:bg-black/60"
-                    }`}
+                    className={iconButtonClass(isDocs)}
                     onClick={() => handleOpenDocs()}
                     title="Docs"
                     >
@@ -199,23 +181,7 @@ const ActiveRecordingState = (
                     </button>
                     <button
                     type="button"
-                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
-                      isHome
-                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
-                        : "hover:bg-black/40 active:bg-black/60"
-                    }`}
-                    onClick={() => handleGoHome()}
-                    title="Home"
-                    >
-                      <IoHomeOutline />
-                    </button>
-                    <button
-                    type="button"
-                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
-                      isWhiteboard
-                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
-                        : "hover:bg-black/40 active:bg-black/60"
-                    }`}
+                    className={iconButtonClass(isWhiteboard)}
                     onClick={() => handleOpenWhiteboard()}
                     title="Whiteboard"
                     >
@@ -223,11 +189,7 @@ const ActiveRecordingState = (
                     </button>
                     <button
                     type="button"
-                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
-                      isMindmap
-                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
-                        : "hover:bg-black/40 active:bg-black/60"
-                    }`}
+                    className={iconButtonClass(isMindmap)}
                     onClick={() => handleOpenMindmap()}
                     title="Mindmap"
                     >
@@ -235,11 +197,7 @@ const ActiveRecordingState = (
                     </button>
                     <button
                     type="button"
-                    className={`cursor-pointer mr-1 p-2 rounded-md text-white text-xl transition-all duration-150 active:scale-90 focus-visible:bg-black/40 outline-none ${
-                      isVideoEditor
-                        ? "bg-blue-400/25 hover:bg-blue-400/35 active:bg-blue-400/45"
-                        : "hover:bg-black/40 active:bg-black/60"
-                    }`}
+                    className={iconButtonClass(isVideoEditor)}
                     onClick={() => handleOpenVideoEditor()}
                     title="Video editor"
                     >
@@ -247,11 +205,19 @@ const ActiveRecordingState = (
                     </button>
                     <button
                     type="button"
-                    className="cursor-pointer p-2 rounded-md text-white text-xl transition-all duration-150 hover:bg-black/40 active:bg-black/60 active:scale-90 focus-visible:bg-black/40 outline-none"
+                    className={iconButtonClass()}
                     onClick={() => handleOpenSettings()}
                     title="Settings"
                     >
                       <IoSettingsOutline />
+                    </button>
+                    <button
+                    type="button"
+                    className={iconButtonClass(isHome)}
+                    onClick={() => handleGoHome()}
+                    title="Home"
+                    >
+                      <IoHomeOutline />
                     </button>
                 </div>
                 <div className='flex items-center'>
@@ -266,30 +232,30 @@ const ActiveRecordingState = (
                         (Ctrl+Shift+B) for presenting/recording a screen that includes this
                         window - see appSettings.ts's showRecordingPanelButtons doc comment. */}
                     {showRecordingPanelButtons && (
-                    <div className="px-2 flex items-center gap-1">
+                    <div className="px-2 flex items-center gap-0.5">
                         <button
                             type="button"
                             title="Take a screenshot"
                             onClick={() => onScreenshotClick?.()}
                             disabled={isRecording}
-                            className={`p-2 rounded-md text-xl transition-all duration-150 active:scale-90 outline-none ${
+                            className={
                                 isRecording
-                                    ? "text-white/30 cursor-not-allowed"
-                                    : "cursor-pointer text-white/70 hover:text-white hover:bg-black/40"
-                            }`}
+                                    ? "p-1.5 rounded-md text-base outline-none text-neutral-300 dark:text-neutral-600 cursor-not-allowed"
+                                    : iconButtonClass()
+                            }
                         >
                             <IoCameraOutline />
                         </button>
-                        <div className="w-px self-stretch my-1 bg-white/20" />
+                        <div className="w-px h-4 mx-1 bg-neutral-300 dark:bg-white/20" />
                         {(() => {
                             const flags = SOURCE_FLAGS[recordType] ?? { screen: false, video: false, audio: false };
                             const sourceButtonClass = (active: boolean) =>
-                                `p-2 rounded-md text-xl transition-all duration-150 outline-none ${
+                                `p-1.5 rounded-md text-base transition-all duration-150 outline-none ${
                                     isRecording ? "cursor-default" : "cursor-pointer active:scale-90"
                                 } ${
                                     active
-                                        ? "text-green-400 bg-green-400/10 hover:bg-green-400/20"
-                                        : "text-white/70 hover:text-white hover:bg-black/40"
+                                        ? "text-green-600 dark:text-green-400 bg-green-500/10 hover:bg-green-500/20"
+                                        : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white hover:bg-neutral-200 dark:hover:bg-white/10"
                                 }`;
                             return (
                                 <>
@@ -320,43 +286,91 @@ const ActiveRecordingState = (
                                 </>
                             );
                         })()}
-                        {isRecording && (
-                            <div className={`ml-1 text-xs font-mono ${isPaused ? "text-amber-400" : "text-white"}`}>
-                                {formatTime(elapsedTime)}{isPaused ? " (paused)" : ""}
+                        {isRecording && canSwitchView && (
+                            // Which view is live as the main picture right now - a cut is logged
+                            // at this moment and applied by the editor and export.
+                            <div
+                                className="ml-2 flex p-0.5 gap-0.5 rounded-lg bg-neutral-200/70 dark:bg-white/10"
+                                title="Switch the main view (Alt+Shift+V)"
+                            >
+                                {(['screen', 'camera'] as const).map((m) => (
+                                    <button
+                                        key={m}
+                                        type="button"
+                                        onClick={() => onSwitchView?.(m)}
+                                        className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                                            viewMode === m
+                                                ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm"
+                                                : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-white"
+                                        }`}
+                                    >
+                                        {m === 'screen' ? <IoScanSharp /> : <IoVideocam />}
+                                        {m === 'screen' ? 'Screen' : 'Camera'}
+                                    </button>
+                                ))}
                             </div>
                         )}
-                        {isRecording && (
+                        {isRecording ? (
+                            // One capsule for the recording in progress: state + time, pause, and a
+                            // Stop that says what it does. It used to be a pulsing green "radio"
+                            // dot, which read as "on" rather than as the way to stop.
+                            <div
+                                className={`ml-2 flex items-center gap-1 h-8 pl-2.5 pr-1 rounded-full ring-1 transition-colors ${
+                                    isPaused
+                                        ? "bg-amber-500/10 ring-amber-500/30"
+                                        : "bg-red-500/10 ring-red-500/25"
+                                }`}
+                            >
+                                <span className="relative flex h-2 w-2 mr-1">
+                                    {!isPaused && <span className="absolute inset-0 rounded-full bg-red-500 opacity-60 animate-ping" />}
+                                    <span className={`relative h-2 w-2 rounded-full ${isPaused ? "bg-amber-500" : "bg-red-500"}`} />
+                                </span>
+                                <span
+                                    className={`text-xs font-mono font-semibold tabular-nums ${isPaused ? "text-amber-600 dark:text-amber-400" : "text-neutral-800 dark:text-white"}`}
+                                    title={isPaused ? "Paused" : "Recording"}
+                                >
+                                    {formatTime(elapsedTime)}
+                                </span>
+                                <button
+                                    type="button"
+                                    title={isPaused ? "Resume recording" : "Pause recording"}
+                                    onClick={isPaused ? handleResumeRecording : handlePauseRecording}
+                                    className="ml-1 h-6 w-6 flex items-center justify-center rounded-full text-neutral-700 dark:text-neutral-200 hover:bg-black/10 dark:hover:bg-white/15 active:scale-90 transition"
+                                >
+                                    {isPaused ? <IoPlay size={12} className="ml-px" /> : <IoPause size={12} />}
+                                </button>
+                                <button
+                                    type="button"
+                                    title="Stop recording"
+                                    onClick={handleStopRecording}
+                                    className="h-6 flex items-center gap-1 pl-2 pr-2.5 rounded-full bg-red-500 hover:bg-red-600 text-white text-[11px] font-semibold active:scale-95 transition shadow-sm"
+                                >
+                                    <IoSquare size={8} />
+                                    Stop
+                                </button>
+                            </div>
+                        ) : (
                             <button
                                 type="button"
-                                title={isPaused ? "Resume recording" : "Pause recording"}
-                                onClick={isPaused ? handleResumeRecording : handlePauseRecording}
-                                className="cursor-pointer ml-1 p-2 rounded-md text-xl text-white/70 hover:text-white hover:bg-black/40 active:scale-90 transition-all duration-150 outline-none"
+                                title="Start recording"
+                                onClick={onStartRecordingClick}
+                                className="cursor-pointer ml-1.5 h-7 w-7 flex items-center justify-center rounded-full ring-2 ring-red-500/80 hover:ring-red-500 hover:bg-red-500/10 active:scale-90 transition-all duration-150 outline-none focus-visible:ring-blue-400"
                             >
-                                {isPaused ? <IoPlayCircle /> : <IoPauseCircle />}
+                                <span className="h-3 w-3 rounded-full bg-red-500" />
                             </button>
                         )}
-                        <button
-                            type="button"
-                            title={isRecording ? "Stop recording" : "Start recording"}
-                            onClick={isRecording ? handleStopRecording : onStartRecordingClick}
-                            className={`cursor-pointer ml-1 p-2 rounded-full text-white active:scale-90 transition-all duration-150 outline-none ${
-                                !isRecording
-                                    ? "bg-red-500 hover:bg-red-400"
-                                    : isPaused
-                                    ? "bg-amber-500 hover:bg-amber-400"
-                                    : "bg-green-500 hover:bg-green-400 animate-pulse"
-                            }`}
-                        >
-                            <IoRadioButtonOn />
-                        </button>
                     </div>
                     )}
 
-                    <div className='flex justify-end pl-2'>
-                    { showDocker ?
-                    (<button onClick={closeDocker}><IoIosArrowDown className="text-white text-xl" /></button>):
-                    (<button onClick={openDocker}><IoIosArrowUp className="text-white text-xl" /></button>)
-                    }
+                    <div className='flex justify-end pl-1'>
+                    <button
+                        type="button"
+                        onClick={showDocker ? closeDocker : openDocker}
+                        title={showDocker ? "Hide panel" : "Show panel"}
+                        className={iconButtonClass()}
+                    >
+                        {showDocker ? <IoIosArrowDown /> : <IoIosArrowUp />}
+                    </button>
                     </div>
                 </div>
             </div>

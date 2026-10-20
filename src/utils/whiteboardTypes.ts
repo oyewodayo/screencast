@@ -207,6 +207,21 @@ export const LINE_ONLY_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<Whiteb
 // The built-in sample series a bar/line/pie/scatter chart starts with (and falls back to if
 // chartData is ever emptied out entirely) - just enough points to look like a real chart immediately
 // on placement rather than a blank box, picked with no particular meaning beyond "visually varied".
+// The colour a node's interior is actually painted with: fillColor with fillOpacity folded in as an
+// alpha channel (#rrggbbaa - accepted alike by SVG fill, CSS backgroundColor and canvas fillStyle,
+// so the live canvas and every export agree). null when there is no fill or it's fully transparent.
+export function resolveNodeFill(node: { fillColor: string | null; fillOpacity?: number }): string | null {
+  const color = node.fillColor;
+  if (!color) return null;
+  const opacity = Math.max(0, Math.min(1, node.fillOpacity ?? 1));
+  if (opacity >= 1) return color;
+  if (opacity <= 0) return null;
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color)?.[1];
+  if (!hex) return color; // a named/rgb() colour can't take a hex alpha suffix - keep it solid
+  const full = hex.length === 3 ? hex.replace(/./g, (c) => c + c) : hex;
+  return `#${full}${Math.round(opacity * 255).toString(16).padStart(2, "0")}`;
+}
+
 export const DEFAULT_CHART_DATA: number[] = [4, 7, 3, 9, 5];
 
 // "latticeGauge" node fields (WhiteboardNode.latticeSize/latticeSiteSpacing/latticeSiteRadius/
@@ -576,6 +591,10 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // Ignored for shapeType "text"/"freehand" (a label/ink stroke has no interior to fill) - null =
   // no fill, same "null = transparent" convention boardTypes.ts uses.
   fillColor: string | null;
+  // 0-1, the fill's own opacity - the outline and text stay solid, so a shape can be made see-through
+  // over an image or plot it's annotating without losing its border. Absent - resolves to 1. Always
+  // read through resolveNodeFill, never applied to fillColor by hand.
+  fillOpacity?: number;
   strokeColor: string;
   strokeWidth: number;
   // "rectangle" only - lets the same shapeType cover both a square-cornered box and a rounded one

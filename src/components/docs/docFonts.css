@@ -1,0 +1,293 @@
+/* components/docs/docFonts.css
+ *
+ * The Docs font library (utils/docFonts.ts): open-licensed faces bundled with the app so they look
+ * the same on every machine and work offline. Only @font-face rules live here - a face is fetched
+ * the first time text actually uses it, so the library costs nothing until it is picked.
+ *
+ * TeX faces (public/fonts/tex/, from CTAN, GUST Font License - see GUST-FONT-LICENSE.txt there):
+ * Latin Modern is the default LaTeX typeface; TeX Gyre Termes and Pagella are the TeX world's
+ * Times and Palatino. The rest come from Fontsource (SIL Open Font License 1.1), each in Latin,
+ * Latin Extended and Greek, regular/italic/bold/bold italic.
+ */
+/* stix-two-text */
+@import "@fontsource/stix-two-text/latin-400.css";
+@import "@fontsource/stix-two-text/latin-400-italic.css";
+@import "@fontsource/stix-two-text/latin-700.css";
+@import "@fontsource/stix-two-text/latin-700-italic.css";
+@import "@fontsource/stix-two-text/latin-ext-400.css";
+@import "@fontsource/stix-two-text/latin-ext-400-italic.css";
+@import "@fontsource/stix-two-text/latin-ext-700.css";
+@import "@fontsource/stix-two-text/latin-ext-700-italic.css";
+@import "@fontsource/stix-two-text/greek-400.css";
+@import "@fontsource/stix-two-text/greek-400-italic.css";
+@import "@fontsource/stix-two-text/greek-700.css";
+@import "@fontsource/stix-two-text/greek-700-italic.css";
+/* libertinus-serif */
+@import "@fontsource/libertinus-serif/latin-400.css";
+@import "@fontsource/libertinus-serif/latin-400-italic.css";
+@import "@fontsource/libertinus-serif/latin-700.css";
+@import "@fontsource/libertinus-serif/latin-700-italic.css";
+@import "@fontsource/libertinus-serif/latin-ext-400.css";
+@import "@fontsource/libertinus-serif/latin-ext-400-italic.css";
+@import "@fontsource/libertinus-serif/latin-ext-700.css";
+@import "@fontsource/libertinus-serif/latin-ext-700-italic.css";
+@import "@fontsource/libertinus-serif/greek-400.css";
+@import "@fontsource/libertinus-serif/greek-400-italic.css";
+@import "@fontsource/libertinus-serif/greek-700.css";
+@import "@fontsource/libertinus-serif/greek-700-italic.css";
+/* source-serif-4 */
+@import "@fontsource/source-serif-4/latin-400.css";
+@import "@fontsource/source-serif-4/latin-400-italic.css";
+@import "@fontsource/source-serif-4/latin-700.css";
+@import "@fontsource/source-serif-4/latin-700-italic.css";
+@import "@fontsource/source-serif-4/latin-ext-400.css";
+@import "@fontsource/source-serif-4/latin-ext-400-italic.css";
+@import "@fontsource/source-serif-4/latin-ext-700.css";
+@import "@fontsource/source-serif-4/latin-ext-700-italic.css";
+@import "@fontsource/source-serif-4/greek-400.css";
+@import "@fontsource/source-serif-4/greek-400-italic.css";
+@import "@fontsource/source-serif-4/greek-700.css";
+@import "@fontsource/source-serif-4/greek-700-italic.css";
+/* eb-garamond */
+@import "@fontsource/eb-garamond/latin-400.css";
+@import "@fontsource/eb-garamond/latin-400-italic.css";
+@import "@fontsource/eb-garamond/latin-700.css";
+@import "@fontsource/eb-garamond/latin-700-italic.css";
+@import "@fontsource/eb-garamond/latin-ext-400.css";
+@import "@fontsource/eb-garamond/latin-ext-400-italic.css";
+@import "@fontsource/eb-garamond/latin-ext-700.css";
+@import "@fontsource/eb-garamond/latin-ext-700-italic.css";
+@import "@fontsource/eb-garamond/greek-400.css";
+@import "@fontsource/eb-garamond/greek-400-italic.css";
+@import "@fontsource/eb-garamond/greek-700.css";
+@import "@fontsource/eb-garamond/greek-700-italic.css";
+/* crimson-pro */
+@import "@fontsource/crimson-pro/latin-400.css";
+@import "@fontsource/crimson-pro/latin-400-italic.css";
+@import "@fontsource/crimson-pro/latin-700.css";
+@import "@fontsource/crimson-pro/latin-700-italic.css";
+@import "@fontsource/crimson-pro/latin-ext-400.css";
+@import "@fontsource/crimson-pro/latin-ext-400-italic.css";
+@import "@fontsource/crimson-pro/latin-ext-700.css";
+@import "@fontsource/crimson-pro/latin-ext-700-italic.css";
+/* literata */
+@import "@fontsource/literata/latin-400.css";
+@import "@fontsource/literata/latin-400-italic.css";
+@import "@fontsource/literata/latin-700.css";
+@import "@fontsource/literata/latin-700-italic.css";
+@import "@fontsource/literata/latin-ext-400.css";
+@import "@fontsource/literata/latin-ext-400-italic.css";
+@import "@fontsource/literata/latin-ext-700.css";
+@import "@fontsource/literata/latin-ext-700-italic.css";
+@import "@fontsource/literata/greek-400.css";
+@import "@fontsource/literata/greek-400-italic.css";
+@import "@fontsource/literata/greek-700.css";
+@import "@fontsource/literata/greek-700-italic.css";
+/* charis-sil */
+@import "@fontsource/charis-sil/latin-400.css";
+@import "@fontsource/charis-sil/latin-400-italic.css";
+@import "@fontsource/charis-sil/latin-700.css";
+@import "@fontsource/charis-sil/latin-700-italic.css";
+@import "@fontsource/charis-sil/latin-ext-400.css";
+@import "@fontsource/charis-sil/latin-ext-400-italic.css";
+@import "@fontsource/charis-sil/latin-ext-700.css";
+@import "@fontsource/charis-sil/latin-ext-700-italic.css";
+/* ibm-plex-serif */
+@import "@fontsource/ibm-plex-serif/latin-400.css";
+@import "@fontsource/ibm-plex-serif/latin-400-italic.css";
+@import "@fontsource/ibm-plex-serif/latin-700.css";
+@import "@fontsource/ibm-plex-serif/latin-700-italic.css";
+@import "@fontsource/ibm-plex-serif/latin-ext-400.css";
+@import "@fontsource/ibm-plex-serif/latin-ext-400-italic.css";
+@import "@fontsource/ibm-plex-serif/latin-ext-700.css";
+@import "@fontsource/ibm-plex-serif/latin-ext-700-italic.css";
+/* ibm-plex-sans */
+@import "@fontsource/ibm-plex-sans/latin-400.css";
+@import "@fontsource/ibm-plex-sans/latin-400-italic.css";
+@import "@fontsource/ibm-plex-sans/latin-700.css";
+@import "@fontsource/ibm-plex-sans/latin-700-italic.css";
+@import "@fontsource/ibm-plex-sans/latin-ext-400.css";
+@import "@fontsource/ibm-plex-sans/latin-ext-400-italic.css";
+@import "@fontsource/ibm-plex-sans/latin-ext-700.css";
+@import "@fontsource/ibm-plex-sans/latin-ext-700-italic.css";
+@import "@fontsource/ibm-plex-sans/greek-400.css";
+@import "@fontsource/ibm-plex-sans/greek-400-italic.css";
+@import "@fontsource/ibm-plex-sans/greek-700.css";
+@import "@fontsource/ibm-plex-sans/greek-700-italic.css";
+/* source-sans-3 */
+@import "@fontsource/source-sans-3/latin-400.css";
+@import "@fontsource/source-sans-3/latin-400-italic.css";
+@import "@fontsource/source-sans-3/latin-700.css";
+@import "@fontsource/source-sans-3/latin-700-italic.css";
+@import "@fontsource/source-sans-3/latin-ext-400.css";
+@import "@fontsource/source-sans-3/latin-ext-400-italic.css";
+@import "@fontsource/source-sans-3/latin-ext-700.css";
+@import "@fontsource/source-sans-3/latin-ext-700-italic.css";
+@import "@fontsource/source-sans-3/greek-400.css";
+@import "@fontsource/source-sans-3/greek-400-italic.css";
+@import "@fontsource/source-sans-3/greek-700.css";
+@import "@fontsource/source-sans-3/greek-700-italic.css";
+/* fira-sans */
+@import "@fontsource/fira-sans/latin-400.css";
+@import "@fontsource/fira-sans/latin-400-italic.css";
+@import "@fontsource/fira-sans/latin-700.css";
+@import "@fontsource/fira-sans/latin-700-italic.css";
+@import "@fontsource/fira-sans/latin-ext-400.css";
+@import "@fontsource/fira-sans/latin-ext-400-italic.css";
+@import "@fontsource/fira-sans/latin-ext-700.css";
+@import "@fontsource/fira-sans/latin-ext-700-italic.css";
+@import "@fontsource/fira-sans/greek-400.css";
+@import "@fontsource/fira-sans/greek-400-italic.css";
+@import "@fontsource/fira-sans/greek-700.css";
+@import "@fontsource/fira-sans/greek-700-italic.css";
+/* atkinson-hyperlegible */
+@import "@fontsource/atkinson-hyperlegible/latin-400.css";
+@import "@fontsource/atkinson-hyperlegible/latin-400-italic.css";
+@import "@fontsource/atkinson-hyperlegible/latin-700.css";
+@import "@fontsource/atkinson-hyperlegible/latin-700-italic.css";
+@import "@fontsource/atkinson-hyperlegible/latin-ext-400.css";
+@import "@fontsource/atkinson-hyperlegible/latin-ext-400-italic.css";
+@import "@fontsource/atkinson-hyperlegible/latin-ext-700.css";
+@import "@fontsource/atkinson-hyperlegible/latin-ext-700-italic.css";
+/* jetbrains-mono */
+@import "@fontsource/jetbrains-mono/latin-400.css";
+@import "@fontsource/jetbrains-mono/latin-400-italic.css";
+@import "@fontsource/jetbrains-mono/latin-700.css";
+@import "@fontsource/jetbrains-mono/latin-700-italic.css";
+@import "@fontsource/jetbrains-mono/latin-ext-400.css";
+@import "@fontsource/jetbrains-mono/latin-ext-400-italic.css";
+@import "@fontsource/jetbrains-mono/latin-ext-700.css";
+@import "@fontsource/jetbrains-mono/latin-ext-700-italic.css";
+@import "@fontsource/jetbrains-mono/greek-400.css";
+@import "@fontsource/jetbrains-mono/greek-400-italic.css";
+@import "@fontsource/jetbrains-mono/greek-700.css";
+@import "@fontsource/jetbrains-mono/greek-700-italic.css";
+/* fira-code */
+@import "@fontsource/fira-code/latin-400.css";
+@import "@fontsource/fira-code/latin-700.css";
+@import "@fontsource/fira-code/latin-ext-400.css";
+@import "@fontsource/fira-code/latin-ext-700.css";
+@import "@fontsource/fira-code/greek-400.css";
+@import "@fontsource/fira-code/greek-700.css";
+/* ibm-plex-mono */
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-400-italic.css";
+@import "@fontsource/ibm-plex-mono/latin-700.css";
+@import "@fontsource/ibm-plex-mono/latin-700-italic.css";
+@import "@fontsource/ibm-plex-mono/latin-ext-400.css";
+@import "@fontsource/ibm-plex-mono/latin-ext-400-italic.css";
+@import "@fontsource/ibm-plex-mono/latin-ext-700.css";
+@import "@fontsource/ibm-plex-mono/latin-ext-700-italic.css";
+/* source-code-pro */
+@import "@fontsource/source-code-pro/latin-400.css";
+@import "@fontsource/source-code-pro/latin-400-italic.css";
+@import "@fontsource/source-code-pro/latin-700.css";
+@import "@fontsource/source-code-pro/latin-700-italic.css";
+@import "@fontsource/source-code-pro/latin-ext-400.css";
+@import "@fontsource/source-code-pro/latin-ext-400-italic.css";
+@import "@fontsource/source-code-pro/latin-ext-700.css";
+@import "@fontsource/source-code-pro/latin-ext-700-italic.css";
+@import "@fontsource/source-code-pro/greek-400.css";
+@import "@fontsource/source-code-pro/greek-400-italic.css";
+@import "@fontsource/source-code-pro/greek-700.css";
+@import "@fontsource/source-code-pro/greek-700-italic.css";
+
+/* TeX faces */
+@font-face {
+  font-family: "Latin Modern Roman";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/tex/lmroman10-regular.otf") format("opentype");
+}
+@font-face {
+  font-family: "Latin Modern Roman";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/tex/lmroman10-italic.otf") format("opentype");
+}
+@font-face {
+  font-family: "Latin Modern Roman";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/tex/lmroman10-bold.otf") format("opentype");
+}
+@font-face {
+  font-family: "Latin Modern Roman";
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/tex/lmroman10-bolditalic.otf") format("opentype");
+}
+@font-face {
+  font-family: "TeX Gyre Termes";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/tex/texgyretermes-regular.otf") format("opentype");
+}
+@font-face {
+  font-family: "TeX Gyre Termes";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/tex/texgyretermes-italic.otf") format("opentype");
+}
+@font-face {
+  font-family: "TeX Gyre Termes";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/tex/texgyretermes-bold.otf") format("opentype");
+}
+@font-face {
+  font-family: "TeX Gyre Termes";
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/tex/texgyretermes-bolditalic.otf") format("opentype");
+}
+@font-face {
+  font-family: "TeX Gyre Pagella";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/tex/texgyrepagella-regular.otf") format("opentype");
+}
+@font-face {
+  font-family: "TeX Gyre Pagella";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/tex/texgyrepagella-italic.otf") format("opentype");
+}
+@font-face {
+  font-family: "TeX Gyre Pagella";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/tex/texgyrepagella-bold.otf") format("opentype");
+}
+@font-face {
+  font-family: "TeX Gyre Pagella";
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/tex/texgyrepagella-bolditalic.otf") format("opentype");
+}
+@font-face {
+  font-family: "Latin Modern Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/tex/lmmono10-regular.otf") format("opentype");
+}
+@font-face {
+  font-family: "Latin Modern Mono";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/tex/lmmono10-italic.otf") format("opentype");
+}

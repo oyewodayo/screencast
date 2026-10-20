@@ -9,6 +9,11 @@ export const MAX_HOME_SCREEN_FILES = 6;
 
 const PINNED_KEY = "briefcast.pinnedFiles.v1";
 const RECENT_KEY = "briefcast.recentFiles.v1";
+// When each home-screen item was last opened, ms since the epoch - keyed by file path, or by
+// "doc:<id>" / "whiteboard:<id>" / "mindmap:<id>" for Briefcast's own creations. Lets something
+// opened but not edited still rank as recent (its file/updated time wouldn't move).
+const OPENED_AT_KEY = "briefcast.openedAt.v1";
+const MAX_OPENED_AT = 200;
 
 function loadPaths(key: string): string[] {
   try {
@@ -47,11 +52,40 @@ export function togglePin(path: string): string[] {
   return next;
 }
 
+export function getOpenedAt(): Record<string, number> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(OPENED_AT_KEY) ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((e): e is [string, number] => typeof e[1] === "number"));
+  } catch {
+    return {};
+  }
+}
+
+function saveOpenedAt(map: Record<string, number>): void {
+  // Newest MAX_OPENED_AT only - the home screen shows a handful, this just must not grow forever.
+  const kept = Object.entries(map)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, MAX_OPENED_AT);
+  try {
+    localStorage.setItem(OPENED_AT_KEY, JSON.stringify(Object.fromEntries(kept)));
+  } catch {
+    /* storage unavailable - recency falls back to modified times */
+  }
+}
+
+export function recordItemOpened(key: string, at = Date.now()): Record<string, number> {
+  const next = { ...getOpenedAt(), [key]: at };
+  saveOpenedAt(next);
+  return next;
+}
+
 // Most-recently-opened first, capped at MAX_HOME_SCREEN_FILES — the home screen's fallback
 // ordering whenever nothing is pinned.
 export function recordFileOpened(path: string): string[] {
   const next = [path, ...getRecentPaths().filter((p) => p !== path)].slice(0, MAX_HOME_SCREEN_FILES);
   savePaths(RECENT_KEY, next);
+  recordItemOpened(path);
   return next;
 }
 
@@ -63,6 +97,12 @@ export function repathFile(oldPath: string, newPath: string): { pinned: string[]
   const recent = rewrite(getRecentPaths());
   savePaths(PINNED_KEY, pinned);
   savePaths(RECENT_KEY, recent);
+  const opened = getOpenedAt();
+  if (oldPath in opened) {
+    opened[newPath] = opened[oldPath];
+    delete opened[oldPath];
+    saveOpenedAt(opened);
+  }
   return { pinned, recent };
 }
 
@@ -73,5 +113,10 @@ export function forgetFile(path: string): { pinned: string[]; recent: string[] }
   const recent = getRecentPaths().filter((p) => p !== path);
   savePaths(PINNED_KEY, pinned);
   savePaths(RECENT_KEY, recent);
+  const opened = getOpenedAt();
+  if (path in opened) {
+    delete opened[path];
+    saveOpenedAt(opened);
+  }
   return { pinned, recent };
 }

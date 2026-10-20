@@ -13,9 +13,10 @@
 // VideoEditorScreen for the two states that model that.
 import React, { useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { IoCutOutline, IoFilmOutline, IoFolderOpenOutline, IoPlay, IoSearchOutline, IoTimeOutline } from "react-icons/io5";
+import { IoCutOutline, IoFilmOutline, IoFolderOpenOutline, IoImagesOutline, IoPlay, IoSearchOutline, IoTimeOutline } from "react-icons/io5";
 import { formatFileSize, truncateFileName } from "../../utils/Formater";
 import { thumbnailLimiter } from "../../utils/concurrencyLimiter";
+import { isVideoProjectPath } from "../../utils/videoEditTypes";
 
 export interface VideoEditorFile {
   name: string;
@@ -38,6 +39,9 @@ interface VideoEditorHomeProps {
   // anywhere on disk - the reason this screen exists as a standalone tool rather than only being
   // reachable from a file that's already open in the library.
   onOpenExternalVideo: () => void;
+  // Opens NewVideoProjectDialog - a new video built from images, or a blank timeline. Projects
+  // (.briefvideo) then show up in `videos` like any other editable file.
+  onCreateVideo: () => void;
 }
 
 // Below this many videos the search box is more clutter than help - same threshold reasoning as
@@ -50,6 +54,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
   resolveThumbnailUrl,
   onOpenVideo,
   onOpenExternalVideo,
+  onCreateVideo,
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
   const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
@@ -132,7 +137,8 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
       </div>
       <div className="px-3 py-2">
         <p className="text-sm font-medium text-gray-800 dark:text-neutral-100 truncate">{truncateFileName(video.name, 30)}</p>
-        <p className="text-xs text-neutral-400 dark:text-neutral-500">{formatFileSize(video.size)}</p>
+        {/* A project file is a few hundred bytes of JSON - its size says nothing about the video. */}
+        <p className="text-xs text-neutral-400 dark:text-neutral-500">{isVideoProjectPath(video.path) ? "Project" : formatFileSize(video.size)}</p>
       </div>
     </button>
   );
@@ -147,7 +153,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
           <div>
             <h1 className="text-xl font-semibold text-gray-800 dark:text-neutral-100">Video editor</h1>
             <p className="text-sm text-neutral-500 dark:text-neutral-400">
-              Trim, cut, add overlays and export - pick any video to start.
+              Trim, cut, add overlays and export - pick any video to start, or make one from images.
             </p>
           </div>
         </div>
@@ -160,6 +166,14 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
           >
             <IoFolderOpenOutline size={18} />
             Open video from anywhere
+          </button>
+          <button
+            type="button"
+            onClick={onCreateVideo}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-md bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-800 text-sm font-medium text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 active:scale-[0.98] transition-all outline-none"
+          >
+            <IoImagesOutline size={18} />
+            Create video from images
           </button>
           {videos.length >= SEARCH_VISIBLE_THRESHOLD && (
             <div className="relative flex-1 min-w-[12rem] max-w-xs">

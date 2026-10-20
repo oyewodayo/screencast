@@ -5,12 +5,20 @@
 // unchanged; if one of these breaks, the app's actual editing behavior changed, not just plumbing.
 import { describe, expect, it } from "vitest";
 import {
+  insertFreezeFrame,
+  reverseClip,
+  unreverseClip,
+  isDetachedAudioOverlay,
+  packAudioRows,
   applyAutoZoomAtClicks,
   buildViewSwitchOverlays,
   bringOverlayToFront,
   clipIndexAt,
   deleteClipAt,
+  deleteClips,
+  duplicateClips,
   deleteOverlay,
+  deletePipOverlayAndCloseGap,
   duplicateOverlay,
   duplicateTimedOverlay,
   insertClip,
@@ -23,11 +31,15 @@ import {
   resizeOverlayTime,
   sendOverlayToBack,
   splitClipAt,
+  splitAudioOverlayAt,
+  setImageClipLengths,
+  mergeClipsInPlace,
+  splitPipOverlayAt,
   toKeepSegments,
   updateClip,
   updateOverlay,
 } from "./videoEditHandlers";
-import { AudioOverlay, Clip, TextOverlay } from "../utils/videoEditTypes";
+import { AudioOverlay, Clip, PipOverlay, TextOverlay } from "../utils/videoEditTypes";
 
 function makeClip(overrides: Partial<Clip> = {}): Clip {
   return { id: "clip-1", sourcePath: "video.mp4", start: 0, end: 10, ...overrides };
@@ -487,5 +499,229 @@ describe("duplicateTimedOverlay", () => {
     const copy = duplicateTimedOverlay(original, 10); // timeline only 10s long
     expect(copy.endTime - copy.startTime).toBeLessThanOrEqual(10);
     expect(copy.endTime).toBeLessThanOrEqual(10);
+  });
+});
+
+describe("packAudioRows", () => {
+  const audio = (id: string, startTime: number, endTime: number): AudioOverlay => ({
+    id, src: `${id}.wav`, startTime, endTime, trimStart: 0, sourceDuration: endTime - startTime, volume: 1, createdAt: 0, updatedAt: 0,
+  });
+
+  it("stacks a detached voice/music pair into two rows", () => {
+    const { rowOf, rowCount } = packAudioRows([audio("voice", 0, 99), audio("music", 0, 99)]);
+    expect(rowCount).toBe(2);
+    expect(new Set([rowOf.get("voice"), rowOf.get("music")])).toEqual(new Set([0, 1]));
+  });
+
+  it("reuses a row once the earlier overlay has ended", () => {
+    const { rowOf, rowCount } = packAudioRows([audio("a", 0, 5), audio("b", 5, 10), audio("c", 2, 8)]);
+    expect(rowCount).toBe(2);
+    expect(rowOf.get("a")).toBe(0);
+    expect(rowOf.get("c")).toBe(1);
+    expect(rowOf.get("b")).toBe(0);
+  });
+
+  it("returns zero rows for no overlays", () => {
+    expect(packAudioRows([]).rowCount).toBe(0);
+  });
+});
+
+function makePip(overrides: Partial<PipOverlay> = {}): PipOverlay {
+  return {
+    id: "pip",
+    sourcePath: "cam.mp4",
+    x: 0.6,
+    y: 0.6,
+    width: 0.3,
+    height: 0.3,
+    shape: "rounded",
+    trimStart: 2,
+    sourceDuration: 60,
+    startTime: 10,
+    endTime: 30,
+    volume: 1,
+    muted: true,
+    createdAt: 0,
+    updatedAt: 0,
+    ...overrides,
+  };
+}
+
+describe("splitPipOverlayAt", () => {
+  it("cuts one pip into two contiguous pieces that continue through the source", () => {
+    const [first, second] = splitPipOverlayAt([makePip({ crop: { x: 0.1, y: 0, width: 0.5, height: 1 } })], "pip", 15);
+    expect(first).toMatchObject({ id: "pip", startTime: 10, endTime: 15, trimStart: 2 });
+    expect(second).toMatchObject({ startTime: 15, endTime: 30, trimStart: 7, x: 0.6, shape: "rounded", crop: { x: 0.1, y: 0, width: 0.5, height: 1 } });
+    expect(second.id).not.toBe("pip");
+  });
+
+  it("refuses a cut too close to either edge, or for an unknown id", () => {
+    const overlays = [makePip()];
+    expect(splitPipOverlayAt(overlays, "pip", 10.05)).toBe(overlays);
+    expect(splitPipOverlayAt(overlays, "pip", 29.95)).toBe(overlays);
+    expect(splitPipOverlayAt(overlays, "missing", 15)).toBe(overlays);
+  });
+});
+
+describe("deletePipOverlayAndCloseGap", () => {
+  it("removes a cut-out middle piece and joins the rest of the chain back up", () => {
+    const [a, rest] = splitPipOverlayAt([makePip()], "pip", 15);
+    const [b, c] = splitPipOverlayAt([rest], rest.id, 20);
+    const result = deletePipOverlayAndCloseGap([a, b, c], b.id);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({ id: a.id, startTime: 10, endTime: 15, trimStart: 2 });
+    // Moved back by the deleted piece's 5s, but still plays the same source range as before.
+    expect(result[1]).toMatchObject({ id: c.id, startTime: 15, endTime: 25, trimStart: 12 });
+  });
+
+  it("moves the whole chain after the deleted piece, not just its immediate neighbour", () => {
+    const pieces = [
+      makePip({ id: "a", startTime: 0, endTime: 5 }),
+      makePip({ id: "b", startTime: 5, endTime: 8 }),
+      makePip({ id: "c", startTime: 8, endTime: 12 }),
+    ];
+    const result = deletePipOverlayAndCloseGap(pieces, "a");
+    expect(result.map((o) => [o.id, o.startTime, o.endTime])).toEqual([
+      ["b", 0, 3],
+      ["c", 3, 7],
+    ]);
+  });
+
+  it("leaves gapped pieces, other sources and a lone pip where they are", () => {
+    const pieces = [
+      makePip({ id: "a", startTime: 0, endTime: 5 }),
+      makePip({ id: "gapped", startTime: 6, endTime: 9 }),
+      makePip({ id: "other", sourcePath: "screen2.mp4", startTime: 5, endTime: 7 }),
+    ];
+    const result = deletePipOverlayAndCloseGap(pieces, "a");
+    expect(result.map((o) => [o.id, o.startTime])).toEqual([
+      ["gapped", 6],
+      ["other", 5],
+    ]);
+    expect(deletePipOverlayAndCloseGap([makePip()], "pip")).toEqual([]);
+  });
+});
+
+describe("isDetachedAudioOverlay", () => {
+  const base: AudioOverlay = { id: "a", src: "C:/music/song.mp3", startTime: 0, endTime: 5, trimStart: 0, sourceDuration: 5, volume: 1, createdAt: 0, updatedAt: 0 };
+
+  it("recognizes flagged detach overlays", () => {
+    expect(isDetachedAudioOverlay({ ...base, detached: true })).toBe(true);
+  });
+
+  it("recognizes legacy detach overlays by their cache folder", () => {
+    expect(isDetachedAudioOverlay({ ...base, src: String.raw`C:\Users\x\AppData\Local\com.withbriefs.briefcast\detached-audio\abc-music.wav` })).toBe(true);
+  });
+
+  it("leaves user-added music alone", () => {
+    expect(isDetachedAudioOverlay(base)).toBe(false);
+  });
+});
+
+describe("freeze frame and reverse", () => {
+  const base = (): Clip[] => [{ id: "a", sourcePath: "v.mp4", start: 2, end: 10, speed: 1.5, transitionIn: { type: "fade", duration: 1 } }];
+
+  it("splits the clip at the frame and puts the still between the halves", () => {
+    const clips = insertFreezeFrame(base(), "a", 5, "still.png", 2);
+    expect(clips.map((c) => [c.sourcePath, c.start, c.end])).toEqual([
+      ["v.mp4", 2, 5],
+      ["still.png", 0, 2],
+      ["v.mp4", 5, 10],
+    ]);
+    expect(clips[0].transitionIn).toBeDefined();
+    expect(clips[2].transitionIn).toBeUndefined();
+    expect(clips[2].speed).toBe(1.5);
+  });
+
+  it("puts the still before or after the clip at its very edges", () => {
+    expect(insertFreezeFrame(base(), "a", 2, "s.png", 2).map((c) => c.sourcePath)).toEqual(["s.png", "v.mp4"]);
+    expect(insertFreezeFrame(base(), "a", 10, "s.png", 2).map((c) => c.sourcePath)).toEqual(["v.mp4", "s.png"]);
+  });
+
+  it("reverses to the rendered file and back, keeping the clip's settings", () => {
+    const reversed = reverseClip(base(), "a", "rev.mp4");
+    expect(reversed[0]).toMatchObject({ sourcePath: "rev.mp4", start: 0, end: 8, speed: 1.5, reversedFrom: { sourcePath: "v.mp4", start: 2, end: 10 } });
+    const restored = unreverseClip(reversed, "a");
+    expect(restored[0]).toMatchObject({ sourcePath: "v.mp4", start: 2, end: 10, speed: 1.5 });
+    expect(restored[0].reversedFrom).toBeUndefined();
+  });
+
+  it("un-reverses just the part of the render a trimmed or split piece covers", () => {
+    const reversed = reverseClip(base(), "a", "rev.mp4");
+    // Render times 0..3 are the LAST three seconds of the original (7..10).
+    const piece = [{ ...reversed[0], start: 0, end: 3 }];
+    expect(unreverseClip(piece, "a")[0]).toMatchObject({ sourcePath: "v.mp4", start: 7, end: 10 });
+  });
+});
+
+describe("deleteClips / duplicateClips (multi-select)", () => {
+  const clips = [makeClip({ id: "a" }), makeClip({ id: "b" }), makeClip({ id: "c" })];
+
+  it("deletes every selected clip and keeps the rest in order", () => {
+    expect(deleteClips(clips, ["a", "c"]).map((c) => c.id)).toEqual(["b"]);
+  });
+
+  it("returns the same array when nothing selected is present", () => {
+    expect(deleteClips(clips, ["zzz"])).toBe(clips);
+    expect(duplicateClips(clips, [], () => "x")).toBe(clips);
+  });
+
+  it("puts each copy right after its own original", () => {
+    let n = 0;
+    const result = duplicateClips(clips, ["a", "c"], () => `copy${++n}`);
+    expect(result.map((c) => c.id)).toEqual(["a", "copy1", "b", "c", "copy2"]);
+    expect(result[1]).toMatchObject({ sourcePath: "video.mp4", start: 0, end: 10 });
+  });
+});
+
+describe("splitAudioOverlayAt", () => {
+  const song = makeAudioOverlay({ id: "song", sourceDuration: 180, startTime: 2, endTime: 62, trimStart: 10, fadeInSec: 1, fadeOutSec: 3 });
+
+  it("cuts into two back-to-back pieces that pick up where the other left off in the song", () => {
+    const [a, b] = splitAudioOverlayAt([song], song.id, 12);
+    expect(a).toMatchObject({ id: song.id, startTime: 2, endTime: 12, trimStart: 10, fadeInSec: 1, fadeOutSec: undefined });
+    expect(b).toMatchObject({ startTime: 12, endTime: 62, trimStart: 20, fadeInSec: undefined, fadeOutSec: 3 });
+    expect(b.id).not.toBe(song.id);
+  });
+
+  it("refuses a cut too close to either edge", () => {
+    const overlays = [song];
+    expect(splitAudioOverlayAt(overlays, song.id, 2.01)).toBe(overlays);
+    expect(splitAudioOverlayAt(overlays, song.id, 61.99)).toBe(overlays);
+  });
+});
+
+describe("setImageClipLengths", () => {
+  it("sets every image clip to the length (speed respected) and leaves videos alone", () => {
+    const clips = [
+      makeClip({ id: "img", sourcePath: "a.jpg", start: 0, end: 5 }),
+      makeClip({ id: "vid", sourcePath: "b.mp4", start: 1, end: 9 }),
+      makeClip({ id: "fast", sourcePath: "c.png", start: 0, end: 5, speed: 2 }),
+    ];
+    const result = setImageClipLengths(clips, 0.2);
+    expect(result[0].end).toBeCloseTo(0.2);
+    expect(result[1]).toBe(clips[1]);
+    expect(result[2].end).toBeCloseTo(0.4);
+  });
+});
+
+describe("mergeClipsInPlace", () => {
+  const a = makeClip({ id: "a", start: 0, end: 4 });
+  const b = makeClip({ id: "b", start: 4, end: 7 });
+  const c = makeClip({ id: "c", start: 7, end: 10 });
+
+  it("joins back-to-back split pieces into one clip spanning them, in the first one's place", () => {
+    const result = mergeClipsInPlace([a, b, c], ["c", "b"]);
+    expect(result?.map((x) => [x.id, x.start, x.end])).toEqual([["a", 0, 4], ["b", 4, 10]]);
+  });
+
+  it("refuses (null) when something was cut out between them", () => {
+    expect(mergeClipsInPlace([a, c], ["a", "c"])).toBeNull();
+  });
+
+  it("refuses when they aren't side by side on the timeline, differ in settings or source", () => {
+    expect(mergeClipsInPlace([a, c, b], ["a", "b"])).toBeNull();
+    expect(mergeClipsInPlace([a, { ...b, speed: 2 }], ["a", "b"])).toBeNull();
+    expect(mergeClipsInPlace([a, { ...b, sourcePath: "other.mp4" }], ["a", "b"])).toBeNull();
   });
 });
