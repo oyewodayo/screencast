@@ -460,17 +460,21 @@ pub fn camera_effect_preview() -> tauri::ipc::Response {
     tauri::ipc::Response::new(jpeg)
 }
 
-// The settings closed (or the effect was turned off): stops the feed - after a grace period, so the
-// recording that Start launches (countdown included) picks up the warm feed instead of loading the
-// model again. A recording claiming it, or the preview starting it again, cancels the stop.
+// The settings closed: stops the feed - after a grace period, so the recording that Start launches
+// (countdown included) picks up the warm feed instead of loading the model again. A recording
+// claiming it, or the preview starting it again, cancels the stop.
+//
+// `immediate`: the effect was switched off while the preview stays open - the plain camera preview
+// wants the camera back now. Waiting out the grace there left the preview on "In use elsewhere".
 const STOP_GRACE: Duration = Duration::from_secs(10);
 static STOP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[tauri::command(async)]
-pub fn camera_effect_stop() {
+pub fn camera_effect_stop(immediate: Option<bool>) {
     let generation = STOP_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let grace = if immediate.unwrap_or(false) { Duration::ZERO } else { STOP_GRACE };
     std::thread::spawn(move || {
-        std::thread::sleep(STOP_GRACE);
+        std::thread::sleep(grace);
         if STOP_GENERATION.load(Ordering::SeqCst) != generation {
             return;
         }

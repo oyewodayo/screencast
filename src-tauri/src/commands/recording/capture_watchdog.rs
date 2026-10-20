@@ -40,6 +40,7 @@ pub(crate) fn watch(app_handle: AppHandle, video_path: PathBuf) {
         // Set while the capture is down: when to try starting it again.
         let mut retry_at: Option<Instant> = None;
         let mut recovering = false;
+        let (mut minimized, mut window_closed) = (false, false);
         loop {
             let _ = tauri::async_runtime::spawn_blocking(|| std::thread::sleep(TICK)).await;
 
@@ -58,6 +59,35 @@ pub(crate) fn watch(app_handle: AppHandle, video_path: PathBuf) {
             if *paused {
                 last_progress = Instant::now();
                 continue;
+            }
+
+            // A window recorded on its own sends nothing while it's minimized (there's nothing to
+            // draw) - that's the window, not a stalled capture, so it's waited out like a pause;
+            // assembly holds its last picture over the gap. A window that's been closed can't be
+            // restarted into at all: the recording is told, once, and nothing is restarted.
+            if let Some(window) = command.window {
+                use crate::commands::window_capture::win;
+                if !win::is_window(window) {
+                    if !window_closed {
+                        window_closed = true;
+                        warn!("The recorded window was closed");
+                        let _ = app_handle.emit("recording-capture-status", "window-closed");
+                    }
+                    last_progress = Instant::now();
+                    continue;
+                }
+                let now_minimized = win::is_minimized(window);
+                if now_minimized != minimized {
+                    minimized = now_minimized;
+                    let _ = app_handle.emit(
+                        "recording-capture-status",
+                        if minimized { "window-minimized" } else { "window-restored" },
+                    );
+                }
+                if minimized {
+                    last_progress = Instant::now();
+                    continue;
+                }
             }
 
             let frames = parts

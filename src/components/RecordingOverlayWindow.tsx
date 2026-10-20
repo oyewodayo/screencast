@@ -1,5 +1,5 @@
 // RecordingOverlayWindow.tsx - This should be a separate component/page
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { IoContractOutline, IoExpandOutline, IoMic, IoPause, IoPlay, IoScanSharp, IoSquare, IoVideocam } from 'react-icons/io5'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { LogicalSize } from '@tauri-apps/api/dpi';
@@ -52,6 +52,12 @@ const ICON_BUTTON_CLASS =
     "h-8 w-8 shrink-0 flex items-center justify-center rounded-full transition active:scale-95";
 
 const RecordingOverlayWindow = () => {
+    // Only the pill should show: this window is transparent, but the app's global stylesheet gives
+    // the root element a light background (App.css :root), which painted a grey box around it.
+    useEffect(() => {
+        document.documentElement.style.background = "transparent";
+        document.body.style.background = "transparent";
+    }, []);
     const [elapsedTime, setElapsedTime] = useState<number>(0);
     const [isMinimized, setIsMinimized] = useState<boolean>(false);
     const [recordType, setRecordType] = useState<string>("sva");
@@ -73,7 +79,9 @@ const RecordingOverlayWindow = () => {
     const [droppedFrames, setDroppedFrames] = useState<number>(0);
     // The screen capture died and is being restarted ('lost'), or just was ('recovered') - see
     // capture_watchdog.rs. The audio carries on throughout.
-    const [captureStatus, setCaptureStatus] = useState<'lost' | 'recovered' | null>(null);
+    // 'window-minimized': the window being recorded on its own is minimized, so its picture is
+    // held until it's back ('window-restored' clears it).
+    const [captureStatus, setCaptureStatus] = useState<'lost' | 'recovered' | 'window-minimized' | null>(null);
     // Live screen<->camera view switching - only meaningful for "sva" recordings with
     // separate_webcam_capture on (see FormData's own doc comment, recording.rs), which is the one
     // combination that actually produces a second (camera) file to switch to. canSwitchView comes
@@ -119,6 +127,9 @@ const RecordingOverlayWindow = () => {
             await message(String(error), { title: 'Recording failed', kind: 'error' });
         }
     };
+
+    const stopRef = useRef<(() => Promise<void>) | null>(null);
+    stopRef.current = handleStopRecording;
 
     const handlePauseRecording = async () => {
         try {
@@ -200,9 +211,18 @@ const RecordingOverlayWindow = () => {
                 setDroppedFrames(event.payload.dropFrames ?? 0);
             });
 
-            const unlistenCapture = await listen<'lost' | 'recovered'>('recording-capture-status', (event) => {
-                setCaptureStatus(event.payload);
-            });
+            const unlistenCapture = await listen<'lost' | 'recovered' | 'window-minimized' | 'window-restored' | 'window-closed'>(
+                'recording-capture-status',
+                (event) => {
+                    // The recorded window is gone - nothing more of it can be recorded, so the
+                    // recording ends there rather than carrying on with a frozen picture.
+                    if (event.payload === 'window-closed') {
+                        void stopRef.current?.();
+                        return;
+                    }
+                    setCaptureStatus(event.payload === 'window-restored' ? null : event.payload);
+                }
+            );
 
             return () => {
                 unlistenRecordingState();
@@ -343,6 +363,10 @@ const RecordingOverlayWindow = () => {
                         ) : captureStatus === 'lost' ? (
                             <span className="text-amber-300/90" title="The screen capture stopped and is being restarted - your audio is still recording">
                                 reconnecting
+                            </span>
+                        ) : captureStatus === 'window-minimized' ? (
+                            <span className="text-amber-300/90" title="The window you're recording is minimized - its picture holds until you bring it back. Your audio is still recording.">
+                                window hidden
                             </span>
                         ) : captureStatus === 'recovered' ? (
                             <span className="text-emerald-300/90" title="The screen capture was restarted - nothing recorded was lost">

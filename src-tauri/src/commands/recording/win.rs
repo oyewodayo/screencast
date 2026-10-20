@@ -1,6 +1,7 @@
 // commands/recording/win.rs
 //
-// Windows recording backend: screen via ffmpeg's `gdigrab`, camera/microphone via `dshow`.
+// Windows recording backend: screen via Desktop Duplication / Windows.Graphics.Capture on the GPU
+// (gpu_capture.rs) or ffmpeg's `gdigrab`, camera/microphone via `dshow`.
 // Moved here verbatim from the old single-file recording.rs.
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -38,6 +39,7 @@ struct ScreenSource {
     target: CaptureTarget,
     framerate: i32,
     max_width: i32,
+    cursor: bool,
 }
 
 impl ScreenSource {
@@ -55,6 +57,21 @@ impl ScreenSource {
             form_data.file_ext.to_lowercase().as_str(),
             "mp4" | "mkv" | "avi" | "mov"
         );
+        let cursor = form_data.capture_cursor;
+        // A window is captured on its own when it can be (see gpu_capture::plan_window): only its
+        // pixels, wherever it is and whatever covers it. Minimized, it has nothing to capture -
+        // restored first, without taking focus from what the user is doing.
+        let window = match &target {
+            CaptureTarget::Window { hwnd, title, title_bar } => {
+                crate::commands::window_capture::win::resolve_window(*hwnd, title).map(|h| {
+                    if crate::commands::window_capture::win::restore_without_focus(h) {
+                        std::thread::sleep(std::time::Duration::from_millis(350));
+                    }
+                    gpu_capture::WindowSource { hwnd: h, title_bar: *title_bar }
+                })
+            }
+            _ => None,
+        };
         let region = capture_region_bounds(&target);
         let gpu = match region {
             Some(region) if gpu_container => {
@@ -62,10 +79,16 @@ impl ScreenSource {
                 let ffmpeg = ffmpeg_path.to_path_buf();
                 // Normally answered from the startup probe's cache, but the first recording of a
                 // session can land while that probe is still running - never on an async worker.
-                crate::services::responsiveness::blocking(move || gpu_capture::plan(&ffmpeg, region, exact))
-                    .await
-                    .ok()
-                    .flatten()
+                crate::services::responsiveness::blocking(move || {
+                    let own = window.and_then(|w| {
+                        let rect = crate::commands::window_capture::win::capture_rect(w.hwnd, w.title_bar)?;
+                        gpu_capture::plan_window(&ffmpeg, w, rect, cursor)
+                    });
+                    own.or_else(|| gpu_capture::plan(&ffmpeg, region, exact, cursor))
+                })
+                .await
+                .ok()
+                .flatten()
             }
             _ => None,
         };
@@ -85,8 +108,8 @@ impl ScreenSource {
             framerate = framerate.min(30);
         }
 
-        gpu_capture::USED_BY_LAST_START.store(gpu.is_some(), std::sync::atomic::Ordering::SeqCst);
-        let source = ScreenSource { gpu, target, framerate, max_width };
+        gpu_capture::note_start(gpu.as_ref());
+        let source = ScreenSource { gpu, target, framerate, max_width, cursor };
         log::info!("Screen capture: {}", source.summary());
         source
     }
@@ -108,6 +131,8 @@ impl ScreenSource {
                     "gdigrab".to_string(),
                     "-framerate".to_string(),
                     self.framerate.to_string(),
+                    "-draw_mouse".to_string(),
+                    (self.cursor as u8).to_string(),
                 ];
                 args.extend(gdigrab_input_args(&self.target)?);
                 Ok(args)
@@ -195,12 +220,18 @@ impl ScreenSource {
         }
     }
 
+    // The window this records on its own, if it does - the watchdog keeps an eye on it.
+    fn window(&self) -> Option<isize> {
+        self.gpu.as_ref().and_then(|g| g.window()).map(|w| w.hwnd)
+    }
+
     // For the log and the "Recording started" message, e.g. "3840x2160 at 60 fps, Intel Quick Sync".
     fn summary(&self) -> String {
         match &self.gpu {
             Some(g) => {
                 let (w, h) = g.scaled_size(self.max_width);
-                format!("{}x{} at {} fps, {}", w, h, self.framerate, g.encoder.label())
+                let what = if g.window().is_some() { ", this window only" } else { "" };
+                format!("{}x{} at {} fps, {}{}", w, h, self.framerate, g.encoder.label(), what)
             }
             None => format!("{} fps, compatibility capture", self.framerate),
         }
@@ -221,8 +252,10 @@ fn desktop_crop_args(x: i32, y: i32, width: i32, height: i32) -> Vec<String> {
     ]
 }
 
-// gdigrab does have its own dedicated window-capture mode (`-i title=<exact title>` instead of
-// `-i desktop`), which is the more obvious way to implement this — deliberately not used here.
+// This is the fallback for a window that can't be captured on its own (gpu_capture::plan_window:
+// an ffmpeg without gfxcapture, a window whose capture failed, a container the GPU path doesn't
+// write). gdigrab does have its own dedicated window-capture mode (`-i title=<exact title>` instead
+// of `-i desktop`), which is the more obvious way to implement this — deliberately not used here.
 // That mode grabs a window's contents the same way the classic GetDC(hwnd)+BitBlt technique
 // does, which is exactly what this app's own window-thumbnail feature (see
 // window_capture/win.rs's capture_window_enhanced) already had to move *away* from in favor of
@@ -245,9 +278,9 @@ fn gdigrab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
             width,
             height,
         } => Ok(desktop_crop_args(*x, *y, *width, *height)),
-        CaptureTarget::Window { title } => {
+        CaptureTarget::Window { hwnd, title, title_bar } => {
             let (x, y, width, height) =
-                crate::commands::window_capture::win::get_window_rect_by_title(title)?;
+                crate::commands::window_capture::win::get_window_rect(*hwnd, title, *title_bar)?;
             Ok(desktop_crop_args(x, y, width, height))
         }
     }
@@ -287,24 +320,24 @@ pub fn get_connected_devices(app_handle: &AppHandle) -> (Vec<String>, Vec<String
     // Debug print the full stderr to see its content
     log::debug!("FFmpeg Stderr: {}", stderr);
 
-    // Extract video and audio device names from stderr
-    let video_pattern = Regex::new(r#"\[dshow @ [0-9a-fA-Fx]+\] "(.*?)" \(video\)"#).unwrap();
-    let audio_pattern = Regex::new(r#"\[dshow @ [0-9a-fA-Fx]+\] "(.*?)" \(audio\)"#).unwrap();
-
-    let video_devices: Vec<String> = video_pattern
-        .captures_iter(&stderr)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-        .collect();
-
-    let audio_devices: Vec<String> = audio_pattern
-        .captures_iter(&stderr)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-        .collect();
-
+    let (video_devices, audio_devices) = parse_dshow_devices(&stderr);
     log::debug!("Parsed Video Devices: {:?}", video_devices);
     log::debug!("Parsed Audio Devices: {:?}", audio_devices);
 
     (video_devices, audio_devices)
+}
+
+// Camera and microphone names from `-list_devices true -f dshow` output. The line's context tag
+// isn't part of the match: ffmpeg 7 printed `[dshow @ 0x..]`, ffmpeg 8+ prints `[in#0 @ 0x..]` -
+// matching the old tag alone found no devices at all after the upgrade.
+pub(crate) fn parse_dshow_devices(stderr: &str) -> (Vec<String>, Vec<String>) {
+    let pattern = Regex::new(r#"(?m)^\[[^\]]+\] "(.*?)" \((video|audio)\)\s*$"#).unwrap();
+    let (mut video, mut audio) = (Vec::new(), Vec::new());
+    for cap in pattern.captures_iter(stderr) {
+        let name = cap[1].to_string();
+        if &cap[2] == "video" { video.push(name) } else { audio.push(name) }
+    }
+    (video, audio)
 }
 
 // Adds one video-only dshow input per selected camera (mic audio travels as its own separate
@@ -390,6 +423,8 @@ async fn start_recording_process(
     // Recordings assembled at stop: the capture framerate and capture latency, and ffmpeg's stderr
     // is read for frame timing (see recording/assembly.rs) instead of discarded.
     frame_timing: Option<(i32, i64)>,
+    // The window recorded on its own, if one is (ScreenSource::window).
+    capture_window: Option<isize>,
 ) -> Result<(), String> {
     log::debug!("FFmpeg args: {:?}", args);
 
@@ -421,6 +456,7 @@ async fn start_recording_process(
             progress_path: progress_sidecar.clone(),
             framerate: fps,
             latency_hns: latency,
+            window: capture_window,
         });
     }
     drop(assembly);
@@ -667,7 +703,7 @@ pub async fn recording_with_output_sva(
     // and the process gets force-killed - which for a container format that needs a proper
     // finalize on exit (WebM/Matroska in particular) produces exactly the kind of corrupt,
     // unparseable file ("EBML header parsing failed") this was silently causing.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS))).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS)), screen.window()).await?;
     if separate_webcam_capture && form_data.capture_path.is_some() {
         start_camera_sidecar(&state, &ffmpeg_path, form_data, output_path).await?;
     }
@@ -718,7 +754,7 @@ pub async fn recording_with_output_sa(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS))).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS)), screen.window()).await?;
 
     Ok(format!(
         "Recording started ({}). File will be saved to {}",
@@ -769,7 +805,7 @@ pub async fn recording_with_output_v(
     // stdout carries the live preview stream for this mode (see preview_output_args), so it is
     // captured and drained rather than inherited - left inherited it would write raw JPEG bytes
     // to whatever console the app was launched from.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true, Some((30, CAMERA_LATENCY_HNS))).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true, Some((30, CAMERA_LATENCY_HNS)), None).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {:?}",
@@ -808,7 +844,7 @@ pub async fn recording_with_output_a(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, None).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, None, None).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -1019,7 +1055,7 @@ pub async fn recording_with_output_va(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true, Some((30, CAMERA_LATENCY_HNS))).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, true, Some((30, CAMERA_LATENCY_HNS)), None).await?;
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -1061,7 +1097,7 @@ pub async fn recording_with_output_s(
     // stdout is captured rather than discarded here: for the camera-only modes it carries the
     // live preview stream (see preview_output_args). The reader thread below must start before
     // anything waits on this process, because a pipe nobody drains eventually blocks ffmpeg.
-    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS))).await?;
+    start_recording_process(app_handle, &state, &ffmpeg_path, &args, progress_sidecar, false, Some((screen.framerate, SCREEN_LATENCY_HNS)), screen.window()).await?;
 
     Ok(format!(
         "Recording started ({}). File will be saved to {}",
@@ -1080,10 +1116,38 @@ pub async fn take_screenshot(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let output_path = output_path.clone();
-    let input_args = gdigrab_input_args(&resolve_capture_target(app_handle, form_data))?;
+    let target = resolve_capture_target(app_handle, form_data);
+    let cursor = form_data.capture_cursor;
+
+    // A window on its own when it can be: exactly its pixels, whether or not it's in front -
+    // Briefcast's own window included, with nothing to hide or bring forward first.
+    let window = match &target {
+        CaptureTarget::Window { hwnd, title, title_bar } => {
+            crate::commands::window_capture::win::resolve_window(*hwnd, title)
+                .map(|h| gpu_capture::WindowSource { hwnd: h, title_bar: *title_bar })
+        }
+        _ => None,
+    };
+    if let Some(window) = window.filter(|_| gpu_capture::window_capture_available(&ffmpeg_path)) {
+        let ffmpeg = ffmpeg_path.clone();
+        let out = output_path.clone();
+        let own = tauri::async_runtime::spawn_blocking(move || window_still(&ffmpeg, window, cursor, &out))
+            .await
+            .map_err(|e| format!("Screenshot task panicked: {}", e))?;
+        match own {
+            Ok(()) => return Ok(format!("Screenshot saved to {}", output_path.display())),
+            Err(e) => log::warn!("Window screenshot failed ({}), capturing the screen area it covers instead", e),
+        }
+    }
+    let input_args = gdigrab_input_args(&target)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let mut args: Vec<String> = vec!["-f".to_string(), "gdigrab".to_string()];
+        let mut args: Vec<String> = vec![
+            "-f".to_string(),
+            "gdigrab".to_string(),
+            "-draw_mouse".to_string(),
+            (cursor as u8).to_string(),
+        ];
         args.extend(input_args);
         args.extend(vec![
             "-frames:v".to_string(),
@@ -1118,6 +1182,44 @@ pub async fn take_screenshot(
     })
     .await
     .map_err(|e| format!("Screenshot task panicked: {}", e))?
+}
+
+// One frame of a window on its own (gfxcapture). A minimized window is restored without focus
+// for the grab and minimized again after, so taking it changes nothing on screen.
+fn window_still(
+    ffmpeg_path: &std::path::Path,
+    window: gpu_capture::WindowSource,
+    cursor: bool,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
+    use crate::commands::window_capture::win;
+    let restored = win::restore_without_focus(window.hwnd);
+    if restored {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-filter_complex"])
+        .arg(gpu_capture::window_still_filter(window, cursor))
+        .args(["-frames:v", "1", "-update", "1", "-y"])
+        .arg(output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    super::hide_console_window(&mut cmd);
+    let result = crate::services::responsiveness::output_with_timeout(cmd, std::time::Duration::from_secs(15));
+    if restored {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                win::hwnd(window.hwnd),
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE,
+            );
+        }
+    }
+    let output = result.map_err(|e| e.to_string())?;
+    if !output.status.success() || !output_path.exists() {
+        return Err(extract_ffmpeg_error(&String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(())
 }
 
 // Runs `f` once per thread currently owned by `pid` - the enumeration primitive shared by
@@ -1196,4 +1298,42 @@ pub(crate) fn resume_process(pid: u32) -> Result<(), String> {
             let _ = CloseHandle(handle);
         }
     })
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::parse_dshow_devices;
+
+    // Not a unit test: lists this machine's real cameras and microphones with $FFMPEG_DIR's ffmpeg.
+    #[test]
+    #[ignore]
+    fn finds_this_machines_devices() {
+        let Ok(dir) = std::env::var("FFMPEG_DIR") else { return };
+        let out = std::process::Command::new(std::path::Path::new(&dir).join("ffmpeg.exe"))
+            .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+            .output()
+            .unwrap();
+        let (video, audio) = parse_dshow_devices(&String::from_utf8_lossy(&out.stderr));
+        println!("cameras {video:?}, microphones {audio:?}");
+        assert!(!video.is_empty() || !audio.is_empty());
+    }
+
+    #[test]
+    fn devices_are_found_in_every_ffmpeg_versions_listing() {
+        // ffmpeg 7 (2024 build) and ffmpeg 9.0, verbatim apart from the device ids.
+        for tag in ["[dshow @ 0000028feb230240]", "[in#0 @ 00000207e3530640]"] {
+            let listing = [
+                format!("{tag} \"Integrated Webcam\" (video)"),
+                format!("{tag}   Alternative name \"@device_pnp_x\""),
+                format!("{tag} \"Microphone (Realtek Audio)\" (audio)"),
+                format!("{tag}   Alternative name \"@device_cm_y\""),
+                "Error opening input file dummy.".to_string(),
+            ]
+            .join("
+");
+            let (video, audio) = parse_dshow_devices(&listing);
+            assert_eq!(video, vec!["Integrated Webcam".to_string()], "{tag}");
+            assert_eq!(audio, vec!["Microphone (Realtek Audio)".to_string()], "{tag}");
+        }
+    }
 }

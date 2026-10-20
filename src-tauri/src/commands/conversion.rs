@@ -7768,7 +7768,9 @@ pub async fn export_trimmed_video(
             let script = std::env::temp_dir().join(format!("briefcast_graph_{}.txt", std::process::id()));
             std::fs::write(&script, &filter).map_err(|e| format!("Failed to write the export's filter graph: {}", e))?;
             temp_overlay_paths.push(script.clone());
-            ("-filter_complex_script", script.to_string_lossy().to_string())
+            // `-/option file` reads the option's value from a file (ffmpeg 7+); the old
+            // -filter_complex_script spelling was removed in ffmpeg 8.
+            ("-/filter_complex", script.to_string_lossy().to_string())
         } else {
             ("-filter_complex", filter)
         };

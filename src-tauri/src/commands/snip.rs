@@ -4,8 +4,12 @@
 // frozen into memory in one GDI grab, and a full-screen overlay (src/components/SnipOverlay.tsx)
 // shows that still image so the user can drag a region, click a window, or click a screen. The
 // chosen area is cropped from the frozen pixels - so what's saved is exactly what was on screen
-// at the moment of the freeze, with no Briefcast window in it and no focus juggling - saved to
-// the screenshots folder and copied to the clipboard.
+// at the moment of the freeze, with no focus juggling - saved to the screenshots folder and
+// copied to the clipboard.
+//
+// Briefcast itself can be in the screenshot too: when it was on screen, the desktop is also
+// grabbed once *before* it hides, and the overlay's "Briefcast" switch shows (and crops from)
+// that grab instead, with Briefcast's own windows clickable like any other.
 //
 // Windows-only for now; elsewhere these commands report "unsupported" and the frontend falls back
 // to the older capture path (take_screenshot).
@@ -45,6 +49,9 @@ pub struct SnipInfo {
     pub monitors: Vec<SnipRect>,
     // Index into `monitors` of the primary display - where the overlay puts its toolbar.
     pub primary: usize,
+    // Briefcast's own windows as they were before it hid, top to bottom - empty when there's no
+    // grab with Briefcast in it (it wasn't on screen, or this is a delayed retake).
+    pub app_windows: Vec<SnipWindow>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -53,6 +60,9 @@ pub struct SnipSelection {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    // Crop from the grab with Briefcast in it (SnipInfo.app_windows).
+    #[serde(default)]
+    pub include_app: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -81,10 +91,12 @@ mod platform {
     };
 
     // The frozen desktop, top-down RGBA, plus where its origin sits in virtual-desktop coordinates.
+    // `with_app` is the same desktop with Briefcast's main window drawn over it as it was showing.
     pub struct Frozen {
         pub rgba: Vec<u8>,
         pub info: SnipInfo,
         pub origin: (i32, i32),
+        pub with_app: Option<Vec<u8>>,
     }
 
     pub static FROZEN: Mutex<Option<Frozen>> = Mutex::new(None);
@@ -152,8 +164,9 @@ mod platform {
                 windows: list_windows(x, y, width, height),
                 monitors,
                 primary,
+                app_windows: Vec::new(),
             };
-            Ok(Frozen { rgba: pixels, info, origin: (x, y) })
+            Ok(Frozen { rgba: pixels, info, origin: (x, y), with_app: None })
         }
     }
 
@@ -302,6 +315,19 @@ pub async fn snip_begin(app_handle: AppHandle, delay_ms: Option<u64>) -> Result<
             if let Some(w) = app_handle.get_webview_window(SNIP_OVERLAY_LABEL) {
                 let _ = w.hide();
             }
+            // Briefcast as the user sees it right now, for a screenshot that includes it: its main
+            // window drawn by itself (exact pixels - a grab of the screen can catch the compositor
+            // mid-transition and come out translucent). Only when it's actually on screen - a
+            // delayed retake starts with it already hidden.
+            let main = main_window(&app_handle);
+            let showing = main
+                .as_ref()
+                .is_some_and(|w| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false));
+            let rendered = main
+                .filter(|_| showing)
+                .and_then(|w| w.hwnd().ok())
+                .and_then(|h| crate::commands::window_capture::win::render_window(h.0 as isize));
+            log::debug!("Snip: Briefcast showing={} rendered={:?}", showing, rendered.as_ref().map(|(x, y, i)| (x, y, i.dimensions())));
             if let Some(w) = main_window(&app_handle) {
                 let _ = w.hide();
             }
@@ -309,7 +335,15 @@ pub async fn snip_begin(app_handle: AppHandle, delay_ms: Option<u64>) -> Result<
             std::thread::sleep(std::time::Duration::from_millis(250 + delay_ms.unwrap_or(0)));
 
             let frozen = match platform::capture_desktop() {
-                Ok(f) => f,
+                Ok(mut f) => {
+                    if let Some((left, top, window)) = rendered {
+                        if let Some((rgba, rect)) = paste_window(&f, left, top, &window) {
+                            f.info.app_windows = vec![SnipWindow { title: "Briefcast".into(), rect }];
+                            f.with_app = Some(rgba);
+                        }
+                    }
+                    f
+                }
                 Err(e) => {
                     if let Some(w) = main_window(&app_handle) {
                         let _ = w.show();
@@ -366,15 +400,25 @@ pub fn snip_info() -> Option<SnipInfo> {
 
 // The frozen image as raw RGBA, for the overlay to put straight into a canvas - no encoding on
 // either side, which is what makes the overlay appear instantly even on a 4K desktop.
+// `include_app`: the grab with Briefcast in it, when there is one.
 #[tauri::command(async)]
-pub fn snip_frame() -> tauri::ipc::Response {
+pub fn snip_frame(include_app: Option<bool>) -> tauri::ipc::Response {
     #[cfg(windows)]
     {
-        let bytes = platform::FROZEN.lock().unwrap().as_ref().map(|f| f.rgba.clone()).unwrap_or_default();
+        let bytes = platform::FROZEN
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|f| match (&f.with_app, include_app.unwrap_or(false)) {
+                (Some(app), true) => app.clone(),
+                _ => f.rgba.clone(),
+            })
+            .unwrap_or_default();
         tauri::ipc::Response::new(bytes)
     }
     #[cfg(not(windows))]
     {
+        let _ = include_app;
         tauri::ipc::Response::new(Vec::new())
     }
 }
@@ -395,6 +439,29 @@ fn screenshot_path(file_name: &str, ext: &str) -> Result<std::path::PathBuf, Str
         n += 1;
     }
     Ok(path)
+}
+
+// The frozen desktop with `window` (its frame's top-left at `left`,`top` on the virtual desktop)
+// drawn over it, and where it landed - None if it's entirely off the desktop.
+#[cfg(windows)]
+fn paste_window(f: &platform::Frozen, left: i32, top: i32, window: &image::RgbaImage) -> Option<(Vec<u8>, SnipRect)> {
+    let (fw, fh) = (f.info.width, f.info.height);
+    let (x0, y0) = (left - f.origin.0, top - f.origin.1);
+    let (ww, wh) = (window.width() as i32, window.height() as i32);
+    let (cx0, cy0) = (x0.max(0), y0.max(0));
+    let (cx1, cy1) = ((x0 + ww).min(fw), (y0 + wh).min(fh));
+    if cx1 - cx0 < 1 || cy1 - cy0 < 1 {
+        return None;
+    }
+    let mut rgba = f.rgba.clone();
+    let src = window.as_raw();
+    let n = ((cx1 - cx0) * 4) as usize;
+    for y in cy0..cy1 {
+        let d = ((y * fw + cx0) * 4) as usize;
+        let s = (((y - y0) * ww + (cx0 - x0)) * 4) as usize;
+        rgba[d..d + n].copy_from_slice(&src[s..s + n]);
+    }
+    Some((rgba, SnipRect { x: cx0, y: cy0, width: cx1 - cx0, height: cy1 - cy0 }))
 }
 
 fn close_overlay_and_return(app: &AppHandle) {
@@ -434,11 +501,15 @@ pub async fn snip_finish(
             let w = selection.width.clamp(1, fw - x) as u32;
             let h = selection.height.clamp(1, fh - y) as u32;
 
+            let source = match (&frozen.with_app, selection.include_app) {
+                (Some(app), true) => app,
+                _ => &frozen.rgba,
+            };
             let row = fw as usize * 4;
             let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
             for line in y as usize..(y as usize + h as usize) {
                 let start = line * row + x as usize * 4;
-                rgba.extend_from_slice(&frozen.rgba[start..start + w as usize * 4]);
+                rgba.extend_from_slice(&source[start..start + w as usize * 4]);
             }
             drop(frozen);
 

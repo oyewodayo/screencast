@@ -30,7 +30,7 @@ mod assembly;
 #[cfg(target_os = "windows")]
 mod capture_watchdog;
 #[cfg(target_os = "windows")]
-mod gpu_capture;
+pub(crate) mod gpu_capture;
 #[cfg(target_os = "windows")]
 mod win;
 // pub(crate): window_capture::macos (a sibling module, not a descendant of this one) needs
@@ -187,6 +187,13 @@ pub struct FormData {
     // doesn't set it (screen_size isn't "window:...") doesn't need to send an empty string.
     #[serde(default)]
     window_title: String,
+    // A window capture includes its title bar and frame - off: just the window's content, the
+    // way recordings of one app usually look best.
+    #[serde(default)]
+    window_title_bar: bool,
+    // Draw the mouse pointer into screen captures. On for a caller that doesn't send it.
+    #[serde(default = "capture_cursor_by_default")]
+    capture_cursor: bool,
     // Whether to also capture system/"what you hear" audio (WASAPI loopback, Windows-only) -
     // only meaningful for the screen-capture modes (sva/sa/s); ignored otherwise. See
     // start_recording's handling of this field and services/audio_capture.rs.
@@ -243,6 +250,10 @@ fn default_border_color() -> String {
     "#ffffff".to_string()
 }
 
+fn capture_cursor_by_default() -> bool {
+    true
+}
+
 fn enhance_by_default() -> bool {
     true
 }
@@ -292,7 +303,13 @@ pub(crate) enum CaptureTarget {
         height: i32,
     },
     Window {
+        // The picked window's handle ("window:<hwnd>") - what Windows captures by. None when it
+        // didn't parse; the title is then the only way to find it (and the only way on Linux and
+        // macOS, which match by title).
+        hwnd: Option<isize>,
         title: String,
+        // Capture the title bar and frame too, not just the content (FormData.window_title_bar).
+        title_bar: bool,
     },
 }
 
@@ -322,10 +339,15 @@ pub(crate) fn resolve_capture_target(
         return CaptureTarget::FullScreen;
     }
 
-    if form_data.screen_size.starts_with("window:") && !form_data.window_title.is_empty() {
-        return CaptureTarget::Window {
-            title: form_data.window_title.clone(),
-        };
+    if let Some(raw) = form_data.screen_size.strip_prefix("window:") {
+        let hwnd = raw.trim().parse::<isize>().ok().filter(|&h| h != 0);
+        if hwnd.is_some() || !form_data.window_title.is_empty() {
+            return CaptureTarget::Window {
+                hwnd,
+                title: form_data.window_title.clone(),
+                title_bar: form_data.window_title_bar,
+            };
+        }
     }
 
     CaptureTarget::FullScreen
@@ -361,8 +383,8 @@ pub(crate) fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32,
             width,
             height,
         } => Some((*x, *y, *width, *height)),
-        CaptureTarget::Window { title } => {
-            crate::commands::window_capture::win::get_window_rect_by_title(title).ok()
+        CaptureTarget::Window { hwnd, title, title_bar } => {
+            crate::commands::window_capture::win::get_window_rect(*hwnd, title, *title_bar).ok()
         }
     }
 }
@@ -1913,7 +1935,7 @@ pub async fn start_recording(
     let (output, early_exit_status) = loop {
         attempts += 1;
         #[cfg(target_os = "windows")]
-        gpu_capture::USED_BY_LAST_START.store(false, std::sync::atomic::Ordering::SeqCst);
+        gpu_capture::note_start(None);
         // A previous attempt's progress file would read as this one having started already.
         let _ = fs::remove_file(&progress_path);
 
@@ -1928,15 +1950,23 @@ pub async fn start_recording(
         let exited = wait_for_capture_start(&ffmpeg_process, &progress_path).await;
 
         #[cfg(target_os = "windows")]
-        if exited.is_some()
-            && attempts == 1
-            && gpu_capture::USED_BY_LAST_START.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            gpu_capture::disable_for_session(&format!(
-                "ffmpeg exited at start with {}",
-                exited.unwrap()
-            ));
-            continue;
+        // A window that can't be captured on its own is retried as the screen area it covers,
+        // and a GPU capture that can't start at all as gdigrab - so up to two retries.
+        if let Some(status) = exited {
+            // What ffmpeg said - a microphone or camera that won't open is no reason to capture the
+            // screen differently (that used to turn GPU capture off for the whole session).
+            let _ = tauri::async_runtime::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(150))).await;
+            let said = assembly_state
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|a| a.current_timing().map(|t| t.lock().unwrap_or_else(|p| p.into_inner()).diagnostics()))
+                .unwrap_or_default();
+            if attempts <= 2
+                && gpu_capture::fallback_after_failed_start(&format!("ffmpeg exited at start with {}", status), &said)
+            {
+                continue;
+            }
         }
         break (output, exited);
     };
@@ -2282,6 +2312,10 @@ async fn dispatch_recording(
     output_path: &PathBuf,
     form_data: &FormData,
 ) -> Result<String, String> {
+    // Said plainly up front, instead of ffmpeg rejecting `-i audio=` with a bare exit code.
+    if matches!(form_data.record_type.as_str(), "sva" | "sa" | "va" | "a") && form_data.audio_device.trim().is_empty() {
+        return Err("No microphone is selected. Pick one under Options > Microphone, or record without sound (Screen only).".to_string());
+    }
     match form_data.record_type.as_str() {
         "sva" => platform::recording_with_output_sva(app_handle, state, output_path, form_data).await,
         "sa" => platform::recording_with_output_sa(app_handle, state, output_path, form_data).await,

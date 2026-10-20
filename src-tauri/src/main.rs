@@ -429,6 +429,8 @@ fn main() {
             commands::window_capture::capture_window_screenshots_by_title_command,
             commands::window_capture::cleanup_screenshot_files,
             commands::window_capture::activate_and_open_window,
+            commands::window_capture::get_capture_capabilities,
+            commands::window_capture::get_monitor_previews,
             commands::conversion::convert_to_mp4,
             commands::conversion::get_playable_preview,
             commands::conversion::get_image_clip_proxy,

@@ -71,6 +71,7 @@
         "skipTaskbar": true,
         "decorations": false,
         "transparent": true,
+        "shadow": false,
         "visible": false,
         "focus": false
       },

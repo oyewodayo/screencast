@@ -20,7 +20,7 @@ import MoveCopyMenu, { FileTransferOptions, FileTransferRequest } from "../compo
 import type { PopoverAnchor } from "../hooks/useClampedPopoverPosition";
 import BottomDocker from "../components/BottomDocker";
 import { listen, emit } from '@tauri-apps/api/event';
-import { WindowInfo } from "../Types";
+import { CaptureCapabilities, WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { PhysicalPosition, PhysicalSize, availableMonitors } from '@tauri-apps/api/window';
 import { fadeTotalMs } from '../utils/annotationStyles';
@@ -416,6 +416,14 @@ const Dashboard = () => {
   // as resolutionWidth above.
   const [framerate, setFramerate] = useState<number | null>(() => loadSettings().defaultFramerate);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
+  // Whether a picked window is captured on its own (covered or not) - asked once; until it
+  // answers, the cautious answer (it isn't) keeps the bring-it-forward steps in place.
+  const captureCapsRef = useRef<CaptureCapabilities>({ window_isolated: false });
+  useEffect(() => {
+    invoke<CaptureCapabilities>('get_capture_capabilities')
+      .then((caps) => { captureCapsRef.current = caps; })
+      .catch((err) => console.error('Failed to read capture capabilities:', err));
+  }, []);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
   const [files, setFiles] = useState<FileMap>({});
@@ -1581,14 +1589,20 @@ const setScreen = () => {
     setSelectScreen(false);
   };
 
-  // Window-targeted *recording* still auto-raises its target: Windows' SetForegroundWindow
-  // restriction (see openScreenshotOverlay below for the full explanation) applies here too and
-  // can just as easily no-op, but a multi-second recording has room to be manually corrected
-  // (switch to the window yourself once it starts) in a way a single-shot screenshot doesn't —
-  // so recording keeps this best-effort auto-focus rather than also gaining an overlay step.
-  const activateTargetWindowIfNeeded = async (): Promise<void> => {
-    if (!screenSize.startsWith('window:')) return;
-    await invoke('activate_and_open_window', { title: selectedScreen });
+  // A window captured on its own needs nothing done to it - it's recorded wherever it is, so
+  // focus stays where the user has it. Only when a window is recorded as the screen area it covers
+  // is it raised first (best effort: Windows' SetForegroundWindow restriction - see
+  // openScreenshotOverlay below - can no-op, and the user can bring it forward themselves).
+  const windowHwnd = (formData: any): number | null => {
+    const raw = typeof formData.screen_size === 'string' && formData.screen_size.startsWith('window:')
+      ? Number(formData.screen_size.slice('window:'.length))
+      : NaN;
+    return Number.isFinite(raw) && raw !== 0 ? raw : null;
+  };
+  const activateTargetWindowIfNeeded = async (formData: any): Promise<void> => {
+    const hwnd = windowHwnd(formData);
+    if (hwnd === null || captureCapsRef.current.window_isolated) return;
+    await invoke('activate_and_open_window', { title: formData.window_title ?? '', hwnd });
     await new Promise(resolve => setTimeout(resolve, 500));
   };
 
@@ -1603,10 +1617,15 @@ const setScreen = () => {
   // same synchronous tick (e.g. clicking a window thumbnail), in which case reading the state
   // directly here would still see the *previous* selection.
   const handleTakeScreenshot = async (formData: any) => {
-    if (formData.screen_size !== 'fullscreen') {
+    // A window captured on its own is taken straight away, wherever it is - Briefcast's own
+    // window included. The short wait lets the options dialog that was just closed leave the
+    // screen first, so a screenshot of Briefcast shows Briefcast, not the dialog.
+    const isolatedWindow = windowHwnd(formData) !== null && captureCapsRef.current.window_isolated;
+    if (formData.screen_size !== 'fullscreen' && !isolatedWindow) {
       await openScreenshotOverlay(formData);
       return;
     }
+    if (isolatedWindow) await new Promise(resolve => setTimeout(resolve, 250));
     try {
       const playShutterSound = () => {
         return new Promise<void>((resolve) => {
@@ -1673,6 +1692,8 @@ const setScreen = () => {
       enhance_audio: recordingPrefs.autoEnhanceAudio,
       overlay_border: recordingPrefs.cameraBorder,
       overlay_border_color: recordingPrefs.cameraBorderColor,
+      capture_cursor: recordingPrefs.captureCursor,
+      window_title_bar: recordingPrefs.windowTitleBar,
       // Live background behind the person in a bubble recorded into the screen (camera_effects.rs) -
       // a separately recorded webcam gets it in the editor instead, at full quality.
       camera_effect: formData.record_type === "sva" && !formData.separate_webcam_capture ? cameraEffectSpec(recordingPrefs.cameraBackground) : null,
@@ -1702,7 +1723,7 @@ const setScreen = () => {
       if (!go) return;
     }
     try {
-        await activateTargetWindowIfNeeded();
+        await activateTargetWindowIfNeeded(formData);
 
         // Play audio notification
         const playAudioNotification = () => {

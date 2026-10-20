@@ -426,6 +426,18 @@ pub fn now_hns() -> i64 {
 mod tests {
     use super::*;
 
+    // Not a unit test: records $MIC_TEST_OUT from the named microphone for 8 seconds through the
+    // same WASAPI path a screen recording uses.
+    #[test]
+    #[ignore]
+    fn records_the_microphone() {
+        let (Ok(out), Ok(name)) = (std::env::var("MIC_TEST_OUT"), std::env::var("MIC_TEST_NAME")) else { return };
+        let capture = start(AudioSource::Microphone(name), PathBuf::from(out)).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        let timeline = capture.stop().unwrap();
+        println!("{} frames, effective rate {}", timeline.frames, timeline.effective_rate);
+    }
+
     // Not a unit test: what this machine's default playback device reports.
     #[test]
     #[ignore]
