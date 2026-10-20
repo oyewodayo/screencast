@@ -9,7 +9,7 @@ import { appCacheDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt, MdViewQuilt, MdFlashOn } from "react-icons/md";
+import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt, MdViewQuilt, MdFlashOn, MdTune, MdVideoLibrary } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -84,10 +84,18 @@ import ChaptersPanel from "./ChaptersPanel";
 import { enqueue as enqueueExport } from "../../utils/exportQueue";
 import { copyItems, emptyClipboardItems } from "../../utils/timelineClipboard";
 import { outputChapters } from "../../utils/videoChapters";
-import { IoBookmarkOutline, IoColorFilterOutline } from "react-icons/io5";
+import { IoBookmarkOutline, IoColorFilterOutline, IoPersonCircleOutline } from "react-icons/io5";
 import { buildCaptionLines } from "../../utils/captions";
 import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import ToolSearch from "./ToolSearch";
+import MixerPanel, { type MixerChannel } from "./MixerPanel";
+import { audioChannelKey, audioChannelName, fileStem, isNeutralFx } from "../../utils/audioFx";
+
+// A video-track layer covering the whole frame - B-roll rather than a picture-in-picture.
+const isFullFrameLayer = (o: PipOverlay) => o.x <= 0.001 && o.y <= 0.001 && o.width >= 0.999 && o.height >= 0.999;
+import { resumeMixer, syncElementFx } from "../../utils/mixerGraph";
+import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
+import { isTrackHidden, pipTrack, tracksInUse, videoTrackLabel } from "../../utils/videoTracks";
 import { subscribeVideoFrames } from "../../utils/videoFrameCache";
 import { getPlayableUrl, isPictureless } from "../../utils/playableVideo";
 import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
@@ -556,6 +564,8 @@ interface VideoTimelineDockerProps {
   onSelectPipOverlay?: (id: string | null) => void;
   isPlacingPip?: boolean;
   onToggleArmPlacePip?: () => void;
+  // "Fix webcam background" - marks a webcam bubble baked into the recording (WebcamBubbleMarker).
+  onMarkWebcamBubble?: () => void;
 
   // Whether the on-canvas crop tool (ClipCropOverlay, mounted as a sibling next to VideoPlayer by
   // Dashboard) is armed - unlike text/image/blur, there's nothing to "place", it just shows/hides
@@ -616,6 +626,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onSelectPipOverlay,
   isPlacingPip = false,
   onToggleArmPlacePip,
+  onMarkWebcamBubble,
   isCroppingClip = false,
   onToggleCroppingClip,
 }) => {
@@ -995,6 +1006,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [introAnchor, setIntroAnchor] = useState<{ left: number; top: number } | null>(null);
   // The music & sound-effects library (MusicLibraryPanel).
   const [musicAnchor, setMusicAnchor] = useState<{ left: number; top: number } | null>(null);
+  // The mixer (MixerPanel), and the strip it opens with its effects showing.
+  const [mixerAnchor, setMixerAnchor] = useState<{ left: number; top: number } | null>(null);
+  const [mixerFocus, setMixerFocus] = useState<string | null>(null);
+  const mixerButtonRef = useRef<HTMLButtonElement>(null);
+  const mixerSession = useMixerSession();
+  const openMixer = (focus: string | null) => {
+    const rect = mixerButtonRef.current?.getBoundingClientRect();
+    setMixerFocus(focus);
+    setMixerAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: 80, top: 80 });
+  };
+  // "Mixer & effects" asked for from elsewhere (a picture-in-picture's panel) - mixerState.ts.
+  const lastMixerRequest = useRef(mixerSession.request);
+  useEffect(() => {
+    if (mixerSession.request === lastMixerRequest.current) return;
+    lastMixerRequest.current = mixerSession.request;
+    if (mixerSession.request) openMixer(mixerSession.request.key);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mixerSession.request]);
   const captionsButtonRef = useRef<HTMLButtonElement>(null);
   // Edit by transcript (TranscriptEditorPanel) - whole-timeline like Captions, sharing its transcripts.
   const [transcriptAnchor, setTranscriptAnchor] = useState<{ left: number; top: number } | null>(null);
@@ -1017,6 +1046,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     captions: captionsAnchor !== null,
     transcript: transcriptAnchor !== null,
     music: musicAnchor !== null,
+    mixer: mixerAnchor !== null,
   };
   const prevDockedPanelsOpen = useRef(dockedPanelsOpen);
   useEffect(() => {
@@ -1032,8 +1062,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (opened !== "captions") setCaptionsAnchor(null);
     if (opened !== "transcript") setTranscriptAnchor(null);
     if (opened !== "music") setMusicAnchor(null);
+    if (opened !== "mixer") setMixerAnchor(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions, dockedPanelsOpen.transcript]);
+  }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions, dockedPanelsOpen.transcript, dockedPanelsOpen.music, dockedPanelsOpen.mixer]);
   const [viewSwitchState, setViewSwitchState] = useState<ViewSwitchDetectState>({ status: "loading" });
   const viewSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const viewSwitchDataRef = useRef<{ events: ViewSwitchEvent[]; webcamPath: string; clipOutputStart: number } | null>(null);
@@ -1486,6 +1517,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     duration: number;
     isDragging: boolean;
     liveStartTime: number;
+    // The video track it started on, and the one under the pointer now (dragging up or down moves
+    // it between tracks; the drop zone above the top one makes a new track).
+    startTrack: number;
+    liveTrack: number;
   }>(null);
 
   const renderPipOverlays: PipOverlay[] = editStore.pipOverlays.map((o) => {
@@ -1493,10 +1528,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       return pipOverlayResizeDrag.edge === "start" ? { ...o, startTime: pipOverlayResizeDrag.liveValue } : { ...o, endTime: pipOverlayResizeDrag.liveValue };
     }
     if (pipOverlayDrag && o.id === pipOverlayDrag.id) {
-      return { ...o, startTime: pipOverlayDrag.liveStartTime, endTime: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration };
+      return { ...o, startTime: pipOverlayDrag.liveStartTime, endTime: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration, track: pipOverlayDrag.liveTrack };
     }
     return o;
   });
+  // One lane per video track in use, top track first (it draws over the ones below it).
+  const videoTrackLanes = tracksInUse(renderPipOverlays).reverse();
+
+  // B-roll: pick videos; they go full frame over the main video from the playhead, back to back,
+  // on the lowest free video track.
+  const handleAddBroll = async () => {
+    const selected = await openFileDialog({ multiple: true, filters: [{ name: "Video", extensions: [...MEDIA_VIDEO_EXTENSIONS] }] });
+    const paths = selected === null ? [] : Array.isArray(selected) ? selected : [selected];
+    if (paths.length === 0) return;
+    const at = currentOutputTime < totalOutputDuration - 1 ? currentOutputTime : 0;
+    const ids = await editStore.addVideoLayers(paths, at);
+    if (ids[0]) onSelectPipOverlay?.(ids[0]);
+  };
 
   const beginPipOverlayResizeDrag = (overlay: PipOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
     e.stopPropagation();
@@ -1539,6 +1587,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       duration: overlay.endTime - overlay.startTime,
       isDragging: false,
       liveStartTime: overlay.startTime,
+      startTrack: pipTrack(overlay),
+      liveTrack: pipTrack(overlay),
     });
   };
   const handlePipOverlayDragMove = (e: React.PointerEvent) => {
@@ -1548,14 +1598,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const deltaSec = (e.clientX - pipOverlayDrag.startClientX) / pxPerSec;
     const raw = snapToTargets(pipOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
     const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - pipOverlayDrag.duration));
-    setPipOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+    // The video-track lane under the pointer - or, above the top one, a new track over every other
+    // layer. (Lanes are in the DOM top track first.)
+    const lanes = Array.from(rootRef.current?.querySelectorAll<HTMLElement>("[data-video-track]") ?? []);
+    let overTrack: number | null = null;
+    for (const lane of lanes) {
+      const r = lane.getBoundingClientRect();
+      if (e.clientY >= r.top && e.clientY < r.bottom) overTrack = Number(lane.dataset.videoTrack);
+    }
+    if (overTrack === null && lanes.length > 0 && e.clientY < lanes[0].getBoundingClientRect().top) {
+      overTrack = Math.max(0, ...editStore.pipOverlays.filter((o) => o.id !== pipOverlayDrag.id).map(pipTrack)) + 1;
+    }
+    setPipOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved || (overTrack !== null && overTrack !== prev.liveTrack), liveStartTime, liveTrack: overTrack ?? prev.liveTrack } : prev));
   };
   const endPipOverlayDrag = () => {
     if (!pipOverlayDrag) return;
-    const { id, isDragging, liveStartTime, duration } = pipOverlayDrag;
+    const { id, isDragging, liveStartTime, duration, startTrack, liveTrack } = pipOverlayDrag;
     setPipOverlayDrag(null);
     if (isDragging) {
-      editStore.movePipOverlayTime(id, liveStartTime);
+      editStore.movePipOverlayTime(id, liveStartTime, liveTrack !== startTrack ? liveTrack : undefined);
     }
     onSelectPipOverlay?.(id);
     setSelectedClipId(null);
@@ -2945,12 +3006,57 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       if (fadeIn > 0) envelope = Math.min(envelope, (now - o.startTime) / fadeIn);
       if (fadeOut > 0) envelope = Math.min(envelope, (o.endTime - now) / fadeOut);
       const duck = isDucked(o) ? duckGainAt(speechRangesRef.current, now, o.duckLevel ?? DEFAULT_DUCK_LEVEL) : 1;
-      audio.volume = o.muted ? 0 : o.volume * Math.max(0, Math.min(1, envelope)) * duck;
+      const session = getMixerSession();
+      const soloOff = silencedBySolo(session, audioChannelKey(o));
+      audio.volume = o.muted || soloOff ? 0 : o.volume * Math.max(0, Math.min(1, envelope)) * duck;
+      // Its mixer effects - the element is routed through them once it has any, or the mixer's
+      // meters want it (mixerGraph.ts).
+      syncElementFx(audio, `audio:${o.id}`, o.fx, !isNeutralFx(o.fx) || session.open);
+      if (isPlaying) resumeMixer();
     });
   };
   useEffect(() => {
     syncAudioOverlaysRef.current();
-  }, [currentOutputTime, isPlaying, editStore.audioOverlays]);
+  }, [currentOutputTime, isPlaying, editStore.audioOverlays, mixerSession]);
+  // The mixer's strips: the video's own sound, each audio track (its pieces together) and each
+  // picture-in-picture whose sound plays.
+  const mixerChannels = useMemo<MixerChannel[]>(() => {
+    const channels: MixerChannel[] = [
+      { key: VIDEO_CHANNEL, name: "Video sound", kind: "video", volume: editStore.videoAudioVolume, muted: editStore.videoAudioMuted, fx: editStore.videoAudioFx, meterIds: ["video"] },
+    ];
+    const groups = new Map<string, AudioOverlay[]>();
+    for (const o of editStore.audioOverlays) {
+      const key = audioChannelKey(o);
+      groups.set(key, [...(groups.get(key) ?? []), o]);
+    }
+    for (const [key, pieces] of groups) {
+      const first = pieces[0];
+      channels.push({
+        key,
+        name: audioChannelName(first),
+        kind: "audio",
+        volume: first.volume,
+        muted: pieces.every((p) => p.muted),
+        fx: first.fx,
+        meterIds: pieces.map((p) => `audio:${p.id}`),
+        detail: pieces.length > 1 ? `${pieces.length} pieces` : undefined,
+      });
+    }
+    for (const p of editStore.pipOverlays) {
+      if (p.muted !== false) continue;
+      channels.push({
+        key: pipChannelKey(p.id),
+        name: fileStem(p.sourcePath),
+        kind: "pip",
+        volume: Number.isFinite(p.volume) ? p.volume : 1,
+        muted: false,
+        fx: p.fx,
+        meterIds: [`pip:${p.id}`],
+      });
+    }
+    return channels;
+  }, [editStore.videoAudioVolume, editStore.videoAudioMuted, editStore.videoAudioFx, editStore.audioOverlays, editStore.pipOverlays]);
+
   useEffect(() => {
     if (!isPlaying || editStore.audioOverlays.length === 0) return;
     // Faster while something is ducked, so its volume ramps glide rather than step.
@@ -3079,6 +3185,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             if (el) audioElementsRef.current.set(o.id, el);
           }}
           src={convertFileSrc(o.src)}
+          // Lets Web Audio read its samples (the mixer's effects and meters) - asset:// answers CORS.
+          crossOrigin="anonymous"
           preload="auto"
           onError={(e) => {
             const el = e.currentTarget;
@@ -3419,6 +3527,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <MdPictureInPictureAlt size={15} className={isPlacingPip ? "text-fuchsia-400" : undefined} />
           </ActionButton>
+          <ActionButton title="Add B-roll - videos over the main one, full frame, on a video track above it" onClick={() => void handleAddBroll()}>
+            <MdVideoLibrary size={15} />
+          </ActionButton>
+          {onMarkWebcamBubble && (
+            <ActionButton title="Fix webcam background - blur or replace what's behind you in a webcam bubble recorded into the video" onClick={onMarkWebcamBubble}>
+              <IoPersonCircleOutline size={16} />
+            </ActionButton>
+          )}
           <button
             type="button"
             data-music-library-button
@@ -3436,6 +3552,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             }`}
           >
             <IoMusicalNotesOutline size={15} className={isPlacingAudio ? "text-teal-400" : undefined} />
+          </button>
+          <button
+            ref={mixerButtonRef}
+            type="button"
+            data-mixer-button
+            title="Mixer - levels, EQ and compression for every sound"
+            onClick={() => (mixerAnchor ? setMixerAnchor(null) : openMixer(null))}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${mixerAnchor ? "bg-neutral-700 text-teal-300" : "text-neutral-300 hover:bg-neutral-700"}`}
+          >
+            <MdTune size={15} />
           </button>
           </div>
         </div>
@@ -4205,8 +4331,30 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 own time range - clicking or dragging a chip brings the playhead back into view
                 (endPipOverlayDrag), since PipOverlayLayer only renders a PiP's actual video bubble
                 while the playhead is inside that range. */}
-            <div className={`h-8 relative border-t border-neutral-800 ${renderPipOverlays.length === 0 ? "hidden" : ""}`}>
-              {renderPipOverlays.map((overlay) => {
+            {videoTrackLanes.map((track) => {
+              const hidden = isTrackHidden(editStore.hiddenVideoTracks, track);
+              const laneLayers = renderPipOverlays.filter((o) => pipTrack(o) === track);
+              return (
+            <div key={`vtrack-${track}`} data-video-track={track} className={`h-8 relative border-t border-neutral-800 ${pipOverlayDrag?.isDragging && pipOverlayDrag.liveTrack === track ? "bg-fuchsia-500/5" : ""}`}>
+              {/* The track's name and eye - stays in view as the timeline scrolls. */}
+              <div className="sticky left-0 z-20 inline-flex items-center gap-0.5 h-full pl-1 pr-1.5 bg-gradient-to-r from-neutral-950 via-neutral-950/90 to-transparent pointer-events-none">
+                <span className="text-[9px] font-semibold text-fuchsia-300/80" title={`Video track ${videoTrackLabel(track)} - higher tracks draw over lower ones`}>
+                  {videoTrackLabel(track)}
+                  {pipOverlayDrag?.isDragging && pipOverlayDrag.liveTrack === track && laneLayers.length === 1 && !editStore.pipOverlays.some((o) => o.id !== pipOverlayDrag.id && pipTrack(o) === track) && (
+                    <span className="ml-1 font-normal text-fuchsia-200/80">new track - over everything below</span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  title={hidden ? `Show ${videoTrackLabel(track)} (in the preview and the saved video)` : `Hide ${videoTrackLabel(track)} (in the preview and the saved video)`}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={() => editStore.setVideoTrackHidden(track, !hidden)}
+                  className="pointer-events-auto p-0.5 rounded text-neutral-400 hover:text-white"
+                >
+                  {hidden ? <IoEyeOffOutline size={11} /> : <IoEyeOutline size={11} />}
+                </button>
+              </div>
+              {laneLayers.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
                 const isSelected = selectedPipOverlayId === overlay.id;
@@ -4218,7 +4366,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     onPointerUp={endPipOverlayDrag}
                     onPointerCancel={endPipOverlayDrag}
                     title={toolMode === "razor" ? "Picture-in-picture - click to split it here" : "Picture-in-picture - click to select (then Split/Delete act on it), drag to move"}
-                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center justify-between gap-1 px-2 text-[11px] text-white ${
+                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-neutral-800 flex items-center justify-between gap-1 px-2 text-[11px] text-white ${hidden ? "opacity-40" : ""} ${
                       toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"
                     } ${
                       isSelected ? "border-dashed border-white" : "border-fuchsia-400"
@@ -4226,8 +4374,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     style={{ left, width }}
                   >
                     <span className="flex items-center gap-1 min-w-0 truncate">
-                      <MdPictureInPictureAlt size={12} className="shrink-0" />
-                      PiP
+                      {isFullFrameLayer(overlay) ? <MdVideoLibrary size={12} className="shrink-0" /> : <MdPictureInPictureAlt size={12} className="shrink-0" />}
+                      {isFullFrameLayer(overlay) ? fileStem(overlay.sourcePath) : "PiP"}
                     </span>
                     <button
                       type="button"
@@ -4245,7 +4393,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   </div>
                 );
               })}
-              {renderPipOverlays.map((overlay) => {
+              {laneLayers.map((overlay) => {
                 const left = overlay.startTime * pxPerSec;
                 const width = (overlay.endTime - overlay.startTime) * pxPerSec;
                 return (
@@ -4272,6 +4420,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 );
               })}
             </div>
+              );
+            })}
 
             {/* Audio-overlay lane - same time-based chip pattern as the text/image lanes above,
                 teal instead of purple/amber, with a real waveform instead of an icon+filename and
@@ -4466,6 +4616,30 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             />
           );
         })()}
+
+      {mixerAnchor && (
+        <MixerPanel
+          anchor={mixerAnchor}
+          channels={mixerChannels}
+          focusKey={mixerFocus}
+          onVolume={(key, volume) => {
+            if (key === VIDEO_CHANNEL) editStore.setVideoAudioVolume(volume);
+            else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { volume });
+            else editStore.updateAudioChannel(key, { volume });
+          }}
+          onMute={(key, muted) => {
+            if (key === VIDEO_CHANNEL) editStore.setVideoAudioMuted(muted);
+            else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { muted });
+            else editStore.updateAudioChannel(key, { muted });
+          }}
+          onFx={(key, fx) => {
+            if (key === VIDEO_CHANNEL) editStore.setVideoAudioFx(fx);
+            else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { fx: isNeutralFx(fx) ? undefined : fx });
+            else editStore.updateAudioChannel(key, { fx });
+          }}
+          onClose={() => setMixerAnchor(null)}
+        />
+      )}
 
       {musicAnchor && (
         <MusicLibraryPanel
@@ -4662,6 +4836,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               }
               hasImageClips={editStore.clips.some((c) => isImageClipPath(c.sourcePath))}
               onCutImagesOnBeat={editStore.cutImagesOnBeat}
+              onOpenMixer={() => openMixer(audioChannelKey(overlay))}
               onDelete={() => {
                 editStore.deleteAudioOverlay(overlay.id);
                 setSelectedAudioOverlayId(null);

@@ -1,4 +1,10 @@
 // Dashboard.tsx
+import { cameraEffectSpec } from "../utils/cameraEffect";
+import WebcamBubbleMarker from "../components/video/WebcamBubbleMarker";
+import type { BubbleRegion } from "../utils/webcamBubble";
+import { removeBackground } from "../utils/backgroundRemoval";
+import { BLUR_DEFAULT, cutoutBackgroundFromPref } from "../utils/cutoutBackground";
+import { VIDEO_CHANNEL, silencedBySolo, useMixerSession } from "../utils/mixerState";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { ToolPanelHostContext } from "../components/docker/ToolPanelHost";
 import CaptionOverlayLayer from "../components/video/CaptionOverlayLayer";
@@ -601,6 +607,8 @@ const Dashboard = () => {
   const editStore = useVideoEditStore(
     selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : undefined
   );
+  // The mixer's session state (open for its meters, solo) - mixerState.ts.
+  const mixerSession = useMixerSession();
   // The assembled/output timeline's own total length - a clip's own contribution is
   // (end-start)/speed, not just (end-start), once it has a speed edit (Clip.speed's own doc
   // comment, videoEditTypes.ts): a sped-up clip plays back in LESS output time than its source
@@ -678,6 +686,60 @@ const Dashboard = () => {
   const [isPlacingBlur, setIsPlacingBlur] = useState<boolean>(false);
   const [selectedPipOverlayId, setSelectedPipOverlayId] = useState<string | null>(null);
   const [isPlacingPip, setIsPlacingPip] = useState<boolean>(false);
+  // "Fix webcam background": the bubble outline is up (WebcamBubbleMarker), and the pip panel to
+  // open once it's lifted off the recording.
+  const [isMarkingBubble, setIsMarkingBubble] = useState(false);
+  const [pipPanelRequest, setPipPanelRequest] = useState<{ id: string } | null>(null);
+  // A separately recorded webcam put on the timeline (its own layer, *_webcam.mp4) gets the live
+  // background the user records with - automatically, in the editor's full quality: its background is
+  // removed and the same blur/colour/picture goes behind them. Only layers added from now on; layers
+  // already in a project when it opens are left as they are.
+  const seenPipIdsRef = useRef<Set<string> | null>(null);
+  const seenForPathRef = useRef<string | null>(null);
+  useEffect(() => {
+    const path = selectedFile?.sourcePath ?? null;
+    if (seenForPathRef.current !== path || seenPipIdsRef.current === null) {
+      seenForPathRef.current = path;
+      seenPipIdsRef.current = new Set(editStore.pipOverlays.map((o) => o.id));
+      return;
+    }
+    const seen = seenPipIdsRef.current;
+    const fresh = editStore.pipOverlays.filter((o) => !seen.has(o.id));
+    fresh.forEach((o) => seen.add(o.id));
+    const pref = loadSettings().cameraBackground;
+    const background = cutoutBackgroundFromPref(pref);
+    if (!background) return;
+    const webcams = fresh.filter((o) => /_webcam\.[a-z0-9]+$/i.test(o.sourcePath) && !o.cutout && !o.bakedBubble);
+    const bySource = new Map<string, string[]>();
+    webcams.forEach((o) => bySource.set(o.sourcePath, [...(bySource.get(o.sourcePath) ?? []), o.id]));
+    bySource.forEach((ids, sourcePath) => {
+      void removeBackground(ids[0], sourcePath, (path) => ids.forEach((id) => editStore.updatePipOverlayContent(id, { cutout: { path, sourcePath, background } })));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editStore.pipOverlays, selectedFile?.sourcePath]);
+
+  const handleBubbleMarked = useCallback(
+    (sourcePath: string, region: BubbleRegion) => {
+      setIsMarkingBubble(false);
+      const ids = editStore.liftWebcamBubble(sourcePath, region);
+      if (ids.length === 0) {
+        window.alert("This clip is sped up, cropped or panned, so its webcam bubble can't be lifted off it.");
+        return;
+      }
+      setSelectedPipOverlayId(ids[0]);
+      setPipPanelRequest({ id: ids[0] });
+      const crop = { x: region.x, y: region.y, width: region.width, height: region.height };
+      // One cut-out serves every piece (same recording, same spot); it starts blurred behind you.
+      void removeBackground(
+        ids[0],
+        sourcePath,
+        (path) => ids.forEach((id) => editStore.updatePipOverlayContent(id, { cutout: { path, sourcePath, region: crop, background: { kind: "blur", amount: BLUR_DEFAULT } } })),
+        crop
+      );
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [editStore.liftWebcamBubble, editStore.updatePipOverlayContent]
+  );
   // Esc disarms whichever placement tool is armed (and with it the "Click anywhere on the video
   // to place …" banner), the same as clicking its toolbar button again.
   const isPlacingAny = isPlacingText || isPlacingImage || isPlacingBlur || isPlacingPip;
@@ -1561,6 +1623,9 @@ const setScreen = () => {
       enhance_audio: recordingPrefs.autoEnhanceAudio,
       overlay_border: recordingPrefs.cameraBorder,
       overlay_border_color: recordingPrefs.cameraBorderColor,
+      // Live background behind the person in a bubble recorded into the screen (camera_effects.rs) -
+      // a separately recorded webcam gets it in the editor instead, at full quality.
+      camera_effect: formData.record_type === "sva" && !formData.separate_webcam_capture ? cameraEffectSpec(recordingPrefs.cameraBackground) : null,
     };
     if (formData.record_type === "c") {
       await handleTakeScreenshot(formData);
@@ -4786,6 +4851,25 @@ const setScreen = () => {
                               overlay, where export applies them. */}
                           <AdjustmentLayersLayer mode="under" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
                           {reframePreview && <ReframePreviewLayer preview={reframePreview} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />}
+                          {/* Video tracks (PiP, B-roll) straight on the video - under blur regions,
+                              pictures and text, where export composites them (videoTracks.ts). */}
+                          <PipOverlayLayer
+                            frameRect={frameRect}
+                            pipOverlays={editStore.pipOverlays}
+                            currentOutputTime={currentOutputTime}
+                            totalOutputDuration={totalOutputDuration}
+                            isPlaying={playerIsPlaying}
+                            selectedPipOverlayId={selectedPipOverlayId}
+                            onSelectPipOverlay={setSelectedPipOverlayId}
+                            isPlacingPip={isPlacingPip}
+                            onPlacementPipConsumed={() => setIsPlacingPip(false)}
+                            onAddPipOverlay={editStore.addPipOverlay}
+                            onUpdatePipOverlayContent={editStore.updatePipOverlayContent}
+                            onDeletePipOverlay={editStore.deletePipOverlay}
+                            getOutputTime={getExactOutputTime}
+                            hiddenTracks={editStore.hiddenVideoTracks}
+                            panelRequest={pipPanelRequest}
+                          />
                           <VideoOverlayLayer
                           frameRect={frameRect}
                           overlays={editStore.textOverlays}
@@ -4830,21 +4914,15 @@ const setScreen = () => {
                           onTrackMotion={startMotionTrack}
                           totalOutputDuration={totalOutputDuration}
                         />
-                        <PipOverlayLayer
-                          frameRect={frameRect}
-                          pipOverlays={editStore.pipOverlays}
-                          currentOutputTime={currentOutputTime}
-                          totalOutputDuration={totalOutputDuration}
-                          isPlaying={playerIsPlaying}
-                          selectedPipOverlayId={selectedPipOverlayId}
-                          onSelectPipOverlay={setSelectedPipOverlayId}
-                          isPlacingPip={isPlacingPip}
-                          onPlacementPipConsumed={() => setIsPlacingPip(false)}
-                          onAddPipOverlay={editStore.addPipOverlay}
-                          onUpdatePipOverlayContent={editStore.updatePipOverlayContent}
-                          onDeletePipOverlay={editStore.deletePipOverlay}
-                        />
                         <AdjustmentLayersLayer mode="over" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
+                        {isMarkingBubble && (
+                          <WebcamBubbleMarker
+                            frameRect={frameRect}
+                            sourcePath={activeClipEffects?.sourcePath ?? selectedFile.sourcePath}
+                            onConfirm={(region) => handleBubbleMarked(activeClipEffects?.sourcePath ?? selectedFile.sourcePath, region)}
+                            onCancel={() => setIsMarkingBubble(false)}
+                          />
+                        )}
                         {/* Above PiP and every other overlay - same stacking as the export, where the
                             captions are the last video stage (export_trimmed_video). */}
                         {editStore.captions?.settings.enabled && captionLines.length > 0 && (
@@ -4904,7 +4982,9 @@ const setScreen = () => {
                 controlsLeading={playerBackButton}
                 onSidebarPanelChange={handlePlayerSidebarPanelChange}
                 trackVolume={editStore.videoAudioVolume}
-                trackMuted={editStore.videoAudioMuted || !!activeClipEffects?.muted}
+                trackMuted={editStore.videoAudioMuted || !!activeClipEffects?.muted || silencedBySolo(mixerSession, VIDEO_CHANNEL)}
+                trackFx={editStore.videoAudioFx}
+                meterTrack={mixerSession.open}
                 activeClipEffects={activeClipEffects}
                 gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}
@@ -5187,6 +5267,7 @@ const setScreen = () => {
         onSelectPipOverlay={setSelectedPipOverlayId}
         isPlacingPip={isPlacingPip}
         onToggleArmPlacePip={() => setIsPlacingPip((v) => !v)}
+        onMarkWebcamBubble={() => setIsMarkingBubble(true)}
         isCroppingClip={isCroppingClip}
         onToggleCroppingClip={() => setIsCroppingClip((v) => !v)}
         selectScreen={selectScreen}

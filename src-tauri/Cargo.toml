@@ -82,6 +82,10 @@ kamadak-exif = "0.6.1"
 # `tauri dev` (the profile.dev.package."*" override below covers dependencies, not this crate):
 # per-pixel tracking at opt-level 0 is two orders of magnitude slower.
 motion-track = { path = "crates/motion-track" }
+pixel-convert = { path = "crates/pixel-convert" }
+# Background removal (services/background_removal.rs): ONNX Runtime loaded at run time from the
+# engine downloaded on first use - nothing is linked or bundled at build time.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "directml", "api-24"] }
 
 # Win32 bindings â€” only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the

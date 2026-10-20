@@ -197,6 +197,10 @@ pub struct FormData {
     // actually changes and why it's gated to exactly one camera on record_type "sva" only.
     #[serde(default)]
     separate_webcam_capture: bool,
+    // Opt-in live background for the camera bubble - blur, a colour or a picture behind the person
+    // (camera_effects.rs). None/omitted: the camera exactly as before.
+    #[serde(default)]
+    camera_effect: Option<crate::commands::camera_effects::CameraEffectSpec>,
     // Opt-in (default false), Windows-only - see services/click_tracker.rs and start_recording's
     // own handling of this field. Only meaningful for the screen-capture modes (sva/sa/s), same
     // as include_system_audio above.
@@ -390,6 +394,37 @@ pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> 
     fs::read_to_string(&sidecar)
         .map(Some)
         .map_err(|e| format!("Failed to read click-tracking sidecar: {}", e))
+}
+
+// Where the camera bubble was baked into a screen recording - its shape, anchor, size, border and
+// how many cameras sat side by side - so the editor can find it exactly to fix its background
+// (webcamBubble.ts recomputes the box from these with the same maths as overlay_stage_filter).
+// Written when the recording starts, removed again if it comes to nothing.
+fn bubble_sidecar_path(video_path: &Path) -> PathBuf {
+    let stem = video_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
+    video_path.with_file_name(format!("{}.bubble.json", stem))
+}
+
+pub(crate) fn write_bubble_sidecar(video_path: &Path, form_data: &FormData, camera_count: usize) {
+    let json = serde_json::json!({
+        "shape": form_data.overlay_shape,
+        "position": form_data.overlay_position,
+        "size": form_data.overlay_size,
+        "border": form_data.overlay_border,
+        "cameraCount": camera_count,
+    });
+    if let Err(e) = fs::write(bubble_sidecar_path(video_path), json.to_string()) {
+        warn!("Failed to write the camera bubble sidecar: {}", e);
+    }
+}
+
+#[tauri::command(async)]
+pub fn load_bubble_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let sidecar = bubble_sidecar_path(&PathBuf::from(&video_path));
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&sidecar).map(Some).map_err(|e| format!("Failed to read the camera bubble sidecar: {}", e))
 }
 
 // Same sidecar convention as click_sidecar_path above, for the screen<->camera view-switch
@@ -2457,10 +2492,14 @@ pub async fn stop_recording(
         warn!("Recording was force-stopped; the end of {:?} may be truncated", output_path);
     }
 
+    // The live camera background (if this recording used it) has nothing left to feed.
+    crate::commands::camera_effects::release_after_recording();
+
     match fs::metadata(&output_path) {
         Ok(meta) if meta.len() > 0 => {}
         Ok(_) => {
             let _ = fs::remove_file(&output_path);
+            let _ = fs::remove_file(bubble_sidecar_path(&output_path));
             return Err("Recording failed: no video/audio was captured, so the output file is empty. The selected screen, camera, or microphone may have become unavailable during recording.".to_string());
         }
         Err(_) => {

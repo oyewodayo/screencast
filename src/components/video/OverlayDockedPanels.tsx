@@ -10,6 +10,7 @@
 // the text panel only exists while TextNoteEditor is open, and that editor commits and closes the
 // moment its textarea loses focus. The blur panel's X/Y/W/H fields are the one exception (real
 // inputs), safe there since a blur region has no editing session to end.
+import type { LayerMask } from "../../utils/layerMask";
 import { KEYFRAME_EASINGS, KEYFRAME_SNAP_SEC, KeyframeEasing, OverlayKeyframe, keyframeAt, keyframeStateAt, removeKeyframeAt, upsertKeyframe } from "../../utils/keyframes";
 import React, { useEffect, useRef } from "react";
 import RevealText from "./RevealText";
@@ -1118,6 +1119,12 @@ export interface ImageDockedPanelProps extends CommonProps {
   // The picture's own reveal (imageReveal.ts); undefined = none.
   reveal?: ImageRevealSettings;
   onReveal?: (reveal: ImageRevealSettings | undefined) => void;
+  // Its mask (layerMask.ts).
+  mask?: LayerMask;
+  maskEditing?: boolean;
+  onMaskShape?: (shape: LayerMask["shape"] | null) => void;
+  onMask?: (mask: LayerMask) => void;
+  onToggleMaskEdit?: () => void;
 }
 
 const SHINE_COLORS = ["#ffffff", "#fde68a", "#fbbf24", "#93c5fd", "#f9a8d4"];
@@ -1187,6 +1194,47 @@ const ImageRevealSection: React.FC<{ reveal?: ImageRevealSettings; onChange: (re
   );
 };
 
+// A layer's mask (layerMask.ts): its shape ("Draw" outlines one on the video), feather, invert, and
+// on-video editing.
+export const MaskSection: React.FC<{
+  mask: LayerMask | undefined;
+  editing: boolean;
+  onShape: (shape: LayerMask["shape"] | null) => void;
+  onMask: (mask: LayerMask) => void;
+  onToggleEdit: () => void;
+}> = ({ mask, editing, onShape, onMask, onToggleEdit }) => (
+  <Section title="Mask">
+    <ChipGrid<LayerMask["shape"] | "none">
+      options={[
+        { value: "none", label: "None" },
+        { value: "ellipse", label: "Ellipse" },
+        { value: "rectangle", label: "Box" },
+        { value: "path", label: "Draw" },
+      ]}
+      value={mask?.shape ?? "none"}
+      onChange={(next) => onShape(next === "none" ? null : next)}
+    />
+    {mask && (
+      <>
+        <SliderRow label="Feather" value={Math.round(mask.feather * 400)} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => onMask({ ...mask, feather: v / 400 })} />
+        {mask.shape === "rectangle" && (
+          <SliderRow label="Corners" value={Math.round((mask.cornerRadius ?? 0) * 200)} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => onMask({ ...mask, cornerRadius: v / 200 })} />
+        )}
+        <LabeledRow label="Invert">
+          <Switch on={mask.invert} label="Show everything except the masked area" onChange={(invert) => onMask({ ...mask, invert })} />
+        </LabeledRow>
+        <button
+          type="button"
+          onClick={onToggleEdit}
+          className={`self-start px-2 py-1 rounded text-[11px] ${editing ? "bg-teal-500/20 text-teal-300 ring-1 ring-teal-400/40" : "bg-white/5 text-white/80 hover:bg-white/10"}`}
+        >
+          {editing ? "Done editing" : "Move / resize on the video"}
+        </button>
+      </>
+    )}
+  </Section>
+);
+
 export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
   <>
     {props.asset && props.onAsset && (
@@ -1248,6 +1296,9 @@ export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
     </Section>
 
     {props.onBlendMode && <BlendSection value={props.blendMode} onChange={props.onBlendMode} />}
+    {!props.asset && props.onMaskShape && props.onMask && props.onToggleMaskEdit && (
+      <MaskSection mask={props.mask} editing={!!props.maskEditing} onShape={props.onMaskShape} onMask={props.onMask} onToggleEdit={props.onToggleMaskEdit} />
+    )}
     {!props.asset && props.onReveal && <ImageRevealSection reveal={props.reveal} onChange={props.onReveal} />}
     <AnimationSection value={props.animation} onChange={props.onAnimation} />
     <MotionSection {...props} />

@@ -11,6 +11,7 @@
 // Each render targets a canvas sized to just the overlay's own box (not the whole video frame) -
 // far cheaper than a full-frame canvas per overlay, and ffmpeg positions it via the returned
 // xPx/yPx either way.
+import { drawLayerMask } from "./layerMask";
 import { invoke } from "@tauri-apps/api/core";
 import { BlurOverlay, ImageOverlay, TextOverlay, TextOverlayCornerStyle } from "./videoEditTypes";
 import { TEXT_FONT_FAMILY, measureTextBlock } from "../handlers/pdfAnnotationHandlers";
@@ -385,8 +386,39 @@ function drawImageOverlayPng(overlay: ImageOverlay, img: HTMLImageElement, frame
   const sy = (overlay.cropY ?? 0) * img.naturalHeight;
   const sWidth = (overlay.cropWidth ?? 1) * img.naturalWidth;
   const sHeight = (overlay.cropHeight ?? 1) * img.naturalHeight;
-  ctx.drawImage(img, sx, sy, sWidth, sHeight, -w / 2, -h / 2, w, h);
-  ctx.restore();
+  if (overlay.mask) {
+    // Masked (layerMask.ts): the picture on its own box-sized canvas, cut by the same mask picture
+    // the preview masks with, then placed - border and shadow stay whole, as in the preview.
+    ctx.restore();
+    const pw = Math.max(1, Math.round(w));
+    const ph = Math.max(1, Math.round(h));
+    const pic = document.createElement("canvas");
+    pic.width = pw;
+    pic.height = ph;
+    const p = pic.getContext("2d");
+    const maskCanvas = document.createElement("canvas");
+    maskCanvas.width = pw;
+    maskCanvas.height = ph;
+    const m = maskCanvas.getContext("2d");
+    if (p && m) {
+      roundedRectPath(p, 0, 0, pw, ph, radius);
+      p.clip();
+      p.translate(pw / 2, ph / 2);
+      if (overlay.flipHorizontal || overlay.flipVertical) p.scale(overlay.flipHorizontal ? -1 : 1, overlay.flipVertical ? -1 : 1);
+      p.drawImage(img, sx, sy, sWidth, sHeight, -pw / 2, -ph / 2, pw, ph);
+      drawLayerMask(m, { mask: overlay.mask }, pw, ph);
+      p.setTransform(1, 0, 0, 1, 0, 0);
+      p.globalCompositeOperation = "destination-in";
+      p.drawImage(maskCanvas, 0, 0);
+      ctx.save();
+      ctx.globalAlpha = overlay.opacity;
+      ctx.drawImage(pic, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    }
+  } else {
+    ctx.drawImage(img, sx, sy, sWidth, sHeight, -w / 2, -h / 2, w, h);
+    ctx.restore();
+  }
 
   if (overlay.borderColor) {
     ctx.save();

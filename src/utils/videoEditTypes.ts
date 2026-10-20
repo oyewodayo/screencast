@@ -9,6 +9,10 @@
 // very last clip's end, splitting divides one clip into two adjacent clips (same sourcePath), and
 // deleting removes a clip from the array outright.
 
+import type { AudioFx } from "./audioFx";
+import type { ChromaKey } from "./chromaKey";
+import type { LayerMask } from "./layerMask";
+import type { CutoutBackground } from "./cutoutBackground";
 import { TextAlign, TextColorRun, TextRange } from "./pdfAnnotationTypes";
 import type { ClipSpeedRamp } from "./clipTiming";
 import type { OverlayKeyframe } from "./keyframes";
@@ -368,6 +372,8 @@ export interface ImageOverlay {
   animation?: OverlayAnimation; // undefined means "none", the pre-existing look
   blendMode?: BlendMode; // undefined means "normal"
   track?: OverlayTrackInfo;
+  // Only this part of the picture shows (layerMask.ts) - in the box's own space.
+  mask?: LayerMask;
   // The visible sub-rectangle of the source picture, set via the dedicated Crop mode
   // (ImageOverlayCropPanel.tsx) - fractions of the SOURCE IMAGE's own natural pixel dimensions,
   // unlike every other field on this type (all normalized against the video frame instead). All
@@ -460,6 +466,9 @@ export interface AudioOverlay {
   // alike (src/utils/musicDucking.ts).
   duckUnderSpeech?: boolean;
   duckLevel?: number;
+  // Its mixer channel's EQ/compressor/balance (audioFx.ts) - every piece of one track (same
+  // label, or same file) carries the same settings; the mixer edits them together.
+  fx?: AudioFx;
   createdAt: number;
   updatedAt: number;
 }
@@ -514,6 +523,29 @@ export interface PipOverlay {
   volume: number; // 0..1, defaults to 1
   muted?: boolean;
   blendMode?: BlendMode; // undefined means "normal"
+  // Its sound's EQ/compressor/balance (audioFx.ts).
+  fx?: AudioFx;
+  // Which video track it's on: 1 = V2 (just above the main video), 2 = V3, ... Higher tracks draw
+  // over lower ones (videoTracks.ts). Undefined means 1.
+  track?: number;
+  // 0..1, undefined = 1; and linear fade in/out at its ends, in seconds (a B-roll dissolve).
+  opacity?: number;
+  fadeIn?: number;
+  fadeOut?: number;
+  // Green/blue-screen keying (chromaKey.ts) - the screen turns transparent.
+  chromaKey?: ChromaKey;
+  // Only this part of the layer shows (layerMask.ts) - in the box's own space, so it moves with it.
+  mask?: LayerMask;
+  // Background removed (backgroundRemoval.ts): the person cut out of `sourcePath` into a video with
+  // transparency, shown in place of the source's picture (its sound still comes from the source).
+  // `region`: only that part of the source was cut out (a bubble baked into a screen recording -
+  // webcamBubble.ts) - the cut-out is then already cropped, and `crop` doesn't apply to it.
+  // `background`: what shows behind the person, inside the layer (cutoutBackground.ts); none =
+  // see-through.
+  cutout?: { path: string; sourcePath: string; region?: ClipCrop; background?: CutoutBackground };
+  // A webcam bubble lifted off the main recording it was baked into (webcamBubble.ts): `sourcePath`
+  // is that recording, `crop` the bubble, and the layer sits exactly over it.
+  bakedBubble?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -668,6 +700,11 @@ export interface VideoEditState {
   // - there's only ever one of these per edit session, never a list.
   videoAudioMuted: boolean;
   videoAudioVolume: number; // 0..1, defaults to 1
+  // The video's own sound's mixer channel - EQ/compressor/balance after its volume (audioFx.ts).
+  videoAudioFx?: AudioFx;
+  // Video tracks (PipOverlay.track) switched off with their eye toggle - left out of the preview
+  // and the export alike.
+  hiddenVideoTracks?: number[];
   // null until captions are first generated - see CaptionTrack.
   captions: CaptionTrack | null;
   updatedAt: string;
@@ -687,6 +724,8 @@ export interface EditableFields {
   chapters: VideoChapter[];
   videoAudioMuted: boolean;
   videoAudioVolume: number;
+  videoAudioFx?: AudioFx;
+  hiddenVideoTracks?: number[];
   captions: CaptionTrack | null;
 }
 
@@ -733,7 +772,9 @@ export interface VideoEditCommand {
     | "edit-adjustment"
     | "delete-adjustment"
     | "edit-chapters"
-    | "track-motion";
+    | "track-motion"
+    | "edit-mixer"
+    | "edit-video-tracks";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {

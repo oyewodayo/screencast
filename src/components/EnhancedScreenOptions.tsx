@@ -6,7 +6,10 @@ import { FiMonitor } from "react-icons/fi";
 import { WindowInfo, MonitorInfo } from "../Types";
 import CameraOverlayPreview from "./CameraOverlayPreview";
 import { RECORD_TYPE_LABELS } from "./ActiveRecordingState";
-import { loadSettings, saveSettings } from "../utils/appSettings";
+import { DEFAULT_SETTINGS, loadSettings, saveSettings, type CameraBackgroundPref } from "../utils/appSettings";
+import { backgroundRemovalStatus, downloadBackgroundEngine } from "../utils/backgroundRemoval";
+import { BACKGROUND_SWATCHES } from "../utils/cutoutBackground";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { PresentationPanel, startOrStopPresentation, usePresentation } from "./PresentationControls";
 import { getPresentationState } from "../services/presentation";
 
@@ -251,6 +254,36 @@ const EnhancedScreenOptions = ({
         saveSettings({ ...settings, ...next });
         if (next.cameraBorder !== undefined) setBorder(next.cameraBorder);
         if (next.cameraBorderColor !== undefined) setBorderColor(next.cameraBorderColor);
+    };
+    // Live background behind you in the bubble (cameraEffect.ts), remembered between recordings.
+    // The engine downloads once, the first time it's wanted; the preview then shows the real effect.
+    const [cameraBg, setCameraBg] = useState<CameraBackgroundPref>(() => loadSettings().cameraBackground ?? DEFAULT_SETTINGS.cameraBackground);
+    const updateCameraBg = (patch: Partial<CameraBackgroundPref>) => {
+        const next = { ...cameraBg, ...patch };
+        saveSettings({ ...loadSettings(), cameraBackground: next });
+        setCameraBg(next);
+    };
+    const [engine, setEngine] = useState<{ state: "unknown" | "ready" | "needs-download" | "unsupported" | "downloading" | "failed"; progress?: number; mb?: number }>({ state: "unknown" });
+    const [engineGeneration, setEngineGeneration] = useState(0);
+    useEffect(() => {
+        backgroundRemovalStatus()
+            .then((st) => setEngine({ state: st.state, mb: st.downloadMb }))
+            .catch(() => setEngine({ state: "unsupported" }));
+    }, []);
+    const getEngine = () => {
+        setEngine((e) => ({ ...e, state: "downloading", progress: 0 }));
+        downloadBackgroundEngine((progress) => setEngine((e) => ({ ...e, state: "downloading", progress })))
+            .then(() => {
+                setEngine({ state: "ready" });
+                setEngineGeneration((g) => g + 1);
+            })
+            .catch(() => setEngine((e) => ({ ...e, state: "failed" })));
+    };
+    // What the preview (and so the feed) is given: nothing until the engine is there.
+    const previewBg = engine.state === "ready" ? cameraBg : undefined;
+    const pickBgPicture = async () => {
+        const selected = await openFileDialog({ multiple: false, filters: [{ name: "Pictures", extensions: ["png", "jpg", "jpeg", "webp", "bmp"] }] });
+        if (typeof selected === "string") updateCameraBg({ kind: "image", imagePath: selected });
     };
 
     // Snapshot of `error` taken when a window-load starts, so the fallback below only reacts
@@ -660,6 +693,113 @@ const EnhancedScreenOptions = ({
                 )}
             </div>
 
+            {engine.state !== "unsupported" && !(separateWebcamCapture && videoDevices.length === 1) && (
+                <div>
+                    <SectionLabel hint="live, while you record">Background</SectionLabel>
+                    <div className="grid grid-cols-4 gap-2">
+                        {([
+                            ["off", "Off", "No effect - your camera as it is"],
+                            ["blur", "Blur", "Your own room, softly blurred"],
+                            ["color", "Colour", "A solid colour behind you"],
+                            ["image", "Picture", "A picture of your own behind you"],
+                        ] as const).map(([kind, label, hint]) => (
+                            <button
+                                key={kind}
+                                type="button"
+                                title={hint}
+                                onClick={() => (kind === "image" && !cameraBg.imagePath ? void pickBgPicture() : updateCameraBg({ kind }))}
+                                className={`flex flex-col items-center gap-1.5 py-2.5 rounded-xl border transition-all ${
+                                    cameraBg.kind === kind
+                                        ? "border-emerald-500 bg-emerald-50/80 dark:bg-emerald-500/10"
+                                        : "border-neutral-200 dark:border-neutral-700 hover:border-neutral-300 dark:hover:border-neutral-600"
+                                }`}
+                            >
+                                <span className="relative w-9 h-9 rounded-full overflow-hidden ring-1 ring-black/10 dark:ring-white/10">
+                                    {kind === "off" && <span className="absolute inset-0 bg-gradient-to-br from-stone-300 to-stone-500" />}
+                                    {kind === "blur" && <span className="absolute inset-0 bg-gradient-to-br from-amber-200 via-sky-400 to-indigo-600 blur-[3px] scale-125" />}
+                                    {kind === "color" && <span className="absolute inset-0" style={{ background: cameraBg.color }} />}
+                                    {kind === "image" &&
+                                        (cameraBg.imagePath ? (
+                                            <img src={convertFileSrc(cameraBg.imagePath)} alt="" className="absolute inset-0 w-full h-full object-cover" />
+                                        ) : (
+                                            <span className="absolute inset-0 bg-gradient-to-br from-emerald-300 to-teal-600" />
+                                        ))}
+                                    <span className="absolute left-1/2 top-[22%] -translate-x-1/2 w-2.5 h-2.5 rounded-full bg-white/90" />
+                                    <span className="absolute left-1/2 bottom-0 -translate-x-1/2 w-5 h-3 rounded-t-full bg-white/90" />
+                                </span>
+                                <span className="text-xs font-medium">{label}</span>
+                            </button>
+                        ))}
+                    </div>
+                    {cameraBg.kind === "blur" && (
+                        <label className="mt-3 flex items-center gap-3 text-xs">
+                            <span className="w-14 text-neutral-500">Amount</span>
+                            <input
+                                type="range"
+                                min={0.15}
+                                max={1}
+                                step={0.01}
+                                value={cameraBg.amount}
+                                onChange={(e) => updateCameraBg({ amount: Number(e.target.value) })}
+                                className="flex-1 accent-emerald-500"
+                            />
+                        </label>
+                    )}
+                    {cameraBg.kind === "color" && (
+                        <div className="mt-3 flex items-center gap-2 flex-wrap">
+                            {BACKGROUND_SWATCHES.map((c) => (
+                                <button
+                                    key={c}
+                                    type="button"
+                                    title={c}
+                                    onClick={() => updateCameraBg({ color: c })}
+                                    className={`w-7 h-7 rounded-full border border-black/10 dark:border-white/20 transition-transform hover:scale-110 ${
+                                        cameraBg.color.toLowerCase() === c ? "ring-2 ring-offset-2 ring-emerald-500 dark:ring-offset-neutral-900" : ""
+                                    }`}
+                                    style={{ background: c }}
+                                />
+                            ))}
+                            <label className="relative w-7 h-7 rounded-full border border-dashed border-neutral-400 dark:border-neutral-500 flex items-center justify-center cursor-pointer overflow-hidden" title="Any colour">
+                                <span className="text-xs text-neutral-500">+</span>
+                                <input type="color" value={cameraBg.color} onChange={(e) => updateCameraBg({ color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
+                            </label>
+                        </div>
+                    )}
+                    {cameraBg.kind === "image" && (
+                        <button type="button" onClick={() => void pickBgPicture()} className="mt-3 text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:underline">
+                            Choose another picture…
+                        </button>
+                    )}
+                    {cameraBg.kind !== "off" && (engine.state === "needs-download" || engine.state === "downloading" || engine.state === "failed") && (
+                        <div className="mt-3 p-3 rounded-xl bg-emerald-50/80 dark:bg-emerald-500/10 border border-emerald-500/30 text-xs">
+                            {engine.state === "downloading" ? (
+                                <>
+                                    <div className="flex justify-between mb-1.5 text-neutral-600 dark:text-neutral-300">
+                                        <span>Getting the background engine…</span>
+                                        <span className="tabular-nums">{Math.round((engine.progress ?? 0) * 100)}%</span>
+                                    </div>
+                                    <div className="h-1.5 rounded-full bg-emerald-500/20 overflow-hidden">
+                                        <div className="h-full bg-emerald-500 transition-[width]" style={{ width: `${Math.round((engine.progress ?? 0) * 100)}%` }} />
+                                    </div>
+                                </>
+                            ) : (
+                                <div className="flex items-center justify-between gap-3">
+                                    <span className="text-neutral-600 dark:text-neutral-300">
+                                        {engine.state === "failed" ? "The download didn't finish." : `A one-time ${engine.mb ?? 40} MB download makes this work.`}
+                                    </span>
+                                    <button type="button" onClick={getEngine} className="shrink-0 px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white font-medium">
+                                        {engine.state === "failed" ? "Try again" : "Get it"}
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                    {cameraBg.kind !== "off" && engine.state === "ready" && (
+                        <p className="mt-2 text-[11px] text-neutral-500">Done live on your computer, in the preview above and in the recording.</p>
+                    )}
+                </div>
+            )}
+
             {videoDevices.length === 1 && (
                 <label className="flex items-start gap-3 p-3 rounded-xl border border-neutral-200 dark:border-neutral-700 cursor-pointer hover:border-neutral-300 dark:hover:border-neutral-600">
                     <input
@@ -971,6 +1111,8 @@ const EnhancedScreenOptions = ({
                                             overlayBorder={border}
                                             overlayBorderColor={borderColor}
                                             showLabel={false}
+                                            cameraBackground={previewBg}
+                                            engineGeneration={engineGeneration}
                                         />
                                     </div>
                                 )}
@@ -1033,6 +1175,8 @@ const EnhancedScreenOptions = ({
                                         overlayBorder={border}
                                         overlayBorderColor={borderColor}
                                         showLabel={false}
+                                        cameraBackground={previewBg}
+                                        engineGeneration={engineGeneration}
                                     />
                                 </div>
                             )}

@@ -130,6 +130,7 @@ interface Props {
   onSelectPipOverlay?: (id: string | null) => void;
   isPlacingPip?: boolean;
   onToggleArmPlacePip?: () => void;
+  onMarkWebcamBubble?: () => void;
   // Video-only: on-canvas crop-tool arm state, same threading as the overlay props above.
   isCroppingClip?: boolean;
   onToggleCroppingClip?: () => void;
@@ -275,6 +276,7 @@ const BottomDocker = ({
   onSelectPipOverlay,
   isPlacingPip,
   onToggleArmPlacePip,
+  onMarkWebcamBubble,
   isCroppingClip,
   onToggleCroppingClip,
   handleFolderSettings,
@@ -722,6 +724,7 @@ const BottomDocker = ({
             onSelectPipOverlay={onSelectPipOverlay}
             isPlacingPip={isPlacingPip}
             onToggleArmPlacePip={onToggleArmPlacePip}
+            onMarkWebcamBubble={onMarkWebcamBubble}
             isCroppingClip={isCroppingClip}
             onToggleCroppingClip={onToggleCroppingClip}
           />

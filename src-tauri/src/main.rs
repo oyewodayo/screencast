@@ -10,6 +10,8 @@ use tauri::Manager;
 
 mod commands {
     pub mod audio_tracks;
+    pub mod background_removal;
+    pub mod camera_effects;
     pub mod conversion;
     pub mod embedded_scan;
     pub mod file_info;
@@ -23,6 +25,7 @@ mod commands {
 }
 mod services {
     pub mod asset_download;
+    pub mod audio_fx;
     pub mod beat_detect;
     pub mod subject_track;
     pub mod boards;
@@ -470,6 +473,16 @@ fn main() {
             commands::conversion::transcribe_doc_audio,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
+            commands::background_removal::background_removal_status,
+            commands::recording::load_bubble_sidecar,
+            commands::camera_effects::camera_effect_start,
+            commands::camera_effects::camera_effect_status,
+            commands::camera_effects::camera_effect_preview,
+            commands::camera_effects::camera_effect_stop,
+            commands::background_removal::download_background_removal,
+            commands::background_removal::cancel_background_removal_download,
+            commands::background_removal::remove_video_background,
+            commands::background_removal::cancel_background_removal,
             commands::conversion::extract_clip_audio,
             commands::audio_tracks::probe_audio_streams,
             commands::file_info::get_file_info,

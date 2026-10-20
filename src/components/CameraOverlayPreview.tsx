@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { IoVideocamOffOutline } from "react-icons/io5";
 import { PHONE_CAMERA_DEVICE, subscribePhoneCamera } from "../services/phoneCamera";
 import { cameraStatusText, useCameraStreams } from "../hooks/useCameraStreams";
+import { useCameraEffectFeed } from "../utils/cameraEffect";
+import type { CameraBackgroundPref } from "../utils/appSettings";
 
 interface CameraOverlayPreviewProps {
     videoDevices: string[];
@@ -18,6 +20,11 @@ interface CameraOverlayPreviewProps {
     // "full" previews the camera as the whole picture, which is what the camera-only record types
     // ("v", "va") actually produce: there's no screen underneath and no bubble to place.
     variant?: "overlay" | "full";
+    // Live background behind the person (cameraEffect.ts): the first camera's bubble then shows the
+    // effect itself, from the same feed the recording will use. `engineGeneration` bumps after the
+    // engine downloads, to start it.
+    cameraBackground?: CameraBackgroundPref;
+    engineGeneration?: number;
 }
 
 // Every number below mirrors OverlayStyle and friends in src-tauri/src/commands/recording.rs,
@@ -105,8 +112,15 @@ const CameraOverlayPreview = ({
     overlayBorderColor = "#ffffff",
     showLabel = true,
     variant = "overlay",
+    cameraBackground,
+    engineGeneration = 0,
 }: CameraOverlayPreviewProps) => {
-    const { streams, errors } = useCameraStreams(videoDevices);
+    // The first camera, with a live background on, is opened by the effect feed rather than the
+    // browser (one owner per camera).
+    const effectDevice = variant === "overlay" && videoDevices[0] && videoDevices[0] !== PHONE_CAMERA_DEVICE ? videoDevices[0] : null;
+    const feed = useCameraEffectFeed(effectDevice, overlayShape, overlaySize, cameraBackground, engineGeneration);
+    const feedOwnsFirst = feed.phase === "starting" || feed.phase === "running";
+    const { streams, errors } = useCameraStreams(feedOwnsFirst ? videoDevices.slice(1) : videoDevices);
 
     // The phone's stream is owned by the phoneCamera service, not acquired here: it arrives over
     // WebRTC rather than from getUserMedia, and the same MediaStream is shared with the pairing
@@ -216,7 +230,15 @@ const CameraOverlayPreview = ({
                                     overlayShape === "circle" ? "50%" : overlayShape === "rounded" ? `${(1 / 8) * 100}%` : 0,
                             }}
                         >
-                            {stream ? (
+                            {index === 0 && feedOwnsFirst ? (
+                                feed.frameUrl ? (
+                                    <img src={feed.frameUrl} alt="" className="w-full h-full object-cover" draggable={false} />
+                                ) : (
+                                    <div className="w-full h-full flex items-center justify-center bg-neutral-800">
+                                        <span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                                    </div>
+                                )
+                            ) : stream ? (
                                 <video
                                     autoPlay
                                     muted
@@ -250,6 +272,20 @@ const CameraOverlayPreview = ({
                 {videoDevices.length === 0 && (
                     <div className="absolute bottom-2 right-2 text-[10px] text-gray-400 dark:text-neutral-600">
                         No camera selected
+                    </div>
+                )}
+                {feed.phase !== "off" && feed.phase !== "needs-engine" && (
+                    <div
+                        className={`absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-medium backdrop-blur ${
+                            feed.phase === "error" ? "bg-red-500/80 text-white" : "bg-black/55 text-white"
+                        }`}
+                        title={feed.message}
+                    >
+                        {feed.phase === "error"
+                            ? "Background effect unavailable"
+                            : feed.phase === "starting" || !feed.engine || feed.engine === "starting"
+                              ? "Getting your background ready…"
+                              : `Live background · ${Math.round(feed.fps ?? 0)} fps`}
                     </div>
                 )}
             </div>

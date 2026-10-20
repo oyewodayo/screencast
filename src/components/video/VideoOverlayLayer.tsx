@@ -37,6 +37,8 @@ import { BLUR_SIGMA_FRACTION } from "../../utils/videoOverlayRender";
 import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
 import { overlayAnimationStyle } from "../../utils/overlayAnimation";
 import { cssBlendMode } from "../../utils/blendModes";
+import { cachedLayerMaskAlphaUrl, DEFAULT_MASK, type LayerMask } from "../../utils/layerMask";
+import MaskEditor from "./MaskEditor";
 import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { renderFormattedSegments } from "../../utils/textFormatting";
@@ -131,6 +133,7 @@ type ImageOverlayContentPatch = Partial<
     | "reveal"
     | "blendMode"
     | "track"
+    | "mask"
   >
 >;
 // "rounded" is a flat px amount (converted to a frameRect.height fraction at click time) rather
@@ -1030,6 +1033,12 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   // mounted near the bottom of this component's return. Its own Apply/Cancel own everything about
   // the crop session; this is only "is it open, and for which overlay".
   const [croppingOverlayId, setCroppingOverlayId] = useState<string | null>(null);
+  // Editing a picture's mask on the video (MaskEditor) - and whether the next drag draws an outline.
+  const [imageMaskEdit, setImageMaskEdit] = useState<{ id: string; drawing: boolean } | null>(null);
+  const [imageMaskLive, setImageMaskLive] = useState<LayerMask | null>(null);
+  useEffect(() => {
+    if (imageMaskEdit && imageMaskEdit.id !== selectedImageOverlayId) setImageMaskEdit(null);
+  }, [imageMaskEdit, selectedImageOverlayId]);
 
   const [imageResizeDrag, setImageResizeDrag] = useState<BoxResizeDrag | null>(null);
   const imageResizeRafRef = useRef<number | null>(null);
@@ -1539,6 +1548,14 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         <div
           className="absolute inset-0"
           style={{ pointerEvents: "auto" }}
+          // Video tracks (PipOverlayLayer) sit beneath this layer - a press over one goes on to it,
+          // so it can still be grabbed and selected while a title is selected.
+          onPointerDown={(e) => {
+            const pip = document.elementsFromPoint(e.clientX, e.clientY).find((el) => el instanceof HTMLElement && el.dataset.pipInteractive !== undefined);
+            if (!pip) return;
+            e.stopPropagation();
+            pip.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, clientX: e.clientX, clientY: e.clientY, button: e.button, buttons: e.buttons, pointerId: e.pointerId, pointerType: e.pointerType, shiftKey: e.shiftKey }));
+          }}
           onClick={() => {
             onSelectOverlay(null);
             onSelectImageOverlay(null);
@@ -1719,6 +1736,22 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             ))}
           </>
         );
+        // Its mask (with the corner rounding folded in) - the same picture export draws it with
+        // (layerMask.ts, drawImageOverlayPng).
+        const imageMask = !o.asset ? (imageMaskEdit?.id === o.id ? imageMaskLive : null) ?? o.mask : undefined;
+        const maskedPicture = imageMask ? (
+          <div
+            className="absolute inset-0 pointer-events-none"
+            style={(() => {
+              const url = cachedLayerMaskAlphaUrl({ mask: imageMask }, o.width * frameRect.width, o.height * frameRect.height);
+              return { maskImage: `url(${url})`, WebkitMaskImage: `url(${url})`, maskSize: "100% 100%", WebkitMaskSize: "100% 100%", maskRepeat: "no-repeat", WebkitMaskRepeat: "no-repeat" };
+            })()}
+          >
+            {picture}
+          </div>
+        ) : (
+          picture
+        );
         const handles = (
           <>
             {isSelected && (
@@ -1774,7 +1807,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           return (
             <React.Fragment key={o.id}>
               <div data-kf-overlay={o.keyframes?.length ? o.id : undefined} className="absolute pointer-events-none" style={{ ...box, ...look, mixBlendMode: blendMode }}>
-                {picture}
+                {maskedPicture}
               </div>
               <div {...dragProps} data-kf-overlay={o.keyframes?.length ? o.id : undefined} style={{ ...box, transform, pointerEvents: placingAnything ? "none" : "auto" }}>
                 {handles}
@@ -1784,7 +1817,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         }
         return (
           <div key={o.id} {...dragProps} data-kf-overlay={o.keyframes?.length ? o.id : undefined} style={{ ...box, ...look, pointerEvents: placingAnything ? "none" : "auto" }}>
-            {picture}
+            {maskedPicture}
             {handles}
           </div>
         );
@@ -2101,6 +2134,26 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         </>
       )}
 
+      {selectedImageOverlayData && imageMaskEdit?.id === selectedImageOverlayData.id && (selectedImageOverlayData.mask || imageMaskEdit.drawing) && (
+        <div style={{ pointerEvents: "auto" }}>
+          <MaskEditor
+            box={{
+              left: selectedImageOverlayData.x * frameRect.width,
+              top: selectedImageOverlayData.y * frameRect.height,
+              width: selectedImageOverlayData.width * frameRect.width,
+              height: selectedImageOverlayData.height * frameRect.height,
+            }}
+            rotation={selectedImageOverlayData.rotation ?? 0}
+            mask={selectedImageOverlayData.mask ?? { ...DEFAULT_MASK, x: 0, y: 0, width: 1, height: 1 }}
+            drawing={imageMaskEdit.drawing}
+            zIndex={22}
+            onLive={setImageMaskLive}
+            onCommit={(mask) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { mask })}
+            onDrawn={() => setImageMaskEdit({ id: selectedImageOverlayData.id, drawing: false })}
+          />
+        </div>
+      )}
+
       {selectedImageOverlayData && (
         <OverlaySettingsPanel
           title={selectedImageOverlayData.asset ? assetEntry(selectedImageOverlayData.asset.kind).label : "Image"}
@@ -2154,6 +2207,21 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 onAsset={(patch) => o.asset && onUpdateImageOverlayContent(o.id, { asset: { ...o.asset, ...patch } })}
                 reveal={o.reveal}
                 onReveal={(reveal) => onUpdateImageOverlayContent(o.id, { reveal })}
+                mask={o.mask}
+                maskEditing={imageMaskEdit?.id === o.id}
+                onMaskShape={(shape) => {
+                  if (shape === null) {
+                    onUpdateImageOverlayContent(o.id, { mask: undefined });
+                    setImageMaskEdit(null);
+                  } else if (shape === "path") {
+                    setImageMaskEdit({ id: o.id, drawing: true });
+                  } else {
+                    onUpdateImageOverlayContent(o.id, { mask: { ...(o.mask ?? DEFAULT_MASK), shape, points: undefined } });
+                    setImageMaskEdit({ id: o.id, drawing: false });
+                  }
+                }}
+                onMask={(mask) => onUpdateImageOverlayContent(o.id, { mask })}
+                onToggleMaskEdit={() => setImageMaskEdit((m) => (m?.id === o.id ? null : { id: o.id, drawing: false }))}
                 x={o.x}
                 y={o.y}
                 width={o.width}

@@ -313,6 +313,7 @@ pub fn get_connected_devices(app_handle: &AppHandle) -> (Vec<String>, Vec<String
 // -filter_complex chaining an overlay stage per camera onto the screen capture.
 // `screen` and `first_camera` come from ScreenSource::graph_screen.
 fn add_overlay_args(
+    app_handle: &AppHandle,
     args: &mut Vec<String>,
     form_data: &FormData,
     screen: &str,
@@ -322,7 +323,21 @@ fn add_overlay_args(
 ) {
     let overlay_size = map_overlay_size(&form_data.overlay_size);
 
-    for device in &form_data.video_devices {
+    for (index, device) in form_data.video_devices.iter().enumerate() {
+        // The first camera with a live background (camera_effects.rs) comes from that feed instead
+        // - already cropped to the bubble and composited. If the feed can't start, the camera is
+        // recorded as it is rather than the recording failing.
+        if index == 0 {
+            if let Some(effect) = &form_data.camera_effect {
+                match crate::commands::camera_effects::ensure_feed(app_handle, device, &form_data.overlay_shape, &form_data.overlay_size, effect, true) {
+                    Ok((port, w, h)) => {
+                        args.extend(crate::commands::camera_effects::feed_input_args(port, w, h));
+                        continue;
+                    }
+                    Err(e) => log::warn!("Live camera background unavailable, recording the camera as it is: {}", e),
+                }
+            }
+        }
         args.extend(vec![
             "-f".to_string(),
             "dshow".to_string(),
@@ -572,7 +587,9 @@ pub async fn recording_with_output_sva(
     let mic_input;
     if baked_camera {
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
-        add_overlay_args(&mut args, form_data, &stage, first_camera, screen.max_width, screen.output_width());
+        add_overlay_args(app_handle, &mut args, form_data, &stage, first_camera, screen.max_width, screen.output_width());
+        // So the editor can find the bubble later (fixing its background) - see bubble_sidecar_path.
+        super::write_bubble_sidecar(output_path, form_data, form_data.video_devices.len());
         mic_input = first_camera + form_data.video_devices.len();
     } else if separate_webcam_capture && form_data.capture_path.is_some() {
         // The camera gets its own ffmpeg (start_camera_sidecar, below) - see CameraSidecar for why.

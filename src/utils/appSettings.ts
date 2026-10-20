@@ -85,6 +85,16 @@ export interface AppSettings {
   // in the Screen Options modal and remembered between recordings.
   cameraBorder: string;
   cameraBorderColor: string;
+  // Live background behind the person in the webcam bubble while recording (camera_effects.rs) -
+  // off unless picked in the Screen Options modal; remembered between recordings.
+  cameraBackground: CameraBackgroundPref;
+}
+
+export interface CameraBackgroundPref {
+  kind: "off" | "blur" | "color" | "image";
+  amount: number;
+  color: string;
+  imagePath: string | null;
 }
 
 const STORAGE_KEY = "briefcast.settings.v1";
@@ -135,6 +145,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoEnhanceAudio: true,
   cameraBorder: "none",
   cameraBorderColor: "#ffffff",
+  cameraBackground: { kind: "off", amount: 0.6, color: "#0f172a", imagePath: null },
 };
 
 // One-time correction for installs whose settings were saved back when "avi" was still the coded

@@ -26,7 +26,7 @@ import { DOCKED_PANEL_CLASS, useDockSnap, useFloatingDismiss, useToolPanelHost }
 import { creditLine, needsCredit } from "../../utils/musicLibrary";
 import { DEFAULT_DUCK_LEVEL, isSpeechOverlay } from "../../utils/musicDucking";
 
-export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "bpm" | "beats" | "trimStart" | "endTime" | "duckUnderSpeech" | "duckLevel">>;
+export type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "bpm" | "beats" | "trimStart" | "endTime" | "duckUnderSpeech" | "duckLevel" | "fx">>;
 
 const MIN_PART_SEC = 0.1;
 const FIT_FADE_OUT_SEC = 2;
@@ -49,10 +49,12 @@ interface AudioOverlayPopoverProps {
   // Beat sync - fit every image clip to this (and any other) track's beats.
   hasImageClips: boolean;
   onCutImagesOnBeat: (everyBeats: number) => void;
+  // Opens the mixer at this track's strip (EQ, compressor, balance).
+  onOpenMixer?: () => void;
   onClose: () => void;
 }
 
-const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onDelete, videoEnd, onSplitAtPlayhead, onPreviewStart, timelinePlaying, hasImageClips, onCutImagesOnBeat, onClose }) => {
+const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onDelete, videoEnd, onSplitAtPlayhead, onPreviewStart, timelinePlaying, hasImageClips, onCutImagesOnBeat, onOpenMixer, onClose }) => {
   const [beatState, setBeatState] = useState<{ busy: boolean; error?: string }>({ busy: false });
   const findBeats = () => {
     setBeatState({ busy: true });
@@ -248,6 +250,16 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
         />
         <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(overlay.volume * 100)}%</span>
       </label>
+      {onOpenMixer && (
+        <button
+          type="button"
+          onClick={onOpenMixer}
+          title="EQ, compressor and balance - shared by every piece of this track"
+          className="self-start -mt-1 px-2 py-1 rounded text-[11px] text-white/80 bg-white/5 hover:bg-white/10"
+        >
+          Mixer &amp; effects…{overlay.fx ? " (on)" : ""}
+        </button>
+      )}
 
       <label className="flex items-center gap-2 text-[11px]">
         <span className="w-12 shrink-0 text-white/60">Fade in</span>

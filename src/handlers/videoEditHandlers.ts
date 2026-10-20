@@ -3,6 +3,7 @@
 // Pure functions only, mirroring pdfAnnotationHandlers.ts's style: no React, callers pass in
 // everything they need explicitly. useVideoEditStore is the only caller.
 
+import { pipTrack } from "../utils/videoTracks";
 import { clipSpeedSteps, subSpan } from "../utils/clipTiming";
 import type { OverlayAsset } from "../utils/videoAssets";
 import { AudioOverlay, BlurOverlay, Clip, ClipCrop, EditableFields, ImageOverlay, KeepSegment, PipOverlay, TextOverlay, VideoEditCommand, isImageClipPath } from "../utils/videoEditTypes";
@@ -758,7 +759,7 @@ export function deletePipOverlayAndCloseGap(overlays: PipOverlay[], id: string):
   let chainEnd = deleted.endTime;
   for (;;) {
     const next = remaining.find(
-      (o) => !chainIds.has(o.id) && o.sourcePath === deleted.sourcePath && Math.abs(o.startTime - chainEnd) <= PIP_CHAIN_EPSILON_SEC
+      (o) => !chainIds.has(o.id) && o.sourcePath === deleted.sourcePath && pipTrack(o) === pipTrack(deleted) && Math.abs(o.startTime - chainEnd) <= PIP_CHAIN_EPSILON_SEC
     );
     if (!next) break;
     chainIds.add(next.id);

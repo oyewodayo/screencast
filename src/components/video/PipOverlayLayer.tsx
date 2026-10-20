@@ -22,7 +22,7 @@
 // `pointer-events: auto` explicitly, or clicks/drags pass straight through it. Drags are tracked
 // with WINDOW-level listeners rather than setPointerCapture, for the same WebView2 reliability
 // reason ClipCropOverlay.tsx documents.
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { ClipCrop, PipOverlay } from "../../utils/videoEditTypes";
@@ -32,6 +32,15 @@ import { MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
 import PipOverlayPopover, { PipOverlayPatch } from "./PipOverlayPopover";
 import { cssBlendMode } from "../../utils/blendModes";
 import ClipCropOverlay from "./ClipCropOverlay";
+import { isNeutralFx } from "../../utils/audioFx";
+import { syncElementFx } from "../../utils/mixerGraph";
+import { pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
+import { isTrackHidden, layerOpacityAt, pipTrack, stackOrder } from "../../utils/videoTracks";
+import { DEFAULT_CHROMA_KEY, guessKeyColor } from "../../utils/chromaKey";
+import { blurMargin, blurSigma, coverRect } from "../../utils/cutoutBackground";
+import { DEFAULT_MASK, layerMaskAlphaUrl, placeMask, type LayerMask } from "../../utils/layerMask";
+import ChromaKeyCanvas from "./ChromaKeyCanvas";
+import MaskEditor from "./MaskEditor";
 
 const DEFAULT_PIP_WIDTH_FRACTION = 0.28;
 const DEFAULT_PIP_MARGIN_FRACTION = 0.04;
@@ -74,6 +83,13 @@ interface PipOverlayLayerProps {
   onAddPipOverlay: (sourcePath: string, sourceDuration: number, x: number, y: number, width: number, height: number, startTime: number, endTime: number) => string;
   onUpdatePipOverlayContent: (id: string, patch: PipOverlayPatch) => void;
   onDeletePipOverlay: (id: string) => void;
+  // The player's exact output time, for fades smoother than currentOutputTime's few ticks a second.
+  getOutputTime?: () => number | null;
+  // Video tracks switched off (VideoEditState.hiddenVideoTracks).
+  hiddenTracks?: number[];
+  // Opens the selected pip's panel when it changes (a fresh object each time) - e.g. right after a
+  // webcam bubble is lifted off the recording, to show its background being removed.
+  panelRequest?: { id: string } | null;
 }
 
 // Same click-vs-drag distinction every other drag surface in this app uses (VideoTimelineDocker's
@@ -197,7 +213,7 @@ function fitBoxToCrop(o: PipOverlay, crop: ClipCrop, srcW: number, srcH: number,
 // it the rest of the way" reasoning VideoTimelineDocker's audio-overlay sync effect already uses,
 // rather than fighting native playback with a write every tick. Shared by the on-canvas pip and
 // PipCropEditor's own full-frame copy of it.
-function usePipPlaybackSync(videoRef: React.RefObject<HTMLVideoElement | null>, overlay: PipOverlay, currentOutputTime: number, isPlaying: boolean) {
+function usePipPlaybackSync(videoRef: React.RefObject<HTMLMediaElement | null>, overlay: PipOverlay, currentOutputTime: number, isPlaying: boolean) {
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -223,6 +239,40 @@ const PIP_VIDEO_RESET_STYLE: React.CSSProperties = { maxWidth: "none", maxHeight
 
 type Gesture = { kind: "move" } | { kind: "resize"; edges: EdgeFlags };
 
+// The current frame of `video`, as pixels (asset:// video is CORS-clean - crossOrigin set below).
+function videoFramePixels(video: HTMLVideoElement): ImageData | null {
+  if (video.readyState < 2 || video.videoWidth === 0) return null;
+  const c = document.createElement("canvas");
+  c.width = video.videoWidth;
+  c.height = video.videoHeight;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  if (!g) return null;
+  g.drawImage(video, 0, 0);
+  try {
+    return g.getImageData(0, 0, c.width, c.height);
+  } catch {
+    return null;
+  }
+}
+
+// The average colour of a 5x5 patch of the frame around source pixel (x, y).
+function sampleFrameColor(frame: ImageData, x: number, y: number): string {
+  const sum = [0, 0, 0];
+  let n = 0;
+  for (let j = -2; j <= 2; j++) {
+    for (let i = -2; i <= 2; i++) {
+      const px = clamp(Math.round(x) + i, 0, frame.width - 1);
+      const py = clamp(Math.round(y) + j, 0, frame.height - 1);
+      const k = (py * frame.width + px) * 4;
+      sum[0] += frame.data[k];
+      sum[1] += frame.data[k + 1];
+      sum[2] += frame.data[k + 2];
+      n++;
+    }
+  }
+  return `#${sum.map((v) => Math.round(v / n).toString(16).padStart(2, "0")).join("")}`;
+}
+
 // One PiP's own box + <video> - kept as a subcomponent (not inlined in the .map() below) so its
 // currentTime/play-pause/drag state all follow the Rules of Hooks per-item, the same reason
 // AudioChipWaveform (VideoTimelineDocker.tsx) is its own component rather than computed inline.
@@ -234,11 +284,56 @@ const PipVideoElement: React.FC<{
   isSelected: boolean;
   onSelect: () => void;
   onChangeBox: (box: Box) => void;
-}> = ({ overlay, currentOutputTime, isPlaying, frameRect, isSelected, onSelect, onChangeBox }) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  getOutputTime?: () => number | null;
+  // Registers its <video> (green-screen colour picking and guessing need its frames).
+  onVideo: (video: HTMLVideoElement | null) => void;
+  // A click on it picks the green screen's colour instead of selecting/moving it.
+  pickingKey: boolean;
+  onPickKey: (color: string) => void;
+  // The mask while it's being dragged in the mask editor.
+  maskLive: LayerMask | null;
+}> = ({ overlay, currentOutputTime, isPlaying, frameRect, isSelected, onSelect, onChangeBox, getOutputTime, onVideo, pickingKey, onPickKey, maskLive }) => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  // Background removed: the cut-out plays as the picture (silent), and the source's own sound - when
+  // it's switched on - from a hidden <audio> kept in step the same way.
+  // A cut-out that won't load (deleted with the derived media) falls back to the original.
+  const [cutoutFailed, setCutoutFailed] = useState<string | null>(null);
+  const cutout = overlay.cutout && overlay.cutout.sourcePath === overlay.sourcePath && cutoutFailed !== overlay.cutout.path ? overlay.cutout.path : null;
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const sounds = overlay.muted === false;
+  const boxRef = useRef<HTMLDivElement>(null);
+  // WebGL keying unavailable - the plain video shows (export still keys).
+  const [keyFailed, setKeyFailed] = useState(false);
+
+  // Opacity and fade in/out (videoTracks.ts) - fades follow the player's exact time every frame,
+  // as export ramps the alpha linearly per frame.
+  const fading = (overlay.fadeIn ?? 0) > 0 || (overlay.fadeOut ?? 0) > 0;
+  const overlayRef = useRef(overlay);
+  overlayRef.current = overlay;
+  useEffect(() => {
+    if (!fading) return;
+    let raf = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const now = getOutputTime?.();
+      if (now === null || now === undefined || !boxRef.current) return;
+      boxRef.current.style.opacity = String(layerOpacityAt(overlayRef.current, now));
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [fading, getOutputTime]);
   const [sourceSize, setSourceSize] = useState<{ width: number; height: number } | null>(null);
 
   usePipPlaybackSync(videoRef, overlay, currentOutputTime, isPlaying);
+  usePipPlaybackSync(audioRef, overlay, currentOutputTime, isPlaying);
+  // What shows behind the cut-out person (cutoutBackground.ts) - for "blur", the original video
+  // again, blurred, kept in step like the rest.
+  const cutoutRegion = cutout ? overlay.cutout?.region : undefined;
+  const background = cutout ? overlay.cutout?.background : undefined;
+  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [originalSize, setOriginalSize] = useState<{ width: number; height: number } | null>(null);
+  usePipPlaybackSync(bgVideoRef, overlay, currentOutputTime, isPlaying);
 
   // Volume is a plain property write (no attribute equivalent) - `muted` below is a real HTML
   // attribute instead, so both preview and export (pip_overlay_chain, conversion.rs) read the
@@ -247,12 +342,21 @@ const PipVideoElement: React.FC<{
   // this app (before `volume` existed on PipOverlay) loads back with volume:undefined, and
   // Math.min(1, undefined) is NaN. Falls back to the type's own documented default (1) exactly the
   // way every other "undefined means 1" field on this type already reads.
+  // Solo on another mixer channel silences it (preview only); its mixer effects route it through
+  // the track-fx worklet (mixerGraph.ts) once it has any, or the mixer's meters want it.
+  const mixer = useMixerSession();
+  const soloOff = silencedBySolo(mixer, pipChannelKey(overlay.id));
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
+    const sound = cutout ? audioRef.current : videoRef.current;
+    if (!sound) return;
     const volume = Number.isFinite(overlay.volume) ? overlay.volume : 1;
-    video.volume = Math.max(0, Math.min(1, volume));
-  }, [overlay.volume]);
+    sound.volume = soloOff ? 0 : Math.max(0, Math.min(1, volume));
+  }, [overlay.volume, soloOff, cutout, sounds]);
+  useEffect(() => {
+    const sound = cutout ? audioRef.current : videoRef.current;
+    if (!sound || overlay.muted !== false) return;
+    syncElementFx(sound, `pip:${overlay.id}`, overlay.fx, !isNeutralFx(overlay.fx) || mixer.open);
+  }, [overlay.id, overlay.fx, overlay.muted, mixer.open, cutout]);
 
   // Live (uncommitted) box while a move/resize gesture is in progress - only committed (one
   // onChangeBox -> one pushCommand) on release, so dragging never spams undo history with one
@@ -272,6 +376,16 @@ const PipVideoElement: React.FC<{
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
+    if (pickingKey && gesture.kind === "move") {
+      // The pixel under the pointer, in the source frame (through the box's cover layout).
+      const video = videoRef.current;
+      const rect = boxRef.current?.getBoundingClientRect();
+      const frame = video ? videoFramePixels(video) : null;
+      if (video && rect && frame && layout) {
+        onPickKey(sampleFrameColor(frame, (e.clientX - rect.left - layout.left) / layout.scale, (e.clientY - rect.top - layout.top) / layout.scale));
+      }
+      return;
+    }
     const start = { x: overlay.x, y: overlay.y, width: overlay.width, height: overlay.height };
     gestureRef.current = { gesture, clientX: e.clientX, clientY: e.clientY, start, moved: false };
   };
@@ -329,7 +443,33 @@ const PipVideoElement: React.FC<{
   const clipPath = overlay.shape === "circle" ? "ellipse(50% 50% at 50% 50%)" : undefined;
   // Fraction of the pip box's OWN height - the same basis export's rounded mask uses.
   const borderRadius = overlay.shape === "rounded" ? (overlay.cornerRadius ?? 0.08) * height : 0;
-  const layout = sourceSize ? coverLayout(width, height, sourceSize.width, sourceSize.height, validCrop(overlay.crop)) : null;
+  // A cut-out of just a region is already cropped to it.
+  const layout = sourceSize ? coverLayout(width, height, sourceSize.width, sourceSize.height, validCrop(cutoutRegion ? undefined : overlay.crop)) : null;
+  // A mask (with the shape folded in) shows through the same picture export multiplies in
+  // (layerMask.ts), at the box's on-screen size.
+  const mask = maskLive ?? overlay.mask;
+  const maskKey = mask ? JSON.stringify(mask) : "";
+  const maskUrl = useMemo(
+    () => (mask && width >= 1 && height >= 1 ? layerMaskAlphaUrl({ shape: overlay.shape, cornerRadius: overlay.cornerRadius, mask }, width, height) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [maskKey, overlay.shape, overlay.cornerRadius, Math.round(width), Math.round(height)]
+  );
+  const maskStyle: React.CSSProperties = maskUrl
+    ? { maskImage: `url(${maskUrl})`, WebkitMaskImage: `url(${maskUrl})`, maskSize: "100% 100%", WebkitMaskSize: "100% 100%", maskRepeat: "no-repeat", WebkitMaskRepeat: "no-repeat" }
+    : {};
+  const keyed = !cutout && !!overlay.chromaKey && !keyFailed;
+  // The blurred original: fitted to the box grown by the blur's reach on every side, so the edges
+  // inside the box stay full - as export draws it (cutoutBackgroundForExport).
+  const blurStyle: React.CSSProperties | null = (() => {
+    if (background?.kind !== "blur" || !originalSize) return null;
+    const sigma = blurSigma(background.amount, height);
+    const m = blurMargin(sigma);
+    const r = coverRect(width + 2 * m, height + 2 * m, originalSize.width, originalSize.height, cutoutRegion ?? validCrop(overlay.crop));
+    return { ...PIP_VIDEO_RESET_STYLE, objectFit: "fill", left: r.left - m, top: r.top - m, width: r.width, height: r.height, filter: `blur(${sigma}px)` };
+  })();
+  const mediaStyle: React.CSSProperties = layout
+    ? { ...PIP_VIDEO_RESET_STYLE, objectFit: "fill", left: layout.left, top: layout.top, width: layout.width, height: layout.height }
+    : { ...PIP_VIDEO_RESET_STYLE, objectFit: "cover", width: "100%", height: "100%" };
 
   const HIT = 20;
   const DOT = 9;
@@ -348,28 +488,59 @@ const PipVideoElement: React.FC<{
   return (
     <>
       <div
+        ref={boxRef}
         data-pip-interactive
         onPointerDown={beginGesture({ kind: "move" })}
-        title="Drag to move - click to edit size, shape and crop"
-        className={`absolute overflow-hidden cursor-move ${isSelected ? "" : "hover:brightness-110"}`}
+        title={pickingKey ? "Click the green screen to key out that colour" : "Drag to move - click to edit size, shape and crop"}
+        className={`absolute overflow-hidden ${pickingKey ? "cursor-crosshair" : "cursor-move"} ${isSelected ? "" : "hover:brightness-110"}`}
         style={{
           left,
           top,
           width,
           height,
-          clipPath,
-          WebkitClipPath: clipPath,
-          borderRadius,
+          // The mask picture carries the shape too, when there is one.
+          clipPath: maskUrl ? undefined : clipPath,
+          WebkitClipPath: maskUrl ? undefined : clipPath,
+          borderRadius: maskUrl ? 0 : borderRadius,
+          ...maskStyle,
           pointerEvents: "auto",
           touchAction: "none",
           zIndex: isSelected ? SELECTED_PIP_Z_INDEX : undefined,
           mixBlendMode: cssBlendMode(overlay.blendMode),
+          opacity: layerOpacityAt(overlay, currentOutputTime),
         }}
       >
+        {background?.kind === "color" && <div className="absolute inset-0 pointer-events-none" style={{ background: background.color }} />}
+        {background?.kind === "image" && (
+          <img src={convertFileSrc(background.path)} alt="" draggable={false} className="absolute inset-0 w-full h-full object-cover pointer-events-none" style={PIP_VIDEO_RESET_STYLE} />
+        )}
+        {background?.kind === "blur" && (
+          <video
+            ref={bgVideoRef}
+            src={convertFileSrc(overlay.sourcePath)}
+            muted
+            playsInline
+            loop
+            draggable={false}
+            onLoadedMetadata={(e) => {
+              const size = { width: e.currentTarget.videoWidth, height: e.currentTarget.videoHeight };
+              if (size.width > 0 && size.height > 0) setOriginalSize(size);
+            }}
+            className="absolute pointer-events-none"
+            style={blurStyle ?? { opacity: 0 }}
+          />
+        )}
         <video
-          ref={videoRef}
-          src={convertFileSrc(overlay.sourcePath)}
-          muted={overlay.muted ?? true}
+          ref={(el) => {
+            videoRef.current = el;
+            setVideoEl(el);
+            onVideo(el);
+          }}
+          src={convertFileSrc(cutout ?? overlay.sourcePath)}
+          // Lets Web Audio read its sound (the mixer) - asset:// answers CORS.
+          crossOrigin="anonymous"
+          muted={cutout ? true : overlay.muted ?? true}
+          onError={() => cutout && setCutoutFailed(cutout)}
           playsInline
           loop
           draggable={false}
@@ -378,12 +549,18 @@ const PipVideoElement: React.FC<{
             if (size.width > 0 && size.height > 0) setSourceSize(size);
           }}
           className={`absolute pointer-events-none ${layout ? "" : "inset-0"}`}
-          style={
-            layout
-              ? { ...PIP_VIDEO_RESET_STYLE, objectFit: "fill", left: layout.left, top: layout.top, width: layout.width, height: layout.height }
-              : { ...PIP_VIDEO_RESET_STYLE, objectFit: "cover", width: "100%", height: "100%" }
-          }
+          style={mediaStyle}
         />
+        {cutout && sounds && <audio ref={audioRef} src={convertFileSrc(overlay.sourcePath)} crossOrigin="anonymous" preload="auto" style={{ display: "none" }} />}
+        {keyed && overlay.chromaKey && (
+          <ChromaKeyCanvas
+            video={videoEl}
+            chromaKey={overlay.chromaKey}
+            className={`absolute pointer-events-none ${layout ? "" : "inset-0"}`}
+            style={mediaStyle}
+            onUnavailable={() => setKeyFailed(true)}
+          />
+        )}
       </div>
       {isSelected && (
         <>
@@ -513,13 +690,43 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
   onAddPipOverlay,
   onUpdatePipOverlayContent,
   onDeletePipOverlay,
+  getOutputTime,
+  hiddenTracks,
+  panelRequest,
 }) => {
   const [popoverOpen, setPopoverOpen] = useState(false);
+  useEffect(() => {
+    if (panelRequest) setPopoverOpen(true);
+  }, [panelRequest]);
   // Zero-size marker at the frame's own top-left (this layer's coordinate origin) - lets the
   // popover anchor and default placement below convert frame fractions to viewport pixels.
   const originRef = useRef<HTMLDivElement>(null);
   // The pip whose PipCropEditor is open, if any - opened from PipOverlayPopover's Crop button.
   const [croppingPipId, setCroppingPipId] = useState<string | null>(null);
+  // Each active pip's <video>, for reading its frames (green-screen colour).
+  const videoEls = useRef(new Map<string, HTMLVideoElement>());
+  // Picking the green screen's colour on a pip (its next click samples the frame).
+  const [pickingKeyFor, setPickingKeyFor] = useState<string | null>(null);
+  // Editing a pip's mask on the canvas (MaskEditor), and whether the next drag draws a new outline.
+  const [maskEdit, setMaskEdit] = useState<{ id: string; drawing: boolean } | null>(null);
+  const [maskLive, setMaskLive] = useState<LayerMask | null>(null);
+  // Escape leaves picking/mask editing.
+  useEffect(() => {
+    if (!pickingKeyFor && !maskEdit) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      setPickingKeyFor(null);
+      setMaskEdit(null);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [pickingKeyFor, maskEdit]);
+  // Both end when the pip is no longer the selected one.
+  useEffect(() => {
+    if (pickingKeyFor && pickingKeyFor !== selectedPipOverlayId) setPickingKeyFor(null);
+    if (maskEdit && maskEdit.id !== selectedPipOverlayId) setMaskEdit(null);
+  }, [selectedPipOverlayId, pickingKeyFor, maskEdit]);
 
   // Same "snapshot once, synchronously, right as placement is armed" reasoning as VideoOverlayLayer's
   // own image-placement effect - avoids re-running (and re-opening the file dialog) if unrelated
@@ -579,7 +786,8 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPlacingPip]);
 
-  const active = overlaysActiveAt(pipOverlays, currentOutputTime);
+  // Bottom track first, so later DOM draws over earlier - the export's compositing order.
+  const active = stackOrder(overlaysActiveAt(pipOverlays, currentOutputTime).filter((o) => !isTrackHidden(hiddenTracks, pipTrack(o))));
   const selected = selectedPipOverlayId ? pipOverlays.find((o) => o.id === selectedPipOverlayId) : undefined;
   const cropping = croppingPipId ? pipOverlays.find((o) => o.id === croppingPipId) : undefined;
 
@@ -636,6 +844,17 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
             }
           }}
           onChangeBox={(box) => onUpdatePipOverlayContent(o.id, box)}
+          getOutputTime={getOutputTime}
+          onVideo={(el) => {
+            if (el) videoEls.current.set(o.id, el);
+            else videoEls.current.delete(o.id);
+          }}
+          pickingKey={pickingKeyFor === o.id}
+          onPickKey={(color) => {
+            onUpdatePipOverlayContent(o.id, { chromaKey: { ...(o.chromaKey ?? DEFAULT_CHROMA_KEY), color } });
+            setPickingKeyFor(null);
+          }}
+          maskLive={maskEdit?.id === o.id ? maskLive : null}
         />
       ))}
       {selected && popoverOpen && !cropping && (
@@ -656,6 +875,40 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
             setCroppingPipId(selected.id);
             setPopoverOpen(false);
           }}
+          onEnableKey={() => {
+            // Start from the screen's own colour: the median of the frame's border.
+            const video = videoEls.current.get(selected.id);
+            const frame = video ? videoFramePixels(video) : null;
+            const color = frame ? guessKeyColor(frame.data, frame.width, frame.height) : DEFAULT_CHROMA_KEY.color;
+            onUpdatePipOverlayContent(selected.id, { chromaKey: { ...DEFAULT_CHROMA_KEY, color } });
+          }}
+          pickingKey={pickingKeyFor === selected.id}
+          onTogglePickKey={() => setPickingKeyFor((id) => (id === selected.id ? null : selected.id))}
+          maskEditing={maskEdit?.id === selected.id}
+          onSetMaskShape={(shape) => {
+            if (shape === null) {
+              onUpdatePipOverlayContent(selected.id, { mask: undefined });
+              setMaskEdit(null);
+            } else if (shape === "path") {
+              setMaskEdit({ id: selected.id, drawing: true });
+            } else {
+              const from = selected.mask ?? DEFAULT_MASK;
+              onUpdatePipOverlayContent(selected.id, { mask: { ...from, shape, points: undefined } });
+              setMaskEdit({ id: selected.id, drawing: false });
+            }
+          }}
+          onToggleMaskEdit={() => setMaskEdit((m) => (m?.id === selected.id ? null : { id: selected.id, drawing: false }))}
+        />
+      )}
+      {selected && maskEdit?.id === selected.id && overlaysActiveAt([selected], currentOutputTime).length > 0 && (selected.mask || maskEdit.drawing) && (
+        <MaskEditor
+          box={{ left: selected.x * frameRect.width, top: selected.y * frameRect.height, width: selected.width * frameRect.width, height: selected.height * frameRect.height }}
+          mask={selected.mask ?? { ...DEFAULT_MASK, x: 0, y: 0, width: 1, height: 1 }}
+          drawing={maskEdit.drawing}
+          zIndex={SELECTED_PIP_Z_INDEX + 1}
+          onLive={setMaskLive}
+          onCommit={(mask) => onUpdatePipOverlayContent(selected.id, { mask: placeMask(mask, mask) })}
+          onDrawn={() => setMaskEdit({ id: selected.id, drawing: false })}
         />
       )}
       {cropping && (

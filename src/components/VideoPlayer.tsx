@@ -33,6 +33,8 @@ import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
 import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
 import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
+import { isNeutralFx, type AudioFx } from '../utils/audioFx';
+import { createTrackFxNode, loadTrackFxModule, resumeMixer, setNodeFx } from '../utils/mixerGraph';
 import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile } from '../utils/captions';
 import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
 import CaptionOverlayLayer from './video/CaptionOverlayLayer';
@@ -190,6 +192,11 @@ interface VideoPlayerProps {
   // itself is actually set to.
   trackVolume?: number; // 0..1, defaults to 1
   trackMuted?: boolean;
+  // The video sound's mixer effects (EQ/compressor/balance - audioFx.ts), played through the
+  // track-fx worklet after everything else; `meterTrack` routes the sound through it even with no
+  // effects set, so the mixer's meter can read its level.
+  trackFx?: AudioFx;
+  meterTrack?: boolean;
   // The currently active clip's own color grade/Ken Burns fields (VideoTimelineDocker's
   // onActiveClipChange, threaded through by Dashboard) - null/undefined means "no clip tracked
   // yet or neither effect set", same as trackVolume/trackMuted this component stays fully clip-
@@ -299,7 +306,7 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange }, ref) => {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -356,6 +363,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     }
     return mediaSourceRef.current;
   };
+  // The video sound's mixer channel: bus -> track-fx worklet -> monitor -> speakers. The user's own
+  // listening volume moves to `monitor` once this exists (the element then plays at just the track
+  // level), so the compressor reacts to the level the export mixes at, not to how loud the user
+  // happens to be listening. Built once, the first time effects or the meter are wanted.
+  const trackFxRef = useRef<{ node: AudioWorkletNode; monitor: GainNode } | null>(null);
+  const trackFxSetupRef = useRef(false);
+  const [trackFxReady, setTrackFxReady] = useState(false);
+  const trackFxLatestRef = useRef(trackFx);
+  trackFxLatestRef.current = trackFx;
   // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only).
   const audioAnalyserRef = useRef<AnalyserNode | null>(null);
   const visualizerCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -1708,9 +1724,53 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // trackMuted collapses this to 0 outright rather than touching video.muted - silence from a 0
   // volume and silence from the muted flag are indistinguishable to the ear, so there's no need to
   // juggle two separate "why is this silent" states for what the local mute button already owns.
+  // With the mixer channel built, the listening volume is applied after its effects instead.
   useEffect(() => {
-    setVolume(videoRef.current, volume * (trackMuted ? 0 : trackVolume));
-  }, [volume, trackVolume, trackMuted]);
+    const fx = trackFxRef.current;
+    if (fx) {
+      setVolume(videoRef.current, trackMuted ? 0 : trackVolume);
+      fx.monitor.gain.value = Math.max(0, Math.min(1, volume));
+    } else {
+      setVolume(videoRef.current, volume * (trackMuted ? 0 : trackVolume));
+    }
+  }, [volume, trackVolume, trackMuted, trackFxReady]);
+
+  const trackFxKey = JSON.stringify(trackFx ?? null);
+  useEffect(() => {
+    const existing = trackFxRef.current;
+    if (existing) {
+      setNodeFx(existing.node, trackFx);
+      return;
+    }
+    if ((isNeutralFx(trackFx) && !meterTrack) || trackFxSetupRef.current) return;
+    const ctx = noiseCtxRef.current;
+    if (!ctx || !videoRef.current) return;
+    trackFxSetupRef.current = true;
+    loadTrackFxModule(ctx)
+      .then(() => {
+        const video = videoRef.current;
+        if (noiseGraphUnmountedRef.current || !video) return;
+        // Rewired in one synchronous block (see attachMediaSource) - no gap in the sound.
+        const { bus } = attachMediaSource(ctx, video);
+        const node = createTrackFxNode(ctx, 'video');
+        const monitor = new GainNode(ctx, { gain: 1 });
+        try {
+          bus.disconnect(ctx.destination);
+        } catch {
+          // Not connected straight to the speakers - nothing to undo.
+        }
+        bus.connect(node).connect(monitor).connect(ctx.destination);
+        setNodeFx(node, trackFxLatestRef.current);
+        trackFxRef.current = { node, monitor };
+        setTrackFxReady(true);
+        if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      })
+      .catch((err) => console.error('Mixer effects unavailable on the video sound:', err))
+      .finally(() => {
+        trackFxSetupRef.current = false;
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackFxKey, meterTrack]);
 
   // Live-preview color grade - a direct CSS `filter` write on the <video> element itself, the
   // export-side counterpart being ffmpeg's eq/colorbalance/vignette chain (conversion.rs). Cleared
@@ -2221,6 +2281,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     if (!video) return;
 
     const handlePlay = (): void => {
+      // Sound routed through Web Audio (cleanup, mixer) is silent while its context is suspended.
+      if (noiseCtxRef.current?.state === 'suspended' && mediaSourceRef.current) noiseCtxRef.current.resume().catch(() => {});
+      resumeMixer();
       setIsPlaying(true);
       setIsPaused(false);
       onPlayStateChange?.(true);
@@ -2237,7 +2300,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     };
 
     const handleVolumeChange = (): void => {
-      setVolumeLevel(getVolumeLevel(video.volume, video.muted));
+      // With the mixer channel built, what's heard is the element's (track) volume times the monitor's.
+      setVolumeLevel(getVolumeLevel(video.volume * (trackFxRef.current?.monitor.gain.value ?? 1), video.muted));
     };
 
     const handleEnded = (): void => {

@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, State, Window};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use crate::services::responsiveness::blocking;
+use crate::services::audio_fx::{audio_fx_filters, mono_to_stereo_filter, AudioFxSpec};
 use crate::services::utility::{get_ffmpeg_path, get_ffprobe_path, path_to_str};
 
 #[cfg(windows)]
@@ -3415,7 +3416,7 @@ async fn stabilization_transforms(app_handle: &AppHandle, source_path: &str, sta
 
 // A name for a file the editor derives from a clip, unique to its source, range and kind - so asking
 // again for the same thing finds the file already made instead of rendering it twice.
-fn derived_media_path(source_path: &str, kind: &str, key: &str, ext: &str) -> Result<PathBuf, String> {
+pub(crate) fn derived_media_path(source_path: &str, kind: &str, key: &str, ext: &str) -> Result<PathBuf, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -4026,6 +4027,9 @@ pub struct OverlayAudio {
     // Music ducking: lowered to `level` while someone speaks - see duck_volume_filter.
     #[serde(default)]
     pub duck: Option<DuckEnvelope>,
+    // The mixer channel's EQ/compressor/balance (audio_fx.rs), after the volume and fades.
+    #[serde(default)]
+    pub fx: Option<AudioFxSpec>,
 }
 
 // Where to lower a music track under speech, worked out by the frontend (src/utils/musicDucking.ts,
@@ -4104,6 +4108,116 @@ pub struct PipOverlay {
     // CSS mix-blend-mode, as OverlayImage.blend_mode.
     #[serde(default)]
     pub blend_mode: Option<String>,
+    // Its sound's EQ/compressor/balance (audio_fx.rs), as OverlayAudio.fx.
+    #[serde(default)]
+    pub fx: Option<AudioFxSpec>,
+    // 0..1 (None = 1), and linear alpha ramps at its ends in seconds (already capped at half its
+    // length by the frontend - videoTracks.ts exportFades).
+    #[serde(default)]
+    pub opacity: Option<f64>,
+    #[serde(default)]
+    pub fade_in: f64,
+    #[serde(default)]
+    pub fade_out: f64,
+    // Green/blue-screen keying (chroma_key_filters); None = none.
+    #[serde(default)]
+    pub chroma_key: Option<ChromaKeySpec>,
+    // A grey PNG the size of the box (white = shown): the layer's shape and its mask, feathered,
+    // rendered by the frontend (layerMask.ts) - the very picture the preview masks with. Multiplied
+    // into the layer's alpha. None: the shape alone, drawn here (geq).
+    #[serde(default)]
+    pub mask_data_base64: Option<String>,
+    // Filled in by export_trimmed_video, not sent: how the preview decoded the source's colours
+    // (probe_browser_color), and the ffmpeg input holding the mask PNG.
+    #[serde(skip)]
+    pub source_color: Option<(&'static str, &'static str)>,
+    #[serde(skip)]
+    pub mask_input: Option<usize>,
+    // The person cut out of the source (background_removal.rs): a VP9+alpha WebM shown in place of
+    // the source's picture. Its sound still comes from the source.
+    #[serde(default)]
+    pub cutout_path: Option<String>,
+    // What shows behind a cut-out person, inside the layer (none = see-through).
+    #[serde(default)]
+    pub cutout_background: Option<CutoutBackgroundSpec>,
+    // Filled in by export_trimmed_video: the inputs holding its picture and, when that's the
+    // cut-out, its sound - and its background's (the source again, or the picture).
+    #[serde(skip)]
+    pub video_input: usize,
+    #[serde(skip)]
+    pub audio_input: Option<usize>,
+    #[serde(skip)]
+    pub background_input: Option<usize>,
+}
+
+// Behind a cut-out (cutoutBackground.ts): "color" - a solid colour; "image" - a picture, already
+// fitted to the layer's box by the frontend (the very drawing the preview shows); "blur" - the
+// source itself (its `source_crop` part) blurred by `blur_sigma` output pixels, drawn
+// `blur_margin` px larger on each side before the blur so its edges stay full (the preview draws
+// it the same way).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CutoutBackgroundSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub image_base64: Option<String>,
+    #[serde(default)]
+    pub blur_sigma: Option<f64>,
+    #[serde(default)]
+    pub blur_margin: Option<i64>,
+    #[serde(default)]
+    pub source_crop: Option<PipCrop>,
+}
+
+// The filters putting `bg` behind the cut-out [cut] (both the layer's size), writing [out] - empty
+// when the background can't be drawn (it then stays see-through).
+fn cutout_background_chain(pip: &PipOverlay, bg: &CutoutBackgroundSpec, cut: &str, tag: &str, out: &str) -> String {
+    let (w, h, st) = (pip.width, pip.height, pip.start_time);
+    let dur = (pip.end_time - pip.start_time).max(0.01) + 0.1;
+    let base = match bg.kind.as_str() {
+        "color" => {
+            let hex = bg.color.as_deref().map(|c| c.trim().trim_start_matches('#')).and_then(|c| u32::from_str_radix(c, 16).ok()).unwrap_or(0) & 0xff_ffff;
+            format!("color=c=0x{hex:06x}:s={w}x{h}:r={OVERLAY_INPUT_FPS}:d={dur:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}bg];")
+        }
+        "image" => match pip.background_input {
+            Some(input) => format!(
+                "color=c=black:s={w}x{h}:r={OVERLAY_INPUT_FPS}:d={dur:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}bb];\
+                 [{input}:v]scale={w}:{h},setpts=PTS-STARTPTS+{st:.4}/TB[{tag}bi];[{tag}bb][{tag}bi]overlay=eof_action=repeat:format=auto,format=yuv420p[{tag}bg];"
+            ),
+            None => return String::new(),
+        },
+        "blur" => match pip.background_input {
+            Some(input) => {
+                let sigma = bg.blur_sigma.filter(|s| s.is_finite()).unwrap_or(0.0).max(0.0);
+                let m = bg.blur_margin.unwrap_or(0).clamp(0, 4096);
+                let (bw, bh) = (w + 2 * m, h + 2 * m);
+                let blur = gaussian_blur_chain(sigma, bw, bh, None);
+                let blur = if blur.is_empty() { String::new() } else { format!("{blur},") };
+                format!(
+                    "[{input}:v]trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS+{st:.4}/TB,{crop}scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},format=yuv420p,{blur}crop={w}:{h}:{m}:{m}[{tag}bg];",
+                    ts = pip.trim_start,
+                    te = pip.trim_start + dur,
+                    crop = pip_crop_fragment(bg.source_crop),
+                )
+            }
+            None => return String::new(),
+        },
+        _ => return String::new(),
+    };
+    format!("{base}[{tag}bg][{cut}]overlay=shortest=1:format=auto,format=yuv420p[{out}];")
+}
+
+// A key colour ("#rrggbb"), how close to it counts as screen and how soft the edge is (ffmpeg
+// chromakey's similarity/blend), and how much screen-coloured spill to take out of the subject.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChromaKeySpec {
+    pub color: String,
+    pub similarity: f64,
+    pub blend: f64,
+    #[serde(default)]
+    pub spill: f64,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -4146,6 +4260,70 @@ fn sanitize_pip_shape(shape: &str) -> &str {
         .unwrap_or("rectangle")
 }
 
+// How the webview decodes a source's colours to RGB, as scale's in_color_matrix/in_range values: its
+// own tags when it has them; untagged, BT.709 from 720 rows up and BT.601 below, limited range -
+// measured on WebView2's decoder (an untagged 1280x718 frame decodes as 601, 64x720 as 709).
+// ffmpeg on its own would assume BT.601 for all of them.
+pub(crate) fn browser_color_for(color_space: &str, color_range: &str, height: i64) -> (&'static str, &'static str) {
+    let matrix = match color_space {
+        "bt709" => "bt709",
+        "smpte170m" | "bt470bg" => "bt601",
+        "bt2020nc" | "bt2020c" => "bt2020",
+        "smpte240m" => "smpte240m",
+        "fcc" => "fcc",
+        _ if height >= 720 => "bt709",
+        _ => "bt601",
+    };
+    let range = if matches!(color_range, "pc" | "jpeg") { "pc" } else { "tv" };
+    (matrix, range)
+}
+
+fn probe_browser_color(ffprobe_path: &PathBuf, source_path: &str) -> (&'static str, &'static str) {
+    let mut cmd = Command::new(ffprobe_path);
+    cmd.args(["-v", "quiet", "-select_streams", "v:0", "-show_entries", "stream=height,color_space,color_range", "-of", "json", source_path]);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let stream = cmd
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| v["streams"].get(0).cloned())
+        .unwrap_or_default();
+    browser_color_for(stream["color_space"].as_str().unwrap_or(""), stream["color_range"].as_str().unwrap_or(""), stream["height"].as_i64().unwrap_or(0))
+}
+
+// The YUV matrix a player will decode an untagged export of `frame_height` rows with - what a keyed
+// layer's colours are converted back to (the same 720-row rule as browser_color_for).
+fn output_matrix(frame_height: i64) -> &'static str {
+    if frame_height >= 720 { "bt709" } else { "bt601" }
+}
+
+// Green/blue-screen keying - the filter fragment (no trailing comma) taking a source frame to
+// straight-alpha rgba. The preview's shader (ChromaKeyCanvas.tsx) runs the same maths, checked
+// against these filters in chromaKey.test.ts:
+//   1. to RGB the way the webview decodes it (`source`: matrix, range), then full-range BT.601 YUV
+//      4:4:4 - the space chromakey measures chroma in (it's chroma only, so shadows key too);
+//   2. chromakey: alpha from the 3x3 neighbourhood's distance to the key colour's (U,V);
+//   3. back to RGB, then despill: the screen channel pulled toward the average of the other two.
+fn chroma_key_filters(k: &ChromaKeySpec, (matrix, range): (&str, &str)) -> String {
+    let hex = u32::from_str_radix(k.color.trim().trim_start_matches('#'), 16).unwrap_or(0x00b140) & 0xff_ffff;
+    let finite = |v: f64, d: f64| if v.is_finite() { v } else { d };
+    let similarity = finite(k.similarity, 0.12).clamp(0.01, 1.0);
+    let blend = finite(k.blend, 0.08).clamp(0.0, 1.0);
+    let spill = finite(k.spill, 0.0).clamp(0.0, 1.0);
+    let mut f = format!(
+        "scale=in_color_matrix={matrix}:in_range={range},format=gbrp,scale=out_color_matrix=bt601:out_range=pc,format=yuv444p,\
+         chromakey=color=0x{hex:06x}:similarity={similarity}:blend={blend},scale=in_color_matrix=bt601:in_range=pc,format=rgba"
+    );
+    if spill > 0.0 {
+        // Blue screen when the key leans blue, as spillType (chromaKey.ts) decides.
+        let (g, b) = ((hex >> 8) & 0xff, hex & 0xff);
+        let (kind, green, blue) = if b > g { ("blue", 0.0, -spill) } else { ("green", -spill, 0.0) };
+        f.push_str(&format!(",despill=type={kind}:mix=0.5:expand=0:red=0:green={green}:blue={blue}:brightness=0:alpha=0"));
+    }
+    f
+}
+
 // One PiP overlay's filter-graph fragment: trims this overlay's own [trim_start, trim_start+
 // duration) window out of its (already `-i`'d, full-length) source, scales it to fill exactly
 // `width`x`height` - `force_original_aspect_ratio=increase` then `crop` is the standard ffmpeg
@@ -4170,15 +4348,64 @@ fn pip_overlay_chain(
     // Re-timed to start at the PiP's own start_time on the output timeline - starting it at 0 made
     // the overlay below (which takes the latest frame at or before each output moment) show the
     // wrong part of the source, or freeze on its last frame, whenever a PiP didn't start at 0:00.
+    // A keyed layer is keyed at the source's own size (as the preview's shader keys the decoded
+    // frame), scaled with its alpha premultiplied (as the browser scales it - no screen-coloured
+    // fringe), and converted back to YUV with the matrix the export will be watched with.
+    // A cut-out (background_removal.rs) already carries its alpha - tagged BT.709, as it was written.
+    let alpha_source = if pip.cutout_path.is_some() {
+        Some("scale=in_color_matrix=bt709:in_range=tv,format=rgba".to_string())
+    } else {
+        pip.chroma_key.as_ref().map(|k| chroma_key_filters(k, pip.source_color.unwrap_or(("bt601", "tv"))))
+    };
+    let (key, cover_scale, to_yuv) = match alpha_source {
+        Some(to_rgba) => (
+            format!("{to_rgba},"),
+            format!("premultiply=inplace=1,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},unpremultiply=inplace=1", w = pip.width, h = pip.height),
+            format!(",scale=out_color_matrix={}:out_range=tv,format=yuva420p", output_matrix(frame.map_or(0, |(_, h)| h))),
+        ),
+        None => (String::new(), format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}", w = pip.width, h = pip.height), String::new()),
+    };
     let cover = format!(
-        "trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS+{st:.4}/TB,{src_crop}scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}",
-        ts = pip.trim_start, te = trim_end, st = pip.start_time, src_crop = pip_crop_fragment(pip.crop), w = pip.width, h = pip.height
+        "trim=start={ts:.3}:end={te:.3},setpts=PTS-STARTPTS+{st:.4}/TB,{src_crop}{key}{cover_scale}{to_yuv}",
+        ts = pip.trim_start, te = trim_end, st = pip.start_time, src_crop = pip_crop_fragment(pip.crop)
     );
     let shape = sanitize_pip_shape(&pip.shape);
     let video_label = format!("pip{}v", stage_index);
 
     let mut chain = String::new();
-    let composited_label = match shape {
+    // With a mask PNG (shape and mask together, from the frontend) or a key, the picture's own
+    // alpha is kept and the mask multiplied into it; otherwise the shape is drawn here.
+    let composited_label = if pip.mask_input.is_some() || pip.chroma_key.is_some() || pip.cutout_path.is_some() {
+        chain.push_str(&format!("[{input_index}:v]{cover}[{video_label}];"));
+        // A cut-out's background goes in behind the person first; shape and mask then cut both.
+        let video_label = match (pip.cutout_path.as_ref(), pip.cutout_background.as_ref()) {
+            (Some(_), Some(bg)) => {
+                let out = format!("pip{stage_index}bgo");
+                let bg_chain = cutout_background_chain(pip, bg, &video_label, &format!("pip{stage_index}"), &out);
+                if bg_chain.is_empty() {
+                    video_label
+                } else {
+                    chain.push_str(&bg_chain);
+                    out
+                }
+            }
+            _ => video_label,
+        };
+        match pip.mask_input {
+            Some(mask) => {
+                let t = format!("pip{stage_index}k");
+                chain.push_str(&format!(
+                    "[{video_label}]format=yuva420p,split=2[{t}c][{t}a0];[{t}a0]alphaextract[{t}a];\
+                     [{mask}:v]format=gray,scale={w}:{h},setpts=PTS-STARTPTS+{st:.4}/TB[{t}m];\
+                     [{t}a][{t}m]blend=all_mode=multiply[{t}ma];[{t}c][{t}ma]alphamerge[{t}out];",
+                    w = pip.width, h = pip.height, st = pip.start_time
+                ));
+                format!("{t}out")
+            }
+            None => video_label,
+        }
+    } else {
+        match shape {
         "rectangle" => {
             chain.push_str(&format!("[{}:v]{}[{}];", input_index, cover, video_label));
             video_label
@@ -4227,7 +4454,10 @@ fn pip_overlay_chain(
             ));
             masked_label
         }
+        }
     };
+
+    let composited_label = pip_alpha_stage(pip, stage_index, composited_label, &mut chain);
 
     if let (Some(mode), Some(frame)) = (pip.blend_mode.as_deref().and_then(blend_mode_ffmpeg), frame) {
         let layer = BlendLayer { label: &composited_label, x: pip.x.to_string(), y: pip.y.to_string(), width: pip.width, height: pip.height, moving: false, fps: PIP_BLEND_FPS };
@@ -4239,6 +4469,35 @@ fn pip_overlay_chain(
         current = current_label, composited = composited_label, x = pip.x, y = pip.y, start = pip.start_time, end = pip.end_time, out = out_label
     ));
     chain
+}
+
+// A layer's opacity and fade in/out: its alpha scaled, the fades as linear ramps over its own
+// (re-timed) frames - the same curve layerOpacityAt (videoTracks.ts) draws in the preview. Returns
+// the label to composite (`label` itself when there's nothing to do).
+fn pip_alpha_stage(pip: &PipOverlay, stage_index: usize, label: String, chain: &mut String) -> String {
+    let opacity = pip.opacity.unwrap_or(1.0);
+    let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
+    let half = ((pip.end_time - pip.start_time) / 2.0).max(0.0);
+    let fade_in = if pip.fade_in.is_finite() { pip.fade_in.clamp(0.0, half) } else { 0.0 };
+    let fade_out = if pip.fade_out.is_finite() { pip.fade_out.clamp(0.0, half) } else { 0.0 };
+    if opacity >= 0.999 && fade_in < 0.001 && fade_out < 0.001 {
+        return label;
+    }
+    // On the alpha plane alone - format=yuva420p only adds one (opaque) to a layer without, and
+    // leaves its colours as they are.
+    let mut filters = vec!["format=yuva420p".to_string()];
+    if opacity < 0.999 {
+        filters.push(format!("lut=a='val*{opacity:.4}'"));
+    }
+    if fade_in >= 0.001 {
+        filters.push(format!("fade=t=in:st={:.4}:d={fade_in:.4}:alpha=1", pip.start_time));
+    }
+    if fade_out >= 0.001 {
+        filters.push(format!("fade=t=out:st={:.4}:d={fade_out:.4}:alpha=1", pip.end_time - fade_out));
+    }
+    let out = format!("pip{stage_index}o");
+    chain.push_str(&format!("[{label}]{}[{out}];", filters.join(",")));
+    out
 }
 
 // ---- Blend modes -------------------------------------------------------------------------------
@@ -5676,6 +5935,16 @@ pub(crate) fn probe_frame_rate(ffprobe_path: &PathBuf, source_path: &str) -> f64
 // ':a' ... matches no streams" the moment a segment's source had no audio track at all). Defaults
 // to true on any probe failure so an unreadable/unusual file keeps the previous "always assume
 // audio" behavior rather than silently dropping a real track.
+// Channel count of `source_path`'s first audio stream; None when it has none or the probe fails.
+fn probe_audio_channels(ffprobe_path: &PathBuf, source_path: &str) -> Option<u32> {
+    let mut cmd = Command::new(ffprobe_path);
+    cmd.args(["-v", "quiet", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "csv=p=0", source_path]);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let output = cmd.output().ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
 fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
     let mut cmd = Command::new(ffprobe_path);
     cmd.args([
@@ -6285,6 +6554,9 @@ pub async fn export_trimmed_video(
     adjustment_layers: Option<Vec<AdjustmentLayerSpec>>,
     // Chapters embedded in the file and written to its .chapters.json sidecar; None = none.
     chapters: Option<Vec<ChapterSpec>>,
+    // The video's own sound's mixer channel - EQ/compressor/balance after the track volume
+    // (audio_fx.rs); None = none.
+    video_audio_fx: Option<AudioFxSpec>,
     // Set by the background export queue (exportQueue.ts): the run gets its own cancel state
     // (cancel_export_job), progress events keyed "export-job:<id>", a live preview frame
     // (export-job-preview events) and below-normal CPU priority so editing stays smooth meanwhile.
@@ -6307,6 +6579,7 @@ pub async fn export_trimmed_video(
     let preview_frame = job_id.as_ref().map(|id| std::env::temp_dir().join(format!("briefcast_export_preview_{}_{}.jpg", std::process::id(), sanitize_job_id(id))));
     let adjustment_layers = adjustment_layers.unwrap_or_default();
     let chapters = chapters.unwrap_or_default();
+    let video_fx_filters = video_audio_fx.as_ref().map(audio_fx_filters).unwrap_or_default();
     // HEIC/HEIF image clips render from their decoded PNG (see still_image_source) - swapped in
     // before anything below reads a segment's path, so every later step just sees a plain image.
     let mut segments = segments;
@@ -6493,12 +6766,34 @@ pub async fn export_trimmed_video(
     // - segments.len() + overlays.len() + blur_mask_count - doesn't need to change to account for
     // them. Each gets the FULL source file as its own `-i` (no -loop/-t pre_args, unlike the image/
     // blur PNGs above) since pip_overlay_chain's own `trim=` does the windowing instead.
-    let pip_input_base = inputs.len();
     let mut pip_overlays = pip_overlays;
     for pip in pip_overlays.iter_mut() {
+        // A cut-out that's gone from disk (derived media cleared) - the original picture instead.
+        if pip.cutout_path.as_deref().is_some_and(|p| !Path::new(p).exists()) {
+            log::warn!("Cut-out missing, exporting the original picture: {:?}", pip.cutout_path);
+            pip.cutout_path = None;
+        }
         let seek = trim_input_seek(pip.trim_start);
         pip.trim_start -= seek;
-        inputs.push(seeking_input(pip.source_path.clone(), seek));
+        pip.video_input = inputs.len();
+        match pip.cutout_path.clone() {
+            // A cut-out's alpha only survives libvpx's own VP9 decoder (ffmpeg's native one drops
+            // it). Its sound comes from the source, read from the same moment.
+            Some(cutout) => {
+                let mut input = seeking_input(cutout, seek);
+                input.pre_args.splice(0..0, ["-c:v".to_string(), "libvpx-vp9".to_string()]);
+                inputs.push(input);
+                if pip.volume > 0.001 {
+                    pip.audio_input = Some(inputs.len());
+                    inputs.push(seeking_input(pip.source_path.clone(), seek));
+                }
+                if pip.cutout_background.as_ref().is_some_and(|b| b.kind == "blur") {
+                    pip.background_input = Some(inputs.len());
+                    inputs.push(seeking_input(pip.source_path.clone(), seek));
+                }
+            }
+            None => inputs.push(seeking_input(pip.source_path.clone(), seek)),
+        }
     }
 
     // Adjustment layers' region masks, after everything else (no index arithmetic above changes):
@@ -6536,6 +6831,46 @@ pub async fn export_trimmed_video(
                 format!("{:.3}", (layer.end_time - layer.start_time).clamp(0.01, total_duration.max(0.01)) + 0.1),
             ],
         });
+    }
+
+    // Video-track layers' mask PNGs - a single frame each (re-timed to the layer's start in the
+    // graph): a looped still would make the alpha multiply emit a frame on the mask's own clock too.
+    for (i, pip) in pip_overlays.iter_mut().enumerate() {
+        let Some(data) = pip.mask_data_base64.take() else { continue };
+        let path = match write_temp_overlay_png(&data, 20_000 + i) {
+            Ok(path) => path,
+            Err(e) => {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(e);
+            }
+        };
+        temp_overlay_paths.push(path.clone());
+        pip.mask_input = Some(inputs.len());
+        inputs.push(InputSpec::plain(path.to_string_lossy().to_string()));
+    }
+    // Cut-out backgrounds that are pictures - single frames too, like the masks.
+    for (i, pip) in pip_overlays.iter_mut().enumerate() {
+        let Some(bg) = pip.cutout_background.as_mut().filter(|b| b.kind == "image") else { continue };
+        let Some(data) = bg.image_base64.take() else { continue };
+        let path = match write_temp_overlay_png(&data, 30_000 + i) {
+            Ok(path) => path,
+            Err(e) => {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(e);
+            }
+        };
+        temp_overlay_paths.push(path.clone());
+        pip.background_input = Some(inputs.len());
+        inputs.push(InputSpec::plain(path.to_string_lossy().to_string()));
+    }
+    // Keyed layers are converted to RGB the way the webview decoded them (probe_browser_color).
+    for pip in pip_overlays.iter_mut().filter(|p| p.chroma_key.is_some()) {
+        let (ffprobe_path, source_path) = (get_ffprobe_path(&app_handle)?, pip.source_path.clone());
+        pip.source_color = Some(blocking(move || probe_browser_color(&ffprobe_path, &source_path)).await?);
     }
 
     // Written next to the overlay PNGs (and cleaned up by the same loop once the export finishes).
@@ -6604,6 +6939,7 @@ pub async fn export_trimmed_video(
         && !has_adjustments
         && !has_clip_effects
         && !has_transitions
+        && video_fx_filters.is_empty()
         && captions_ass_path.is_none()
         && output_frame.is_none()
         && quality.as_deref() != Some("small");
@@ -6667,9 +7003,14 @@ pub async fn export_trimmed_video(
             "-movflags".into(),
             "+faststart".into(),
         ];
+        let mut af: Vec<String> = Vec::new();
         if (effective_video_volume - 1.0).abs() > 0.001 {
+            af.push(format!("volume={:.3}", effective_video_volume));
+        }
+        af.extend(video_fx_filters.iter().cloned());
+        if !af.is_empty() {
             args.push("-af".into());
-            args.push(format!("volume={:.3}", effective_video_volume));
+            args.push(af.join(","));
         }
         args
     } else {
@@ -6992,6 +7333,15 @@ pub async fn export_trimmed_video(
             }
         };
         adjust_pass(&mut filter, &mut current_label, false);
+        // Video tracks (PiP and B-roll layers) next, straight on the video: beneath blur regions,
+        // pictures, text and captions - as the preview mounts PipOverlayLayer before
+        // VideoOverlayLayer (Dashboard.tsx). They arrive bottom track first (videoTracks.ts
+        // stackOrder), so each composites over the ones before it.
+        for (i, pip) in pip_overlays.iter().enumerate() {
+            let out_label = format!("pip{}out", i);
+            filter.push_str(&pip_overlay_chain(pip, pip.video_input, i, &current_label, &out_label, adjust_frame));
+            current_label = out_label;
+        }
         for (i, bv) in blur_overlays.iter().enumerate() {
             let out_label = format!("bb{}out", i);
             filter.push_str(&blur_region_chain(bv, i, blur_mask_input_index[i], &current_label, &out_label));
@@ -7106,25 +7456,6 @@ pub async fn export_trimmed_video(
             current_label = next_label;
         }
 
-        // PiP layers composite last (on top of blur AND text/image, matching the live preview's
-        // own DOM order - PipOverlayLayer is mounted after VideoOverlayLayer, see Dashboard.tsx) -
-        // each stage always writes to its own "pipNout" intermediate label, never "outv" directly
-        // (unlike the text/image loop just above, which can), since that loop may have already
-        // claimed "outv" for itself and a second filter stage can't also output to the same label.
-        // The shared fallback right below (`current_label != "outv"`) is what actually renames
-        // whatever this leaves current_label pointing at.
-        for (i, pip) in pip_overlays.iter().enumerate() {
-            let out_label = format!("pip{}out", i);
-            filter.push_str(&pip_overlay_chain(
-                pip,
-                pip_input_base + i,
-                i,
-                &current_label,
-                &out_label,
-                adjust_frame,
-            ));
-            current_label = out_label;
-        }
         // Adjustment layers placed "over" act on everything composited so far (captions excepted).
         adjust_pass(&mut filter, &mut current_label, true);
 
@@ -7158,7 +7489,7 @@ pub async fn export_trimmed_video(
         // map below and the amix mixing block further down consume whichever label this produces.
         // Skipped entirely (base_audio_label just stays "outa") when the volume is untouched, so a
         // video nobody's adjusted this for doesn't grow an extra no-op filter node.
-        let base_audio_label = if (effective_video_volume - 1.0).abs() > 0.001 {
+        let mut base_audio_label = if (effective_video_volume - 1.0).abs() > 0.001 {
             filter.push_str(&format!(
                 "[outa]volume={:.3}[outa_vol];",
                 effective_video_volume
@@ -7167,6 +7498,12 @@ pub async fn export_trimmed_video(
         } else {
             "outa"
         };
+        // The video sound's mixer channel, after its volume - as the preview's effects sit after
+        // the element's own volume.
+        if !video_fx_filters.is_empty() {
+            filter.push_str(&format!("[{base_audio_label}]{}[outa_fx];", video_fx_filters.join(",")));
+            base_audio_label = "outa_fx";
+        }
 
         // Which pip overlays actually contribute audio - the frontend already collapses its own
         // "play this clip's own audio" toggle into volume=0 when off (see PipOverlay.muted,
@@ -7182,22 +7519,37 @@ pub async fn export_trimmed_video(
                 let audible = p.volume > 0.001;
                 let ffprobe_path = ffprobe_path.clone();
                 let source_path = p.source_path.clone();
-                // Spawned (not just created) here, so every probe runs concurrently.
+                // Spawned (not just created) here, so every probe runs concurrently. The channel
+                // count is what tells a mono source apart (mono_to_stereo_filter).
                 tauri::async_runtime::spawn_blocking(move || {
-                    audible && probe_has_audio(&ffprobe_path, &source_path)
+                    if audible && probe_has_audio(&ffprobe_path, &source_path) {
+                        Some(probe_audio_channels(&ffprobe_path, &source_path))
+                    } else {
+                        None
+                    }
                 })
             })
             .collect();
         let mut pip_audio_input_index: Vec<Option<usize>> = Vec::with_capacity(pip_overlays.len());
+        let mut pip_audio_channels: Vec<Option<u32>> = Vec::with_capacity(pip_overlays.len());
         for (i, probe) in pip_audio_probes.into_iter().enumerate() {
-            let has_audio = probe
+            let probed = probe
                 .await
                 .map_err(|e| format!("Background task failed: {}", e))?;
-            pip_audio_input_index.push(if has_audio {
-                Some(pip_input_base + i)
-            } else {
-                None
-            });
+            pip_audio_input_index.push(probed.map(|_| pip_overlays[i].audio_input.unwrap_or(pip_overlays[i].video_input)));
+            pip_audio_channels.push(probed.flatten());
+        }
+        // Audio overlays' channel counts, for the same mono up-mix.
+        let overlay_channel_probes: Vec<_> = audio_overlays
+            .iter()
+            .map(|o| {
+                let (ffprobe_path, source_path) = (ffprobe_path.clone(), o.source_path.clone());
+                tauri::async_runtime::spawn_blocking(move || probe_audio_channels(&ffprobe_path, &source_path))
+            })
+            .collect();
+        let mut overlay_channels: Vec<Option<u32>> = Vec::with_capacity(audio_overlays.len());
+        for probe in overlay_channel_probes {
+            overlay_channels.push(probe.await.map_err(|e| format!("Background task failed: {}", e))?);
         }
         let has_pip_audio = pip_audio_input_index.iter().any(|idx| idx.is_some());
 
@@ -7217,9 +7569,10 @@ pub async fn export_trimmed_video(
             for (i, audio_ov) in audio_overlays.iter().enumerate() {
                 let input_index = audio_input_base + i;
                 let trim_end = audio_ov.trim_start + (audio_ov.end_time - audio_ov.start_time);
+                let upmix = mono_to_stereo_filter(overlay_channels[i]).map(|f| format!("{f},")).unwrap_or_default();
                 let mut chain = format!(
-                    "[{}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,volume={:.3}",
-                    input_index, audio_ov.trim_start, trim_end, audio_ov.volume
+                    "[{}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,{}volume={:.3}",
+                    input_index, audio_ov.trim_start, trim_end, upmix, audio_ov.volume
                 );
                 if let Some(duck) = audio_ov.duck.as_ref().and_then(|d| duck_volume_filter(d, audio_ov.start_time, audio_ov.end_time - audio_ov.start_time)) {
                     chain.push(',');
@@ -7235,6 +7588,10 @@ pub async fn export_trimmed_video(
                         ",afade=t=out:st={:.3}:d={:.3}",
                         fade_out_start, audio_ov.fade_out
                     ));
+                }
+                for f in audio_ov.fx.as_ref().map(audio_fx_filters).unwrap_or_default() {
+                    chain.push(',');
+                    chain.push_str(&f);
                 }
                 let delay_ms = (audio_ov.start_time * 1000.0).round().max(0.0);
                 let track_label = format!("aov{}", i);
@@ -7255,8 +7612,10 @@ pub async fn export_trimmed_video(
                 let trim_end = pip.trim_start + (pip.end_time - pip.start_time);
                 let delay_ms = (pip.start_time * 1000.0).round().max(0.0);
                 let track_label = format!("pipa{}", i);
+                let upmix = mono_to_stereo_filter(pip_audio_channels[i]).map(|f| format!("{f},")).unwrap_or_default();
+                let fx: String = pip.fx.as_ref().map(audio_fx_filters).unwrap_or_default().iter().map(|f| format!(",{f}")).collect();
                 filter.push_str(&format!(
-                    "[{idx}:a]atrim=start={ts:.3}:end={te:.3},asetpts=PTS-STARTPTS,volume={vol:.3},adelay={delay:.0}:all=1[{label}];",
+                    "[{idx}:a]atrim=start={ts:.3}:end={te:.3},asetpts=PTS-STARTPTS,{upmix}volume={vol:.3}{fx},adelay={delay:.0}:all=1[{label}];",
                     idx = input_index, ts = pip.trim_start, te = trim_end, vol = pip.volume, delay = delay_ms, label = track_label
                 ));
                 mix_inputs.push_str(&format!("[{}]", track_label));
@@ -9696,6 +10055,19 @@ mod tests {
             end_time: 5.0,
             volume: 0.0,
             blend_mode: None,
+            fx: None,
+            opacity: None,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            chroma_key: None,
+            mask_data_base64: None,
+            source_color: None,
+            mask_input: None,
+            cutout_path: None,
+            cutout_background: None,
+            video_input: 1,
+            audio_input: None,
+            background_input: None,
         };
         let long_base = s(&["-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=30:d=6"]);
         let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
@@ -9727,5 +10099,190 @@ mod tests {
         let t = 1.0 / (1.0 + 0.3275911 * x.abs());
         let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-x * x).exp();
         if x >= 0.0 { y } else { -y }
+    }
+
+    #[test]
+    fn decodes_colours_the_way_the_webview_does() {
+        assert_eq!(browser_color_for("unknown", "unknown", 720), ("bt709", "tv"));
+        assert_eq!(browser_color_for("", "", 718), ("bt601", "tv"));
+        assert_eq!(browser_color_for("smpte170m", "pc", 1080), ("bt601", "pc"));
+        assert_eq!(browser_color_for("bt709", "tv", 480), ("bt709", "tv"));
+        assert_eq!(output_matrix(1080), "bt709");
+        assert_eq!(output_matrix(480), "bt601");
+    }
+
+    #[test]
+    fn keys_with_the_chain_the_preview_is_checked_against() {
+        let k = ChromaKeySpec { color: "#18a848".into(), similarity: 0.1, blend: 0.12, spill: 0.7 };
+        // chromaKey.test.ts runs this same chain (after the source's own RGB conversion) in ffmpeg
+        // and compares it with the preview shader's maths.
+        assert_eq!(
+            chroma_key_filters(&k, ("bt709", "tv")),
+            "scale=in_color_matrix=bt709:in_range=tv,format=gbrp,scale=out_color_matrix=bt601:out_range=pc,format=yuv444p,\
+             chromakey=color=0x18a848:similarity=0.1:blend=0.12,scale=in_color_matrix=bt601:in_range=pc,format=rgba,\
+             despill=type=green:mix=0.5:expand=0:red=0:green=-0.7:blue=0:brightness=0:alpha=0"
+        );
+        let blue = ChromaKeySpec { color: "1040d0".into(), similarity: 5.0, blend: f64::NAN, spill: 0.0 };
+        let f = chroma_key_filters(&blue, ("bt601", "tv"));
+        assert!(f.contains("chromakey=color=0x1040d0:similarity=1:blend=0.08,"), "{f}");
+        assert!(!f.contains("despill"), "{f}");
+    }
+
+    // Not a unit test: a green-screen layer keyed, masked and faded in through pip_overlay_chain with
+    // the real ffmpeg ($FFMPEG_DIR), checked pixel by pixel.
+    #[test]
+    #[ignore]
+    fn video_layers_key_mask_and_fade() {
+        let Ok(dir) = std::env::var("FFMPEG_DIR") else { return };
+        let ffmpeg = PathBuf::from(&dir).join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        let tmp = std::env::temp_dir().join(format!("briefcast_layer_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (w, h) = (320usize, 240usize);
+        let run = |args: &[String]| {
+            let out = Command::new(&ffmpeg).args(["-v", "error", "-y"]).args(args).output().unwrap();
+            assert!(out.status.success(), "ffmpeg failed: {}\n{:?}", String::from_utf8_lossy(&out.stderr), args);
+            out.stdout
+        };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        // Grey subject on a green screen, 160x120 - placed 1:1 at the frame's top-left.
+        let screen = s(&["-f", "lavfi", "-i", "color=c=0x00B140:s=160x120:r=30:d=3,drawbox=x=50:y=30:w=60:h=60:color=0x808080:t=fill"]);
+        let base = s(&["-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=30:d=3"]);
+        // Mask: the left half shows.
+        let mask_png = tmp.join("mask.png");
+        run(&s(&["-f", "lavfi", "-i", "color=c=white:s=160x120,format=gray,geq=lum='if(lt(X,80),255,0)'", "-frames:v", "1", &mask_png.to_string_lossy()]));
+        let mask = s(&["-i", &mask_png.to_string_lossy()]);
+        let pip = PipOverlay {
+            source_path: String::new(),
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 120,
+            shape: "rectangle".into(),
+            corner_radius: None,
+            crop: None,
+            trim_start: 0.0,
+            start_time: 0.5,
+            end_time: 2.5,
+            volume: 0.0,
+            blend_mode: None,
+            fx: None,
+            opacity: None,
+            fade_in: 0.5,
+            fade_out: 0.0,
+            chroma_key: Some(ChromaKeySpec { color: "#00b140".into(), similarity: 0.1, blend: 0.05, spill: 0.0 }),
+            mask_data_base64: None,
+            source_color: Some(("bt601", "tv")),
+            mask_input: Some(2),
+            cutout_path: None,
+            cutout_background: None,
+            video_input: 1,
+            audio_input: None,
+            background_input: None,
+        };
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let frame = |t: f64| -> Vec<u8> {
+            let mut args: Vec<String> = [base.clone(), screen.clone(), mask.clone()].concat();
+            args.extend(s(&["-filter_complex", graph.trim_end_matches(';'), "-map", "[out]", "-ss"]));
+            args.push(format!("{t:.3}"));
+            args.extend(s(&["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]));
+            let px = run(&args);
+            assert_eq!(px.len(), w * h * 3);
+            px
+        };
+        let at = |px: &[u8], x: usize, y: usize| -> [f64; 3] {
+            let i = (y * w + x) * 3;
+            [px[i] as f64, px[i + 1] as f64, px[i + 2] as f64]
+        };
+        let near = |got: [f64; 3], want: [f64; 3], tol: f64, what: &str| {
+            for c in 0..3 {
+                assert!((got[c] - want[c]).abs() <= tol, "{what}: got {got:?}, want {want:?}");
+            }
+        };
+        let base_rgb = [200.0, 100.0, 50.0];
+        let grey = [128.0, 128.0, 128.0];
+        let px = frame(1.5);
+        near(at(&px, 20, 20), base_rgb, 6.0, "the screen is keyed out");
+        near(at(&px, 65, 60), grey, 6.0, "the subject shows");
+        near(at(&px, 100, 60), base_rgb, 6.0, "the masked-off half of the subject doesn't");
+        near(at(&px, 200, 60), base_rgb, 6.0, "outside the layer");
+        // Halfway through its half-second fade-in: half subject, half video.
+        let px = frame(0.75);
+        let half = [(grey[0] + base_rgb[0]) / 2.0, (grey[1] + base_rgb[1]) / 2.0, (grey[2] + base_rgb[2]) / 2.0];
+        near(at(&px, 65, 60), half, 10.0, "fading in");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Not a unit test: a cut-out (VP9 with alpha, as background_removal.rs writes) composited through
+    // pip_overlay_chain with the real ffmpeg ($FFMPEG_DIR) - its transparency must survive.
+    #[test]
+    #[ignore]
+    fn cutout_layers_keep_their_alpha() {
+        let Ok(dir) = std::env::var("FFMPEG_DIR") else { return };
+        let ffmpeg = PathBuf::from(&dir).join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        let tmp = std::env::temp_dir().join(format!("briefcast_cutout_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(&ffmpeg).args(["-v", "error", "-y"]).args(args).output().unwrap();
+            assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
+            out.stdout
+        };
+        // A grey picture whose left half is transparent, written the way the cut-outs are.
+        let cutout = tmp.join("cut.webm");
+        run(&[
+            "-f", "lavfi", "-i", "color=c=0x808080:s=160x120:r=25:d=2,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,80),0,255)'",
+            "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuva420p",
+            "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-crf", "18", "-b:v", "0", "-auto-alt-ref", "0", "-colorspace", "bt709", &cutout.to_string_lossy(),
+        ]);
+        let pip = PipOverlay {
+            source_path: String::new(),
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 120,
+            shape: "rectangle".into(),
+            corner_radius: None,
+            crop: None,
+            trim_start: 0.0,
+            start_time: 0.0,
+            end_time: 2.0,
+            volume: 0.0,
+            blend_mode: None,
+            fx: None,
+            opacity: None,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            chroma_key: None,
+            mask_data_base64: None,
+            source_color: None,
+            mask_input: None,
+            cutout_path: Some(cutout.to_string_lossy().to_string()),
+            cutout_background: None,
+            video_input: 1,
+            audio_input: None,
+            background_input: None,
+        };
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let px = run(&[
+            "-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=25:d=2",
+            "-c:v", "libvpx-vp9", "-i", &cutout.to_string_lossy(),
+            "-filter_complex", graph.trim_end_matches(';'), "-map", "[out]", "-ss", "1", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ]);
+        let at = |x: usize, y: usize| { let i = (y * 320 + x) * 3; [px[i] as f64, px[i + 1] as f64, px[i + 2] as f64] };
+        let near = |got: [f64; 3], want: [f64; 3], what: &str| assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 6.0), "{what}: got {got:?}, want {want:?}");
+        near(at(30, 60), [200.0, 100.0, 50.0], "the transparent half shows the video under it");
+        near(at(130, 60), [128.0, 128.0, 128.0], "the opaque half shows the cut-out");
+        // With a colour behind the person, the see-through half shows that colour instead.
+        let pip = PipOverlay { cutout_background: Some(CutoutBackgroundSpec { kind: "color".into(), color: Some("#2050e0".into()), image_base64: None, blur_sigma: None, blur_margin: None, source_crop: None }), ..pip };
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let px = run(&[
+            "-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=25:d=2",
+            "-c:v", "libvpx-vp9", "-i", &cutout.to_string_lossy(),
+            "-filter_complex", graph.trim_end_matches(';'), "-map", "[out]", "-ss", "1", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ]);
+        let at = |x: usize, y: usize| { let i = (y * 320 + x) * 3; [px[i] as f64, px[i + 1] as f64, px[i + 2] as f64] };
+        near(at(30, 60), [32.0, 80.0, 224.0], "the background colour fills behind the person");
+        near(at(130, 60), [128.0, 128.0, 128.0], "the person stays in front");
+        near(at(250, 60), [200.0, 100.0, 50.0], "outside the layer");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
