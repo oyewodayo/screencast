@@ -13,7 +13,7 @@ import { BLEND_MODES } from "../../utils/blendModes";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { pipChannelKey, requestMixer } from "../../utils/mixerState";
 import { pipTrack, videoTrackLabel } from "../../utils/videoTracks";
-import { MAX_FEATHER, type LayerMask } from "../../utils/layerMask";
+import { MAX_FEATHER, REVEAL_STYLES, type LayerMask, type MaskReveal } from "../../utils/layerMask";
 import CutoutBackgroundPicker from "./CutoutBackgroundPicker";
 import { BLUR_DEFAULT } from "../../utils/cutoutBackground";
 import { backgroundRemovalStatus, cancelBackgroundRemoval, dismissBackgroundError, removeBackground, useBackgroundJob, type BackgroundRemovalStatus } from "../../utils/backgroundRemoval";
@@ -39,6 +39,8 @@ interface PipOverlayPopoverProps {
   onTogglePickKey: () => void;
   // Mask: choose its shape ("path" draws one on the video; null removes it), edit it on the video.
   maskEditing: boolean;
+  // The mask opening over the layer's start (and closing at its end) - layerMask.ts reveals.
+  onSetReveal: (reveal: MaskReveal | null) => void;
   onSetMaskShape: (shape: LayerMask["shape"] | null) => void;
   onToggleMaskEdit: () => void;
 }
@@ -153,6 +155,7 @@ const PipOverlayPopover: React.FC<PipOverlayPopoverProps> = ({
   pickingKey,
   onTogglePickKey,
   maskEditing,
+  onSetReveal,
   onSetMaskShape,
   onToggleMaskEdit,
 }) => {
@@ -354,6 +357,45 @@ const PipOverlayPopover: React.FC<PipOverlayPopoverProps> = ({
             <label className="flex items-center gap-2 text-[11px] cursor-pointer" title="Show everything except the masked area">
               <input type="checkbox" checked={overlay.mask.invert} onChange={(e) => onUpdate({ mask: { ...overlay.mask!, invert: e.target.checked } })} className="accent-teal-400" />
               <span className="text-white/70">Invert</span>
+            </label>
+          </>
+        )}
+        <span className="text-[10px] uppercase tracking-wide text-white/40 pt-1">Reveal</span>
+        <div className="flex flex-wrap gap-1">
+          {[{ value: null, label: "None", hint: "Shows straight away" }, ...REVEAL_STYLES].map((opt) => {
+            const current = overlay.mask?.reveal;
+            const active = opt.value === null ? !current : current?.style === opt.value;
+            return (
+              <button
+                key={opt.label}
+                type="button"
+                title={opt.hint}
+                onClick={() => onSetReveal(opt.value === null ? null : { style: opt.value, duration: current?.duration ?? 0.8, exit: current?.exit })}
+                className={`px-2 py-1 rounded text-[11px] transition-colors ${active ? "text-teal-300 bg-teal-500/10 ring-1 ring-teal-400/40" : "text-white/70 hover:text-white hover:bg-white/10"}`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+        {overlay.mask?.reveal && (
+          <>
+            <label className="flex items-center gap-2 text-[11px]">
+              <span className="w-16 text-white/60">Duration</span>
+              <input
+                type="range"
+                min={0.2}
+                max={4}
+                step={0.05}
+                value={overlay.mask.reveal.duration}
+                onChange={(e) => onSetReveal({ ...overlay.mask!.reveal!, duration: Number(e.target.value) })}
+                className="flex-1 accent-teal-400"
+              />
+              <span className="w-8 text-right tabular-nums text-white/50">{overlay.mask.reveal.duration.toFixed(1)}s</span>
+            </label>
+            <label className="flex items-center gap-2 text-[11px] cursor-pointer" title="Close the same way over the layer's last moments">
+              <input type="checkbox" checked={!!overlay.mask.reveal.exit} onChange={(e) => onSetReveal({ ...overlay.mask!.reveal!, exit: e.target.checked })} className="accent-teal-400" />
+              <span className="text-white/70">Close at the end</span>
             </label>
           </>
         )}

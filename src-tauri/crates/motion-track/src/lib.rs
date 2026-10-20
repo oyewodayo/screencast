@@ -14,6 +14,9 @@
 //! Nothing here knows about files, time or the editor: frames in, boxes out, in the frames' own
 //! pixels. `smooth` takes the per-frame jitter out of a finished track.
 
+mod finder;
+pub use finder::{suppress_overlaps, Detection, Finder};
+
 /// One grayscale frame, row-major, `width * height` bytes.
 #[derive(Clone, Copy)]
 pub struct GrayFrame<'a> {

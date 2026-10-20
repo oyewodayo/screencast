@@ -567,6 +567,11 @@ export interface AdjustmentRegion {
   feather: number;
   // Apply everywhere EXCEPT the region (a spotlight: blur or darken the background).
   invert: boolean;
+  // The region moving over the layer's life - following a subject (motion tracking) or animated:
+  // its top-left (x, y) at each time from the layer's start; scale/opacity unused.
+  keyframes?: OverlayKeyframe[];
+  // How the keyframes were found, when they came from motion tracking.
+  track?: OverlayTrackInfo;
 }
 export interface AdjustmentLayer {
   id: string;
@@ -590,6 +595,9 @@ export interface AdjustmentLayer {
   fadeOut?: number;
   // Where it applies; undefined = the whole frame.
   region?: AdjustmentRegion;
+  // A solid colour ("#rrggbb") instead of the adjusted picture - with a region, what masks the
+  // main video: the area (or, inverted, everything around it) shows this colour.
+  fill?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -774,7 +782,8 @@ export interface VideoEditCommand {
     | "edit-chapters"
     | "track-motion"
     | "edit-mixer"
-    | "edit-video-tracks";
+    | "edit-video-tracks"
+    | "find-hide";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {

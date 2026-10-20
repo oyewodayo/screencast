@@ -38,7 +38,7 @@ import { pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixe
 import { isTrackHidden, layerOpacityAt, pipTrack, stackOrder } from "../../utils/videoTracks";
 import { DEFAULT_CHROMA_KEY, guessKeyColor } from "../../utils/chromaKey";
 import { blurMargin, blurSigma, coverRect } from "../../utils/cutoutBackground";
-import { DEFAULT_MASK, layerMaskAlphaUrl, placeMask, type LayerMask } from "../../utils/layerMask";
+import { DEFAULT_MASK, layerMaskAlphaUrl, placeMask, revealMaskCss, revealMaskPicture, revealStartingMask, type LayerMask } from "../../utils/layerMask";
 import ChromaKeyCanvas from "./ChromaKeyCanvas";
 import MaskEditor from "./MaskEditor";
 
@@ -449,14 +449,50 @@ const PipVideoElement: React.FC<{
   // (layerMask.ts), at the box's on-screen size.
   const mask = maskLive ?? overlay.mask;
   const maskKey = mask ? JSON.stringify(mask) : "";
+  // A revealing mask (not while it's being edited - that shows it open) is its shape's picture
+  // placed per frame, over the layer's own shape.
+  const reveal = !maskLive && mask?.reveal ? mask : null;
   const maskUrl = useMemo(
-    () => (mask && width >= 1 && height >= 1 ? layerMaskAlphaUrl({ shape: overlay.shape, cornerRadius: overlay.cornerRadius, mask }, width, height) : null),
+    () => (mask && !reveal && width >= 1 && height >= 1 ? layerMaskAlphaUrl({ shape: overlay.shape, cornerRadius: overlay.cornerRadius, mask }, width, height) : null),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [maskKey, overlay.shape, overlay.cornerRadius, Math.round(width), Math.round(height)]
+    [maskKey, !!reveal, overlay.shape, overlay.cornerRadius, Math.round(width), Math.round(height)]
   );
+  const revealPic = useMemo(
+    () => (reveal && width >= 1 && height >= 1 ? revealMaskPicture(reveal, width, height, false) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [maskKey, !!reveal, Math.round(width), Math.round(height)]
+  );
+  const shapeUrl = useMemo(
+    () => (revealPic && overlay.shape && overlay.shape !== "rectangle" ? layerMaskAlphaUrl({ shape: overlay.shape, cornerRadius: overlay.cornerRadius }, width, height) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [!!revealPic, overlay.shape, overlay.cornerRadius, Math.round(width), Math.round(height)]
+  );
+  const span = overlay.endTime - overlay.startTime;
+  const revealCss = (now: number) => (reveal && revealPic ? revealMaskCss(reveal, revealPic, shapeUrl, now - overlay.startTime, span, width, height) : null);
+  const revealCssRef = useRef(revealCss);
+  revealCssRef.current = revealCss;
+  useEffect(() => {
+    if (!revealPic) return;
+    let raf = 0;
+    let last = "";
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const now = getOutputTime?.();
+      if (now === null || now === undefined || !boxRef.current) return;
+      const css = revealCssRef.current(now);
+      if (!css || css.maskPosition === last) return;
+      last = css.maskPosition;
+      const style = boxRef.current.style as unknown as Record<string, string>;
+      style.maskPosition = style.webkitMaskPosition = css.maskPosition;
+      style.maskSize = style.webkitMaskSize = css.maskSize;
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [revealPic, getOutputTime]);
   const maskStyle: React.CSSProperties = maskUrl
     ? { maskImage: `url(${maskUrl})`, WebkitMaskImage: `url(${maskUrl})`, maskSize: "100% 100%", WebkitMaskSize: "100% 100%", maskRepeat: "no-repeat", WebkitMaskRepeat: "no-repeat" }
-    : {};
+    : ((revealCss(currentOutputTime) ?? {}) as React.CSSProperties);
+  const masked = !!maskUrl || !!revealPic;
   const keyed = !cutout && !!overlay.chromaKey && !keyFailed;
   // The blurred original: fitted to the box grown by the blur's reach on every side, so the edges
   // inside the box stay full - as export draws it (cutoutBackgroundForExport).
@@ -499,9 +535,9 @@ const PipVideoElement: React.FC<{
           width,
           height,
           // The mask picture carries the shape too, when there is one.
-          clipPath: maskUrl ? undefined : clipPath,
-          WebkitClipPath: maskUrl ? undefined : clipPath,
-          borderRadius: maskUrl ? 0 : borderRadius,
+          clipPath: masked ? undefined : clipPath,
+          WebkitClipPath: masked ? undefined : clipPath,
+          borderRadius: masked ? 0 : borderRadius,
           ...maskStyle,
           pointerEvents: "auto",
           touchAction: "none",
@@ -898,6 +934,14 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
             }
           }}
           onToggleMaskEdit={() => setMaskEdit((m) => (m?.id === selected.id ? null : { id: selected.id, drawing: false }))}
+          onSetReveal={(reveal) => {
+            if (!reveal) {
+              if (selected.mask) onUpdatePipOverlayContent(selected.id, { mask: { ...selected.mask, reveal: undefined } });
+              return;
+            }
+            const from = selected.mask ?? revealStartingMask(reveal.style);
+            onUpdatePipOverlayContent(selected.id, { mask: { ...from, reveal } });
+          }}
         />
       )}
       {selected && maskEdit?.id === selected.id && overlaysActiveAt([selected], currentOutputTime).length > 0 && (selected.mask || maskEdit.drawing) && (

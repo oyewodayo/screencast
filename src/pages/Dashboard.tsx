@@ -1,4 +1,8 @@
 // Dashboard.tsx
+import FindHideTool, { type FindStatus } from "../components/video/FindHideTool";
+import { cancelFind, coversFor, findEverywhere, type HideEffect, type HideShape } from "../utils/objectFind";
+// What motion tracking can make follow a subject.
+type TrackKind = "text" | "image" | "blur" | "adjustment";
 import { cameraEffectSpec } from "../utils/cameraEffect";
 import WebcamBubbleMarker from "../components/video/WebcamBubbleMarker";
 import type { BubbleRegion } from "../utils/webcamBubble";
@@ -677,7 +681,7 @@ const Dashboard = () => {
   const [selectedAdjustmentId, setSelectedAdjustmentId] = useState<string | null>(null);
   // Motion tracking (motionTracking.ts): picking what to follow, then following it.
   const [trackSession, setTrackSession] = useState<null | {
-    kind: "text" | "image" | "blur";
+    kind: TrackKind;
     id: string;
     initial: TrackBox;
     tracking: { progress: number; jobId: string } | null;
@@ -689,6 +693,42 @@ const Dashboard = () => {
   // "Fix webcam background": the bubble outline is up (WebcamBubbleMarker), and the pip panel to
   // open once it's lifted off the recording.
   const [isMarkingBubble, setIsMarkingBubble] = useState(false);
+  // Find & hide (FindHideTool / objectFind.ts): the tool is up, and how its search is going.
+  const [isFinding, setIsFinding] = useState(false);
+  const [findStatus, setFindStatus] = useState<FindStatus>({ phase: "idle" });
+  const findJobRef = useRef<string | null>(null);
+  const runFindAndHide = async (target: { x: number; y: number; width: number; height: number }, effect: HideEffect, shape: HideShape, sensitivity: number) => {
+    if (!selectedFile) return;
+    if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
+    const jobId = crypto.randomUUID();
+    findJobRef.current = jobId;
+    setFindStatus({ phase: "searching", progress: 0, found: 0 });
+    try {
+      const frame = await resolveTimelineFrame(selectedFile.sourcePath);
+      const exact = getExactOutputTime();
+      const anchorTime = exact !== null && Math.abs(exact - currentOutputTime) < 0.5 ? exact : currentOutputTime;
+      const appearances = await findEverywhere({
+        clips: editStore.clips,
+        frame,
+        target,
+        anchorTime,
+        sensitivity,
+        jobId,
+        onProgress: (progress, found) => findJobRef.current === jobId && setFindStatus({ phase: "searching", progress, found }),
+      });
+      if (findJobRef.current !== jobId) return;
+      const W = frame?.width ?? 1920;
+      const H = frame?.height ?? 1080;
+      editStore.addFoundCovers(coversFor(appearances, effect, shape, 0.12, W, H));
+      setFindStatus({ phase: "done", found: appearances.length });
+    } catch (err) {
+      if (findJobRef.current !== jobId) return;
+      const message = String(err instanceof Error ? err.message : err);
+      setFindStatus(message.includes("cancelled") ? { phase: "idle" } : { phase: "error", message });
+    } finally {
+      if (findJobRef.current === jobId) findJobRef.current = null;
+    }
+  };
   const [pipPanelRequest, setPipPanelRequest] = useState<{ id: string } | null>(null);
   // A separately recorded webcam put on the timeline (its own layer, *_webcam.mp4) gets the live
   // background the user records with - automatically, in the editor's full quality: its background is
@@ -947,9 +987,16 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // ---- Motion tracking: pick what to follow on the paused frame, follow it, bake it into the
   // overlay's keyframes (motionTracking.ts) as one undo step.
   const trackAnchorRef = useRef(0);
-  const overlayForTracking = (kind: "text" | "image" | "blur", id: string) =>
-    kind === "text" ? editStore.textOverlays.find((o) => o.id === id) : kind === "image" ? editStore.imageOverlays.find((o) => o.id === id) : editStore.blurOverlays.find((o) => o.id === id);
-  const startMotionTrack = (kind: "text" | "image" | "blur", id: string) => {
+  const overlayForTracking = (kind: TrackKind, id: string) => {
+    if (kind === "adjustment") {
+      // An adjustment layer's area, followed like a blur region (position only).
+      const l = editStore.adjustmentLayers.find((a) => a.id === id);
+      const r = l?.region;
+      return l && r ? { x: r.x, y: r.y, width: r.width, height: r.height, startTime: l.startTime, endTime: l.endTime, keyframes: r.keyframes } : undefined;
+    }
+    return kind === "text" ? editStore.textOverlays.find((o) => o.id === id) : kind === "image" ? editStore.imageOverlays.find((o) => o.id === id) : editStore.blurOverlays.find((o) => o.id === id);
+  };
+  const startMotionTrack = (kind: TrackKind, id: string) => {
     const o = overlayForTracking(kind, id);
     if (!o) return;
     // The timeline's playhead; the player's exact clock refines it only when they agree (it can
@@ -987,14 +1034,17 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
         target,
         anchorTime: trackAnchorRef.current,
         followScale,
-        positionOnly: session.kind === "blur",
+        positionOnly: session.kind === "blur" || session.kind === "adjustment",
         jobId,
         onProgress: (progress) => setTrackSession((s) => (s?.tracking?.jobId === jobId ? { ...s, tracking: { progress, jobId } } : s)),
       });
       const patch = { keyframes: result.keyframes, track: result.track };
       if (session.kind === "text") editStore.updateTextOverlayContent(session.id, patch);
       else if (session.kind === "image") editStore.updateImageOverlayContent(session.id, patch);
-      else editStore.updateBlurOverlayContent(session.id, patch);
+      else if (session.kind === "adjustment") {
+        const region = editStore.adjustmentLayers.find((a) => a.id === session.id)?.region;
+        if (region) editStore.updateAdjustmentLayer(session.id, { region: { ...region, ...patch } });
+      } else editStore.updateBlurOverlayContent(session.id, patch);
       setTrackSession(null);
       const lost = Math.round(result.track.lostFraction * 100);
       setMessage(lost > 20 ? `Following it - it was out of sight ${lost}% of the time, held in place there` : "Pinned - it follows the motion now");
@@ -4915,6 +4965,23 @@ const setScreen = () => {
                           totalOutputDuration={totalOutputDuration}
                         />
                         <AdjustmentLayersLayer mode="over" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
+                        {isFinding && (
+                          <FindHideTool
+                            frameRect={frameRect}
+                            status={findStatus}
+                            onFind={(target, effect, shape, sensitivity) => void runFindAndHide(target, effect, shape, sensitivity)}
+                            onCancelSearch={() => {
+                              if (findJobRef.current) void cancelFind(findJobRef.current);
+                              findJobRef.current = null;
+                              setFindStatus({ phase: "idle" });
+                            }}
+                            onClose={() => {
+                              if (findJobRef.current) void cancelFind(findJobRef.current);
+                              findJobRef.current = null;
+                              setIsFinding(false);
+                            }}
+                          />
+                        )}
                         {isMarkingBubble && (
                           <WebcamBubbleMarker
                             frameRect={frameRect}
@@ -4946,13 +5013,14 @@ const setScreen = () => {
                           onSetTime={(id, edge, time) => editStore.resizeAdjustmentLayerTime(id, edge, Math.max(0, Math.min(totalOutputDuration, time)))}
                           onDuplicate={(id) => selectAdjustment(editStore.duplicateAdjustmentLayer(id))}
                           onDelete={editStore.deleteAdjustmentLayer}
+                          onTrackMotion={(id) => startMotionTrack("adjustment", id)}
                         />
                         {trackSession && (
                           <TrackTargetPicker
                             key={`${trackSession.kind}:${trackSession.id}`}
                             frameRect={frameRect}
                             initial={trackSession.initial}
-                            canFollowScale={trackSession.kind !== "blur"}
+                            canFollowScale={trackSession.kind !== "blur" && trackSession.kind !== "adjustment"}
                             tracking={trackSession.tracking}
                             error={trackSession.error}
                             onTrack={(target, followScale) => void runMotionTrack(target, followScale)}
@@ -5268,6 +5336,10 @@ const setScreen = () => {
         isPlacingPip={isPlacingPip}
         onToggleArmPlacePip={() => setIsPlacingPip((v) => !v)}
         onMarkWebcamBubble={() => setIsMarkingBubble(true)}
+        onFindAndHide={() => {
+          setFindStatus({ phase: "idle" });
+          setIsFinding(true);
+        }}
         isCroppingClip={isCroppingClip}
         onToggleCroppingClip={() => setIsCroppingClip((v) => !v)}
         selectScreen={selectScreen}

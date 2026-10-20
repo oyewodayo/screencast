@@ -28,6 +28,7 @@ import ResizeHandles from "./ResizeHandles";
 import { ResizeHandle, PxBox, isCornerHandle, resizeBoxFromHandle } from "../../utils/boxResize";
 import RevealText from "./RevealText";
 import ImageRevealWrap from "./ImageRevealWrap";
+import RevealMaskBox from "./RevealMaskBox";
 import { isTextReveal } from "../../utils/textReveal";
 import AssetFloatingControls from "./AssetFloatingControls";
 import { assetEntry } from "../../utils/videoAssets";
@@ -1739,7 +1740,18 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         // Its mask (with the corner rounding folded in) - the same picture export draws it with
         // (layerMask.ts, drawImageOverlayPng).
         const imageMask = !o.asset ? (imageMaskEdit?.id === o.id ? imageMaskLive : null) ?? o.mask : undefined;
-        const maskedPicture = imageMask ? (
+        // An opening mask plays (except while it's being edited - that shows it open).
+        const maskedPicture = imageMask?.reveal && imageMaskEdit?.id !== o.id ? (
+          <RevealMaskBox
+            mask={imageMask}
+            widthPx={o.width * frameRect.width}
+            heightPx={o.height * frameRect.height}
+            span={o.endTime - o.startTime}
+            getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime}
+          >
+            {picture}
+          </RevealMaskBox>
+        ) : imageMask ? (
           <div
             className="absolute inset-0 pointer-events-none"
             style={(() => {

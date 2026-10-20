@@ -12,6 +12,7 @@
 import type { CSSProperties } from "react";
 import type { AdjustmentLayer, AdjustmentRegion } from "./videoEditTypes";
 import { CssColorOp, colorPresetOps, cssFilterFromOps, vignetteBackground } from "./videoColorFilters";
+import { keyframeStateAt } from "./keyframes";
 
 export const DEFAULT_ADJUSTMENT_SECONDS = 5;
 // Blur slider's top end, as a fraction of the frame's height (~43 px of sigma at 1080p).
@@ -42,7 +43,14 @@ export const adjustmentVignette = (layer: AdjustmentLayer): number =>
 
 // Whether the layer changes anything at all.
 export const adjustmentIsActive = (layer: AdjustmentLayer): boolean =>
-  (layer.blur ?? 0) > 1e-4 || adjustmentColorOps(layer).length > 0 || adjustmentVignette(layer) > 1e-3;
+  !!layer.fill || (layer.blur ?? 0) > 1e-4 || adjustmentColorOps(layer).length > 0 || adjustmentVignette(layer) > 1e-3;
+
+// The region where it is `local` seconds into the layer - its keyframes (a followed subject) when
+// it has them.
+export function regionAt(region: AdjustmentRegion, local: number): AdjustmentRegion {
+  const k = keyframeStateAt(region.keyframes, local);
+  return k ? { ...region, x: k.x, y: k.y } : region;
+}
 
 // The preview's backdrop-filter: blur first, then colour - the order export applies them in.
 export function adjustmentBackdropFilter(layer: AdjustmentLayer, frameHeightPx: number): string {
@@ -199,10 +207,62 @@ export interface AdjustmentLayerExport {
   maskDataBase64?: string;
   maskX: number;
   maskY: number;
+  // A moving region: the mask is the region alone, placed by these (output pixels, absolute s).
+  maskKeyframes?: { time: number; x: number; y: number; scale: number; opacity: number; easing: string }[];
+  maskInvert?: boolean;
+  fill?: string;
+}
+
+// The region's own mask, at its own size wherever it is (not clipped to the frame) - what a moving
+// region is placed with every frame.
+function renderRegionAlone(region: AdjustmentRegion, W: number, H: number): string | null {
+  const w = Math.max(2, Math.ceil(region.width * W));
+  const h = Math.max(2, Math.ceil(region.height * H));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  const image = ctx.createImageData(w, h);
+  const at = { ...region, x: 0, y: 0, invert: false };
+  for (let j = 0; j < h; j++) {
+    for (let i = 0; i < w; i++) {
+      const v = Math.round(regionAlpha(at, W, H, i + 0.5, j + 0.5) * 255);
+      const k = (j * w + i) * 4;
+      image.data[k] = image.data[k + 1] = image.data[k + 2] = v;
+      image.data[k + 3] = 255;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  return canvas.toDataURL("image/png");
 }
 
 export function adjustmentLayerExport(layer: AdjustmentLayer, W: number, H: number): AdjustmentLayerExport | null {
   if (!adjustmentIsActive(layer) || (layer.opacity ?? 1) <= 0.001) return null;
+  const region = layer.region;
+  const fill = layer.fill;
+  if (region?.keyframes?.length) {
+    const alone = renderRegionAlone(region, W, H);
+    const vignette = adjustmentVignette(layer);
+    const blur = (layer.blur ?? 0) * H;
+    return {
+      startTime: layer.startTime,
+      endTime: layer.endTime,
+      placement: layer.placement,
+      colorOps: adjustmentColorOps(layer),
+      blurSigma: blur > 0.05 ? blur : undefined,
+      vignette: vignette > 1e-3 ? vignette : undefined,
+      opacity: Math.max(0, Math.min(1, layer.opacity ?? 1)),
+      fadeIn: layer.fadeIn ?? 0,
+      fadeOut: layer.fadeOut ?? 0,
+      maskDataBase64: alone ?? undefined,
+      maskX: 0,
+      maskY: 0,
+      maskKeyframes: region.keyframes.map((k) => ({ time: layer.startTime + k.time, x: k.x * W, y: k.y * H, scale: 1, opacity: 1, easing: k.easing })),
+      maskInvert: region.invert,
+      fill,
+    };
+  }
   const mask = renderAdjustmentMask(layer.region, W, H);
   const vignette = adjustmentVignette(layer);
   const blur = (layer.blur ?? 0) * H;
@@ -219,6 +279,7 @@ export function adjustmentLayerExport(layer: AdjustmentLayer, W: number, H: numb
     maskDataBase64: mask?.dataUrl,
     maskX: mask?.x ?? 0,
     maskY: mask?.y ?? 0,
+    fill,
   };
 }
 

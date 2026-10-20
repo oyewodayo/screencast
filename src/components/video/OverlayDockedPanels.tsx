@@ -10,7 +10,7 @@
 // the text panel only exists while TextNoteEditor is open, and that editor commits and closes the
 // moment its textarea loses focus. The blur panel's X/Y/W/H fields are the one exception (real
 // inputs), safe there since a blur region has no editing session to end.
-import type { LayerMask } from "../../utils/layerMask";
+import { REVEAL_STYLES, revealStartingMask, type LayerMask, type RevealStyle } from "../../utils/layerMask";
 import { KEYFRAME_EASINGS, KEYFRAME_SNAP_SEC, KeyframeEasing, OverlayKeyframe, keyframeAt, keyframeStateAt, removeKeyframeAt, upsertKeyframe } from "../../utils/keyframes";
 import React, { useEffect, useRef } from "react";
 import RevealText from "./RevealText";
@@ -1232,6 +1232,31 @@ export const MaskSection: React.FC<{
         </button>
       </>
     )}
+    <LabeledRow label="Opens">
+      <div className="flex-1">
+        <ChipGrid<RevealStyle | "none">
+          options={[{ value: "none", label: "At once" }, ...REVEAL_STYLES.map((r) => ({ value: r.value, label: r.label }))]}
+          value={mask?.reveal?.style ?? "none"}
+          onChange={(style) => {
+            if (style === "none") {
+              if (mask) onMask({ ...mask, reveal: undefined });
+              return;
+            }
+            // No mask yet: one that covers the whole picture once open.
+            onMask({ ...(mask ?? revealStartingMask(style)), reveal: { style, duration: mask?.reveal?.duration ?? 0.8, exit: mask?.reveal?.exit } });
+          }}
+        />
+      </div>
+    </LabeledRow>
+    {mask?.reveal && (
+      <>
+        <SliderRow label="Duration" value={mask.reveal.duration} min={0.2} max={4} step={0.05} format={(v) => `${v.toFixed(1)}s`} onChange={(duration) => onMask({ ...mask, reveal: { ...mask.reveal!, duration } })} />
+        <LabeledRow label="Close">
+          <Switch on={!!mask.reveal.exit} label="Close the same way over the picture's last moments" onChange={(exit) => onMask({ ...mask, reveal: { ...mask.reveal!, exit } })} />
+          <span className="text-white/40">{mask.reveal.exit ? "at the end too" : "stays open"}</span>
+        </LabeledRow>
+      </>
+    )}
   </Section>
 );
 
@@ -1410,6 +1435,8 @@ export interface AdjustmentDockedPanelProps {
   onSetTime?: (edge: "start" | "end", time: number) => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  // Follow a subject with the area (motion tracking).
+  onTrackMotion?: () => void;
 }
 
 const LOOKS: { value: ColorFilterPreset; label: string }[] = [
@@ -1421,7 +1448,7 @@ const LOOKS: { value: ColorFilterPreset; label: string }[] = [
   { value: "bw", label: "B&W" },
 ];
 
-export const AdjustmentDockedPanel: React.FC<AdjustmentDockedPanelProps> = ({ layer, playhead, onChange, onSetTime, onDuplicate, onDelete }) => {
+export const AdjustmentDockedPanel: React.FC<AdjustmentDockedPanelProps> = ({ layer, playhead, onChange, onSetTime, onDuplicate, onDelete, onTrackMotion }) => {
   const region = layer.region;
   const pct = (v: number) => `${Math.round(v * 100)}%`;
   const setRegion = (patch: Partial<AdjustmentRegion> | null) =>
@@ -1477,8 +1504,28 @@ export const AdjustmentDockedPanel: React.FC<AdjustmentDockedPanelProps> = ({ la
               <Switch on={region.invert} label="Apply everywhere except the area - blur or darken the background around a subject" onChange={(invert) => setRegion({ invert })} />
               <span className="text-white/40">{region.invert ? "everything but the area" : "inside the area"}</span>
             </LabeledRow>
+            {(onTrackMotion || !!region.keyframes?.length) && (
+              <TrackingBlock
+                track={region.keyframes?.length ? region.track : undefined}
+                onTrack={onTrackMotion}
+                onRemove={() => setRegion({ keyframes: undefined, track: undefined })}
+                keyframeCount={region.keyframes?.length ?? 0}
+                span={span}
+              />
+            )}
+            {!region.keyframes?.length && onTrackMotion && (
+              <p className="text-[11px] leading-snug text-white/45">Follow a subject - a spotlight that stays on a speaker, a blur that stays on a face.</p>
+            )}
           </>
         )}
+        <LabeledRow label="Fill">
+          <Switch
+            on={!!layer.fill}
+            label="Cover the area with a solid colour instead - mask out part of the video (inverted: everything around it)"
+            onChange={(on) => onChange({ fill: on ? (layer.fill ?? "#000000") : undefined })}
+          />
+          {layer.fill ? <ColorSwatchPicker color={layer.fill} onChange={(fill) => onChange({ fill })} size="sm" /> : <span className="text-white/40">off</span>}
+        </LabeledRow>
       </Section>
 
       <Section title="Strength">

@@ -11,7 +11,7 @@
 // Each render targets a canvas sized to just the overlay's own box (not the whole video frame) -
 // far cheaper than a full-frame canvas per overlay, and ffmpeg positions it via the returned
 // xPx/yPx either way.
-import { drawLayerMask } from "./layerMask";
+import { drawLayerMask, drawRevealCoverage, revealCoverageKey, revealMaskCanvas } from "./layerMask";
 import { invoke } from "@tauri-apps/api/core";
 import { BlurOverlay, ImageOverlay, TextOverlay, TextOverlayCornerStyle } from "./videoEditTypes";
 import { TEXT_FONT_FAMILY, measureTextBlock } from "../handlers/pdfAnnotationHandlers";
@@ -271,9 +271,13 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
   return img ? drawImageOverlayPng(overlay, img, framePixelWidth, framePixelHeight) : null;
 }
 
-// A picture overlay's reveal (imageReveal.ts) as the PNG frame sequence export burns in - the image
-// decoded once, each distinct moment drawn once (the settled picture, and each shine phase, are
-// shared by every frame that shows them).
+// Whether a picture overlay changes over its time on screen - a reveal (imageReveal.ts) or a mask
+// that opens (layerMask.ts reveals) - and so exports as a frame sequence.
+export const imageOverlayAnimates = (o: ImageOverlay): boolean => !!o.reveal || (!o.asset && !!o.mask?.reveal);
+
+// A picture overlay's reveal (imageReveal.ts) and/or opening mask, as the PNG frame sequence export
+// burns in - the image decoded once, each distinct moment drawn once (the settled picture, and each
+// shine phase, are shared by every frame that shows them).
 export async function renderImageRevealFrames(
   overlay: ImageOverlay,
   framePixelWidth: number,
@@ -281,24 +285,31 @@ export async function renderImageRevealFrames(
 ): Promise<{ unique: string[]; sequence: number[]; xPx: number; yPx: number } | null> {
   const settings = overlay.reveal;
   const duration = overlay.endTime - overlay.startTime;
-  if (!settings || duration <= 0) return null;
+  if (!imageOverlayAnimates(overlay) || duration <= 0) return null;
   const img = await loadOverlayImage(overlay.src);
   if (!img) return null;
+  // An opening mask: its picture drawn once at the box's export size, placed per frame.
+  const mask = !overlay.asset && overlay.mask?.reveal ? overlay.mask : null;
+  const boxW = Math.max(1, Math.round(overlay.width * framePixelWidth));
+  const boxH = Math.max(1, Math.round(overlay.height * framePixelHeight));
+  const pic = mask ? revealMaskCanvas(mask, boxW, boxH, false) : null;
   const total = Math.max(1, Math.ceil(duration * IMAGE_REVEAL_FPS));
   const unique: string[] = [];
   const sequence: number[] = [];
   const keyIndex = new Map<string, number>();
   let origin: { xPx: number; yPx: number } | null = null;
   for (let k = 0; k < total; k++) {
-    const state = imageRevealState(settings, k / IMAGE_REVEAL_FPS, duration);
-    let idx = keyIndex.get(state.key);
+    const t = k / IMAGE_REVEAL_FPS;
+    const state = settings ? imageRevealState(settings, t, duration) : undefined;
+    const key = `${state?.key ?? "still"}|${mask ? revealCoverageKey(mask, t, duration, boxW, boxH) : ""}`;
+    let idx = keyIndex.get(key);
     if (idx === undefined) {
-      const rendered = drawImageOverlayPng(overlay, img, framePixelWidth, framePixelHeight, state);
+      const rendered = drawImageOverlayPng(overlay, img, framePixelWidth, framePixelHeight, state, mask && pic ? { pic, local: t, span: duration } : undefined);
       if (!rendered) return null;
       origin = origin ?? { xPx: rendered.xPx, yPx: rendered.yPx };
       idx = unique.length;
       unique.push(rendered.dataUrl);
-      keyIndex.set(state.key, idx);
+      keyIndex.set(key, idx);
       // eslint-disable-next-line no-await-in-loop
       if (idx % 12 === 11) await new Promise((r) => setTimeout(r, 0));
     }
@@ -330,8 +341,16 @@ async function loadOverlayImage(src: string): Promise<HTMLImageElement | null> {
   return loaded ? img : null;
 }
 
-// Draws a picture overlay - at one moment of its reveal when `reveal` is given - to its own PNG.
-function drawImageOverlayPng(overlay: ImageOverlay, img: HTMLImageElement, framePixelWidth: number, framePixelHeight: number, reveal?: ImageRevealState): RenderedOverlayPng | null {
+// Draws a picture overlay - at one moment of its reveal when `reveal` is given, and of its opening
+// mask when `maskReveal` is - to its own PNG.
+function drawImageOverlayPng(
+  overlay: ImageOverlay,
+  img: HTMLImageElement,
+  framePixelWidth: number,
+  framePixelHeight: number,
+  reveal?: ImageRevealState,
+  maskReveal?: { pic: ReturnType<typeof revealMaskCanvas>; local: number; span: number }
+): RenderedOverlayPng | null {
   const w = overlay.width * framePixelWidth;
   const h = overlay.height * framePixelHeight;
   if (w <= 0 || h <= 0) return null;
@@ -406,7 +425,8 @@ function drawImageOverlayPng(overlay: ImageOverlay, img: HTMLImageElement, frame
       p.translate(pw / 2, ph / 2);
       if (overlay.flipHorizontal || overlay.flipVertical) p.scale(overlay.flipHorizontal ? -1 : 1, overlay.flipVertical ? -1 : 1);
       p.drawImage(img, sx, sy, sWidth, sHeight, -pw / 2, -ph / 2, pw, ph);
-      drawLayerMask(m, { mask: overlay.mask }, pw, ph);
+      if (maskReveal) drawRevealCoverage(m, overlay.mask, maskReveal.pic, maskReveal.local, maskReveal.span, pw, ph);
+      else drawLayerMask(m, { mask: overlay.mask }, pw, ph);
       p.setTransform(1, 0, 0, 1, 0, 0);
       p.globalCompositeOperation = "destination-in";
       p.drawImage(maskCanvas, 0, 0);
@@ -430,7 +450,7 @@ function drawImageOverlayPng(overlay: ImageOverlay, img: HTMLImageElement, frame
     ctx.restore();
   }
 
-  if (reveal) applyImageReveal(ctx, canvas, reveal, overlay.reveal!, w, h);
+  if (reveal && overlay.reveal) applyImageReveal(ctx, canvas, reveal, overlay.reveal, w, h);
 
   ctx.restore();
 

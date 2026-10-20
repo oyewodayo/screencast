@@ -16,6 +16,7 @@ mod commands {
     pub mod embedded_scan;
     pub mod file_info;
     pub mod motion_tracking;
+    pub mod object_find;
     pub mod music_library;
     pub mod native_playback;
     pub mod snip;
@@ -475,6 +476,8 @@ fn main() {
             commands::conversion::export_trimmed_video,
             commands::background_removal::background_removal_status,
             commands::recording::load_bubble_sidecar,
+            commands::object_find::find_objects,
+            commands::object_find::cancel_find_objects,
             commands::camera_effects::camera_effect_start,
             commands::camera_effects::camera_effect_status,
             commands::camera_effects::camera_effect_preview,

@@ -3985,6 +3985,17 @@ pub struct AdjustmentLayerSpec {
     pub mask_x: i64,
     #[serde(default)]
     pub mask_y: i64,
+    // The region moving (a spotlight following someone - adjustmentLayers.ts): the mask PNG is then
+    // the region alone (not inverted), and these place its top-left over time (output pixels,
+    // absolute output seconds); `mask_invert` turns it into "everything but the region".
+    #[serde(default)]
+    pub mask_keyframes: Option<Vec<OverlayKeyframe>>,
+    #[serde(default)]
+    pub mask_invert: bool,
+    // A solid colour instead of the adjusted picture ("#rrggbb") - what masks the main video: show
+    // only a region of it, the rest filled.
+    #[serde(default)]
+    pub fill: Option<String>,
 }
 
 fn one() -> f64 {
@@ -4148,6 +4159,64 @@ pub struct PipOverlay {
     pub audio_input: Option<usize>,
     #[serde(skip)]
     pub background_input: Option<usize>,
+    // A mask that moves and resizes (a reveal - layerMask.ts): its own picture (the shape, feathered,
+    // with room for the feather around it) placed at each moment's box inside the layer.
+    #[serde(default)]
+    pub mask_motion: Option<MaskMotionSpec>,
+    #[serde(skip)]
+    pub mask_motion_input: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MaskMotionSpec {
+    pub image_base64: String,
+    // The picture's top-left and size in the layer's box (pixels), at absolute output seconds.
+    pub keyframes: Vec<MaskKeyframeSpec>,
+    #[serde(default)]
+    pub invert: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MaskKeyframeSpec {
+    pub time: f64,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub easing: String,
+}
+
+// The moving mask as a grey stream the layer's size ([out]): the mask's picture scaled and placed
+// per frame on black (inverted when asked). Its input is the picture looped at OVERLAY_INPUT_FPS
+// from the layer's start, so the frame number gives the time for the per-frame size.
+fn moving_mask_chain(pip: &PipOverlay, motion: &MaskMotionSpec, input: usize, tag: &str, out: &str) -> String {
+    // The keyframes as OverlayKeyframes (x, y, and the size riding in scale/opacity), for keyframe_expr.
+    let kfs: Vec<OverlayKeyframe> = motion
+        .keyframes
+        .iter()
+        .map(|k| OverlayKeyframe { time: k.time, x: k.x, y: k.y, scale: k.w.max(2.0), opacity: k.h.max(2.0), easing: k.easing.clone() })
+        .collect();
+    let (w, h, st) = (pip.width, pip.height, pip.start_time);
+    let frame_time = format!("({st:.4}+n/{OVERLAY_INPUT_FPS})");
+    let (mw, mh) = (keyframe_expr(&kfs, &frame_time, |k| k.scale), keyframe_expr(&kfs, &frame_time, |k| k.opacity));
+    let (kx, ky) = (keyframe_expr(&kfs, "t", |k| k.x), keyframe_expr(&kfs, "t", |k| k.y));
+    // Smaller than 2 px the picture can't be scaled down any further - a closed reveal would show as
+    // a faint dot or line. The preview draws nothing there, so neither does this.
+    let raw: Vec<OverlayKeyframe> = motion
+        .keyframes
+        .iter()
+        .map(|k| OverlayKeyframe { time: k.time, x: 0.0, y: 0.0, scale: k.w, opacity: k.h, easing: k.easing.clone() })
+        .collect();
+    let (tw, th) = (keyframe_expr(&raw, "t", |k| k.scale), keyframe_expr(&raw, "t", |k| k.opacity));
+    let shown = format!("gte({tw},2)*gte({th},2)");
+    let negate = if motion.invert { ",negate" } else { "" };
+    let d = (pip.end_time - pip.start_time).max(0.01) + 0.1;
+    format!(
+        "color=c=black:s={w}x{h}:r={OVERLAY_INPUT_FPS}:d={d:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}mc];\
+         [{input}:v]format=yuv420p,setpts=PTS-STARTPTS+{st:.4}/TB,scale=w='max(2,trunc({mw}/2)*2)':h='max(2,trunc({mh}/2)*2)':eval=frame[{tag}mp];\
+         [{tag}mc][{tag}mp]overlay=x='{kx}':y='{ky}':eof_action=repeat:enable='{shown}',format=gray{negate}[{out}];"
+    )
 }
 
 // Behind a cut-out (cutoutBackground.ts): "color" - a solid colour; "image" - a picture, already
@@ -4375,7 +4444,7 @@ fn pip_overlay_chain(
     let mut chain = String::new();
     // With a mask PNG (shape and mask together, from the frontend) or a key, the picture's own
     // alpha is kept and the mask multiplied into it; otherwise the shape is drawn here.
-    let composited_label = if pip.mask_input.is_some() || pip.chroma_key.is_some() || pip.cutout_path.is_some() {
+    let composited_label = if pip.mask_input.is_some() || pip.mask_motion_input.is_some() || pip.chroma_key.is_some() || pip.cutout_path.is_some() {
         chain.push_str(&format!("[{input_index}:v]{cover}[{video_label}];"));
         // A cut-out's background goes in behind the person first; shape and mask then cut both.
         let video_label = match (pip.cutout_path.as_ref(), pip.cutout_background.as_ref()) {
@@ -4391,14 +4460,30 @@ fn pip_overlay_chain(
             }
             _ => video_label,
         };
-        match pip.mask_input {
+        let t = format!("pip{stage_index}k");
+        // The mask to multiply in: the static shape/mask picture, the moving mask, or both.
+        let still = pip.mask_input.map(|mask| {
+            chain.push_str(&format!("[{mask}:v]format=gray,scale={w}:{h},setpts=PTS-STARTPTS+{st:.4}/TB[{t}m];", w = pip.width, h = pip.height, st = pip.start_time));
+            format!("{t}m")
+        });
+        let moving = match (pip.mask_motion.as_ref(), pip.mask_motion_input) {
+            (Some(motion), Some(input)) => {
+                chain.push_str(&moving_mask_chain(pip, motion, input, &t, &format!("{t}mv")));
+                Some(format!("{t}mv"))
+            }
+            _ => None,
+        };
+        let mask = match (still, moving) {
+            (Some(a), Some(b)) => {
+                chain.push_str(&format!("[{a}][{b}]blend=all_mode=multiply[{t}mb];"));
+                Some(format!("{t}mb"))
+            }
+            (a, b) => a.or(b),
+        };
+        match mask {
             Some(mask) => {
-                let t = format!("pip{stage_index}k");
                 chain.push_str(&format!(
-                    "[{video_label}]format=yuva420p,split=2[{t}c][{t}a0];[{t}a0]alphaextract[{t}a];\
-                     [{mask}:v]format=gray,scale={w}:{h},setpts=PTS-STARTPTS+{st:.4}/TB[{t}m];\
-                     [{t}a][{t}m]blend=all_mode=multiply[{t}ma];[{t}c][{t}ma]alphamerge[{t}out];",
-                    w = pip.width, h = pip.height, st = pip.start_time
+                    "[{video_label}]format=yuva420p,split=2[{t}c][{t}a0];[{t}a0]alphaextract[{t}a];[{t}a][{mask}]blend=all_mode=multiply[{t}ma];[{t}c][{t}ma]alphamerge[{t}out];"
                 ));
                 format!("{t}out")
             }
@@ -4726,7 +4811,10 @@ fn css_op_from_spec(spec: &CssOpSpec) -> Option<CssColorOp> {
 fn adjustment_layer_chain(layer: &AdjustmentLayerSpec, mask_input: Option<(usize, i64, i64)>, (fw, fh): (i64, i64), current: &str, tag: &str, out: &str) -> String {
     // The frontend renders the mask on even edges inside the frame (4:2:0 chroma can only be
     // cropped on even pixels); kept that way here whatever arrives, the mask scaled to match.
+    let moving = mask_input.is_some() && layer.mask_keyframes.as_ref().is_some_and(|k| !k.is_empty());
     let (rx, ry, rw, rh) = match mask_input {
+        // A moving region works on the whole frame, its mask placed afresh every frame.
+        Some(_) if moving => (0, 0, fw, fh),
         Some((_, mw, mh)) => {
             let x0 = layer.mask_x.clamp(0, (fw - 2).max(0)) & !1;
             let y0 = layer.mask_y.clamp(0, (fh - 2).max(0)) & !1;
@@ -4736,7 +4824,7 @@ fn adjustment_layer_chain(layer: &AdjustmentLayerSpec, mask_input: Option<(usize
     };
     let (start, end) = (layer.start_time, layer.end_time.max(layer.start_time + 0.01));
     let mut fx: Vec<String> = vec![format!("trim=start={start:.4}:end={end:.4}")];
-    if mask_input.is_some() {
+    if mask_input.is_some() && !moving {
         fx.push(format!("crop={rw}:{rh}:{rx}:{ry}"));
     }
     let blur = gaussian_blur_chain(layer.blur_sigma.unwrap_or(0.0), rw, rh, None);
@@ -4752,6 +4840,11 @@ fn adjustment_layer_chain(layer: &AdjustmentLayerSpec, mask_input: Option<(usize
             m[0][0], m[0][1], m[0][2], o[0], m[1][0], m[1][1], m[1][2], o[1], m[2][0], m[2][1], m[2][2], o[2]
         ));
     }
+    if let Some(hex) = layer.fill.as_deref().map(|c| c.trim().trim_start_matches('#')).and_then(|c| u32::from_str_radix(c, 16).ok()) {
+        // Every pixel the colour: no input weights, the colour as the offset (on the alpha column).
+        let (r, g, b) = (((hex >> 16) & 255) as f64 / 255.0, ((hex >> 8) & 255) as f64 / 255.0, (hex & 255) as f64 / 255.0);
+        fx.push(format!("colorchannelmixer=rr=0:rg=0:rb=0:ra={r:.6}:gr=0:gg=0:gb=0:ga={g:.6}:br=0:bg=0:bb=0:ba={b:.6}:aa=1"));
+    }
     let mut graph = format!("[{current}]split=2[{tag}bg][{tag}src];[{tag}src]{}[{tag}a0];", fx.join(","));
     let mut cur = format!("{tag}a0");
     if let Some(v) = layer.vignette.filter(|v| *v > 0.001) {
@@ -4761,9 +4854,23 @@ fn adjustment_layer_chain(layer: &AdjustmentLayerSpec, mask_input: Option<(usize
         cur = format!("{tag}a2");
     }
     if let Some((input, _, _)) = mask_input {
-        graph.push_str(&format!(
-            "[{input}:v]format=gray,scale={rw}:{rh},setpts=PTS-STARTPTS+{start:.4}/TB[{tag}mk];[{cur}][{tag}mk]alphamerge[{tag}a3];"
-        ));
+        if moving {
+            // The region's mask pasted onto black where the keyframes put it, every frame (the
+            // keyframe expressions blur regions use), inverted for a spotlight.
+            let kfs = layer.mask_keyframes.as_deref().unwrap_or(&[]);
+            let (kx, ky) = (keyframe_expr(kfs, "t", |k| k.x), keyframe_expr(kfs, "t", |k| k.y));
+            let negate = if layer.mask_invert { ",negate" } else { "" };
+            graph.push_str(&format!(
+                "color=c=black:s={fw}x{fh}:r={OVERLAY_INPUT_FPS}:d={d:.3},setpts=PTS+{start:.4}/TB,format=yuv420p[{tag}mc];\
+                 [{input}:v]format=yuv420p,setpts=PTS-STARTPTS+{start:.4}/TB[{tag}mp];\
+                 [{tag}mc][{tag}mp]overlay=x='{kx}':y='{ky}':eof_action=repeat,format=gray{negate}[{tag}mk];[{cur}][{tag}mk]alphamerge[{tag}a3];",
+                d = end - start + 0.1
+            ));
+        } else {
+            graph.push_str(&format!(
+                "[{input}:v]format=gray,scale={rw}:{rh},setpts=PTS-STARTPTS+{start:.4}/TB[{tag}mk];[{cur}][{tag}mk]alphamerge[{tag}a3];"
+            ));
+        }
         cur = format!("{tag}a3");
     }
     let mut alpha_ops: Vec<String> = Vec::new();
@@ -6849,6 +6956,26 @@ pub async fn export_trimmed_video(
         temp_overlay_paths.push(path.clone());
         pip.mask_input = Some(inputs.len());
         inputs.push(InputSpec::plain(path.to_string_lossy().to_string()));
+    }
+    // Moving masks' pictures, looped at the overlay rate for the layer's length (the per-frame size
+    // follows the frame number - moving_mask_chain).
+    for (i, pip) in pip_overlays.iter_mut().enumerate() {
+        let Some(data) = pip.mask_motion.as_ref().map(|m| m.image_base64.clone()) else { continue };
+        let path = match write_temp_overlay_png(&data, 40_000 + i) {
+            Ok(path) => path,
+            Err(e) => {
+                for temp_path in &temp_overlay_paths {
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return Err(e);
+            }
+        };
+        temp_overlay_paths.push(path.clone());
+        pip.mask_motion_input = Some(inputs.len());
+        inputs.push(InputSpec {
+            path: path.to_string_lossy().to_string(),
+            pre_args: vec!["-loop".into(), "1".into(), "-framerate".into(), format!("{}", OVERLAY_INPUT_FPS), "-t".into(), format!("{:.3}", (pip.end_time - pip.start_time).max(0.01) + 0.1)],
+        });
     }
     // Cut-out backgrounds that are pictures - single frames too, like the masks.
     for (i, pip) in pip_overlays.iter_mut().enumerate() {
@@ -9973,7 +10100,7 @@ mod tests {
 
         // Adjustment layers: CSS brightness(0.5) over 0.5..1.5s.
         let adj = |ops: Vec<CssOpSpec>, extra: &dyn Fn(&mut AdjustmentLayerSpec)| {
-            let mut a = AdjustmentLayerSpec { start_time: 0.5, end_time: 1.5, placement: "under".into(), color_ops: ops, blur_sigma: None, vignette: None, opacity: 1.0, fade_in: 0.0, fade_out: 0.0, mask_data_base64: None, mask_x: 0, mask_y: 0 };
+            let mut a = AdjustmentLayerSpec { start_time: 0.5, end_time: 1.5, placement: "under".into(), color_ops: ops, blur_sigma: None, vignette: None, opacity: 1.0, fade_in: 0.0, fade_out: 0.0, mask_data_base64: None, mask_x: 0, mask_y: 0, mask_keyframes: None, mask_invert: false, fill: None };
             extra(&mut a);
             a
         };
@@ -10068,6 +10195,8 @@ mod tests {
             video_input: 1,
             audio_input: None,
             background_input: None,
+            mask_motion: None,
+            mask_motion_input: None,
         };
         let long_base = s(&["-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=30:d=6"]);
         let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
@@ -10178,6 +10307,8 @@ mod tests {
             video_input: 1,
             audio_input: None,
             background_input: None,
+            mask_motion: None,
+            mask_motion_input: None,
         };
         let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
         let frame = |t: f64| -> Vec<u8> {
@@ -10260,6 +10391,8 @@ mod tests {
             video_input: 1,
             audio_input: None,
             background_input: None,
+            mask_motion: None,
+            mask_motion_input: None,
         };
         let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
         let px = run(&[
@@ -10283,6 +10416,98 @@ mod tests {
         near(at(30, 60), [32.0, 80.0, 224.0], "the background colour fills behind the person");
         near(at(130, 60), [128.0, 128.0, 128.0], "the person stays in front");
         near(at(250, 60), [200.0, 100.0, 50.0], "outside the layer");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Not a unit test: a spotlight sliding across the frame, a fill, and a reveal mask sliding inside
+    // a layer, through the real ffmpeg ($FFMPEG_DIR), checked where each should be at mid-move.
+    #[test]
+    #[ignore]
+    fn moving_masks_and_fill() {
+        let Ok(dir) = std::env::var("FFMPEG_DIR") else { return };
+        let ffmpeg = PathBuf::from(&dir).join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        let tmp = std::env::temp_dir().join(format!("briefcast_moving_mask_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(&ffmpeg).args(["-v", "error", "-y"]).args(args).output().unwrap();
+            assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
+            out.stdout
+        };
+        // A hard-edged 40x40 white mask.
+        let square = tmp.join("square.png");
+        run(&["-f", "lavfi", "-i", "color=c=white:s=40x40,format=gray", "-frames:v", "1", &square.to_string_lossy()]);
+        let b64 = BASE64.encode(std::fs::read(&square).unwrap());
+        let kf = |time: f64, x: f64, y: f64| OverlayKeyframe { time, x, y, scale: 1.0, opacity: 1.0, easing: "linear".into() };
+        let frame_at = |inputs: &[&str], graph: &str, t: &str| -> Vec<u8> {
+            let mut args: Vec<&str> = inputs.to_vec();
+            args.extend(["-filter_complex", graph, "-map", "[out]", "-ss", t, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
+            run(&args)
+        };
+        let at = |px: &[u8], x: usize, y: usize| { let i = (y * 320 + x) * 3; [px[i] as f64, px[i + 1] as f64, px[i + 2] as f64] };
+        let near = |got: [f64; 3], want: [f64; 3], what: &str| assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 8.0), "{what}: got {got:?}, want {want:?}");
+        let base = "color=c=0xC86432:s=320x240:r=30:d=3";
+        let orange = [200.0, 100.0, 50.0];
+
+        // Spotlight: everything but a 40x40 square goes black; the square slides from x=20 to x=220
+        // between 0.5 s and 1.5 s - at 1.0 s it's at x=120.
+        let spot = AdjustmentLayerSpec {
+            start_time: 0.0, end_time: 3.0, placement: "under".into(), color_ops: vec![CssOpSpec { op: "brightness".into(), value: 0.0 }], blur_sigma: None, vignette: None,
+            opacity: 1.0, fade_in: 0.0, fade_out: 0.0, mask_data_base64: None, mask_x: 0, mask_y: 0,
+            mask_keyframes: Some(vec![kf(0.5, 20.0, 100.0), kf(1.5, 220.0, 100.0)]), mask_invert: true, fill: None,
+        };
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&spot, Some((1, 40, 40)), (320, 240), "base", "spot", "out"));
+        let sq = square.to_string_lossy().to_string();
+        let px = frame_at(&["-f", "lavfi", "-i", base, "-loop", "1", "-framerate", "30", "-t", "3.1", "-i", &sq], graph.trim_end_matches(';'), "1.0");
+        near(at(&px, 140, 120), orange, "inside the spotlight at mid-move");
+        near(at(&px, 40, 120), [0.0, 0.0, 0.0], "where it started is dark now");
+        near(at(&px, 240, 120), [0.0, 0.0, 0.0], "where it's going is still dark");
+
+        // Fill: the whole frame one colour.
+        let fill = AdjustmentLayerSpec { color_ops: vec![], mask_keyframes: None, mask_invert: false, fill: Some("#2050e0".into()), ..spot };
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&fill, None, (320, 240), "base", "fill", "out"));
+        let px = frame_at(&["-f", "lavfi", "-i", base], graph.trim_end_matches(';'), "1.0");
+        near(at(&px, 160, 120), [32.0, 80.0, 224.0], "filled");
+
+        // Reveal: a grey 160x120 layer shows only inside a 40x40 mask sliding from x=0 to x=120
+        // (within the layer) between 0.5 s and 1.5 s.
+        let pip = PipOverlay {
+            source_path: String::new(), x: 0, y: 0, width: 160, height: 120, shape: "rectangle".into(), corner_radius: None, crop: None,
+            trim_start: 0.0, start_time: 0.0, end_time: 3.0, volume: 0.0, blend_mode: None, fx: None, opacity: None, fade_in: 0.0, fade_out: 0.0,
+            chroma_key: None, mask_data_base64: None, source_color: None, mask_input: None, cutout_path: None, cutout_background: None,
+            video_input: 1, audio_input: None, background_input: None,
+            mask_motion: Some(MaskMotionSpec { image_base64: b64, keyframes: vec![
+                MaskKeyframeSpec { time: 0.5, x: 0.0, y: 40.0, w: 40.0, h: 40.0, easing: "linear".into() },
+                MaskKeyframeSpec { time: 1.5, x: 120.0, y: 40.0, w: 40.0, h: 40.0, easing: "linear".into() },
+            ], invert: false }),
+            mask_motion_input: Some(2),
+        };
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let px = frame_at(&["-f", "lavfi", "-i", base, "-f", "lavfi", "-i", "color=c=0x808080:s=160x120:r=30:d=3", "-loop", "1", "-framerate", "30", "-t", "3.1", "-i", &sq], graph.trim_end_matches(';'), "1.0");
+        near(at(&px, 80, 60), [128.0, 128.0, 128.0], "the layer shows inside the mask at mid-move");
+        near(at(&px, 20, 60), orange, "and not where the mask started");
+
+        // An iris opening from nothing at the layer's centre: fully hidden on its first frame (no
+        // 2 px dot), open by 1 s; inverted, the whole layer shows on the first frame.
+        let iris = |invert: bool| PipOverlay {
+            mask_motion: Some(MaskMotionSpec { image_base64: BASE64.encode(std::fs::read(&square).unwrap()), keyframes: vec![
+                MaskKeyframeSpec { time: 0.0, x: 80.0, y: 60.0, w: 0.0, h: 0.0, easing: "ease-out".into() },
+                MaskKeyframeSpec { time: 1.0, x: 60.0, y: 40.0, w: 40.0, h: 40.0, easing: "hold".into() },
+            ], invert }),
+            mask_motion_input: Some(2),
+            source_path: String::new(), x: 0, y: 0, width: 160, height: 120, shape: "rectangle".into(), corner_radius: None, crop: None,
+            trim_start: 0.0, start_time: 0.0, end_time: 3.0, volume: 0.0, blend_mode: None, fx: None, opacity: None, fade_in: 0.0, fade_out: 0.0,
+            chroma_key: None, mask_data_base64: None, source_color: None, mask_input: None, cutout_path: None, cutout_background: None,
+            video_input: 1, audio_input: None, background_input: None,
+        };
+        let inputs = ["-f", "lavfi", "-i", base, "-f", "lavfi", "-i", "color=c=0x808080:s=160x120:r=30:d=3", "-loop", "1", "-framerate", "30", "-t", "3.1", "-i", &sq];
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&iris(false), 1, 0, "base", "out", Some((320, 240))));
+        let first = frame_at(&inputs, graph.trim_end_matches(';'), "0");
+        for (x, y) in [(79, 59), (80, 60), (81, 61), (80, 59)] {
+            near(at(&first, x, y), orange, "nothing of the layer on the closed iris's first frame");
+        }
+        near(at(&frame_at(&inputs, graph.trim_end_matches(';'), "1.2"), 80, 60), [128.0, 128.0, 128.0], "open after the iris");
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&iris(true), 1, 0, "base", "out", Some((320, 240))));
+        near(at(&frame_at(&inputs, graph.trim_end_matches(';'), "0"), 80, 60), [128.0, 128.0, 128.0], "inverted: the whole layer on the first frame");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

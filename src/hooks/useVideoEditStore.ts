@@ -1,7 +1,7 @@
 // hooks/useVideoEditStore.ts
 import { chromaKeyForExport } from "../utils/chromaKey";
 import { cutoutBackgroundForExport } from "../utils/cutoutBackground";
-import { hasShapeOrMask, layerMaskGreyPng } from "../utils/layerMask";
+import { hasShapeOrMask, layerMaskGreyPng, revealMaskMotion } from "../utils/layerMask";
 import { compactTracks, exportFades, freeTrack, isTrackHidden, pipTrack, stackOrder } from "../utils/videoTracks";
 import { audioChannelKey, fxForExport, tidyFx, type AudioFx } from "../utils/audioFx";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -94,7 +94,7 @@ interface ExportKeyframe {
   easing: string;
 }
 import { beatOutputTimes, fitImageClipsToBeats } from "../utils/beatSync";
-import { BLUR_SIGMA_FRACTION, blurNeedsMask, renderBlurMaskToPng, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
+import { BLUR_SIGMA_FRACTION, blurNeedsMask, renderBlurMaskToPng, imageOverlayAnimates, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
 import { isTextReveal } from "../utils/textReveal";
 const appWindow = getCurrentWebviewWindow()
 
@@ -292,6 +292,7 @@ export interface UseVideoEditStoreResult {
   // B-roll: videos laid full-frame over the main one from `startTime`, back to back, on the lowest
   // free video track. Resolves the new layers' ids.
   addVideoLayers: (paths: string[], startTime: number) => Promise<string[]>;
+  addFoundCovers: (covers: { blurs: BlurOverlay[]; images: ImageOverlay[] }) => void;
   liftWebcamBubble: (sourcePath: string, region: { x: number; y: number; width: number; height: number; shape: PipShape; cornerRadius?: number }) => string[];
   hiddenVideoTracks: number[];
   setVideoTrackHidden: (track: number, hidden: boolean) => void;
@@ -1119,6 +1120,21 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  // Find & hide's result (objectFind.ts): blur regions and covers following every appearance of
+  // something - one undo step.
+  const addFoundCovers = useCallback(
+    (covers: { blurs: BlurOverlay[]; images: ImageOverlay[] }) => {
+      const current = stateRef.current;
+      if (!current || covers.blurs.length + covers.images.length === 0) return;
+      pushCommand(
+        snapshot(current, {}),
+        snapshot(current, { blurOverlays: [...current.blurOverlays, ...covers.blurs], imageOverlays: [...current.imageOverlays, ...covers.images] }),
+        "find-hide"
+      );
+    },
+    [pushCommand]
+  );
+
   const addBlurOverlay = useCallback(
     (x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number): string => {
       const current = stateRef.current;
@@ -1882,8 +1898,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
               });
             continue;
           }
-          if (o.reveal) {
-            // A revealing picture burns in as a frame sequence of its reveal (imageReveal.ts).
+          if (imageOverlayAnimates(o)) {
+            // A revealing picture (imageReveal.ts) or one whose mask opens (layerMask.ts) burns in
+            // as a frame sequence.
             // eslint-disable-next-line no-await-in-loop
             const seq = await renderImageRevealFrames(o, pxW, pxH);
             if (seq)
@@ -1983,6 +2000,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             const cutout = o.cutout?.sourcePath === o.sourcePath ? o.cutout : undefined;
             const wPx = Math.round(o.width * videoPixelSize.width);
             const hPx = Math.round(o.height * videoPixelSize.height);
+            // A revealing mask moves per frame; the layer's own shape stays the still mask.
+            const maskMotion = revealMaskMotion(o, wPx, hPx);
             return {
             sourcePath: o.sourcePath,
             x: Math.round(o.x * videoPixelSize.width),
@@ -2010,9 +2029,14 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             chromaKey: cutout ? null : chromaKeyForExport(o.chromaKey),
             // The shape and mask as one grey picture the size of the box - drawn by the same code
             // as the preview's mask (layerMask.ts).
-            maskDataBase64: hasShapeOrMask(o)
-              ? layerMaskGreyPng({ shape: o.shape, cornerRadius: o.cornerRadius, mask: o.mask }, wPx, hPx)
-              : undefined,
+            maskDataBase64: maskMotion
+              ? hasShapeOrMask({ shape: o.shape })
+                ? layerMaskGreyPng({ shape: o.shape, cornerRadius: o.cornerRadius }, wPx, hPx)
+                : undefined
+              : hasShapeOrMask(o)
+                ? layerMaskGreyPng({ shape: o.shape, cornerRadius: o.cornerRadius, mask: o.mask }, wPx, hPx)
+                : undefined,
+            maskMotion,
             };
           }))
         : [];
@@ -2270,6 +2294,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     addPipOverlay,
     addVideoLayers,
     liftWebcamBubble,
+    addFoundCovers,
     hiddenVideoTracks: state?.hiddenVideoTracks ?? [],
     setVideoTrackHidden,
     addSplitScreen,

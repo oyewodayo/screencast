@@ -55,7 +55,7 @@ const BAKE_FPS = 30;
 const SIMPLIFY_TOLERANCE_PX = 0.35;
 
 // Where the source picture sits in the project frame, as fractions of the frame (frame_fit_chain).
-function fitRect(source: Size, frame: Size | null): Box {
+export function fitRect(source: Size, frame: Size | null): Box {
   if (!frame) return { x: 0, y: 0, width: 1, height: 1 };
   const r = containRect(frame.width, frame.height, source.width, source.height);
   return { x: r.x / frame.width, y: r.y / frame.height, width: r.width / frame.width, height: r.height / frame.height };
@@ -64,21 +64,21 @@ function fitRect(source: Size, frame: Size | null): Box {
 const progressAt = (clip: Clip, sourceTime: number) => (clip.end > clip.start ? (sourceTime - clip.start) / (clip.end - clip.start) : 0);
 
 // Source fraction -> output fraction, per axis, for a clip at a source time.
-function forward(clip: Clip, fit: Box, sourceTime: number): { m: FrameAffine; fit: Box } {
+export function forward(clip: Clip, fit: Box, sourceTime: number): { m: FrameAffine; fit: Box } {
   return { m: clipFrameAffine(clip, progressAt(clip, sourceTime)), fit };
 }
-const toOutX = (g: { m: FrameAffine; fit: Box }, u: number) => g.m.ax * (g.fit.x + u * g.fit.width) + g.m.bx;
-const toOutY = (g: { m: FrameAffine; fit: Box }, v: number) => g.m.ay * (g.fit.y + v * g.fit.height) + g.m.by;
-const toSrcX = (g: { m: FrameAffine; fit: Box }, X: number) => ((X - g.m.bx) / g.m.ax - g.fit.x) / g.fit.width;
-const toSrcY = (g: { m: FrameAffine; fit: Box }, Y: number) => ((Y - g.m.by) / g.m.ay - g.fit.y) / g.fit.height;
+export const toOutX = (g: { m: FrameAffine; fit: Box }, u: number) => g.m.ax * (g.fit.x + u * g.fit.width) + g.m.bx;
+export const toOutY = (g: { m: FrameAffine; fit: Box }, v: number) => g.m.ay * (g.fit.y + v * g.fit.height) + g.m.by;
+export const toSrcX = (g: { m: FrameAffine; fit: Box }, X: number) => ((X - g.m.bx) / g.m.ax - g.fit.x) / g.fit.width;
+export const toSrcY = (g: { m: FrameAffine; fit: Box }, Y: number) => ((Y - g.m.by) / g.m.ay - g.fit.y) / g.fit.height;
 
-interface ClipSpan {
+export interface ClipSpan {
   clip: Clip;
   outStart: number;
   outEnd: number;
 }
 
-function clipSpans(clips: Clip[]): ClipSpan[] {
+export function clipSpans(clips: Clip[]): ClipSpan[] {
   let at = 0;
   return clips.map((clip) => {
     const d = clipOutputDuration(clip);

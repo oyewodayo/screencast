@@ -566,6 +566,8 @@ interface VideoTimelineDockerProps {
   onToggleArmPlacePip?: () => void;
   // "Fix webcam background" - marks a webcam bubble baked into the recording (WebcamBubbleMarker).
   onMarkWebcamBubble?: () => void;
+  // Find & hide - outline something once, hide it everywhere (FindHideTool).
+  onFindAndHide?: () => void;
 
   // Whether the on-canvas crop tool (ClipCropOverlay, mounted as a sibling next to VideoPlayer by
   // Dashboard) is armed - unlike text/image/blur, there's nothing to "place", it just shows/hides
@@ -627,6 +629,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   isPlacingPip = false,
   onToggleArmPlacePip,
   onMarkWebcamBubble,
+  onFindAndHide,
   isCroppingClip = false,
   onToggleCroppingClip,
 }) => {
@@ -3530,6 +3533,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <ActionButton title="Add B-roll - videos over the main one, full frame, on a video track above it" onClick={() => void handleAddBroll()}>
             <MdVideoLibrary size={15} />
           </ActionButton>
+          {onFindAndHide && (
+            <ActionButton title="Find & hide - draw around something once (a logo, a name, a face) and blur or cover it everywhere it appears" onClick={onFindAndHide}>
+              <IoEyeOffOutline size={16} />
+            </ActionButton>
+          )}
           {onMarkWebcamBubble && (
             <ActionButton title="Fix webcam background - blur or replace what's behind you in a webcam bubble recorded into the video" onClick={onMarkWebcamBubble}>
               <IoPersonCircleOutline size={16} />

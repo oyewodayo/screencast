@@ -20,6 +20,7 @@ import {
   adjustmentIsActive,
   adjustmentVignetteBackground,
   fadeEnvelope,
+  regionAt,
   regionMaskStyle,
 } from "../../utils/adjustmentLayers";
 import { DOCKED_PANEL_CLASS, useToolPanelHost } from "../docker/ToolPanelHost";
@@ -37,6 +38,8 @@ interface Props {
   onSetTime?: (id: string, edge: "start" | "end", time: number) => void;
   onDuplicate?: (id: string) => void;
   onDelete?: (id: string) => void;
+  // Follow a subject with the layer's area (motion tracking).
+  onTrackMotion?: (id: string) => void;
 }
 
 const isOn = (l: AdjustmentLayer, t: number) => t >= l.startTime && t < l.endTime;
@@ -68,10 +71,36 @@ const Layers: React.FC<Props> = ({ mode, frameRect, layers, currentOutputTime, g
     return () => cancelAnimationFrame(raf);
   }, [anyFading, getOutputTime]);
 
+  // Moving regions follow the player's exact time every frame, as export moves the mask per frame.
+  const movingRef = useRef<AdjustmentLayer[]>([]);
+  movingRef.current = active.filter((l) => !!l.region?.keyframes?.length);
+  const anyMoving = movingRef.current.length > 0;
+  const frameRef = useRef(frameRect);
+  frameRef.current = frameRect;
+  useEffect(() => {
+    if (!anyMoving) return;
+    let raf = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const now = getOutputTime?.();
+      if (now === null || now === undefined) return;
+      for (const l of movingRef.current) {
+        const placed = { ...l, region: regionAt(l.region!, now - l.startTime) };
+        const style = placedStyle(placed, frameRef.current) as Record<string, string | number>;
+        document.querySelectorAll<HTMLElement>(`[data-adj-layer="${l.id}"]`).forEach((el) => {
+          for (const [k, v] of Object.entries(style)) (el.style as unknown as Record<string, string>)[k] = typeof v === "number" ? `${v}px` : v;
+        });
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [anyMoving, getOutputTime]);
+
   return (
     <>
       {active.map((l) => {
-        const box = adjustmentElementBox(l);
+        // A moving region where it is now (the frame loop below keeps it in step between renders).
+        const placed = l.region ? { ...l, region: regionAt(l.region, currentOutputTime - l.startTime) } : l;
         const filter = adjustmentBackdropFilter(l, frameRect.height);
         return (
           <div
@@ -79,15 +108,11 @@ const Layers: React.FC<Props> = ({ mode, frameRect, layers, currentOutputTime, g
             data-adj-layer={l.id}
             className="absolute pointer-events-none"
             style={{
-              left: box.x * frameRect.width,
-              top: box.y * frameRect.height,
-              width: box.width * frameRect.width,
-              height: box.height * frameRect.height,
+              ...placedStyle(placed, frameRect),
               backdropFilter: filter,
               WebkitBackdropFilter: filter,
-              background: adjustmentVignetteBackground(l),
+              background: l.fill ?? adjustmentVignetteBackground(l),
               opacity: fadeEnvelope(l, currentOutputTime),
-              ...(l.region ? regionMaskStyle(l.region, frameRect.width, frameRect.height) : {}),
             }}
           />
         );
@@ -96,17 +121,31 @@ const Layers: React.FC<Props> = ({ mode, frameRect, layers, currentOutputTime, g
   );
 };
 
+// The layer element's box and mask for a (placed) layer, in frame pixels.
+function placedStyle(layer: AdjustmentLayer, frameRect: { width: number; height: number }): React.CSSProperties {
+  const box = adjustmentElementBox(layer);
+  return {
+    left: box.x * frameRect.width,
+    top: box.y * frameRect.height,
+    width: box.width * frameRect.width,
+    height: box.height * frameRect.height,
+    ...(layer.region ? regionMaskStyle(layer.region, frameRect.width, frameRect.height) : {}),
+  };
+}
+
 type Drag = { kind: "move" | "nw" | "ne" | "sw" | "se"; startX: number; startY: number; box: { x: number; y: number; width: number; height: number } };
 const MIN_REGION = 0.03;
 
-const Controls: React.FC<Props> = ({ frameRect, layers, currentOutputTime, selectedId, onSelect, onUpdate, onSetTime, onDuplicate, onDelete }) => {
+const Controls: React.FC<Props> = ({ frameRect, layers, currentOutputTime, selectedId, onSelect, onUpdate, onSetTime, onDuplicate, onDelete, onTrackMotion }) => {
   const host = useToolPanelHost();
   const layer = layers.find((l) => l.id === selectedId) ?? null;
   const [drag, setDrag] = useState<Drag | null>(null);
   const [live, setLive] = useState<Drag["box"] | null>(null);
   if (!layer || !onUpdate) return null;
   const region = layer.region;
-  const box = live ?? (region ? { x: region.x, y: region.y, width: region.width, height: region.height } : null);
+  // A followed area is edited where it is at the playhead; moving it shifts its whole path.
+  const here = region && regionAt(region, currentOutputTime - layer.startTime);
+  const box = live ?? (here ? { x: here.x, y: here.y, width: here.width, height: here.height } : null);
 
   const begin = (kind: Drag["kind"]) => (e: React.PointerEvent) => {
     if (!box) return;
@@ -134,7 +173,12 @@ const Controls: React.FC<Props> = ({ frameRect, layers, currentOutputTime, selec
     setLive(next);
   };
   const end = () => {
-    if (drag && live && region) onUpdate(layer.id, { region: { ...region, ...live } });
+    if (drag && live && region && here) {
+      const dx = live.x - here.x;
+      const dy = live.y - here.y;
+      const keyframes = region.keyframes?.map((k) => ({ ...k, x: k.x + dx, y: k.y + dy }));
+      onUpdate(layer.id, { region: { ...region, ...live, x: region.x + dx, y: region.y + dy, keyframes } });
+    }
     setDrag(null);
     setLive(null);
   };
@@ -158,6 +202,7 @@ const Controls: React.FC<Props> = ({ frameRect, layers, currentOutputTime, selec
       onChange={(patch) => onUpdate(layer.id, patch)}
       onSetTime={onSetTime ? (edge, time) => onSetTime(layer.id, edge, time) : undefined}
       onDuplicate={() => onDuplicate?.(layer.id)}
+      onTrackMotion={onTrackMotion ? () => onTrackMotion(layer.id) : undefined}
       onDelete={() => {
         onDelete?.(layer.id);
         onSelect?.(null);
