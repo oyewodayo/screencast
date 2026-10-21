@@ -11,6 +11,7 @@
 // Pure functions only; values are 0..1 RGB as decoded (gamma-encoded), which is also what lut3d
 // operates on.
 import type { ClipGrade } from "./videoEditTypes";
+import { applyLook } from "./gradeLooks";
 
 export interface Lut3D {
   size: number;
@@ -26,7 +27,8 @@ export const GRADE_SLIDERS = ["exposure", "contrast", "saturation", "temperature
 export type GradeSlider = (typeof GRADE_SLIDERS)[number];
 
 export const hasGrade = (grade: ClipGrade | undefined): grade is ClipGrade =>
-  !!grade && (GRADE_SLIDERS.some((k) => Math.abs(grade[k] ?? 0) > 1e-4) || (!!grade.lut && grade.lut.intensity > 0));
+  !!grade &&
+  (GRADE_SLIDERS.some((k) => Math.abs(grade[k] ?? 0) > 1e-4) || (!!grade.lut && grade.lut.intensity > 0) || (!!grade.look && grade.look.intensity > 0));
 
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const toLinear = (c: number) => Math.pow(c, 2.2);
@@ -97,6 +99,9 @@ export function gradePixel(r: number, g: number, b: number, grade: ClipGrade, us
   r = y + (r - y) * sat;
   g = y + (g - y) * sat;
   b = y + (b - y) * sat;
+
+  // The creative look last, over the corrected picture.
+  if (grade.look && grade.look.intensity > 0) return applyLook(grade.look.name, clamp01(grade.look.intensity), clamp01(r), clamp01(g), clamp01(b));
 
   return [clamp01(r), clamp01(g), clamp01(b)];
 }

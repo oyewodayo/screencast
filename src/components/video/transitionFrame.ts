@@ -8,6 +8,7 @@
 // tile shows exactly what the preview - and the export (transition_fold_step, conversion.rs),
 // which mirrors the same maths - will do.
 import { LeakDirection, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
+import { TransitionPictures, drawCanvasTransition, isCanvasTransition } from "./transitionCanvas";
 
 export interface TransitionElements {
   // The outgoing frame, filling the whole container box.
@@ -21,6 +22,10 @@ export interface TransitionElements {
   fx: HTMLCanvasElement | null;
   // The outgoing frame itself, for the pixelize copy.
   source: CanvasImageSource;
+  // Both pictures as the frame shows them, for the transitions that move both (transitionCanvas.ts) -
+  // asked for only by those, once per drawn frame. Null while they aren't ready: the outgoing
+  // picture then just holds.
+  pictures?: () => TransitionPictures | null;
 }
 
 // The frame rect (the picture) inside the container box the mover fills.
@@ -189,6 +194,17 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
   glow.style.mixBlendMode = "screen";
   if (pixel) pixel.style.display = "none";
   if (fx) fx.style.display = "none";
+
+  if (isCanvasTransition(type)) {
+    // Composited whole from both pictures on the fx canvas, which covers the frame.
+    const pics = els.pictures?.() ?? null;
+    const ctx = pics && fx ? fxContext(fx, W, H) : null;
+    if (!pics || !fx || !ctx) return;
+    fx.style.display = "block";
+    mover.style.opacity = "0";
+    drawCanvasTransition(ctx, type, look, p, pics, W, H, window.devicePixelRatio || 1);
+    return;
+  }
 
   // Frame-local (0..1) polygon -> mover clip-path in container px.
   const toClipPath = (poly: Pt[]) => `polygon(${poly.map(([u, v]) => `${L + u * W}px ${T + v * H}px`).join(",")})`;

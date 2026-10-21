@@ -17,6 +17,8 @@ use crate::services::utility::{get_ffmpeg_path, get_ffprobe_path, path_to_str};
 
 #[cfg(windows)]
 use crate::commands::recording::hide_console_window;
+use crate::services::transition_graphs::{canvas_transition, is_canvas_transition};
+use crate::services::clip_fx::{clip_fx_graph, ClipFx};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConversionProgress {
@@ -3145,10 +3147,12 @@ pub struct TransitionLook {
     pub direction: Option<String>,
     pub size: Option<f64>,
     pub orientation: Option<String>,
+    // Iris: the shape the new clip opens out of. Only ever matched against known names.
+    pub shape: Option<String>,
 }
 
 // "#rrggbb" -> (r, g, b); anything else -> None.
-fn parse_hex_color(color: &str) -> Option<(f64, f64, f64)> {
+pub(crate) fn parse_hex_color(color: &str) -> Option<(f64, f64, f64)> {
     let hex = color.trim().strip_prefix('#')?;
     if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -3197,10 +3201,23 @@ pub struct KeepSegment {
     // which play over music. Rendered as silence of the segment's exact length.
     #[serde(default)]
     pub muted: Option<bool>,
+    // An effect over the clip's whole picture (services/clip_fx.rs) - after its look, before the
+    // vignette preset's layer.
+    #[serde(default)]
+    pub fx: Option<ClipFx>,
+    // The editor-drawn pointer of an "Editable pointer" recording (pointerTrack.ts): its ripples and
+    // cursor as sprite tracks timed in the source's own seconds, laid onto the clip's picture before
+    // its crop and zoom (so they zoom with it) - see segment_effect_chain.
+    #[serde(default)]
+    pub pointer_layers: Option<Vec<SpriteTrack>>,
     // The source's own frame rate - what Ken Burns clocks itself by (ken_burns_chain). Filled in by
     // export_trimmed_video before the graph is built; never sent by the frontend.
     #[serde(skip)]
     pub source_fps: Option<f64>,
+}
+
+fn has_pointer_layers(seg: &KeepSegment) -> bool {
+    seg.pointer_layers.as_ref().is_some_and(|l| !l.is_empty())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4933,7 +4950,7 @@ fn color_filter_chain(cf: &ClipColorFilter) -> String {
 // One CSS filter function on colour (Filter Effects Module, "filter functions" - their SVG
 // feColorMatrix equivalents).
 #[derive(Clone, Copy, Debug)]
-enum CssColorOp {
+pub(crate) enum CssColorOp {
     Brightness(f64),
     Grayscale(f64),
     Sepia(f64),
@@ -4982,7 +4999,7 @@ impl CssColorOp {
 }
 
 // The filter list applied left to right, as one affine map: x -> M x + o.
-fn compose_css_color_ops(ops: &[CssColorOp]) -> ([[f64; 3]; 3], [f64; 3]) {
+pub(crate) fn compose_css_color_ops(ops: &[CssColorOp]) -> ([[f64; 3]; 3], [f64; 3]) {
     let mut m = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let mut o = [0.0; 3];
     for op in ops {
@@ -5004,14 +5021,25 @@ fn compose_css_color_ops(ops: &[CssColorOp]) -> ([[f64; 3]; 3], [f64; 3]) {
 // Where a segment's video chain should end, and what follows it: a vignette preset puts its layer
 // between the chain and `label` (vignette_layer, over the clip's finished frame as the preview
 // draws it); anything else ends straight at `label`.
+//
+// A clip effect (Clip.fx) goes first, over the clip's picture, with the vignette over it - the order
+// the preview's ClipFxLayer draws them in.
 fn segment_vignette(seg: &KeepSegment, w: Option<i64>, h: Option<i64>, label: &str, i: usize) -> (String, String) {
-    match (&seg.color_filter, w, h) {
+    let (vig_in, vig_graph) = match (&seg.color_filter, w, h) {
         (Some(cf), Some(w), Some(h)) if cf.preset == "vignette" => {
             let pre = format!("{label}nv");
             (pre.clone(), vignette_layer(cf.intensity, w, h, 30.0, &pre, label, i))
         }
         _ => (label.to_string(), String::new()),
+    };
+    if let (Some(fx), Some(w), Some(h)) = (&seg.fx, w, h) {
+        let pre = format!("{label}fx");
+        // Its own length plus room for a transition's tail.
+        if let Some(fx_graph) = clip_fx_graph(fx, &pre, &vig_in, (w, h), segment_output_duration(seg) + 2.0, i) {
+            return (pre, format!("{fx_graph}{vig_graph}"));
+        }
     }
+    (vig_in, vig_graph)
 }
 
 // The "vignette" preset: the preview's radial-gradient(ellipse at center, transparent s0%,
@@ -5444,6 +5472,8 @@ fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
         || segment_noise_reduction_db(seg).is_some()
         || !segment_audio_cleanup_filters(seg, None).is_empty()
         || seg.muted.unwrap_or(false)
+        || has_pointer_layers(seg)
+        || seg.fx.as_ref().is_some_and(|fx| fx.intensity > 0.0)
 }
 
 // Decomposes an arbitrary speed factor into a chain of ffmpeg `atempo` filters, each within the
@@ -5470,17 +5500,27 @@ fn atempo_chain(speed: f64) -> String {
         .join(",")
 }
 
-fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>, fit_frame: bool, lut_path: Option<&str>, stab_path: Option<&str>) -> String {
+// `pointer`: the clip's editor-drawn pointer (pointer_fragment), laid on after the clip's look and
+// before any change of geometry - the preview draws the pointer over the graded picture, at the
+// source position, moved and zoomed along with crop / Ken Burns / mirror. Fitting and mirroring then
+// follow the colour stages instead of preceding them (per-pixel colour maps don't care), only for
+// such a clip; every other clip keeps its exact chain.
+fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>, fit_frame: bool, lut_path: Option<&str>, stab_path: Option<&str>, pointer: Option<&str>) -> String {
     let mut extra = String::new();
     // Stabilization first, on the clip's own frames exactly as pass 1 analysed them.
     if let (Some(path), Some(stab)) = (stab_path, &seg.stabilize) {
         extra.push_str(&stabilize_chain(path, stab.strength));
     }
-    if let (true, Some(w), Some(h)) = (fit_frame, out_w, out_h) {
-        extra.push_str(&frame_fit_chain(w, h, is_still_image_path(&seg.source_path)));
-    }
-    if seg.flip_horizontal.unwrap_or(false) {
-        extra.push_str(",hflip");
+    let fit_and_flip = |extra: &mut String| {
+        if let (true, Some(w), Some(h)) = (fit_frame, out_w, out_h) {
+            extra.push_str(&frame_fit_chain(w, h, is_still_image_path(&seg.source_path)));
+        }
+        if seg.flip_horizontal.unwrap_or(false) {
+            extra.push_str(",hflip");
+        }
+    };
+    if pointer.is_none() {
+        fit_and_flip(&mut extra);
     }
     // The grade, then the colour preset - the preview's order: GradeCanvas draws the graded frame
     // and the preset's CSS filter applies on top of it (colour maps don't commute, so the order is
@@ -5495,6 +5535,10 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         } else if cf.preset != "none" {
             extra.push_str(&color_filter_chain(cf));
         }
+    }
+    if let Some(fragment) = pointer {
+        extra.push_str(fragment);
+        fit_and_flip(&mut extra);
     }
     if let (Some(crop), Some(w), Some(h)) = (&seg.crop, out_w, out_h) {
         extra.push_str(&crop_chain(crop));
@@ -5576,7 +5620,7 @@ fn rgb_to_yuv((r, g, b): (f64, f64, f64)) -> (i64, i64, i64) {
 // A per-frame command series for `target` (a named filter instance, "gblur@w3"): `param` set to
 // value(p) at every frame of the window, p = transition progress 0..1. How a filter whose options
 // aren't expressions (a blur radius, a pixel block size) follows the transition exactly.
-fn sendcmd_series(target: &str, params: &[&str], d: f64, fps: f64, value: impl Fn(f64) -> f64) -> String {
+pub(crate) fn sendcmd_series(target: &str, params: &[&str], d: f64, fps: f64, value: impl Fn(f64) -> f64) -> String {
     let frames = (d * fps).ceil().max(1.0) as usize;
     // Only where the value changes.
     let mut cmds: Vec<String> = Vec::new();
@@ -5641,7 +5685,7 @@ fn transition_window_graph(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64,
             // the progress has passed shows the new clip. The same hash as the preview's.
             let s = "(sin(X*12.9898+Y*78.233)*43758.5453)";
             format!(
-                "[old{i}]split[ma{i}][mm{i}];[mm{i}]format=gray,scale=160:-1,geq=lum='255*gte({s}-floor({s}),{pg})',scale={w}:{h}:flags=bilinear[mk{i}];\
+                "[old{i}]split[ma{i}][mm{i}];[mm{i}]scale=160:-1,format=gray,geq=lum='255*gte({s}-floor({s}),{pg})',scale={w}:{h}:flags=bilinear[mk{i}];\
                  [ma{i}]format=yuva420p[mb{i}];[mb{i}][mk{i}]alphamerge[mo{i}];[head{i}][mo{i}]overlay=eof_action=pass[tr{i}];"
             )
         }
@@ -5694,9 +5738,11 @@ fn transition_window_graph(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64,
         }
         "whip" => {
             // A sideways smear through a white flash: blur sin(pi p)*3% of the width, sliding 30%.
-            let blur = sendcmd_series(&format!("gblur@w{i}"), &["sigma"], d, fps, |p| (std::f64::consts::PI * p).sin() * 0.03 * w as f64);
+            // gblur takes its vertical sigma from `sigma` only once, at init - a series has to drive
+            // sigmaV too, or the blur stays one-dimensional.
+            let blur = sendcmd_series(&format!("gblur@w{i}"), &["sigma", "sigmaV"], d, fps, |p| (std::f64::consts::PI * p).sin() * 0.03 * w as f64);
             format!(
-                "[old{i}]split[oa{i}][ob{i}];[oa{i}]format=yuva420p,{blur},gblur@w{i}=sigma=0,fade=t=out:st=0:d={d:.4}:alpha=1[oc{i}];\
+                "[old{i}]split[oa{i}][ob{i}];[oa{i}]format=yuva420p,{blur},gblur@w{i}=sigma=0:sigmaV=0,fade=t=out:st=0:d={d:.4}:alpha=1[oc{i}];\
                  [head{i}][oc{i}]overlay=x='-0.3*main_w*{pt}':y=0:eof_action=pass[x{i}];{flash}[x{i}][fl{i}]overlay=eof_action=pass[tr{i}];",
                 flash = flat(&format!("ob{i}"), &format!("fl{i}"), 235, &format!("min(1,{:.3}*pow(sin(PI*{pg}),2))", 0.8 * k))
             )
@@ -5714,9 +5760,9 @@ fn transition_window_graph(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64,
             if name == "zoomin" {
                 return format!("[old{i}]{persp},{fade_out}[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass[tr{i}];");
             }
-            let blur = sendcmd_series(&format!("gblur@z{i}"), &["sigma"], d, fps, |p| p * 0.012 * w as f64 * k);
+            let blur = sendcmd_series(&format!("gblur@z{i}"), &["sigma", "sigmaV"], d, fps, |p| p * 0.012 * w as f64 * k);
             format!(
-                "[old{i}]split[oa{i}][ob{i}];[oa{i}]format=yuva420p,{blur},gblur@z{i}=sigma=0,{persp},fade=t=out:st=0:d={d:.4}:alpha=1[oc{i}];\
+                "[old{i}]split[oa{i}][ob{i}];[oa{i}]format=yuva420p,{blur},gblur@z{i}=sigma=0:sigmaV=0,{persp},fade=t=out:st=0:d={d:.4}:alpha=1[oc{i}];\
                  [head{i}][oc{i}]overlay=eof_action=pass[x{i}];{flash}[x{i}][fl{i}]overlay=eof_action=pass[tr{i}];",
                 flash = flat(&format!("ob{i}"), &format!("fl{i}"), 235, &format!("min(1,{:.3}*pow(sin(PI*{pg}),2))", 0.35 * k))
             )
@@ -5763,8 +5809,14 @@ fn transition_window_graph(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64,
             format!("[old{i}]{px},pixelize@p{i}=w=1:h=1[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass:enable='lt(t,{half:.4})'[tr{i}];")
         }
         "pagecurl" | "colorsweep" => drawn_transition(name, i, d, look),
+        n if is_canvas_transition(n) => canvas_transition(n, i, d, fps, (w, h), look),
         _ => format!("[old{i}]{fade_out}[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass[tr{i}];"),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn transition_window_graph_for_tests(name: &str, i: usize, d: f64, fps: f64, frame: (i64, i64)) -> String {
+    transition_window_graph(name, i, d, fps, frame, &TransitionLook::default())
 }
 
 // The two transitions drawn from sprites slid per frame (page curl, colour sweep): [old{i}] (the
@@ -5872,6 +5924,21 @@ const ALLOWED_TRANSITIONS: &[&str] = &[
     "pagecurl",
     "zoomblur",
     "colorsweep",
+    // Both pictures move (services/transition_graphs.rs).
+    "blocks",
+    "mosaic",
+    "split",
+    "slider",
+    "strips",
+    "beam",
+    "iris",
+    "spin",
+    "glitch",
+    "slice",
+    "push",
+    "cube",
+    "flip",
+    "tiles",
 ];
 
 fn sanitize_transition_name(name: &str) -> &str {
@@ -5893,6 +5960,9 @@ const ALLOWED_OVERLAY_ANIMATIONS: &[&str] = &[
     "slide-up",
     "slide-down",
     "pop",
+    "flip",
+    "zoom",
+    "drop",
 ];
 
 fn sanitize_overlay_animation(name: &str) -> &str {
@@ -5935,6 +6005,43 @@ fn overlay_slide_remaining_expr(start_time: f64, end_time: f64) -> String {
 fn overlay_pop_scale_expr(start_time: f64, end_time: f64, tv: &str) -> String {
     let p = overlay_arrival_expr(start_time, end_time, tv);
     format!("if(gte({p},1),1,max(0.01,1+2.70158*pow({p}-1,3)+1.70158*pow({p}-1,2)))")
+}
+
+// "flip": its horizontal squash - one and a half coin turns, |cos((1-p)^3 3pi)| (overlayAnimation.ts).
+fn overlay_flip_sx_expr(start_time: f64, end_time: f64, tv: &str) -> String {
+    let p = overlay_arrival_expr(start_time, end_time, tv);
+    format!("if(gte({p},1),1,max(0.02,abs(cos(pow(1-{p},3)*3*PI))))")
+}
+
+// "zoom": rushing in from 2.5x.
+fn overlay_zoom_scale_expr(start_time: f64, end_time: f64, tv: &str) -> String {
+    let p = overlay_arrival_expr(start_time, end_time, tv);
+    format!("(1+1.5*pow(1-{p},3))")
+}
+
+// The overlay's own scale animation over time in `tv` (pop / flip / zoom), if it has one.
+fn overlay_anim_scale_expr(animation: &str, start_time: f64, end_time: f64, tv: &str) -> Option<String> {
+    match animation {
+        "pop" | "flip" => Some(overlay_pop_scale_expr(start_time, end_time, tv)),
+        "zoom" => Some(overlay_zoom_scale_expr(start_time, end_time, tv)),
+        _ => None,
+    }
+}
+
+// "drop": how far above its resting spot it is - easeOutBounce of the arrival, from 0.3 frames up.
+fn overlay_drop_offset_expr(start_time: f64, end_time: f64) -> String {
+    let p = overlay_arrival_expr(start_time, end_time, "t");
+    let (n1, d1) = (7.5625, 2.75);
+    let bounce = format!(
+        "if(lt({p},{a:.6}),{n1}*pow({p},2),if(lt({p},{b:.6}),{n1}*pow({p}-{c:.6},2)+0.75,if(lt({p},{d:.6}),{n1}*pow({p}-{e:.6},2)+0.9375,{n1}*pow({p}-{f:.6},2)+0.984375)))",
+        a = 1.0 / d1,
+        b = 2.0 / d1,
+        c = 1.5 / d1,
+        d = 2.5 / d1,
+        e = 2.25 / d1,
+        f = 2.625 / d1
+    );
+    format!("-(1-({bounce}))*main_h*0.3")
 }
 
 // The overlay filter's own x/y, as ffmpeg expression strings - a plain integer for "none"/"fade"
@@ -5982,6 +6089,7 @@ fn overlay_position_expr(ov: &OverlayImage, animation: &str) -> (String, String)
                 remaining = overlay_slide_remaining_expr(ov.start_time, ov.end_time)
             ),
         ),
+        "drop" => (ov.x.to_string(), format!("({})+({})", ov.y, overlay_drop_offset_expr(ov.start_time, ov.end_time))),
         _ => (ov.x.to_string(), ov.y.to_string()),
     }
 }
@@ -5996,6 +6104,7 @@ fn overlay_slide_offset_expr(ov: &OverlayImage, animation: &str) -> (String, Str
         "slide-right" => (format!("(main_w*{f})*{r}"), "0".into()),
         "slide-up" => ("0".into(), format!("-(main_h*{f})*{r}")),
         "slide-down" => ("0".into(), format!("(main_h*{f})*{r}")),
+        "drop" => ("0".into(), overlay_drop_offset_expr(ov.start_time, ov.end_time)),
         _ => ("0".into(), "0".into()),
     }
 }
@@ -6291,6 +6400,213 @@ fn write_temp_overlay_sequence(frames: &OverlayFrames, index: usize, created: &m
         created.push(path);
     }
     Ok(dir.join(format!("{}_f%06d.png", prefix)).to_string_lossy().to_string())
+}
+
+// ---- Sprite tracks and the screen frame (the Screen Style panel) ---------------------------------
+//
+// A sprite track (spriteTrack.ts) is a layer made of a few small pictures shown one after another
+// at changing places - an editor-drawn pointer at its sub-pixel phases, a click ripple's frames,
+// keyboard-shortcut chips. The editor paints each distinct picture once, with the code its preview
+// paints with; here they become an ffconcat list (each picture held until the next run - nothing is
+// rendered per frame) overlaid at a position that is a step function of time. Runs change on
+// boundaries the editor puts between frames, so a frame never lands where the picture and its
+// position could disagree.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpriteTrack {
+    // PNG data URLs, each exactly width x height.
+    pub sprites: Vec<String>,
+    pub width: i64,
+    pub height: i64,
+    // (from seconds, sprite index or -1 for nothing, x, y) - sorted; each holds until the next.
+    pub runs: Vec<(f64, i64, i64, i64)>,
+    // Where the last run ends.
+    pub end: f64,
+}
+
+// The frame around the video (screenStyle.ts): the backdrop at the final frame's size with a
+// transparent rounded hole, and where the edited picture is scaled into - the hole's box.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenStyleSpec {
+    pub backdrop_base64: String,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+// A sprite's bytes as an 8-bit RGBA PNG of exactly w x h - what the canvas usually hands over
+// already; anything else (an opaque canvas saved as RGB, a size off by one) is redrawn so every
+// picture in the concat list has one size and format (a change mid-stream reconfigures the graph).
+fn normalized_sprite_png(data_base64: &str, w: u32, h: u32) -> Result<Vec<u8>, String> {
+    let payload = data_base64.rsplit(',').next().unwrap_or(data_base64);
+    let bytes = BASE64.decode(payload).map_err(|e| format!("Failed to decode a sprite: {}", e))?;
+    let ihdr_ok = bytes.len() > 26
+        && &bytes[1..4] == b"PNG"
+        && u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) == w
+        && u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) == h
+        && bytes[24] == 8
+        && bytes[25] == 6;
+    if ihdr_ok {
+        return Ok(bytes);
+    }
+    let decoded = image::load_from_memory(&bytes).map_err(|e| format!("Failed to read a sprite: {}", e))?.to_rgba8();
+    let mut canvas = image::RgbaImage::new(w, h);
+    image::imageops::overlay(&mut canvas, &decoded, 0, 0);
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to write a sprite: {}", e))?;
+    Ok(out)
+}
+
+// The track's pictures in `dir` and an ffconcat list showing them run by run, timed from `shift`
+// (run times minus `shift`, anything before 0 dropped). Returns the list's path.
+fn write_sprite_track(track: &SpriteTrack, dir: &Path, shift: f64) -> Result<PathBuf, String> {
+    let (w, h) = (track.width.clamp(2, 8192) as u32, track.height.clamp(2, 8192) as u32);
+    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create a sprite folder: {}", e))?;
+    for (i, data) in track.sprites.iter().enumerate() {
+        std::fs::write(dir.join(format!("s{i}.png")), normalized_sprite_png(data, w, h)?).map_err(|e| format!("Failed to write a sprite: {}", e))?;
+    }
+    let mut blank = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::new(w, h))
+        .write_to(&mut std::io::Cursor::new(&mut blank), image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to write a sprite: {}", e))?;
+    std::fs::write(dir.join("blank.png"), blank).map_err(|e| format!("Failed to write a sprite: {}", e))?;
+
+    let name = |sprite: i64| -> String {
+        if sprite >= 0 && (sprite as usize) < track.sprites.len() {
+            format!("s{sprite}.png")
+        } else {
+            "blank.png".to_string()
+        }
+    };
+    // Boundaries rounded once, so the durations add up to exactly them (no drift over a long list).
+    let at = |t: f64| ((t - shift).max(0.0) * 1e6).round() / 1e6;
+    let mut list = String::from("ffconcat version 1.0\n");
+    let mut cursor = 0.0;
+    // Each picture opened at a microsecond frame rate: the list's timestamps take the first file's
+    // timebase, and the image demuxer's default (1/25 s) rounded every run onto a 40 ms grid -
+    // measured: a sprite meant for one 60 fps frame showed on the next.
+    fn push(file: &str, until: f64, list: &mut String, cursor: &mut f64) {
+        let d = until - *cursor;
+        if d > 0.0 {
+            list.push_str(&format!("file '{file}'\noption framerate 1000000\nduration {d:.6}\n"));
+            *cursor = until;
+        }
+    }
+    for (k, run) in track.runs.iter().enumerate() {
+        let from = at(run.0);
+        let until = at(track.runs.get(k + 1).map(|r| r.0).unwrap_or(track.end));
+        if from > cursor {
+            push("blank.png", from, &mut list, &mut cursor);
+        }
+        push(&name(run.1), until, &mut list, &mut cursor);
+    }
+    // Then nothing. The demuxer ignores a list's last duration, so the blank is listed twice.
+    list.push_str("file 'blank.png'\noption framerate 1000000\nduration 1\nfile 'blank.png'\noption framerate 1000000\n");
+    let path = dir.join("track.ffconcat");
+    std::fs::write(&path, list).map_err(|e| format!("Failed to write a sprite list: {}", e))?;
+    Ok(path)
+}
+
+// The ffmpeg input reading a sprite track's list.
+fn sprite_track_input(list: &Path) -> InputSpec {
+    InputSpec { path: list.to_string_lossy().to_string(), pre_args: vec!["-f".into(), "concat".into(), "-safe".into(), "0".into()] }
+}
+
+// A value that holds from each point's time to the next, as an expression in `tvar` - a balanced
+// tree of comparisons (a long pointer path has thousands of steps).
+fn step_expr(points: &[(f64, i64)], tvar: &str) -> String {
+    fn build(points: &[(f64, i64)], lo: usize, hi: usize, tvar: &str) -> String {
+        if lo == hi {
+            return points[lo].1.to_string();
+        }
+        let mid = (lo + hi + 1) / 2;
+        format!("if(lt({tvar},{:.6}),{},{})", points[mid].0, build(points, lo, mid - 1, tvar), build(points, mid, hi, tvar))
+    }
+    if points.is_empty() {
+        return "0".into();
+    }
+    build(points, 0, points.len() - 1, tvar)
+}
+
+// One axis of a track's position over time (run times minus `shift`), changes only.
+fn sprite_track_axis(track: &SpriteTrack, shift: f64, value: impl Fn(&(f64, i64, i64, i64)) -> i64) -> String {
+    let mut points: Vec<(f64, i64)> = Vec::new();
+    for run in &track.runs {
+        let v = value(run);
+        if points.last().map_or(true, |p| p.1 != v) {
+            points.push((run.0 - shift, v));
+        }
+    }
+    step_expr(&points, "t")
+}
+
+// [main] with the sprite track read from input `input` laid over it, into [out].
+fn sprite_track_overlay(track: &SpriteTrack, input: usize, shift: f64, main: &str, tag: &str, out: &str) -> String {
+    let x = sprite_track_axis(track, shift, |r| r.2);
+    let y = sprite_track_axis(track, shift, |r| r.3);
+    format!("[{input}:v]format=rgba[{tag}s];[{main}][{tag}s]overlay=x='{x}':y='{y}':eof_action=pass[{out}];")
+}
+
+// A segment's pointer layers as a fragment spliced into its chain (segment_effect_chain): the chain
+// so far is named, each layer (read from `inputs`, timed from `shift` - the segment's first frame)
+// laid over it in turn, and the chain carries on from the result.
+fn pointer_fragment(i: usize, layers: &[SpriteTrack], inputs: &[usize], shift: f64) -> String {
+    let mut fragment = format!("[ptr{i}m];");
+    let mut current = format!("ptr{i}m");
+    for (k, (layer, input)) in layers.iter().zip(inputs).enumerate() {
+        let out = format!("ptr{i}l{k}");
+        fragment.push_str(&sprite_track_overlay(layer, *input, shift, &current, &format!("ptr{i}s{k}"), &out));
+        current = out;
+    }
+    fragment.push_str(&format!("[{current}]null"));
+    fragment
+}
+
+// The video scaled into the frame's hole, the backdrop (single frame, repeated) over it.
+fn screen_style_chain(input: &str, backdrop_input: usize, ss: &ScreenStyleSpec, (w, h): (i64, i64), out: &str) -> String {
+    let cw = (ss.width.clamp(2, w) / 2) * 2;
+    let ch = (ss.height.clamp(2, h) / 2) * 2;
+    let cx = (ss.x.clamp(0, w - cw) / 2) * 2;
+    let cy = (ss.y.clamp(0, h - ch) / 2) * 2;
+    format!(
+        "[{input}]scale={cw}:{ch},setsar=1,pad={w}:{h}:{cx}:{cy}:color=black[{out}c];[{backdrop_input}:v]format=rgba[{out}b];[{out}c][{out}b]overlay=0:0[{out}];"
+    )
+}
+
+// When the first frame at or after `at` (seconds of the file's own timeline) is shown - what a
+// segment trimmed from `at` counts its time from. Packets only, so it's quick.
+fn probe_first_frame_at(ffprobe_path: &PathBuf, path: &str, at: f64) -> Option<f64> {
+    let mut cmd = Command::new(ffprobe_path);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        &format!("{:.3}%{:.3}", (at - 3.0).max(0.0), at + 1.0),
+        "-show_entries",
+        "packet=pts_time:format=start_time",
+        "-of",
+        "json",
+        path,
+    ]);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    let probe: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let start = probe["format"]["start_time"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    probe["packets"]
+        .as_array()?
+        .iter()
+        .filter_map(|p| p["pts_time"].as_str()?.parse::<f64>().ok())
+        .map(|t| t - start)
+        .filter(|t| *t >= at - 1e-6)
+        .fold(None, |best: Option<f64>, t| Some(best.map_or(t, |b| b.min(t))))
 }
 
 // ---- Smart render (plain cuts) ------------------------------------------------------------------
@@ -6664,6 +6980,12 @@ pub async fn export_trimmed_video(
     // The video's own sound's mixer channel - EQ/compressor/balance after the track volume
     // (audio_fx.rs); None = none.
     video_audio_fx: Option<AudioFxSpec>,
+    // The frame around the video (Screen Style - screenStyle.ts): wallpaper, padding, corners and
+    // shadow at the final frame's size. None = the video fills the frame as always.
+    screen_style: Option<ScreenStyleSpec>,
+    // Keyboard-shortcut chips (keystrokes.ts) as a sprite track on the output timeline, over every
+    // overlay and under the captions. None = none.
+    keystrokes: Option<SpriteTrack>,
     // Set by the background export queue (exportQueue.ts): the run gets its own cancel state
     // (cancel_export_job), progress events keyed "export-job:<id>", a live preview frame
     // (export-job-preview events) and below-normal CPU priority so editing stays smooth meanwhile.
@@ -7069,6 +7391,8 @@ pub async fn export_trimmed_video(
         && video_fx_filters.is_empty()
         && captions_ass_path.is_none()
         && output_frame.is_none()
+        && screen_style.is_none()
+        && keystrokes.is_none()
         && quality.as_deref() != Some("small");
     if plain_cuts {
         let ffprobe_path = get_ffprobe_path(&app_handle)?;
@@ -7097,6 +7421,13 @@ pub async fn export_trimmed_video(
 
     // A queued export's live preview frame output (RunExtras), filled in by whichever path runs.
     let mut preview_args: Vec<String> = Vec::new();
+    // Sprite tracks' pictures and lists (the drawn pointer, shortcut chips), removed when the export
+    // ends however it ends.
+    let sprite_root = TempDir(std::env::temp_dir().join(format!(
+        "briefcast_sprites_{}_{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    )));
     let owned_args: Vec<String> = if segments.len() == 1
         && !has_video_overlays
         && !has_blur_overlays
@@ -7107,6 +7438,8 @@ pub async fn export_trimmed_video(
         && captions_ass_path.is_none()
         && output_frame.is_none()
         && loudness_lufs.is_none()
+        && screen_style.is_none()
+        && keystrokes.is_none()
     {
         // Still the fast path even with a track volume/mute adjustment - that's a plain `-af`, no
         // filter graph needed just for it.
@@ -7146,6 +7479,48 @@ pub async fn export_trimmed_video(
         // which reads the file itself at absolute times.
         let ffmpeg_for_decode = get_ffmpeg_path(&app_handle)?;
         let ffprobe_for_decode = get_ffprobe_path(&app_handle)?;
+
+        // The screen frame, the drawn pointer and the shortcut chips (the Screen Style panel) - their
+        // inputs come after every other kind, so no index arithmetic above changes. Each clip's
+        // pointer is timed from the clip's first frame (what its trimmed picture calls t=0), found
+        // before the segments are re-timed for input seeking below.
+        let fail = |e: String, temp: &[PathBuf]| {
+            for path in temp {
+                let _ = std::fs::remove_file(path);
+            }
+            e
+        };
+        let mut pointer_fragments: Vec<Option<String>> = vec![None; segments.len()];
+        for (i, seg) in segments.iter().enumerate() {
+            let Some(layers) = seg.pointer_layers.as_ref().filter(|l| !l.is_empty()) else { continue };
+            let (ffprobe, path, at) = (ffprobe_for_decode.clone(), seg.source_path.clone(), seg.start);
+            let first = blocking(move || probe_first_frame_at(&ffprobe, &path, at)).await?.unwrap_or(seg.start);
+            let mut indices = Vec::with_capacity(layers.len());
+            for (k, layer) in layers.iter().enumerate() {
+                let list = write_sprite_track(layer, &sprite_root.0.join(format!("seg{i}_{k}")), first).map_err(|e| fail(e, &temp_overlay_paths))?;
+                indices.push(inputs.len());
+                inputs.push(sprite_track_input(&list));
+            }
+            pointer_fragments[i] = Some(pointer_fragment(i, layers, &indices, first));
+        }
+        let screen_style_input = match &screen_style {
+            Some(ss) => {
+                let path = write_temp_overlay_png(&ss.backdrop_base64, 50_000).map_err(|e| fail(e, &temp_overlay_paths))?;
+                temp_overlay_paths.push(path.clone());
+                inputs.push(InputSpec::plain(path.to_string_lossy().to_string()));
+                Some(inputs.len() - 1)
+            }
+            None => None,
+        };
+        let keystroke_input = match &keystrokes {
+            Some(track) => {
+                let list = write_sprite_track(track, &sprite_root.0.join("keys"), 0.0).map_err(|e| fail(e, &temp_overlay_paths))?;
+                inputs.push(sprite_track_input(&list));
+                Some(inputs.len() - 1)
+            }
+            None => None,
+        };
+
         let mut decode_choice: HashMap<String, bool> = HashMap::new();
         // Source seconds each file is read for - only a long read of a heavy source is worth racing.
         let mut seconds_from: HashMap<String, f64> = HashMap::new();
@@ -7296,7 +7671,7 @@ pub async fn export_trimmed_video(
         // below has one consistent label to start from regardless of how many segments there were.
         if segments.len() == 1 {
             let seg = &segments[0];
-            let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[0].as_deref(), stab_paths[0].as_deref());
+            let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[0].as_deref(), stab_paths[0].as_deref(), pointer_fragments[0].as_deref());
             let (end, vignette) = segment_vignette(seg, video_width, video_height, "base", 0);
             filter.push_str(&format!("{}[{end}];{vignette}", segment_video_chain("[0:v]", seg, &extra)));
             filter.push_str(&segment_audio_chain(
@@ -7314,7 +7689,7 @@ pub async fn export_trimmed_video(
             // timeline with no transitions takes this exact path regardless of color/Ken Burns.
             let mut concat_inputs = String::new();
             for (i, seg) in segments.iter().enumerate() {
-                let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref());
+                let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref(), pointer_fragments[i].as_deref());
                 let (end, vignette) = segment_vignette(seg, video_width, video_height, &format!("v{i}"), i);
                 filter.push_str(&format!("{}[{end}];{vignette}", segment_video_chain(&format!("[{i}:v]"), seg, &extra)));
                 filter.push_str(&segment_audio_chain(
@@ -7360,7 +7735,7 @@ pub async fn export_trimmed_video(
             // failed with "First input link main timebase ... do not match" (reproduced against
             // the bundled ffmpeg). Pinning every segment to AVTB makes all fold steps agree.
             for (i, seg) in segments.iter().enumerate() {
-                let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref());
+                let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref(), pointer_fragments[i].as_deref());
                 // A transition into the next clip plays this one's tail handle (transition_tail):
                 // read past the cut, then split the tail off as [old{i+1}].
                 match segments.get(i + 1).and_then(transition_window) {
@@ -7439,7 +7814,7 @@ pub async fn export_trimmed_video(
         // Platform format: the assembled video fitted into it first, so every overlay below (and
         // the captions, laid out by the frontend at this same size) lands on the final frame.
         if let Some(frame) = &output_frame {
-            filter.push_str(&reframe_chain("base", "framed", frame));
+            filter.push_str(&reframe_chain(&current_label, "framed", frame));
             current_label = "framed".to_string();
         }
         // Adjustment layers placed "under" grade/blur the video itself - before blur regions and
@@ -7497,7 +7872,7 @@ pub async fn export_trimmed_video(
                 source_label = shifted;
             }
             let animation = sanitize_overlay_animation(&ov.animation);
-            let composited_label = if animation == "fade" {
+            let composited_label = if animation == "fade" || animation == "zoom" {
                 // The preview's ramp: 0.4s, or half the overlay's length if that's shorter.
                 let ramp = overlay_animation_ramp(ov.start_time, ov.end_time);
                 let faded_label = format!("ovfade{}", i);
@@ -7513,14 +7888,14 @@ pub async fn export_trimmed_video(
             let (mut x_expr, mut y_expr) = overlay_position_expr(ov, animation);
             let mut composited_label = composited_label;
             let kfs = ov.keyframes.as_ref().filter(|k| !k.is_empty());
-            let pops = animation == "pop";
+            let flips = animation == "flip";
             let kf_scales = kfs.is_some_and(|kfs| kfs.iter().any(|k| (k.scale - 1.0).abs() > 1e-3));
             // The overlay's scale over time in `tv`: its keyframed scale times pop's overshoot -
             // the preview multiplies the two the same way (the box's scale() transform inside the
             // keyframe layer's). None when it never scales.
             let scale_at = |tv: &str| -> Option<String> {
                 let kf = kfs.filter(|_| kf_scales).map(|kfs| keyframe_expr(kfs, tv, |k| k.scale.max(0.01)));
-                let pop = pops.then(|| overlay_pop_scale_expr(ov.start_time, ov.end_time, tv));
+                let pop = overlay_anim_scale_expr(animation, ov.start_time, ov.end_time, tv);
                 match (kf, pop) {
                     (Some(a), Some(b)) => Some(format!("({a})*({b})")),
                     (a, b) => a.or(b),
@@ -7528,10 +7903,13 @@ pub async fn export_trimmed_video(
             };
             // Scale per frame - `n` counts this input's frames, which start at start_time.
             let frame_time = format!("({:.4}+n/{})", ov.start_time, OVERLAY_INPUT_FPS);
+            // A flip squashes the width on top (overlay_flip_sx_expr).
+            let squash_at = |tv: &str| flips.then(|| overlay_flip_sx_expr(ov.start_time, ov.end_time, tv));
             if let Some(s) = scale_at(&frame_time) {
+                let sx = squash_at(&frame_time).map(|q| format!("({s})*({q})")).unwrap_or_else(|| s.clone());
                 let scaled = format!("ovkfs{}", i);
                 filter.push_str(&format!(
-                    "[{composited_label}]scale=w='max(2,trunc(iw*({s})/2)*2)':h='max(2,trunc(ih*({s})/2)*2)':eval=frame[{scaled}];"
+                    "[{composited_label}]scale=w='max(2,trunc(iw*({sx})/2)*2)':h='max(2,trunc(ih*({s})/2)*2)':eval=frame[{scaled}];"
                 ));
                 composited_label = scaled;
             }
@@ -7555,7 +7933,8 @@ pub async fn export_trimmed_video(
             }
             if let Some(s) = scale_at("t") {
                 // Scaled about the box's centre, as the preview does.
-                x_expr = format!("({x_expr})+overlay_w*(1/({s})-1)/2");
+                let sx = squash_at("t").map(|q| format!("({s})*({q})")).unwrap_or_else(|| s.clone());
+                x_expr = format!("({x_expr})+overlay_w*(1/({sx})-1)/2");
                 y_expr = format!("({y_expr})+overlay_h*(1/({s})-1)/2");
             }
             // Never "outv" itself - later stages (PiP, adjustment layers, captions) read from here;
@@ -7564,7 +7943,7 @@ pub async fn export_trimmed_video(
             // A blend mode composites through blend_composite instead: over the overlay's own box
             // when it stays put, the whole frame when anything moves it.
             if let (Some(mode), Some(frame), Some((w, h))) = (ov.blend_mode.as_deref().and_then(blend_mode_ffmpeg), adjust_frame, overlay_layer_size(ov)) {
-                let moving = kfs.is_some() || animation.starts_with("slide") || scale_at("t").is_some();
+                let moving = kfs.is_some() || animation.starts_with("slide") || animation == "drop" || scale_at("t").is_some();
                 let layer = BlendLayer { label: &composited_label, x: x_expr.clone(), y: y_expr.clone(), width: w, height: h, moving, fps: OVERLAY_INPUT_FPS };
                 filter.push_str(&blend_composite(&current_label, &layer, frame, mode, ov.start_time, ov.end_time, &format!("ovb{i}"), &next_label));
                 current_label = next_label;
@@ -7585,6 +7964,21 @@ pub async fn export_trimmed_video(
 
         // Adjustment layers placed "over" act on everything composited so far (captions excepted).
         adjust_pass(&mut filter, &mut current_label, true);
+
+        // The screen frame (wallpaper, padding, corners, shadow) goes around the whole edited
+        // picture - clips, layers, blurs, pictures and text shrink into it together, so nothing
+        // placed on the video ever moves off what it was placed on. Only the shortcut chips and
+        // captions sit on the frame itself, as in the preview.
+        if let (Some(ss), Some(input), Some(frame)) = (&screen_style, screen_style_input, adjust_frame) {
+            filter.push_str(&screen_style_chain(&current_label, input, ss, frame, "styled"));
+            current_label = "styled".to_string();
+        }
+
+        // Shortcut chips over everything but the captions, as the preview stacks them.
+        if let (Some(track), Some(input)) = (&keystrokes, keystroke_input) {
+            filter.push_str(&sprite_track_overlay(track, input, 0.0, &current_label, "keys", "keysout"));
+            current_label = "keysout".to_string();
+        }
 
         // Whatever [current_label] is pointing at (the plain trim/concat [base], or the last blur/
         // image/text/pip stage that actually ran) needs to end up named [outv] for the -map below -
@@ -8828,7 +9222,9 @@ mod tests {
             stabilize: None,
             speed_steps: None,
             muted: None,
+            pointer_layers: None,
             source_fps: None,
+            fx: None,
         }
     }
 
@@ -9075,8 +9471,8 @@ mod tests {
         assert!(graph.starts_with("color=black:s=320x180:") && graph.ends_with("[v2nv][vig2]overlay=shortest=1:format=auto[v2];"), "{graph}");
         // Not a colour map, and without a frame size, ffmpeg's own vignette.
         assert_eq!(color_filter_chain(seg.color_filter.as_ref().unwrap()), "");
-        assert!(segment_effect_chain(&seg, None, None, false, None, None).contains(",vignette="));
-        assert!(!segment_effect_chain(&seg, Some(1280), Some(720), false, None, None).contains("vignette"));
+        assert!(segment_effect_chain(&seg, None, None, false, None, None, None).contains(",vignette="));
+        assert!(!segment_effect_chain(&seg, Some(1280), Some(720), false, None, None, None).contains("vignette"));
     }
 
     #[test]
@@ -9249,7 +9645,7 @@ mod tests {
             width: 1.0,
             height: 1.0,
         });
-        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None);
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None, None);
         let hflip_pos = chain.find("hflip").expect("hflip missing");
         let color_pos = chain.find("colorchannelmixer").expect("color filter missing");
         let crop_pos = chain.find("crop=").expect("crop missing");
@@ -9275,7 +9671,7 @@ mod tests {
             target_y: None,
             span: None,
         });
-        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None);
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None, None);
         // Exactly one scale=1920:1080 (Ken Burns' own trailing one), not two.
         assert_eq!(chain.matches("scale=1920:1080").count(), 1);
     }
@@ -9283,7 +9679,7 @@ mod tests {
     #[test]
     fn segment_effect_chain_with_no_effects_is_empty() {
         assert_eq!(
-            segment_effect_chain(&base_segment(), Some(1920), Some(1080), false, None, None),
+            segment_effect_chain(&base_segment(), Some(1920), Some(1080), false, None, None, None),
             ""
         );
     }
@@ -9596,7 +9992,7 @@ mod tests {
     #[test]
     fn frame_fit_letterboxes_before_any_clip_effect() {
         let seg = KeepSegment { source_path: "photo.jpg".to_string(), flip_horizontal: Some(true), ..base_segment() };
-        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), true, None, None);
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), true, None, None, None);
         let fit = chain.find("pad=1920:1080").expect("pads to the output frame");
         let flip = chain.find("hflip").expect("still applies the clip's own effects");
         assert!(fit < flip, "fit must come first so effects see the output-sized frame: {chain}");
@@ -9607,7 +10003,7 @@ mod tests {
     #[test]
     fn frame_fit_is_skipped_unless_requested() {
         let seg = KeepSegment { source_path: "photo.jpg".to_string(), ..base_segment() };
-        assert_eq!(segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None), "");
+        assert_eq!(segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None, None), "");
         assert!(!frame_fit_chain(1280, 720, false).contains("format="), "videos keep their own pixel format");
     }
 
@@ -9699,6 +10095,7 @@ mod tests {
             direction: Some("'; drop".to_string()),
             size: Some(1.0),
             orientation: Some("'; drop".to_string()),
+            shape: Some("'; drop".to_string()),
         };
         for name in ALLOWED_TRANSITIONS {
             let step = transition_window_graph(name, 1, 0.5, 30.0, (1280, 720), &hostile);
@@ -9736,6 +10133,18 @@ mod tests {
             let kb = ClipKenBurns { preset: preset.to_string(), intensity: Some(0.8), target_x: None, target_y: None, span: None };
             std::fs::write(format!("{dir}/kb_{preset}.chain"), ken_burns_chain(&kb, 4.0, 640, 360, 30.0)).unwrap();
         }
+        // Every clip effect over a 4s clip at 640x360, [0:v] -> [out].
+        for kind in ["echo", "rgbsplit", "huecycle", "focus", "colorin", "flicker"] {
+            let fx = ClipFx { kind: kind.into(), intensity: 0.6 };
+            std::fs::write(format!("{dir}/fx_{kind}.graph"), clip_fx_graph(&fx, "0:v", "out", (640, 360), 4.0, 0).unwrap()).unwrap();
+        }
+        // The box animations' scale / squash / position expressions for an overlay shown 1s-3s.
+        for anim in ["pop", "flip", "zoom", "drop"] {
+            let s = overlay_anim_scale_expr(anim, 1.0, 3.0, "t").unwrap_or_else(|| "1".into());
+            let sx = if anim == "flip" { overlay_flip_sx_expr(1.0, 3.0, "t") } else { "1".into() };
+            let dy = if anim == "drop" { overlay_drop_offset_expr(1.0, 3.0) } else { "0".into() };
+            std::fs::write(format!("{dir}/anim_{anim}.txt"), format!("{s}\n{sx}\n{dy}")).unwrap();
+        }
         let look: TransitionLook = std::env::var("DUMP_TRANSITION_LOOK").ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
         let mut seg0 = base_segment();
         seg0.end = 2.0;
@@ -9747,7 +10156,11 @@ mod tests {
             graph.push_str(&transition_tail("full0", "v0", "old1", 2.0, 1.0, 30.0));
             graph.push_str(&format!("{},fps=30.000,settb=AVTB[v1];", segment_video_chain("[1:v]", &seg1, "")));
             graph.push_str("anullsrc=channel_layout=stereo:sample_rate=44100:duration=2[a0];anullsrc=channel_layout=stereo:sample_rate=44100:duration=2[a1];");
-            let (step, v, _) = transition_fold_step("v0", "a0", 1, 2.0, 2.0, 30.0, Some((640, 360)), Some((name, 1.0)), Some(&look));
+            let size = std::env::var("DUMP_TRANSITION_SIZE")
+                .ok()
+                .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+                .unwrap_or((640, 360));
+            let (step, v, _) = transition_fold_step("v0", "a0", 1, 2.0, 2.0, 30.0, Some(size), Some((name, 1.0)), Some(&look));
             graph.push_str(&step);
             graph.push_str(&format!("[{v}]format=yuv420p[out]"));
             std::fs::write(format!("{dir}/{name}.txt"), graph).unwrap();
@@ -9823,7 +10236,7 @@ mod tests {
             }
             let mut g = String::new();
             for (i, seg) in segs.iter().enumerate() {
-                let extra = segment_effect_chain(seg, Some(1920), Some(1080), true, None, None);
+                let extra = segment_effect_chain(seg, Some(1920), Some(1080), true, None, None, None);
                 match segs.get(i + 1).and_then(transition_window) {
                     Some(d) => {
                         g.push_str(&format!("{},fps=30.000,settb=AVTB[full{i}];", segment_video_chain_with_tail(&format!("[{i}:v]"), seg, &extra, tail_source_seconds(seg, d))));
@@ -9872,7 +10285,7 @@ mod tests {
             ..base_segment()
         };
         assert!(segment_needs_filter_graph(&seg));
-        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, Some(r"C\:/tmp/g.cube"), None);
+        let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, Some(r"C\:/tmp/g.cube"), None, None);
         let lut = chain.find(r"lut3d=file='C\:/tmp/g.cube':interp=trilinear").expect("lut3d step");
         assert!(lut < chain.find("colorchannelmixer").unwrap(), "{chain}");
     }
@@ -10510,6 +10923,179 @@ mod tests {
         near(at(&frame_at(&inputs, graph.trim_end_matches(';'), "1.2"), 80, 60), [128.0, 128.0, 128.0], "open after the iris");
         let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&iris(true), 1, 0, "base", "out", Some((320, 240))));
         near(at(&frame_at(&inputs, graph.trim_end_matches(';'), "0"), 80, 60), [128.0, 128.0, 128.0], "inverted: the whole layer on the first frame");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Evaluates what step_expr builds: nested if(lt(t,X),A,B) over integer leaves.
+    fn eval_step(expr: &str, t: f64) -> i64 {
+        if let Some(rest) = expr.strip_prefix("if(lt(t,") {
+            let close = rest.find(')').unwrap();
+            let threshold: f64 = rest[..close].parse().unwrap();
+            let body = &rest[close + 2..rest.len() - 1];
+            // Split the two branches at the top-level comma.
+            let mut depth = 0;
+            let split = body.char_indices().find(|&(_, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ',' if depth == 0 => return true,
+                    _ => {}
+                }
+                false
+            });
+            let (a, b) = body.split_at(split.unwrap().0);
+            return if t < threshold { eval_step(a, t) } else { eval_step(&b[1..], t) };
+        }
+        expr.parse().unwrap()
+    }
+
+    #[test]
+    fn step_expressions_hold_each_value_until_the_next() {
+        assert_eq!(step_expr(&[], "t"), "0");
+        assert_eq!(step_expr(&[(0.0, 10)], "t"), "10");
+        assert_eq!(step_expr(&[(0.0, 10), (1.0, 20), (2.0, 30)], "t"), "if(lt(t,1.000000),10,if(lt(t,2.000000),20,30))");
+        let points: Vec<(f64, i64)> = (0..37).map(|i| (i as f64 * 0.25 - 1.0, i * 7)).collect();
+        for k in 0..200 {
+            let t = k as f64 * 0.05 - 2.0;
+            let want = points.iter().rev().find(|p| p.0 <= t).map_or(points[0].1, |p| p.1);
+            assert_eq!(eval_step(&step_expr(&points, "t"), t), want, "at {t}");
+        }
+    }
+
+    fn tiny_png(w: u32, h: u32, rgba: [u8; 4]) -> String {
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(w, h, image::Rgba(rgba)))
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        format!("data:image/png;base64,{}", BASE64.encode(out))
+    }
+
+    #[test]
+    fn sprite_lists_hold_each_picture_for_its_run() {
+        let dir = std::env::temp_dir().join(format!("briefcast_sprite_list_test_{}", std::process::id()));
+        let track = SpriteTrack {
+            sprites: vec![tiny_png(4, 4, [255, 0, 0, 255]), tiny_png(4, 4, [0, 0, 255, 255])],
+            width: 4,
+            height: 4,
+            runs: vec![(0.5, 0, 2, 2), (0.75, -1, 2, 2), (1.0, 1, 4, 4)],
+            end: 1.5,
+        };
+        // Timed from 0.25: blank first, then each run - and everything before 0 dropped.
+        let list = std::fs::read_to_string(write_sprite_track(&track, &dir, 0.25).unwrap()).unwrap();
+        let entries: Vec<(&str, &str)> = list
+            .lines()
+            .filter(|l| !l.starts_with("option ") && !l.starts_with("ffconcat"))
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|c| (c[0], c.get(1).copied().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("file 'blank.png'", "duration 0.250000"),
+                ("file 's0.png'", "duration 0.250000"),
+                ("file 'blank.png'", "duration 0.250000"),
+                ("file 's1.png'", "duration 0.500000"),
+                ("file 'blank.png'", "duration 1"),
+                ("file 'blank.png'", ""),
+            ]
+        );
+        // Every picture at a microsecond timebase (see write_sprite_track).
+        assert_eq!(list.matches("option framerate 1000000").count(), 6);
+        let list = std::fs::read_to_string(write_sprite_track(&track, &dir, 0.6).unwrap()).unwrap();
+        assert!(list.starts_with("ffconcat version 1.0\nfile 's0.png'\noption framerate 1000000\nduration 0.150000\n"), "{list}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sprites_become_rgba_of_the_tracks_size() {
+        // An opaque RGB picture one pixel short.
+        let mut rgb = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 4, image::Rgb([9, 8, 7])))
+            .write_to(&mut std::io::Cursor::new(&mut rgb), image::ImageFormat::Png)
+            .unwrap();
+        let fixed = image::load_from_memory(&normalized_sprite_png(&BASE64.encode(rgb), 4, 4).unwrap()).unwrap();
+        assert!(matches!(fixed, image::DynamicImage::ImageRgba8(_)));
+        let px = fixed.to_rgba8();
+        assert_eq!(px.dimensions(), (4, 4));
+        assert_eq!(px.get_pixel(0, 0).0, [9, 8, 7, 255]);
+        assert_eq!(px.get_pixel(3, 0).0[3], 0);
+        // Already right: passed through untouched.
+        let ok = tiny_png(4, 4, [1, 2, 3, 4]);
+        assert_eq!(normalized_sprite_png(&ok, 4, 4).unwrap(), BASE64.decode(ok.rsplit(',').next().unwrap()).unwrap());
+    }
+
+    // Not a unit test: the editor-drawn pointer through a clip's real chain and the screen frame,
+    // rendered by the real ffmpeg ($FFMPEG_DIR) and checked frame by frame. The sprite alternates
+    // red/blue every frame while it moves 2 px a frame, so a picture or a position one frame early
+    // or late shows up as the wrong colour or a coloured pixel where the box just was.
+    #[test]
+    #[ignore]
+    fn pointer_sprites_land_on_their_frames_and_zoom_with_the_clip() {
+        let Ok(dir) = std::env::var("FFMPEG_DIR") else { return };
+        let ffmpeg = PathBuf::from(&dir).join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        let tmp = std::env::temp_dir().join(format!("briefcast_pointer_test_{}", std::process::id()));
+        let run = |args: &[&str]| {
+            let out = Command::new(&ffmpeg).args(["-v", "error", "-y"]).args(args).output().unwrap();
+            assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
+            out.stdout
+        };
+        // Cells centred on k/60 of SOURCE time, boundaries half a cell before - as pointerTrack.ts.
+        let runs: Vec<(f64, i64, i64, i64)> = (30..91).map(|k: i64| ((k as f64 - 0.5) / 60.0, k % 2, 2 * (k - 30), 40)).collect();
+        let track = SpriteTrack { sprites: vec![tiny_png(8, 8, [255, 0, 0, 255]), tiny_png(8, 8, [0, 0, 255, 255])], width: 8, height: 8, runs, end: 90.5 / 60.0 };
+        let list = write_sprite_track(&track, &tmp.join("ptr"), 0.5).unwrap();
+        let list_path = list.to_string_lossy().to_string();
+        // The clip: 0.5..1.5 s of a grey 60 fps source, cropped to its top-left quarter (2x zoom).
+        let seg = KeepSegment { start: 0.5, end: 1.5, crop: Some(ClipCrop { x: 0.0, y: 0.0, width: 0.5, height: 0.5 }), ..base_segment() };
+        let fragment = pointer_fragment(0, std::slice::from_ref(&track), &[1], 0.5);
+        let extra = segment_effect_chain(&seg, Some(320), Some(240), false, None, None, Some(&fragment));
+        let graph = format!("{}[out]", segment_video_chain("[0:v]", &seg, &extra));
+        let px = run(&[
+            "-f", "lavfi", "-i", "color=c=0x808080:s=320x240:r=60:d=3",
+            "-f", "concat", "-safe", "0", "-i", &list_path,
+            "-filter_complex", &graph, "-map", "[out]", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ]);
+        let frame_bytes = 320 * 240 * 3;
+        let frames = px.len() / frame_bytes;
+        assert!(frames >= 58, "only {frames} frames");
+        let at = |f: usize, x: usize, y: usize| { let i = f * frame_bytes + (y * 320 + x) * 3; [px[i] as f64, px[i + 1] as f64, px[i + 2] as f64] };
+        let near = |got: [f64; 3], want: [f64; 3], what: &str| assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 12.0), "{what}: got {got:?}, want {want:?}");
+        for f in 0..frames.min(60) {
+            let k = 30 + f as i64;
+            // Zoomed 2x: the 8 px box at (2j, 40) of the source is 16 px at (4j, 80).
+            let x = 4 * (k - 30) as usize;
+            let want = if k % 2 == 0 { [255.0, 0.0, 0.0] } else { [0.0, 0.0, 255.0] };
+            near(at(f, x + 8, 88), want, &format!("the pointer on frame {f}"));
+            if x >= 4 {
+                // A frame late, the box would still cover x-4 (red or blue are far darker than the
+                // grey) - luma, since 4:2:0 chroma smears across the edge either way.
+                let [r, g, b] = at(f, x - 4, 88);
+                let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                assert!((luma - 128.0).abs() <= 12.0, "nothing where it was, frame {f}: luma {luma}");
+            }
+        }
+
+        // The screen frame: a green backdrop with a transparent hole at (40, 30) 240 x 180.
+        let mut backdrop = image::RgbaImage::from_pixel(320, 240, image::Rgba([0, 200, 0, 255]));
+        for y in 30..210 {
+            for x in 40..280 {
+                backdrop.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(backdrop).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        let backdrop_path = tmp.join("backdrop.png");
+        std::fs::write(&backdrop_path, &bytes).unwrap();
+        let ss = ScreenStyleSpec { backdrop_base64: String::new(), x: 40, y: 30, width: 240, height: 180 };
+        let graph = format!("[0:v]format=yuv420p[base];{}", screen_style_chain("base", 1, &ss, (320, 240), "out"));
+        let px = run(&[
+            "-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=30:d=2", "-i", &backdrop_path.to_string_lossy(),
+            "-filter_complex", graph.trim_end_matches(';'), "-map", "[out]", "-ss", "1.0", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ]);
+        let at = |x: usize, y: usize| { let i = (y * 320 + x) * 3; [px[i] as f64, px[i + 1] as f64, px[i + 2] as f64] };
+        near(at(10, 10), [0.0, 200.0, 0.0], "the wallpaper");
+        near(at(160, 120), [200.0, 100.0, 50.0], "the video in the hole");
+        near(at(42, 32), [200.0, 100.0, 50.0], "right to the hole's edge");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

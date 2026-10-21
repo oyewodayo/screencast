@@ -6,11 +6,34 @@
 // the live preview draws them (TransitionPreviewLayer), so what you dial in is what you get.
 import React from "react";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
-import { LeakDirection, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
+import { IrisShape, LeakDirection, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
 import { DEFAULT_SWEEP_COLOR } from "../video/transitionFrame";
+import { DEFAULT_BEAM_COLOR } from "../video/transitionCanvas";
 
-export const transitionHasLook = (type: TransitionType | null): boolean =>
-  type === "lightleak" || type === "fadewhite" || type === "whip" || type === "horzopen" || type === "zoomblur" || type === "colorsweep";
+const LOOK_TYPES = new Set<TransitionType>(["lightleak", "fadewhite", "whip", "horzopen", "zoomblur", "colorsweep", "push", "cube", "flip", "spin", "strips", "beam", "slider", "iris"]);
+export const transitionHasLook = (type: TransitionType | null): boolean => !!type && LOOK_TYPES.has(type);
+
+// Which way the pictures travel (push, cube, flip).
+const MOVE_DIRECTIONS: { value: LeakDirection; label: string; title: string }[] = [
+  { value: "left", label: "←", title: "Moves to the left" },
+  { value: "right", label: "→", title: "Moves to the right" },
+  { value: "up", label: "↑", title: "Moves up" },
+  { value: "down", label: "↓", title: "Moves down" },
+];
+const IRIS_SHAPES: { value: IrisShape; label: string }[] = [
+  { value: "triangle", label: "▼ Triangle" },
+  { value: "diamond", label: "◆ Diamond" },
+  { value: "hexagon", label: "⬢ Hexagon" },
+  { value: "star", label: "★ Star" },
+  { value: "heart", label: "♥ Heart" },
+];
+const BEAM_COLORS: { color: string; name: string }[] = [
+  { color: DEFAULT_BEAM_COLOR, name: "Warm white" },
+  { color: "#ffffff", name: "White" },
+  { color: "#7dd3fc", name: "Ice" },
+  { color: "#c084fc", name: "Violet" },
+  { color: "#fbbf24", name: "Gold" },
+];
 
 const SWEEP_COLORS: { color: string; name: string }[] = [
   { color: DEFAULT_SWEEP_COLOR, name: "Golden" },
@@ -154,6 +177,70 @@ const TransitionLookControls: React.FC<{ type: TransitionType; look: TransitionL
       </>
     );
   }
+  if (type === "push" || type === "cube" || type === "flip") {
+    const direction = MOVE_DIRECTIONS.some((d) => d.value === look.direction) ? look.direction : "left";
+    return (
+      <Row label="Direction">
+        {MOVE_DIRECTIONS.map((d) => (
+          <Chip key={d.value} active={direction === d.value} title={d.title} onClick={() => set({ direction: d.value })}>
+            {d.label}
+          </Chip>
+        ))}
+      </Row>
+    );
+  }
+  if (type === "spin")
+    return (
+      <Row label="Turns">
+        <Chip active={look.direction !== "left"} title="Clockwise" onClick={() => set({ direction: "right" })}>
+          ↻ Clockwise
+        </Chip>
+        <Chip active={look.direction === "left"} title="Anticlockwise" onClick={() => set({ direction: "left" })}>
+          ↺ Anticlockwise
+        </Chip>
+      </Row>
+    );
+  if (type === "strips")
+    return (
+      <Row label="Strips">
+        <Chip active={look.orientation !== "horizontal"} title="Columns sliding up and down" onClick={() => set({ orientation: "vertical" })}>
+          ║ Columns
+        </Chip>
+        <Chip active={look.orientation === "horizontal"} title="Rows sliding left and right" onClick={() => set({ orientation: "horizontal" })}>
+          ═ Rows
+        </Chip>
+      </Row>
+    );
+  if (type === "slider" || type === "beam") {
+    const sweep = (
+      <Row label="Sweep">
+        <Chip active={look.direction !== "left"} title="Left to right" onClick={() => set({ direction: "right" })}>
+          →
+        </Chip>
+        <Chip active={look.direction === "left"} title="Right to left" onClick={() => set({ direction: "left" })}>
+          ←
+        </Chip>
+      </Row>
+    );
+    if (type === "slider") return sweep;
+    return (
+      <>
+        <ColorRow colors={BEAM_COLORS} value={look.color ?? DEFAULT_BEAM_COLOR} onChange={(color) => set({ color })} />
+        {strength}
+        {sweep}
+      </>
+    );
+  }
+  if (type === "iris")
+    return (
+      <Row label="Shape">
+        {IRIS_SHAPES.map((s) => (
+          <Chip key={s.value} active={(look.shape ?? "triangle") === s.value} title={s.label} onClick={() => set({ shape: s.value })}>
+            {s.label}
+          </Chip>
+        ))}
+      </Row>
+    );
   if (type === "horzopen")
     return (
       <Row label="Opens">

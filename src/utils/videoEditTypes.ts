@@ -19,6 +19,10 @@ import type { OverlayKeyframe } from "./keyframes";
 import type { OverlayAsset } from "./videoAssets";
 import type { TextRevealSettings } from "./textReveal";
 import type { ImageRevealSettings } from "./imageReveal";
+import type { ScreenStyle } from "./screenStyle";
+import type { PointerStyle } from "./pointerTrack";
+import type { KeystrokeStyle } from "./keystrokes";
+import type { SpriteTrackSpec } from "./spriteTrack";
 
 // A per-clip color grade, applied to that clip's own trimmed segment (both live preview -
 // VideoPlayer's CSS `filter`, see cssFilterForColorPreset in videoColorFilters.ts - and export
@@ -46,7 +50,11 @@ export interface ClipGrade {
   shadows?: number;
   // A .cube file from disk (camera log conversions, film looks), applied first, mixed by intensity.
   lut?: { path: string; name: string; intensity: number };
+  // A built-in creative look (gradeLooks.ts) applied last, on top of the corrections, mixed by
+  // intensity 0..1 - baked into the same LUT, so preview and export match exactly.
+  look?: { name: GradeLookName; intensity: number };
 }
+export type GradeLookName = "film" | "tealorange" | "moody" | "golden" | "cyber" | "bleach" | "pastel" | "noir";
 
 // A simple, non-keyframed motion effect animated across THIS clip's own [start,end) source
 // range, not the output timeline - preview (VideoPlayer, driven off video.currentTime directly
@@ -137,7 +145,25 @@ export type TransitionType =
   // Not ffmpeg names: xfade custom expressions (page_curl_expr, zoom_blur_expr, color_sweep_expr).
   | "pagecurl"
   | "zoomblur"
-  | "colorsweep";
+  | "colorsweep"
+  // Not ffmpeg names: both pictures move - composited from the two frames (transitionCanvas.ts in
+  // the preview, canvas_transition in conversion.rs).
+  | "blocks"
+  | "mosaic"
+  | "split"
+  | "slider"
+  | "strips"
+  | "beam"
+  | "iris"
+  | "spin"
+  | "glitch"
+  | "slice"
+  | "push"
+  | "cube"
+  | "flip"
+  | "tiles";
+// The shape an iris transition opens out of.
+export type IrisShape = "triangle" | "diamond" | "hexagon" | "star" | "heart";
 // Where a light leak's hot spot travels.
 export type LeakDirection = "right" | "left" | "down" | "up" | "diagonal" | "center";
 // The look of transitions that have one (TransitionLookControls). All optional - undefined is the
@@ -150,8 +176,10 @@ export interface TransitionLook {
   direction?: LeakDirection;
   // Light leak hot-spot size, 0.3..2.5 (1 = default).
   size?: number;
-  // Bar open: out of a horizontal line (default) or a vertical one.
+  // Bar open: out of a horizontal line (default) or a vertical one. Strips: columns (default) or rows.
   orientation?: "horizontal" | "vertical";
+  // Iris: the shape the new clip opens out of (default triangle).
+  shape?: IrisShape;
 }
 export interface ClipTransitionIn {
   type: TransitionType;
@@ -211,6 +239,15 @@ export interface Clip {
   // The clip's own sound is silenced, in the preview and the export - e.g. the quick cuts of a
   // highlight intro (highlightIntro.ts), which play over music.
   muted?: boolean;
+  // An effect over the clip's whole picture (echo, RGB split, colour cycle...) - clipFx.ts in the
+  // preview, services/clip_fx.rs on export.
+  fx?: ClipFx;
+}
+
+export type ClipFxKind = "echo" | "rgbsplit" | "huecycle" | "focus" | "colorin" | "flicker";
+export interface ClipFx {
+  kind: ClipFxKind;
+  intensity: number; // 0..1
 }
 
 // Optional audio-cleanup stages for one clip, applied in this order in both the live preview
@@ -255,7 +292,25 @@ export type TextOverlayCornerStyle = "square" | "rounded" | "pill";
 // exports as a per-frame scale (overlay_pop_scale_expr, conversion.rs).
 // "typewriter"/"words"/"rise" are text-only title reveals, letter by letter or word by word -
 // see textReveal.ts; they export exactly (as a frame sequence).
-export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down" | "pop" | "typewriter" | "words" | "rise";
+export type OverlayAnimation =
+  | "none"
+  | "fade"
+  | "slide-left"
+  | "slide-right"
+  | "slide-up"
+  | "slide-down"
+  | "pop"
+  | "flip"
+  | "zoom"
+  | "drop"
+  | "typewriter"
+  | "words"
+  | "rise"
+  | "scatter"
+  | "blur"
+  | "drop"
+  | "spread"
+  | "wave";
 
 // How an overlay mixes with the picture under it - CSS mix-blend-mode names (the preview sets them
 // on the overlay's element). Export composites the same formula (blend_composite, conversion.rs);
@@ -686,6 +741,10 @@ export interface KeepSegment {
   // time map (speed_steps, conversion.rs). When set, `speed` is ignored.
   speedSteps?: { sourceStart: number; sourceEnd: number; speed: number }[];
   muted?: boolean;
+  // The editor-drawn pointer of an "Editable pointer" recording (pointerTrack.ts): its ripples and
+  // cursor as sprite tracks timed in the source's seconds, composited onto the clip's own picture.
+  pointerLayers?: SpriteTrackSpec[];
+  fx?: ClipFx;
 }
 
 export interface VideoEditState {
@@ -715,6 +774,13 @@ export interface VideoEditState {
   hiddenVideoTracks?: number[];
   // null until captions are first generated - see CaptionTrack.
   captions: CaptionTrack | null;
+  // Screen-recording polish (Screen Style panel): the frame around the video - wallpaper, padding,
+  // corners, shadow (screenStyle.ts; undefined/null = none); how the editor draws the pointer of
+  // recordings made with "Editable pointer" (pointerTrack.ts); and the keyboard-shortcut chips
+  // (keystrokes.ts). The latter two hold only what was changed from their defaults.
+  screenStyle?: ScreenStyle | null;
+  pointerStyle?: Partial<PointerStyle>;
+  keystrokeStyle?: Partial<KeystrokeStyle>;
   updatedAt: string;
 }
 
@@ -735,6 +801,9 @@ export interface EditableFields {
   videoAudioFx?: AudioFx;
   hiddenVideoTracks?: number[];
   captions: CaptionTrack | null;
+  screenStyle?: ScreenStyle | null;
+  pointerStyle?: Partial<PointerStyle>;
+  keystrokeStyle?: Partial<KeystrokeStyle>;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -783,7 +852,8 @@ export interface VideoEditCommand {
     | "track-motion"
     | "edit-mixer"
     | "edit-video-tracks"
-    | "find-hide";
+    | "find-hide"
+    | "edit-screen-style";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {
@@ -867,7 +937,14 @@ export interface NewProjectOptions {
   kenBurns: boolean;
   // Crossfade into every image after the first.
   transition: TransitionType | null;
+  // Overrides `transition`: these, in turn, into each image after the first (a "mix").
+  transitionCycle?: TransitionType[];
+  // A built-in look (gradeLooks.ts) on every clip.
+  look?: GradeLookName;
 }
+
+// How long the transition into each image of a new project lasts.
+export const projectTransitionSeconds = (imageSeconds: number) => Math.min(1, imageSeconds / 3);
 
 // Initial timeline for a new project - one clip per image, in the order given.
 export function createProjectState(imagePaths: string[], options: NewProjectOptions): VideoEditState {
@@ -882,7 +959,10 @@ export function createProjectState(imagePaths: string[], options: NewProjectOpti
       start: 0,
       end: duration,
       ...(options.kenBurns ? { kenBurns: { preset: kenBurnsCycle[i % kenBurnsCycle.length], intensity: 0.5 } } : {}),
-      ...(options.transition && i > 0 ? { transitionIn: { type: options.transition, duration: Math.min(1, duration / 3) } } : {}),
+      ...(i > 0 && (options.transitionCycle?.length || options.transition)
+        ? { transitionIn: { type: options.transitionCycle?.length ? options.transitionCycle[(i - 1) % options.transitionCycle.length] : options.transition!, duration: projectTransitionSeconds(duration) } }
+        : {}),
+      ...(options.look ? { grade: { look: { name: options.look, intensity: 0.85 } } } : {}),
     })),
     textOverlays: [],
     imageOverlays: [],

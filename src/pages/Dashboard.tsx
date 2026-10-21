@@ -18,7 +18,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ask, open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import MoveCopyMenu, { FileTransferOptions, FileTransferRequest } from "../components/docker/MoveCopyMenu";
 import type { PopoverAnchor } from "../hooks/useClampedPopoverPosition";
-import BottomDocker from "../components/BottomDocker";
+import BottomDocker, { SHOW_DOCKER_EVENT } from "../components/BottomDocker";
 import { listen, emit } from '@tauri-apps/api/event';
 import { CaptureCapabilities, WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -64,8 +64,17 @@ import { useGradeLut } from "../utils/gradeLuts";
 import { clipOutputDuration, sourceToOutputOffset } from "../utils/clipTiming";
 import { OverlayKeyframe, keyframeAt, keyframeStateAt, upsertKeyframe } from "../utils/keyframes";
 import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
+import ClipFxLayer from "../components/video/ClipFxLayer";
+import { forgetTimelineBootstrap } from "../components/docker/VideoTimelineDocker";
 import ClipHandoffLayer, { ClipHandoffApi } from "../components/video/ClipHandoffLayer";
 import ReframePreviewLayer, { type ReframePreview } from "../components/video/ReframePreviewLayer";
+import PointerLayer from "../components/video/PointerLayer";
+import KeystrokeLayer from "../components/video/KeystrokeLayer";
+import ScreenBackdropLayer from "../components/video/ScreenBackdropLayer";
+import { useClipRecordings } from "../hooks/useClipRecordings";
+import { pointerStyleOf } from "../utils/pointerTrack";
+import { buildKeyChips, keystrokeStyleOf } from "../utils/keystrokes";
+import { screenContentRect } from "../utils/screenStyle";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
@@ -654,6 +663,19 @@ const Dashboard = () => {
   const activeGradeLut = useGradeLut(activeClipEffects?.grade);
   // Export's Fill window, shown on the player while the export options are open.
   const [reframePreview, setReframePreview] = useState<ReframePreview | null>(null);
+  // Screen-recording polish (Screen Style panel): each source's recorded pointer and shortcuts, the
+  // shortcut chips on the output timeline, and the frame's content rectangle (fractions of the
+  // project frame) the edited picture is laid out in.
+  const clipRecordings = useClipRecordings(editStore.clips);
+  const pointerStyle = useMemo(() => pointerStyleOf(editStore.pointerStyle), [editStore.pointerStyle]);
+  const keystrokeStyle = useMemo(() => keystrokeStyleOf(editStore.keystrokeStyle), [editStore.keystrokeStyle]);
+  const keyChips = useMemo(() => buildKeyChips(editStore.clips, clipRecordings), [editStore.clips, clipRecordings]);
+  const projectFrame = activeClipEffects?.frame ?? null;
+  const screenContentInset = useMemo(() => {
+    if (!editStore.screenStyle || !projectFrame) return null;
+    const r = screenContentRect(projectFrame.width, projectFrame.height, editStore.screenStyle);
+    return { x: r.x / projectFrame.width, y: r.y / projectFrame.height, width: r.width / projectFrame.width, height: r.height / projectFrame.height };
+  }, [editStore.screenStyle, projectFrame?.width, projectFrame?.height]);
 
   // Moving a keyframed overlay sets its keyframe at the playhead rather than its base x/y (which
   // the keyframes have replaced): the move is added to where the keyframes put it there.
@@ -958,6 +980,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // During a clip handoff, the standby stands in for the player; mid-switch without one, the player's
   // own report still belongs to the clip it's leaving, so it reads as "not there yet".
   const getMainPlaybackState = useCallback(() => videoPlayerRef.current?.getPlaybackState() ?? null, []);
+  const getMainVideoElement = useCallback(() => videoPlayerRef.current?.getVideoElement() ?? null, []);
   const getPlayerPlaybackState = useCallback(() => {
     const handoff = handoffRef.current;
     if (handoff?.isActive()) return handoff.state();
@@ -1694,6 +1717,9 @@ const setScreen = () => {
       overlay_border_color: recordingPrefs.cameraBorderColor,
       capture_cursor: recordingPrefs.captureCursor,
       window_title_bar: recordingPrefs.windowTitleBar,
+      // The pointer and shortcuts for the editor's Screen Style (services/input_tracker.rs).
+      track_pointer: recordingPrefs.editablePointer,
+      track_keys: recordingPrefs.recordShortcuts,
       // Live background behind the person in a bubble recorded into the screen (camera_effects.rs) -
       // a separately recorded webcam gets it in the editor instead, at full quality.
       camera_effect: formData.record_type === "sva" && !formData.separate_webcam_capture ? cameraEffectSpec(recordingPrefs.cameraBackground) : null,
@@ -2762,6 +2788,16 @@ const setScreen = () => {
 		// clip to clip is ordinary editing); opening anything it can't edit - an image, a PDF -
 		// leaves it, since the tool has nothing to do with what's now on screen.
 		setVideoEditorScreen((prev) => (prev && getFileCategory(fileName) === "video" ? { mode: "editing" } : null));
+		// The player starts over on the file's own picture - the timeline must re-seat playback on
+		// its first clip (see forgetTimelineBootstrap).
+		forgetTimelineBootstrap(filePath);
+		// A project has nothing to show but its timeline (its own picture is a blank canvas), so it
+		// always opens in the editor.
+		if (isVideoProjectPath(filePath)) {
+			setVideoEditorScreen({ mode: "editing" });
+			setDockerMode("file-tools");
+			window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
+		}
 		setRecentPaths(recordFileOpened(filePath));
 		// Remembered per category so clicking the sidebar's Video/Audio/Image/Pdf/Documents tab can
 		// bring this file back later (see restoreLastOpenedForCategory below), rather than leaving
@@ -4889,13 +4925,33 @@ const setScreen = () => {
                 onPrevious={hasSiblingMedia ? () => (isAudioSelected ? navigateAudio(-1) : navigateVideo(-1)) : undefined}
                 onNext={hasSiblingMedia ? () => (isAudioSelected ? navigateAudio(1) : navigateVideo(1)) : undefined}
                 autoplayNext={isAudioSelected ? audioAutoplayNext : videoAutoplayNext}
+                onEditVideo={
+                  getFileCategory(selectedFile.name) === "video"
+                    ? () => {
+                        if (dockerMode === "file-tools") return setDockerMode("record");
+                        setDockerMode("file-tools");
+                        window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
+                      }
+                    : undefined
+                }
+                isEditingVideo={dockerMode === "file-tools"}
                 onAutoplayNextChange={() =>
                   isAudioSelected ? setAudioAutoplayNext((prev) => !prev) : setVideoAutoplayNext((prev) => !prev)
                 }
                 overlay={
                   getFileCategory(selectedFile.name) === "video"
-                    ? (frameRect) => (
+                    ? (fullFrame) => {
+                        // With a Screen Style the edited picture - and every layer placed on it - is laid
+                        // out in the frame's content rectangle with the wallpaper around it; only the
+                        // shortcut chips and captions sit on the whole frame, as export composites them.
+                        const inset = screenContentInset;
+                        const frameRect = inset
+                          ? { left: fullFrame.left + inset.x * fullFrame.width, top: fullFrame.top + inset.y * fullFrame.height, width: inset.width * fullFrame.width, height: inset.height * fullFrame.height }
+                          : fullFrame;
+                        const contentBox = { left: (inset?.x ?? 0) * fullFrame.width, top: (inset?.y ?? 0) * fullFrame.height, width: frameRect.width, height: frameRect.height };
+                        return (
                         <>
+                          <div className="absolute pointer-events-none" style={contentBox}>
                           {/* The next clip, covering the player while it switches to it. Under
                               the transition preview, which draws the outgoing clip over it. */}
                           <ClipHandoffLayer
@@ -4909,6 +4965,24 @@ const setScreen = () => {
                             seekMain={seekMainPlayer}
                             onTime={setPlayerCurrentTime}
                           />
+                          {/* The clip's effect (echo, RGB split...) over its picture (clipFx.ts). */}
+                          <ClipFxLayer
+                            frameRect={frameRect}
+                            clips={editStore.clips}
+                            activeClipId={activeClipEffects?.id ?? null}
+                            getPlaybackState={getPlayerPlaybackState}
+                            getVideoElement={getMainVideoElement}
+                          />
+                          {/* The recorded pointer, drawn on the clip's own picture (pointerTrack.ts). */}
+                          <PointerLayer
+                            frameRect={frameRect}
+                            clips={editStore.clips}
+                            activeClipId={activeClipEffects?.id ?? null}
+                            recordings={clipRecordings}
+                            style={pointerStyle}
+                            frame={projectFrame}
+                            getPlaybackState={getPlayerPlaybackState}
+                          />
                           {/* First, so it sits under every overlay - export composites the
                               transition into the base video before any overlay too. */}
                           <TransitionPreviewLayer
@@ -4916,6 +4990,7 @@ const setScreen = () => {
                             clips={editStore.clips}
                             activeClipId={activeClipEffects?.id ?? null}
                             getPlaybackState={getPlayerPlaybackState}
+                            getVideoElement={getMainVideoElement}
                             resolveClipUrl={resolveTimelineClipUrl}
                           />
                           {/* Adjustment layers on the video itself - beneath blur regions and every
@@ -4986,6 +5061,24 @@ const setScreen = () => {
                           totalOutputDuration={totalOutputDuration}
                         />
                         <AdjustmentLayersLayer mode="over" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
+                        </div>
+                        {/* The frame around the edited picture, then what sits on the frame itself. */}
+                        {editStore.screenStyle && projectFrame && <ScreenBackdropLayer style={editStore.screenStyle} frame={projectFrame} />}
+                        <KeystrokeLayer frameRect={fullFrame} chips={keyChips} style={keystrokeStyle} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />
+                        {/* Above PiP and every other overlay - same stacking as the export, where the
+                            captions are the last video stage (export_trimmed_video). */}
+                        {editStore.captions?.settings.enabled && captionLines.length > 0 && (
+                          <CaptionOverlayLayer
+                            frameRect={fullFrame}
+                            lines={captionLines}
+                            settings={editStore.captions.settings}
+                            currentOutputTime={currentOutputTime}
+                            isPlaying={playerIsPlaying}
+                            clipSpeed={activeClipEffects?.speed ?? 1}
+                          />
+                        )}
+                        {/* Tools that work on the picture itself, laid out with it. */}
+                        <div className="absolute pointer-events-none" style={contentBox}>
                         {isFinding && (
                           <FindHideTool
                             frameRect={frameRect}
@@ -5009,18 +5102,6 @@ const setScreen = () => {
                             sourcePath={activeClipEffects?.sourcePath ?? selectedFile.sourcePath}
                             onConfirm={(region) => handleBubbleMarked(activeClipEffects?.sourcePath ?? selectedFile.sourcePath, region)}
                             onCancel={() => setIsMarkingBubble(false)}
-                          />
-                        )}
-                        {/* Above PiP and every other overlay - same stacking as the export, where the
-                            captions are the last video stage (export_trimmed_video). */}
-                        {editStore.captions?.settings.enabled && captionLines.length > 0 && (
-                          <CaptionOverlayLayer
-                            frameRect={frameRect}
-                            lines={captionLines}
-                            settings={editStore.captions.settings}
-                            currentOutputTime={currentOutputTime}
-                            isPlaying={playerIsPlaying}
-                            clipSpeed={activeClipEffects?.speed ?? 1}
                           />
                         )}
                         <AdjustmentLayersLayer
@@ -5064,10 +5145,13 @@ const setScreen = () => {
                             onLivePreview={(crop) => videoPlayerRef.current?.previewCropLive(crop)}
                           />
                         )}
+                        </div>
                       </>
-                      )
+                        );
+                      }
                     : undefined
                 }
+                contentInset={screenContentInset}
                 controlsLeading={playerBackButton}
                 onSidebarPanelChange={handlePlayerSidebarPanelChange}
                 trackVolume={editStore.videoAudioVolume}

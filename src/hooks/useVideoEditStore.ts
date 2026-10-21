@@ -84,6 +84,10 @@ export interface SplitScreenCell {
   frameAspect?: number;
 }
 import { renderAssetFrames } from "../utils/videoAssets";
+import { keystrokesForExport, loadClipRecordings, screenStyleExport, withPointerLayers } from "../utils/screenPolish";
+import type { ScreenStyle } from "../utils/screenStyle";
+import type { PointerStyle } from "../utils/pointerTrack";
+import type { KeystrokeStyle } from "../utils/keystrokes";
 
 interface ExportKeyframe {
   time: number;
@@ -180,7 +184,7 @@ type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec
 // with its part, title, licence, beats and ducking already decided).
 export type NewAudioOverlayExtras = Partial<Pick<AudioOverlay, "trimStart" | "label" | "library" | "bpm" | "beats" | "fadeInSec" | "fadeOutSec" | "volume" | "duckUnderSpeech" | "duckLevel">>;
 type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted" | "blendMode" | "fx" | "opacity" | "fadeIn" | "fadeOut" | "chromaKey" | "mask" | "cutout">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted" | "fx">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -300,6 +304,14 @@ export interface UseVideoEditStoreResult {
   liftWebcamBubble: (sourcePath: string, region: { x: number; y: number; width: number; height: number; shape: PipShape; cornerRadius?: number }) => string[];
   hiddenVideoTracks: number[];
   setVideoTrackHidden: (track: number, hidden: boolean) => void;
+  // Screen-recording polish (Screen Style panel): the frame around the video (null = none), and
+  // how the editor draws the recorded pointer and the shortcut chips (patches over the defaults).
+  screenStyle: ScreenStyle | null;
+  setScreenStyle: (style: ScreenStyle | null) => void;
+  pointerStyle: Partial<PointerStyle> | undefined;
+  updatePointerStyle: (patch: Partial<PointerStyle>) => void;
+  keystrokeStyle: Partial<KeystrokeStyle> | undefined;
+  updateKeystrokeStyle: (patch: Partial<KeystrokeStyle>) => void;
   // Removes the piece AND closes the gap it leaves in its own split chain - see
   // deletePipOverlayAndCloseGap (videoEditHandlers.ts).
   deletePipOverlay: (id: string) => void;
@@ -702,6 +714,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     videoAudioFx: current.videoAudioFx,
     hiddenVideoTracks: current.hiddenVideoTracks,
     captions: current.captions ?? null,
+    screenStyle: current.screenStyle,
+    pointerStyle: current.pointerStyle,
+    keystrokeStyle: current.keystrokeStyle,
     ...patch,
   });
 
@@ -1461,6 +1476,32 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  // Whole-video settings: one undo step per change (a dragged slider's run merges into one).
+  const setScreenStyle = useCallback(
+    (screenStyle: ScreenStyle | null) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { screenStyle }), "edit-screen-style");
+    },
+    [pushCommand]
+  );
+  const updatePointerStyle = useCallback(
+    (patch: Partial<PointerStyle>) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { pointerStyle: { ...(current.pointerStyle ?? {}), ...patch } }), "edit-screen-style");
+    },
+    [pushCommand]
+  );
+  const updateKeystrokeStyle = useCallback(
+    (patch: Partial<KeystrokeStyle>) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { keystrokeStyle: { ...(current.keystrokeStyle ?? {}), ...patch } }), "edit-screen-style");
+    },
+    [pushCommand]
+  );
+
   const addSplitScreen = useCallback(
     (cells: SplitScreenCell[], startTime: number, endTime: number, backdropColor: string | null): string[] => {
       const current = stateRef.current;
@@ -2076,10 +2117,16 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         ? (current.adjustmentLayers ?? []).map((l) => adjustmentLayerExport(l, videoPixelSize.width, videoPixelSize.height)).filter((l) => l !== null)
         : [];
 
+      // Screen-recording polish (screenPolish.ts): the frame around the edited picture and the
+      // shortcut chips, both on the final frame, and each clip's drawn pointer.
+      const recordings = await loadClipRecordings(current.clips);
+      const screenStyle = await screenStyleExport(current, videoPixelSize);
+      const keystrokes = videoPixelSize ? keystrokesForExport(current, recordings, videoPixelSize) : null;
+
       return {
         args: {
           outputBasePath: sourcePath,
-          segments: await withGradeLuts(toKeepSegments(current.clips), current.clips),
+          segments: await withPointerLayers(await withGradeLuts(toKeepSegments(current.clips), current.clips), current.clips, current, recordings),
           overlays,
           blurOverlays,
           audioOverlays,
@@ -2096,6 +2143,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           adjustmentLayers,
           chapters: chaptersForExport(current.clips, current.chapters ?? []),
           videoAudioFx: fxForExport(current.videoAudioFx),
+          screenStyle,
+          keystrokes,
         },
         sourcePath,
         durationSec: totalOutputDuration(current.clips),
@@ -2165,9 +2214,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       // stays a live setting on the merged clip.
       let resultPath: string;
       try {
+        const mergedClips = [{ ...first, transitionIn: undefined }, ...selected.slice(1)];
         resultPath = await invoke<string>("export_trimmed_video", {
           outputBasePath: sourcePath,
-          segments: await withGradeLuts(toKeepSegments([{ ...first, transitionIn: undefined }, ...selected.slice(1)]), selected),
+          // The merged file has no pointer track of its own, so the drawn pointer goes into it.
+          segments: await withPointerLayers(await withGradeLuts(toKeepSegments(mergedClips), selected), mergedClips, current, await loadClipRecordings(mergedClips)),
           overlays: [],
           blurOverlays: [],
           audioOverlays: [],
@@ -2215,7 +2266,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         const resultPath = await invoke<string>("export_trimmed_video", {
           outputBasePath: sourcePath,
           // Alone, there's nothing for it to transition in from.
-          segments: await withGradeLuts(toKeepSegments([{ ...clip, transitionIn: undefined }]), [clip]),
+          segments: await withPointerLayers(await withGradeLuts(toKeepSegments([{ ...clip, transitionIn: undefined }]), [clip]), [clip], current, await loadClipRecordings([clip])),
           overlays: [],
           blurOverlays: [],
           audioOverlays: [],
@@ -2302,6 +2353,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     addFoundCovers,
     hiddenVideoTracks: state?.hiddenVideoTracks ?? [],
     setVideoTrackHidden,
+    screenStyle: state?.screenStyle ?? null,
+    setScreenStyle,
+    pointerStyle: state?.pointerStyle,
+    updatePointerStyle,
+    keystrokeStyle: state?.keystrokeStyle,
+    updateKeystrokeStyle,
     addSplitScreen,
     insertHighlightIntro,
     updatePipOverlayContent,

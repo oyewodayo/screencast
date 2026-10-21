@@ -31,7 +31,7 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
-import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
+import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, insetFraming, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
 import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
 import { isNeutralFx, type AudioFx } from '../utils/audioFx';
 import { createTrackFxNode, loadTrackFxModule, resumeMixer, setNodeFx } from '../utils/mixerGraph';
@@ -147,6 +147,9 @@ const ARROW_SEEK_SECONDS = 5;
 interface VideoPlayerProps {
   src?: string;
   title?: string;
+  // "Edit video" in the settings menu - opens (or closes) the editor for what's playing.
+  onEditVideo?: () => void;
+  isEditingVideo?: boolean;
   autoPlay?: boolean;
   // Real filesystem path behind `src` (which is already a browser-loadable asset:// URL) -
   // needed only to invoke get_playable_preview if native playback fails. Without it, a decode
@@ -218,6 +221,10 @@ interface VideoPlayerProps {
   // (no buttons) when there's nothing else to switch to.
   onPrevious?: () => void;
   onNext?: () => void;
+  // The Screen Style's content rectangle (fractions of the frame - screenStyle.ts): the picture is
+  // drawn inside it instead of filling the frame, the frame's wallpaper drawn around it by the
+  // caller. Null/undefined: the picture fills the frame.
+  contentInset?: { x: number; y: number; width: number; height: number } | null;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -261,6 +268,9 @@ export interface VideoPlayerHandle {
   // until that source has decoded a frame to show. `paused` lets a layer that plays its own
   // <video> in step (the transition's moving outgoing tail) follow play/pause/scrub.
   getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean; paused: boolean; seeking: boolean; volume: number; muted: boolean } | null;
+  // The <video> itself - transitions that move the incoming clip paint what it shows (with its
+  // inline framing transform/filter, or GradeCanvas's graded copy) into their own canvas.
+  getVideoElement: () => HTMLVideoElement | null;
   // Opens the "Set thumbnail" picker for this video (waits for it to load if it just opened).
   openThumbnailPicker: () => void;
 }
@@ -306,7 +316,9 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange, contentInset = null, onEditVideo, isEditingVideo }, ref) => {
+  const contentInsetRef = useRef(contentInset);
+  contentInsetRef.current = contentInset;
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -478,11 +490,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     // Export's exact framing: fitted into the project frame, then flip -> crop -> Ken Burns
     // (clipFrameAffine), clipped to the frame (playerFraming).
     const m = clipFrameAffine({ crop, kenBurns: kb, flipHorizontal: effects?.flipHorizontal, sourceStart: effects?.sourceStart, sourceEnd: effects?.sourceEnd }, progress);
-    const framing = playerFraming(
-      m,
-      { width: video.clientWidth, height: video.clientHeight },
-      { width: video.videoWidth, height: video.videoHeight },
-      effects?.frame ?? null
+    // ...then, with a Screen Style, into its content rectangle.
+    const framing = insetFraming(
+      playerFraming(
+        m,
+        { width: video.clientWidth, height: video.clientHeight },
+        { width: video.videoWidth, height: video.videoHeight },
+        effects?.frame ?? null
+      ),
+      contentInsetRef.current
     );
     video.style.transformOrigin = framing.transform ? '0 0' : '';
     video.style.transform = framing.transform;
@@ -566,6 +582,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (!video) return null;
       return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2, paused: video.paused, seeking: video.seeking, volume: video.volume, muted: video.muted };
     },
+    getVideoElement: () => videoRef.current,
     openThumbnailPicker: () => openThumbnailPickerRef.current(),
   }), []);
 
@@ -2015,7 +2032,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       video.style.clipPath = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal, activeClipEffects?.frame?.width, activeClipEffects?.frame?.height]);
+  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal, activeClipEffects?.frame?.width, activeClipEffects?.frame?.height, contentInset?.x, contentInset?.y, contentInset?.width, contentInset?.height]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);
@@ -2893,6 +2910,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							noise={playerNoise}
 							noiseStatus={noiseStatus}
 							onNoiseChange={setPlayerNoise}
+							onEditVideo={onEditVideo ? () => { setShowSettings(false); onEditVideo(); } : undefined}
+							isEditingVideo={isEditingVideo}
 							/>
 							</div>
 						)}
@@ -3067,10 +3086,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						<div
 							className="absolute pointer-events-none"
 							style={{
-								left: frameRect.left,
-								top: frameRect.top,
-								width: frameRect.width,
-								height: frameRect.height,
+								// On the clip's own picture - inside the Screen Style's content rectangle when there is one.
+								left: frameRect.left + (contentInset?.x ?? 0) * frameRect.width,
+								top: frameRect.top + (contentInset?.y ?? 0) * frameRect.height,
+								width: frameRect.width * (contentInset?.width ?? 1),
+								height: frameRect.height * (contentInset?.height ?? 1),
 								background: vignetteBackground(activeClipEffects.colorFilter.intensity),
 							}}
 						/>

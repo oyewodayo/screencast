@@ -33,6 +33,7 @@ import {
   VideoContext,
 } from "../../utils/musicLibrary";
 import { DOCKED_PANEL_CLASS, useDockSnap, useFloatingDismiss, useToolPanelHost } from "./ToolPanelHost";
+import { BUILTIN_SFX_TRACKS, isBuiltinSfxId } from "../../utils/builtinSfx";
 
 export interface TrackBeats {
   bpm: number;
@@ -402,7 +403,8 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
   useFloatingDismiss("[data-music-library-panel], [data-music-library-button]", onClose, !!dockHost);
   useDockSnap(panelRef, !!dockHost);
 
-  const tracks = catalog.status === "ready" ? catalog.tracks : [];
+  // The catalog plus Briefcast's own sound effects (made on the spot - always there, even offline).
+  const tracks = useMemo(() => (catalog.status === "ready" ? [...catalog.tracks, ...BUILTIN_SFX_TRACKS] : []), [catalog]);
   const byId = useMemo(() => new Map(tracks.map((t) => [t.id, t])), [tracks]);
   const savedSet = useMemo(() => new Set(saved), [saved]);
   const tabTracks = useMemo(() => tracks.filter((t) => t.kind === tab), [tracks, tab]);
@@ -674,7 +676,7 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
         onTogglePlay={toggleRowPlay}
         onToggleSaved={toggleSaved}
         onQuickAdd={quickAdd}
-        onDownload={downloadsOn ? download : undefined}
+        onDownload={downloadsOn && !isBuiltinSfxId(t.id) ? download : undefined}
         download={downloads[t.id]}
       >
         {extra}

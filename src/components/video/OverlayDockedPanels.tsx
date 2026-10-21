@@ -158,6 +158,9 @@ const ANIMATIONS: { value: OverlayAnimation; label: string; title: string }[] = 
   { value: "none", label: "None", title: "No animation" },
   { value: "fade", label: "Fade", title: "Fade in and out" },
   { value: "pop", label: "Pop", title: "Pop in with a springy overshoot" },
+  { value: "flip", label: "Flip", title: "Spin in like a tossed coin" },
+  { value: "zoom", label: "Zoom", title: "Rush in from big, fading in" },
+  { value: "drop", label: "Drop", title: "Fall from above and bounce to rest" },
   { value: "slide-left", label: "← Slide", title: "Slide in from the right, out to the left" },
   { value: "slide-right", label: "Slide →", title: "Slide in from the left, out to the right" },
   { value: "slide-up", label: "↑ Slide", title: "Slide up" },
@@ -169,6 +172,11 @@ const TEXT_REVEALS: { value: OverlayAnimation; label: string; title: string }[] 
   { value: "typewriter", label: "Type", title: "Typewriter - letters type on with a caret" },
   { value: "words", label: "Words", title: "Word by word - each word rises into place" },
   { value: "rise", label: "Rise", title: "Letters bounce up one after another" },
+  { value: "blur", label: "Blur in", title: "Letters rise out of a soft blur" },
+  { value: "scatter", label: "Scatter", title: "Letters fly in from all around and settle" },
+  { value: "drop", label: "Drop", title: "Letters fall from above and bounce to rest" },
+  { value: "spread", label: "Spread", title: "Letters close up from far apart" },
+  { value: "wave", label: "Wave", title: "Letters hop up one after another" },
 ];
 
 // The animation picker's tiles play each animation on a sample title, on a loop: on screen for
@@ -211,7 +219,7 @@ const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange
         }
         const s = overlayAnimationStyle(animation, 0, SAMPLE_LIFE_SEC, t, box.clientWidth, box.clientHeight);
         el.style.opacity = String(s.opacity);
-        el.style.transform = `translate(${s.translateXPx}px, ${s.translateYPx}px) scale(${s.scale})`;
+        el.style.transform = `translate(${s.translateXPx}px, ${s.translateYPx}px) scale(${s.scale * (s.scaleX ?? 1)}, ${s.scale})`;
       });
     };
     raf = requestAnimationFrame(tick);

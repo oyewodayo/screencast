@@ -27,6 +27,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { FrameRect } from "../../utils/videoFrameRect";
 import { Clip, TransitionLook, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
 import { renderTransitionFrame } from "./transitionFrame";
+import { TransitionPictures, isCanvasTransition, paintDisplayedPicture } from "./transitionCanvas";
 import { clipFrameStyle } from "../../utils/videoColorFilters";
 import { Lut3D, hasGrade, sampleLut } from "../../utils/colorGrade";
 import { clipOutputDuration, sourceToOutputOffset, speedAtSource } from "../../utils/clipTiming";
@@ -39,6 +40,8 @@ interface TransitionPreviewLayerProps {
   // The clip the player is showing right now (VideoTimelineDocker's onActiveClipChange).
   activeClipId: string | null;
   getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean; paused: boolean } | null;
+  // The player's <video> - the incoming clip as shown, for transitions that move it too.
+  getVideoElement?: () => HTMLVideoElement | null;
   // What the player loads for a clip's source (Dashboard's resolveTimelineClipUrl) - compared
   // against the player's own src to know whether it has swapped to the incoming clip yet.
   resolveClipUrl: (sourcePath: string) => Promise<string>;
@@ -172,7 +175,30 @@ function tailVideo(url: string, start: number): HTMLVideoElement {
   return video;
 }
 
-const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRect, clips, activeClipId, getPlaybackState, resolveClipUrl }) => {
+// A reusable canvas the size of the frame in device pixels, cleared to black, scaled to frame px.
+function framePictureContext(canvas: HTMLCanvasElement, W: number, H: number, dpr: number): CanvasRenderingContext2D | null {
+  const w = Math.max(1, Math.round(W * dpr));
+  const h = Math.max(1, Math.round(H * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, w, h);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return ctx;
+}
+
+// GradeCanvas's graded copy of a <video>, when it's the one being shown.
+const shownGradeCanvas = (scope: Element | null | undefined): HTMLCanvasElement | null => {
+  const canvas = scope?.querySelector<HTMLCanvasElement>("canvas[data-grade-canvas]");
+  return canvas && canvas.style.display !== "none" && canvas.width > 0 ? canvas : null;
+};
+
+const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRect, clips, activeClipId, getPlaybackState, getVideoElement, resolveClipUrl }) => {
   const activeIndex = activeClipId ? clips.findIndex((clip) => clip.id === activeClipId) : -1;
   const incoming = activeIndex > 0 && hasTransition(clips[activeIndex]) ? clips[activeIndex] : null;
   const outgoing = incoming ? clips[activeIndex - 1] : null;
@@ -230,6 +256,9 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
   // Drawn transition layers (page curl, colour sweep), over everything.
   const fxCanvasRef = useRef<HTMLCanvasElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  // Both pictures as shown, for the transitions that move both (transitionCanvas.ts).
+  const oldPicRef = useRef<HTMLCanvasElement | null>(null);
+  const newPicRef = useRef<HTMLCanvasElement | null>(null);
   const readyCanvas = frame && frame.key === frameKey ? frame.canvas : null;
   // The moving tail, once its player and (for a graded clip) its LUT are in hand.
   const readyTail = moving && tail?.key === frameKey && tailLut?.key === frameKey ? tail.video : null;
@@ -311,12 +340,48 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
         tailWrap.style.visibility = onFrame ? "visible" : "hidden";
       }
     };
+    // The outgoing picture as the mover shows it (its tail or frozen frame, in the clip's end-state
+    // look) and the incoming one as the player shows it, each painted into a frame-sized canvas.
+    const outgoingLook = clipFrameStyle(outgoing!, 1, { width: frameRect.width, height: frameRect.height });
+    const pictures = (): TransitionPictures | null => {
+      const video = getVideoElement?.();
+      if (!video) return null;
+      const dpr = window.devicePixelRatio || 1;
+      const { width: W, height: H } = frameRect;
+      oldPicRef.current ??= document.createElement("canvas");
+      newPicRef.current ??= document.createElement("canvas");
+      const oldCtx = framePictureContext(oldPicRef.current, W, H, dpr);
+      const newCtx = framePictureContext(newPicRef.current, W, H, dpr);
+      if (!oldCtx || !newCtx) return null;
+      const box = { x: -frameRect.left, y: -frameRect.top, w: containerW, h: containerH };
+      const oldEl = tailShown && tailVideoEl ? shownGradeCanvas(tailWrap) ?? tailVideoEl : readyCanvas;
+      paintDisplayedPicture(oldCtx, oldEl, box, outgoingLook.transform, "", outgoingLook.filter);
+      // The <video>'s own layout box (transforms aside), relative to the frame's top-left.
+      const rootRect = root.getBoundingClientRect();
+      const parentRect = (video.offsetParent ?? video.parentElement)?.getBoundingClientRect();
+      const vbox = parentRect
+        ? { x: parentRect.left + video.offsetLeft - (rootRect.left + frameRect.left), y: parentRect.top + video.offsetTop - (rootRect.top + frameRect.top), w: video.offsetWidth, h: video.offsetHeight }
+        : box;
+      // The incoming clip with its effect on (ClipFxLayer's canvas, frame-sized), when it has one.
+      const withFx = root.parentElement?.querySelector<HTMLCanvasElement>("canvas[data-clip-fx]");
+      if (withFx && withFx.style.display !== "none" && withFx.width > 0) newCtx.drawImage(withFx, 0, 0, frameRect.width, frameRect.height);
+      else paintDisplayedPicture(newCtx, shownGradeCanvas(video.parentElement) ?? video, vbox, video.style.transform, video.style.transformOrigin, video.style.filter);
+      return { old: oldPicRef.current, next: newPicRef.current };
+    };
     const render = (p: number) =>
       renderTransitionFrame(
         type,
         look,
         p,
-        { mover, black, glow, pixel: pixelCanvasRef.current, fx: fxCanvasRef.current, source: tailShown && tailVideoEl ? tailVideoEl : readyCanvas },
+        {
+          mover,
+          black,
+          glow,
+          pixel: pixelCanvasRef.current,
+          fx: fxCanvasRef.current,
+          source: tailShown && tailVideoEl ? tailVideoEl : readyCanvas,
+          pictures: isCanvasTransition(type) ? pictures : undefined,
+        },
         geometry
       );
 
@@ -344,7 +409,7 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [incoming, readyCanvas, readyTail, incomingUrl, frameRect.left, frameRect.top, frameRect.width, frameRect.height, containerW, containerH, getPlaybackState]);
+  }, [incoming, readyCanvas, readyTail, incomingUrl, frameRect.left, frameRect.top, frameRect.width, frameRect.height, containerW, containerH, getPlaybackState, getVideoElement]);
 
   if (!incoming || !outgoing || !readyCanvas) return null;
   const { left: L, top: T, width: W, height: H } = frameRect;

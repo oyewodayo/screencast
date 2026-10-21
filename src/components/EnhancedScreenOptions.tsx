@@ -1,4 +1,4 @@
-import { IoClose, IoScanOutline, IoApps, IoReload, IoArrowBack, IoVideocam, IoMic, IoDesktopOutline, IoSwapHorizontal, IoPencil, IoPhonePortraitOutline, IoVolumeHigh, IoHandLeftOutline, IoTvOutline, IoSearch, IoNavigateOutline, IoBrowsersOutline, IoShieldCheckmarkOutline, IoInformationCircleOutline } from "react-icons/io5";
+import { IoClose, IoScanOutline, IoApps, IoReload, IoArrowBack, IoVideocam, IoMic, IoDesktopOutline, IoSwapHorizontal, IoPencil, IoPhonePortraitOutline, IoVolumeHigh, IoHandLeftOutline, IoTvOutline, IoSearch, IoNavigateOutline, IoBrowsersOutline, IoShieldCheckmarkOutline, IoInformationCircleOutline, IoSparklesOutline, IoKeypadOutline } from "react-icons/io5";
 import { PHONE_CAMERA_DEVICE, PHONE_CAMERA_LABEL } from "../services/phoneCamera";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
@@ -260,11 +260,17 @@ const EnhancedScreenOptions = ({
     // Remembered between recordings (appSettings) and sent with every capture by Dashboard.
     const [captureCursor, setCaptureCursor] = useState(() => loadSettings().captureCursor);
     const [windowTitleBar, setWindowTitleBar] = useState(() => loadSettings().windowTitleBar);
-    const updateCapturePrefs = (next: { captureCursor?: boolean; windowTitleBar?: boolean }) => {
+    const [editablePointer, setEditablePointer] = useState(() => loadSettings().editablePointer);
+    const [recordShortcuts, setRecordShortcuts] = useState(() => loadSettings().recordShortcuts);
+    const updateCapturePrefs = (next: { captureCursor?: boolean; windowTitleBar?: boolean; editablePointer?: boolean; recordShortcuts?: boolean }) => {
         saveSettings({ ...loadSettings(), ...next });
         if (next.captureCursor !== undefined) setCaptureCursor(next.captureCursor);
         if (next.windowTitleBar !== undefined) setWindowTitleBar(next.windowTitleBar);
+        if (next.editablePointer !== undefined) setEditablePointer(next.editablePointer);
+        if (next.recordShortcuts !== undefined) setRecordShortcuts(next.recordShortcuts);
     };
+    // The pointer/shortcut recording is a Windows input hook (services/input_tracker.rs).
+    const inputTrackingSupported = navigator.userAgent.includes("Windows");
     // Bubble border, remembered between recordings (appSettings) and sent with every recording
     // by Dashboard's handleStartRecording.
     const [border, setBorder] = useState(() => loadSettings().cameraBorder);
@@ -997,12 +1003,39 @@ const EnhancedScreenOptions = ({
     const renderCaptureToggles = () => (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {toggleRow(
-                captureCursor,
+                captureCursor || (isScreenType && editablePointer && inputTrackingSupported),
                 () => updateCapturePrefs({ captureCursor: !captureCursor }),
                 <IoNavigateOutline className="text-emerald-500 -scale-x-100" />,
                 "Show cursor",
-                recordType === "c" ? "Include the mouse pointer in the screenshot." : "Include the mouse pointer in the video."
+                recordType === "c"
+                    ? "Include the mouse pointer in the screenshot."
+                    : isScreenType && editablePointer && inputTrackingSupported
+                    ? "Drawn by the editor - see Editable pointer."
+                    : "Include the mouse pointer in the video.",
+                isScreenType && editablePointer && inputTrackingSupported
             )}
+            {isScreenType &&
+                toggleRow(
+                    editablePointer && inputTrackingSupported,
+                    () => updateCapturePrefs({ editablePointer: !editablePointer }),
+                    <IoSparklesOutline className="text-emerald-500" />,
+                    "Editable pointer",
+                    inputTrackingSupported
+                        ? "Records the pointer separately, so the editor can smooth and enlarge it and ripple every click (Screen style). The recorded file itself has no pointer."
+                        : "Windows only for now.",
+                    !inputTrackingSupported
+                )}
+            {isScreenType &&
+                toggleRow(
+                    recordShortcuts && inputTrackingSupported,
+                    () => updateCapturePrefs({ recordShortcuts: !recordShortcuts }),
+                    <IoKeypadOutline className="text-emerald-500" />,
+                    "Record shortcuts",
+                    inputTrackingSupported
+                        ? "Keys you press with Ctrl, Alt or Win (and Enter, Esc, Tab, F-keys), shown as keycaps in the editor. Ordinary typing is never recorded."
+                        : "Windows only for now.",
+                    !inputTrackingSupported
+                )}
             {windowPicked &&
                 toggleRow(
                     windowTitleBar,

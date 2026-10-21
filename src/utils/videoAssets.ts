@@ -23,6 +23,7 @@ export type AssetKind =
   | "star"
   | "heart"
   | "blob"
+  | "neon"
   // callouts
   | "arrow"
   | "pointer"
@@ -52,15 +53,23 @@ export type AssetKind =
   | "progress"
   | "countdown"
   | "timer"
+  | "halo"
   // full-frame overlays
   | "viewfinder"
   | "reveal"
   | "letterbox"
   | "vignette"
   | "bokeh"
-  | "snow";
+  | "snow"
+  | "filmstrip"
+  | "film35"
+  | "retro"
+  | "polaroid"
+  | "lightleak"
+  | "grain"
+  | "twinkle";
 
-export type AssetEntrance = "none" | "pop" | "draw" | "zoom" | "spin" | "drop" | "wipe" | "glitch";
+export type AssetEntrance = "none" | "pop" | "draw" | "zoom" | "spin" | "drop" | "wipe" | "glitch" | "flip";
 export type AssetLoop = "none" | "pulse" | "float" | "spin" | "wiggle" | "glow" | "shimmer" | "hue";
 // How a countdown spends its time: one number per second (then holds the last), or the numbers
 // spread evenly over the element's whole length.
@@ -129,6 +138,8 @@ export const ASSET_CATALOG: AssetCatalogEntry[] = [
   { kind: "star", label: "Star", category: "Shapes", aspect: 1, motion: "static", defaults: { color: "#fde047", color2: "#f59e0b", glow: true, ...fx("spin", "pulse") } },
   { kind: "heart", label: "Heart", category: "Shapes", aspect: 1.1, motion: "static", defaults: { color: "#f43f5e", color2: "#ec4899", ...fx("pop", "pulse") } },
   { kind: "blob", label: "Blob", category: "Shapes", aspect: 1, motion: "periodic", defaults: { color: "#8b5cf6", color2: "#22d3ee", ...fx("zoom") } },
+  // A glowing neon-tube outline - draws itself on.
+  { kind: "neon", label: "Neon frame", category: "Shapes", aspect: 1.25, motion: "static", defaults: { color: "#facc15", color2: "#ffffff", ...fx("draw", "glow") } },
 
   { kind: "subscribe", label: "Subscribe", category: "Callouts", aspect: 3.6, motion: "static", settleSec: 2.2, text: ["Button", "Clicked"], defaults: { color: "#ef4444", text: "SUBSCRIBE", subtext: "SUBSCRIBED", ...fx("pop") } },
   { kind: "lower-third", label: "Lower third", category: "Callouts", aspect: 5, motion: "static", text: ["Name", "Title"], defaults: { color: "#111827", color2: "#3b82f6", text: "Your Name", subtext: "Title · Company", ...fx("wipe", "shimmer") } },
@@ -166,6 +177,8 @@ export const ASSET_CATALOG: AssetCatalogEntry[] = [
   { kind: "spinner", label: "Loader", category: "Animated", aspect: 1, motion: "periodic", defaults: { color: "#3b82f6", color2: "#22d3ee", ...fx("zoom") } },
   { kind: "equalizer", label: "Equalizer", category: "Animated", aspect: 1.4, motion: "periodic", defaults: { color: "#22d3ee", color2: "#a855f7", ...fx("wipe") } },
   { kind: "progress", label: "Progress", category: "Animated", aspect: 8, motion: "timed", defaults: { color: "#22c55e", color2: "#3b82f6", ...fx("wipe", "none", false) } },
+  // A glowing ring on the floor / around a subject, a highlight running round it.
+  { kind: "halo", label: "Halo ring", category: "Animated", aspect: 2.4, motion: "periodic", defaults: { color: "#ffffff", color2: "#fde68a", ...fx("zoom") } },
 
   {
     kind: "viewfinder",
@@ -184,7 +197,31 @@ export const ASSET_CATALOG: AssetCatalogEntry[] = [
   { kind: "vignette", label: "Vignette", category: "Overlays", aspect: 16 / 9, motion: "static", fullFrame: true, defaults: { color: "#000000", ...fx("none") } },
   { kind: "bokeh", label: "Bokeh", category: "Overlays", aspect: 16 / 9, motion: "periodic", fullFrame: true, defaults: { color: "#fbbf24", color2: "#f472b6", ...fx("none") } },
   { kind: "snow", label: "Snow", category: "Overlays", aspect: 16 / 9, motion: "periodic", fullFrame: true, defaults: { color: "#ffffff", ...fx("none") } },
+  // Film: perforated strips down the sides (rolling), a 35mm negative's frame, an old rounded
+  // slide/TV frame, a polaroid border, warm light leaks, grain and dust, glints twinkling.
+  { kind: "filmstrip", label: "Film strip", category: "Overlays", aspect: 16 / 9, motion: "periodic", fullFrame: true, text: ["Edge print"], defaults: { color: "#0b0b0b", color2: "#ecebe6", text: "FILM 400", ...fx("none", "none", false) } },
+  { kind: "film35", label: "35mm frame", category: "Overlays", aspect: 16 / 9, motion: "static", fullFrame: true, text: ["Edge print"], defaults: { color: "#0d0d0d", color2: "#f59e0b", text: "FILM 400  ▸ 24A", ...fx("none", "none", false) } },
+  { kind: "retro", label: "Retro frame", category: "Overlays", aspect: 16 / 9, motion: "static", fullFrame: true, defaults: { color: "#000000", ...fx("none", "none", false) } },
+  { kind: "polaroid", label: "Polaroid", category: "Overlays", aspect: 16 / 9, motion: "static", fullFrame: true, text: ["Caption"], defaults: { color: "#f7f5f0", color2: "#3f3f46", text: "", ...fx("none", "none", false) } },
+  { kind: "lightleak", label: "Light leaks", category: "Overlays", aspect: 16 / 9, motion: "periodic", fullFrame: true, defaults: { color: "#ff5a1f", color2: "#ffc53d", ...fx("none") } },
+  {
+    kind: "grain",
+    label: "Film grain",
+    category: "Overlays",
+    aspect: 16 / 9,
+    motion: "periodic",
+    fullFrame: true,
+    defaults: { color: "#000000", ...fx("none", "none", false) },
+    // The grain re-rolls 12 times a second through GRAIN_FRAMES patterns.
+    idleKey: (_a, t) => `g${grainFrame(t)}`,
+  },
+  { kind: "twinkle", label: "Twinkles", category: "Overlays", aspect: 16 / 9, motion: "periodic", fullFrame: true, defaults: { color: "#ffffff", color2: "#fde68a", ...fx("none") } },
 ];
+
+// Film grain: GRAIN_FRAMES fixed patterns, re-rolled GRAIN_FPS times a second.
+const GRAIN_FRAMES = 8;
+const GRAIN_FPS = 12;
+const grainFrame = (t: number) => Math.floor(t * GRAIN_FPS) % GRAIN_FRAMES;
 
 export const ASSET_CATEGORIES: AssetCategory[] = ["Shapes", "Callouts", "Animated", "Overlays"];
 
@@ -199,7 +236,7 @@ export const assetSupportsOutline = (kind: AssetKind): boolean => POLY_SHAPES.ha
 // Elements made of a second colour (gradient end or accent) - the panel's second swatch.
 export const assetUsesColor2 = (kind: AssetKind): boolean =>
   !STROKE_SHAPES.has(kind) &&
-  !["highlight", "speech", "check", "cross", "ping", "subscribe", "pin", "cursor", "chevrons", "bell", "rec", "reveal", "letterbox", "vignette", "snow"].includes(kind);
+  !["highlight", "speech", "check", "cross", "ping", "subscribe", "pin", "cursor", "chevrons", "bell", "rec", "reveal", "letterbox", "vignette", "snow", "retro", "grain"].includes(kind);
 
 export const ASSET_ENTRANCES: { value: AssetEntrance; label: string }[] = [
   { value: "none", label: "None" },
@@ -210,6 +247,7 @@ export const ASSET_ENTRANCES: { value: AssetEntrance; label: string }[] = [
   { value: "drop", label: "Drop" },
   { value: "wipe", label: "Wipe" },
   { value: "glitch", label: "Glitch" },
+  { value: "flip", label: "Flip" },
 ];
 
 export const ASSET_LOOPS: { value: AssetLoop; label: string }[] = [
@@ -246,7 +284,7 @@ export function countdownPlan(asset: OverlayAsset, duration: number): { from: nu
 
 export const entranceSeconds = (asset: OverlayAsset, duration: number): number => {
   if (asset.entrance === "none") return 0;
-  const base = asset.entrance === "draw" ? 0.9 : asset.entrance === "drop" ? 0.8 : 0.6;
+  const base = asset.entrance === "draw" ? 0.9 : asset.entrance === "drop" || asset.entrance === "flip" ? 0.8 : 0.6;
   return Math.max(0, Math.min(base, duration * 0.35));
 };
 
@@ -1244,9 +1282,335 @@ function drawElement(ctx: CanvasRenderingContext2D, asset: OverlayAsset, w: numb
       }
       return;
     }
+    case "neon": {
+      // A neon tube: a wide soft glow, the coloured tube, a near-white core - drawing itself on.
+      const inset = unit * 0.09;
+      const pts = roundedRectPts(w - 2 * inset, h - 2 * inset, unit * 0.14);
+      const shown = partialPts(pts, reveal);
+      if (shown.length < 2) return;
+      const tube = Math.max(2, unit * 0.035);
+      ctx.save();
+      ctx.shadowColor = asset.color;
+      ctx.shadowBlur = unit * 0.12;
+      ctx.strokeStyle = asset.color;
+      ctx.lineWidth = tube;
+      tracePath(ctx, shown);
+      ctx.stroke();
+      ctx.shadowBlur = unit * 0.04;
+      tracePath(ctx, shown);
+      ctx.stroke();
+      ctx.restore();
+      ctx.strokeStyle = withAlpha(asset.color2 ?? "#ffffff", 0.9);
+      ctx.lineWidth = Math.max(1, tube * 0.35);
+      tracePath(ctx, shown);
+      ctx.stroke();
+      return;
+    }
+    case "halo": {
+      // A glowing ellipse with a bright arc running round it.
+      const rx = w * 0.42;
+      const ry = h * 0.36;
+      const lw = Math.max(2, unit * 0.06);
+      ctx.save();
+      ctx.shadowColor = asset.color;
+      ctx.shadowBlur = unit * 0.25;
+      ctx.strokeStyle = withAlpha(asset.color, 0.85);
+      ctx.lineWidth = lw;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, rx, ry, 0, -Math.PI / 2, -Math.PI / 2 + TAU * reveal);
+      ctx.stroke();
+      ctx.restore();
+      if (reveal >= 1) {
+        const a = (t / 2.4) * TAU;
+        ctx.save();
+        ctx.shadowColor = asset.color2 ?? asset.color;
+        ctx.shadowBlur = unit * 0.2;
+        ctx.strokeStyle = asset.color2 ?? "#ffffff";
+        ctx.lineWidth = lw * 1.4;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, rx, ry, 0, a, a + 0.9);
+        ctx.stroke();
+        ctx.restore();
+      }
+      return;
+    }
+    case "filmstrip": {
+      // Perforated strips down the long sides (across the top and bottom of a wide frame), the
+      // holes rolling through, an amber edge print.
+      const tall = h >= w;
+      const along = tall ? h : w;
+      const across = tall ? w : h;
+      const sw = Math.max(w, h) * 0.05;
+      const holeW = sw * 0.42;
+      const holeL = sw * 0.6;
+      const pitch = sw * 1.15;
+      // Two pitches per 2.4s - a whole number of holes per loop, so it loops seamlessly.
+      const roll = ((t / 2.4) % 1) * pitch * 2;
+      for (const side of [-1, 1]) {
+        ctx.save();
+        // In this frame the strip runs top to bottom at x = cx.
+        if (!tall) ctx.rotate(Math.PI / 2);
+        const cx = side * (across / 2 - sw / 2);
+        ctx.fillStyle = asset.color;
+        ctx.fillRect(cx - sw / 2, -along / 2, sw, along);
+        ctx.fillStyle = asset.color2 ?? "#ecebe6";
+        const hx = cx - holeW / 2 + side * sw * 0.12;
+        for (let y = -along / 2 - pitch * 2 + roll; y < along / 2 + pitch; y += pitch) {
+          pillPath(ctx, hx, y, holeW, holeL, holeW * 0.22);
+          ctx.fill();
+        }
+        if (asset.text) {
+          ctx.save();
+          ctx.translate(cx - side * sw * 0.3, 0);
+          ctx.rotate((side * Math.PI) / 2);
+          ctx.font = `600 ${sw * 0.2}px ${FONT_STACK}`;
+          ctx.fillStyle = "rgba(245,158,11,0.75)";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          const label = `${asset.text}   ▸ ${side > 0 ? 13 : 12}`;
+          // Repeats along the strip, rolling with the holes (a whole number of repeats per loop).
+          const step = along / Math.max(1, Math.round(along / Math.max(ctx.measureText(label).width * 2.2, along * 0.3)));
+          const shift = ((t / 2.4) % 1) * step;
+          for (let q = -along / 2 - step; q < along / 2 + step; q += step) ctx.fillText(label, side * (q + shift), 0);
+          ctx.restore();
+        }
+        ctx.restore();
+      }
+      return;
+    }
+    case "film35": {
+      // A 35mm negative's frame: a black surround with a rounded window, sprocket holes along the
+      // long edges, edge print in amber.
+      const tall = h >= w;
+      const band = Math.min(w, h) * 0.11;
+      const side = Math.min(w, h) * 0.045;
+      const winW = w - 2 * (tall ? band : side);
+      const winH = h - 2 * (tall ? side : band);
+      ctx.fillStyle = asset.color;
+      ctx.beginPath();
+      ctx.rect(-w / 2, -h / 2, w, h);
+      if (typeof ctx.roundRect === "function") ctx.roundRect(-winW / 2, -winH / 2, winW, winH, Math.min(winW, winH) * 0.025);
+      else ctx.rect(-winW / 2, -winH / 2, winW, winH);
+      ctx.fill("evenodd");
+      const along = tall ? h : w;
+      const holeA = band * 0.3;
+      const holeB = band * 0.2;
+      const pitch = band * 0.55;
+      ctx.fillStyle = "#e7e5df";
+      for (const s2 of [-1, 1]) {
+        const c = s2 * ((tall ? w : h) / 2 - band * 0.3);
+        for (let a = -along / 2 + pitch / 2; a < along / 2; a += pitch) {
+          if (tall) pillPath(ctx, c - holeB / 2, a, holeB, holeA, holeB * 0.25);
+          else pillPath(ctx, a, c - holeB / 2, holeA, holeB, holeB * 0.25);
+          ctx.fill();
+        }
+      }
+      if (asset.text) {
+        ctx.save();
+        ctx.fillStyle = withAlpha(asset.color2 ?? "#f59e0b", 0.9);
+        ctx.font = `700 ${band * 0.17}px ${FONT_STACK}`;
+        ctx.textBaseline = "middle";
+        ctx.textAlign = "center";
+        if (tall) {
+          ctx.translate(-w / 2 + band * 0.72, 0);
+          ctx.rotate(-Math.PI / 2);
+        } else ctx.translate(0, -h / 2 + band * 0.72);
+        ctx.fillText(asset.text, -along * 0.22, 0);
+        ctx.fillText(asset.text.replace(/\d+/, (n) => String(Number(n) + 1)), along * 0.25, 0);
+        ctx.restore();
+      }
+      return;
+    }
+    case "retro": {
+      // An old slide / TV frame: rounded window, dark surround, edges falling off into it.
+      const inset = unit * 0.035;
+      const ww2 = w - 2 * inset;
+      const hh2 = h - 2 * inset;
+      const r = unit * 0.09;
+      const windowPath = (grow = 0) => {
+        ctx.beginPath();
+        if (typeof ctx.roundRect === "function") ctx.roundRect(-ww2 / 2 - grow, -hh2 / 2 - grow, ww2 + 2 * grow, hh2 + 2 * grow, r);
+        else ctx.rect(-ww2 / 2 - grow, -hh2 / 2 - grow, ww2 + 2 * grow, hh2 + 2 * grow);
+      };
+      ctx.fillStyle = asset.color;
+      windowPath();
+      ctx.rect(-w / 2, -h / 2, w, h);
+      ctx.fill("evenodd");
+      // The inner falloff: the window's edge shadowed inwards, the corners darker.
+      ctx.save();
+      windowPath();
+      ctx.clip();
+      ctx.shadowColor = withAlpha(asset.color, 0.85);
+      ctx.shadowBlur = unit * 0.08;
+      ctx.lineWidth = unit * 0.05;
+      ctx.strokeStyle = asset.color;
+      windowPath(unit * 0.025);
+      ctx.stroke();
+      ctx.shadowColor = "transparent";
+      const g = ctx.createRadialGradient(0, 0, Math.min(ww2, hh2) * 0.45, 0, 0, Math.hypot(ww2, hh2) / 2);
+      g.addColorStop(0, withAlpha(asset.color, 0));
+      g.addColorStop(1, withAlpha(asset.color, 0.45));
+      ctx.fillStyle = g;
+      ctx.fillRect(-w / 2, -h / 2, w, h);
+      ctx.restore();
+      return;
+    }
+    case "polaroid": {
+      const side = unit * 0.055;
+      const bottom = unit * 0.2;
+      const winW = w - 2 * side;
+      const winH = h - side - bottom;
+      const top = -h / 2 + side;
+      ctx.fillStyle = asset.color;
+      ctx.beginPath();
+      ctx.rect(-w / 2, -h / 2, w, h);
+      ctx.rect(-winW / 2, top, winW, winH);
+      ctx.fill("evenodd");
+      // A faint inner edge where the print meets the border.
+      ctx.strokeStyle = "rgba(0,0,0,0.12)";
+      ctx.lineWidth = Math.max(1, unit * 0.004);
+      ctx.strokeRect(-winW / 2, top, winW, winH);
+      if (asset.text) {
+        ctx.fillStyle = asset.color2 ?? "#3f3f46";
+        ctx.font = `400 ${bottom * 0.34}px "Segoe Print", "Bradley Hand", "Comic Sans MS", cursive`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(asset.text, 0, h / 2 - bottom / 2, winW * 0.9);
+      }
+      return;
+    }
+    case "lightleak": {
+      // Warm leaks breathing in from the edges - soft blobs drifting along them, added on.
+      const prev = ctx.globalCompositeOperation;
+      ctx.globalCompositeOperation = "lighter";
+      // edge angle (rad), turns per loop, size, second colour?, phase
+      const blobs: [number, number, number, boolean, number][] = [
+        [Math.PI * 0.95, 1, 0.75, false, 0],
+        [Math.PI * 0.1, 1, 0.6, true, 0.33],
+        [Math.PI * 1.55, 2, 0.5, false, 0.66],
+        [Math.PI * 0.55, 1, 0.45, true, 0.2],
+      ];
+      for (const [base, speed, size, second, phase] of blobs) {
+        const u = (t / LOOP_PERIOD_SEC) * speed + phase;
+        const a = base + Math.sin(u * TAU) * 0.35;
+        const x = Math.cos(a) * w * 0.55;
+        const y = Math.sin(a) * h * 0.55;
+        const r = Math.max(w, h) * size;
+        const breathe = 0.55 + 0.45 * Math.sin((u + 0.25) * TAU);
+        const col = second ? asset.color2 ?? asset.color : asset.color;
+        const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+        g.addColorStop(0, withAlpha(col, 0.55 * breathe));
+        g.addColorStop(0.35, withAlpha(col, 0.28 * breathe));
+        g.addColorStop(1, withAlpha(col, 0));
+        ctx.fillStyle = g;
+        ctx.fillRect(-w / 2, -h / 2, w, h);
+      }
+      ctx.globalCompositeOperation = prev;
+      return;
+    }
+    case "grain": {
+      ctx.drawImage(grainCanvas(Math.max(1, Math.round(w)), Math.max(1, Math.round(h)), grainFrame(t)), -w / 2, -h / 2, w, h);
+      return;
+    }
+    case "twinkle": {
+      // Glints across the frame, each flaring and fading on its own beat.
+      for (let i = 0; i < 34; i++) {
+        const x = (hash(i * 4.7) - 0.5) * w * 0.96;
+        const y = (hash(i * 9.1 + 2) - 0.5) * h * 0.96;
+        const period = [1.2, 1.6, 2.4][i % 3];
+        const ph = (t / period + hash(i * 1.3)) % 1;
+        const flare = Math.pow(Math.max(0, Math.sin(ph * Math.PI)), 3);
+        if (flare < 0.02) continue;
+        const r = unit * (0.012 + 0.03 * hash(i * 6.1)) * (0.4 + 0.6 * flare);
+        const col = i % 4 === 0 ? asset.color2 ?? asset.color : asset.color;
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(ph * 0.6);
+        ctx.globalAlpha *= flare;
+        const g = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 1.6);
+        g.addColorStop(0, withAlpha(col, 0.9));
+        g.addColorStop(1, withAlpha(col, 0));
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(0, 0, r * 1.6, 0, TAU);
+        ctx.fill();
+        // A four-point star.
+        ctx.fillStyle = col;
+        ctx.beginPath();
+        for (let k = 0; k < 8; k++) {
+          const rr = k % 2 === 0 ? r * 2.2 : r * 0.22;
+          const ang = (k * Math.PI) / 4;
+          ctx.lineTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+      return;
+    }
     default:
       return;
   }
+}
+
+// Film grain patterns, by size and frame: light and dark specks at random, a few dust motes and now
+// and then a scratch - drawn once per pattern and reused.
+const grainCache = new Map<string, HTMLCanvasElement>();
+function grainCanvas(w: number, h: number, frame: number): HTMLCanvasElement {
+  const key = `${w}x${h}#${frame}`;
+  const cached = grainCache.get(key);
+  if (cached) return cached;
+  // Grain a couple of pixels across at 1080p, whatever the size.
+  const cell = Math.max(1, Math.round(Math.min(w, h) / 540));
+  const gw = Math.max(1, Math.ceil(w / cell));
+  const gh = Math.max(1, Math.ceil(h / cell));
+  const small = document.createElement("canvas");
+  small.width = gw;
+  small.height = gh;
+  const ctx = small.getContext("2d")!;
+  const img = ctx.createImageData(gw, gh);
+  // xorshift, seeded by the pattern number - the same grain every time.
+  let seed = ((frame + 1) * 2654435761) >>> 0 || 1;
+  const rand = () => {
+    seed ^= seed << 13;
+    seed >>>= 0;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    seed >>>= 0;
+    return seed / 4294967296;
+  };
+  for (let i = 0; i < gw * gh; i++) {
+    const v = rand();
+    const c = v > 0.5 ? 255 : 0;
+    img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = c;
+    img.data[i * 4 + 3] = Math.round(Math.abs(v - 0.5) * 2 * 34);
+  }
+  ctx.putImageData(img, 0, 0);
+  for (let k = 0; k < 6; k++) {
+    ctx.fillStyle = rand() > 0.5 ? "rgba(255,255,255,0.5)" : "rgba(0,0,0,0.55)";
+    ctx.beginPath();
+    ctx.arc(rand() * gw, rand() * gh, 0.6 + rand() * 1.6, 0, TAU);
+    ctx.fill();
+  }
+  if (frame % 3 === 0) {
+    const x = rand() * gw;
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x + (rand() - 0.5) * 6, gh);
+    ctx.stroke();
+  }
+  // Scaled up without smoothing, so the grain stays crisp.
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+  const octx = out.getContext("2d")!;
+  octx.imageSmoothingEnabled = false;
+  octx.drawImage(small, 0, 0, w, h);
+  grainCache.set(key, out);
+  if (grainCache.size > GRAIN_FRAMES * 2) grainCache.delete(grainCache.keys().next().value!);
+  return out;
 }
 
 // ---------- effects ----------
@@ -1254,6 +1618,8 @@ function drawElement(ctx: CanvasRenderingContext2D, asset: OverlayAsset, w: numb
 interface EffectState {
   alpha: number;
   scale: number;
+  // Horizontal squash on top of `scale` (a flip turning edge-on; negative shows its back).
+  scaleX: number;
   rotate: number;
   dx: number;
   dy: number;
@@ -1264,7 +1630,7 @@ interface EffectState {
 
 function effectState(asset: OverlayAsset, w: number, h: number, t: number, duration: number): EffectState {
   const unit = Math.min(w, h);
-  const s: EffectState = { alpha: 1, scale: 1, rotate: 0, dx: 0, dy: 0, reveal: 1, wipe: 1, glitch: 0 };
+  const s: EffectState = { alpha: 1, scale: 1, scaleX: 1, rotate: 0, dx: 0, dy: 0, reveal: 1, wipe: 1, glitch: 0 };
   const e = entranceSeconds(asset, duration);
   // How far "in" the element is: 0 -> 1 entering, 1 -> 0 leaving (when exit is on).
   let r = e > 0 ? clamp01(t / e) : 1;
@@ -1301,6 +1667,14 @@ function effectState(asset: OverlayAsset, w: number, h: number, t: number, durat
     case "wipe":
       s.wipe = easeInOut(r);
       if (selfDrawn) s.reveal = easeOutCubic(r);
+      break;
+    case "flip":
+      // A coin toss: one and a half turns about the vertical axis, landing face up, a little
+      // overshoot in size as it lands.
+      s.scaleX = Math.cos((1 - easeOutCubic(r)) * Math.PI * 3);
+      s.scale = r >= 1 ? 1 : Math.max(0, easeOutBack(r));
+      s.alpha = clamp01(r * 4);
+      if (selfDrawn) s.reveal = r;
       break;
     case "glitch":
       s.glitch = r >= 1 ? 0 : 1 - r;
@@ -1347,14 +1721,14 @@ export function drawAssetFrame(ctx: CanvasRenderingContext2D, asset: OverlayAsse
   if (w <= 0 || h <= 0) return;
   const unit = Math.min(w, h);
   const s = effectState(asset, w, h, t, duration);
-  if (s.alpha <= 0 || s.scale <= 0.001) return;
+  if (s.alpha <= 0 || s.scale <= 0.001 || Math.abs(s.scale * s.scaleX) <= 0.001) return;
 
   ctx.save();
   if (opts.rotationDeg) ctx.rotate((opts.rotationDeg * Math.PI) / 180);
   ctx.translate(s.dx, s.dy);
   if (s.glitch > 0) ctx.translate((hash(Math.floor(t * 30) * 1.7) - 0.5) * unit * 0.18 * s.glitch, 0);
   ctx.rotate(s.rotate);
-  ctx.scale(s.scale * (opts.flipHorizontal ? -1 : 1), s.scale * (opts.flipVertical ? -1 : 1));
+  ctx.scale(s.scale * s.scaleX * (opts.flipHorizontal ? -1 : 1), s.scale * (opts.flipVertical ? -1 : 1));
   ctx.globalAlpha *= s.alpha;
 
   if (s.wipe < 1) {

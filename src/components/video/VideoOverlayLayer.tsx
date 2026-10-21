@@ -446,6 +446,9 @@ const ANIMATION_OPTIONS: { value: OverlayAnimation; label: string }[] = [
   { value: "none", label: "None" },
   { value: "fade", label: "Fade" },
   { value: "pop", label: "Pop" },
+  { value: "flip", label: "Flip" },
+  { value: "zoom", label: "Zoom" },
+  { value: "drop", label: "Drop" },
   { value: "slide-left", label: "Slide ←" },
   { value: "slide-right", label: "Slide →" },
   { value: "slide-up", label: "Slide ↑" },
@@ -456,6 +459,11 @@ const TEXT_REVEAL_OPTIONS: { value: OverlayAnimation; label: string }[] = [
   { value: "typewriter", label: "Typewriter" },
   { value: "words", label: "Word by word" },
   { value: "rise", label: "Rise" },
+  { value: "blur", label: "Blur in" },
+  { value: "scatter", label: "Scatter" },
+  { value: "drop", label: "Drop" },
+  { value: "spread", label: "Spread" },
+  { value: "wave", label: "Wave" },
 ];
 
 // A single button (shared by the text and image style panels) that opens a small menu of
@@ -1659,7 +1667,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         const transform =
           [
             anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
-            anim.scale !== 1 ? `scale(${anim.scale})` : null,
+            anim.scale !== 1 || (anim.scaleX ?? 1) !== 1 ? `scale(${anim.scale * (anim.scaleX ?? 1)}, ${anim.scale})` : null,
             o.rotation ? `rotate(${o.rotation}deg)` : null,
           ]
             .filter(Boolean)
@@ -1861,7 +1869,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 // --reveal-fade: a title reveal's exit fade, set by RevealText.
                 opacity: o.keyframes?.length || isTextReveal(o.animation) ? `calc(${anim.opacity} * var(--kf-opacity, 1) * var(--reveal-fade, 1))` : anim.opacity,
                 transform:
-                  [anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null, anim.scale !== 1 ? `scale(${anim.scale})` : null]
+                  [anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null, anim.scale !== 1 || (anim.scaleX ?? 1) !== 1 ? `scale(${anim.scale * (anim.scaleX ?? 1)}, ${anim.scale})` : null]
                     .filter(Boolean)
                     .join(" ") || undefined,
                 background: o.backgroundColor ?? "transparent",

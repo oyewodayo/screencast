@@ -115,6 +115,9 @@ export function buildShort(
       hiddenVideoTracks: [],
       audioOverlays: carryMusic(base.audioOverlays, moment, totalDuration(untightened) - totalDuration(main), durationSec),
       captions,
+      // A wallpaper frame would only shrink a vertical short; the drawn pointer (pointerStyle) and
+      // shortcut chips carry over.
+      screenStyle: null,
     },
     untightened,
     cuts,

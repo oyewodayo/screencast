@@ -38,6 +38,7 @@ const Tile: React.FC<{
   const boxRef = useRef<HTMLDivElement>(null);
   const moverRef = useRef<HTMLDivElement>(null);
   const oldImgRef = useRef<HTMLImageElement>(null);
+  const newImgRef = useRef<HTMLImageElement>(null);
   const pixelRef = useRef<HTMLCanvasElement>(null);
   const blackRef = useRef<HTMLDivElement>(null);
   const glowRef = useRef<HTMLDivElement>(null);
@@ -50,7 +51,12 @@ const Tile: React.FC<{
     const black = blackRef.current;
     const glow = glowRef.current;
     if (!box || !mover || !old || !black || !glow) return;
-    register(type, { type, box, els: { mover, black, glow, pixel: pixelRef.current, fx: fxRef.current, source: old } });
+    const loaded = (img: HTMLImageElement | null): img is HTMLImageElement => !!img && img.complete && img.naturalWidth > 0;
+    const pictures = () => {
+      const next = newImgRef.current;
+      return loaded(old) && loaded(next) ? { old, next } : null;
+    };
+    register(type, { type, box, els: { mover, black, glow, pixel: pixelRef.current, fx: fxRef.current, source: old, pictures } });
     return () => register(type, null);
   }, [type, register]);
 
@@ -62,7 +68,7 @@ const Tile: React.FC<{
       className={`group flex flex-col gap-1 min-w-0 rounded-md p-1 text-left transition-colors ${active ? "bg-blue-500/15 ring-1 ring-blue-400/60" : "hover:bg-white/[0.06]"}`}
     >
       <div ref={boxRef} className="relative w-full aspect-video overflow-hidden rounded bg-black isolate">
-        <img src={stills[1]} alt="" draggable={false} className="absolute inset-0 w-full h-full" />
+        <img ref={newImgRef} src={stills[1]} alt="" draggable={false} className="absolute inset-0 w-full h-full" />
         <div ref={moverRef} className="absolute inset-0">
           <img ref={oldImgRef} src={stills[0]} alt="" draggable={false} className="absolute inset-0 w-full h-full" />
           <canvas ref={pixelRef} className="absolute inset-0 w-full h-full" style={{ imageRendering: "pixelated", display: "none" }} />

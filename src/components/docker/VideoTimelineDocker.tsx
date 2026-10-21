@@ -62,6 +62,7 @@ import { assetEntry, makeAsset } from "../../utils/videoAssets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import MusicLibraryPanel from "./MusicLibraryPanel";
 import { libraryInfoOf, restoreMusicTrack, VideoContext } from "../../utils/musicLibrary";
+import { BUILTIN_SFX_TRACKS, TRANSITION_SOUNDS, builtinSfxFile } from "../../utils/builtinSfx";
 import { computeSpeechTimeline, DEFAULT_DUCK_LEVEL, duckGainAt, isDucked, isSpeechOverlay, TimeRange } from "../../utils/musicDucking";
 import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION } from "./ClipEffectsPopover";
 import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
@@ -82,12 +83,29 @@ import ToolModePopover, { TimelineToolMode } from "./ToolModePopover";
 import { useToolPanelHost } from "./ToolPanelHost";
 import CaptionsPanel from "./CaptionsPanel";
 import ChaptersPanel from "./ChaptersPanel";
+import ScreenStylePanel from "./ScreenStylePanel";
+import { MdOutlineWallpaper } from "react-icons/md";
+import { useClipRecordings } from "../../hooks/useClipRecordings";
+import { hasPointerPath, pointerStyleOf } from "../../utils/pointerTrack";
+import { buildKeyChips, keystrokeStyleOf } from "../../utils/keystrokes";
 import { enqueue as enqueueExport } from "../../utils/exportQueue";
 import { copyItems, emptyClipboardItems } from "../../utils/timelineClipboard";
 import { outputChapters } from "../../utils/videoChapters";
 import { IoBookmarkOutline, IoColorFilterOutline, IoPersonCircleOutline, IoSparkles } from "react-icons/io5";
 import { buildCaptionLines } from "../../utils/captions";
-import { ActiveClipEffects, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
+import { ActiveClipEffects, ClipEffectBadge, TRANSITION_PRESETS, clipEffectBadges } from "../../utils/videoColorFilters";
+import { GRADE_LOOKS } from "../../utils/gradeLooks";
+import { CLIP_FX } from "../../utils/clipFx";
+
+// Clip effect badges (clipEffectBadges), coloured by kind.
+const BADGE_TONES: Record<ClipEffectBadge["tone"], string> = {
+  look: "bg-amber-400/90 text-black",
+  fx: "bg-fuchsia-500/90 text-white",
+  motion: "bg-sky-500/90 text-white",
+  time: "bg-orange-500/90 text-white",
+  frame: "bg-black/75 text-teal-300",
+  sound: "bg-red-600/90 text-white",
+};
 import ToolSearch from "./ToolSearch";
 import MixerPanel, { type MixerChannel } from "./MixerPanel";
 import { audioChannelKey, audioChannelName, fileStem, isNeutralFx } from "../../utils/audioFx";
@@ -186,6 +204,13 @@ const AUDIO_JUMP_SEC = 1;
 // cache (a few bytes per file ever opened) is an acceptable tradeoff for not needing to lift this
 // state through Dashboard/BottomDocker just to keep it alive across the panel toggle.
 const bootstrappedClipIdByFile = new Map<string, string>();
+// Called whenever a file is (re)opened for playback: the player starts over on the file's own
+// picture (a project's blank canvas), so "already playing from its first clip" no longer holds and
+// the timeline must put playback on the first clip again when it next mounts. Without this, a
+// project opened a second time in a session played its black canvas under a full timeline.
+export const forgetTimelineBootstrap = (path: string): void => {
+  bootstrappedClipIdByFile.delete(path);
+};
 
 const formatTimestamp = (totalSeconds: number): string => {
   const minutes = Math.floor(totalSeconds / 60);
@@ -1002,6 +1027,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [captionsAnchor, setCaptionsAnchor] = useState<{ left: number; top: number } | null>(null);
   // Chapters (ChaptersPanel) - whole-timeline like Captions.
   const [chaptersAnchor, setChaptersAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Screen style (ScreenStylePanel) - the frame, the drawn pointer and shortcut keys, whole-video.
+  const [screenStyleAnchor, setScreenStyleAnchor] = useState<{ left: number; top: number } | null>(null);
+  const clipRecordings = useClipRecordings(editStore.clips);
+  const hasEditablePointer = [...clipRecordings.values()].some((r) => hasPointerPath(r));
+  const shortcutCount = useMemo(() => buildKeyChips(editStore.clips, clipRecordings).reduce((n, c) => n + c.count, 0), [editStore.clips, clipRecordings]);
   // Elements gallery (shapes and animated elements - videoAssets.ts).
   const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
   // Split screen builder (SplitScreenPanel).
@@ -3530,6 +3560,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <IoBookmarkOutline size={15} />
           </button>
+          <button
+            type="button"
+            data-screen-style-panel
+            title="Screen style - frame the video on a wallpaper with rounded corners and a shadow; smooth the pointer, show clicks and shortcut keys"
+            onClick={(e) => {
+              if (screenStyleAnchor) {
+                setScreenStyleAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setScreenStyleAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${screenStyleAnchor ? "bg-neutral-700 text-emerald-300" : "text-neutral-300 hover:bg-neutral-700"}`}
+          >
+            <MdOutlineWallpaper size={15} className={editStore.screenStyle ? "text-emerald-300" : undefined} />
+          </button>
           <ActionButton
             title={isPlacingPip ? "Choosing a video file…" : "Add picture-in-picture video (e.g. a separately-recorded webcam)"}
             onClick={() => onToggleArmPlacePip?.()}
@@ -3996,14 +4042,37 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     ) : (
                       <div className="h-full w-full bg-neutral-800" />
                     )}
-                    {clip.stabilize && (
-                      <span
-                        title="Stabilized when saved"
-                        className="absolute top-0.5 left-0.5 z-[6] px-1 rounded-sm bg-black/70 text-[8px] leading-3 font-semibold uppercase tracking-wide text-teal-300 pointer-events-none"
-                      >
-                        Steady
-                      </span>
-                    )}
+                    {/* What's on this clip - look, colour, effect, motion, speed, framing, sound -
+                        as small badges; clicking them opens the clip's effects. */}
+                    {!isPending &&
+                      (() => {
+                        const badges = clipEffectBadges(baseClips[i] ?? clip, {
+                          look: (name) => GRADE_LOOKS.find((l) => l.value === name)?.label,
+                          fx: (kind) => CLIP_FX.find((f) => f.value === kind)?.label,
+                        });
+                        if (!badges.length) return null;
+                        const summary = badges.map((b) => b.label).join(" · ");
+                        return (
+                          <button
+                            type="button"
+                            title={`${summary} - click to edit this clip's effects`}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              const rect = e.currentTarget.getBoundingClientRect();
+                              setSelectedClipIds([clip.id]);
+                              setEffectsPopoverAnchor({ left: rect.left, top: rect.bottom + 4 });
+                            }}
+                            className="absolute top-0.5 left-0.5 z-[6] flex gap-0.5 overflow-hidden rounded-sm hover:ring-1 hover:ring-white/70"
+                            style={{ maxWidth: Math.max(0, width - 8) }}
+                          >
+                            {badges.map((b) => (
+                              <span key={b.key} className={`shrink-0 px-1 rounded-sm text-[8.5px] leading-[13px] font-semibold tracking-wide whitespace-nowrap ${BADGE_TONES[b.tone]}`}>
+                                {b.label}
+                              </span>
+                            ))}
+                          </button>
+                        );
+                      })()}
                     {!isPending && !isImageClipPath(clip.sourcePath) && (
                       <ClipWaveform
                         sourcePath={clip.sourcePath}
@@ -4589,6 +4658,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               anchor={effectsPopoverAnchor}
               selectedCount={selectedCount}
               onUpdate={updateSelectedClips}
+              onAddTransitionSound={
+                clipIndex > 0
+                  ? (soundId) => {
+                      const sound = TRANSITION_SOUNDS.find((s) => s.id === soundId);
+                      const track = BUILTIN_SFX_TRACKS.find((t) => t.id === soundId);
+                      if (!sound || !track) return;
+                      const start = Math.max(0, (outputStarts[clipIndex] ?? 0) - sound.lead);
+                      builtinSfxFile(soundId)
+                        .then((path) => {
+                          const id = editStore.addAudioOverlay(path, track.duration, start, start + track.duration, { label: track.title, library: libraryInfoOf(track) });
+                          setSelectedAudioOverlayId(id);
+                        })
+                        .catch((err) => console.error("Couldn't make the transition sound", err));
+                    }
+                  : undefined
+              }
               onClose={() => setEffectsPopoverAnchor(null)}
             />
           );
@@ -4791,6 +4876,21 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onChange={editStore.setChapters}
           onSeek={seekToOutputTime}
           onClose={() => setChaptersAnchor(null)}
+        />
+      )}
+
+      {screenStyleAnchor && (
+        <ScreenStylePanel
+          anchor={screenStyleAnchor}
+          screenStyle={editStore.screenStyle}
+          onScreenStyle={editStore.setScreenStyle}
+          pointerStyle={pointerStyleOf(editStore.pointerStyle)}
+          onPointerStyle={editStore.updatePointerStyle}
+          keystrokeStyle={keystrokeStyleOf(editStore.keystrokeStyle)}
+          onKeystrokeStyle={editStore.updateKeystrokeStyle}
+          hasPointer={hasEditablePointer}
+          shortcutCount={shortcutCount}
+          onClose={() => setScreenStyleAnchor(null)}
         />
       )}
 

@@ -1,7 +1,7 @@
 // utils/textReveal.ts
 //
-// Title animations that work letter by letter or word by word - typewriter, word-by-word, rise -
-// rather than moving the whole box like fade/slide/pop do. One timing model shared by the live
+// Title animations that work letter by letter or word by word - typewriter, word-by-word, rise,
+// scatter, blur-in, drop, spread, wave - rather than moving the whole box like fade/slide/pop do. One timing model shared by the live
 // preview (VideoOverlayLayer's RevealText, per-character <span>s) and export
 // (renderTextOverlayToPng drawing per character, sent as a frame sequence), so the title types
 // on exactly the same way on screen and in the file.
@@ -10,10 +10,10 @@
 // as the line fills in.
 import type { OverlayAnimation } from "./videoEditTypes";
 
-export type TextReveal = "typewriter" | "words" | "rise";
+export type TextReveal = "typewriter" | "words" | "rise" | "scatter" | "blur" | "drop" | "spread" | "wave";
 
-export const isTextReveal = (animation: OverlayAnimation | undefined): animation is TextReveal =>
-  animation === "typewriter" || animation === "words" || animation === "rise";
+const TEXT_REVEALS = new Set<string>(["typewriter", "words", "rise", "scatter", "blur", "drop", "spread", "wave"]);
+export const isTextReveal = (animation: OverlayAnimation | undefined): animation is TextReveal => !!animation && TEXT_REVEALS.has(animation);
 
 // How a title leaves: fade out, play its reveal backwards (un-type), or just cut at its end.
 export type TextRevealExit = "fade" | "reverse" | "none";
@@ -36,7 +36,7 @@ export interface TextRevealSettings {
   humanize?: boolean;
   // Typewriter only. Default "bar".
   caretStyle?: CaretStyle;
-  // Words / rise: where letters come in from. Default "below".
+  // Words / rise / blur: where letters come in from. Default "below".
   from?: "below" | "above";
   // An accent line that draws itself under the title as it reveals, in this colour.
   underline?: string;
@@ -56,6 +56,14 @@ const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
 const easeOutBack = (t: number) => {
   const c1 = 1.70158;
   return 1 + (c1 + 1) * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+};
+const easeOutBounce = (t: number) => {
+  const n1 = 7.5625;
+  const d1 = 2.75;
+  if (t < 1 / d1) return n1 * t * t;
+  if (t < 2 / d1) return n1 * (t -= 1.5 / d1) * t + 0.75;
+  if (t < 2.5 / d1) return n1 * (t -= 2.25 / d1) * t + 0.9375;
+  return n1 * (t -= 2.625 / d1) * t + 0.984375;
 };
 
 const speedOf = (settings?: TextRevealSettings) => Math.max(TEXT_REVEAL_SPEED_MIN, Math.min(TEXT_REVEAL_SPEED_MAX, settings?.speed ?? 1));
@@ -83,6 +91,9 @@ function naturalSeconds(text: string, kind: TextReveal, settings?: TextRevealSet
   const { words } = wordIndexes(text);
   if (kind === "typewriter") return settings?.unit === "word" ? Math.max(0.3, words * 0.22) : Math.max(0.4, chars * 0.045);
   if (kind === "words") return Math.max(0.4, (words - 1) * 0.14 + WORD_IN_SEC);
+  if (kind === "spread") return 0.9;
+  if (kind === "scatter") return Math.max(0.7, chars * 0.025 + 0.55);
+  if (kind === "drop") return Math.max(0.7, chars * 0.04 + 0.6);
   return Math.max(0.5, chars * 0.03 + CHAR_IN_SEC);
 }
 
@@ -106,6 +117,10 @@ export interface CharState {
   opacity: number;
   // Vertical offset in em (positive = lower).
   dy: number;
+  // Horizontal offset in em (positive = right). Undefined = 0.
+  dx?: number;
+  // Blur radius in em. Undefined = sharp.
+  blur?: number;
 }
 
 export interface TextRevealState {
@@ -176,12 +191,48 @@ function revealAt(text: string, kind: TextReveal, p: number, reveal: number, set
     };
   }
 
-  const inSec = Math.min(CHAR_IN_SEC, reveal);
+  if (kind === "spread") {
+    // The letters start pulled apart about the middle, soft, and close up into the word.
+    const e = easeOutCubic(clamp01(p / reveal));
+    const mid = (n - 1) / 2;
+    return { char: (i) => ({ opacity: e, dy: 0, dx: (i - mid) * 0.6 * (1 - e), blur: 0.15 * (1 - e) }), caretAt: null };
+  }
+
+  if (kind === "scatter") {
+    // Letters fly in from all around in a random order and settle into place.
+    const inSec = Math.min(0.5, reveal);
+    const spread = Math.max(0, reveal - inSec);
+    return {
+      char: (i) => {
+        const local = clamp01((p - hash(i * 2.9) * spread) / inSec);
+        const e = easeOutCubic(local);
+        const a = hash(i * 3.1 + 7) * Math.PI * 2;
+        return { opacity: clamp01(local * 3), dx: Math.cos(a) * 1.2 * (1 - e), dy: Math.sin(a) * 1.2 * (1 - e) };
+      },
+      caretAt: null,
+    };
+  }
+
+  const inSec = Math.min(kind === "drop" ? 0.6 : CHAR_IN_SEC, reveal);
   const stagger = n > 1 ? Math.max(0, reveal - inSec) / (n - 1) : 0;
   return {
     char: (i) => {
       const local = clamp01((p - i * stagger) / inSec);
-      return { opacity: clamp01(local * 2.5), dy: local >= 1 ? 0 : (1 - easeOutBack(local)) * 0.8 * dir };
+      switch (kind) {
+        case "blur": {
+          // Each letter rises a little out of a blur.
+          const e = easeOutCubic(local);
+          return { opacity: e, dy: (1 - e) * 0.35 * dir, blur: (1 - e) * 0.25 };
+        }
+        case "drop":
+          // Falls from above and bounces to rest.
+          return { opacity: clamp01(local * 4), dy: -(1 - easeOutBounce(local)) * 1.0 };
+        case "wave":
+          // Hops up and lands, one after another.
+          return { opacity: clamp01(local * 3), dy: -Math.sin(Math.PI * local) * 0.45 };
+        default:
+          return { opacity: clamp01(local * 2.5), dy: local >= 1 ? 0 : (1 - easeOutBack(local)) * 0.8 * dir };
+      }
     },
     caretAt: null,
   };

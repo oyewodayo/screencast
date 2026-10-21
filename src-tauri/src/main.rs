@@ -26,6 +26,8 @@ mod commands {
 }
 mod services {
     pub mod asset_download;
+    pub mod transition_graphs;
+    pub mod clip_fx;
     pub mod audio_fx;
     pub mod beat_detect;
     pub mod subject_track;
@@ -74,6 +76,9 @@ mod services {
     // Cargo dependency at all.
     #[cfg(target_os = "windows")]
     pub mod click_tracker;
+    // The editable pointer and shortcut keys of a screen recording (the editor's Screen Style).
+    #[cfg(target_os = "windows")]
+    pub mod input_tracker;
     // Windows Job Object wrapper that kills recording ffmpeg children the instant this app's own
     // process dies for any reason (including a force-kill), so they can't outlive it holding the
     // camera/mic open - see the module's own doc comment for the orphan this fixes.
@@ -408,6 +413,7 @@ fn main() {
             commands::recording::stop_recording,
             commands::recording::get_recording_status,
             commands::recording::load_click_sidecar,
+            commands::recording::load_pointer_sidecar,
             commands::recording::load_view_switch_sidecar,
             commands::recording::record_view_switch,
             commands::recording::get_webcam_sidecar_path,
@@ -501,6 +507,7 @@ fn main() {
             commands::music_library::get_music_track_file,
             commands::music_library::restore_music_track,
             commands::music_library::save_music_track,
+            commands::music_library::store_builtin_sound,
             commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,

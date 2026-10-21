@@ -119,11 +119,15 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
   const underlineColor = reveal && overlay.reveal?.underline;
   const canvasHeight = underlineColor ? Math.ceil(boxHeight + fontSizePx * 0.25) : boxHeight;
 
+  // A reveal's letters travel outside the box as they come in (scatter, drop, rise) - room for them
+  // all round, as the preview lets them overflow it.
+  const bleed = reveal ? Math.ceil(fontSizePx * 1.5) : 0;
   const canvas = document.createElement("canvas");
-  canvas.width = canvasWidth;
-  canvas.height = canvasHeight;
+  canvas.width = canvasWidth + 2 * bleed;
+  canvas.height = canvasHeight + 2 * bleed;
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
+  ctx.translate(bleed, bleed);
 
   const baseFont = `${fontSizePx}px ${TEXT_FONT_FAMILY}`;
   ctx.font = baseFont;
@@ -181,10 +185,12 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
     for (let j = 0; j < segment.length; j++) {
       if (reveal.caretAt === absStart + j) drawCaret(cx, y, fillColor);
       const ch = segment[j];
-      const { opacity, dy } = reveal.char(absStart + j);
+      const { opacity, dy, dx = 0, blur = 0 } = reveal.char(absStart + j);
       if (opacity > 0) {
         ctx.globalAlpha = fade * opacity;
-        drawPlain(ch, cx, y + dy * fontSizePx, fillColor);
+        if (blur > 0.001) ctx.filter = `blur(${blur * fontSizePx}px)`;
+        drawPlain(ch, cx + dx * fontSizePx, y + dy * fontSizePx, fillColor);
+        ctx.filter = "none";
         ctx.globalAlpha = fade;
       }
       cx += ctx.measureText(ch).width;
@@ -256,8 +262,8 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
 
   return {
     dataUrl: canvas.toDataURL("image/png"),
-    xPx: Math.round(overlay.x * framePixelWidth - padding),
-    yPx: Math.round(overlay.y * framePixelHeight - padding),
+    xPx: Math.round(overlay.x * framePixelWidth - padding) - bleed,
+    yPx: Math.round(overlay.y * framePixelHeight - padding) - bleed,
   };
 }
 

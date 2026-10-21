@@ -94,6 +94,10 @@ pub struct AppState {
     // stops it and writes its collected clicks to a sidecar JSON file next to the finished video.
     #[cfg(target_os = "windows")]
     click_capture: Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
+    // The pointer/shortcut recording for the recording in progress (FormData.track_pointer /
+    // track_keys - services/input_tracker.rs), written to "<name>.pointer.json" at stop.
+    #[cfg(target_os = "windows")]
+    input_capture: Arc<Mutex<Option<crate::services::input_tracker::InputCapture>>>,
     // Screen<->camera view-switch events for the recording currently in progress, logged by the
     // record_view_switch command as the user toggles the live recording bar's "Screen"/"Camera"
     // control - see that command's own doc comment. Not Windows-only by construction (unlike
@@ -213,6 +217,13 @@ pub struct FormData {
     // as include_system_audio above.
     #[serde(default)]
     track_clicks: bool,
+    // "Editable pointer" (Windows, screen modes): the screen is captured without the pointer and
+    // its path, clicks and looks are recorded beside it for the editor to draw (input_tracker.rs).
+    #[serde(default)]
+    track_pointer: bool,
+    // "Record shortcuts": keyboard shortcuts (never typing) recorded for the editor's key chips.
+    #[serde(default)]
+    track_keys: bool,
     // Max output width in px for screen-capture modes (sva/sa/s) - None reproduces the previous
     // hardcoded behavior exactly (MAX_RECORDING_WIDTH, 1920). The frontend's "native" option sends
     // a very large value (comfortably above any realistic display) rather than a separate sentinel/
@@ -416,6 +427,23 @@ pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> 
     fs::read_to_string(&sidecar)
         .map(Some)
         .map_err(|e| format!("Failed to read click-tracking sidecar: {}", e))
+}
+
+// Where a recording's editable pointer and shortcut keys live (services/input_tracker.rs) - read by
+// the editor (pointerTrack.ts) to draw the pointer back and show the shortcuts. Named like the
+// library's other companions (sidecars.rs) so it moves, copies and goes to the trash with the
+// video: a recording parted from it would have no pointer at all.
+fn pointer_sidecar_path(video_path: &Path) -> PathBuf {
+    crate::services::sidecars::sidecar_path(video_path, ".pointer.json")
+}
+
+#[tauri::command(async)]
+pub fn load_pointer_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let sidecar = pointer_sidecar_path(&PathBuf::from(&video_path));
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&sidecar).map(Some).map_err(|e| format!("Failed to read the pointer sidecar: {}", e))
 }
 
 // Where the camera bubble was baked into a screen recording - its shape, anchor, size, border and
@@ -1845,6 +1873,8 @@ pub async fn start_recording(
     let assembly_state = state.assembly.clone();
     #[cfg(target_os = "windows")]
     let click_capture = state.click_capture.clone();
+    #[cfg(target_os = "windows")]
+    let input_capture = state.input_capture.clone();
 
     // Screen recordings are assembled at stop from separately captured parts, in exact sync - see
     // recording/assembly.rs. The audio captures start here, before ffmpeg, so they're already
@@ -1919,6 +1949,36 @@ pub async fn start_recording(
                 None => warn!("Failed to resolve the capture region's own bounds, recording will proceed without click tracking"),
             }
         }
+
+        // The editable pointer and shortcut keys (services/input_tracker.rs). Only once the pointer
+        // really is being recorded does the capture leave it out of the picture - if the tracker
+        // can't start, the recording keeps its pointer as usual.
+        let screen_capture = matches!(form_data.record_type.as_str(), "sva" | "sa" | "s");
+        let wants_pointer = form_data.track_pointer && screen_capture;
+        let wants_keys = form_data.track_keys && screen_capture;
+        *state.input_capture.lock().await = None;
+        if wants_pointer || wants_keys {
+            let target = resolve_capture_target(&app_handle, &form_data);
+            match capture_region_bounds(&target) {
+                Some((x, y, width, height)) => {
+                    use crate::services::input_tracker::{Area, InputCapture};
+                    let area = match target {
+                        CaptureTarget::Window { hwnd, title, title_bar } => Area::Window { hwnd, title, title_bar, x, y, width, height },
+                        _ => Area::Fixed { x, y, width, height },
+                    };
+                    match InputCapture::start(area, wants_pointer, wants_keys) {
+                        Ok(capture) => {
+                            if wants_pointer {
+                                form_data.capture_cursor = false;
+                            }
+                            *state.input_capture.lock().await = Some(capture);
+                        }
+                        Err(e) => warn!("Couldn't record the pointer/shortcuts, recording will proceed without them: {}", e),
+                    }
+                }
+                None => warn!("Failed to resolve the capture region's own bounds, recording will proceed without the editable pointer"),
+            }
+        }
     }
 
     // ffmpeg's Command::spawn() only fails if the executable itself can't launch - a bad device
@@ -1943,7 +2003,7 @@ pub async fn start_recording(
             Ok(output) => output,
             Err(e) => {
                 #[cfg(target_os = "windows")]
-                discard_start(&assembly_state, &click_capture).await;
+                discard_start(&assembly_state, &click_capture, &input_capture).await;
                 return Err(e);
             }
         };
@@ -1974,7 +2034,7 @@ pub async fn start_recording(
     if let Some(status) = early_exit_status {
         *output_path_state.lock().await = None;
         #[cfg(target_os = "windows")]
-        discard_start(&assembly_state, &click_capture).await;
+        discard_start(&assembly_state, &click_capture, &input_capture).await;
         return Err(format!(
             "Recording failed to start (ffmpeg exited immediately with {}). The selected device may be in use by another app, or unavailable.",
             status
@@ -2282,7 +2342,11 @@ fn retime_webcam(ffmpeg_path: &Path, segments: &assembly::Segments, camera: &ass
 async fn discard_start(
     assembly_state: &Arc<Mutex<Option<assembly::Assembly>>>,
     click_capture: &Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
+    input_capture: &Arc<Mutex<Option<crate::services::input_tracker::InputCapture>>>,
 ) {
+    if let Some(capture) = input_capture.lock().await.take() {
+        let _ = crate::services::responsiveness::blocking(move || capture.stop()).await;
+    }
     if let Some(mut parts) = assembly_state.lock().await.take() {
         if let Some(mut camera) = parts.camera.take() {
             if let Some(mut process) = camera.process.take() {
@@ -2594,6 +2658,32 @@ pub async fn stop_recording(
                         }
                     }
                     Err(e) => warn!("Failed to serialize click-tracking data: {}", e),
+                }
+            }
+        }
+
+        // The editable pointer and shortcut keys, onto the final file's timeline the same way.
+        let input_capture = state.input_capture.lock().await.take();
+        if let Some(capture) = input_capture {
+            let started_hns = capture.started_hns;
+            if let Some(log) = crate::services::responsiveness::blocking(move || capture.stop()).await.ok().flatten() {
+                let to_output = |hns: i64| match &segments {
+                    Some((segments, _)) => segments.output_time(hns),
+                    None => Some((hns - started_hns) as f64 / 1e7).filter(|t| *t >= 0.0),
+                };
+                if !log.is_empty() {
+                    if let Err(e) = fs::write(pointer_sidecar_path(&output_path), log.to_sidecar(to_output).to_string()) {
+                        warn!("Failed to write the pointer sidecar: {}", e);
+                    }
+                }
+                // Auto zoom on click reads the clicks sidecar - written from the pointer's own clicks
+                // when "Track clicks" wasn't also on.
+                let clicks_path = click_sidecar_path(&output_path);
+                let clicks = log.left_clicks(to_output);
+                if !clicks_path.exists() && !clicks.is_empty() {
+                    if let Ok(json) = serde_json::to_string(&clicks) {
+                        let _ = fs::write(&clicks_path, json);
+                    }
                 }
             }
         }

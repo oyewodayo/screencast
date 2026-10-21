@@ -17,6 +17,9 @@ import { ActiveClipEffects } from "../utils/videoColorFilters";
 import { loadSettings } from "../utils/appSettings";
 import { startSnip } from "../services/snip";
 
+// Dispatched (on window) to bring the dock back up when it was minimized.
+export const SHOW_DOCKER_EVENT = "briefcast:show-docker";
+
 const FEEDBACK_EMAIL = "withbriefs@gmail.com";
 
 // Opens the user's mail client with a pre-filled feedback email. Version + OS go in the body so
@@ -360,6 +363,12 @@ const BottomDocker = ({
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
   const [showDocker, setShowDocker] = useState(true);
+  // Something asked for the dock (the player's "Edit video") - bring it back if minimized.
+  useEffect(() => {
+    const open = () => setShowDocker(true);
+    window.addEventListener(SHOW_DOCKER_EVENT, open);
+    return () => window.removeEventListener(SHOW_DOCKER_EVENT, open);
+  }, []);
   // Click tracking (services/click_tracker.rs, a Win32 mouse hook) is still Windows-only with no
   // equivalent elsewhere, unlike system audio ("what you hear"), which is now attempted on every
   // platform (WASAPI on Windows, an auto-selected PulseAudio monitor source on Linux, and
