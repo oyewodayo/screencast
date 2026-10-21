@@ -16,7 +16,8 @@
 // selection are one and the same thing, not two parallel selection models.
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoImageOutline, IoTrashOutline } from "react-icons/io5";
+import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoImageOutline, IoTrashOutline, IoPhonePortraitOutline } from "react-icons/io5";
+import { openPhoneTransfer } from "../services/phoneTransfer";
 import { formatFileSize, truncateFileName } from "../utils/Formater";
 import { preloadImage } from "../utils/imageObjectCache";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
@@ -405,6 +406,14 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
               </button>
               <button
                 type="button"
+                onClick={() => openPhoneTransfer(selectedInFolder)}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm font-medium text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+              >
+                <IoPhonePortraitOutline size={16} className="text-neutral-400 dark:text-neutral-500 shrink-0" />
+                <span className="flex-1 text-left">Transfer to phone</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => onBulkDelete(selectedInFolder)}
                 className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
               >
@@ -487,6 +496,17 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
             >
               <span className="flex-1 text-left">Move or copy to…</span>
               <IoChevronForward size={11} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+            </button>
+            <button
+              type="button"
+              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+              onClick={() => {
+                const target = selectedFilePaths.has(contextMenu.file.path) && selectedInFolder.length > 1 ? selectedInFolder : [contextMenu.file];
+                openPhoneTransfer(target);
+                setContextMenu(null);
+              }}
+            >
+              Transfer to phone
             </button>
             <button
               type="button"

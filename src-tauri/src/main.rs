@@ -43,6 +43,14 @@ mod services {
     // comment for why a webcam driver (DroidCam/Iriun/Camo) is otherwise the only way to get a
     // phone into a DirectShow device list, and why this needs to be an HTTPS server to avoid one.
     pub mod phone_camera;
+    // "Transfer to phone" - sends files to a phone's browser over the LAN, pairing once by QR.
+    // Builds on phone_camera's address/QR helpers; see the module's own doc comment.
+    pub mod phone_transfer;
+    // A real HTTPS certificate per install for phone transfers - see the module comment.
+    pub mod lan_tls;
+    // Phones on a USB cable: send to Android, import photos/videos from Android or iPhone, via
+    // Windows Portable Devices. Commands exist everywhere; only Windows has a worker behind them.
+    pub mod usb_phone;
     // Carries the live recording preview from ffmpeg's stdout to the UI without touching the
     // disk - see the module's own doc comment for the file-based approach this replaced and why.
     pub mod preview_stream;
@@ -366,6 +374,7 @@ fn main() {
         .manage(commands::native_playback::NativePlaybackState::default())
         .manage(services::file_watcher::FileWatcherState::default())
         .manage(services::phone_camera::PhoneCameraState::default())
+        .manage(services::phone_transfer::PhoneTransferState::default())
         .setup(|app| {
             // Start watching the Briefcast folder for external changes right away, so the sidebar
             // stays live without needing a restart or a manual refresh click - see
@@ -380,6 +389,10 @@ fn main() {
             }
 
             services::telemetry::init(app.handle());
+            // Only if a phone was paired before - lets a phone that still has the page open
+            // reconnect without anyone opening the Transfer dialog first.
+            services::phone_transfer::autostart(app.handle().clone());
+            services::usb_phone::start(app.handle());
             services::responsiveness::start_ui_watchdog(app.handle());
             #[cfg(target_os = "windows")]
             services::webview_recovery::install(app.handle());
@@ -424,6 +437,19 @@ fn main() {
             services::phone_camera::stop_phone_camera_server,
             services::phone_camera::phone_camera_status,
             services::phone_camera::phone_camera_send_signal,
+            services::phone_transfer::start_phone_transfer_server,
+            services::phone_transfer::phone_transfer_send,
+            services::phone_transfer::phone_transfer_devices,
+            services::phone_transfer::phone_transfer_forget,
+            services::phone_transfer::phone_transfer_answer_pair,
+            services::phone_transfer::phone_transfer_history,
+            services::usb_phone::usb_phones,
+            services::usb_phone::usb_phone_scan,
+            services::usb_phone::usb_phone_browse,
+            services::usb_phone::usb_phone_thumbnail,
+            services::usb_phone::usb_phone_send,
+            services::usb_phone::usb_phone_import,
+            services::usb_phone::usb_transfer_cancel,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,

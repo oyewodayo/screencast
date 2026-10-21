@@ -45,7 +45,9 @@ import {
   IoSyncOutline,
   IoDownloadOutline,
   IoDocumentTextOutline,
+  IoPhonePortraitOutline,
 } from "react-icons/io5";
+import { openPhoneTransfer } from "../../services/phoneTransfer";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, MIN_AUDIO_START_ROOM_SEC, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
 import { AdjustmentLayer, AudioOverlay, BlurOverlay, Clip, IMAGE_CLIP_EXTENSIONS, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
@@ -3836,6 +3838,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                         }}
                       >
                         <IoFolderOutline size={13} /> Move or copy to…
+                      </button>
+                    )}
+                    {!isProject && (
+                      <button
+                        type="button"
+                        className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          openPhoneTransfer([file]);
+                        }}
+                      >
+                        <IoPhonePortraitOutline size={13} /> Transfer to phone
                       </button>
                     )}
                     {onSetThumbnail && !isProject && (

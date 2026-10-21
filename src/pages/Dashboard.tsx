@@ -79,6 +79,11 @@ import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
+import { PhoneTransferHost } from "../components/Modals/PhoneTransferModal";
+import { openPhoneReceive, openPhoneTransfer } from "../services/phoneTransfer";
+import PhoneIncomingTray from "../components/PhoneIncomingTray";
+import UsbPhoneTray from "../components/UsbPhoneTray";
+import { UsbImportHost } from "../components/Modals/UsbImportModal";
 import FileInfoModal from "../components/Modals/FileInfoModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
 import { PresentationLiveBar } from "../components/PresentationControls";
@@ -164,6 +169,7 @@ import {
   IoImagesOutline,
   IoFolderOpenOutline,
   IoImageOutline,
+  IoPhonePortraitOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -3954,6 +3960,16 @@ const setScreen = () => {
                     {activeFileCategory !== "trash" && (
                       <button
                         type="button"
+                        title="Get files from phone"
+                        onClick={openPhoneReceive}
+                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                      >
+                        <IoPhonePortraitOutline size={15} />
+                      </button>
+                    )}
+                    {activeFileCategory !== "trash" && (
+                      <button
+                        type="button"
                         title="New folder"
                         onClick={() => startCreateFolder("")}
                         className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
@@ -4656,6 +4672,23 @@ const setScreen = () => {
                                         </span>
                                         <IoChevronForward size={12} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
                                       </button>
+                                      {/* A project file is an edit list, not media a phone can play -
+                                          Save renders it first. */}
+                                      {!isVideoProjectPath(file.path) && (
+                                        <button
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            openPhoneTransfer(filesToActOn(file).filter((f) => !isVideoProjectPath(f.path)));
+                                            setOpenMenu(null);
+                                          }}
+                                        >
+                                          <IoPhonePortraitOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                          <span className="flex-1 text-left">
+                                            {filesToActOn(file).length > 1 ? `Transfer ${filesToActOn(file).length} to phone` : "Transfer to phone"}
+                                          </span>
+                                        </button>
+                                      )}
                                       {getFileCategory(file.name) === "video" && !isVideoProjectPath(file.path) && (
                                         <button
                                           className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
@@ -5520,6 +5553,8 @@ const setScreen = () => {
       />
       )}
 
+      <PhoneTransferHost />
+      <UsbImportHost />
       {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} onStorageChanged={handleStorageChanged} />}
       {showPhoneCamera && (
         <PhoneCameraModal
@@ -5557,6 +5592,8 @@ const setScreen = () => {
             </span>
           </div>
         )}
+        <PhoneIncomingTray onOpen={(path, name) => void loadFileForPlayback(path, name)} />
+        <UsbPhoneTray />
         <ExportQueueChip
           onOpen={(job) => job.resultPath && void loadFileForPlayback(job.resultPath, job.resultPath.split(/[\\/]/).pop() ?? job.title)}
           onShare={setShareJob}

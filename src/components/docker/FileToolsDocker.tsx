@@ -11,7 +11,9 @@ import {
   IoResizeOutline,
   IoCheckmark,
   IoFolderOutline,
+  IoPhonePortraitOutline,
 } from "react-icons/io5";
+import { openPhoneTransfer } from "../../services/phoneTransfer";
 import MoveCopyMenu, { FileTransferOptions } from "./MoveCopyMenu";
 import type { PopoverAnchor } from "../../hooks/useClampedPopoverPosition";
 import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory";
@@ -398,6 +400,13 @@ const FileToolsDockerGeneric: React.FC<{
             </button>
           )}
           {fileTransfer && transferAnchor && <MoveCopyMenu files={[file]} options={fileTransfer} anchor={transferAnchor} onClose={() => setTransferAnchor(null)} />}
+          <button
+            type="button"
+            onClick={() => openPhoneTransfer([file])}
+            className="flex items-center gap-1.5 p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+          >
+            <IoPhonePortraitOutline /> Transfer
+          </button>
           <button
             type="button"
             onClick={handleShowInFolder}

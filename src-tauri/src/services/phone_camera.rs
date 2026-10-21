@@ -94,7 +94,7 @@ struct WsQuery {
 // recording. A fresh key per server start rides in the pairing URL's fragment (#k=...), which
 // browsers never send in a request, and the phone page hands it back on the socket URL.
 // 64 random bits from the OS source behind RandomState - unguessable over a network.
-fn pairing_key() -> String {
+pub(crate) fn pairing_key() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(0);
@@ -102,7 +102,7 @@ fn pairing_key() -> String {
 }
 
 // Constant-time, so response timing can't be used to guess the key a character at a time.
-fn key_matches(given: &str, expected: &str) -> bool {
+pub(crate) fn key_matches(given: &str, expected: &str) -> bool {
     given.len() == expected.len()
         && given.bytes().zip(expected.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
@@ -141,7 +141,7 @@ pub struct PhoneCameraState {
 //
 // Excluded: loopback (the phone is not localhost) and link-local 169.254.x (APIPA - an adapter
 // that failed to get a DHCP lease, i.e. not on a working network at all).
-fn lan_addresses() -> Result<Vec<IpAddr>, String> {
+pub(crate) fn lan_addresses() -> Result<Vec<IpAddr>, String> {
     let usable = |ip: &IpAddr| match ip {
         IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
         // IPv6 is skipped entirely: the URL would need bracket syntax, and any phone that can
@@ -213,7 +213,7 @@ fn generate_cert(ips: &[IpAddr]) -> Result<(Vec<u8>, Vec<u8>), String> {
     ))
 }
 
-fn render_qr(url: &str) -> String {
+pub(crate) fn render_qr(url: &str) -> String {
     use qrcode::{render::svg, QrCode};
     match QrCode::new(url) {
         Ok(code) => code
