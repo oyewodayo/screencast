@@ -2,15 +2,39 @@
 //
 // The "look" of the transitions that have one (ClipTransitionIn.look): a light leak's colour,
 // strength, sweep direction and spot size; a flash's colour and strength; a whip's flash strength;
-// which way a bar opens. Export reads the same values (transition_glow_filter, conversion.rs) and
+// which way a bar opens; a page curl's corner, curl, paper, shadow and motion; how soft a wipe's
+// edge is; a dissolve's grain. Export reads the same values (transition_glow_filter, conversion.rs) and
 // the live preview draws them (TransitionPreviewLayer), so what you dial in is what you get.
 import React from "react";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
-import { IrisShape, LeakDirection, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
+import { IrisShape, LeakDirection, PeelFrom, TransitionEasing, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
 import { DEFAULT_SWEEP_COLOR } from "../video/transitionFrame";
 import { DEFAULT_BEAM_COLOR } from "../video/transitionCanvas";
+import { DEFAULT_PAPER_COLOR, DEFAULT_SEE_THROUGH } from "../video/pageCurl";
 
-const LOOK_TYPES = new Set<TransitionType>(["lightleak", "fadewhite", "whip", "horzopen", "zoomblur", "colorsweep", "push", "cube", "flip", "spin", "strips", "beam", "slider", "iris"]);
+const LOOK_TYPES = new Set<TransitionType>([
+  "lightleak",
+  "fadewhite",
+  "whip",
+  "horzopen",
+  "zoomblur",
+  "colorsweep",
+  "push",
+  "cube",
+  "flip",
+  "spin",
+  "strips",
+  "beam",
+  "slider",
+  "iris",
+  "pagecurl",
+  "wipeleft",
+  "wiperight",
+  "circleopen",
+  "radial",
+  "dissolve",
+  "pixelize",
+]);
 export const transitionHasLook = (type: TransitionType | null): boolean => !!type && LOOK_TYPES.has(type);
 
 // Which way the pictures travel (push, cube, flip).
@@ -33,6 +57,31 @@ const BEAM_COLORS: { color: string; name: string }[] = [
   { color: "#7dd3fc", name: "Ice" },
   { color: "#c084fc", name: "Violet" },
   { color: "#fbbf24", name: "Gold" },
+];
+
+// Where a page curl lifts from - the glyph marks the corner or edge.
+const PEEL_FROM: { value: PeelFrom; label: string; title: string }[] = [
+  { value: "bottomRight", label: "◢", title: "From the bottom-right corner" },
+  { value: "bottomLeft", label: "◣", title: "From the bottom-left corner" },
+  { value: "topRight", label: "◥", title: "From the top-right corner" },
+  { value: "topLeft", label: "◤", title: "From the top-left corner" },
+  { value: "right", label: "▐", title: "From the right edge, like turning a page" },
+  { value: "left", label: "▌", title: "From the left edge" },
+  { value: "bottom", label: "▄", title: "From the bottom edge" },
+  { value: "top", label: "▀", title: "From the top edge" },
+];
+const PAPER_COLORS: { color: string; name: string }[] = [
+  { color: DEFAULT_PAPER_COLOR, name: "Cream" },
+  { color: "#ffffff", name: "White" },
+  { color: "#c9a77c", name: "Kraft" },
+  { color: "#9aa3ad", name: "Grey" },
+  { color: "#1c1c1e", name: "Black" },
+];
+const EASINGS: { value: TransitionEasing; label: string; title: string }[] = [
+  { value: "smooth", label: "Smooth", title: "Eases in and out" },
+  { value: "linear", label: "Steady", title: "Constant speed" },
+  { value: "in", label: "Speed up", title: "Starts slowly, finishes fast" },
+  { value: "out", label: "Slow down", title: "Starts fast, settles at the end" },
 ];
 
 const SWEEP_COLORS: { color: string; name: string }[] = [
@@ -76,7 +125,7 @@ const DIRECTIONS: { value: LeakDirection; label: string; title: string }[] = [
 
 const Row: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
   <div className="flex items-center gap-2 text-[11px]">
-    <span className="w-14 shrink-0 text-white/60">{label}</span>
+    <span className="w-16 shrink-0 text-white/60">{label}</span>
     <div className="flex-1 min-w-0 flex items-center gap-1.5 flex-wrap">{children}</div>
   </div>
 );
@@ -92,8 +141,8 @@ const Chip: React.FC<{ active: boolean; title: string; onClick: () => void; chil
   </button>
 );
 
-const ColorRow: React.FC<{ colors: { color: string; name: string }[]; value: string; onChange: (c: string) => void }> = ({ colors, value, onChange }) => (
-  <Row label="Colour">
+const ColorRow: React.FC<{ label?: string; colors: { color: string; name: string }[]; value: string; onChange: (c: string) => void }> = ({ label = "Colour", colors, value, onChange }) => (
+  <Row label={label}>
     {colors.map((c) => (
       <button
         key={c.color}
@@ -139,6 +188,61 @@ const TransitionLookControls: React.FC<{ type: TransitionType; look: TransitionL
     />
   );
 
+  const pct = (v: number) => `${Math.round(v * 100)}%`;
+  const softness = (
+    <SliderRow label="Softness" value={look.softness ?? 0} min={0} max={1} step={0.02} format={pct} onChange={(softness) => set({ softness })} />
+  );
+
+  if (type === "pagecurl")
+    return (
+      <>
+        <Row label="Peel from">
+          {PEEL_FROM.map((d) => (
+            <Chip key={d.value} active={(look.peelFrom ?? "bottomRight") === d.value} title={d.title} onClick={() => set({ peelFrom: d.value })}>
+              {d.label}
+            </Chip>
+          ))}
+        </Row>
+        <SliderRow label="Curl size" value={look.size ?? 1} min={0.4} max={2} step={0.05} format={pct} onChange={(size) => set({ size })} />
+        <ColorRow label="Paper" colors={PAPER_COLORS} value={look.color ?? DEFAULT_PAPER_COLOR} onChange={(color) => set({ color })} />
+        <SliderRow label="See-through" value={look.seeThrough ?? DEFAULT_SEE_THROUGH} min={0} max={1} step={0.05} format={pct} onChange={(seeThrough) => set({ seeThrough })} />
+        <SliderRow label="Shadow" value={look.intensity ?? 1} min={0} max={1.5} step={0.05} format={pct} onChange={(intensity) => set({ intensity })} />
+        <Row label="Motion">
+          {EASINGS.map((e) => (
+            <Chip key={e.value} active={(look.easing ?? "smooth") === e.value} title={e.title} onClick={() => set({ easing: e.value })}>
+              {e.label}
+            </Chip>
+          ))}
+        </Row>
+      </>
+    );
+  if (type === "wipeleft" || type === "wiperight" || type === "circleopen") return softness;
+  if (type === "radial")
+    return (
+      <>
+        <Row label="Turns">
+          <Chip active={look.direction !== "left"} title="Clockwise" onClick={() => set({ direction: "right" })}>
+            ↻ Clockwise
+          </Chip>
+          <Chip active={look.direction === "left"} title="Anticlockwise" onClick={() => set({ direction: "left" })}>
+            ↺ Anticlockwise
+          </Chip>
+        </Row>
+        {softness}
+      </>
+    );
+  if (type === "dissolve" || type === "pixelize")
+    return (
+      <SliderRow
+        label={type === "dissolve" ? "Grain" : "Blocks"}
+        value={look.size ?? 1}
+        min={0.3}
+        max={3}
+        step={0.05}
+        format={pct}
+        onChange={(size) => set({ size })}
+      />
+    );
   if (type === "lightleak")
     return (
       <>

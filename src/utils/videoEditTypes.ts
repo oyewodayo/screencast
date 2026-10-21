@@ -142,12 +142,12 @@ export type TransitionType =
   // Not ffmpeg names: a crossfade / horizontal blur plus a glow pass (transition_fold_step).
   | "lightleak"
   | "whip"
-  // Not ffmpeg names: xfade custom expressions (page_curl_expr, zoom_blur_expr, color_sweep_expr).
-  | "pagecurl"
+  // Not ffmpeg names: drawn over the outgoing picture (transitionFrame.ts / transition_window_graph).
   | "zoomblur"
   | "colorsweep"
-  // Not ffmpeg names: both pictures move - composited from the two frames (transitionCanvas.ts in
-  // the preview, canvas_transition in conversion.rs).
+  // Not ffmpeg names: both pictures move - composited from the two frames (transitionCanvas.ts and
+  // pageCurl.ts in the preview, canvas_transition in transition_graphs.rs).
+  | "pagecurl"
   | "blocks"
   | "mosaic"
   | "split"
@@ -166,16 +166,28 @@ export type TransitionType =
 export type IrisShape = "triangle" | "diamond" | "hexagon" | "star" | "heart";
 // Where a light leak's hot spot travels.
 export type LeakDirection = "right" | "left" | "down" | "up" | "diagonal" | "center";
+// The corner or edge a page curl lifts from.
+export type PeelFrom = "bottomRight" | "bottomLeft" | "topRight" | "topLeft" | "right" | "left" | "bottom" | "top";
+// A transition's motion curve: ease in and out (default), constant speed, speeding up, slowing down.
+export type TransitionEasing = "smooth" | "linear" | "in" | "out";
 // The look of transitions that have one (TransitionLookControls). All optional - undefined is the
 // default look. Export: transition_glow_filter (conversion.rs); preview: TransitionPreviewLayer.
 export interface TransitionLook {
-  // Light leak / flash / colour sweep colour, "#rrggbb".
+  // Light leak / flash / colour sweep colour, "#rrggbb". Page curl: the paper's colour.
   color?: string;
-  // Glow strength, 0.1..1.5 (1 = default).
+  // Glow strength, 0.1..1.5 (1 = default). Page curl: its shadow, 0..1.5.
   intensity?: number;
   direction?: LeakDirection;
-  // Light leak hot-spot size, 0.3..2.5 (1 = default).
+  // Light leak hot-spot size, 0.3..2.5 (1 = default). Page curl: the curl's radius, 0.4..2.
+  // Dissolve: grain size, pixelize: block size, 0.3..3.
   size?: number;
+  // Page curl: where it lifts from (default bottom-right), how much of the picture shows through
+  // the back of the page (0..1, default 0.15), and its motion curve.
+  peelFrom?: PeelFrom;
+  seeThrough?: number;
+  easing?: TransitionEasing;
+  // Wipe / circle / clock wipe: how soft the edge is, 0..1 (0 = hard, the default).
+  softness?: number;
   // Bar open: out of a horizontal line (default) or a vertical one. Strips: columns (default) or rows.
   orientation?: "horizontal" | "vertical";
   // Iris: the shape the new clip opens out of (default triangle).

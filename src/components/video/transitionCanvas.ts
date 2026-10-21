@@ -10,10 +10,11 @@
 // Every curve is a function of the transition progress p (0..1) and the frame size W x H, in frame
 // pixels; the export evaluates the same formulas per frame at the output size.
 import type { IrisShape, LeakDirection, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
+import { drawPageCurl } from "./pageCurl";
 
-export type CanvasTransition = "blocks" | "mosaic" | "split" | "slider" | "strips" | "beam" | "iris" | "spin" | "glitch" | "slice" | "push" | "cube" | "flip" | "tiles";
+export type CanvasTransition = "pagecurl" | "blocks" | "mosaic" | "split" | "slider" | "strips" | "beam" | "iris" | "spin" | "glitch" | "slice" | "push" | "cube" | "flip" | "tiles";
 
-const CANVAS_TRANSITIONS = new Set<string>(["blocks", "mosaic", "split", "slider", "strips", "beam", "iris", "spin", "glitch", "slice", "push", "cube", "flip", "tiles"]);
+const CANVAS_TRANSITIONS = new Set<string>(["pagecurl", "blocks", "mosaic", "split", "slider", "strips", "beam", "iris", "spin", "glitch", "slice", "push", "cube", "flip", "tiles"]);
 
 export const isCanvasTransition = (type: TransitionType | null): type is CanvasTransition => !!type && CANVAS_TRANSITIONS.has(type);
 
@@ -387,6 +388,9 @@ export function drawCanvasTransition(ctx: CanvasRenderingContext2D, type: Canvas
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, W, H);
   switch (type) {
+    case "pagecurl":
+      drawPageCurl(ctx, look, p, old, next, W, H, dpr);
+      break;
     case "blocks":
     case "mosaic": {
       const [cols, rows] = gridSize(W, H);

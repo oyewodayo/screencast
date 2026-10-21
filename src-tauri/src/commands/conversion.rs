@@ -3149,6 +3149,18 @@ pub struct TransitionLook {
     pub orientation: Option<String>,
     // Iris: the shape the new clip opens out of. Only ever matched against known names.
     pub shape: Option<String>,
+    // Page curl: the corner/edge it lifts from and its motion curve (both matched against known
+    // names), and how much of the picture shows through the back of the page (clamped 0..1).
+    pub peel_from: Option<String>,
+    pub easing: Option<String>,
+    pub see_through: Option<f64>,
+    // Wipe / circle / clock wipe edge softness, clamped 0..1.
+    pub softness: Option<f64>,
+}
+
+// A numeric look field clamped to [lo, hi], or `default` when unset or not a finite number.
+pub(crate) fn look_num(v: Option<f64>, default: f64, lo: f64, hi: f64) -> f64 {
+    v.filter(|x| x.is_finite()).unwrap_or(default).clamp(lo, hi)
 }
 
 // "#rrggbb" -> (r, g, b); anything else -> None.
@@ -5609,7 +5621,7 @@ fn transition_fold_step(
 }
 
 // BT.601 limited-range Y, Cb, Cr of an 8-bit RGB colour.
-fn rgb_to_yuv((r, g, b): (f64, f64, f64)) -> (i64, i64, i64) {
+pub(crate) fn rgb_to_yuv((r, g, b): (f64, f64, f64)) -> (i64, i64, i64) {
     let (r, g, b) = (r / 255.0, g / 255.0, b / 255.0);
     let y = 16.0 + 65.481 * r + 128.553 * g + 24.966 * b;
     let u = 128.0 - 37.797 * r - 74.203 * g + 112.0 * b;
@@ -5679,13 +5691,16 @@ fn transition_window_graph(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64,
         )
     };
     let tint = look.color.as_deref().and_then(parse_hex_color);
+    // Wipe / circle / clock wipe edge softness (transitionFrame.ts).
+    let soft = look_num(look.softness, 0.0, 0.0, 1.0);
     match name {
         "dissolve" => {
-            // Grain by grain: a fixed noise field (160 cells across) and every cell whose value
-            // the progress has passed shows the new clip. The same hash as the preview's.
+            // Grain by grain: a fixed noise field (160 / size cells across) and every cell whose
+            // value the progress has passed shows the new clip. The same hash as the preview's.
             let s = "(sin(X*12.9898+Y*78.233)*43758.5453)";
+            let cols = (160.0 / look_num(look.size, 1.0, 0.3, 3.0)).round() as i64;
             format!(
-                "[old{i}]split[ma{i}][mm{i}];[mm{i}]scale=160:-1,format=gray,geq=lum='255*gte({s}-floor({s}),{pg})',scale={w}:{h}:flags=bilinear[mk{i}];\
+                "[old{i}]split[ma{i}][mm{i}];[mm{i}]scale={cols}:-1,format=gray,geq=lum='255*gte({s}-floor({s}),{pg})',scale={w}:{h}:flags=bilinear[mk{i}];\
                  [ma{i}]format=yuva420p[mb{i}];[mb{i}][mk{i}]alphamerge[mo{i}];[head{i}][mo{i}]overlay=eof_action=pass[tr{i}];"
             )
         }
@@ -5782,11 +5797,40 @@ fn transition_window_graph(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64,
             );
             masked(&lum)
         }
+        "circleopen" if soft > 0.0 => {
+            // CSS's radial-gradient(transparent r - S/2, #000 r + S/2), S = 15% of the diagonal at
+            // full softness, the radius travelling far enough for the band to clear the corners.
+            let s = format!("({:.4}*hypot(W,H))", 0.15 * soft);
+            masked(&format!("255*clip((hypot(X-W/2,Y-H/2)-({pg}*(hypot(W,H)/2+{s})-{s}))/{s},0,1)"))
+        }
         "circleopen" => masked(&format!("255*gt(hypot(X-W/2,Y-H/2),{pg}*hypot(W,H)/2)")),
         "radial" => {
-            // A sweep clockwise from 12 o'clock (CSS conic-gradient from 0deg).
-            let a = "atan2(X-W/2,H/2-Y)";
-            masked(&format!("255*gte(if(lt({a},0),{a}+2*PI,{a}),{pg}*2*PI)"))
+            // A sweep from 12 o'clock (CSS conic-gradient from 0deg) - clockwise, or anticlockwise
+            // as its mirror - its edge up to 60 degrees soft.
+            let a = "if(lt(atan2(X-W/2,H/2-Y),0),atan2(X-W/2,H/2-Y)+2*PI,atan2(X-W/2,H/2-Y))";
+            let a = if look.direction.as_deref() == Some("left") { format!("(2*PI-{a})") } else { a.to_string() };
+            let band = 60.0 * soft * std::f64::consts::PI / 180.0;
+            if band > 0.0 {
+                masked(&format!("255*clip(({a}-{pg}*{:.5}+{band:.5})/{band:.5},0,1)", 2.0 * std::f64::consts::PI + band))
+            } else {
+                masked(&format!("255*gte({a},{pg}*2*PI)"))
+            }
+        }
+        "wipeleft" | "wiperight" if soft > 0.0 => {
+            // A soft edge S wide (30% of the width at full softness): a sprite [white | ramp |
+            // black] (reversed for wiperight), 2W + S wide, slid across so the ramp clears the
+            // frame at both ends - the preview's linear-gradient mask.
+            let sw = (0.3 * soft * w as f64 / 2.0).round().max(1.0) as i64 * 2;
+            let left = name == "wipeleft";
+            let ramp = if left { format!("1-clip((X-{w})/{sw},0,1)") } else { format!("clip((X-{w})/{sw},0,1)") };
+            let x = if left { format!("-{}*{pt}", w + sw) } else { format!("{}*{pt}-{}", w + sw, w + sw) };
+            format!(
+                "[old{i}]split=3[ma{i}][mc{i}][ms{i}];\
+                 [ms{i}]trim=end_frame=1,format=gray,scale={sprite}:2,geq=lum='255*({ramp})',scale={sprite}:{h},format=yuv420p,tpad=stop_mode=clone:stop_duration={d:.4}[sp{i}];\
+                 [mc{i}]lutyuv=y=0:u=128:v=128[cv{i}];[cv{i}][sp{i}]overlay=x='{x}':y=0[mk{i}];\
+                 [ma{i}]format=yuva420p[mb{i}];[mb{i}][mk{i}]alphamerge[mo{i}];[head{i}][mo{i}]overlay=eof_action=pass[tr{i}];",
+                sprite = 2 * w + sw
+            )
         }
         "wipeleft" | "wiperight" => {
             // A hard edge, exact to the pixel: a half-white sprite two frames wide slid across.
@@ -5803,12 +5847,13 @@ fn transition_window_graph(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64,
             format!("[head{i}][old{i}]overlay=x='{sign}main_w*{pt}':y=0:eof_action=pass[tr{i}];")
         }
         "pixelize" => {
-            // Coarsens toward the midpoint (blocks up to 1/24 of the width), then the new clip.
-            let max_block = (w as f64 / 24.0).max(2.0);
+            // Coarsens toward the midpoint (blocks up to 1/24 of the width, times size), then the
+            // new clip.
+            let max_block = (w as f64 / 24.0 * look_num(look.size, 1.0, 0.3, 3.0)).max(2.0);
             let px = sendcmd_series(&format!("pixelize@p{i}"), &["w", "h"], d, fps, |p| (1.0 + (max_block - 1.0) * (2.0 * p).min(1.0)).round());
             format!("[old{i}]{px},pixelize@p{i}=w=1:h=1[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass:enable='lt(t,{half:.4})'[tr{i}];")
         }
-        "pagecurl" | "colorsweep" => drawn_transition(name, i, d, look),
+        "colorsweep" => drawn_transition(name, i, d, look),
         n if is_canvas_transition(n) => canvas_transition(n, i, d, fps, (w, h), look),
         _ => format!("[old{i}]{fade_out}[oc{i}];[head{i}][oc{i}]overlay=eof_action=pass[tr{i}];"),
     }
@@ -5819,8 +5864,8 @@ pub(crate) fn transition_window_graph_for_tests(name: &str, i: usize, d: f64, fp
     transition_window_graph(name, i, d, fps, frame, &TransitionLook::default())
 }
 
-// The two transitions drawn from sprites slid per frame (page curl, colour sweep): [old{i}] (the
-// outgoing clip's tail, `d` seconds, timed from 0) over [head{i}], into [tr{i}].
+// The colour sweep, drawn from a sprite slid per frame: [old{i}] (the outgoing clip's tail, `d`
+// seconds, timed from 0) over [head{i}], into [tr{i}].
 fn drawn_transition(name: &str, i: usize, d: f64, look: &TransitionLook) -> String {
     // Transition progress 0..1 from an overlay's `t` (seconds since the window began).
     let q = format!("min(t/{d:.3},1)");
@@ -5855,39 +5900,7 @@ fn drawn_transition(name: &str, i: usize, d: f64, look: &TransitionLook) -> Stri
                 half = d / 2.0,
             )
         }
-        // The old page peels away from its bottom-right corner along a fold line u+v = k (u, v =
-        // fractions across / down the frame) sweeping from k=2 to 0: the page shows on one side,
-        // the new clip on the other, with a paper-white curl over the page's edge and soft shadows
-        // either side of it. Both layers are functions of u+v-k alone, so each is drawn ONCE, on a
-        // sprite three frames wide (a = 3x/w - 2 + y/h runs over every u+v-k the frame needs),
-        // and slid left by 2*q frame widths: the page's mask (white = page) onto black, and the
-        // curl + shadows (with alpha) straight over the result. Drawn at quarter size and scaled
-        // up, which also softens their edges.
-        _ => {
-            let a = "(3*X/W-2+Y/H)";
-            let sprite = |planes: &str, fmt: &str| {
-                format!("trim=end_frame=1,scale=iw*3/2:ih/2,format={fmt},geq={planes},scale=iw*2:ih*2:flags=bilinear,tpad=stop_mode=clone:stop_duration={d:.3}")
-            };
-            let mask = sprite(&format!("lum='255*clip(0.5-{a}*60,0,1)':cb=128:cr=128"), "yuv420p");
-            // The curl's coverage, antialiased over ~1.5 sprite pixels at both its edges (a step
-            // in `a` per pixel is 3/W), and the shadows' opacity either side of it.
-            let e = "(4.5/W)";
-            let f = format!("(clip(({a}+0.45)/{e},0,1)*clip(-{a}/{e},0,1))");
-            let shadow = format!("if(between({a},-0.51,-0.45),0.3*({a}+0.51)/0.06,if(between({a},0,0.12),0.45*(1-{a}/0.12),0))");
-            let curl = sprite(
-                &format!("lum='if(gt({f},0),180+45*sin(PI*clip(-{a}/0.45,0,1)),16)':cb=128:cr=128:a='255*({f}+(1-{f})*{shadow})'"),
-                "yuva420p",
-            );
-            let slide = format!("x='-2*main_w*{q}':y=0");
-            format!(
-                "[old{i}]split=4[page{i}][canvas{i}][maskf{i}][curlf{i}];\
-                 [maskf{i}]{mask}[masks{i}];[curlf{i}]{curl}[curls{i}];\
-                 [canvas{i}]lutyuv=y=0:u=128:v=128[black{i}];[black{i}][masks{i}]overlay={slide}[mask{i}];\
-                 [page{i}][mask{i}]alphamerge[peel{i}];\
-                 [head{i}][peel{i}]overlay=eof_action=pass[paged{i}];\
-                 [paged{i}][curls{i}]overlay={slide}:eof_action=pass[tr{i}];"
-            )
-        }
+        _ => String::new(),
     }
 }
 
@@ -5920,11 +5933,11 @@ const ALLOWED_TRANSITIONS: &[&str] = &[
     // Not ffmpeg names - xfade plus a glow pass (see transition_fold_step).
     "lightleak",
     "whip",
-    // xfade custom expressions (page_curl_expr, zoom_blur_expr, color_sweep_expr).
-    "pagecurl",
+    // Drawn over the outgoing picture (transition_window_graph).
     "zoomblur",
     "colorsweep",
     // Both pictures move (services/transition_graphs.rs).
+    "pagecurl",
     "blocks",
     "mosaic",
     "split",
@@ -10096,10 +10109,14 @@ mod tests {
             size: Some(1.0),
             orientation: Some("'; drop".to_string()),
             shape: Some("'; drop".to_string()),
+            peel_from: Some("'; drop".to_string()),
+            easing: Some("'; drop".to_string()),
+            see_through: Some(f64::NAN),
+            softness: Some(f64::INFINITY),
         };
         for name in ALLOWED_TRANSITIONS {
             let step = transition_window_graph(name, 1, 0.5, 30.0, (1280, 720), &hostile);
-            assert!(!step.contains("drop"), "{name}: {step}");
+            assert!(!step.contains("drop") && !step.contains("NaN") && !step.contains("inf"), "{name}: {step}");
         }
         assert!(parse_hex_color("red").is_none() && parse_hex_color("#12345g").is_none());
         // Intensity is clamped to 1.5: the flash's sin() peak scale.
@@ -10261,11 +10278,9 @@ mod tests {
 
     #[test]
     fn drawn_transitions_slide_sprites_over_the_incoming_head() {
-        for name in ["pagecurl", "colorsweep"] {
-            assert_eq!(sanitize_transition_name(name), name);
-            let step = drawn_transition(name, 1, 0.8, &TransitionLook::default());
-            assert!(step.contains("[old1]") && step.contains("[head1]") && step.ends_with("[tr1];"), "{step}");
-        }
+        assert_eq!(sanitize_transition_name("colorsweep"), "colorsweep");
+        let step = drawn_transition("colorsweep", 1, 0.8, &TransitionLook::default());
+        assert!(step.contains("[old1]") && step.contains("[head1]") && step.ends_with("[tr1];"), "{step}");
         // The sweep's colour and direction come from the look - parsed, never interpolated raw.
         let look = TransitionLook { color: Some("#2563eb".into()), direction: Some("left".into()), ..Default::default() };
         let step = drawn_transition("colorsweep", 1, 0.8, &look);

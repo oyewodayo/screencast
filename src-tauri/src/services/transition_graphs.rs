@@ -13,10 +13,10 @@
 // Cost: everything that moves is a per-frame overlay position, crop window or `perspective`
 // corner set over native filters; per-pixel maths (geq) runs once on a sprite, or per frame only
 // on a reduced-size mask that is scaled up (its edges are soft anyway).
-use crate::commands::conversion::{parse_hex_color, sendcmd_series, TransitionLook};
+use crate::commands::conversion::{look_num, parse_hex_color, rgb_to_yuv, sendcmd_series, TransitionLook};
 use std::f64::consts::PI;
 
-pub const CANVAS_TRANSITIONS: &[&str] = &["blocks", "mosaic", "split", "slider", "strips", "beam", "iris", "spin", "glitch", "slice", "push", "cube", "flip", "tiles"];
+pub const CANVAS_TRANSITIONS: &[&str] = &["pagecurl", "blocks", "mosaic", "split", "slider", "strips", "beam", "iris", "spin", "glitch", "slice", "push", "cube", "flip", "tiles"];
 
 pub fn is_canvas_transition(name: &str) -> bool {
     CANVAS_TRANSITIONS.contains(&name)
@@ -114,6 +114,128 @@ fn face_chain(src: &str, out: &str, tag: &str, w: i64, h: i64, d: f64, shade: &s
     )
 }
 
+// ---------- page curl (components/video/pageCurl.ts) ----------
+
+const CURL_RADIUS: f64 = 0.07;
+const CURL_TAIL: f64 = 1.0;
+const CURL_SHADE_FRONT: f64 = 0.55;
+const CURL_SHADE_BACK: f64 = 0.6;
+const CURL_SHADOW_ALPHA: f64 = 0.6;
+const CURL_SHADOW_BLUR: f64 = 0.34;
+const CURL_SHADOW_SHIFT: f64 = 0.25;
+const DEFAULT_SEE_THROUGH: f64 = 0.15;
+
+// The unit vector the page lifts towards (pageCurl.ts curlDirection).
+pub fn curl_direction(peel_from: Option<&str>, w: f64, h: f64) -> (f64, f64) {
+    let (x, y) = match peel_from {
+        Some("right") => return (1.0, 0.0),
+        Some("left") => return (-1.0, 0.0),
+        Some("bottom") => return (0.0, 1.0),
+        Some("top") => return (0.0, -1.0),
+        Some("bottomLeft") => (-h, w),
+        Some("topRight") => (h, -w),
+        Some("topLeft") => (-h, -w),
+        _ => (h, w),
+    };
+    let n = x.hypot(y);
+    (x / n, y / n)
+}
+
+// pageCurl.ts ease, as an expression of the progress expression `p`.
+fn ex_ease(easing: Option<&str>, p: &str) -> String {
+    let c = c01(p);
+    match easing {
+        Some("linear") => c,
+        Some("in") => format!("pow({c},2)"),
+        Some("out") => format!("(1-pow(1-{c},2))"),
+        _ => ex_smooth(p),
+    }
+}
+
+// The page peeling off over a cylinder (pageCurl.ts has the model). In fold space - the frame
+// turned so the peel points along +x - every layer is a column remap that depends only on the
+// fold's position K, so each frame's maps are one row computed by geq and stretched down the
+// canvas, and `remap` does the per-pixel work natively. The curl is drawn there at half size past
+// 960 px wide (it's soft and moving fast), turned back, and laid over the new clip and what's left
+// of the page - which stays the untouched original, cut by a turned-back mask.
+fn page_curl(i: usize, d: f64, fps: f64, (w, h): (i64, i64), look: &TransitionLook) -> String {
+    let sc = if w > 960 { 2.0 } else { 1.0 };
+    let (fw, fh) = (even(w as f64 / sc), even(h as f64 / sc));
+    let (dx, dy) = curl_direction(look.peel_from.as_deref(), w as f64, h as f64);
+    let theta = dy.atan2(dx);
+    let wr = even(fw as f64 * dx.abs() + fh as f64 * dy.abs());
+    let hr = even(fw as f64 * dy.abs() + fh as f64 * dx.abs());
+    let r = CURL_RADIUS * look_num(look.size, 1.0, 0.4, 2.0) * (fw as f64).hypot(fh as f64);
+    let travel = wr as f64 + r + CURL_TAIL * r;
+    let see = look_num(look.see_through, DEFAULT_SEE_THROUGH, 0.0, 1.0);
+    let shadow = look_num(look.intensity, 1.0, 0.0, 1.5);
+    let (py, pu, pv) = rgb_to_yuv(look.color.as_deref().and_then(parse_hex_color).unwrap_or((242.0, 239.0, 232.0)));
+
+    let pg = format!("min(T/{d:.4},1)");
+    let k = format!("({wr}-{}*{travel:.3})", ex_ease(look.easing.as_deref(), &pg));
+    let a = format!("(X-{k})");
+    let rr = format!("{r:.3}");
+    // One row per frame (geq on Wr x 1), stretched down the fold canvas.
+    let row = |fmt: &str, planes: &str| format!("color=c=black:s={wr}x1:r={fps:.3}:d={d:.4},format={fmt},geq={planes},scale={wr}:{hr}:flags=neighbor");
+    let rot = |angle: f64, ow: i64, oh: i64, fill: &str| if angle.abs() < 1e-9 { "null".to_string() } else { format!("rotate=a={angle:.6}:ow={ow}:oh={oh}:c={fill}") };
+    // Source columns (65535 = none, which remap fills transparent): the printed side round the
+    // cylinder's near half, with a sliver behind the fold so page and curl meet without a seam; and
+    // the back of the page, over the top of the cylinder then flat back over the page.
+    let xa = format!("lum='if(between({a},-2,0),X,if(between({a},0,{rr}),{k}+{rr}*asin({a}/{rr}),65535))'");
+    let src_b = format!("if(lt({a},0),{k}+{:.3}-{a},{k}+{rr}*(PI-asin(min({a}/{rr},1))))", PI * r);
+    let xb = format!("lum='if(gt({a},{rr}),65535,if(lt({src_b},0),65535,{src_b}))'");
+    // Darkening across each half of the cylinder as it turns edge-on.
+    let band = |strength: f64| format!("if(between({a},0,{rr}),{strength}*(1-sqrt(1-pow(clip({a}/{rr},0,1),2))),0)");
+    let shade_front = format!("lum=16:cb=128:cr=128:a='255*{}'", band(CURL_SHADE_FRONT));
+    // The back: paper at 1 - see over the picture, then the shading - folded into one layer per
+    // column (alpha 1 - (1-s)(1-q), colour ((1-s)q paper + s black) / alpha).
+    let s = band(CURL_SHADE_BACK);
+    let q = 1.0 - see;
+    let al = format!("(1-(1-{s})*{see:.3})");
+    let mix = |c: i64, z: i64| format!("'((1-{s})*{q:.3}*{c}+{s}*{z})/max({al},0.0001)'");
+    let shade_back = format!("lum={}:cb={}:cr={}:a='255*{al}'", mix(py, 16), mix(pu, 128), mix(pv, 128));
+    let mask = format!("lum='255*clip({k}-X+0.5,0,1)'");
+
+    let mut g = format!(
+        "[old{i}]split[cpg{i}][crs{i}];[crs{i}]scale={fw}:{fh},format=yuva444p,{},split[cfa{i}][cfb{i}];\
+         {}[cxa{i}];{}[cxb{i}];color=c=black:s=1x{hr}:r={fps:.3}:d={d:.4},format=gray16le,geq=lum='Y',scale={wr}:{hr}:flags=neighbor,split[cya{i}][cyb{i}];\
+         [cfa{i}][cxa{i}][cya{i}]remap=fill=black@0,split[ca1{i}][ca2{i}];[ca2{i}]alphaextract[caa{i}];{}[csa{i}];[ca1{i}][csa{i}]overlay[ca3{i}];[ca3{i}][caa{i}]alphamerge[cas{i}];\
+         [cfb{i}][cxb{i}][cyb{i}]remap=fill=black@0,split[cb1{i}][cb2{i}];[cb2{i}]alphaextract[cba{i}];{}[csb{i}];[cb1{i}][csb{i}]overlay[cb3{i}];[cb3{i}][cba{i}]alphamerge[cbs{i}];",
+        rot(-theta, wr, hr, "none"),
+        row("gray16le", &xa),
+        row("gray16le", &xb),
+        row("yuva444p", &shade_front),
+        row("yuva444p", &shade_back),
+    );
+    if shadow > 0.0 {
+        // The lifted sheet's silhouette, blurred at quarter size (two box passes ~ the preview's
+        // gaussian), shifted along the peel and laid under it.
+        let (mw, mh) = ((wr / 4).max(2), (hr / 4).max(2));
+        let blur = ((CURL_SHADOW_BLUR * r / 4.0 / 0.816).round() as i64).clamp(1, (mw.min(mh) / 2 - 1).max(1));
+        let shift = (CURL_SHADOW_SHIFT * r).round() as i64;
+        g.push_str(&format!(
+            "[cas{i}][cbs{i}]overlay,split[cab{i}][cam{i}];\
+             [cam{i}]alphaextract,scale={mw}:{mh},boxblur={blur}:2,scale={wr}:{hr},pad={}:{hr}:{shift}:0,crop={wr}:{hr}:0:0,lut=c0='val*{:.3}'[csm{i}];\
+             color=c=black:s={wr}x{hr}:r={fps:.3}:d={d:.4},format=yuva444p[cbk{i}];[cbk{i}][csm{i}]alphamerge[csh{i}];[csh{i}][cab{i}]overlay[ccf{i}];",
+            wr + shift,
+            (CURL_SHADOW_ALPHA * shadow).min(1.0)
+        ));
+    } else {
+        g.push_str(&format!("[cas{i}][cbs{i}]overlay[ccf{i}];"));
+    }
+    // Turned back (premultiplied, so the curl's edges don't pick up the transparent black around
+    // them), then: the new clip, the page cut at the fold, the curl.
+    g.push_str(&format!(
+        "[ccf{i}]format=gbrap,premultiply=inplace=1,{},scale={w}:{h},unpremultiply=inplace=1[ccl{i}];\
+         {},{},scale={w}:{h}[cmk{i}];[cpg{i}]format=yuva420p[cpa{i}];[cpa{i}][cmk{i}]alphamerge[cpp{i}];\
+         [head{i}][cpp{i}]overlay=eof_action=pass[cpx{i}];[cpx{i}][ccl{i}]overlay=eof_action=pass[tr{i}];",
+        rot(theta, fw, fh, "none"),
+        row("gray", &mask),
+        rot(theta, fw, fh, "black"),
+    ));
+    g
+}
+
 // The whole window graph for one of CANVAS_TRANSITIONS.
 pub fn canvas_transition(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64, i64), look: &TransitionLook) -> String {
     let (wf, hf) = (w as f64, h as f64);
@@ -128,6 +250,7 @@ pub fn canvas_transition(name: &str, i: usize, d: f64, fps: f64, (w, h): (i64, i
     let alpha_over = |base: &str, layer: &str, out: &str| format!("[{base}][{layer}]overlay=eof_action=pass[{out}];");
 
     match name {
+        "pagecurl" => page_curl(i, d, fps, (w, h), look),
         "blocks" | "mosaic" => {
             let (cols, rows) = grid_size(w, h);
             let th = if name == "blocks" {
@@ -636,6 +759,64 @@ mod tests {
         assert_eq!(grid_size(1920, 1080), (7, 4));
         assert_eq!(grid_size(1080, 1920), (4, 7));
         assert_eq!(grid_size(1080, 1080), (4, 4));
+    }
+
+    #[test]
+    fn page_curl_follows_the_look() {
+        let look = TransitionLook {
+            peel_from: Some("topLeft".into()),
+            easing: Some("linear".into()),
+            see_through: Some(0.5),
+            color: Some("#c9a77c".into()),
+            ..Default::default()
+        };
+        let g = canvas_transition("pagecurl", 1, 0.8, 30.0, (1920, 1080), &look);
+        // Turned into fold space and back, the column maps remapped, the page cut by a mask.
+        assert!(g.contains("rotate=a=") && g.contains("remap=fill=black@0") && g.contains("alphamerge[cpp1]") && g.ends_with("[tr1];"), "{g}");
+        // Linear motion, kraft paper at half opacity over the back.
+        assert!(g.contains("clip(min(T/0.8000,1),0,1)*") && g.contains("0.500*"), "{g}");
+        let (y, ..) = rgb_to_yuv((201.0, 167.0, 124.0));
+        assert!(g.contains(&format!("*{y}+")), "{g}");
+        // Peeling from the right edge needs no rotation; no shadow drops the shadow pass.
+        let edge = TransitionLook { peel_from: Some("right".into()), intensity: Some(0.0), ..Default::default() };
+        let g = canvas_transition("pagecurl", 1, 0.8, 30.0, (640, 360), &edge);
+        assert!(!g.contains("rotate=") && !g.contains("boxblur"), "{g}");
+        // The preview's peel directions: corners fold along the other diagonal.
+        let (dx, dy) = curl_direction(Some("bottomLeft"), 16.0, 9.0);
+        assert!((dx + 9.0 / 337f64.sqrt()).abs() < 1e-9 && (dy - 16.0 / 337f64.sqrt()).abs() < 1e-9);
+        assert_eq!(curl_direction(Some("'; drop"), 16.0, 9.0), curl_direction(None, 16.0, 9.0));
+    }
+
+    // Not a unit test: renders page curls with the bundled ffmpeg ($FFMPEG_DIR), checking each runs
+    // through to its halfway frame. Set $CURL_FRAMES_DIR to also keep those frames as PNGs, to
+    // compare with the preview.
+    #[test]
+    #[ignore]
+    fn page_curls_render() {
+        let Ok(bin) = std::env::var("FFMPEG_DIR") else { return };
+        let ffmpeg = std::path::PathBuf::from(&bin).join("ffmpeg.exe");
+        let looks = [
+            ("default", TransitionLook::default()),
+            ("right", TransitionLook { peel_from: Some("right".into()), see_through: Some(0.5), ..Default::default() }),
+            ("topleft", TransitionLook { peel_from: Some("topLeft".into()), color: Some("#c9a77c".into()), size: Some(1.6), easing: Some("linear".into()), ..Default::default() }),
+            ("bottom", TransitionLook { peel_from: Some("bottom".into()), color: Some("#1c1c1e".into()), see_through: Some(0.0), intensity: Some(1.5), ..Default::default() }),
+        ];
+        for (tag, look) in looks {
+            let body = canvas_transition("pagecurl", 1, 1.0, 30.0, (1280, 720), &look);
+            let save = std::env::var("CURL_FRAMES_DIR").map(|_| format!(",split[keep][stat];[keep]scale=480:270,format=rgb24[png];[stat]")).unwrap_or_default();
+            let graph = format!(
+                "testsrc2=s=1280x720:r=30:d=1,format=yuv420p,settb=AVTB[old1];smptebars=s=1280x720:r=30:d=1,format=yuv420p,settb=AVTB[head1];{body}[tr1]select='eq(n,12)'{save}signalstats,metadata=print:key=lavfi.signalstats.YAVG[stats]"
+            );
+            let mut args: Vec<String> = ["-v", "info", "-hide_banner", "-filter_complex", &graph, "-map", "[stats]", "-f", "null", "-"].iter().map(|s| s.to_string()).collect();
+            if let Ok(dir) = std::env::var("CURL_FRAMES_DIR") {
+                args.extend(["-map", "[png]", "-frames:v", "1", "-y"].iter().map(|s| s.to_string()));
+                args.push(format!("{dir}/curl_{tag}.png"));
+            }
+            let out = std::process::Command::new(&ffmpeg).args(&args).output().unwrap();
+            let log = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: {log}");
+            assert!(log.contains("YAVG="), "{tag}: no halfway frame - {log}");
+        }
     }
 
     // Not a unit test: renders every canvas transition between two coloured test patterns with the
